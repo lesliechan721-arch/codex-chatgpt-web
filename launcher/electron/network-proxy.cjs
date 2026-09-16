@@ -5,6 +5,7 @@ const {
   electronProxyConfiguration,
   normalizeNetworkProxyUrl,
 } = require("./network-proxy-config.cjs");
+const { registerLoggedIpc } = require("./logging.cjs");
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -20,6 +21,7 @@ function runtimeRestartError(result) {
 function createNetworkProxyController({
   browserPartition,
   getBrowserHost = () => null,
+  getRuntimeHost = () => null,
   getRuntimeSupervisor = () => null,
   logger,
   publishState = () => {},
@@ -57,7 +59,7 @@ function createNetworkProxyController({
     if (restartError) throw new Error(restartError);
   };
 
-  const setProxy = async (rawProxyUrl) => {
+  const updateProxy = async (rawProxyUrl) => {
     const nextProxyUrl = normalizeNetworkProxyUrl(rawProxyUrl);
     const current = stateStore.read();
     const previousProxyUrl = current.networkProxyUrl ?? null;
@@ -74,8 +76,10 @@ function createNetworkProxyController({
     }
 
     let primaryError;
+    let state;
     try {
       await applyProxy(nextProxyUrl, true);
+      state = stateStore.update({ networkProxyUrl: nextProxyUrl });
     } catch (error) {
       primaryError = error;
     }
@@ -92,10 +96,23 @@ function createNetworkProxyController({
       throw new Error(message);
     }
 
-    const state = stateStore.update({ networkProxyUrl: nextProxyUrl });
     logger?.info?.("network.proxy_updated", { customProxy: nextProxyUrl !== null });
     publishState(state);
     return state;
+  };
+
+  const setProxy = async (rawProxyUrl) => {
+    const runtimeHost = getRuntimeHost();
+    if (!runtimeHost) return updateProxy(rawProxyUrl);
+    if (typeof runtimeHost.runLifecycleOperation !== "function") {
+      const activeOperation = runtimeHost.currentOperation?.();
+      if (activeOperation) throw new Error(`Another launcher operation is active: ${activeOperation}`);
+      return updateProxy(rawProxyUrl);
+    }
+    return runtimeHost.runLifecycleOperation(
+      "network-proxy",
+      () => updateProxy(rawProxyUrl),
+    );
   };
 
   const applySaved = async () => {
@@ -105,7 +122,12 @@ function createNetworkProxyController({
     return proxyUrl;
   };
 
-  ipc.handle("launcher:network-proxy", (_event, proxyUrl) => setProxy(proxyUrl));
+  registerLoggedIpc(
+    ipc,
+    logger,
+    "launcher:network-proxy",
+    (_event, proxyUrl) => setProxy(proxyUrl),
+  );
 
   return {
     applySaved,

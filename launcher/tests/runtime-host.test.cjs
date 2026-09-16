@@ -543,6 +543,22 @@ test("mutating launcher operations are serialized before lifecycle changes begin
   assert.equal(fixture.invocation(), undefined);
 });
 
+test("external lifecycle work blocks runtime mutations and releases its reservation", async () => {
+  const fixture = hostFor(null);
+  let finish;
+  const blocked = new Promise(resolve => { finish = resolve; });
+  const operation = fixture.host.runLifecycleOperation("network-proxy", async () => {
+    assert.equal(fixture.host.currentOperation(), "network-proxy");
+    await blocked;
+    return "done";
+  });
+  await assert.rejects(fixture.host.setupCore(), /Another launcher operation is active: network-proxy/);
+  assert.equal(fixture.invocation(), undefined);
+  finish();
+  assert.equal(await operation, "done");
+  assert.equal(fixture.host.currentOperation(), null);
+});
+
 function bridgeFixture({ active }) {
   const calls = [];
   let routeActive = active;

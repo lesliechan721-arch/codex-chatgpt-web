@@ -149,6 +149,16 @@ code {
   pointer-events: auto;
 }
 
+.titlebar-right {
+  position: absolute;
+  top: 0;
+  right: 8px;
+  display: flex;
+  height: 100%;
+  align-items: center;
+  pointer-events: auto;
+}
+
 .titlebar-left .icon-button {
   width: 32px;
   height: 32px;
@@ -178,6 +188,10 @@ code {
 
 .app-root:not([data-platform="darwin"]) .titlebar-left {
   left: 8px;
+}
+
+.app-root:not([data-platform="darwin"]) .titlebar-right {
+  right: 148px;
 }
 
 .app-root:not([data-platform="darwin"]) .titlebar-left .icon-button {

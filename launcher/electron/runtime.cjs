@@ -225,6 +225,19 @@ class RuntimeHost {
     return this.lifecycleOperation || this.active || (stuckChild ? "previous runtime process shutdown" : null);
   }
 
+  async runLifecycleOperation(name, action) {
+    if (typeof name !== "string" || !name || typeof action !== "function") {
+      throw new Error("Runtime lifecycle operation is invalid");
+    }
+    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    this.lifecycleOperation = name;
+    try {
+      return await action();
+    } finally {
+      this.lifecycleOperation = null;
+    }
+  }
+
   browserInteractionMode() {
     const mode = this.getBrowserInteractionMode();
     if (mode !== "automatic" && mode !== "manual") {

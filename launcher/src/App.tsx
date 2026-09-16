@@ -12,6 +12,7 @@ import {
 import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
+import { NetworkProxySettings } from "./NetworkProxySettings";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -346,6 +347,7 @@ function LauncherShell({
   const [browserSlot, setBrowserSlot] = useState<HTMLDivElement | null>(null);
   const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
+  const [networkProxyOpen, setNetworkProxyOpen] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
   const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
     snapshot.state.browserInteractionMode === "automatic"
@@ -356,7 +358,8 @@ function LauncherShell({
   const browserSlotRef = useCallback((node: HTMLDivElement | null) => setBrowserSlot(node), []);
   const browserSurfaceActive = surface === "browser"
     && !(compactSidebar && sidebarOpen)
-    && !biggerContextRecommendationOpen;
+    && !biggerContextRecommendationOpen
+    && !networkProxyOpen;
   const needsBrowser = snapshot.state.browserInteractionMode === "automatic"
     && browser?.authenticated !== true;
   const needsSetup = !needsBrowser && !interactionSetupComplete;
@@ -530,7 +533,14 @@ function LauncherShell({
         draggable={surface !== "browser"}
         sidebarOpen={sidebarOpen}
         toggleSidebar={toggleSidebar}
-      />
+      >
+        <NetworkProxySettings
+          disabled={operation?.status === "running" || browser?.status === "running"}
+          onOpenChange={setNetworkProxyOpen}
+          state={snapshot.state}
+          updateState={updateState}
+        />
+      </TitleBar>
 
       {compactSidebar && sidebarOpen ? (
         <button
@@ -730,12 +740,14 @@ function LauncherShell({
 }
 
 function TitleBar({
+  children,
   copy,
   devProfile,
   draggable,
   sidebarOpen,
   toggleSidebar,
 }: {
+  children?: ReactNode;
   copy: Copy;
   devProfile: boolean;
   draggable: boolean;
@@ -752,6 +764,7 @@ function TitleBar({
         />
         {devProfile ? <span className="titlebar-dev-profile">{copy.devBadge}</span> : null}
       </div>
+      {children ? <div className="titlebar-right no-drag">{children}</div> : null}
     </header>
   );
 }

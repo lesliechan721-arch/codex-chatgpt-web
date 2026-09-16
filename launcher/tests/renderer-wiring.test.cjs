@@ -5,6 +5,7 @@ const path = require("node:path");
 
 const launcherRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "utf8");
+const rendererEntrySource = fs.readFileSync(path.join(launcherRoot, "src", "main.tsx"), "utf8");
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
@@ -15,6 +16,19 @@ test("embedded ChatGPT is measured only after its animated surface mounts", () =
   assert.match(appSource, /setBrowserSurfaceActive\(browserSurfaceActive\)\.then\(\(\) => \{/);
   assert.match(appSource, /observer\.observe\(browserSlot\)/);
   assert.match(appSource, /ref=\{browserSlotRef\}/);
+});
+
+test("the proxy dialog coordinates with the native browser surface", () => {
+  assert.match(appSource, /const \[networkProxyOpen, setNetworkProxyOpen\] = useState\(false\)/);
+  assert.match(
+    appSource,
+    /const browserSurfaceActive = surface === "browser"[\s\S]*?&& !networkProxyOpen;/,
+  );
+  assert.match(
+    appSource,
+    /<NetworkProxySettings[\s\S]*?onOpenChange=\{setNetworkProxyOpen\}/,
+  );
+  assert.doesNotMatch(rendererEntrySource, /<NetworkProxySettings/);
 });
 
 test("native clicks reach browser tabs instead of the window drag region", () => {
@@ -220,7 +234,7 @@ test("Bigger Context startup recommendation reuses the persisted setting and set
     appSource,
     /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
   );
-  assert.match(appSource, /&& !biggerContextRecommendationOpen;/);
+  assert.match(appSource, /&& !biggerContextRecommendationOpen\s*&& !networkProxyOpen;/);
   assert.match(appSource, /updateState\(await api!\.setBiggerContext\(enabled\)\)/);
   assert.match(
     appSource,

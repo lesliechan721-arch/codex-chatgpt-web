@@ -2,7 +2,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createNetworkProxyController } = require("../electron/network-proxy.cjs");
 
-function harness({ initialProxy = null, restartResults = [{ status: "ready" }] } = {}) {
+function harness({
+  failStateUpdate = false,
+  initialProxy = null,
+  restartResults = [{ status: "ready" }],
+  runtimeOperation = null,
+} = {}) {
   let state = {
     version: 1,
     onboardingComplete: true,
@@ -14,6 +19,7 @@ function harness({ initialProxy = null, restartResults = [{ status: "ready" }] }
   const logs = [];
   const handlers = new Map();
   let restartIndex = 0;
+  let activeRuntimeOperation = runtimeOperation;
   const environment = { OTHER: "kept" };
   const supervisor = {
     readConfig: () => ({ mode: "full" }),
@@ -23,9 +29,26 @@ function harness({ initialProxy = null, restartResults = [{ status: "ready" }] }
     browserPartition: "persist:test-chatgpt",
     environment,
     getBrowserHost: () => ({ activeTraceId: null, currentOperation: () => null }),
+    getRuntimeHost: () => ({
+      currentOperation: () => activeRuntimeOperation,
+      runLifecycleOperation: async (name, action) => {
+        if (activeRuntimeOperation) {
+          throw new Error(`Another launcher operation is active: ${activeRuntimeOperation}`);
+        }
+        activeRuntimeOperation = name;
+        try {
+          return await action();
+        } finally {
+          activeRuntimeOperation = null;
+        }
+      },
+    }),
     getRuntimeSupervisor: () => supervisor,
     ipc: { handle: (channel, handler) => handlers.set(channel, handler) },
-    logger: { info: (event, detail) => logs.push({ event, detail }) },
+    logger: {
+      error: (event, detail) => logs.push({ event, detail }),
+      info: (event, detail) => logs.push({ event, detail }),
+    },
     publishState: next => published.push(next),
     sessionApi: {
       fromPartition(partition) {
@@ -39,6 +62,7 @@ function harness({ initialProxy = null, restartResults = [{ status: "ready" }] }
     stateStore: {
       read: () => structuredClone(state),
       update: patch => {
+        if (failStateUpdate) throw new Error("state write failed");
         state = { ...state, ...patch };
         return structuredClone(state);
       },
@@ -107,6 +131,43 @@ test("proxy controller restores the prior proxy when runtime restart fails", asy
     mode: "fixed_servers",
     proxyRules: "http://127.0.0.1:7890/",
     proxyBypassRules: "localhost;127.0.0.1;[::1]",
+  });
+});
+
+test("proxy controller restores the prior proxy when state persistence fails", async () => {
+  const testHarness = harness({ failStateUpdate: true });
+  await assert.rejects(
+    testHarness.controller.setProxy("http://localhost:9999"),
+    /state write failed/,
+  );
+  assert.equal(testHarness.readState().networkProxyUrl, null);
+  assert.equal(testHarness.environment.HTTPS_PROXY, undefined);
+  assert.equal(testHarness.restartCount(), 2);
+  assert.deepEqual(testHarness.applied.at(-1), { mode: "system" });
+});
+
+test("proxy controller refuses changes while a runtime lifecycle operation is active", async () => {
+  const testHarness = harness({ runtimeOperation: "doctor" });
+  await assert.rejects(
+    testHarness.controller.setProxy("http://127.0.0.1:7890"),
+    /Another launcher operation is active: doctor/,
+  );
+  assert.equal(testHarness.applied.length, 0);
+  assert.equal(testHarness.connectionsClosed.length, 0);
+  assert.equal(testHarness.restartCount(), 0);
+  assert.equal(testHarness.environment.HTTP_PROXY, undefined);
+});
+
+test("proxy IPC failures are written to launcher activity", async () => {
+  const testHarness = harness();
+  const handler = testHarness.handlers.get("launcher:network-proxy");
+  await assert.rejects(handler({}, "socks5://127.0.0.1:1080"), /http:\/\/ or https:\/\//);
+  assert.deepEqual(testHarness.logs.at(-1), {
+    event: "launcher.ipc_failed",
+    detail: {
+      channel: "launcher:network-proxy",
+      message: "Network proxy must use http:// or https://",
+    },
   });
 });
 

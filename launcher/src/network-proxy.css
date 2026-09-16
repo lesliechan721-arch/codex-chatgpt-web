@@ -1,12 +1,8 @@
 .network-proxy-launcher {
-  position: fixed;
-  right: 22px;
-  bottom: 22px;
-  z-index: 1200;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 38px;
+  min-height: 30px;
   padding: 0 13px 0 11px;
   border: 1px solid rgba(255, 255, 255, 0.13);
   border-radius: 999px;
@@ -30,6 +26,12 @@
 
 .network-proxy-launcher:active {
   transform: translateY(0);
+}
+
+.network-proxy-launcher:disabled {
+  opacity: 0.45;
+  cursor: default;
+  transform: none;
 }
 
 .network-proxy-launcher svg {
@@ -235,11 +237,6 @@
 }
 
 @media (max-width: 640px) {
-  .network-proxy-launcher {
-    right: 14px;
-    bottom: 14px;
-  }
-
   .network-proxy-backdrop {
     padding: 14px;
   }

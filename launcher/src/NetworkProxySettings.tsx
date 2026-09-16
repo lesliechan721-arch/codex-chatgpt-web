@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import type { Language, LauncherState } from "./types";
 import "./network-proxy.css";
 
@@ -92,47 +93,45 @@ const COPY: Record<Language, ProxyCopy> = {
   },
 };
 
-export function NetworkProxySettings() {
-  const [state, setState] = useState<LauncherState | null>(null);
+export function NetworkProxySettings({
+  disabled = false,
+  onOpenChange,
+  state,
+  updateState,
+}: {
+  disabled?: boolean;
+  onOpenChange: (open: boolean) => void;
+  state: LauncherState;
+  updateState: (state: LauncherState) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!api) return;
-    let cancelled = false;
-    void api.snapshot().then(snapshot => {
-      if (!cancelled) setState(snapshot.state);
-    }).catch(() => {});
-    const unsubscribe = api.onStateChanged(next => {
-      setState(next);
-      if (!open) setDraft(next.networkProxyUrl ?? "");
-    });
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open || !state) return;
+    if (!open) return;
     setDraft(state.networkProxyUrl ?? "");
     setError(null);
-  }, [open, state?.networkProxyUrl]);
+  }, [open, state.networkProxyUrl]);
 
-  const language = state?.language ?? "en";
+  const setDialogOpen = (next: boolean) => {
+    setOpen(next);
+    onOpenChange(next);
+  };
+
+  const language = state.language ?? "en";
   const copy = COPY[language] ?? COPY.en;
   const normalizedDraft = draft.trim();
-  const saved = state?.networkProxyUrl ?? "";
+  const saved = state.networkProxyUrl ?? "";
   const dirty = normalizedDraft !== saved;
-  const status = state?.networkProxyUrl ? copy.custom : copy.system;
+  const status = state.networkProxyUrl ? copy.custom : copy.system;
   const buttonTitle = useMemo(
     () => `${copy.title} · ${status}`,
     [copy.title, status],
   );
 
-  if (!api || !state?.onboardingComplete) return null;
+  if (!api) return null;
 
   const apply = async (proxyUrl: string | null) => {
     if (busy) return;
@@ -140,9 +139,9 @@ export function NetworkProxySettings() {
     setError(null);
     try {
       const next = await api.setNetworkProxy(proxyUrl);
-      setState(next);
+      updateState(next);
       setDraft(next.networkProxyUrl ?? "");
-      setOpen(false);
+      setDialogOpen(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -155,7 +154,8 @@ export function NetworkProxySettings() {
       <button
         aria-label={buttonTitle}
         className={`network-proxy-launcher${state.networkProxyUrl ? " is-active" : ""}`}
-        onClick={() => setOpen(true)}
+        disabled={disabled}
+        onClick={() => setDialogOpen(true)}
         title={buttonTitle}
         type="button"
       >
@@ -166,8 +166,8 @@ export function NetworkProxySettings() {
         <i aria-hidden="true" />
       </button>
 
-      {open ? (
-        <div className="network-proxy-backdrop" role="presentation" onMouseDown={() => !busy && setOpen(false)}>
+      {open ? createPortal((
+        <div className="network-proxy-backdrop" role="presentation" onMouseDown={() => !busy && setDialogOpen(false)}>
           <section
             aria-labelledby="network-proxy-title"
             aria-modal="true"
@@ -184,7 +184,7 @@ export function NetworkProxySettings() {
                 aria-label={copy.cancel}
                 className="network-proxy-close"
                 disabled={busy}
-                onClick={() => setOpen(false)}
+                onClick={() => setDialogOpen(false)}
                 type="button"
               >
                 ×
@@ -223,7 +223,7 @@ export function NetworkProxySettings() {
                 <button
                   className="network-proxy-secondary"
                   disabled={busy}
-                  onClick={() => setOpen(false)}
+                  onClick={() => setDialogOpen(false)}
                   type="button"
                 >
                   {copy.cancel}
@@ -240,7 +240,7 @@ export function NetworkProxySettings() {
             </footer>
           </section>
         </div>
-      ) : null}
+      ), document.body) : null}
     </>
   );
 }
