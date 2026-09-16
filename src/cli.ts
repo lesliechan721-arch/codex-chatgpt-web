@@ -30,6 +30,7 @@ import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
+import { runApiKeyCommand } from "./api-key-cli";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -38,6 +39,8 @@ Focused ChatGPT web-backed models for the native Codex harness.
 Usage:
   codex-chatgpt-web setup --browser-only [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
+  codex-chatgpt-web api-key <enable|rotate> <--generate|--key-stdin>
+  codex-chatgpt-web api-key <status|disable|codex-config>
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
@@ -80,6 +83,13 @@ Setup options:
   --bigger-context             Enable experimental adaptive 1/2/3-message context
   --standard-context           Disable experimental multi-message context
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
+
+API key mode:
+  --generate                   Generate a 256-bit client key; stdout prints it once
+  --key-stdin                  Import a 32–256 character key from piped stdin
+  api-key codex-config         Export custom-provider TOML and a local model catalog
+                               No Codex OAuth is required; restart the service after mode/key changes
+                               See docs/api-key-mode.zh-CN.md for migration and security boundaries
 
 Global:
   --home PATH                  Override ~/.codex-chatgpt-web
@@ -554,6 +564,7 @@ async function main(): Promise<void> {
   }
   if (command === "help") stdout.write(HELP);
   else if (command === "setup") await setupCommand(args);
+  else if (command === "api-key") await runApiKeyCommand(args);
   else if (command === "login") await loginCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "route") await routeCommand(args);

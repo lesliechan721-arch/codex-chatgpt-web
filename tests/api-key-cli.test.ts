@@ -1,0 +1,64 @@
+import { test } from "bun:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { apiKeyMatches, apiKeyPolicy } from "../src/api-access";
+import { loadApiAccessPolicy } from "../src/api-access-config";
+
+function withHome(run: (home: string) => void): void {
+  const home = mkdtempSync(join(tmpdir(), "cgw-api-key-cli-"));
+  try { run(home); } finally { rmSync(home, { recursive: true, force: true }); }
+}
+function cli(home: string, args: string[], input?: string) {
+  const result = Bun.spawnSync([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
+    "--home", home, "api-key", ...args], {
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home },
+    stdin: input === undefined ? "ignore" : Buffer.from(input),
+    stdout: "pipe", stderr: "pipe",
+  });
+  return { code: result.exitCode, out: result.stdout.toString(), err: result.stderr.toString() };
+}
+
+test("CLI generates once, reports redacted status, rotates and explicitly disables", () => withHome(home => {
+  const enabled = cli(home, ["enable", "--generate"]);
+  assert.equal(enabled.code, 0, enabled.err);
+  const first = enabled.out.trim();
+  assert.match(first, /^cgw_[A-Za-z0-9_-]{43}$/);
+  assert.ok(!enabled.err.includes(first));
+  const status = cli(home, ["status"]);
+  assert.equal(status.code, 0, status.err);
+  assert.equal(JSON.parse(status.out).configured_mode, "api-key");
+  assert.ok(!status.out.includes(first));
+  assert.ok(!status.out.includes("keySha256"));
+  assert.ok(!readFileSync(join(home, "api-access.json"), "utf8").includes(first));
+  const next = cli(home, ["rotate", "--generate"]);
+  assert.equal(next.code, 0, next.err);
+  assert.ok(!apiKeyMatches(first, loadApiAccessPolicy(home)));
+  assert.ok(apiKeyMatches(next.out.trim(), loadApiAccessPolicy(home)));
+  const disabled = cli(home, ["disable"]);
+  assert.equal(disabled.code, 0, disabled.err);
+  assert.equal(loadApiAccessPolicy(home).mode, "openai");
+}));
+
+test("CLI stdin import never echoes the key and rejects ambiguous options", () => withHome(home => {
+  const key = "test_imported_key_" + "k".repeat(32);
+  const imported = cli(home, ["enable", "--key-stdin"], `${key}\r\n`);
+  assert.equal(imported.code, 0, imported.err);
+  assert.equal(imported.out, "");
+  assert.ok(!imported.err.includes(key));
+  assert.deepEqual(loadApiAccessPolicy(home), apiKeyPolicy(key));
+  assert.notEqual(cli(home, ["rotate", "--generate", "--key-stdin"]).code, 0);
+  assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
+  const invalid = cli(home, ["rotate", "--key-stdin"], "short-secret\n");
+  assert.notEqual(invalid.code, 0);
+  assert.ok(!invalid.err.includes("short-secret"));
+}));
+
+test("CLI fails closed for damaged policy; only explicit disable recovers", () => withHome(home => {
+  writeFileSync(join(home, "api-access.json"), "{");
+  assert.notEqual(cli(home, ["status"]).code, 0);
+  assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
+  assert.equal(cli(home, ["disable"]).code, 0);
+  assert.equal(loadApiAccessPolicy(home).mode, "openai");
+}));
