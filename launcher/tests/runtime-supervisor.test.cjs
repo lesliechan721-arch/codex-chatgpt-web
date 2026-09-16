@@ -9,6 +9,12 @@ const { spawn } = require("node:child_process");
 const { packagedRuntimePaths } = require("../electron/runtime-command.cjs");
 const { linuxDesktopEntry, requireAutostartState } = require("../electron/autostart.cjs");
 const {
+  createLogger,
+  exportSanitizedLogs,
+  registerSensitiveProxyUrl,
+} = require("../electron/logging.cjs");
+const { captureProxyEnvironment, restoreProxyEnvironment } = require("../electron/network-proxy-config.cjs");
+const {
   MAX_RESTARTS_PER_WINDOW,
   RuntimeSupervisor,
   managedTunnelConnectArgs,
@@ -1278,6 +1284,112 @@ test("crash-loop diagnostics include the last redacted child failure", () => {
   }
 });
 
+test("authenticated proxy URLs never reach runtime logs, state, failures, operations, or exports", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-proxy-redaction-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "diagnostics.jsonl");
+  const operations = [];
+  const logger = createLogger({ filePath });
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger,
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+    publishOperation: operation => operations.push(operation),
+  });
+  const authenticatedProxyUrl = "http://proxy-user:p%40ss@private.proxy.example:8123/path";
+  try {
+    const child = supervisor.spawnChild("daemon", {
+      executable: process.execPath,
+      args: ["-e", `process.stderr.write(${JSON.stringify(`failure via ${authenticatedProxyUrl}\\n`)}); process.exit(1)`],
+      cwd: root,
+    });
+    await new Promise(resolve => child.once("close", resolve));
+    supervisor.restartHistory.daemon = Array.from(
+      { length: MAX_RESTARTS_PER_WINDOW },
+      () => Date.now(),
+    );
+    supervisor.scheduleRecovery("daemon");
+    exportSanitizedLogs({ filePath, destinationPath });
+
+    const state = fs.readFileSync(supervisor.statePath, "utf8");
+    const rawLog = fs.readFileSync(filePath, "utf8");
+    const exported = fs.readFileSync(destinationPath, "utf8");
+    const exposed = JSON.stringify({
+      lastChildFailure: supervisor.lastChildFailure,
+      operations,
+      state,
+      rawLog,
+      exported,
+    });
+    assert.match(exposed, /\[authenticated-proxy-url\]/);
+    assert.doesNotMatch(exposed, /http:\/\/|proxy-user|p%40ss|private\.proxy\.example|8123/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a registered old unauthenticated proxy endpoint never reaches delayed runtime diagnostics", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-proxy-endpoint-redaction-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "diagnostics.jsonl");
+  const operations = [];
+  const logger = createLogger({ filePath });
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger,
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+    publishOperation: operation => operations.push(operation),
+  });
+  const proxyUrl = "http://private.proxy.example:8123/";
+  const ordinaryUrl = "http://public.example:9090/health";
+  const environmentSnapshot = captureProxyEnvironment(process.env);
+  try {
+    process.env.HTTP_PROXY = proxyUrl;
+    registerSensitiveProxyUrl(proxyUrl);
+    delete process.env.HTTP_PROXY;
+    const child = supervisor.spawnChild("daemon", {
+      executable: process.execPath,
+      args: ["-e", `process.stderr.write(${JSON.stringify(`proxy ${proxyUrl} host private.proxy.example endpoint private.proxy.example:8123 port 8123 plus ${ordinaryUrl}\\n`)}); process.exit(1)`],
+      cwd: root,
+    });
+    await new Promise(resolve => child.once("close", resolve));
+    supervisor.restartHistory.daemon = Array.from(
+      { length: MAX_RESTARTS_PER_WINDOW },
+      () => Date.now(),
+    );
+    supervisor.scheduleRecovery("daemon");
+    exportSanitizedLogs({ filePath, destinationPath });
+
+    const artifacts = {
+      lastChildFailure: JSON.stringify(supervisor.lastChildFailure),
+      operations: JSON.stringify(operations),
+      state: fs.readFileSync(supervisor.statePath, "utf8"),
+      rawLog: fs.readFileSync(filePath, "utf8"),
+      exported: fs.readFileSync(destinationPath, "utf8"),
+    };
+    for (const [name, artifact] of Object.entries(artifacts)) {
+      assert.match(artifact, /\[network-proxy-url\]/, name);
+      assert.doesNotMatch(
+        artifact,
+        /http:\/\/private\.proxy\.example:8123|private\.proxy\.example|8123/,
+        name,
+      );
+      assert.match(
+        artifact,
+        name === "exported" ? /http:\/\/public\.example:9090/ : /http:\/\/public\.example:9090\/health/,
+        name,
+      );
+    }
+  } finally {
+    restoreProxyEnvironment(process.env, environmentSnapshot);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("launcher supervisor refuses shutdown while a Codex turn is active and compensates the drain", async () => {
   const actions = [];
   const supervisor = new RuntimeSupervisor({
@@ -1404,6 +1516,149 @@ test("explicit launcher shutdown force-stops only its owned runtime when gracefu
     "graceful-stop",
     "forced-stop:daemon still reports one HTTP turn",
   ]);
+});
+
+test("forced-partial shutdown restores monitoring for a tunnel that may still be alive", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-forced-partial-monitor-"));
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  const config = launcherConfig(path.join(root, "launcher.json"), {
+    mode: "full",
+    tunnel: { alias: "kept-tunnel", profileName: "default", tunnelId: "tunnel_kept" },
+  });
+  supervisor.tunnel = { pid: null };
+  supervisor.readConfig = () => config;
+  supervisor.runTunnelStopCommand = async () => { throw new Error("tunnel stop failed"); };
+  try {
+    const result = await supervisor.forceStopOwnedRuntime(new Error("graceful stop failed"));
+    assert.equal(result.status, "forced-partial");
+    assert.equal(supervisor.tunnel !== null, true);
+    assert.equal(supervisor.tunnelMonitorTimer !== null, true);
+  } finally {
+    supervisor.stopTunnelMonitor();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const unavailableConfig of ["missing", "invalid"]) {
+  test(`forced-partial shutdown uses the last valid config when the current config is ${unavailableConfig}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `codex-web-gpt-forced-partial-${unavailableConfig}-`));
+    const descriptorPath = path.join(root, "launcher.json");
+    const config = launcherConfig(descriptorPath, {
+      mode: "full",
+      tunnel: {
+        binaryPath: process.execPath,
+        tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+        runtimeKeyFile: path.join(root, "runtime.key"),
+        profileDir: path.join(root, "profile"),
+        profileName: "default",
+        alias: "cached-tunnel",
+      },
+    });
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => "0.2.0", isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: root,
+      coreHome: root,
+      browserDescriptorPath: descriptorPath,
+    });
+    fs.writeFileSync(supervisor.configPath, JSON.stringify(config));
+    assert.equal(supervisor.readConfig().tunnel.alias, "cached-tunnel");
+    if (unavailableConfig === "missing") fs.rmSync(supervisor.configPath);
+    else fs.writeFileSync(supervisor.configPath, "{not-json");
+    supervisor.tunnel = { pid: null };
+    supervisor.runTunnelStopCommand = async () => { throw new Error("tunnel stop failed"); };
+    let monitoredConfig;
+    const startTunnelMonitor = supervisor.startTunnelMonitor.bind(supervisor);
+    supervisor.startTunnelMonitor = nextConfig => {
+      monitoredConfig = nextConfig;
+      startTunnelMonitor(nextConfig);
+    };
+    try {
+      const result = await supervisor.forceStopOwnedRuntime(new Error("graceful stop failed"));
+      assert.equal(result.status, "forced-partial");
+      assert.equal(monitoredConfig.tunnel.alias, "cached-tunnel");
+      assert.equal(supervisor.tunnelMonitorTimer !== null, true);
+    } finally {
+      supervisor.stopTunnelMonitor();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("forced-partial shutdown ignores a current browser-only config for a live tunnel", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-forced-partial-browser-only-"));
+  const descriptorPath = path.join(root, "launcher.json");
+  const fullConfig = launcherConfig(descriptorPath, {
+    mode: "full",
+    tunnel: {
+      binaryPath: process.execPath,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKeyFile: path.join(root, "runtime.key"),
+      profileDir: path.join(root, "profile"),
+      profileName: "default",
+      alias: "cached-full-tunnel",
+    },
+  });
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: descriptorPath,
+  });
+  fs.writeFileSync(supervisor.configPath, JSON.stringify(fullConfig));
+  assert.equal(supervisor.readConfig().tunnel.alias, "cached-full-tunnel");
+  fs.writeFileSync(supervisor.configPath, JSON.stringify(launcherConfig(descriptorPath)));
+  supervisor.tunnel = { pid: null };
+  let stoppedConfig;
+  supervisor.runTunnelStopCommand = async config => {
+    stoppedConfig = config;
+    throw new Error("tunnel stop failed");
+  };
+  let monitoredConfig;
+  const startTunnelMonitor = supervisor.startTunnelMonitor.bind(supervisor);
+  supervisor.startTunnelMonitor = config => {
+    monitoredConfig = config;
+    startTunnelMonitor(config);
+  };
+  try {
+    const result = await supervisor.forceStopOwnedRuntime(new Error("graceful stop failed"));
+    assert.equal(result.status, "forced-partial");
+    assert.equal(stoppedConfig.tunnel.alias, "cached-full-tunnel");
+    assert.equal(monitoredConfig.tunnel.alias, "cached-full-tunnel");
+    assert.equal(supervisor.tunnelMonitorTimer !== null, true);
+  } finally {
+    supervisor.stopTunnelMonitor();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("forced-partial shutdown preserves ownership evidence when no valid tunnel config was seen", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-forced-partial-no-config-"));
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  supervisor.tunnel = { pid: 123_456_701 };
+  try {
+    const result = await supervisor.forceStopOwnedRuntime(new Error("graceful stop failed"));
+    assert.equal(result.status, "forced-partial");
+    assert.equal(supervisor.tunnelMonitorTimer, null);
+    const state = JSON.parse(fs.readFileSync(supervisor.statePath, "utf8"));
+    assert.equal(state.status, "failed");
+    assert.equal(state.tunnelPid, 123_456_701);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("launcher resumes an owned drained daemon before reporting it ready", async () => {

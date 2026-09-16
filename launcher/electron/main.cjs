@@ -23,9 +23,13 @@ const {
   createLogger,
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
+  redactText,
   registerLoggedIpc,
 } = require("./logging.cjs");
-const { createNetworkProxyController } = require("./network-proxy.cjs");
+const {
+  NETWORK_PROXY_FATAL_MESSAGE,
+  createNetworkProxyController,
+} = require("./network-proxy.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
@@ -60,6 +64,7 @@ const KEYS_URL = "https://platform.openai.com/settings/organization/api-keys";
 const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL]);
 const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
 const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
+const LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE = "Launcher could not confirm that managed runtimes stopped. It will remain open.";
 
 const launchEnvironment = {
   CODEX_CHATGPT_WEB_HOME: process.env.CODEX_CHATGPT_WEB_HOME,
@@ -84,6 +89,7 @@ let mainWindow = null;
 let mainWindowReadyToShow = false;
 let mainWindowShowRequested = false;
 let startupFailed = false;
+let networkProxyFatalExit = false;
 let browserHost = null;
 let runtimeHost = null;
 let browserControl = null;
@@ -118,9 +124,58 @@ function send(channel, value) {
   }
 }
 
+function handleNetworkProxyLogin(controller, event, webContents, _authenticationResponseDetails, authInfo, callback) {
+  return controller.handleLogin(event, webContents, authInfo, callback);
+}
+
+async function handleUnsafeProxyAuthenticationState({
+  appApi,
+  browserControlInstance,
+  browserHostInstance,
+  logger,
+  onExitCommitted,
+  publishFatalOperation,
+  runtimeSupervisorInstance,
+  stopBackgroundWork,
+  showWindow,
+}) {
+  try {
+    logger.error("network.proxy_authentication_reset_failed", { message: NETWORK_PROXY_FATAL_MESSAGE });
+  } catch {}
+  try {
+    publishFatalOperation({
+      name: "network-proxy",
+      status: "failed",
+      message: NETWORK_PROXY_FATAL_MESSAGE,
+    });
+  } catch {}
+  try { stopBackgroundWork(); } catch {}
+  try { showWindow(); } catch {}
+  try { browserHostInstance?.destroy(); } catch {}
+  try { await browserControlInstance?.close(); } catch {}
+
+  let runtimeStopped = !runtimeSupervisorInstance;
+  if (runtimeSupervisorInstance) {
+    try {
+      const result = await runtimeSupervisorInstance.shutdown({ cancelActiveTurns: true, force: true });
+      runtimeStopped = result?.status === "stopped" || result?.status === "forced";
+    } catch {
+      runtimeStopped = false;
+    }
+  }
+  if (!runtimeStopped) return { status: "supervision-retained" };
+
+  onExitCommitted();
+  appApi.exit(1);
+  return { status: "exit-requested" };
+}
+
 function publishOperation(operation) {
-  lastOperation = operation;
-  send("launcher:operation", operation);
+  const safeOperation = typeof operation?.message === "string"
+    ? { ...operation, message: redactText(operation.message) }
+    : operation;
+  lastOperation = safeOperation;
+  send("launcher:operation", safeOperation);
 }
 
 function stopCatalogVerificationMonitor() {
@@ -923,7 +978,17 @@ async function requestQuit() {
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
-    await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    if (runtimeSupervisor) {
+      let shutdownResult;
+      try {
+        shutdownResult = await runtimeSupervisor.shutdown({ cancelActiveTurns: true, force: true });
+      } catch {
+        throw new Error(LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE);
+      }
+      if (shutdownResult?.status !== "stopped" && shutdownResult?.status !== "forced") {
+        throw new Error(LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE);
+      }
+    }
     stopCatalogVerificationMonitor();
     quitting = true;
     await browserHost?.persistSession();
@@ -1009,14 +1074,41 @@ async function start() {
     filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
     publish: (record) => send("launcher:log", record),
   });
+  const exitForUnsafeProxyAuthenticationState = () => handleUnsafeProxyAuthenticationState({
+    appApi: app,
+    browserControlInstance: browserControl,
+    browserHostInstance: browserHost,
+    logger,
+    onExitCommitted: () => {
+      networkProxyFatalExit = true;
+      startupFailed = true;
+      exitCommitted = true;
+      quitting = true;
+    },
+    publishFatalOperation: publishOperation,
+    runtimeSupervisorInstance: runtimeSupervisor,
+    stopBackgroundWork: stopCatalogVerificationMonitor,
+    showWindow: showMainWindow,
+  });
   const networkProxyController = createNetworkProxyController({
     browserPartition: LAUNCHER_PROFILE.browserPartition,
+    fatal: exitForUnsafeProxyAuthenticationState,
     getBrowserHost: () => browserHost,
     getRuntimeHost: () => runtimeHost,
     getRuntimeSupervisor: () => runtimeSupervisor,
     logger,
     publishState: (state) => send("launcher:state-changed", state),
     stateStore,
+  });
+  app.on("login", (event, webContents, authenticationResponseDetails, authInfo, callback) => {
+    handleNetworkProxyLogin(
+      networkProxyController,
+      event,
+      webContents,
+      authenticationResponseDetails,
+      authInfo,
+      callback,
+    );
   });
   await networkProxyController.applySaved();
   const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
@@ -1312,6 +1404,10 @@ async function start() {
 }
 
 void start().catch(async (error) => {
+  if (typeof networkProxyFatalExit !== "undefined" && networkProxyFatalExit) {
+    app.exit(1);
+    return;
+  }
   startupFailed = true;
   const message = error instanceof Error ? error.message : String(error);
   try {

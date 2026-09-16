@@ -39,7 +39,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       language: "zh-CN",
       onboardingComplete: true,
       keepRunningOnClose: false,
-      networkProxyUrl: "http://127.0.0.1:7890/",
+      networkProxyUrl: "http://user:p%40ss@127.0.0.1:7890/",
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
     });
@@ -55,7 +55,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
-      networkProxyUrl: "http://127.0.0.1:7890/",
+      networkProxyUrl: "http://user:p%40ss@127.0.0.1:7890/",
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
       sidebarOpen: true,

@@ -69,7 +69,7 @@ function readJson(pathname) {
 }
 
 function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error);
+  return redactText(error instanceof Error ? error.message : String(error));
 }
 
 function appendFailure(primary, label, failure) {
@@ -341,7 +341,13 @@ class RuntimeSupervisor {
       throw new Error("Runtime supervisor launcher profile is invalid");
     }
     this.launcherProfile = launcherProfile;
-    this.publishOperation = publishOperation;
+    this.publishOperation = typeof publishOperation === "function"
+      ? operation => publishOperation(
+          typeof operation?.message === "string"
+            ? { ...operation, message: redactText(operation.message) }
+            : operation,
+        )
+      : undefined;
     this.runtimeInvocationFactory = runtimeInvocationFactory;
     this.configPath = path.join(coreHome, "config.json");
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
@@ -363,16 +369,21 @@ class RuntimeSupervisor {
     this.restartableChildren = new WeakSet();
     this.lastChildFailure = { daemon: null, tunnel: null };
     this.lastChildOutput = { daemon: null, tunnel: null };
+    this.lastTunnelConfig = null;
   }
 
   readConfig() {
     if (!fs.existsSync(this.configPath)) return null;
-    return validateConfig(
+    const config = validateConfig(
       readJson(this.configPath),
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
     );
+    if (config.mode === "full" && config.tunnel) {
+      this.lastTunnelConfig = structuredClone(config);
+    }
+    return config;
   }
 
   readSetupConfig() {
@@ -418,13 +429,14 @@ class RuntimeSupervisor {
   }
 
   snapshot(status = "idle", detail) {
+    const safeDetail = typeof detail === "string" ? redactText(detail) : detail;
     return {
       version: 1,
       ownerPid: process.pid,
       daemonPid: this.daemon?.pid ?? null,
       tunnelPid: this.tunnel?.pid ?? null,
       status,
-      ...(detail ? { detail } : {}),
+      ...(safeDetail ? { detail: safeDetail } : {}),
       updatedAt: new Date().toISOString(),
     };
   }
@@ -519,14 +531,14 @@ class RuntimeSupervisor {
       this.restartableChildren.delete(child);
       if (this[name] === child) this[name] = null;
       const detail = error
-        ? `${name} failed to start: ${error.message}`
+        ? `${name} failed to start: ${errorMessage(error)}`
         : `${name} exited (${signal || code})`
           + (this.lastChildOutput[name] ? `: ${this.lastChildOutput[name]}` : "");
       this.lastChildFailure[name] = detail;
       const statePersisted = this.tryWriteState(expected ? "stopping" : "degraded", detail);
       this.logger[expected ? "info" : "error"](
         error ? `runtime.${name}_spawn_failed` : `runtime.${name}_exited`,
-        error ? { message: error.message } : { code, signal },
+        error ? { message: errorMessage(error) } : { code, signal },
       );
       if (!expected && restartable && statePersisted) this.scheduleRecovery(name);
     };
@@ -535,7 +547,7 @@ class RuntimeSupervisor {
         handleTerminal({ error });
         return;
       }
-      this.logger.error(`runtime.${name}_process_error`, { message: error.message, pid: child.pid });
+      this.logger.error(`runtime.${name}_process_error`, { message: errorMessage(error), pid: child.pid });
     });
     child.once("exit", (code, signal) => handleTerminal({ code, signal }));
     this.logger.info(`runtime.${name}_started`, { pid: child.pid });
@@ -1062,16 +1074,17 @@ class RuntimeSupervisor {
       if (this.stopping || generation !== this.tunnelMonitorGeneration) return;
       if (immediate) this.tunnelMonitorFailures = TUNNEL_MONITOR_FAILURE_THRESHOLD - 1;
       this.tunnelMonitorFailures += 1;
+      const safeMessage = redactText(message);
       this.logger.warn("runtime.tunnel_monitor_unhealthy", {
         consecutiveFailures: this.tunnelMonitorFailures,
-        message,
+        message: safeMessage,
       });
       if (this.tunnelMonitorFailures < TUNNEL_MONITOR_FAILURE_THRESHOLD) return;
-      this.lastChildFailure.tunnel = message;
+      this.lastChildFailure.tunnel = safeMessage;
       this.tunnel = null;
       this.stopTunnelMonitor();
-      if (!this.tryWriteState("degraded", message)) return;
-      this.publishOperation?.({ name: "runtime-recovery", status: "running", message });
+      if (!this.tryWriteState("degraded", safeMessage)) return;
+      this.publishOperation?.({ name: "runtime-recovery", status: "running", message: safeMessage });
       this.scheduleRecovery("tunnel");
     };
     this.tunnelMonitorTimer = setInterval(() => {
@@ -1504,7 +1517,7 @@ class RuntimeSupervisor {
         });
         return;
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
+        lastError = errorMessage(error);
         await sleep(100);
       }
     }
@@ -1675,7 +1688,7 @@ class RuntimeSupervisor {
         settled = true;
         clearTimers();
         reject(timeoutError
-          ? new Error(`${timeoutError.message}; termination failed: ${error.message}`)
+          ? new Error(`${errorMessage(timeoutError)}; termination failed: ${errorMessage(error)}`)
           : error);
       });
       child.once("exit", (code) => {
@@ -2052,13 +2065,24 @@ class RuntimeSupervisor {
     try {
       if (this.recoveryTasks.size > 0) await Promise.allSettled([...this.recoveryTasks]);
       const failures = [];
+      let tunnelConfig = null;
       if (this.tunnel) {
         try {
-          const config = this.readConfig();
-          if (!config) throw new Error("runtime configuration is unavailable");
-          const stopped = await this.runTunnelStopCommand(config);
+          try {
+            tunnelConfig = this.readConfig();
+          } catch {
+            tunnelConfig = null;
+          }
+          if ((!tunnelConfig || tunnelConfig.mode !== "full" || !tunnelConfig.tunnel)
+            && this.lastTunnelConfig) {
+            tunnelConfig = structuredClone(this.lastTunnelConfig);
+          }
+          if (!tunnelConfig || tunnelConfig.mode !== "full" || !tunnelConfig.tunnel) {
+            throw new Error("runtime configuration is unavailable");
+          }
+          const stopped = await this.runTunnelStopCommand(tunnelConfig);
           if (stopped.code !== 0) throw new Error(tunnelControlDiagnostic(stopped));
-          await this.waitForTunnelStopped(config, 5_000);
+          await this.waitForTunnelStopped(tunnelConfig, 5_000);
           this.tunnel = null;
         } catch (error) {
           failures.push(`tunnel: ${errorMessage(error)}`);
@@ -2070,7 +2094,10 @@ class RuntimeSupervisor {
         failures.push(`daemon: ${errorMessage(error)}`);
       }
       if (failures.length === 0) this.clearState();
-      else this.tryWriteState("failed", failures.join("; "));
+      else {
+        this.tryWriteState("failed", failures.join("; "));
+        if (this.tunnel && tunnelConfig) this.startTunnelMonitor(tunnelConfig);
+      }
       this.logger.warn("runtime.forced_shutdown_completed", {
         message: errorMessage(reason),
         failures,

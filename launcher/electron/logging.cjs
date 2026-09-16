@@ -1,13 +1,125 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { renameAtomicFile } = require("./atomic-file.cjs");
+const { PROXY_ENV_KEYS } = require("./network-proxy-config.cjs");
 
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 const MAX_MEMORY_RECORDS = 300;
 const MAX_LOG_STRING_CHARS = 16 * 1024;
+const MAX_SENSITIVE_PROXY_URLS = 32;
+const sensitiveProxyUrls = new Map();
+
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function proxyUrlDescriptor(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const raw = value.trim();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+
+  const urls = new Set([raw, parsed.href]);
+  parsed.username = "";
+  parsed.password = "";
+  urls.add(parsed.href);
+  urls.add(parsed.origin);
+  for (const url of [...urls]) {
+    if (url.endsWith("/")) urls.add(url.slice(0, -1));
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+  const ipv6 = hostname.includes(":");
+  const bracketedHost = ipv6 ? `[${hostname}]` : hostname;
+  const port = parsed.port || (parsed.protocol === "http:" ? "80" : "443");
+  const hosts = new Set([hostname, bracketedHost]);
+  const endpoints = new Set();
+  for (const host of hosts) endpoints.add(`${host}:${port}`);
+  urls.add(`${parsed.protocol}//${bracketedHost}:${port}`);
+  urls.add(`${parsed.protocol}//${bracketedHost}:${port}/`);
+  return { endpoints, hosts, port, urls };
+}
+
+function registerSensitiveProxyUrl(value) {
+  const descriptor = proxyUrlDescriptor(value);
+  if (!descriptor) return false;
+  const key = [...descriptor.urls].sort()[0].toLowerCase();
+  sensitiveProxyUrls.delete(key);
+  sensitiveProxyUrls.set(key, descriptor);
+  while (sensitiveProxyUrls.size > MAX_SENSITIVE_PROXY_URLS) {
+    sensitiveProxyUrls.delete(sensitiveProxyUrls.keys().next().value);
+  }
+  return true;
+}
+
+function redactAuthenticatedProxyUrls(value) {
+  return value.replace(
+    /https?:\/\/[^\s"'`<>/?#]*@[^\s"'`<>/?#]+(?:[/?#][^\s"'`<>]*)?/gi,
+    "[authenticated-proxy-url]",
+  );
+}
+
+function currentProxyUrlDescriptors(environment = process.env) {
+  const descriptors = [];
+  for (const key of PROXY_ENV_KEYS) {
+    const descriptor = proxyUrlDescriptor(environment[key]);
+    if (descriptor) descriptors.push(descriptor);
+  }
+  return descriptors;
+}
+
+function replaceLiteral(value, literal, marker, bounded = false) {
+  const escaped = escapeRegularExpression(literal);
+  const pattern = bounded
+    ? new RegExp(`(^|[^A-Za-z0-9._-])(${escaped})(?=$|[^A-Za-z0-9._-])`, "gi")
+    : new RegExp(escaped, "gi");
+  return bounded
+    ? value.replace(pattern, (_match, prefix) => `${prefix}${marker}`)
+    : value.replace(pattern, marker);
+}
+
+function redactProxyDescriptors(value, descriptors) {
+  let redacted = value;
+  const urls = new Set();
+  const endpoints = new Set();
+  const hosts = new Set();
+  const ports = new Set();
+  for (const descriptor of descriptors) {
+    for (const url of descriptor.urls) urls.add(url);
+    for (const endpoint of descriptor.endpoints) endpoints.add(endpoint);
+    for (const host of descriptor.hosts) hosts.add(host);
+    ports.add(descriptor.port);
+  }
+  for (const url of [...urls].sort((left, right) => right.length - left.length)) {
+    redacted = replaceLiteral(redacted, url, "[network-proxy-url]");
+  }
+  for (const endpoint of [...endpoints].sort((left, right) => right.length - left.length)) {
+    redacted = replaceLiteral(redacted, endpoint, "[network-proxy-endpoint]", true);
+  }
+  for (const host of [...hosts].sort((left, right) => right.length - left.length)) {
+    redacted = replaceLiteral(redacted, host, "[network-proxy-host]", true);
+  }
+  for (const port of ports) {
+    redacted = redacted.replace(
+      new RegExp(`\\bport\\s+${escapeRegularExpression(port)}\\b`, "gi"),
+      "[network-proxy-port]",
+    );
+  }
+  return redacted;
+}
+
+function redactCurrentProxyUrls(value, environment = process.env) {
+  return redactProxyDescriptors(value, currentProxyUrlDescriptors(environment));
+}
 
 function redactText(value) {
-  const redacted = value
+  const descriptors = [...sensitiveProxyUrls.values(), ...currentProxyUrlDescriptors()];
+  const redacted = redactAuthenticatedProxyUrls(redactProxyDescriptors(value, descriptors))
     .replace(/tunnel_[a-f0-9]{32}/g, "[tunnel-id]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[runtime-key]")
     .replace(/\bBearer\s+[A-Za-z0-9._~-]{20,}\b/gi, "Bearer [redacted]");
@@ -185,7 +297,7 @@ function installProcessDiagnosticGuards({ filePath, streams = [process.stdout, p
         fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
         fs.appendFileSync(
           filePath,
-          `${new Date().toISOString()} ${error instanceof Error ? error.stack || error.message : String(error)}\n`,
+          `${new Date().toISOString()} ${redactText(error instanceof Error ? error.stack || error.message : String(error))}\n`,
           { mode: 0o600 },
         );
       } catch {
@@ -214,8 +326,11 @@ module.exports = {
   exportSanitizedLogs,
   installProcessDiagnosticGuards,
   readRecent,
+  redactAuthenticatedProxyUrls,
+  redactCurrentProxyUrls,
   redactExportText,
   redactText,
+  registerSensitiveProxyUrl,
   registerLoggedIpc,
   sanitize,
   sanitizeForExport,

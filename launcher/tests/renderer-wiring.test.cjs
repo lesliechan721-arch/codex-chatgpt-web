@@ -10,6 +10,7 @@ const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
+const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "NetworkProxySettings.tsx"), "utf8");
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -29,6 +30,162 @@ test("the proxy dialog coordinates with the native browser surface", () => {
     /<NetworkProxySettings[\s\S]*?onOpenChange=\{setNetworkProxyOpen\}/,
   );
   assert.doesNotMatch(rendererEntrySource, /<NetworkProxySettings/);
+});
+
+test("proxy authentication is scoped to the embedded partition and unsafe cache state exits", () => {
+  assert.match(electronMain, /app\.on\("login"[\s\S]*?handleNetworkProxyLogin\([\s\S]*?networkProxyController/);
+  assert.match(electronMain, /fatal: exitForUnsafeProxyAuthenticationState/);
+  assert.match(electronMain, /runtimeSupervisorInstance\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/);
+  assert.match(electronMain, /browserHost\?\.destroy\(\)/);
+  assert.match(electronMain, /app\.exit\(1\)/);
+});
+
+test("Electron's five-argument login event forwards authInfo and callback without shifting", () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function handleNetworkProxyLogin(");
+  const end = electronMain.indexOf("function publishOperation", start);
+  const sandbox = {};
+  vm.runInNewContext(electronMain.slice(start, end), sandbox);
+  const event = {};
+  const webContents = {};
+  const responseDetails = { url: "https://target.example" };
+  const authInfo = { isProxy: true, scheme: "basic", host: "proxy.example", port: 8080 };
+  const callback = () => {};
+  let received;
+  const result = sandbox.handleNetworkProxyLogin({
+    handleLogin: (...args) => {
+      received = args;
+      return "handled";
+    },
+  }, event, webContents, responseDetails, authInfo, callback);
+  assert.equal(result, "handled");
+  assert.equal(received[0], event);
+  assert.equal(received[1], webContents);
+  assert.equal(received[2], authInfo);
+  assert.equal(received[3], callback);
+  assert.equal(received.includes(responseDetails), false);
+});
+
+test("unsafe proxy authentication exits only after runtime shutdown is confirmed", async () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("async function handleUnsafeProxyAuthenticationState(");
+  const end = electronMain.indexOf("function publishOperation", start);
+  const sandbox = { NETWORK_PROXY_FATAL_MESSAGE: "fixed proxy fatal" };
+  vm.runInNewContext(electronMain.slice(start, end), sandbox);
+
+  for (const scenario of [
+    { name: "stopped", shutdown: async () => ({ status: "stopped" }), exits: true },
+    { name: "forced", shutdown: async () => ({ status: "forced" }), exits: true },
+    { name: "forced-partial", shutdown: async () => ({ status: "forced-partial", failures: ["private"] }), exits: false },
+    { name: "throw", shutdown: async () => { throw new Error("http://user:pw@private.example:8123"); }, exits: false },
+  ]) {
+    const events = [];
+    const logs = [];
+    const operations = [];
+    const result = await sandbox.handleUnsafeProxyAuthenticationState({
+      appApi: { exit: code => events.push(["exit", code]) },
+      browserControlInstance: { close: async () => events.push("control-closed") },
+      browserHostInstance: { destroy: () => events.push("browser-destroyed") },
+      logger: { error: (event, detail) => logs.push({ event, detail }) },
+      onExitCommitted: () => events.push("exit-committed"),
+      publishFatalOperation: operation => operations.push(operation),
+      runtimeSupervisorInstance: { shutdown: scenario.shutdown },
+      stopBackgroundWork: () => events.push("background-stopped"),
+      showWindow: () => events.push("window-shown"),
+    });
+    assert.equal(result.status, scenario.exits ? "exit-requested" : "supervision-retained", scenario.name);
+    assert.equal(events.some(event => Array.isArray(event) && event[0] === "exit"), scenario.exits, scenario.name);
+    assert.equal(events.includes("browser-destroyed"), true, scenario.name);
+    assert.equal(events.includes("control-closed"), true, scenario.name);
+    assert.equal(events.includes("window-shown"), true, scenario.name);
+    assert.equal(logs[0].detail.message, "fixed proxy fatal", scenario.name);
+    assert.equal(operations[0].message, "fixed proxy fatal", scenario.name);
+    assert.doesNotMatch(JSON.stringify({ logs, operations }), /private|user:pw|8123/, scenario.name);
+  }
+});
+
+test("fatal partial shutdown stays supervised and a later partial quit does not exit", async () => {
+  const vm = require("node:vm");
+  const fatalStart = electronMain.indexOf("async function handleUnsafeProxyAuthenticationState(");
+  const fatalEnd = electronMain.indexOf("function publishOperation", fatalStart);
+  const quitStart = electronMain.indexOf("async function requestQuit()");
+  const quitEnd = electronMain.indexOf("async function start()", quitStart);
+  const events = [];
+  const operations = [];
+  let monitorActive = true;
+  let shutdownCalls = 0;
+  const runtimeSupervisor = {
+    shutdown: async () => {
+      shutdownCalls += 1;
+      if (shutdownCalls === 3) throw new Error("private shutdown exception");
+      return { status: "forced-partial", failures: ["private child detail"] };
+    },
+  };
+  const browserHost = {
+    currentOperation: () => null,
+    destroy: () => events.push("browser-destroyed"),
+    persistSession: async () => events.push("session-persisted"),
+  };
+  const sandbox = {
+    LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE: "fixed shutdown failure",
+    NETWORK_PROXY_FATAL_MESSAGE: "fixed proxy fatal",
+    app: { exit: code => events.push(["exit", code]), quit: () => events.push("quit") },
+    browserControl: { close: async () => events.push("control-closed") },
+    browserHost,
+    exitCommitted: false,
+    publishOperation: operation => operations.push(operation),
+    quitting: false,
+    runtimeHost: { currentOperation: () => null },
+    runtimeSupervisor,
+    showMainWindow: () => events.push("window-shown"),
+    shutdownInProgress: false,
+    stopCatalogVerificationMonitor: () => events.push("background-stopped"),
+  };
+  vm.runInNewContext(
+    `${electronMain.slice(fatalStart, fatalEnd)}\n${electronMain.slice(quitStart, quitEnd)}`,
+    sandbox,
+  );
+
+  const fatalResult = await sandbox.handleUnsafeProxyAuthenticationState({
+    appApi: sandbox.app,
+    browserControlInstance: sandbox.browserControl,
+    browserHostInstance: browserHost,
+    logger: { error: () => {} },
+    onExitCommitted: () => { sandbox.exitCommitted = true; },
+    publishFatalOperation: sandbox.publishOperation,
+    runtimeSupervisorInstance: runtimeSupervisor,
+    stopBackgroundWork: sandbox.stopCatalogVerificationMonitor,
+    showWindow: sandbox.showMainWindow,
+  });
+  assert.equal(fatalResult.status, "supervision-retained");
+  assert.equal(monitorActive, true);
+
+  const quitResult = await sandbox.requestQuit();
+  assert.equal(quitResult.ok, false);
+  assert.equal(quitResult.message, "fixed shutdown failure");
+  assert.equal(shutdownCalls, 2);
+  assert.equal(monitorActive, true);
+  assert.equal(sandbox.exitCommitted, false);
+  assert.equal(events.includes("quit"), false);
+  assert.equal(events.some(event => Array.isArray(event) && event[0] === "exit"), false);
+  assert.equal(events.includes("session-persisted"), false);
+  assert.equal(operations.at(-1).message, "fixed shutdown failure");
+  assert.doesNotMatch(JSON.stringify(operations), /private child detail/);
+
+  const thrownQuitResult = await sandbox.requestQuit();
+  assert.equal(thrownQuitResult.ok, false);
+  assert.equal(thrownQuitResult.message, "fixed shutdown failure");
+  assert.equal(shutdownCalls, 3);
+  assert.equal(events.includes("quit"), false);
+  assert.doesNotMatch(JSON.stringify(operations), /private shutdown exception/);
+});
+
+test("all proxy translations describe authenticated URLs and the MCP Tunnel limitation", () => {
+  assert.equal((networkProxySettingsSource.match(/http:\/\/user:password@host:port/g) || []).length, 5);
+  assert.equal((networkProxySettingsSource.match(/MCP Tunnel/g) || []).length, 5);
+  assert.equal((networkProxySettingsSource.match(/http:\/\/user:password@proxy\.example:8080/g) || []).length, 5);
+  assert.doesNotMatch(networkProxySettingsSource, /SOCKS/i);
+  assert.match(networkProxySettingsSource, /autoComplete="off"/);
 });
 
 test("native clicks reach browser tabs instead of the window drag region", () => {
@@ -87,7 +244,7 @@ test("a foreground launch request survives hidden startup until the launcher win
 test("normal shutdown persists the ChatGPT session before closing browser views", () => {
   assert.match(
     electronMain,
-    /runtimeSupervisor\?\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/,
+    /runtimeSupervisor\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/,
   );
   const persist = electronMain.indexOf("await browserHost?.persistSession()");
   const destroy = electronMain.indexOf("browserHost?.destroy()", persist);
@@ -203,7 +360,7 @@ test("packaged runtime is verified before launcher browser surfaces can bind por
 test("DEV launcher exposes its profile and supervises only its Full-mode MCP runtime", () => {
   assert.match(electronMain, /profile:\s*LAUNCHER_PROFILE\.kind/);
   assert.match(electronMain, /if \(IS_DEV_PROFILE\) \{[\s\S]*?config\?\.mode === "full"[\s\S]*?runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?\} else void \(async \(\) => \{/);
-  assert.match(electronMain, /await runtimeSupervisor\?\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/);
+  assert.match(electronMain, /await runtimeSupervisor\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/);
   assert.match(electronMain, /packaged:\s*app\.isPackaged && !IS_DEV_PROFILE/);
   assert.match(electronMain, /IS_DEV_PROFILE && !stateStore\.read\(\)\.onboardingComplete/);
   assert.match(electronMain, /onboardingComplete:\s*true,[\s\S]*?autoStart:\s*false/);
