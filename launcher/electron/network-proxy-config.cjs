@@ -167,9 +167,7 @@ function electronProxyConfiguration(rawProxyUrl) {
   let electronProxyUrl = proxyUrl;
   if (electronProxyUrl) {
     const parsed = new URL(electronProxyUrl);
-    parsed.username = "";
-    parsed.password = "";
-    electronProxyUrl = parsed.href;
+    electronProxyUrl = `${parsed.protocol}//${parsed.host}`;
   }
   return proxyUrl
     ? {

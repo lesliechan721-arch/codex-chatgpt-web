@@ -119,7 +119,7 @@ test("proxy controller applies persisted proxy before runtime startup", async ()
   await testHarness.controller.applySaved();
   assert.deepEqual(testHarness.applied, [{
     mode: "fixed_servers",
-    proxyRules: "http://127.0.0.1:7890/",
+    proxyRules: "http://127.0.0.1:7890",
     proxyBypassRules: "localhost;127.0.0.1;[::1]",
   }]);
   assert.equal(testHarness.environment.HTTPS_PROXY, "http://127.0.0.1:7890/");
@@ -182,7 +182,7 @@ test("proxy controller restores the prior proxy when runtime restart fails", asy
   assert.equal(testHarness.restartCount(), 2);
   assert.deepEqual(testHarness.applied.at(-1), {
     mode: "fixed_servers",
-    proxyRules: "http://127.0.0.1:7890/",
+    proxyRules: "http://127.0.0.1:7890",
     proxyBypassRules: "localhost;127.0.0.1;[::1]",
   });
 });

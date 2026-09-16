@@ -143,12 +143,17 @@ test("Electron proxy configuration switches between fixed and system modes", () 
   assert.deepEqual(electronProxyConfiguration(null), { mode: "system" });
   assert.deepEqual(electronProxyConfiguration("http://127.0.0.1:7890"), {
     mode: "fixed_servers",
-    proxyRules: "http://127.0.0.1:7890/",
+    proxyRules: "http://127.0.0.1:7890",
     proxyBypassRules: "localhost;127.0.0.1;[::1]",
   });
   assert.deepEqual(electronProxyConfiguration("https://user:secret@Proxy.EXAMPLE:443"), {
     mode: "fixed_servers",
-    proxyRules: "https://proxy.example/",
+    proxyRules: "https://proxy.example",
+    proxyBypassRules: "localhost;127.0.0.1;[::1]",
+  });
+  assert.deepEqual(electronProxyConfiguration("http://user:secret@127.0.0.1:7888/"), {
+    mode: "fixed_servers",
+    proxyRules: "http://127.0.0.1:7888",
     proxyBypassRules: "localhost;127.0.0.1;[::1]",
   });
 });
