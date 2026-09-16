@@ -25,6 +25,7 @@ const {
   installProcessDiagnosticGuards,
   registerLoggedIpc,
 } = require("./logging.cjs");
+const { createNetworkProxyController } = require("./network-proxy.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
@@ -298,10 +299,6 @@ function createTray(logger, language) {
 }
 
 function showMainWindow() {
-  // A Windows login launch may still be materializing the packaged runtime when the user opens
-  // the desktop shortcut. Electron delivers `second-instance` immediately, before `createWindow`
-  // has produced anything to show. Preserve that foreground request until the real window reaches
-  // `ready-to-show`; otherwise the already-running `--hidden` instance silently consumes it.
   mainWindowShowRequested = true;
   if ((!mainWindowReadyToShow && !startupFailed) || !mainWindow || mainWindow.isDestroyed()) return;
   mainWindowShowRequested = false;
@@ -1008,6 +1005,15 @@ async function start() {
     filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
     publish: (record) => send("launcher:log", record),
   });
+  const networkProxyController = createNetworkProxyController({
+    browserPartition: LAUNCHER_PROFILE.browserPartition,
+    getBrowserHost: () => browserHost,
+    getRuntimeSupervisor: () => runtimeSupervisor,
+    logger,
+    publishState: (state) => send("launcher:state-changed", state),
+    stateStore,
+  });
+  await networkProxyController.applySaved();
   const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
   nativeTheme.themeSource = "system";
   mainWindow = createWindow({
@@ -1307,8 +1313,6 @@ void start().catch(async (error) => {
     fs.appendFileSync(path.join(app.getPath("logs"), "launcher-fatal.log"), `${new Date().toISOString()} ${error?.stack || error}\n`);
   } catch {}
   try {
-    // Browser bootstrap can fail before the renderer is loaded. Keep the error reachable
-    // through the existing instance, and release browser resources before a user retry.
     const cleanupErrors = [];
     try { browserHost?.destroy(); } catch (caught) { cleanupErrors.push(String(caught)); }
     try { await browserControl?.close(); } catch (caught) { cleanupErrors.push(String(caught)); }
@@ -1332,8 +1336,6 @@ void start().catch(async (error) => {
       ? await dialog.showMessageBox(mainWindow, options)
       : await dialog.showMessageBox(options);
     if (result.response === 0) {
-      // Internal child commands use the resolved profile. A fresh launcher must instead
-      // resolve the original launch environment, especially for the isolated DEV profile.
       for (const [key, value] of Object.entries(launchEnvironment)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
@@ -1341,7 +1343,6 @@ void start().catch(async (error) => {
       app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--hidden") });
     }
   } finally {
-    // A failed dialog or relaunch must not leave a headless single-instance owner behind.
     app.exit(1);
   }
 });

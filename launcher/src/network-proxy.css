@@ -1,0 +1,259 @@
+.network-proxy-launcher {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 1200;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 13px 0 11px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 999px;
+  background: rgba(31, 31, 31, 0.94);
+  color: rgba(255, 255, 255, 0.82);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(14px);
+  cursor: pointer;
+  transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.network-proxy-launcher:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.24);
+  background: rgba(40, 40, 40, 0.97);
+}
+
+.network-proxy-launcher:active {
+  transform: translateY(0);
+}
+
+.network-proxy-launcher svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.network-proxy-launcher i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.network-proxy-launcher.is-active i {
+  background: #70d7a4;
+  box-shadow: 0 0 0 3px rgba(112, 215, 164, 0.12);
+}
+
+.network-proxy-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(0, 0, 0, 0.56);
+  backdrop-filter: blur(8px);
+}
+
+.network-proxy-dialog {
+  width: min(520px, calc(100vw - 40px));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  background: #1d1d1d;
+  color: #f2f2f2;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+  overflow: hidden;
+}
+
+.network-proxy-dialog > header,
+.network-proxy-dialog > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px;
+}
+
+.network-proxy-dialog > header {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.network-proxy-dialog > header small {
+  display: block;
+  margin-bottom: 4px;
+  color: #8f8f8f;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.network-proxy-dialog h2 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.network-proxy-close {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #a8a8a8;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.network-proxy-close:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+}
+
+.network-proxy-description,
+.network-proxy-note,
+.network-proxy-error,
+.network-proxy-field {
+  margin-right: 22px;
+  margin-left: 22px;
+}
+
+.network-proxy-description {
+  margin-top: 20px;
+  margin-bottom: 18px;
+  color: #b7b7b7;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.network-proxy-field {
+  display: grid;
+  gap: 8px;
+}
+
+.network-proxy-field > span {
+  color: #dedede;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.network-proxy-field input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  outline: none;
+  background: #151515;
+  color: #f3f3f3;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.network-proxy-field input:focus {
+  border-color: rgba(136, 179, 255, 0.75);
+  box-shadow: 0 0 0 3px rgba(77, 134, 236, 0.13);
+}
+
+.network-proxy-field input:disabled {
+  opacity: 0.6;
+}
+
+.network-proxy-note {
+  margin-top: 10px;
+  margin-bottom: 0;
+  color: #858585;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.network-proxy-error {
+  margin-top: 12px;
+  margin-bottom: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 101, 101, 0.25);
+  border-radius: 9px;
+  background: rgba(255, 72, 72, 0.08);
+  color: #ffaaaa;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.network-proxy-dialog > footer {
+  margin-top: 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.network-proxy-dialog > footer > div {
+  display: flex;
+  gap: 8px;
+}
+
+.network-proxy-primary,
+.network-proxy-secondary {
+  min-height: 34px;
+  padding: 0 13px;
+  border-radius: 9px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.network-proxy-primary {
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  background: #efefef;
+  color: #151515;
+}
+
+.network-proxy-secondary {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: #d1d1d1;
+}
+
+.network-proxy-primary:disabled,
+.network-proxy-secondary:disabled,
+.network-proxy-close:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+@media (max-width: 640px) {
+  .network-proxy-launcher {
+    right: 14px;
+    bottom: 14px;
+  }
+
+  .network-proxy-backdrop {
+    padding: 14px;
+  }
+
+  .network-proxy-dialog {
+    width: calc(100vw - 28px);
+  }
+
+  .network-proxy-dialog > footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .network-proxy-dialog > footer > div {
+    justify-content: flex-end;
+  }
+}
