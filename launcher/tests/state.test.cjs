@@ -10,7 +10,7 @@ const {
   validateSidebarState,
 } = require("../electron/state.cjs");
 
-test("launcher state persists onboarding, language, and autostart atomically", () => {
+test("launcher state persists onboarding, language, autostart, and network proxy atomically", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-launcher-state-"));
   const file = path.join(root, "state.json");
   try {
@@ -27,6 +27,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      networkProxyUrl: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
@@ -38,6 +39,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       language: "zh-CN",
       onboardingComplete: true,
       keepRunningOnClose: false,
+      networkProxyUrl: "http://127.0.0.1:7890/",
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
     });
@@ -53,6 +55,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      networkProxyUrl: "http://127.0.0.1:7890/",
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
       sidebarOpen: true,
@@ -99,7 +102,7 @@ test("every supported launcher language survives a state update and reload", () 
   }
 });
 
-test("persisted sidebar corruption is repaired without changing the rest of launcher state", () => {
+test("persisted sidebar and proxy corruption are repaired without changing the rest of launcher state", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-sidebar-state-"));
   const file = path.join(root, "state.json");
   try {
@@ -111,6 +114,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       bridgeEnabled: false,
       browserSmokePassed: "yes",
       browserSmokeVersion: { invalid: true },
+      networkProxyUrl: "socks5://127.0.0.1:1080",
       sidebarOpen: "yes",
       sidebarWidth: 900,
       mcpGuideStep: 99,
@@ -129,6 +133,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
+      networkProxyUrl: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
       sidebarOpen: true,
