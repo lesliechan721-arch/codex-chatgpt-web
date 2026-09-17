@@ -33,6 +33,7 @@ import {
   authenticateApiRequest,
   guardApiRequest,
   parseApiAccessPolicy,
+  apiAccessRevision,
   requireWebModelInApiKeyMode,
   type ApiAccessPolicy,
 } from "./api-access";
@@ -850,6 +851,7 @@ export function startServer(
           version: VERSION,
           mode: config.mode,
           access_mode: accessPolicy.mode,
+          api_access_revision: apiAccessRevision(accessPolicy, config.controlToken),
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,

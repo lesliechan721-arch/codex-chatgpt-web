@@ -13,6 +13,7 @@ import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import { NetworkProxySettings } from "./NetworkProxySettings";
+import { ApiAccessSettings } from "./ApiAccessSettings";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -1671,6 +1672,7 @@ function SettingsSurface({
 
   return (
     <ContentSurface narrow title={devProfile ? copy.devSettingsTitle : copy.settingsTitle}>
+      {!devProfile ? <ApiAccessSettings language={language} /> : null}
       <SectionHeading label={copy.general} />
       <div className="settings-list">
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} flushAfter label={copy.launchAtLogin}>

@@ -7,6 +7,12 @@ function subscription(channel, listener) {
 }
 
 contextBridge.exposeInMainWorld("codexWebLauncher", {
+  apiAccessStatus: () => ipcRenderer.invoke("launcher:api-access-status"),
+  apiAccessGenerate: () => ipcRenderer.invoke("launcher:api-access-generate"),
+  apiAccessApply: (input) => ipcRenderer.invoke("launcher:api-access-apply", input),
+  apiAccessCopyKey: (key) => ipcRenderer.invoke("launcher:api-access-copy-key", key),
+  apiAccessCopyUrl: () => ipcRenderer.invoke("launcher:api-access-copy-url"),
+  apiAccessExport: () => ipcRenderer.invoke("launcher:api-access-export"),
   snapshot: () => ipcRenderer.invoke("launcher:snapshot"),
   setLanguage: (language) => ipcRenderer.invoke("launcher:set-language", language),
   openSocial: (target) => ipcRenderer.invoke("launcher:open-social", target),

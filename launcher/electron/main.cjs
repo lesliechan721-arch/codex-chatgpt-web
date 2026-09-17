@@ -7,6 +7,7 @@ const { pathToFileURL } = require("node:url");
 const {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -31,6 +32,8 @@ const {
   createNetworkProxyController,
 } = require("./network-proxy.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
+const { createApiAccessSettings, readPolicyFile } = require("./api-access-settings.cjs");
+const { registerApiAccessIpc } = require("./api-access-ipc.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
@@ -524,6 +527,43 @@ function smokePassedForCurrentVersion(state) {
 
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
+  const apiAccessSettings = createApiAccessSettings({
+    coreHome: CORE_HOME,
+    runtimeHost,
+    supervisor: runtimeSupervisor,
+    browserHost,
+    clipboard,
+    confirmChange: async ({ mode, replacingKey, configured }) => {
+      const chinese = (stateStore.read().language || "en").startsWith("zh");
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: "warning",
+        buttons: chinese ? ["取消", "应用"] : ["Cancel", "Apply"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: chinese ? "修改 API 接入配置" : "Change API access settings",
+        message: mode === "api-key"
+          ? (chinese ? "仅允许持有本地 API Key 的客户端使用 Web 模型。" : "Only local API key clients will be allowed to use Web models.")
+          : (chinese ? "恢复原生 OpenAI 转发，不再使用本地 API Key 鉴权。" : "Restore native OpenAI forwarding without local API key authentication."),
+        detail: [
+          configured
+            ? (chinese ? "先确认空闲，再受控重启并验证后台，不会自动取消活动任务。" : "The idle runtime will be restarted and verified; active tasks will not be cancelled.")
+            : (chinese ? "配置将在首次初始化运行时时生效。" : "Settings take effect when the runtime is first initialized."),
+          replacingKey
+            ? (chinese ? "新密钥验证生效后，旧密钥失效。请先保存新密钥。" : "The old key stops working after the new key is verified. Save the new key first.")
+            : (chinese ? "不会覆盖 Codex 的 config.toml 或 auth.json；客户端配置需要自行导出和应用。" : "Codex config.toml and auth.json are not overwritten; export and apply the client config separately."),
+        ].join("\n\n"),
+      });
+      return result.response === 1;
+    },
+  });
+  const disposeApiAccessIpc = registerApiAccessIpc({
+    ipcMain,
+    controller: apiAccessSettings,
+    getWindow: () => mainWindow,
+    rendererNavigationAllowed,
+  });
+  app.once("will-quit", disposeApiAccessIpc);
   handle("launcher:snapshot", async () => ({
     profile: LAUNCHER_PROFILE.kind,
     profilePaths: {
@@ -1312,6 +1352,9 @@ async function start() {
     }
     const runtime = await runtimeSupervisor.startIfConfigured();
     if (runtime.status !== "ready") return runtime;
+    // API-key clients use an explicitly exported provider. Do not reconnect the legacy OpenAI
+    // route on Launcher startup or overwrite the user's independently chosen client routing.
+    if (readPolicyFile(path.join(CORE_HOME, "api-access.json")).policy.mode === "api-key") return runtime;
     const route = await runtimeHost.connectBridgeRoute();
     return { ...runtime, bridgeRouteChanged: route.changed === true };
   })().then(async (runtime) => {

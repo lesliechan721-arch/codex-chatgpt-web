@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 /** HTTP access is orthogonal to browser-only/full and automatic/manual execution. */
 export type ApiAccessPolicy =
@@ -99,4 +99,11 @@ export function adapterRequestHeaders(headers: Headers, policy: ApiAccessPolicy)
       "chatgpt-account-id", "openai-organization", "openai-project"]) result.delete(name);
   }
   return result;
+}
+
+/** Non-credential evidence that the daemon loaded the exact configured policy at startup. */
+export function apiAccessRevision(policy: ApiAccessPolicy, controlToken: string): string {
+  return createHmac("sha256", controlToken)
+    .update(`codex-web-api-access:v1\0${policy.mode}\0${policy.mode === "api-key" ? policy.keySha256 : ""}`)
+    .digest("hex");
 }

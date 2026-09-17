@@ -61,7 +61,7 @@ Codex 自定义 provider
 }
 ```
 
-以上摘要仅为占位符，不能直接作为有效配置。建议始终通过 CLI 生成文件。
+以上摘要仅为占位符，不能直接作为有效配置。建议通过 Launcher 设置页或 CLI 生成文件。
 
 关闭时显式写入：
 
@@ -134,13 +134,30 @@ Codex 自定义 provider
 
 **本地目录是快照。** 更改浏览器交互模式、账户模型资格、Zero Risk Pro、Bigger Context 或 subagent 配置后，重新导出目录并重启 Codex。服务端仍会检查真实当前配置，不能靠旧目录获得额外模型权限。
 
-## 6. CLI 与接入步骤
+## 6. Launcher GUI、CLI 与客户端接入
+
+### 6.0 Launcher GUI
+
+生产 Launcher 的设置页新增独立的 **API 接入**面板。DEV Launcher 不提供该开关，因为 DEV 不启动 Responses listener。新面板支持中文和英文，其余语言暂以英文显示。
+
+1. 打开“独立 API Key 模式”开关。开关仅改变表单草稿，不立即改动后台。
+2. 输入自己的密钥，或点击“随机生成密钥”。生成只返回候选密钥，不自动保存或轮换。
+3. 使用“显示/隐藏”“复制密钥”检查并保存候选密钥。勾选“我已在应用之外保存这把新密钥”。旧密钥不可读取，不能从摘要还原。
+4. 点击“应用并重启”，在原生确认对话框再次确认。该操作不会自动取消活动任务；存在活动 HTTP/browser/MCP 任务或其他 Launcher 生命周期操作时会拒绝修改。
+5. 只有后台重启且加载策略的证据一致后才显示“已保存并验证生效”。没有初始化运行时的安装只保存配置，明确显示“首次启动生效”，不声称服务已经运行。
+6. 点击“复制地址”获取 Base URL；“导出并复制 Codex 配置”调用现有 `api-key codex-config`，更新本地模型目录并复制不含密钥的 TOML。
+
+客户端仍须设置 `CODEX_CHATGPT_WEB_API_KEY`。仅在终端 export 不代表从 Finder/开始菜单启动的桌面 Codex 一定能继承该变量；需要按照客户端实际启动方式提供环境。GUI 不自动更改 `auth.json`，不把密钥插入导出的 TOML，也不覆盖现有 `config.toml`。
+
+API Key 模式已启用时，密钥输入框留空表示保持现有密钥并重新应用/启动；输入新密钥才表示轮换。关闭开关并应用会恢复 OpenAI 转发模式，客户端的旧 provider/auth 配置需要自行恢复。设置页离开或保存成功会清除候选密钥的组件状态；这不是 JavaScript 内存的可证明擦除。复制操作会在 60 秒后仅当剪贴板仍为那把密钥时清除内容，正常退出也尝试清除；不会覆盖用户后来复制的其他内容。系统剪贴板历史、第三方剪贴板工具及强制退出不在此清除保证之内。
+
+账号资格、Bigger Context 或 Automatic/Zero Risk 模式改变后，需要再次导出客户端模型目录。这次没有添加自动安装 Codex provider、自动设置系统环境变量或自动重新登录 Codex 的行为。
 
 ### 6.1 前提
 
 这是现有 bridge 的附加接入方式，不是独立的无浏览器推理服务。先按原项目流程配置/登录 ChatGPT；Full 仍完成 Tunnel/Connector 配置。已有 fork 安装可直接切换；从源码使用以下命令，打包后的命令名等价替换为 `codex-chatgpt-web`。
 
-本次没有新增 Launcher 设置页，也没有重写其 onboarding、doctor 或旧的 `route connect` 安装器。它们仍可能以原生 OpenAI route 的视角显示状态。服务 API 模式与下述 Codex 自定义 provider 是验收入口；不要把旧 doctor 的原生 route 检查结果当作 API Key 鉴权结果。
+现在可以通过 Launcher **Settings → API 接入**配置此模式，也保留 CLI。GUI 与 CLI 共用同一份 `api-access.json`，不把密钥写入 `launcher-state.json`。旧 onboarding、doctor、手动 `route connect` 安装器没有整体重写，它们的原生 route 检查不等于 API Key 验证；API 接入面板会单独显示“已保存模式”“后台生效模式”和验证结果。API Key 模式下 Launcher 启动时跳过旧的自动 `connectBridgeRoute()`，不会为了恢复内置 OpenAI 路由而覆盖用户选择。
 
 ### 6.2 随机生成并启用
 
@@ -295,3 +312,85 @@ bun run verify
 - [Codex 配置文档](https://developers.openai.com/codex/config-advanced/)：自定义 provider、环境变量鉴权、profile、model_catalog_json。
 - [Codex ModelInfo 源码基线](https://github.com/openai/codex/blob/da18000cae9884ab45f83b2d07fbd5a220a1de39/codex-rs/protocol/src/openai_models.rs)：本地模板所需的模型元数据字段。
 - 项目既有 `src/model-catalog.ts`、`src/chatgpt-web-models.ts`、`src/server.ts`、`docs/security-model.md`、`CONTRIBUTING.md`。
+
+
+## 11. Launcher GUI 实现与复核
+
+### 11.1 分层和接线
+
+```text
+SettingsSurface
+  → ApiAccessSettings.tsx（草稿、掩码、确认已备份密钥、状态）
+  → preload.cjs（六个明确的 IPC 方法）
+  → api-access-ipc.cjs（来源校验、参数数量、封闭错误码）
+  → api-access-settings.cjs（私有策略文件、生命周期事务、导出）
+  → RuntimeHost.runLifecycleOperation
+  → RuntimeSupervisor.stopForSetup / startIfConfigured
+  → daemon /healthz（加载策略的 HMAC 证据）
+```
+
+所有 IPC 必须来自当前 Launcher BrowserWindow 的 **同一 webContents、同一主 frame、被允许的 renderer URL**。ChatGPT WebContents、子 frame、未知窗口不能调用这些接口。新 IPC 不使用全局状态广播传密钥，不记录原始参数/结果/任意底层异常。错误只返回预定义代码；前端将代码映射为中文/英文，不把输入密钥拼入错误文本。
+
+| IPC | 返回 | 副作用 |
+|---|---|---|
+| `launcher:api-access-status` | 不含密钥/存储摘要的状态、乐观并发 revision | 读取本地策略和 daemon health |
+| `launcher:api-access-generate` | `cgw_` + 32 随机字节的 base64url | 不落盘，仅候选值 |
+| `launcher:api-access-apply` | 是否取消、应用后状态 | 原生确认、排空、写入、重启/回滚 |
+| `launcher:api-access-copy-key` | 成功标志 | 复制当前候选密钥，设定条件清除计时器 |
+| `launcher:api-access-copy-url` | 成功标志 | 仅复制从可信 config 读取的本地 Base URL |
+| `launcher:api-access-export` | 不含密钥的 TOML、目录路径 | 调用已有导出逻辑，并复制 TOML |
+
+GUI 的版本 1 策略读写和校验在 CJS 主进程中实现。核心运行时使用 Bun/TypeScript，所以新增 `tests/api-access-gui-contract.test.ts` 比较双方对合法/非法策略、密钥摘要和健康证据的行为。没有引入新运行依赖或改变打包目录；新增主进程模块位于已有 `electron/**` 范围。
+
+### 11.2 区分“磁盘配置”和“实际加载配置”
+
+仅比较 `/healthz.access_mode` 无法识别“仍为 api-key 模式、但密钥已轮换而后台未重启”。因此 health 新增非凭证字段 `api_access_revision`：
+
+```text
+HMAC-SHA256(
+  key = daemon controlToken,
+  message = "codex-web-api-access:v1\0" + mode + "\0" + storedKeyDigestOrEmpty
+)
+```
+
+这里不是向 health 暴露原始密钥或其存储摘要。这个值也不能用作客户端 API key 或管理 token。Launcher 使用自身持有的可信 config.controlToken 和磁盘策略计算相同证据。CLI 轮换密钥、GUI 开关或修改管理 token 后，后台不重启会显示不一致。旧后台没有该字段时显示“需要重启/无法确认”，不能仅凭 HTTP 200 推断已加载新密钥。
+
+前端状态包括 `in-sync`、`restart-required`、`stopped`、`unconfigured`、`invalid`。GUI 改变策略时同时要求提交从 status 得到的 `expectedRevision`；该 revision 使用主进程随机密钥对文件字节做 HMAC，仅用于判断表单是否过期，不是认证凭证。在确认对话框之前、之后和排空之后检查文件是否被其他操作修改。
+
+这属于乐观并发检测，不是跨 CLI/GUI 进程的全局文件锁。不要同时通过多个管理入口轮换密钥；最终的同步读写间仍存在极小的跨进程竞争窗口。后续需要多管理员场景时，应把所有策略写入收敛为单一管理通道或增加跨进程锁，而不是把当前单用户模式扩大成多租户服务。
+
+### 11.3 受控切换及失败边界
+
+顺序是：校验输入和旧 revision → 获取 Launcher 生命周期互斥 → 校验浏览器空闲 → 原生用户确认 → 校验 daemon 活动计数 → `stopForSetup()` 原子排空并停止 → 再校验文件 revision → 私有原子写入 → `startIfConfigured()` → 核对 health HMAC。
+
+- 密钥非法、与 controlToken 相同、表单过期、用户取消：不写文件，不启动任务。
+- 活动任务存在、排空/停止失败：不改接入文件，不自动调用 cancel-turns。
+- 新后台启动/验证失败：先确认替换后台停止，才恢复旧文件的原始字节，并尝试恢复旧后台；只有旧后台验证成功才返回 `apply-failed-restored`。
+- 替换后台无法确认停止：保留新配置并返回 `saved-runtime-unverified`，不能把文件切回旧值而掩盖仍在运行的新策略。
+- 恢复失败或恢复期间检测到外部文件变更：返回 `recovery-failed`，不宣称哪把密钥已生效。
+- 已损坏、过大、非普通文件或符号链接策略文件：拒绝 GUI 自动降级。使用原有显式 CLI 恢复步骤修复后重新载入。
+- 外部服务管理的配置：GUI 显示不可应用，要求使用该服务自己的管理流程；不把其他进程当作 Launcher 的子进程重启。
+
+### 11.4 GUI 增量验证记录
+
+本轮实际运行：
+
+- `node --test launcher/tests/api-access-*.test.cjs`：33 项通过。测试使用真实临时文件和注入的 RuntimeHost/Supervisor/IPC/clipboard 边界，不调用真实账户。
+- 2 项 GUI/daemon 契约测试：原始 TypeScript 测试转译后通过 Node `test`/`assert` 兼容层执行，通过；不是原生 Bun 执行记录。
+- 两个新增 CJS 生产模块通过 `node --check`。
+- 5 个新增/修改 TypeScript/TSX 文件通过 TypeScript 转译语法检查；`api-access.ts` 与 `api-access-types.ts` 通过隔离 strict/noUncheckedIndexedAccess 类型检查。
+
+尚未运行：完整 Launcher React 类型检查、完整仓库 `bun run verify`、真实 Electron GUI 点击测试、三平台打包以及真实 Codex/ChatGPT/MCP 压缩端到端验收。不能用注入的 supervisor 测试代替真实 runtime 生命周期验收。
+
+### 11.5 合并前 GUI 人工验收
+
+1. 在本 PR 代码上重新构建核心 runtime 和 Launcher，确认使用的是包含 `api_access_revision` 的新 daemon，而不是旧的安装缓存。
+2. 现有正常 OpenAI 转发安装：打开设置，检查当前模式；开启 API Key 模式，生成、隐藏/显示、复制密钥，确认取消原生对话框不改文件。
+3. 应用成功后，用新密钥请求 `/v1/models` 返回仅 Web 模型；无密钥/错误密钥为 401，原生模型为 400，原生 search/images 为 404。
+4. 开一个真实 Codex/MCP 活动任务再修改设置，确认被拒绝或无法排空时安全恢复；不得取消该任务或覆盖密钥。
+5. 轮换密钥后，旧密钥 401、新密钥成功。CLI 另行轮换但不重启时，新面板应显示已保存与后台不一致，而不是虚假“已生效”。
+6. 通过手动关闭/退出并重新启动 Launcher，确认 API 模式不自动重连旧的内置 OpenAI route。
+7. 导出 TOML，确认不含密钥，设置独立 Codex 客户端环境，完成 Web 模型普通请求、SSE、工具调用、v1/v2 compaction。
+8. 关闭 API Key 模式并应用，恢复自己的原生 provider/auth 配置，检查原有转发和全局网络代理仍正常。
+9. 验证故障：让新 daemon 启动失败，确认旧配置恢复或显式报恢复失败；不能只看开关位置判断服务实际状态。
+10. 验证安全：从 ChatGPT webContents/iframe 调用新 IPC 均被拒绝；安全日志导出不含候选密钥；复制其他文本后不被密钥清除计时器覆盖。
