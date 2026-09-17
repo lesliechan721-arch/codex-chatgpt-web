@@ -136,17 +136,78 @@ function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function compactionScope(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  const item = record(value);
+  if (!item) return value;
+  return Object.fromEntries(
+    Object.entries(item)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => [key, canonicalJson(child)]),
+  );
+}
+
+function canonicalCompactionPrefixItem(value: unknown): unknown {
+  const item = record(value);
+  if (!item || typeof item.role !== "string") return canonicalJson(value);
+  if (item.type === "message") {
+    const { type: _type, ...implicit } = item;
+    return canonicalJson(implicit);
+  }
+  return canonicalJson(item);
+}
+
+function canonicalCompactionPrefixHash(input: unknown[]): string {
+  return digest(input.map(canonicalCompactionPrefixItem));
+}
+
+function legacyMessageTypeVariant(value: unknown, explicit: boolean): unknown {
+  const item = record(value);
+  if (!item || typeof item.role !== "string") return value;
+  if (explicit && item.type === undefined) return { type: "message", ...item };
+  if (!explicit && item.type === "message") {
+    const { type: _type, ...implicit } = item;
+    return implicit;
+  }
+  return value;
+}
+
+function matchesCompactionPrefixHash(input: unknown[], prefixLength: number, expectedHash: string): boolean {
+  const prefix = input.slice(0, prefixLength);
+  return canonicalCompactionPrefixHash(prefix) === expectedHash
+    // Compatibility with persisted proofs written before semantic prefix hashing. These cannot
+    // represent every mixed legacy encoding, but exact/all-explicit/all-implicit proofs remain
+    // valid until the next accepted ordinary turn refreshes the stored source proof.
+    || digest(prefix) === expectedHash
+    || digest(prefix.map(value => legacyMessageTypeVariant(value, true))) === expectedHash
+    || digest(prefix.map(value => legacyMessageTypeVariant(value, false))) === expectedHash;
+}
+
+function compactionScopeValue(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): unknown[] {
   const identity = extractChatGptTurnIdentity(parsed);
   // Callers already required canonical thread/turn identity, so this metadata is valid JSON.
   const wire = record(record(parsed._rawBody)?.client_metadata)?.["x-codex-turn-metadata"];
   const metadata = record(typeof wire === "string" ? JSON.parse(wire) : wire);
-  return digest([
+  return [
     parsed.modelId, parsed.options.reasoning, source,
     identity.parentThreadId, identity.agentName, identity.subagentKind,
     metadata?.sandbox_mode ?? metadata?.sandbox,
     Object.keys(record(metadata?.workspaces) ?? {}).sort(),
-  ]);
+  ];
+}
+
+function compactionScope(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
+  return digest(canonicalJson(compactionScopeValue(parsed, source)));
+}
+
+function matchesCompactionScopeHash(
+  parsed: CodexParsedRequest,
+  source: ChatGptTurnUserRevision,
+  expectedHash: string,
+): boolean {
+  const value = compactionScopeValue(parsed, source);
+  return digest(canonicalJson(value)) === expectedHash
+    || digest(value) === expectedHash;
 }
 
 function trustedCompactionSource(parsed: CodexParsedRequest): TrustedCompactionSource | undefined {
@@ -155,7 +216,12 @@ function trustedCompactionSource(parsed: CodexParsedRequest): TrustedCompactionS
   const input = record(parsed._rawBody)?.input;
   const source = chatGptTurnUserRevisionHistory(parsed).at(-1);
   if (!identity.threadId || !identity.turnId || !Array.isArray(input) || input.length === 0 || !source) return undefined;
-  return { turnId: identity.turnId, prefixLength: input.length, prefixHash: digest(input), scopeHash: compactionScope(parsed, source) };
+  return {
+    turnId: identity.turnId,
+    prefixLength: input.length,
+    prefixHash: canonicalCompactionPrefixHash(input),
+    scopeHash: compactionScope(parsed, source),
+  };
 }
 
 function authority(environment: ChatGptTurnEnvironment, updatedAt: number, parsed: CodexParsedRequest): StoredThreadEnvironment {
@@ -297,8 +363,8 @@ export class ChatGptThreadEnvironmentStore {
     const source = extractChatGptCompactionSourceRevision(parsed);
     // Standalone compaction has a new turn id; its source must still be the recorded native turn.
     if (identity.turnId !== proof.turnId && source.turnId !== proof.turnId) return undefined;
-    if (compactionScope(parsed, source) !== proof.scopeHash
-      || digest(input.slice(0, proof.prefixLength)) !== proof.prefixHash) return undefined;
+    if (!matchesCompactionScopeHash(parsed, source, proof.scopeHash)
+      || !matchesCompactionPrefixHash(input, proof.prefixLength, proof.prefixHash)) return undefined;
     const suffix = input.slice(proof.prefixLength).map(value => {
       const item = record(value);
       return item && item.type === undefined && item.role ? { ...item, type: "message" } : value;

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
@@ -601,6 +602,67 @@ describe("authenticated full-history compaction environment", () => {
     for (let retry = 0; retry < 2; retry++) {
       expect(store().resolve(compact)).toEqual({ ...trusted, tools: compact.context.tools ?? [] });
     }
+  });
+
+  test("accepts semantically identical mixed message encodings in an authenticated compaction prefix", () => {
+    const { source, compact, body } = fixture();
+    const sourceInput = (source._rawBody as { input: Array<Record<string, unknown>> }).input;
+    delete sourceInput[1]!.type;
+    const store = new ChatGptThreadEnvironmentStore();
+    const trusted = store.resolve(source);
+    delete body.input[0]!.type;
+    const compactContent = body.input[1]!.content as Array<Record<string, unknown>>;
+    compactContent[0] = { text: compactContent[0]!.text, type: compactContent[0]!.type };
+
+    expect(store.resolve(compact)).toEqual({ ...trusted, tools: compact.context.tools ?? [] });
+
+    const reverse = fixture();
+    const reverseSourceInput = (reverse.source._rawBody as { input: Array<Record<string, unknown>> }).input;
+    delete reverseSourceInput[0]!.type;
+    const reverseStore = new ChatGptThreadEnvironmentStore();
+    const reverseTrusted = reverseStore.resolve(reverse.source);
+    delete reverse.body.input[1]!.type;
+    expect(reverseStore.resolve(reverse.compact)).toEqual({
+      ...reverseTrusted,
+      tools: reverse.compact.context.tools ?? [],
+    });
+  });
+
+  test("keeps pre-fix raw compaction proofs valid for an exact replay", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-compaction-legacy-proof-"));
+    temporaryRoots.push(stateRoot);
+    const path = join(stateRoot, "environments.json");
+    const { source, compact } = fixture();
+    const sourceBody = source._rawBody as {
+      input: Array<Record<string, unknown>>;
+      client_metadata: Record<string, string>;
+    };
+    const trusted = new ChatGptThreadEnvironmentStore(path).resolve(source);
+    const saved = JSON.parse(readFileSync(path, "utf8"));
+    const proof = saved.threads.thread_current.compactionSource;
+    const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const metadata = JSON.parse(sourceBody.client_metadata["x-codex-turn-metadata"]!);
+    proof.prefixHash = hash(sourceBody.input);
+    proof.scopeHash = hash([
+      source.modelId,
+      source.options.reasoning,
+      {
+        content: sourceBody.input[1]!.content,
+        turnId: "turn_current",
+        itemId: sourceBody.input[1]!.id,
+      },
+      undefined,
+      undefined,
+      undefined,
+      metadata.sandbox_mode ?? metadata.sandbox,
+      Object.keys(metadata.workspaces ?? {}).sort(),
+    ]);
+    writeFileSync(path, JSON.stringify(saved));
+
+    expect(new ChatGptThreadEnvironmentStore(path).resolve(compact)).toEqual({
+      ...trusted,
+      tools: compact.context.tools ?? [],
+    });
   });
 
   test("same-turn auto-compaction authenticates an untagged source previously accepted through replay", () => {
