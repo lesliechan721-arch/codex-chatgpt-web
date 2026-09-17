@@ -408,6 +408,7 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 test("DEV browser-only setup persists only the isolated harness profile", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-dev-setup-"));
   const devHome = join(root, "dev");
