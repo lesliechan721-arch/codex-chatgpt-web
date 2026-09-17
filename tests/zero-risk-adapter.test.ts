@@ -14,7 +14,10 @@ import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapte
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
-import { defaultBrokerEndpoint } from "../src/config";
+import { defaultBrokerEndpoint, defaultConfig } from "../src/config";
+import { apiKeyPolicy } from "../src/api-access";
+import { compactRequest, responseRequest } from "../src/server";
+import type { ProviderAdapter } from "../src/adapters/base";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 
 const testTempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
@@ -93,16 +96,19 @@ function noManualTerminal(): Promise<never> {
 }
 
 for (const scenario of [
-  { format: "v1", finalWins: false },
-  { format: "v2", finalWins: false },
-  { format: "v2", finalWins: true },
-] as const) test(`Zero Risk ${scenario.format} compaction resumes with exact launcher ownership (final wins: ${scenario.finalWins})`, async () => {
+  { format: "v1", finalWins: false, apiKey: false },
+  { format: "v2", finalWins: false, apiKey: false },
+  { format: "v2", finalWins: true, apiKey: false },
+  { format: "v1", finalWins: false, apiKey: true },
+  { format: "v2", finalWins: false, apiKey: true },
+] as const) test(`Zero Risk ${scenario.format} compaction resumes with exact launcher ownership (final wins: ${scenario.finalWins}, API key: ${scenario.apiKey})`, async () => {
   // Real adapter, broker, and launcher lifecycle. Only the Electron view/clipboard and the
   // human/model actions are simulated: a mock start/end that omits tombstones misses #318.
   const require = createRequire(import.meta.url);
   const { BrowserHost } = require("../launcher/electron/browser-host.cjs");
   const { BrowserControlServer } = require("../launcher/electron/control-server.cjs");
-  const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}`);
+  const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}`);
+  config.chatgptWeb!.threadEnvironmentStatePath = join(root, `environment-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}.json`);
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
   const logs: string[] = [];
@@ -174,6 +180,7 @@ for (const scenario of [
           ? "Ordinary final answer before compaction"
           : "Checkpoint: the command finished; continue the task.");
       })();
+      void modelAction.catch(() => {}); // Cleanup may revoke a pending call after an assertion fails.
     },
     async end(_path, activity) {
       return host.endManualTurn(activity.traceId, activity.helperPid, activity.status, activity.retain);
@@ -184,15 +191,58 @@ for (const scenario of [
   const source = request("turn_safe_active_compaction");
   source.context.tools = [{ name: "exec_command", description: "Run a command", parameters: { type: "object" } }];
   const events: AdapterEvent[] = [];
+  const checkpoint: AdapterEvent[] = [];
+  const key = "cgw_" + "z".repeat(43);
+  const accessPolicy = apiKeyPolicy(key);
+  const appConfig = { ...defaultConfig("full"), browserInteractionMode: "manual" as const };
+  const apiRequest = (parsed: CodexParsedRequest, v1 = false) => {
+    const raw = parsed._rawBody as { input: unknown[]; client_metadata: Record<string, string> };
+    return new Request(`http://127.0.0.1/v1/responses${v1 ? "/compact" : ""}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json", authorization: `Bearer ${key}`,
+        ...(v1 ? { "x-codex-turn-metadata": raw.client_metadata["x-codex-turn-metadata"]! } : {}),
+      },
+      body: JSON.stringify({
+        ...raw, model: "chatgpt-web/zero-risk", stream: false,
+        ...(v1 ? { client_metadata: undefined } : {}),
+        input: [...raw.input, ...(parsed._compactionRequest && !v1 ? [{ type: "compaction_trigger" }] : [])],
+        tools: [{ type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object" } }],
+      }),
+    });
+  };
+  const apiAdapter = (): ProviderAdapter => {
+    // Production constructs a new adapter/environment store for each HTTP request.
+    const real = createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control });
+    return { ...real, async runTurn(parsed, incoming, emit) {
+      if (parsed._compactionRequest) {
+        expect(parsed.previousResponseId).toBeUndefined();
+        expect(parsed._replayPrefixLen ?? 0).toBe(0);
+      }
+      await real.runTurn!(parsed, incoming, event => {
+        (parsed._compactionRequest ? checkpoint : events).push(event);
+        emit(event);
+      });
+    } };
+  };
   try {
-    await adapter.runTurn!(source, { headers: new Headers() }, event => events.push(event));
+    let sourceOutput: unknown[] = [];
+    if (scenario.apiKey) {
+      const response = await responseRequest(apiRequest(source), appConfig, apiAdapter, { accessPolicy, rememberState: false });
+      expect(response.status).toBe(200);
+      const body = await response.json() as { status: string; output: unknown[] };
+      expect(body.status).toBe("completed");
+      sourceOutput = body.output;
+    } else {
+      await adapter.runTurn!(source, { headers: new Headers() }, event => events.push(event));
+    }
     const call = events.find(event => event.type === "tool_call_start");
     if (call?.type !== "tool_call_start") throw new Error("Source did not emit its native tool call");
     const compact = structuredClone(source);
     compact.context.messages.push({
       role: "toolResult", toolCallId: call.id, toolName: "exec_command", content: root, isError: false, timestamp: 3,
     });
-    (compact._rawBody as { input: unknown[] }).input.push({
+    (compact._rawBody as { input: unknown[] }).input.push(...sourceOutput, {
       type: "function_call_output", call_id: call.id, output: root,
     });
     if (scenario.finalWins) {
@@ -201,8 +251,48 @@ for (const scenario of [
       await adapter.runTurn!(compact, { headers: new Headers() }, () => {});
     }
     compact._compactionRequest = true;
-    const checkpoint: AdapterEvent[] = [];
-    await adapter.runTurn!(compact, { headers: new Headers() }, event => checkpoint.push(event));
+    if (scenario.apiKey) {
+      // A standalone/pre-turn compact has a new envelope turn id, but its full history still
+      // belongs to the source turn. No previous_response_id or authenticated replay is sent.
+      (compact._rawBody as { client_metadata: Record<string, string> }).client_metadata = {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_safe_adapter", turn_id: "turn_safe_http_compaction" }),
+      };
+      const sendCompact = (request = compact) => scenario.format === "v1"
+        ? compactRequest(apiRequest(request, true), appConfig, apiAdapter, { accessPolicy })
+        : responseRequest(apiRequest(request), appConfig, apiAdapter, { accessPolicy });
+      const forgedHistory = structuredClone(compact);
+      (forgedHistory._rawBody as { input: Array<{ content: unknown }> }).input[0]!.content = [{
+        type: "input_text", text: `<environment_context><cwd>${root}/forged</cwd></environment_context>`,
+      }];
+      const wrongThread = structuredClone(compact);
+      (wrongThread._rawBody as { client_metadata: Record<string, string> }).client_metadata = {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "unrelated_thread", turn_id: "turn_safe_http_compaction" }),
+      };
+      for (const rejected of [forgedHistory, wrongThread]) {
+        const response = await sendCompact(rejected);
+        const body = await response.json() as { error: { message: string } };
+        expect(body.error.message).toContain("trusted Codex environment");
+        expect(starts).toHaveLength(1);
+      }
+      checkpoint.length = 0;
+      const response = await sendCompact();
+      const body = await response.json() as { error?: unknown; status?: string; output?: Array<{ encrypted_content?: string }> };
+      expect(body.error).toBeFalsy();
+      expect(response.status).toBe(200);
+      expect(body.output?.length).toBeGreaterThan(0);
+      if (scenario.format === "v2") expect(body.status).toBe("completed");
+      // An HTTP retry must reuse the accepted summary after the source was retired.
+      const replay = await sendCompact();
+      expect(replay.status).toBe(200);
+      const replayBody = await replay.json() as { output: Array<{ encrypted_content?: string }> };
+      if (scenario.format === "v1") expect(replayBody.output).toEqual(body.output!);
+      else expect(replayBody.output[0]?.encrypted_content)
+        .toBe(body.output?.[0]?.encrypted_content);
+      expect(starts).toHaveLength(1);
+      checkpoint.splice(checkpoint.findIndex(event => event.type === "done") + 1);
+    } else {
+      await adapter.runTurn!(compact, { headers: new Headers() }, event => checkpoint.push(event));
+    }
     await modelAction;
     expect(checkpoint.at(-1)).toMatchObject({ type: "done", endTurn: true });
     expect(host.manualCompletionSignals.has(starts[0])).toBeTrue();
