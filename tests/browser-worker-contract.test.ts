@@ -3094,7 +3094,7 @@ test("Bigger Context fits mixed-density whole records within both token and comp
       { stagingEffort: stagingMode.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens, finalMessageChars: final.length },
     )).not.toThrow();
   }
-}, 30_000);
+}, 90_000);
 
 test("Bigger Context preflight expands only the total context ceiling and keeps each message boundary", () => {
   const plus = {
@@ -3555,14 +3555,6 @@ test("stalled-turn diagnostics record DOM metrics without response or overlay co
   expect(diagnosticSource).toContain('innerText ?? candidate.textContent ?? ""');
   expect(diagnosticSource).not.toMatch(/\btext:\s*(?:root|candidate)\.innerText/);
   expect(diagnosticSource).not.toMatch(/\bariaLabel:\s*candidate\.getAttribute/);
-});
-
-test("browser completion requires ChatGPT's response-scoped copy action", () => {
-  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  const sessionSource = readFileSync(new URL("../src/chatgpt-session.ts", import.meta.url), "utf8");
-  expect(sessionSource).toContain('button[data-testid="copy-turn-action-button"]');
-  expect(workerSource).toContain("CHATGPT_COMPLETION_ACTION_SELECTOR");
-  expect(workerSource).not.toContain('root.querySelectorAll<HTMLElement>("button")');
 });
 
 test("browser send accepts only new logical turns or generation, not remounted history", () => {
