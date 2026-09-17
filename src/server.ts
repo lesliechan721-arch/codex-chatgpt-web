@@ -24,6 +24,19 @@ import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
+import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
+import { loadApiAccessPolicy } from "./api-access-config";
+import {
+  OPENAI_ACCESS,
+  adapterRequestHeaders,
+  apiKeyMatches,
+  authenticateApiRequest,
+  guardApiRequest,
+  parseApiAccessPolicy,
+  apiAccessRevision,
+  requireWebModelInApiKeyMode,
+  type ApiAccessPolicy,
+} from "./api-access";
 import {
   readCodexModelContextOverride,
   readCodexSubagentProtocol,
@@ -353,6 +366,8 @@ export class HttpTurnCounter {
 type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapter;
 
 export interface ResponseRequestOptions {
+  /** Explicit HTTP policy; internal DEV callers retain their existing in-process behavior. */
+  accessPolicy?: ApiAccessPolicy;
   /** DEV and other in-process harnesses can keep continuation state in their own canonical store. */
   rememberState?: boolean;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
@@ -377,7 +392,15 @@ export async function modelsRequest(
   config: AppConfig,
   fetchUpstream?: NativeFetch,
   contextOverride?: () => CodexModelContextOverride | undefined,
+  accessPolicy: ApiAccessPolicy = OPENAI_ACCESS,
 ): Promise<Response> {
+  const denied = authenticateApiRequest(req, accessPolicy);
+  if (denied) return denied;
+  if (accessPolicy.mode === "api-key") {
+    return Response.json(buildStandaloneModelCatalog(config), {
+      headers: { "cache-control": "no-store" },
+    });
+  }
   let upstream: Response;
   try {
     upstream = await forwardNativeCodexRequest(req, "models", fetchUpstream);
@@ -449,6 +472,9 @@ export async function responseRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
+  const accessPolicy = options.accessPolicy ?? OPENAI_ACCESS;
+  const denied = authenticateApiRequest(req, accessPolicy);
+  if (denied) return denied;
   const nativeRequest = req.clone();
   let raw: unknown;
   try {
@@ -463,6 +489,8 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
+  const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy);
+  if (rejectedModel) return rejectedModel;
   try {
     const identity = extractCodexTurnIdentityFromBody(raw);
     if (identity.threadId && identity.turnId) {
@@ -593,7 +621,7 @@ export async function responseRequest(
   else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
   const run = async () => {
     try {
-      await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => {
+      await adapter.runTurn!(parsed, { headers: adapterRequestHeaders(req.headers, accessPolicy), abortSignal: abort.signal }, event => {
         options.onAdapterEvent?.(event);
         queue.push(event);
       });
@@ -654,8 +682,11 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
-  options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
+  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "accessPolicy"> = {},
 ): Promise<Response> {
+  const accessPolicy = options.accessPolicy ?? OPENAI_ACCESS;
+  const denied = authenticateApiRequest(req, accessPolicy);
+  if (denied) return denied;
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
   try {
@@ -669,6 +700,8 @@ export async function compactRequest(
       error instanceof Error ? error.message : "Compaction request body must be a JSON object",
     );
   }
+  const rejectedModel = requireWebModelInApiKeyMode(raw.model, accessPolicy);
+  if (rejectedModel) return rejectedModel;
   const headerTurnMetadata = req.headers.get("x-codex-turn-metadata");
   if (headerTurnMetadata) {
     const existingMetadata = raw.client_metadata;
@@ -769,10 +802,15 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory; accessPolicy?: ApiAccessPolicy } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
+  }
+  // Snapshot before opening a socket/broker. Rotation or mode changes require a controlled restart.
+  const accessPolicy = parseApiAccessPolicy(dependencies.accessPolicy ?? loadApiAccessPolicy());
+  if (apiKeyMatches(config.controlToken, accessPolicy)) {
+    throw new Error("Client API key must not be the daemon control token");
   }
   const startedAt = Date.now();
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
@@ -803,6 +841,8 @@ export function startServer(
     port: config.port,
     idleTimeout: 0,
     async fetch(req) {
+      const denied = guardApiRequest(req, accessPolicy);
+      if (denied) return denied;
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
         return Response.json({
@@ -810,6 +850,8 @@ export function startServer(
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
+          access_mode: accessPolicy.mode,
+          api_access_revision: apiAccessRevision(accessPolicy, config.controlToken),
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
@@ -970,7 +1012,9 @@ export function startServer(
           try {
             catalogConfig = {
               ...config,
-              subagentProtocol: readCodexSubagentProtocol(config.subagentProtocol),
+              subagentProtocol: accessPolicy.mode === "api-key"
+                ? config.subagentProtocol
+                : readCodexSubagentProtocol(config.subagentProtocol),
             };
           } catch (error) {
             return formatErrorResponse(
@@ -984,6 +1028,7 @@ export function startServer(
             catalogConfig,
             dependencies.fetchUpstream,
             readCodexModelContextOverride,
+            accessPolicy,
           );
           if (response.ok) {
             successfulModelCatalogRequests += 1;
@@ -1005,7 +1050,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, accessPolicy },
           ),
           req.signal,
           process.platform,
@@ -1019,7 +1064,7 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity },
+            { onTurnIdentity: bindIdentity, accessPolicy },
           ),
           req.signal,
           process.platform,

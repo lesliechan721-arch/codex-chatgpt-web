@@ -1,0 +1,25 @@
+.api-access-settings { margin: 28px 0; padding: 20px; border: 1px solid var(--border, #363636); border-radius: 12px; }
+.api-access-settings h2 { margin: 0 0 12px; font-size: 16px; }
+.api-access-settings p, .api-access-settings small { color: var(--text-secondary, #aaa); line-height: 1.55; overflow-wrap: anywhere; }
+.api-access-settings p { margin: 12px 0; font-size: 13px; }
+.api-access-settings small { display: block; font-size: 12px; }
+.api-access-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; }
+.api-access-settings button { cursor: pointer; font: inherit; font-size: 12px; color: inherit; background: transparent; border: 1px solid var(--border, #555); border-radius: 6px; padding: 8px 12px; }
+.api-access-settings button[aria-checked="true"] { border-color: var(--text-primary, #eee); }
+.api-access-settings button:disabled { cursor: not-allowed; opacity: .45; }
+.api-access-settings button:focus-visible, .api-access-settings input:focus-visible { outline: 2px solid var(--text-primary, #eee); outline-offset: 3px; }
+.api-access-settings fieldset { min-width: 0; margin: 18px 0; border: 0; padding: 0; }
+.api-access-settings label { font-size: 13px; }
+.api-access-settings input:not([type="checkbox"]) { box-sizing: border-box; display: block; width: 100%; margin: 8px 0; padding: 10px; border: 1px solid var(--border, #555); border-radius: 6px; color: inherit; background: var(--background, #181818); font-family: monospace; }
+.api-access-status { display: flex; flex-wrap: wrap; gap: 12px 32px; font-size: 12px; }
+.api-access-status div { display: flex; flex-direction: column; gap: 6px; }
+.api-access-status dt { color: var(--text-secondary, #aaa); }
+.api-access-status dd { margin: 0; }
+.api-access-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.api-access-ack { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0; }
+.api-access-ack input { margin-top: 3px; }
+.api-access-client { margin-top: 20px; }
+.api-access-client code { display: block; overflow-wrap: anywhere; margin-top: 8px; }
+.api-access-client pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; font-size: 11px; border: 1px solid var(--border, #363636); border-radius: 6px; }
+.api-access-settings .api-access-error { color: var(--color-error, #ffb4a9); }
+@media (max-width: 480px) { .api-access-settings { padding: 14px; } .api-access-toggle { flex-wrap: wrap; } }

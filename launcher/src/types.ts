@@ -1,4 +1,5 @@
 import languages from "../electron/languages.json";
+import type { ApiAccessApi } from "./api-access-types";
 
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
@@ -122,7 +123,7 @@ export interface LauncherSnapshot {
   update: UpdateState;
 }
 
-export interface LauncherApi {
+export interface LauncherApi extends ApiAccessApi {
   snapshot(): Promise<LauncherSnapshot>;
   setLanguage(language: Language): Promise<LauncherState>;
   openSocial(target: "github" | "x"): Promise<LauncherState>;
