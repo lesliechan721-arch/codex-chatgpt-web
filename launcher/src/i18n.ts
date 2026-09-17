@@ -195,6 +195,8 @@ const en = {
   doctorBrowserReady: "Embedded launcher browser is authenticated and reachable (pid {pid})",
   doctorManualBrowserReady: "Embedded launcher browser is reachable for Zero Risk (pid {pid})",
   doctorCodexInstalled: "Codex native model route is installed",
+  doctorApiKeyManualRoute: "API key mode leaves Codex model routing to manual client configuration",
+  doctorApiKeyRouteCleanup: "API key mode still has a managed Codex route pending cleanup",
   doctorRuntimeOwned: "Launcher owns the background runtime",
   doctorChromeFound: "Chrome executable found: {path}",
   doctorLoginVerified: "ChatGPT login state has authenticated browser evidence",
@@ -397,6 +399,8 @@ const zh: Record<keyof typeof en, string> = {
   doctorBrowserReady: "内嵌浏览器已登录且可访问（进程 {pid}）",
   doctorManualBrowserReady: "Zero Risk 内嵌浏览器可访问（进程 {pid}）",
   doctorCodexInstalled: "已安装 Codex 原生模型路由",
+  doctorApiKeyManualRoute: "API Key 模式由客户端手动配置 Codex 模型路由",
+  doctorApiKeyRouteCleanup: "API Key 模式仍有待清理的受管理 Codex 路由",
   doctorRuntimeOwned: "启动器正在管理后台运行时",
   doctorChromeFound: "已找到 Chrome 可执行文件：{path}",
   doctorLoginVerified: "已通过浏览器验证 ChatGPT 登录状态",
@@ -599,6 +603,8 @@ const ja: Record<keyof typeof en, string> = {
   doctorBrowserReady: "内蔵ブラウザーは認証済みで接続可能です（PID {pid}）",
   doctorManualBrowserReady: "Zero Risk の内蔵ブラウザーに接続できます（PID {pid}）",
   doctorCodexInstalled: "Codex のネイティブモデルルートはインストール済みです",
+  doctorApiKeyManualRoute: "API Key モードでは Codex モデルルーティングをクライアントで手動設定します",
+  doctorApiKeyRouteCleanup: "API Key モードにはクリーンアップ待ちの管理対象 Codex ルートが残っています",
   doctorRuntimeOwned: "ランチャーがバックグラウンドランタイムを管理しています",
   doctorChromeFound: "Chrome 実行ファイルが見つかりました: {path}",
   doctorLoginVerified: "ChatGPT のログイン状態はブラウザーで認証済みです",
@@ -801,6 +807,8 @@ const ko: Record<keyof typeof en, string> = {
   doctorBrowserReady: "내장 브라우저가 인증되어 연결 가능합니다 (PID {pid})",
   doctorManualBrowserReady: "Zero Risk 내장 브라우저에 연결할 수 있습니다 (PID {pid})",
   doctorCodexInstalled: "Codex 네이티브 모델 경로가 설치되어 있습니다",
+  doctorApiKeyManualRoute: "API Key 모드에서는 Codex 모델 라우팅을 클라이언트에서 수동으로 구성합니다",
+  doctorApiKeyRouteCleanup: "API Key 모드에 정리가 필요한 관리 대상 Codex 경로가 남아 있습니다",
   doctorRuntimeOwned: "런처가 백그라운드 런타임을 관리하고 있습니다",
   doctorChromeFound: "Chrome 실행 파일을 찾았습니다: {path}",
   doctorLoginVerified: "브라우저에서 ChatGPT 로그인 상태를 확인했습니다",
@@ -1003,6 +1011,8 @@ const zhTW: Record<keyof typeof en, string> = {
   doctorBrowserReady: "內建瀏覽器已登入且可存取（程序 {pid}）",
   doctorManualBrowserReady: "Zero Risk 內建瀏覽器可存取（程序 {pid}）",
   doctorCodexInstalled: "已安裝 Codex 原生模型路由",
+  doctorApiKeyManualRoute: "API Key 模式由用戶端手動設定 Codex 模型路由",
+  doctorApiKeyRouteCleanup: "API Key 模式仍有待清理的受管理 Codex 路由",
   doctorRuntimeOwned: "啟動器正在管理背景執行階段",
   doctorChromeFound: "已找到 Chrome 執行檔：{path}",
   doctorLoginVerified: "已透過瀏覽器驗證 ChatGPT 登入狀態",
@@ -1039,6 +1049,12 @@ export function localizeRuntimeMessage(
       .replace("{pid}", () => match[2]);
   }
   if (checkId === "codex" && message === "Codex native model route is installed") return copy.doctorCodexInstalled;
+  if (checkId === "codex" && message === "API key mode leaves Codex model routing to manual client configuration") {
+    return copy.doctorApiKeyManualRoute;
+  }
+  if (checkId === "codex" && message === "API key mode still has a managed Codex route pending cleanup") {
+    return copy.doctorApiKeyRouteCleanup;
+  }
   if (checkId === "service" && message === "Launcher owns the background runtime") return copy.doctorRuntimeOwned;
   if (checkId === "service" && message === "macOS background service is loaded") return copy.doctorMacServiceLoaded;
   if (checkId === "chrome") {

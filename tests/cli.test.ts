@@ -3,10 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { apiKeyPolicy } from "../src/api-access";
+import { apiAccessRevision, apiKeyPolicy } from "../src/api-access";
 import { saveApiAccessPolicy } from "../src/api-access-config";
 import { defaultBrokerEndpoint, defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { VERSION } from "../src/version";
 
 setDefaultTimeout(30_000);
 
@@ -336,6 +337,74 @@ test("API key mode route, subagents and serve never inject Codex configuration",
       await serve.exited;
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("doctor requires the running daemon to load the saved API key policy", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-api-doctor-sync-"));
+  const appHome = join(root, "app");
+  const codexHome = join(root, "codex");
+  mkdirSync(appHome, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  let health: Record<string, unknown> = {};
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(health));
+  });
+  try {
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(0, "127.0.0.1", resolveListen);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const config = {
+      ...defaultConfig("browser-only"),
+      port: address.port,
+      storageStatePath: join(appHome, "browser", "storage-state.json"),
+      brokerSocketPath: join(appHome, "runtime", "turn-broker.sock"),
+    };
+    writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config)}\n`);
+    const policy = apiKeyPolicy(`cgw_${"s".repeat(43)}`);
+    saveApiAccessPolicy(policy, appHome);
+    health = {
+      service: "codex-chatgpt-web",
+      status: "ok",
+      version: VERSION,
+      mode: "browser-only",
+      access_mode: "api-key",
+      api_access_revision: apiAccessRevision(policy, config.controlToken),
+      accepting_turns: true,
+      pid: process.pid,
+    };
+    const env = {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+      CODEX_HOME: codexHome,
+    };
+    const current = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+    expect(current.checks.find((check: { id: string }) => check.id === "proxy")).toMatchObject({
+      status: "ok",
+    });
+    expect(current.checks.find((check: { id: string }) => check.id === "codex")).toMatchObject({
+      status: "ok",
+      message: "API key mode leaves Codex model routing to manual client configuration",
+    });
+
+    health = { ...health, access_mode: "openai", api_access_revision: "0".repeat(64) };
+    const stale = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+    expect(stale.checks.find((check: { id: string }) => check.id === "proxy")).toMatchObject({
+      status: "error",
+      message: "Responses proxy has not loaded the current API access configuration",
+    });
+    expect(stale.checks.find((check: { id: string }) => check.id === "codex")).toMatchObject({
+      status: "error",
+      message: "Codex model route is not installed",
+    });
+    expect(stale.ok).toBeFalse();
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
     rmSync(root, { recursive: true, force: true });
   }
 });
