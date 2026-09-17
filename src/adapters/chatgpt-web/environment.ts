@@ -67,6 +67,10 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function inputItemType(item: Record<string, unknown> | undefined): unknown {
+  return item?.type ?? (typeof item?.role === "string" ? "message" : undefined);
+}
+
 function pathIdentity(value: string): string {
   const normalized = resolve(value);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -107,7 +111,8 @@ export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boo
   const input = Array.isArray(body?.input) ? body.input : [];
   return input.some(value => {
     const item = record(value);
-    return item?.type === "message" && /<\/?environment_context\b/i.test(rawMessageText(item));
+    return inputItemType(item) === "message" && item !== undefined
+      && /<\/?environment_context\b/i.test(rawMessageText(item));
   });
 }
 
@@ -121,11 +126,12 @@ export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest):
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const item = record(input[index]);
     if (!item) continue;
-    if ((item.type === "message" && item.role === "assistant")
+    const type = inputItemType(item);
+    if ((type === "message" && item.role === "assistant")
       || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
       laterAssistantOutput = true;
     }
-    if (item.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+    if (type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
     const owner = itemTurnId(item);
     if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
   }
@@ -147,7 +153,8 @@ export function unattributedChatGptEnvironmentMessages(
   const messages: ChatGptUnattributedEnvironmentMessage[] = [];
   for (const value of input) {
     const item = record(value);
-    if (item?.type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+    if (inputItemType(item) !== "message" || !item
+      || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
     // Explicit current provenance must keep the normal current-update rejection. A native item
     // without provenance is historical only if the canonical rollout proves that exact message.
     const owner = itemTurnId(item);
@@ -172,7 +179,7 @@ function isUserOrParentInstruction(
   item: Record<string, unknown> | undefined,
   metadata?: Record<string, unknown>,
 ): item is Record<string, unknown> {
-  if (item?.type === "message" && item.role === "user") return !contextualUserMessage(item);
+  if (inputItemType(item) === "message" && item?.role === "user") return !contextualUserMessage(item);
   if (item?.type !== "agent_message" || typeof item.id !== "string" || !item.id
     || metadata?.subagent_kind !== "thread_spawn"
     || (metadata.request_kind !== "turn" && metadata.request_kind !== "compaction")
@@ -198,7 +205,8 @@ export function priorChatGptAbortedTurnIds(parsed: CodexParsedRequest): string[]
   return [...new Set(input.flatMap(value => {
     const item = record(value);
     const abortedTurnId = item ? itemTurnId(item) : undefined;
-    return item?.type === "message"
+    return inputItemType(item) === "message"
+      && item !== undefined
       && item.role === "user"
       && isTurnAbortedNotice(item)
       && abortedTurnId !== undefined
@@ -249,7 +257,7 @@ function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record
   if (!isUserOrParentInstruction(item, metadata)) return undefined;
   const messageTurnId = itemTurnId(item);
   // An abort notice is contextual only when native metadata identifies its earlier turn.
-  if (item.type === "message" && isTurnAbortedNotice(item) && expectedTurnId !== undefined
+  if (inputItemType(item) === "message" && isTurnAbortedNotice(item) && expectedTurnId !== undefined
     && messageTurnId !== undefined && messageTurnId !== expectedTurnId) return undefined;
   const itemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
   if (messageTurnId === undefined && itemId === undefined) return undefined;
@@ -292,7 +300,7 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
   const body = record(parsed._rawBody);
   const updates = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
     const item = record(value);
-    if (item?.type !== "message" || item.role !== "user" || itemTurnId(item) !== turnId
+    if (inputItemType(item) !== "message" || !item || item.role !== "user" || itemTurnId(item) !== turnId
       || typeof item.id !== "string" || !item.id) return [];
     // Native compaction groups plugins, instructions and environment into sibling content parts.
     // Read the environment part without treating the surrounding preamble as part of its XML.
@@ -318,13 +326,13 @@ function environmentBeforeUser(input: unknown[], userIndex: number, expectedTurn
 
   let candidateIndex = userIndex - 1;
   let candidate = record(input[candidateIndex]);
-  while (candidate?.type === "message" && candidate.role === "developer") {
+  while (inputItemType(candidate) === "message" && candidate?.role === "developer") {
     const developerTurnId = itemTurnId(candidate);
     if (developerTurnId !== userTurnId) return undefined;
     candidateIndex -= 1;
     candidate = record(input[candidateIndex]);
   }
-  if (candidate?.type !== "message" || candidate.role !== "user") return undefined;
+  if (inputItemType(candidate) !== "message" || candidate?.role !== "user") return undefined;
 
   const candidateTurnId = itemTurnId(candidate);
   if (candidateTurnId !== userTurnId) return undefined;
@@ -478,14 +486,15 @@ function canonicalMetadataEnvironmentBeforeUser(
 
   let candidateIndex = userIndex - 1;
   let candidate = record(input[candidateIndex]);
-  while (candidate?.type === "message" && candidate.role === "developer") {
+  while (inputItemType(candidate) === "message" && candidate?.role === "developer") {
     const developerTurnId = itemTurnId(candidate);
     const serverOwnedId = typeof candidate.id === "string" && candidate.id.length > 0;
     if (developerTurnId === undefined ? !serverOwnedId : developerTurnId !== metadataTurnId) return undefined;
     candidateIndex -= 1;
     candidate = record(input[candidateIndex]);
   }
-  if (candidate?.type !== "message" || candidate.role !== "user" || typeof candidate.id !== "string" || !candidate.id) return undefined;
+  if (inputItemType(candidate) !== "message" || candidate?.role !== "user"
+    || typeof candidate.id !== "string" || !candidate.id) return undefined;
   const candidateTurnId = itemTurnId(candidate);
   if (candidateTurnId !== undefined && candidateTurnId !== metadataTurnId) return undefined;
 
@@ -510,7 +519,7 @@ function hasAssistantOutputBetween(input: unknown[], startIndex: number, endInde
   for (let index = startIndex; index < endIndex; index += 1) {
     const item = record(input[index]);
     if (!item) continue;
-    if (item.type === "message" && item.role === "assistant") return true;
+    if (inputItemType(item) === "message" && item.role === "assistant") return true;
     if (item.type === "function_call" || item.type === "reasoning") return true;
   }
   return false;

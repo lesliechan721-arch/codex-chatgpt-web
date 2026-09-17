@@ -21,6 +21,31 @@ function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function isLocalCompaction(body: unknown): boolean {
+  if (!isObj(body) || !isObj(body.client_metadata)) return false;
+  const wire = body.client_metadata["x-codex-turn-metadata"];
+  let metadata: unknown = wire;
+  if (typeof wire === "string") {
+    try { metadata = JSON.parse(wire); } catch { return false; }
+  }
+  if (!isObj(metadata) || metadata.request_kind !== "compaction"
+    || !isObj(metadata.compaction) || metadata.compaction.implementation !== "responses") return false;
+  const input = Array.isArray(body.input) ? body.input : [];
+  const tail = input.at(-1);
+  // This prompt is a native control item, not a new human instruction. Metadata alone does not
+  // authorize a filesystem, and copying the prompt into an ordinary turn does not compact it.
+  const text = isObj(tail) && Array.isArray(tail.content)
+    ? tail.content.map(part => isObj(part) ? part.text : undefined).join("\n") : tail?.content;
+  if (typeof metadata.thread_id !== "string" || !metadata.thread_id
+    || typeof metadata.turn_id !== "string" || !metadata.turn_id
+    || !isObj(tail) || (tail.type !== undefined && tail.type !== "message") || tail.role !== "user"
+    || tail.id !== undefined || tail.internal_chat_message_metadata_passthrough !== undefined
+    || typeof text !== "string" || !text.trim()) {
+    throw new Error("Invalid native local compaction control message");
+  }
+  return true;
+}
+
 type InputBlock =
   | { type: "input_text"; text: string }
   | { type: "text"; text: string }
@@ -303,7 +328,8 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   const loadedToolSpecs: unknown[] = [];
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
-  let compactionRequest = false;
+  const localCompaction = isLocalCompaction(body);
+  let compactionRequest = localCompaction;
   let opaqueMultiAgentV2Payload = false;
 
   if (typeof data.instructions === "string" && data.instructions.length > 0) {
@@ -317,6 +343,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
+        if (localCompaction) throw new Error("Local compaction cannot request a remote compaction output item");
         compactionRequest = true;
         continue;
       }
@@ -636,6 +663,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     _rawBody: body,
     ...(replayedInputPrefixLength > 0 ? { _replayPrefixLen: replayedInputPrefixLength } : {}),
     ...(compactionRequest ? { _compactionRequest: true } : {}),
+    ...(localCompaction ? { _compactionOutput: "message" as const } : {}),
     ...(opaqueMultiAgentV2Payload ? { _opaqueMultiAgentV2Payload: true } : {}),
   };
 }

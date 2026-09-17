@@ -2169,9 +2169,7 @@ function DoctorSummary({ copy, language, report }: { copy: Copy; language: Langu
         {visibleChecks.map((check) => (
           <p key={check.id}>
             <StateDot state={check.status === "ok" ? "ready" : check.status === "warning" ? "busy" : "error"} />
-            <span>{check.status === "ok"
-              ? localizeRuntimeMessage(copy, check.message, check.id, language)
-              : check.message}</span>
+            <span>{localizeRuntimeMessage(copy, check.message, check.id, language)}</span>
           </p>
         ))}
       </div>

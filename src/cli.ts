@@ -31,7 +31,7 @@ import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopT
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
 import { runApiKeyCommand } from "./api-key-cli";
-import { loadApiAccessPolicy } from "./api-access-config";
+import { clearOpenAiRoutingPending, loadApiAccessPolicy } from "./api-access-config";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 
 const HELP = `codex-chatgpt-web ${VERSION}
@@ -409,6 +409,7 @@ async function routeCommand(args: string[]): Promise<void> {
         ? deactivateCodexIntegration()
         : undefined;
   if (!result) throw new Error(`Unknown route action: ${action}`);
+  if (action === "connect" && result.active) clearOpenAiRoutingPending();
   stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 

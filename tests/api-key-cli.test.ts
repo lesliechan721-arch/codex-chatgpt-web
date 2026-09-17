@@ -1,10 +1,11 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { apiKeyMatches, apiKeyPolicy } from "../src/api-access";
-import { loadApiAccessPolicy } from "../src/api-access-config";
+import { loadApiAccessPolicy, openAiRoutingPendingPath } from "../src/api-access-config";
+import { defaultConfig } from "../src/config";
 
 function withHome(run: (home: string) => void): void {
   const home = mkdtempSync(join(tmpdir(), "cgw-api-key-cli-"));
@@ -13,7 +14,7 @@ function withHome(run: (home: string) => void): void {
 function cli(home: string, args: string[], input?: string) {
   const result = Bun.spawnSync([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
     "--home", home, "api-key", ...args], {
-    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home },
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: join(home, "codex") },
     stdin: input === undefined ? "ignore" : Buffer.from(input),
     stdout: "pipe", stderr: "pipe",
   });
@@ -61,4 +62,13 @@ test("CLI fails closed for damaged policy; only explicit disable recovers", () =
   assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
   assert.equal(cli(home, ["disable"]).code, 0);
   assert.equal(loadApiAccessPolicy(home).mode, "openai");
+}));
+
+test("successful CLI reconnect clears the persisted OpenAI routing warning", () => withHome(home => {
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  const pending = openAiRoutingPendingPath(home);
+  writeFileSync(pending, '{"version":1}\n');
+  const result = cli(home, ["reconnect"]);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(existsSync(pending), false);
 }));

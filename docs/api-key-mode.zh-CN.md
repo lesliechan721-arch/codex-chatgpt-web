@@ -79,6 +79,8 @@ OpenAI 模式为 `{"version":1,"mode":"openai"}`。文件不存在时保留旧�
 {"version":1,"digest":"<对应密钥摘要>","ciphertext":"<OS 加密密文的 Base64>"}
 ```
 
+GUI 正常切回 OpenAI 模式时，还会用 `secrets/api-client-key-reuse.json` 记录允许复用的密钥摘要。
+
 使用 Electron `safeStorage.encryptString/decryptString`；密文原子写入 owner-only 文件。主进程仅在用户明确点击查看、复制或需要复用时解密，状态刷新不会解密。
 
 Linux 的 `basic_text` 和 `unknown` 后端不当作安全存储。OS 加密、密钥库或密文写入不可用时，不把明文降级写入磁盘；本次会话可在主进程内存里查看/复制密钥，GUI 提示用户自行备份。鉴权摘要已正常保存，所以这种情况不阻止模式切换。
@@ -89,7 +91,7 @@ Linux 的 `basic_text` 和 `unknown` 后端不当作安全存储。OS 加密、�
 
 旧安装、CLI 生成/导入的密钥可能只有摘要，**无法从 SHA-256 还原明文**。这种密钥仍可认证，但不能凭空显示。用户可以继续使用原来备份的值，或从 GUI 重置以建立新的加密副本。
 
-外部 CLI 轮换后，旧的 GUI 加密副本必须与当前摘要匹配才允许查看；不能显示一把已经失效的旧密钥。GUI 从 API 模式退出时也会丢弃不匹配的副本，避免后续复用它。
+外部 CLI 写入接入策略时会删除 GUI 复用标记。CLI 轮换后，旧的 GUI 加密副本必须与当前摘要匹配才允许查看；CLI 随后关闭 API 模式也不能重新启用旧密钥。GUI 从 API 模式退出时也会丢弃不匹配的副本，避免后续复用它。
 
 本机操作系统账户、进程内存和密钥库权限仍是安全边界；这不是多租户凭证保险库。
 
@@ -120,7 +122,7 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 
 清理冲突不会撤销已经保存的接入模式；GUI 显示待清理。可以解决冲突后点击重试或运行 `api-key cleanup`。无 journal 的疑似残留需要人工核对，不能安全推断安装前的值。
 
-切回 OpenAI 模式时，GUI 尝试 `api-key reconnect` 恢复原生转发集成，但不强制覆盖冲突的路由。失败仍保存选择，并提示恢复未完成。此前手动选择的 `model_provider` 不会擅自删除，用户需要核对客户端实际选择。
+切回 OpenAI 模式时，GUI 尝试 `api-key reconnect` 恢复原生转发集成，但不强制覆盖冲突的路由。失败仍保存选择，并通过 `api-access-routing-pending.json` 在 Launcher 重启后继续提示恢复未完成；成功重连、setup 或 route connect 会清除该标记。此前手动选择的 `model_provider` 不会擅自删除，用户需要核对客户端实际选择。
 
 ## 6. 导出配置补齐哪些内容
 

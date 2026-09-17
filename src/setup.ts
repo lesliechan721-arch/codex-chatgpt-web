@@ -1,4 +1,4 @@
-import { loadApiAccessPolicy } from "./api-access-config";
+import { clearOpenAiRoutingPending, loadApiAccessPolicy } from "./api-access-config";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -629,9 +629,12 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
   // API mode owns no Codex config. Setup/upgrades may only remove prior recorded injection.
   if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration();
-  else installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  else {
+    installCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+    clearOpenAiRoutingPending();
+  }
 
   return {
     mode: config.mode,

@@ -118,10 +118,7 @@ test("runtime message localization preserves other languages and unknown backend
 
 test("launcher UI localizes MCP verification progress and doctor check messages", () => {
   assert.match(appSource, /localizeRuntimeMessage\(copy, operation\.message, undefined, language\)/);
-  assert.match(
-    appSource,
-    /check\.status === "ok"\s*\?\s*localizeRuntimeMessage\(copy, check\.message, check\.id, language\)\s*:\s*check\.message/,
-  );
+  assert.match(appSource, /<span>\{localizeRuntimeMessage\(copy, check\.message, check\.id, language\)\}<\/span>/);
 });
 
 
@@ -142,7 +139,7 @@ test("native dialogs and IPC accept exactly the renderer's supported languages",
   for (const language of ["__proto__", "constructor", "unknown", null, [], {}]) assert.throws(() => validateLanguage(language), /Language must/);
 });
 
-test("all locales translate known doctor success checks without changing literal diagnostic data", () => {
+test("all locales translate known doctor messages without changing literal diagnostic data", () => {
   const { copyFor, localizeRuntimeMessage } = loadI18nModule();
   const fixturePath = "C:\\sample $&\\config.toml";
   const checks = [
@@ -156,6 +153,8 @@ test("all locales translate known doctor success checks without changing literal
     ["browser-host", "Embedded launcher browser is authenticated and reachable (pid 345)", "doctorBrowserReady", "{pid}", "345"],
     ["browser-host", "Embedded launcher browser is reachable for Zero Risk (pid 678)", "doctorManualBrowserReady", "{pid}", "678"],
     ["codex", "Codex native model route is installed", "doctorCodexInstalled"],
+    ["codex", "API key mode leaves Codex model routing to manual client configuration", "doctorApiKeyManualRoute"],
+    ["codex", "API key mode still has a managed Codex route pending cleanup", "doctorApiKeyRouteCleanup"],
     ["service", "Launcher owns the background runtime", "doctorRuntimeOwned"],
     ["chrome", `Chrome executable found: ${fixturePath}`, "doctorChromeFound", "{path}", fixturePath],
     ["login", "ChatGPT login state has authenticated browser evidence", "doctorLoginVerified"],

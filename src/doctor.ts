@@ -1,4 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { apiAccessRevision, type ApiAccessPolicy } from "./api-access";
+import { loadApiAccessPolicy } from "./api-access-config";
 import type { AppConfig } from "./config";
 import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
@@ -61,7 +63,7 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
   return undefined;
 }
 
-async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
+async function proxyCheck(config: AppConfig, accessPolicy: ApiAccessPolicy): Promise<DoctorCheck> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
   try {
@@ -76,6 +78,14 @@ async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
     }
     if (body.version !== config.releaseVersion) {
       return { id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` };
+    }
+    if (body.api_access_revision !== apiAccessRevision(accessPolicy, config.controlToken)) {
+      return {
+        id: "proxy",
+        status: "error",
+        message: "Responses proxy has not loaded the current API access configuration",
+        detail: `Daemon access mode is ${String(body.access_mode)}; config requires ${accessPolicy.mode}`,
+      };
     }
     if (body.accepting_turns !== true) {
       return {
@@ -108,6 +118,18 @@ export async function runDoctor(): Promise<DoctorReport> {
     return { ok: false, checks };
   }
 
+  let accessPolicy: ApiAccessPolicy;
+  try {
+    accessPolicy = loadApiAccessPolicy();
+  } catch (error) {
+    checks.push({
+      id: "api-access",
+      status: "error",
+      message: "API access configuration is invalid",
+      detail: error instanceof Error ? error.message : String(error),
+    });
+    return { ok: false, mode: config.mode, checks };
+  }
   if (config.browserHost === "launcher") {
     try {
       const descriptor = config.browserInteractionMode === "manual"
@@ -148,8 +170,23 @@ export async function runDoctor(): Promise<DoctorReport> {
     }
   }
 
+  const proxy = await proxyCheck(config, accessPolicy);
+  const apiKeyMode = accessPolicy.mode === "api-key" && proxy.status === "ok";
   const codex = inspectCodexIntegration();
-  if (!codex.installed) {
+  if (apiKeyMode && !codex.installed) {
+    checks.push({
+      id: "codex",
+      status: "ok",
+      message: "API key mode leaves Codex model routing to manual client configuration",
+    });
+  } else if (apiKeyMode) {
+    checks.push({
+      id: "codex",
+      status: "warning",
+      message: "API key mode still has a managed Codex route pending cleanup",
+      ...(codex.errors.length > 0 ? { detail: codex.errors.join("; ") } : {}),
+    });
+  } else if (!codex.installed) {
     checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
   } else if (codex.errors.length > 0) {
     checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });
@@ -174,7 +211,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "service", status: "ok", message: "macOS background service is loaded" });
   }
-  checks.push(await proxyCheck(config));
+  checks.push(proxy);
 
   if (config.mode === "full") {
     const settings = config.tunnel!;

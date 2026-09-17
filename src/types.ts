@@ -8,12 +8,19 @@ export interface CodexParsedRequest {
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**
-   * True when the input carried `{type:"compaction_trigger"}` — Codex remote compaction v2 asking
-   * this turn to produce a `{type:"compaction"}` output item. Routed adapters can't natively;
-   * the server runs the model as a summarizer and the bridge emits a synthetic compaction item
-   * (see src/responses/compaction.ts).
+   * A dedicated native compaction request (local Responses or remote v1/v2).
+   * This controls summarization and lifecycle, not the output wire format.
    */
   _compactionRequest?: boolean;
+  /** Local Responses compaction consumes assistant text; remote compaction consumes an item. */
+  _compactionOutput?: "message";
+  /**
+   * Native Codex compaction can rebuild retained message ids. ChatGPT Web fills this map only
+   * after the canonical rollout proves an exact replacement-history identity mapping.
+   */
+  _chatGptMessageIdAliases?: Record<string, string>;
+  /** Native source turn authenticated from rollout evidence for a standalone compaction request. */
+  _chatGptCompactionSourceTurnId?: string;
   /**
    * True when Codex MultiAgent V2 delegated an agent_message as provider-private encrypted_content.
    * ChatGPT Web has no OpenAI backend key for that blob; the Responses HTTP boundary rejects it
