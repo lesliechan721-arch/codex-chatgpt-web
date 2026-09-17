@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { apiKeyPolicy } from "../src/api-access";
+import { saveApiAccessPolicy } from "../src/api-access-config";
 import { defaultBrokerEndpoint, defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -24,6 +26,18 @@ async function runCli(args: string[], env: Record<string, string | undefined>) {
     new Response(child.stderr).text(),
   ]);
   return { exitCode, stdout, stderr };
+}
+
+async function unusedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server has no port");
+  await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  return address.port;
 }
 
 test("production and DEV setup reject the removed connector-name option before configuration", async () => {
@@ -262,6 +276,65 @@ test("generic --home cannot collapse DEV mode into another runtime home", async 
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--home does not apply to DEV mode");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("API key mode route, subagents and serve never inject Codex configuration", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-api-mode-"));
+  const appHome = join(root, "app");
+  const codexHome = join(root, "codex");
+  const codexConfig = join(codexHome, "config.toml");
+  const cliPath = resolve(import.meta.dir, "../src/cli.ts");
+  const originalCodexConfig = 'model_provider = "user-provider"\n';
+  mkdirSync(appHome, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  try {
+    const config = {
+      ...defaultConfig("browser-only"),
+      port: await unusedPort(),
+      storageStatePath: join(appHome, "browser", "storage-state.json"),
+      brokerSocketPath: join(appHome, "runtime", "turn-broker.sock"),
+    };
+    writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config)}\n`);
+    saveApiAccessPolicy(apiKeyPolicy(`cgw_${"k".repeat(43)}`), appHome);
+    writeFileSync(codexConfig, originalCodexConfig);
+    const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: codexHome };
+
+    const route = await runCli(["route", "connect"], env);
+    expect(route.exitCode).toBe(0);
+    expect(JSON.parse(route.stdout)).toMatchObject({
+      installed: false,
+      active: false,
+      manualConfigurationRequired: true,
+    });
+    expect(readFileSync(codexConfig, "utf8")).toBe(originalCodexConfig);
+
+    const subagents = await runCli(["subagents", "native"], env);
+    expect(subagents.exitCode).toBe(0);
+    expect(JSON.parse(subagents.stdout)).toMatchObject({
+      protocol: "native",
+      manualConfigurationRequired: true,
+    });
+    expect(readFileSync(codexConfig, "utf8")).toBe(originalCodexConfig);
+
+    const serve = Bun.spawn([process.execPath, cliPath, "serve"], {
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const reader = serve.stdout.getReader();
+    try {
+      const first = await reader.read();
+      expect(first.done).toBeFalse();
+      expect(new TextDecoder().decode(first.value)).toContain("listening on");
+      expect(readFileSync(codexConfig, "utf8")).toBe(originalCodexConfig);
+    } finally {
+      reader.releaseLock();
+      serve.kill();
+      await serve.exited;
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

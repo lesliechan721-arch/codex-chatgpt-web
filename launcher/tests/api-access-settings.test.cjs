@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -7,6 +8,15 @@ const { createCipheriv, createDecipheriv } = require("node:crypto");
 const { createApiAccessSettings, keyPolicy, parsePolicy, policyRevision, validateChange } = require("../electron/api-access-settings.cjs");
 const KEY = "cgw_" + "a".repeat(43);
 const NEXT = "cgw_" + "b".repeat(43);
+const ROOT = path.resolve(__dirname, "../..");
+
+function apiKeyCli(home, args) {
+  return spawnSync("bun", [path.join(ROOT, "src", "cli.ts"), "--home", home, "api-key", ...args], {
+    cwd: ROOT,
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: path.join(home, "codex") },
+    encoding: "utf8",
+  });
+}
 
 function encryption() {
   const secret = Buffer.alloc(32, 7);
@@ -136,6 +146,17 @@ test("disable and re-enable can reuse the sealed key without requiring a new key
   const result = await f.controller.apply({ mode: "api-key", expectedRevision: (await f.controller.status()).revision });
   assert.equal(result.status.runtimeState, "in-sync"); assert.equal(f.controller.reveal(), KEY);
 });
+test("CLI rotation and disable cannot reactivate the revoked GUI key", async t => {
+  const f = fixture(t); await f.apply();
+  const rotated = apiKeyCli(f.coreHome, ["rotate", "--generate"]);
+  assert.equal(rotated.status, 0, rotated.stderr || rotated.error?.message);
+  const disabled = apiKeyCli(f.coreHome, ["disable"]);
+  assert.equal(disabled.status, 0, disabled.stderr || disabled.error?.message);
+  const status = await f.controller.status();
+  assert.equal(status.configuredMode, "openai");
+  assert.equal(status.keyAvailable, false);
+  await assert.rejects(f.controller.apply({ mode: "api-key", expectedRevision: status.revision }), /key-required/);
+});
 test("digest-only keys still authenticate but are not fabricated by reveal", async t => {
   const f = fixture(t); fs.writeFileSync(f.file, JSON.stringify(keyPolicy(KEY)));
   assert.equal((await f.controller.status()).keyConfigured, true); assert.equal((await f.controller.status()).keyAvailable, false);
@@ -185,6 +206,18 @@ test("OpenAI switch restores only forwarding integration and persists through a 
   assert.equal(result.status.configuredMode, "openai"); assert.equal(result.status.routingPending, true);
   assert.deepEqual(f.state.commands.at(-1), ["api-key", "reconnect"]);
   assert.equal(result.status.runtimeState, "in-sync");
+});
+test("a failed OpenAI reconnect remains pending after the controller restarts", async t => {
+  const f = fixture(t); await f.apply(); f.state.reconnectError = true;
+  await f.apply("openai"); f.controller.dispose();
+  const pending = path.join(f.coreHome, "api-access-routing-pending.json");
+  assert.equal(fs.existsSync(pending), true);
+  const restarted = f.create(); t.after(() => restarted.dispose());
+  assert.equal((await restarted.status()).routingPending, true);
+  f.state.reconnectError = false;
+  const result = await restarted.apply({ mode: "openai", expectedRevision: (await restarted.status()).revision });
+  assert.equal(result.status.routingPending, false);
+  assert.equal(fs.existsSync(pending), false);
 });
 test("disabling after an external key rotation does not reactivate a revoked GUI key", async t => {
   const f = fixture(t); await f.apply(); fs.writeFileSync(f.file, JSON.stringify(keyPolicy(NEXT)));
