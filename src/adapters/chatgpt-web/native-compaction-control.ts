@@ -46,7 +46,10 @@ export function activeCompactionToolResultInstruction(): string {
  * already-visible native tool boundary, the same manually submitted response returns the
  * checkpoint through the same Zero Risk request instead.
  */
-export function zeroRiskActiveCompactionToolResultInstruction(toolExecuted: boolean): string {
+export function zeroRiskActiveCompactionToolResultInstruction(
+  toolExecuted: boolean,
+  compactPrompt = COMPACT_PROMPT,
+): string {
   return [
     `<${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
     toolExecuted
@@ -55,7 +58,7 @@ export function zeroRiskActiveCompactionToolResultInstruction(toolExecuted: bool
     toolExecuted
       ? "Consume that canonical result, stop ordinary task work now, and do not call any more work tools."
       : "Stop ordinary task work now and do not call any more work tools.",
-    COMPACT_PROMPT,
+    compactPrompt,
     "Call no more work tools. Return only the complete checkpoint summary to Codex with codex_turn_complete.",
     `</${CODEX_ACTIVE_COMPACTION_REQUEST_MARKER}>`,
   ].join("\n");
@@ -63,10 +66,11 @@ export function zeroRiskActiveCompactionToolResultInstruction(toolExecuted: bool
 
 export function structuredCompactionHandoffInstruction(
   transaction: CompactionTransactionHandle,
+  compactPrompt = COMPACT_PROMPT,
 ): string {
   return [
     "Automatic Codex context compaction has started. Stop ordinary task work and do not call any more work tools.",
-    COMPACT_PROMPT,
+    compactPrompt,
     ...compactionControlBinding(transaction),
     "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
     "The outer bridge accepts compaction only after the structured checkpoint is valid and its owned browser turn has physically settled.",

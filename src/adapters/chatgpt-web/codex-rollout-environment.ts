@@ -19,6 +19,7 @@ import type {
   ChatGptRootThreadMetadata,
   ChatGptThreadSpawnLineage,
   ChatGptTurnEnvironment,
+  ChatGptTurnUserRevision,
   ChatGptUnattributedEnvironmentMessage,
 } from "./environment";
 
@@ -194,7 +195,9 @@ function firstRolloutRecord(fd: number, size: number): Record<string, unknown> {
   throw new Error("Codex rollout has no complete session metadata record");
 }
 
-function latestTurnContext(fd: number, size: number): Record<string, unknown> | undefined {
+function latestRolloutRecord(
+  fd: number, size: number, matches: (item: Record<string, unknown>) => boolean,
+): Record<string, unknown> | undefined {
   let position = size;
   let carry = Buffer.alloc(0);
   let firstSegmentAtEof = true;
@@ -223,7 +226,7 @@ function latestTurnContext(fd: number, size: number): Record<string, unknown> | 
         throw new Error("Codex rollout JSONL record exceeds the bounded record size");
       }
       const item = parseJsonLine(line);
-      if (item.type === "turn_context") return record(item.payload);
+      if (matches(item)) return item;
     }
     carry = Buffer.from(data.subarray(0, lineEnd));
     if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) {
@@ -232,7 +235,174 @@ function latestTurnContext(fd: number, size: number): Record<string, unknown> | 
   }
   if (carry.length === 0) return undefined;
   const item = parseJsonLine(carry);
-  return item.type === "turn_context" ? record(item.payload) : undefined;
+  return matches(item) ? item : undefined;
+}
+
+/** Wire history can omit turn metadata, but an exact native message can prove its source turn. */
+function authenticatesCompactionSource(
+  fd: number, size: number, source: ChatGptTurnUserRevision | undefined, latestTurnId: unknown,
+): boolean {
+  if (!source?.itemId || typeof latestTurnId !== "string") return false;
+  // Local compaction re-ids retained human messages. Only the latest replacement history is
+  // current; neither guardian_history nor a message removed by a later compact is proof.
+  const item = latestRolloutRecord(fd, size, item => item.type === "compacted"
+    || (item.type === "response_item" && record(item.payload)?.id === source.itemId));
+  const replacement = record(item?.payload)?.replacement_history;
+  const matches = Array.isArray(replacement)
+    ? replacement.map(record).filter(message => message?.id === source.itemId) : [];
+  const payload = item?.type === "compacted"
+    ? matches.length === 1 ? matches[0] : undefined : record(item?.payload);
+  return payload?.type === "message" && payload.role === "user"
+    && record(payload.internal_chat_message_metadata_passthrough)?.turn_id === latestTurnId
+    && isDeepStrictEqual(payload.content, source.content);
+}
+
+interface NativeUserMessageIdentity {
+  id: string;
+  turnId: string;
+  content: unknown;
+}
+
+function nativeUserMessageIdentity(value: unknown): NativeUserMessageIdentity | undefined {
+  const payload = record(value);
+  const turnId = record(payload?.internal_chat_message_metadata_passthrough)?.turn_id;
+  return payload?.type === "message" && payload.role === "user"
+    && typeof payload.id === "string" && payload.id.length > 0
+    && typeof turnId === "string" && turnId.length > 0
+    ? { id: payload.id, turnId, content: payload.content }
+    : undefined;
+}
+
+function originalResponseItemIds(
+  fd: number,
+  size: number,
+  replacements: NativeUserMessageIdentity[],
+): Map<string, Set<string>> {
+  const matches = new Map(replacements.map(message => [message.id, new Set<string>()]));
+  let position = 0;
+  let carry = Buffer.alloc(0);
+  while (position < size) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
+    const chunk = Buffer.alloc(length);
+    const count = readSync(fd, chunk, 0, length, position);
+    if (count !== length) throw new Error("Codex rollout changed during message identity lookup");
+    position += length;
+    const data = Buffer.concat([carry, chunk]);
+    let start = 0;
+    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
+      const line = data.subarray(start, end);
+      start = end + 1;
+      if (!line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) {
+        throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      }
+      const item = parseJsonLine(line);
+      if (item.type !== "response_item") continue;
+      const candidate = nativeUserMessageIdentity(item.payload);
+      if (!candidate) continue;
+      for (const replacement of replacements) {
+        if (candidate.id === replacement.id || candidate.turnId !== replacement.turnId
+          || !isDeepStrictEqual(candidate.content, replacement.content)) continue;
+        matches.get(replacement.id)!.add(candidate.id);
+      }
+    }
+    carry = Buffer.from(data.subarray(start));
+    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) {
+      throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    }
+  }
+  // A trailing partial record can be concurrently written. It is not identity evidence until
+  // Codex terminates the JSONL record with a newline.
+  return matches;
+}
+
+/**
+ * Recover stable instruction ids after native local compaction re-ids retained user messages.
+ * Every alias requires one exact current replacement item and one unique earlier response_item
+ * with the same native turn and content. Ambiguous or incomplete evidence produces no alias.
+ */
+export interface ResolvedCodexRolloutMessageIdentity {
+  aliases?: Record<string, string>;
+  turnId: string;
+}
+
+export function resolveCurrentCodexRolloutMessageIdAliases(options: {
+  codexHome: string;
+  sqliteHome?: string;
+  lineage: RolloutIdentity;
+  turnId: string;
+  revisions: readonly ChatGptTurnUserRevision[];
+  compactionSource?: ChatGptTurnUserRevision;
+}): ResolvedCodexRolloutMessageIdentity | undefined {
+  const requested = options.revisions.filter((revision): revision is ChatGptTurnUserRevision & { itemId: string } => (
+    typeof revision.itemId === "string" && revision.itemId.length > 0
+  ));
+  if (requested.length === 0) return undefined;
+  const nativeThreadId = CODEX_ID.test(options.lineage.threadId);
+  const nativeTurnId = CODEX_ID.test(options.turnId);
+  if (!nativeThreadId && !nativeTurnId) return undefined;
+  if (!nativeThreadId || !nativeTurnId
+    || ("parentThreadId" in options.lineage && !CODEX_ID.test(options.lineage.parentThreadId))) return undefined;
+
+  try {
+    const indexed = indexedRollout(configuredSqliteHome(options.codexHome, options.sqliteHome), options.lineage);
+    const candidates = indexed.kind === "found"
+      ? [indexed.path]
+      : scanCanonicalRollouts(options.codexHome, options.lineage.threadId);
+    const recovered: ResolvedCodexRolloutMessageIdentity[] = [];
+    for (const candidate of candidates) {
+      const rolloutPath = validateRolloutPath(options.codexHome, candidate, options.lineage.threadId);
+      const fd = openSync(rolloutPath, "r");
+      try {
+        const size = fstatSync(fd).size;
+        if (!Number.isSafeInteger(size) || size <= 0) continue;
+        validateSessionMeta(firstRolloutRecord(fd, size), options.lineage);
+        const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
+        const aliasTurnId = latest?.turn_id === options.turnId
+          ? options.turnId
+          : authenticatesCompactionSource(fd, size, options.compactionSource, latest?.turn_id)
+            ? latest?.turn_id
+            : undefined;
+        if (typeof aliasTurnId !== "string") continue;
+        const compacted = latestRolloutRecord(fd, size, item => item.type === "compacted");
+        const replacementHistory = record(compacted?.payload)?.replacement_history;
+        const aliases: Record<string, string> = {};
+        if (Array.isArray(replacementHistory)) {
+          const replacements: NativeUserMessageIdentity[] = [];
+          for (const revision of requested) {
+            const exact = replacementHistory.map(nativeUserMessageIdentity).filter((message): message is NativeUserMessageIdentity => (
+              message !== undefined
+              && message.id === revision.itemId
+              && message.turnId === aliasTurnId
+              && isDeepStrictEqual(message.content, revision.content)
+            ));
+            if (exact.length === 1) replacements.push(exact[0]!);
+          }
+          if (replacements.length > 0) {
+            const originals = originalResponseItemIds(fd, size, replacements);
+            for (const replacement of replacements) {
+              const ids = [...(originals.get(replacement.id) ?? [])];
+              if (ids.length === 1) aliases[replacement.id] = ids[0]!;
+            }
+          }
+        }
+        if (options.compactionSource || Object.keys(aliases).length > 0) {
+          recovered.push({
+            turnId: aliasTurnId,
+            ...(Object.keys(aliases).length > 0 ? { aliases } : {}),
+          });
+        }
+      } finally {
+        closeSync(fd);
+      }
+    }
+    if (recovered.length !== 1) return undefined;
+    return recovered[0];
+  } catch {
+    // This mapping is only a replay optimization. Missing, changing, or malformed rollout state
+    // must fail closed to the new id instead of weakening ordinary environment validation.
+    return undefined;
+  }
 }
 
 function verifyHistoricalEnvironmentMessages(
@@ -609,6 +779,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   lineage: RolloutIdentity;
   turnId: string;
   compactionSourceTurnId?: string;
+  compactionSource?: ChatGptTurnUserRevision;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
 }): ChatGptTurnEnvironment | undefined {
@@ -638,9 +809,10 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       const size = fstatSync(fd).size;
       if (!Number.isSafeInteger(size) || size <= 0) throw new Error("Codex rollout is empty");
       validateSessionMeta(firstRolloutRecord(fd, size), lineage);
-      const latest = latestTurnContext(fd, size);
+      const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
       if (!latest) throw new Error("Codex rollout has no complete turn context");
-      if (latest.turn_id !== turnId && (compactionSourceTurnId === undefined || latest.turn_id !== compactionSourceTurnId)) {
+      if (latest.turn_id !== turnId && (compactionSourceTurnId === undefined || latest.turn_id !== compactionSourceTurnId)
+        && !authenticatesCompactionSource(fd, size, options.compactionSource, latest.turn_id)) {
         if (indexed.kind === "found") {
           throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
         }

@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
-import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
+import { COMPACT_PROMPT, encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { CodexParsedRequest, CodexTool } from "../src/types";
 
@@ -1038,6 +1038,89 @@ describe("trusted Codex task environment continuity", () => {
       cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
       tools: request.context.tools,
     });
+  });
+
+  for (const fault of ["none", "content", "id", "older turn", "missing record", "sandbox", "current update", "re-id", "discarded", "guardian only", "duplicate id"]) {
+    test(`local compaction proves an untagged source from the latest native turn (fault: ${fault})`, () => {
+      const { codexHome, request, rolloutPath } = resumedRootFixture();
+      const body = request._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+      const source = structuredClone(body.input[0]!);
+      const native = { type: "response_item", payload: source };
+      if (fault === "older turn") source.internal_chat_message_metadata_passthrough = { turn_id: "01a06c66-0000-75c6-a0df-318f890ef6de" };
+      if (fault !== "missing record") writeFileSync(rolloutPath, readFileSync(rolloutPath, "utf8") + JSON.stringify(native) + "\n");
+      if (["re-id", "discarded", "guardian only", "duplicate id"].includes(fault)) {
+        const retained = { ...source, id: "msg_retained" };
+        const replacement = fault === "discarded" || fault === "guardian only" ? []
+          : fault === "duplicate id" ? [retained, retained] : [retained];
+        writeFileSync(rolloutPath, readFileSync(rolloutPath, "utf8") + JSON.stringify({
+          type: "compacted", payload: { replacement_history: replacement, guardian_history: [source, retained] },
+        }) + "\n");
+        if (fault !== "discarded") body.input[0]!.id = retained.id;
+      }
+      request._compactionRequest = true;
+      request._compactionOutput = "message";
+      const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+      metadata.turn_id = "01a06c66-0001-75c6-a0df-318f890ef6de";
+      metadata.request_kind = "compaction";
+      if (fault === "sandbox") metadata.sandbox_mode = "read-only";
+      body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      delete body.input[0]!.internal_chat_message_metadata_passthrough;
+      if (fault === "content") body.input[0]!.content = [{ type: "input_text", text: "Changed instruction" }];
+      if (fault === "id") body.input[0]!.id = "msg_unrelated";
+      if (fault === "current update") body.input.push({
+        type: "message", role: "user", id: "msg_invalid_update",
+        internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id },
+        content: [{ type: "input_text", text: "<environment_context><cwd>invalid</cwd></environment_context>" }],
+      });
+      body.input.push({ type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] });
+      const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+      if (fault === "none" || fault === "re-id") {
+        expect(store.resolve(request).cwd).toBe(root);
+        expect(request._chatGptCompactionSourceTurnId).toBe(rolloutTurnId);
+      } else expect(() => store.resolve(request)).toThrow();
+    });
+  }
+
+  test("local compaction re-id maps a retained instruction only to one exact native predecessor", () => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const source = structuredClone(body.input[0]!);
+    const retained = { ...source, id: "msg_retained_after_compaction" };
+    writeFileSync(rolloutPath, readFileSync(rolloutPath, "utf8") + [
+      JSON.stringify({ type: "response_item", payload: source }),
+      JSON.stringify({ type: "compacted", payload: { replacement_history: [retained] } }),
+    ].join("\n") + "\n");
+    body.input[0] = retained;
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request).cwd).toBe(root);
+    expect(request._chatGptMessageIdAliases).toEqual({
+      msg_retained_after_compaction: "msg_child_prompt",
+    });
+
+    const compact = structuredClone(request);
+    compact._compactionRequest = true;
+    compact._compactionOutput = "message";
+    const compactBody = compact._rawBody as { client_metadata: Record<string, string> };
+    const compactMetadata = JSON.parse(compactBody.client_metadata["x-codex-turn-metadata"]!);
+    compactBody.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      ...compactMetadata,
+      request_kind: "compaction",
+      turn_id: "01a06c66-0001-75c6-a0df-318f890ef6de",
+    });
+    delete (compact._rawBody as { input: Array<Record<string, unknown>> }).input[0]!
+      .internal_chat_message_metadata_passthrough;
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(compact).cwd).toBe(root);
+    expect(compact._chatGptMessageIdAliases).toEqual({
+      msg_retained_after_compaction: "msg_child_prompt",
+    });
+    expect(compact._chatGptCompactionSourceTurnId).toBe(rolloutTurnId);
+
+    writeFileSync(rolloutPath, readFileSync(rolloutPath, "utf8") + JSON.stringify({
+      type: "response_item",
+      payload: { ...source, id: "msg_same_instruction_again" },
+    }) + "\n");
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+    expect(request._chatGptMessageIdAliases).toBeUndefined();
   });
 
   test.skipIf(process.platform !== "win32")("resumed Windows tasks accept the same indexed rollout with either path namespace", () => {

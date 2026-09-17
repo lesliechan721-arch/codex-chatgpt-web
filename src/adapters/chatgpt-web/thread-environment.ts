@@ -21,7 +21,10 @@ import {
   type ChatGptTurnEnvironment,
   type ChatGptTurnUserRevision,
 } from "./environment";
-import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
+import {
+  resolveCurrentCodexRolloutEnvironment,
+  resolveCurrentCodexRolloutMessageIdAliases,
+} from "./codex-rollout-environment";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -266,6 +269,7 @@ export class ChatGptThreadEnvironmentStore {
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
+    this.attachNativeMessageIdAliases(parsed, identity.turnId);
     try {
       const environment = extractChatGptTurnEnvironment(parsed);
       if (identity.threadId) this.set(identity.threadId, environment, parsed);
@@ -282,15 +286,16 @@ export class ChatGptThreadEnvironmentStore {
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
-      const compactionSourceTurnId = parsed._compactionRequest
-        ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
+      const compactionSource = parsed._compactionRequest
+        ? extractChatGptCompactionSourceRevision(parsed) : undefined;
       if (rolloutIdentity && identity.turnId) {
         const rolloutEnvironment = resolveCurrentCodexRolloutEnvironment({
           codexHome: this.codexHome,
           ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
           lineage: rolloutIdentity,
           turnId: identity.turnId,
-          ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}),
+          ...(compactionSource?.turnId ? { compactionSourceTurnId: compactionSource.turnId } : {}),
+          ...(compactionSource && !compactionSource.turnId ? { compactionSource } : {}),
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
           tools: parsed.context.tools,
         });
@@ -351,6 +356,38 @@ export class ChatGptThreadEnvironmentStore {
       };
       this.set(lineage.threadId, inherited, parsed);
       return inherited;
+    }
+  }
+
+  private attachNativeMessageIdAliases(parsed: CodexParsedRequest, turnId?: string): void {
+    delete parsed._chatGptMessageIdAliases;
+    delete parsed._chatGptCompactionSourceTurnId;
+    if (!turnId) return;
+    try {
+      const compactionSource = parsed._compactionRequest
+        ? extractChatGptCompactionSourceRevision(parsed)
+        : undefined;
+      const revisions = compactionSource ? [compactionSource] : chatGptTurnUserRevisionHistory(parsed);
+      const aliasTurnId = compactionSource?.turnId ?? turnId;
+      // A standalone compaction envelope owns a new turn id. Its source execution key must use
+      // the retained instruction's native turn. Real local-compaction wire history can omit that
+      // turn id, so rollout evidence must be allowed to authenticate the exact retained source.
+      const lineage = extractChatGptThreadSpawnLineage(parsed);
+      const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      if (!rolloutIdentity) return;
+      const resolved = resolveCurrentCodexRolloutMessageIdAliases({
+        codexHome: this.codexHome,
+        ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+        lineage: rolloutIdentity,
+        turnId: aliasTurnId,
+        revisions,
+        ...(compactionSource && !compactionSource.turnId ? { compactionSource } : {}),
+      });
+      if (resolved?.aliases) parsed._chatGptMessageIdAliases = resolved.aliases;
+      if (compactionSource && resolved?.turnId) parsed._chatGptCompactionSourceTurnId = resolved.turnId;
+    } catch {
+      // Alias recovery changes replay identity only. Normal environment validation below remains
+      // authoritative, so missing or malformed optional identity evidence must not change it.
     }
   }
 

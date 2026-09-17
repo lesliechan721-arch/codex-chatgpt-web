@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -52,12 +52,14 @@ function request(turnId: string): CodexParsedRequest {
       input: [
         {
           type: "message",
+          id: "msg_environment",
           role: "user",
           content: [{ type: "input_text", text: environment }],
           internal_chat_message_metadata_passthrough: { turn_id: turnId },
         },
         {
           type: "message",
+          id: "msg_instruction",
           role: "user",
           content: [{ type: "input_text", text: "Inspect the Zero Risk transport." }],
           internal_chat_message_metadata_passthrough: { turn_id: turnId },
@@ -101,16 +103,57 @@ for (const scenario of [
   { format: "v2", finalWins: true, apiKey: false },
   { format: "v1", finalWins: false, apiKey: true },
   { format: "v2", finalWins: false, apiKey: true },
+  { format: "local", finalWins: false, apiKey: true },
+  { format: "local", finalWins: true, apiKey: true },
 ] as const) test(`Zero Risk ${scenario.format} compaction resumes with exact launcher ownership (final wins: ${scenario.finalWins}, API key: ${scenario.apiKey})`, async () => {
   // Real adapter, broker, and launcher lifecycle. Only the Electron view/clipboard and the
   // human/model actions are simulated: a mock start/end that omits tombstones misses #318.
   const require = createRequire(import.meta.url);
   const { BrowserHost } = require("../launcher/electron/browser-host.cjs");
   const { BrowserControlServer } = require("../launcher/electron/control-server.cjs");
+  const reIdAfterLocalCompaction = scenario.format === "local";
+  const nativeThreadId = "01be7f20-1111-7111-8111-111111111111";
+  const nativeTurnId = "01be7f20-2222-7222-8222-222222222222";
+  const nativeCompactTurnId = "01be7f20-3333-7333-8333-333333333333";
+  const nativeSecondCompactTurnId = "01be7f20-5555-7555-8555-555555555555";
+  const codexHome = join(root, `codex-home-local-reid-${scenario.finalWins}`);
+  let rolloutPath: string | undefined;
+  if (reIdAfterLocalCompaction) {
+    const rolloutDir = join(codexHome, "sessions", "2026", "09", "17");
+    mkdirSync(rolloutDir, { recursive: true });
+    rolloutPath = join(rolloutDir, `rollout-2026-09-17T20-00-00-${nativeThreadId}.jsonl`);
+    writeFileSync(rolloutPath, [
+      JSON.stringify({ type: "session_meta", payload: { id: nativeThreadId, source: "vscode" } }),
+      JSON.stringify({
+        type: "turn_context",
+        payload: {
+          turn_id: nativeTurnId,
+          cwd: root,
+          workspace_roots: [root],
+          approval_policy: "never",
+          sandbox_policy: { type: "danger-full-access" },
+          permission_profile: { type: "disabled" },
+          model: "chatgpt-web/zero-risk",
+          summary: "auto",
+        },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          id: "msg_instruction",
+          role: "user",
+          content: [{ type: "input_text", text: "Inspect the Zero Risk transport." }],
+          internal_chat_message_metadata_passthrough: { turn_id: nativeTurnId },
+        },
+      }),
+    ].join("\n") + "\n");
+  }
   const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}`);
   config.chatgptWeb!.threadEnvironmentStatePath = join(root, `environment-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}.json`);
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
+  const localCompactPrompt = "CUSTOM_LOCAL_COMPACT_PROMPT preserve database migration and rollback steps.";
   const logs: string[] = [];
   const logger = { info(event: string) { logs.push(event); }, warn() {}, error() {} };
   const host = Object.assign(Object.create(BrowserHost.prototype), {
@@ -175,6 +218,9 @@ for (const scenario of [
           arguments: { cmd: "pwd" },
         }, null);
         if (!scenario.finalWins) expect(JSON.stringify(result)).toContain("codex_turn_complete");
+        if (scenario.format === "local" && !scenario.finalWins) {
+          expect(JSON.stringify(result)).toContain(localCompactPrompt);
+        }
         await callTurnBroker(socket, { method: "activity_complete", token, activityId: claim.activityId });
         broker.completeSafeTurn(token, scenario.finalWins
           ? "Ordinary final answer before compaction"
@@ -187,8 +233,35 @@ for (const scenario of [
     },
     async cancel(_path, owner) { host.cancelManualTurn(owner.traceId, owner.helperPid); },
   };
-  const adapter = createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control });
-  const source = request("turn_safe_active_compaction");
+  const createAdapter = () => {
+    if (!reIdAfterLocalCompaction) {
+      return createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control });
+    }
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+    try {
+      return createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control });
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
+  };
+  const adapter = createAdapter();
+  const source = request(reIdAfterLocalCompaction ? nativeTurnId : "turn_safe_active_compaction");
+  if (reIdAfterLocalCompaction) {
+    const raw = source._rawBody as {
+      prompt_cache_key: string;
+      client_metadata: Record<string, string>;
+    };
+    raw.prompt_cache_key = nativeThreadId;
+    raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      request_kind: "turn",
+      thread_id: nativeThreadId,
+      turn_id: nativeTurnId,
+      sandbox_mode: "danger-full-access",
+      workspaces: { [root]: {} },
+    });
+  }
   source.context.tools = [{ name: "exec_command", description: "Run a command", parameters: { type: "object" } }];
   const events: AdapterEvent[] = [];
   const checkpoint: AdapterEvent[] = [];
@@ -197,6 +270,7 @@ for (const scenario of [
   const appConfig = { ...defaultConfig("full"), browserInteractionMode: "manual" as const };
   const apiRequest = (parsed: CodexParsedRequest, v1 = false) => {
     const raw = parsed._rawBody as { input: unknown[]; client_metadata: Record<string, string> };
+    const local = parsed._compactionRequest && scenario.format === "local";
     return new Request(`http://127.0.0.1/v1/responses${v1 ? "/compact" : ""}`, {
       method: "POST",
       headers: {
@@ -206,7 +280,13 @@ for (const scenario of [
       body: JSON.stringify({
         ...raw, model: "chatgpt-web/zero-risk", stream: false,
         ...(v1 ? { client_metadata: undefined } : {}),
-        input: [...raw.input, ...(parsed._compactionRequest && !v1 ? [{ type: "compaction_trigger" }] : [])],
+        ...(local ? { client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+          ...JSON.parse(raw.client_metadata["x-codex-turn-metadata"]!),
+          request_kind: "compaction", compaction: { implementation: "responses", phase: "standalone_turn", strategy: "memento" },
+        }) } } : {}),
+        input: [...raw.input, ...(parsed._compactionRequest && !v1 ? [local
+          ? { type: "message", role: "user", content: [{ type: "input_text", text: localCompactPrompt }] }
+          : { type: "compaction_trigger" }] : [])],
         tools: [{ type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object" } }],
       }),
     });
@@ -219,6 +299,15 @@ for (const scenario of [
         expect(parsed.previousResponseId).toBeUndefined();
         expect(parsed._replayPrefixLen ?? 0).toBe(0);
       }
+      await real.runTurn!(parsed, incoming, event => {
+        (parsed._compactionRequest ? checkpoint : events).push(event);
+        emit(event);
+      });
+    } };
+  };
+  const rolloutApiAdapter = (): ProviderAdapter => {
+    const real = createAdapter();
+    return { ...real, async runTurn(parsed, incoming, emit) {
       await real.runTurn!(parsed, incoming, event => {
         (parsed._compactionRequest ? checkpoint : events).push(event);
         emit(event);
@@ -254,8 +343,13 @@ for (const scenario of [
     if (scenario.apiKey) {
       // A standalone/pre-turn compact has a new envelope turn id, but its full history still
       // belongs to the source turn. No previous_response_id or authenticated replay is sent.
-      (compact._rawBody as { client_metadata: Record<string, string> }).client_metadata = {
-        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_safe_adapter", turn_id: "turn_safe_http_compaction" }),
+      const compactRaw = compact._rawBody as { client_metadata: Record<string, string> };
+      const compactMetadata = JSON.parse(compactRaw.client_metadata["x-codex-turn-metadata"]!);
+      compactRaw.client_metadata = {
+        "x-codex-turn-metadata": JSON.stringify({
+          ...compactMetadata,
+          turn_id: reIdAfterLocalCompaction ? nativeCompactTurnId : "turn_safe_http_compaction",
+        }),
       };
       const sendCompact = (request = compact) => scenario.format === "v1"
         ? compactRequest(apiRequest(request, true), appConfig, apiAdapter, { accessPolicy })
@@ -266,7 +360,13 @@ for (const scenario of [
       }];
       const wrongThread = structuredClone(compact);
       (wrongThread._rawBody as { client_metadata: Record<string, string> }).client_metadata = {
-        "x-codex-turn-metadata": JSON.stringify({ thread_id: "unrelated_thread", turn_id: "turn_safe_http_compaction" }),
+        "x-codex-turn-metadata": JSON.stringify({
+          ...compactMetadata,
+          thread_id: reIdAfterLocalCompaction
+            ? "01be7f20-4444-7444-8444-444444444444"
+            : "unrelated_thread",
+          turn_id: reIdAfterLocalCompaction ? nativeCompactTurnId : "turn_safe_http_compaction",
+        }),
       };
       for (const rejected of [forgedHistory, wrongThread]) {
         const response = await sendCompact(rejected);
@@ -276,19 +376,24 @@ for (const scenario of [
       }
       checkpoint.length = 0;
       const response = await sendCompact();
-      const body = await response.json() as { error?: unknown; status?: string; output?: Array<{ encrypted_content?: string }> };
+      const body = await response.json() as { error?: unknown; status?: string; output?: Array<{ type?: string; content?: unknown; encrypted_content?: string }> };
       expect(body.error).toBeFalsy();
       expect(response.status).toBe(200);
       expect(body.output?.length).toBeGreaterThan(0);
       if (scenario.format === "v2") expect(body.status).toBe("completed");
+      if (scenario.format === "local") {
+        expect(body.status).toBe("completed");
+        expect(body.output?.[0]?.type).toBe("message");
+      }
       // An HTTP retry must reuse the accepted summary after the source was retired.
       const replay = await sendCompact();
       expect(replay.status).toBe(200);
-      const replayBody = await replay.json() as { output: Array<{ encrypted_content?: string }> };
+      const replayBody = await replay.json() as { output: Array<{ content?: unknown; encrypted_content?: string }> };
       if (scenario.format === "v1") expect(replayBody.output).toEqual(body.output!);
+      else if (scenario.format === "local") expect(replayBody.output[0]?.content).toEqual(body.output?.[0]?.content);
       else expect(replayBody.output[0]?.encrypted_content)
         .toBe(body.output?.[0]?.encrypted_content);
-      expect(starts).toHaveLength(1);
+      expect(starts).toHaveLength(scenario.finalWins ? 2 : 1);
       checkpoint.splice(checkpoint.findIndex(event => event.type === "done") + 1);
     } else {
       await adapter.runTurn!(compact, { headers: new Headers() }, event => checkpoint.push(event));
@@ -304,6 +409,18 @@ for (const scenario of [
     } : {
       type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }],
     });
+    if (reIdAfterLocalCompaction) {
+      if (!rolloutPath) throw new Error("Missing native rollout for local re-id regression");
+      const raw = continuation._rawBody as { input: Array<Record<string, unknown>> };
+      const instruction = raw.input.find(item => item.id === "msg_instruction");
+      if (!instruction) throw new Error("Missing source instruction for local re-id regression");
+      const retained = { ...instruction, id: "msg_instruction_after_compaction" };
+      appendFileSync(rolloutPath, JSON.stringify({
+        type: "compacted",
+        payload: { replacement_history: [retained] },
+      }) + "\n");
+      instruction.id = retained.id;
+    }
     const final: AdapterEvent[] = [];
     await adapter.runTurn!(continuation, { headers: new Headers() }, event => final.push(event));
     expect(starts).toHaveLength(2);
@@ -315,6 +432,68 @@ for (const scenario of [
     expect(starts).toHaveLength(2); // exact reconnect replays, it must not submit again
     expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
     expect(() => host.beginManualTurn(starts[0], process.pid, "old prompt")).toThrow("already completed");
+
+    if (scenario.format === "local" && !scenario.finalWins) {
+      if (!rolloutPath) throw new Error("Missing native rollout for repeated local compaction regression");
+      const secondCompact = structuredClone(continuation);
+      secondCompact._compactionRequest = true;
+      secondCompact._compactionOutput = "message";
+      const secondCompactRaw = secondCompact._rawBody as { client_metadata: Record<string, string> };
+      const secondCompactMetadata = JSON.parse(secondCompactRaw.client_metadata["x-codex-turn-metadata"]!);
+      secondCompactRaw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+        ...secondCompactMetadata,
+        request_kind: "compaction",
+        turn_id: nativeSecondCompactTurnId,
+      });
+      const secondCompactInstruction = (secondCompact._rawBody as { input: Array<Record<string, unknown>> }).input
+        .find(item => item.id === "msg_instruction_after_compaction");
+      if (!secondCompactInstruction) throw new Error("Missing retained instruction for second local compaction");
+      delete secondCompactInstruction.internal_chat_message_metadata_passthrough;
+
+      checkpoint.length = 0;
+      const secondResponse = await responseRequest(
+        apiRequest(secondCompact), appConfig, rolloutApiAdapter, { accessPolicy, rememberState: false },
+      );
+      const secondBody = await secondResponse.json() as {
+        error?: unknown;
+        status?: string;
+        output?: Array<{ type?: string; content?: unknown }>;
+      };
+      expect(secondResponse.status).toBe(200);
+      expect(secondBody.error).toBeFalsy();
+      expect(secondBody.status).toBe("completed");
+      expect(secondBody.output?.[0]?.type).toBe("message");
+      const startsAfterSecondCompaction = starts.length;
+      const secondSummary = checkpoint
+        .filter(event => event.type === "text_delta")
+        .map(event => event.text)
+        .join("");
+      expect(secondSummary.length).toBeGreaterThan(0);
+
+      const secondContinuation = structuredClone(continuation);
+      const secondContinuationRaw = secondContinuation._rawBody as { input: Array<Record<string, unknown>> };
+      const currentInstruction = secondContinuationRaw.input.find(item => item.id === "msg_instruction_after_compaction");
+      if (!currentInstruction) throw new Error("Missing first retained instruction for repeated local compaction regression");
+      const retainedAgain = { ...currentInstruction, id: "msg_instruction_after_second_compaction" };
+      appendFileSync(rolloutPath, JSON.stringify({
+        type: "compacted",
+        payload: { replacement_history: [retainedAgain] },
+      }) + "\n");
+      currentInstruction.id = retainedAgain.id;
+      secondContinuationRaw.input.push({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${secondSummary}` }],
+      });
+
+      const secondFinal: AdapterEvent[] = [];
+      await adapter.runTurn!(secondContinuation, { headers: new Headers() }, event => secondFinal.push(event));
+      expect(starts).toHaveLength(startsAfterSecondCompaction);
+      expect(secondFinal.some(event => (
+        event.type === "text_delta" && event.text === "Final answer after compaction"
+      ))).toBeTrue();
+      expect(secondFinal.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    }
   } finally {
     chatGptTurnSessions.clear();
     for (const tab of host.turnTabs.values()) clearTimeout(tab.manualDeadlineTimer);

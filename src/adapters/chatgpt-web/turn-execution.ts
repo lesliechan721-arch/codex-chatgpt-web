@@ -184,9 +184,16 @@ function compactionInputRevision(parsed: CodexParsedRequest): unknown[] {
   return input;
 }
 
+function canonicalMessageId(parsed: CodexParsedRequest, itemId: string | undefined): string | undefined {
+  if (!itemId) return undefined;
+  const alias = parsed._chatGptMessageIdAliases?.[itemId];
+  return typeof alias === "string" && alias.length > 0 ? alias : itemId;
+}
+
 export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
+  const currentRevision = chatGptTurnUserRevisionHistory(parsed).at(-1);
   return executionKey(parsed, {
     threadId: identity.threadId,
     turnId: identity.turnId,
@@ -194,7 +201,7 @@ export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
     revision: parsed._compactionRequest
       ? compactionInputRevision(parsed)
       : extractChatGptTurnUserRevision(parsed),
-    ...(!parsed._compactionRequest ? { instructionId: chatGptTurnUserRevisionHistory(parsed).at(-1)?.itemId } : {}),
+    ...(!parsed._compactionRequest ? { instructionId: canonicalMessageId(parsed, currentRevision?.itemId) } : {}),
   });
 }
 
@@ -205,7 +212,7 @@ export interface ChatGptInstructionLineage {
 
 export function chatGptInstructionLineage(parsed: CodexParsedRequest): ChatGptInstructionLineage {
   const revisions = chatGptTurnUserRevisionHistory(parsed).map(revision => createHash("sha256")
-    .update(JSON.stringify([revision.itemId ?? null, revision.content])).digest("hex"));
+    .update(JSON.stringify([canonicalMessageId(parsed, revision.itemId) ?? null, revision.content])).digest("hex"));
   const current = revisions.pop();
   if (!current) throw new Error("ChatGPT web requires a canonical user instruction");
   return { current, predecessors: new Set(revisions) };
@@ -260,10 +267,10 @@ export function chatGptCompactionSourceExecutionKey(parsed: CodexParsedRequest):
   const source = extractChatGptCompactionSourceRevision(parsed);
   return executionKey(parsed, {
     threadId: identity.threadId,
-    turnId: source.turnId ?? identity.turnId,
+    turnId: source.turnId ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId,
     purpose: "response",
     revision: source.content,
-    instructionId: source.itemId,
+    instructionId: canonicalMessageId(parsed, source.itemId),
   });
 }
 

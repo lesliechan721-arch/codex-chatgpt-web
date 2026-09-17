@@ -4,6 +4,7 @@ import type {
   CodexParsedRequest,
   CodexToolResultMessage,
 } from "../../types";
+import { COMPACT_PROMPT } from "../../responses/compaction";
 import { extractChatGptCompactionSourceRevision } from "./environment";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { ChatGptCompactionHandoffAccepted } from "./adapter-error";
@@ -58,27 +59,43 @@ function interruptedByActiveCompaction(): BrokerToolResult {
   };
 }
 
-function withZeroRiskCompactionInstruction(result: BrokerToolResult): BrokerToolResult {
+function withZeroRiskCompactionInstruction(
+  result: BrokerToolResult,
+  compactPrompt: string,
+): BrokerToolResult {
   return {
     ...result,
     content: [
       ...result.content,
       {
         type: "text",
-        text: zeroRiskActiveCompactionToolResultInstruction(true),
+        text: zeroRiskActiveCompactionToolResultInstruction(true, compactPrompt),
       },
     ],
   };
 }
 
-function interruptedByZeroRiskCompaction(): BrokerToolResult {
+function interruptedByZeroRiskCompaction(compactPrompt: string): BrokerToolResult {
   return {
     content: [{
       type: "text",
-      text: zeroRiskActiveCompactionToolResultInstruction(false),
+      text: zeroRiskActiveCompactionToolResultInstruction(false, compactPrompt),
     }],
     isError: true,
   };
+}
+
+function compactionPrompt(parsed: CodexParsedRequest): string {
+  if (parsed._compactionOutput !== "message") return COMPACT_PROMPT;
+  const control = parsed.context.messages.at(-1);
+  if (control?.role !== "user") {
+    throw new Error("Local compaction is missing its native compact_prompt control message");
+  }
+  const text = typeof control.content === "string"
+    ? control.content
+    : control.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+  if (!text.trim()) throw new Error("Local compaction compact_prompt must not be empty");
+  return text;
 }
 
 function userPromptText(content: unknown): string | undefined {
@@ -221,6 +238,7 @@ export async function settleActiveZeroRiskCompactionSource(
   broker: TurnBrokerOwner,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
+  const compactPrompt = compactionPrompt(parsed);
   return source.runExclusive(async () => {
     if (signal?.aborted) {
       source.cancel(abortReason(signal));
@@ -241,7 +259,7 @@ export async function settleActiveZeroRiskCompactionSource(
       token = await source.runtime.token;
       const interruptedQueued = await broker.requestCompaction(
         token,
-        interruptedByZeroRiskCompaction(),
+        interruptedByZeroRiskCompaction(compactPrompt),
       );
       for (const [index, request] of outstanding.entries()) {
         const result = results.get(request.callId)!;
@@ -250,7 +268,7 @@ export async function settleActiveZeroRiskCompactionSource(
           token,
           request.callId,
           interruptedQueued === 0 && index === outstanding.length - 1
-            ? withZeroRiskCompactionInstruction(canonical)
+            ? withZeroRiskCompactionInstruction(canonical, compactPrompt)
             : canonical,
         );
         source.runtime.externalProgress.recordToolResult();
@@ -310,7 +328,7 @@ export async function requestRetainedCompactionHandoff(
       }
     }, () => {});
     transaction = await withCompactionAbort(transactionPromise, operationSignal);
-    const instruction = structuredCompactionHandoffInstruction(transaction);
+    const instruction = structuredCompactionHandoffInstruction(transaction, compactionPrompt(parsed));
     const prepare = async () => ({ text: instruction, images: [], release: () => {} });
     browser = worker.run({
       traceId,
