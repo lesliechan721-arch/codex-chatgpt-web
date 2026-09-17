@@ -6,6 +6,8 @@ import { API_KEY_ENV, OPENAI_ACCESS, apiKeyMatches, apiKeyPolicy, generateApiKey
 import { apiAccessConfigPath, loadApiAccessPolicy, saveApiAccessPolicy } from "./api-access-config";
 import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
+import { installCodexIntegration } from "./codex-integration";
+import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { renderApiKeyCodexConfig } from "./api-key-codex-config";
 
 async function readKeyFromStdin(): Promise<string> {
@@ -24,8 +26,8 @@ async function readKeyFromStdin(): Promise<string> {
 
 export async function runApiKeyCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
-  if (!["enable", "rotate", "disable", "status", "codex-config"].includes(action)) {
-    throw new Error("API key command must be enable, rotate, disable, status or codex-config");
+  if (!["enable", "rotate", "disable", "status", "codex-config", "cleanup", "reconnect"].includes(action)) {
+    throw new Error("API key command must be enable, rotate, disable, status, codex-config, cleanup or reconnect");
   }
   if (action === "enable" || action === "rotate") {
     if (args.length !== 1 || (args[0] !== "--generate" && args[0] !== "--key-stdin")) {
@@ -44,6 +46,8 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     // stdout contains only the newly generated secret, so callers can capture it without parsing.
     // Imported secrets are never echoed, and status/config export never reveals any secret/hash.
     if (generated) stdout.write(`${key}\n`);
+    try { cleanupApiKeyCodexIntegration(); }
+    catch { stderr.write("Saved, but recorded Codex injection needs manual conflict resolution; run api-key cleanup.\n"); }
     stderr.write(`API key mode saved. Restart the service/Launcher to apply it; an already-running process keeps its previous policy.\n`);
     stderr.write(`Set ${API_KEY_ENV} in the Codex client environment. Browser ChatGPT login and Full-mode tunnel credentials remain separate.\n`);
     return;
@@ -56,6 +60,16 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     return;
   }
   const policy = loadApiAccessPolicy();
+  if (action === "reconnect") {
+    if (policy.mode !== "openai") throw new Error("API Key mode never installs Codex configuration");
+    installCodexIntegration(loadConfig());
+    stdout.write(`${JSON.stringify({ installed: true })}\n`);
+    return;
+  }
+  if (action === "cleanup") {
+    stdout.write(`${JSON.stringify(cleanupApiKeyCodexIntegration())}\n`);
+    return;
+  }
   if (action === "status") {
     stdout.write(`${JSON.stringify({
       configured_mode: policy.mode,
@@ -77,6 +91,8 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     catalogPath,
     model: route.slug,
     reasoningEffort: route.codexEffort,
+    subagentProtocol: config.subagentProtocol,
+    runtimeCommand: config.runtimeCommand,
   }));
   stderr.write("Local model catalog exported. Re-export after account capabilities, browser mode or context settings change.\n");
 }

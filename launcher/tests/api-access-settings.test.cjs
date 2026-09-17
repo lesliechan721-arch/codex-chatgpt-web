@@ -1,252 +1,194 @@
-const { test } = require("node:test");
+const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { createHash } = require("node:crypto");
-const {
-  createApiAccessSettings, keyPolicy, parsePolicy, policyRevision, readPolicyFile,
-} = require("../electron/api-access-settings.cjs");
-
+const { createCipheriv, createDecipheriv } = require("node:crypto");
+const { createApiAccessSettings, keyPolicy, parsePolicy, policyRevision, validateChange } = require("../electron/api-access-settings.cjs");
 const KEY = "cgw_" + "a".repeat(43);
-const KEY2 = "cgw_" + "b".repeat(43);
-const CONTROL = "c".repeat(43);
-const OPENAI = { version: 1, mode: "openai" };
+const NEXT = "cgw_" + "b".repeat(43);
 
-function harness(t, options = {}) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cgw-gui-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const file = path.join(home, "api-access.json");
-  const write = value => fs.writeFileSync(file, JSON.stringify(value));
-  if (options.policy) write(options.policy);
-  const events = [];
-  const config = { browserHost: "launcher", port: 17841, controlToken: CONTROL };
-  let configured = options.configured !== false;
-  let health = null;
-  let operation = null;
-  let confirm = options.confirm !== false;
-  let failStarts = 0;
-  let failStops = 0;
-  let onStop = null;
-  let clipboardValue = "";
-  let timer;
-  const runtimeHost = {
-    launcherProfile: options.dev ? "development" : "production",
-    runtimeConfigSnapshot: () => ({ configured, owner: !configured ? "none" : options.external ? "external" : "launcher", config: configured ? config : undefined }),
-    currentOperation: () => operation,
-    runLifecycleOperation: async (name, run) => {
-      if (operation) throw new Error("other-operation");
-      operation = name;
-      try { return await run(); } finally { operation = null; }
-    },
-    run: async (name, args) => {
-      events.push(["run", name, args]);
-      return { stdout: 'requires_openai_auth = false\nenv_key = "CODEX_CHATGPT_WEB_API_KEY"\n' };
-    },
-  };
-  function setHealthy(policy = readPolicyFile(file).policy) {
-    health = { service: "codex-chatgpt-web", status: "ok", accepting_turns: true,
-      active_http_turns: 0, active_browser_turns: 0,
-      access_mode: policy.mode, api_access_revision: policyRevision(policy, CONTROL) };
-  }
-  if (configured) setHealthy();
-  const supervisor = {
-    proxyHealthPayload: async () => health,
-    stopForSetup: async () => {
-      events.push("stop");
-      if (failStops-- > 0 || health?.active_http_turns > 0 || health?.active_browser_turns > 0) throw new Error("not idle");
-      health = null;
-      if (onStop) await onStop();
-      return { status: "stopped" };
-    },
-    startIfConfigured: async () => {
-      events.push("start");
-      if (failStarts-- > 0) throw new Error("private upstream message never exposed");
-      if (configured) setHealthy();
-      return { status: configured ? "ready" : "not-configured" };
-    },
-  };
-  const browserHost = { activeTraceId: null, currentOperation: () => null };
-  const clipboard = { readText: () => clipboardValue, writeText: value => { clipboardValue = value; }, clear: () => { clipboardValue = ""; } };
-  const controller = createApiAccessSettings({ coreHome: home, runtimeHost, supervisor, browserHost, clipboard,
-    confirmChange: async details => { events.push(["confirm", details]); return confirm; },
-    setTimer: fn => { timer = fn; return 1; }, clearTimer: () => { timer = null; },
-  });
-  t.after(controller.dispose);
+function encryption() {
+  const secret = Buffer.alloc(32, 7);
   return {
-    controller, file, events, browserHost, runtimeHost, supervisor, write, setHealthy,
-    health: () => health,
-    clipboard: () => clipboardValue,
-    externalCopy: value => { clipboardValue = value; },
-    tick: () => timer?.(),
-    failStarts: n => { failStarts = n; }, failStops: n => { failStops = n; },
-    onStop: fn => { onStop = fn; }, busy: () => { operation = "other-operation"; },
-    change: async (mode, key) => controller.apply({ mode, ...(key === undefined ? {} : { key }), expectedRevision: (await controller.status()).revision }),
+    isEncryptionAvailable: () => true,
+    getSelectedStorageBackend: () => "gnome_libsecret",
+    encryptString: text => {
+      const cipher = createCipheriv("aes-256-gcm", secret, Buffer.alloc(12, 8));
+      const data = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+      return Buffer.concat([cipher.getAuthTag(), data]);
+    },
+    decryptString: bytes => {
+      const cipher = createDecipheriv("aes-256-gcm", secret, Buffer.alloc(12, 8));
+      cipher.setAuthTag(bytes.subarray(0, 16));
+      return Buffer.concat([cipher.update(bytes.subarray(16)), cipher.final()]).toString("utf8");
+    },
   };
 }
+function fixture(t, options = {}) {
+  const coreHome = fs.mkdtempSync(path.join(os.tmpdir(), "api-access-test-"));
+  t.after(() => fs.rmSync(coreHome, { recursive: true, force: true }));
+  const file = path.join(coreHome, "api-access.json");
+  const config = { port: 17841, controlToken: "c".repeat(43) };
+  const state = { configured: true, owner: "launcher", effective: { version: 1, mode: "openai" },
+    active: 0, operation: null, stopped: false, stopError: false, startError: false, cleanupError: false,
+    stops: 0, starts: 0, commands: [], clipboard: "", timer: null, ...options };
+  const host = {
+    launcherProfile: state.profile ?? "production",
+    currentOperation: () => state.operation,
+    runtimeConfigSnapshot: () => ({ configured: state.configured, owner: state.owner, ...(state.configured ? { config } : {}) }),
+    runLifecycleOperation: async (name, action) => {
+      assert.equal(state.operation, null); state.operation = name;
+      try { return await action(); } finally { state.operation = null; }
+    },
+    run: async (name, args) => {
+      assert.equal(state.operation, name); state.commands.push(args);
+      if (args[1] === "reconnect" && state.reconnectError) throw new Error("route conflict");
+      if (args[1] === "cleanup" && state.cleanupError) throw new Error("private arbitrary error");
+      return { stdout: args[1] === "codex-config"
+        ? 'requires_openai_auth = false\nenv_key = "CODEX_CHATGPT_WEB_API_KEY"\n' : '{"changed":false}\n' };
+    },
+  };
+  const supervisor = {
+    proxyHealthPayload: async () => state.stopped ? null : ({
+      service: "codex-chatgpt-web", status: "ok", accepting_turns: true,
+      access_mode: state.effective.mode, api_access_revision: policyRevision(state.effective, config.controlToken),
+      active_http_turns: state.active, active_browser_turns: 0,
+    }),
+    stopForSetup: async () => {
+      state.stops++; assert.ok(fs.existsSync(file), "policy is saved BEFORE stopping");
+      if (state.stopError) throw new Error("stop failed"); state.stopped = true;
+    },
+    startIfConfigured: async () => {
+      state.starts++; if (state.startError) throw new Error("start failed");
+      state.effective = JSON.parse(fs.readFileSync(file, "utf8")); state.stopped = false;
+      return { status: "ready" };
+    },
+  };
+  const safeStorage = options.safeStorage ?? encryption();
+  const create = () => createApiAccessSettings({ coreHome, runtimeHost: host, supervisor,
+    safeStorage, browserHost: { get activeTraceId() { return state.browserActive ? "trace" : null; }, currentOperation: () => null },
+    confirmChange: () => { throw new Error("mode changes no longer require a second confirmation"); },
+    clipboard: { readText: () => state.clipboard, writeText: text => { state.clipboard = text; }, clear: () => { state.clipboard = ""; } },
+    setTimer: fn => { state.timer = fn; return { unref() {} }; }, clearTimer: () => { state.timer = null; },
+  });
+  const controller = create(); t.after(() => controller.dispose());
+  const apply = async (mode = "api-key", key = KEY) => controller.apply({ mode,
+    ...(key !== undefined && mode === "api-key" ? { key } : {}), expectedRevision: (await controller.status()).revision });
+  return { controller, apply, state, file, coreHome, create, config };
+}
 
-test("version-1 parser rejects extra fields, bad digest and malformed objects", () => {
-  for (const value of [null, [], {}, { version: 2, mode: "openai" }, { ...OPENAI, key: KEY }, { version: 1, mode: "api-key", keySha256: KEY }]) {
-    assert.throws(() => parsePolicy(value), /invalid-policy/);
+test("mode/key are saved first, then the supervised runtime restarts", async t => {
+  const f = fixture(t); const result = await f.apply();
+  assert.equal(result.status.configuredMode, "api-key"); assert.equal(result.status.runtimeState, "in-sync");
+  assert.equal(f.state.stops, 1); assert.equal(f.state.starts, 1);
+  assert.deepEqual(f.state.commands[0], ["api-key", "cleanup"]);
+  assert.equal(result.status.keyAvailable, true); assert.equal(f.controller.reveal(), KEY);
+  const status = JSON.stringify(await f.controller.status()); assert.ok(!status.includes(KEY));
+  assert.ok(!status.includes(keyPolicy(KEY).keySha256));
+});
+test("missing key prevents first enable, without any write or restart", async t => {
+  const f = fixture(t);
+  await assert.rejects(f.controller.apply({ mode: "api-key", expectedRevision: (await f.controller.status()).revision }), /key-required/);
+  assert.equal(fs.existsSync(f.file), false); assert.equal(f.state.stops, 0);
+});
+for (const scenario of ["stopError", "startError", "browserActive"]) {
+  test(`${scenario} does not roll back or reject a saved mode`, async t => {
+    const f = fixture(t, { [scenario]: true }); const result = await f.apply();
+    assert.equal(JSON.parse(fs.readFileSync(f.file)).mode, "api-key");
+    assert.notEqual(result.status.runtimeState, "in-sync"); assert.equal(f.controller.reveal(), KEY);
+  });
+}
+test("active HTTP turns defer restart, not saving; retry applies the same key", async t => {
+  const f = fixture(t, { active: 1 }); const first = await f.apply();
+  assert.equal(first.status.runtimeState, "restart-required"); assert.equal(f.state.stops, 0);
+  f.state.active = 0;
+  const result = await f.controller.apply({ mode: "api-key", expectedRevision: first.status.revision });
+  assert.equal(result.status.runtimeState, "in-sync"); assert.equal(f.controller.reveal(), KEY);
+});
+test("another launcher operation does not prevent saving", async t => {
+  const f = fixture(t, { operation: "mcp-setup" }); const result = await f.apply();
+  assert.equal(result.status.configuredMode, "api-key"); assert.equal(result.status.cleanupPending, true);
+  assert.equal(f.state.stops, 0); assert.equal(f.state.commands.length, 0);
+});
+test("failed cleanup is visible but neither saving nor restarting is cancelled", async t => {
+  const f = fixture(t, { cleanupError: true }); const result = await f.apply();
+  assert.equal(result.status.cleanupPending, true); assert.equal(result.status.runtimeState, "in-sync");
+});
+test("first-time and externally managed runtime accept saved preferences", async t => {
+  for (const option of [{ configured: false }, { owner: "external" }]) {
+    const f = fixture(t, option); assert.equal((await f.apply()).status.configuredMode, "api-key");
+    assert.equal(f.state.stops, 0);
   }
-  assert.deepEqual(parsePolicy(OPENAI), OPENAI);
 });
-test("generated keys have 256-bit random payload and are not saved", t => {
-  const h = harness(t); const keys = new Set(Array.from({ length: 64 }, () => h.controller.generate()));
-  assert.equal(keys.size, 64);
-  for (const key of keys) assert.match(key, /^cgw_[A-Za-z0-9_-]{43}$/);
-  assert.equal(fs.existsSync(h.file), false);
+test("key reset replaces authentication digest and survives a Launcher restart encrypted", async t => {
+  const f = fixture(t); await f.apply(); await f.apply("api-key", NEXT);
+  assert.equal(f.state.effective.keySha256, keyPolicy(NEXT).keySha256);
+  assert.equal(f.controller.reveal(), NEXT); f.controller.dispose();
+  const next = f.create(); t.after(() => next.dispose()); assert.equal(next.reveal(), NEXT);
+  const disk = fs.readFileSync(path.join(f.coreHome, "secrets", "api-client-key.json"), "utf8");
+  assert.ok(!disk.includes(NEXT)); assert.ok(!disk.includes(KEY));
 });
-test("key validation never echoes the rejected secret", () => {
-  for (const key of ["short", KEY + "\n", "密钥".repeat(40), "x".repeat(257), null]) {
-    assert.throws(() => keyPolicy(key), { message: "invalid-key" });
-  }
+test("disable and re-enable can reuse the sealed key without requiring a new key", async t => {
+  const f = fixture(t); await f.apply(); await f.apply("openai");
+  assert.equal((await f.controller.status()).keyAvailable, true);
+  await assert.rejects(async () => f.controller.reveal(), /api-mode-required/);
+  const result = await f.controller.apply({ mode: "api-key", expectedRevision: (await f.controller.status()).revision });
+  assert.equal(result.status.runtimeState, "in-sync"); assert.equal(f.controller.reveal(), KEY);
 });
-test("saved/effective status contains no key or stored hash", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) });
-  const status = await h.controller.status();
-  assert.equal(status.runtimeState, "in-sync");
-  assert.equal(status.keyConfigured, true);
-  assert.ok(!JSON.stringify(status).includes(KEY));
-  assert.ok(!JSON.stringify(status).includes(keyPolicy(KEY).keySha256));
+test("digest-only keys still authenticate but are not fabricated by reveal", async t => {
+  const f = fixture(t); fs.writeFileSync(f.file, JSON.stringify(keyPolicy(KEY)));
+  assert.equal((await f.controller.status()).keyConfigured, true); assert.equal((await f.controller.status()).keyAvailable, false);
+  assert.throws(() => f.controller.reveal(), /key-unavailable/);
+  await f.apply("api-key", NEXT); assert.equal(f.controller.reveal(), NEXT);
 });
-test("revision detects an externally rotated key even in the same mode", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); h.write(keyPolicy(KEY2));
-  const status = await h.controller.status();
-  assert.equal(status.configuredMode, "api-key"); assert.equal(status.effectiveMode, "api-key");
-  assert.equal(status.runtimeState, "restart-required");
+test("a CLI-rotated digest cannot reveal the previously sealed key", async t => {
+  const f = fixture(t); await f.apply(); fs.writeFileSync(f.file, JSON.stringify(keyPolicy(NEXT)));
+  assert.equal((await f.controller.status()).keyAvailable, false); assert.throws(() => f.controller.reveal(), /key-unavailable/);
 });
-test("health revision is keyed and not a client credential or plain digest", () => {
-  const policy = keyPolicy(KEY); const revision = policyRevision(policy, CONTROL);
-  assert.match(revision, /^[a-f0-9]{64}$/);
-  assert.notEqual(revision, policy.keySha256);
-  assert.notEqual(revision, policyRevision(policy, "another-management-token"));
-  assert.notEqual(revision, createHash("sha256").update(JSON.stringify(policy)).digest("hex"));
+test("unavailable OS encryption is session-only, never plaintext on disk", async t => {
+  const f = fixture(t, { safeStorage: { isEncryptionAvailable: () => false } });
+  assert.equal((await f.apply()).status.keyStorage, "session"); assert.equal(f.controller.reveal(), KEY);
+  assert.equal(fs.existsSync(path.join(f.coreHome, "secrets", "api-client-key.json")), false);
+  f.controller.dispose(); assert.throws(() => f.controller.reveal(), /key-unavailable/);
+  assert.equal(JSON.parse(fs.readFileSync(f.file)).keySha256, keyPolicy(KEY).keySha256);
 });
-test("enable persists only hash and restarts before acknowledging success", async t => {
-  const h = harness(t); const result = await h.change("api-key", KEY);
+test("stale forms and management-token reuse cannot replace a key", async t => {
+  const f = fixture(t); const before = await f.controller.status(); await f.apply();
+  await assert.rejects(f.controller.apply({ mode: "api-key", key: NEXT, expectedRevision: before.revision }), /stale-settings/);
+  await assert.rejects(f.apply("api-key", f.config.controlToken), /control-key-reuse/);
+  assert.equal(f.controller.reveal(), KEY);
+});
+test("malformed policy fails closed and does not leak rejected data", async t => {
+  const f = fixture(t); fs.writeFileSync(f.file, KEY);
+  assert.equal((await f.controller.status()).configuredMode, "invalid");
+  assert.throws(() => parsePolicy({ version: 1, mode: "api-key", key: KEY }), /invalid-policy/);
+  assert.throws(() => validateChange({ mode: "api-key", key: KEY, expectedRevision: "invalid" }), /invalid-input/);
+});
+test("secret clipboard expires conditionally and is cleared on rotation", async t => {
+  const f = fixture(t); await f.apply(); f.controller.copyKey(KEY); const expire = f.state.timer;
+  f.state.clipboard = "unrelated"; expire(); assert.equal(f.state.clipboard, "unrelated");
+  f.controller.copyKey(KEY); await f.apply("api-key", NEXT); assert.equal(f.state.clipboard, "");
+});
+test("export is a separate explicit CLI action and never includes a key", async t => {
+  const f = fixture(t); await f.apply(); const result = await f.controller.exportConfig();
+  assert.ok(result.config.includes("requires_openai_auth = false")); assert.ok(!result.config.includes(KEY));
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "codex-config"]);
+});
+test("DEV profile cannot change production API access", async t => {
+  const f = fixture(t, { profile: "development" }); await assert.rejects(f.controller.status(), /dev-profile/);
+});
+
+test("OpenAI switch restores only forwarding integration and persists through a route conflict", async t => {
+  const f = fixture(t); await f.apply(); f.state.reconnectError = true;
+  const result = await f.apply("openai");
+  assert.equal(result.status.configuredMode, "openai"); assert.equal(result.status.routingPending, true);
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "reconnect"]);
   assert.equal(result.status.runtimeState, "in-sync");
-  assert.deepEqual(h.events.filter(e => typeof e === "string"), ["stop", "start"]);
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY));
-  assert.ok(!fs.readFileSync(h.file, "utf8").includes(KEY));
-  if (process.platform !== "win32") assert.equal(fs.statSync(h.file).mode & 0o777, 0o600);
 });
-test("rotation changes the active revision and removes old key authority", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); const old = h.health().api_access_revision;
-  await h.change("api-key", KEY2);
-  assert.notEqual(h.health().api_access_revision, old);
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY2));
-  assert.equal(h.events[0][1].replacingKey, true);
-});
-test("blank key preserves the configured key across a restart", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); await h.change("api-key");
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY));
-});
-test("disable clears digest and verifies native forwarding mode", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); const result = await h.change("openai");
-  assert.deepEqual(readPolicyFile(h.file).policy, OPENAI);
-  assert.equal(result.status.effectiveMode, "openai"); assert.equal(result.status.runtimeState, "in-sync");
-});
-test("first installation can save without starting an unconfigured runtime", async t => {
-  const h = harness(t, { configured: false }); const result = await h.change("api-key", KEY);
-  assert.equal(result.status.runtimeState, "unconfigured");
-  assert.deepEqual(h.events.filter(e => typeof e === "string"), []);
-});
-test("enabling with no key and importing a control token are rejected before stop", async t => {
-  const h = harness(t);
-  await assert.rejects(h.change("api-key"), { code: "key-required" });
-  await assert.rejects(h.change("api-key", CONTROL), { code: "control-key-reuse" });
-  assert.equal(h.events.length, 0);
-});
-test("native dialog cancellation is side-effect free", async t => {
-  const h = harness(t, { confirm: false }); const result = await h.change("api-key", KEY);
-  assert.equal(result.cancelled, true); assert.equal(fs.existsSync(h.file), false);
-  assert.deepEqual(h.events.filter(e => typeof e === "string"), []);
-});
-test("active HTTP/tool turns are not cancelled or overwritten", async t => {
-  const h = harness(t); h.health().active_http_turns = 1;
-  await assert.rejects(h.change("api-key", KEY), { code: "runtime-busy" });
-  assert.equal(fs.existsSync(h.file), false); assert.ok(!h.events.includes("stop"));
-});
-test("active browser work and competing lifecycle operations are rejected", async t => {
-  const h = harness(t); h.browserHost.activeTraceId = "active-turn";
-  await assert.rejects(h.change("api-key", KEY), { code: "runtime-busy" });
-  h.browserHost.activeTraceId = null; h.busy();
-  await assert.rejects(h.change("api-key", KEY), { code: "runtime-busy" });
-});
-test("stop failure preserves the original file", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); const before = fs.readFileSync(h.file);
-  h.failStops(1); await assert.rejects(h.change("api-key", KEY2), { code: "stop-failed" });
-  assert.deepEqual(fs.readFileSync(h.file), before);
-});
-test("start failure stops replacement, rolls back exact bytes and verifies old policy", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) }); const before = fs.readFileSync(h.file);
-  h.failStarts(1); await assert.rejects(h.change("api-key", KEY2), { code: "apply-failed-restored" });
-  assert.deepEqual(fs.readFileSync(h.file), before); assert.equal((await h.controller.status()).runtimeState, "in-sync");
-  assert.deepEqual(h.events.filter(e => typeof e === "string"), ["stop", "start", "stop", "start"]);
-});
-test("rollback restores an absent legacy policy file", async t => {
-  const h = harness(t); h.failStarts(1);
-  await assert.rejects(h.change("api-key", KEY), { code: "apply-failed-restored" });
-  assert.equal(fs.existsSync(h.file), false);
-});
-test("unverifiable replacement stop leaves saved policy, never restores behind a live process", async t => {
-  const h = harness(t); h.failStarts(1);
-  let stops = 0;
-  const original = h.supervisor.stopForSetup;
-  h.supervisor.stopForSetup = async () => { if (++stops === 2) throw new Error("unknown live process"); return original(); };
-  await assert.rejects(h.change("api-key", KEY), { code: "saved-runtime-unverified" });
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY));
-});
-test("failed old-runtime recovery is reported without claiming success", async t => {
-  const h = harness(t); h.failStarts(2);
-  await assert.rejects(h.change("api-key", KEY), { code: "recovery-failed" });
-});
-test("stale renderer settings cannot overwrite a CLI change", async t => {
-  const h = harness(t); const revision = (await h.controller.status()).revision;
-  h.write(keyPolicy(KEY2));
-  await assert.rejects(h.controller.apply({ mode: "api-key", key: KEY, expectedRevision: revision }), { code: "stale-settings" });
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY2));
-});
-test("a CLI write during draining is retained", async t => {
-  const h = harness(t); h.onStop(() => h.write(keyPolicy(KEY2)));
-  await assert.rejects(h.change("api-key", KEY), { code: "stale-settings" });
-  assert.deepEqual(readPolicyFile(h.file).policy, keyPolicy(KEY2));
-});
-test("malformed, oversized and symbolic-link policy files fail closed", async t => {
-  const h = harness(t); fs.writeFileSync(h.file, "{");
-  assert.equal((await h.controller.status()).configuredMode, "invalid");
-  fs.writeFileSync(h.file, " ".repeat(4097)); assert.throws(() => readPolicyFile(h.file), /invalid-policy/);
-  if (process.platform !== "win32") {
-    fs.unlinkSync(h.file); fs.symlinkSync(path.join(path.dirname(h.file), "missing"), h.file);
-    assert.throws(() => readPolicyFile(h.file), /invalid-policy/);
-  }
-});
-test("external and DEV runtime mutations are rejected", async t => {
-  const external = harness(t, { external: true });
-  assert.equal((await external.controller.status()).canApply, false);
-  await assert.rejects(external.change("api-key", KEY), { code: "external-runtime" });
-  const dev = harness(t, { dev: true });
-  await assert.rejects(dev.controller.status(), { code: "dev-profile" });
-  assert.throws(dev.controller.generate, { code: "dev-profile" });
-});
-test("clipboard key is cleared after timeout only if not replaced", t => {
-  const h = harness(t); h.controller.copyKey(KEY); assert.equal(h.clipboard(), KEY);
-  h.tick(); assert.equal(h.clipboard(), "");
-  h.controller.copyKey(KEY); h.externalCopy("user text"); h.tick(); assert.equal(h.clipboard(), "user text");
-});
-test("clipboard cleanup also runs on application disposal", t => {
-  const h = harness(t); h.controller.copyKey(KEY); h.controller.dispose(); assert.equal(h.clipboard(), "");
-});
-test("export reuses existing CLI and never includes a key in argv or output", async t => {
-  const h = harness(t, { policy: keyPolicy(KEY) });
-  const result = await h.controller.exportConfig();
-  assert.ok(result.config.includes("requires_openai_auth = false"));
-  assert.ok(!JSON.stringify(h.events).includes(KEY));
-  assert.equal(h.clipboard(), result.config);
-});
-test("copy URL and export reject missing runtime or wrong access mode", async t => {
-  const h = harness(t, { configured: false });
-  await assert.rejects(h.controller.copyBaseUrl(), { code: "not-configured" });
-  await assert.rejects(h.controller.exportConfig(), { code: "api-mode-required" });
+test("disabling after an external key rotation does not reactivate a revoked GUI key", async t => {
+  const f = fixture(t); await f.apply(); fs.writeFileSync(f.file, JSON.stringify(keyPolicy(NEXT)));
+  await f.apply("openai");
+  assert.equal((await f.controller.status()).keyAvailable, false);
+  await assert.rejects(f.controller.apply({ mode: "api-key", expectedRevision: (await f.controller.status()).revision }), /key-required/);
 });

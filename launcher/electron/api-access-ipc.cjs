@@ -4,6 +4,7 @@ const { ERROR_CODES } = require("./api-access-settings.cjs");
 function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigationAllowed }) {
   const methods = {
     "launcher:api-access-status": () => controller.status(),
+    "launcher:api-access-reveal": () => controller.reveal(),
     "launcher:api-access-generate": () => controller.generate(),
     "launcher:api-access-apply": input => controller.apply(input),
     "launcher:api-access-copy-key": key => controller.copyKey(key),

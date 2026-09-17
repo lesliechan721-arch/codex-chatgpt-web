@@ -8,6 +8,7 @@ function subscription(channel, listener) {
 
 contextBridge.exposeInMainWorld("codexWebLauncher", {
   apiAccessStatus: () => ipcRenderer.invoke("launcher:api-access-status"),
+  apiAccessReveal: () => ipcRenderer.invoke("launcher:api-access-reveal"),
   apiAccessGenerate: () => ipcRenderer.invoke("launcher:api-access-generate"),
   apiAccessApply: (input) => ipcRenderer.invoke("launcher:api-access-apply", input),
   apiAccessCopyKey: (key) => ipcRenderer.invoke("launcher:api-access-copy-key", key),
