@@ -1,3 +1,5 @@
+import { loadApiAccessPolicy } from "./api-access-config";
+import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
@@ -473,14 +475,16 @@ export function preflightSetup(options: SetupOptions): void {
       throw new Error("Automatic and Zero Risk require different Tunnel IDs and separate ChatGPT connectors");
     }
   }
-  preflightCodexIntegration(config, {
+  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
+  else preflightCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
 }
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
   const { existing, config, launcherOwned } = prepareSetup(options);
-  preflightCodexIntegration(config, {
+  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
+  else preflightCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
@@ -623,7 +627,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
+  // API mode owns no Codex config. Setup/upgrades may only remove prior recorded injection.
+  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration();
+  else installCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
 

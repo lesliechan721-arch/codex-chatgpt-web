@@ -6,7 +6,7 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -31,6 +31,8 @@ import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopT
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
 import { runApiKeyCommand } from "./api-key-cli";
+import { loadApiAccessPolicy } from "./api-access-config";
+import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -40,7 +42,7 @@ Usage:
   codex-chatgpt-web setup --browser-only [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web api-key <enable|rotate> <--generate|--key-stdin>
-  codex-chatgpt-web api-key <status|disable|codex-config>
+  codex-chatgpt-web api-key <status|disable|codex-config|cleanup|reconnect>
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
@@ -370,7 +372,9 @@ async function setupCommand(args: string[]): Promise<void> {
     stdout.write("One account-level step remains: attach the tunnel to the ChatGPT connector named in config.\n");
     stdout.write("Open: https://chatgpt.com/#settings/Plugins\n");
   }
-  stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
+  stdout.write(loadApiAccessPolicy().mode === "api-key"
+    ? "Export the API Key client configuration and copy it into Codex manually; no provider was injected.\n"
+    : "Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
 }
 
 async function doctorCommand(args: string[]): Promise<void> {
@@ -384,6 +388,11 @@ async function doctorCommand(args: string[]): Promise<void> {
 async function routeCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
+  if (loadApiAccessPolicy().mode === "api-key" && (action === "connect" || action === "disconnect")) {
+    const result = cleanupApiKeyCodexIntegration();
+    stdout.write(`${JSON.stringify({ ...result, installed: false, active: false, manualConfigurationRequired: true, errors: [] })}\n`);
+    return;
+  }
   const result = action === "status"
     ? (() => {
         const status = inspectCodexIntegration();
@@ -421,6 +430,12 @@ async function subagentsCommand(args: string[]): Promise<void> {
   }
   if (action !== "compatibility-v1" && action !== "native") {
     throw new Error("Subagent protocol must be one of: status, compatibility-v1, native");
+  }
+  if (loadApiAccessPolicy().mode === "api-key") {
+    saveConfig({ ...config, subagentProtocol: action });
+    cleanupApiKeyCodexIntegration();
+    stdout.write(`${JSON.stringify({ protocol: action, manualConfigurationRequired: true, launcherRestartRequired: true })}\n`);
+    return;
   }
   const journal = setCodexSubagentProtocol(config, action);
   stdout.write(`${JSON.stringify({
@@ -595,6 +610,10 @@ async function main(): Promise<void> {
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
+    if (loadApiAccessPolicy().mode === "api-key") {
+      try { cleanupApiKeyCodexIntegration(); }
+      catch { process.stderr.write("API mode: recorded Codex injection could not be cleaned; inspect conflicts or run api-key cleanup.\n"); }
+    }
     const server = startServer(config);
     stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
     await new Promise<void>(() => {});

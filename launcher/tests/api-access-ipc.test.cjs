@@ -7,7 +7,7 @@ function harness() {
   const frame = { url: "file:///application/index.html" };
   const contents = { mainFrame: frame, isDestroyed: () => false };
   const window = { webContents: contents, isDestroyed: () => false };
-  const controller = Object.fromEntries(["status", "generate", "apply", "copyKey", "copyBaseUrl", "exportConfig", "dispose"]
+  const controller = Object.fromEntries(["status", "reveal", "generate", "apply", "copyKey", "copyBaseUrl", "exportConfig", "dispose"]
     .map(name => [name, (...args) => { calls.push([name, ...args]); return "safe-value"; }]));
   const dispose = registerApiAccessIpc({ ipcMain: { handle: (name, fn) => handlers.set(name, fn), removeHandler: name => handlers.delete(name) },
     controller, getWindow: () => window, rendererNavigationAllowed: url => url === frame.url });
@@ -41,6 +41,14 @@ test("known codes survive and no arbitrary error code is reflected", async () =>
   assert.deepEqual(await h.handlers.get("launcher:api-access-apply")(h.event, {}), { ok: false, code: "unavailable" });
 });
 test("dispose unregisters every method and clears owned clipboard", () => {
-  const h = harness(); assert.equal(h.handlers.size, 6); h.dispose();
+  const h = harness(); assert.equal(h.handlers.size, 7); h.dispose();
   assert.equal(h.handlers.size, 0); assert.deepEqual(h.calls, [["dispose"]]);
+});
+
+test("reveal is available only to the trusted renderer with no arguments", async () => {
+  const h = harness(); const reveal = h.handlers.get("launcher:api-access-reveal");
+  assert.deepEqual(await reveal({ sender: {}, senderFrame: h.frame }), { ok: false, code: "untrusted-sender" });
+  assert.deepEqual(await reveal(h.event, "unused"), { ok: false, code: "invalid-input" });
+  assert.deepEqual(await reveal(h.event), { ok: true, value: "safe-value" });
+  assert.deepEqual(h.calls, [["reveal"]]);
 });
