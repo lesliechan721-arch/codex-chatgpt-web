@@ -228,6 +228,76 @@ test("turn broker rejects a Unix socket path that leaves no room for sun_path's 
   }
 });
 
+for (const attemptListen of [false, true])
+test(`closing a non-owner broker preserves the live Zero Risk endpoint (listen attempted: ${attemptListen})`, async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join("/tmp", "cgw-broker-owner-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const owner = TurnBroker.forSocket(socketPath);
+  try {
+    const nonce = "surface_nonce_socket_owner_0123456789";
+    const requestId = await owner.registerSafe({
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" }, tools: [],
+    }, nonce);
+    owner.confirmSafeTurnSent(requestId, nonce);
+    owner.startSafeTurn(requestId);
+    const before = statSync(socketPath);
+    // A separate process must have its own broker registry, as a second runtime would.
+    const child = Bun.spawn([process.execPath, "-e", `
+      import assert from "node:assert/strict";
+      import { TurnBroker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/turn-broker.ts", import.meta.url).href)};
+      const broker = TurnBroker.forSocket(${JSON.stringify(socketPath)});
+      try {
+        if (${attemptListen}) await assert.rejects(broker.listen(), /already owned by another process/);
+      } finally {
+        await broker.close();
+      }
+    `], { stdout: "pipe", stderr: "pipe" });
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(existsSync(socketPath)).toBe(true);
+    expect(statSync(socketPath).ino).toBe(before.ino);
+    await expect(callTurnBroker(socketPath, { method: "owner_status" }))
+      .resolves.toMatchObject({ acceptingExternalOwners: true });
+    await expect(callTurnBroker(socketPath, {
+      method: "safe_complete", token: requestId, finalAnswer: "Zero Risk completed after non-owner cleanup",
+    })).resolves.toMatchObject({ completed: true });
+    await expect(owner.waitForSafeCompletion(requestId)).resolves.toBe("Zero Risk completed after non-owner cleanup");
+  } finally {
+    await owner.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 10_000);
+
+for (const overlap of [false, true])
+test(`closing a retired broker preserves its replacement and registry entry (overlap: ${overlap})`, async () => {
+  if (overlap && process.platform === "win32") return;
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-broker-replace-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const retired = TurnBroker.forSocket(socketPath);
+  let replacement: TurnBroker | undefined;
+  try {
+    await retired.listen();
+    const closing = retired.close();
+    if (!overlap) {
+      await closing;
+      if (process.platform !== "win32") expect(existsSync(socketPath)).toBe(false);
+    }
+    replacement = TurnBroker.forSocket(socketPath);
+    await replacement.listen();
+    await closing;
+    await retired.close();
+    await expect(callTurnBroker(socketPath, { method: "owner_status" }))
+      .resolves.toMatchObject({ acceptingExternalOwners: true });
+    expect(TurnBroker.forSocket(socketPath)).toBe(replacement);
+  } finally {
+    await retired.close();
+    await replacement?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("turn broker tokens do not expire while their browser turn is still alive", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-broker-unbounded-"));
   const socketPath = defaultBrokerEndpoint(root);

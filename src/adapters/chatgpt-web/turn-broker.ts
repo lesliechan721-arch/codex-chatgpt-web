@@ -260,6 +260,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
+  private ownedSocket?: { dev: number; ino: number };
 
   private constructor(readonly socketPath: string) {}
 
@@ -722,18 +723,24 @@ export class TurnBroker implements TurnBrokerOwner {
     this.compactionTransactions.close();
     for (const token of [...this.channels.keys()]) this.revoke(token);
     const server = this.server;
+    const ownedSocket = this.ownedSocket;
     this.server = undefined;
     this.startPromise = undefined;
-    brokers.delete(this.socketPath);
+    this.ownedSocket = undefined;
+    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     if (server?.listening) {
       await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
         if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
         else rejectClose(error);
       }));
     }
-    if (!isWindowsPipeEndpoint(this.socketPath)
-      && existsSync(this.socketPath)
-      && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
+    // Failed/unused instances never own the path. A replacement can also bind while close waits.
+    if (ownedSocket && existsSync(this.socketPath)) {
+      const current = lstatSync(this.socketPath);
+      if (current.isSocket() && current.dev === ownedSocket.dev && current.ino === ownedSocket.ino) {
+        unlinkSync(this.socketPath);
+      }
+    }
   }
 
   private start(): Promise<void> {
@@ -765,7 +772,10 @@ export class TurnBroker implements TurnBrokerOwner {
         });
         server.listen(this.socketPath, () => {
           server.off("error", rejectStart);
-          if (!windowsPipe) chmodSync(this.socketPath, 0o600);
+          if (!windowsPipe) {
+            this.ownedSocket = lstatSync(this.socketPath);
+            chmodSync(this.socketPath, 0o600);
+          }
           resolveStart();
         });
       };
