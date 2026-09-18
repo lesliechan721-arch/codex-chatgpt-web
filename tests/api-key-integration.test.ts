@@ -80,7 +80,7 @@ test("API preflight accepts manual providers and creates no Codex injection", ()
 test("export shares V1 feature defaults and Interrupt command but omits conflicting auth/voice/trust", () => {
   const config = defaultConfig();
   const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json", model: "chatgpt-web/high",
-    reasoningEffort: "high", subagentProtocol: config.subagentProtocol, runtimeCommand: config.runtimeCommand });
+    reasoningEffort: "high", apiKey: "cgw_" + "a".repeat(43), subagentProtocol: config.subagentProtocol, runtimeCommand: config.runtimeCommand });
   const parsed = Bun.TOML.parse(text) as any;
   const defaults = Bun.TOML.parse(installCompatibilityV1Features("").text) as any;
   expect(text).not.toContain("Managed by codex-chatgpt-web");
@@ -93,6 +93,6 @@ test("export shares V1 feature defaults and Interrupt command but omits conflict
 });
 test("native subagent export does not inject Compatibility V1 feature overrides", () => {
   const parsed = Bun.TOML.parse(renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json",
-    model: "chatgpt-web/high", reasoningEffort: "high", subagentProtocol: "native" })) as any;
+    model: "chatgpt-web/high", reasoningEffort: "high", apiKey: "cgw_" + "a".repeat(43), subagentProtocol: "native" })) as any;
   expect(parsed.features).toBeUndefined(); expect(parsed.agents).toBeUndefined();
 });

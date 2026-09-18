@@ -4,10 +4,25 @@ import {
   OPENAI_ACCESS, adapterRequestHeaders, apiKeyMatches, apiKeyPolicy, authenticateApiRequest,
   generateApiKey, guardApiRequest, parseApiAccessPolicy, requireWebModelInApiKeyMode,
 } from "../src/api-access";
-import { renderApiKeyCodexConfig } from "../src/api-key-codex-config";
+import { codexProxyEnvironment, renderApiKeyCodexConfig } from "../src/api-key-codex-config";
+import { upstreamApiKeyDigest, type UpstreamProviderRuntime } from "../src/upstream-provider";
 
 const key = "cgw_" + "a".repeat(43);
 const policy = apiKeyPolicy(key);
+const upstreamKey = "provider token with punctuation !@#$%^&*()";
+const upstreamRuntime: UpstreamProviderRuntime = {
+  available: true,
+  keyMatches: true,
+  apiKey: upstreamKey,
+  config: {
+    version: 1,
+    baseUrl: "https://provider.example/v1/",
+    apiKeySha256: upstreamApiKeyDigest(upstreamKey),
+    proxy: { mode: "global" },
+    modelFilter: { mode: "regex", pattern: "^gpt-" },
+    supportsOpenAiServerCompaction: false,
+  },
+};
 const request = (path = "/v1/models", authorization: string | null = `Bearer ${key}`, method = "GET") =>
   new Request(`http://127.0.0.1${path}`, { method, headers: authorization ? { authorization } : {} });
 
@@ -84,6 +99,14 @@ test("native search, image, chat-completion and unknown paths never enter dispat
   }
 });
 
+test("available custom upstream opens only the specified API-key endpoints", () => {
+  for (const path of ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits"]) {
+    assert.equal(guardApiRequest(request(path, `Bearer ${key}`, "POST"), policy, upstreamRuntime), undefined);
+  }
+  assert.equal(guardApiRequest(request("/v1/chat/completions", `Bearer ${key}`, "POST"), policy, upstreamRuntime)?.status, 404);
+  assert.equal(guardApiRequest(request("/v1/alpha/search", "", "POST"), policy, upstreamRuntime)?.status, 401);
+});
+
 test("unsupported methods return 405 rather than falling through", () => {
   const response = guardApiRequest(request("/v1/models", `Bearer ${key}`, "POST"), policy);
   assert.equal(response?.status, 405);
@@ -107,6 +130,8 @@ test("only the Web namespace can reach model eligibility validation", () => {
     assert.equal(requireWebModelInApiKeyMode(model, policy)?.status, 400);
   }
   assert.equal(requireWebModelInApiKeyMode("chatgpt-web/high", policy), undefined);
+  assert.equal(requireWebModelInApiKeyMode("gpt-upstream", policy, upstreamRuntime), undefined);
+  assert.equal(requireWebModelInApiKeyMode("other-upstream", policy, upstreamRuntime)?.status, 400);
 });
 
 test("adapter headers drop secrets but preserve canonical turn metadata", () => {
@@ -120,21 +145,34 @@ test("adapter headers drop secrets but preserve canonical turn metadata", () => 
   assert.equal(adapterRequestHeaders(incoming, OPENAI_ACCESS).get("authorization"), `Bearer ${key}`);
 });
 
-test("Codex export uses a separate provider and environment key, not OAuth", () => {
+test("Codex export embeds the local bearer token and switches provider name only for declared server compaction", () => {
   const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "C:\\Local Data\\models.json",
-    model: "chatgpt-web/high", reasoningEffort: "high" });
+    model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key });
   assert.ok(text.includes('requires_openai_auth = false'));
-  assert.ok(text.includes('env_key = "CODEX_CHATGPT_WEB_API_KEY"'));
+  assert.ok(text.includes(`experimental_bearer_token = "${key}"`));
+  assert.ok(!text.includes("env_key ="));
   assert.ok(text.includes('model_provider = "chatgpt_web"'));
   assert.ok(text.includes('supports_websockets = false'));
   assert.ok(text.includes('wire_api = "responses"'));
   assert.ok(text.includes('web_search = "disabled"'));
   assert.ok(text.includes('C:\\\\Local Data\\\\models.json'));
-  assert.ok(!text.includes(key));
+  assert.ok(text.includes('name = "ChatGPT Web (local API key)"'));
+  const openAi = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/models.json",
+    model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key, supportsOpenAiServerCompaction: true });
+  assert.ok(openAi.includes('name = "OpenAI"'));
 });
 
 test("Codex export validates the endpoint and model", () => {
-  const base = { port: 17841, catalogPath: "/models.json", model: "chatgpt-web/high", reasoningEffort: "high" };
+  const base = { port: 17841, catalogPath: "/models.json", model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key };
   for (const port of [0, -1, 65536, 1.5, NaN]) assert.throws(() => renderApiKeyCodexConfig({ ...base, port }));
   assert.throws(() => renderApiKeyCodexConfig({ ...base, model: "native-model" }));
+});
+
+test("Codex proxy environment is separate and always bypasses loopback", () => {
+  const environment = codexProxyEnvironment({ HTTP_PROXY: "http://proxy.example:8080", NO_PROXY: "internal.example" });
+  assert.equal(environment.HTTP_PROXY, "http://proxy.example:8080");
+  assert.equal(environment.http_proxy, "http://proxy.example:8080");
+  assert.ok(environment.NO_PROXY.includes("internal.example"));
+  for (const host of ["localhost", "127.0.0.1", "::1"]) assert.ok(environment.NO_PROXY.includes(host));
+  assert.equal(environment.no_proxy, environment.NO_PROXY);
 });

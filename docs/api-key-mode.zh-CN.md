@@ -6,7 +6,7 @@
 
 目标是简化接入设置，同时将「服务端接入策略」与「用户手动维护的 Codex 配置」分开。HTTP 接入仍有 `openai` / `api-key` 两种模式，与 `browser-only` / `full`、`automatic` / `manual` 是独立维度。
 
-API 模式不转发原生 OpenAI/Codex 接口，不意味着不访问 OpenAI：实际推理仍需要 ChatGPT 网页登录；Full / Zero Risk 仍需要原有 Tunnel 与 Connector。本次没有改变浏览器、MCP 工具权限、SSE、上下文压缩算法或全局代理模块。
+未配置自定义上游时，API 模式保持 Web-only：`chatgpt-web/*` 继续使用 ChatGPT 浏览器适配器，非 Web 模型以及原生搜索/图片端点不会转发。配置可用的 OpenAI 兼容上游后，非 Web Responses、search 和 images 请求按保存的上游、模型筛选和代理策略转发；`chatgpt-web/*` 始终保留给本地 Web 路由。OpenAI 转发模式不读取该上游配置。Full / Zero Risk 仍使用原有 Tunnel 与 Connector。
 
 ## 2. Launcher 使用流程
 
@@ -16,7 +16,7 @@ API 模式不转发原生 OpenAI/Codex 接口，不意味着不访问 OpenAI：�
 - 第一次启用 API 模式、又没有可复用的密钥时，先显示密钥输入框。可以输入或随机生成；通过校验后点击「保存并切换」。没有有效密钥不会启用 API 模式。
 - 已有可复用的密钥时，点击 API 模式直接保存并尝试重启后台。
 - API 模式下显示掩码密钥；「查看 / 隐藏」「复制密钥」「重置密钥」分别负责显隐、复制和更新。重置使用同一个紧凑输入框，保存新密钥后尝试重启后台。
-- Base URL、「复制 Codex 配置」「导出 TOML」及导出预览仅在 API 模式下显示。导出的内容不包含 API Key。
+- Base URL、上游设置、「复制 Codex 配置」「导出 TOML」及导出预览仅在 API 模式下显示。Codex TOML 是显式敏感导出，包含当前本地服务 API Key，但不包含自定义上游 API Key；代理环境与 TOML 分开显示。
 
 界面主要显示「已保存并生效」或「已保存，后台尚未加载」，而不是要求用户理解多个配置阶段。暂未生效时显示当前运行模式，并提供「重试重启」。未初始化后台也允许保存模式与密钥，初始化后生效。
 
@@ -85,7 +85,7 @@ GUI 正常切回 OpenAI 模式时，还会用 `secrets/api-client-key-reuse.json
 
 Linux 的 `basic_text` 和 `unknown` 后端不当作安全存储。OS 加密、密钥库或密文写入不可用时，不把明文降级写入磁盘；本次会话可在主进程内存里查看/复制密钥，GUI 提示用户自行备份。鉴权摘要已正常保存，所以这种情况不阻止模式切换。
 
-密钥不进入 `launcher-state.json`、普通 snapshot、广播事件、操作日志或 Codex TOML。查看通过独立 IPC 返回给可信主窗口，切换状态、隐藏、失去窗口焦点或卸载组件会清除已显示的字符串。剪贴板 60 秒后只在内容仍为该密钥时清除，不清除后来复制的内容；系统剪贴板历史不在保证范围内。
+密钥不进入 `launcher-state.json`、普通 snapshot、广播事件或操作日志。只有用户明确执行「复制 Codex 配置」或「导出 TOML」时，当前本地服务 API Key 才作为 `experimental_bearer_token` 进入该次敏感导出。自定义上游 API Key 不进入 Codex TOML。查看通过独立 IPC 返回给可信主窗口，切换状态、隐藏、失去窗口焦点或卸载组件会清除已显示的字符串。剪贴板 60 秒后只在内容仍为该密钥时清除，不清除后来复制的内容；系统剪贴板历史不在保证范围内。
 
 ### 4.3 旧密钥与 CLI 密钥
 
@@ -131,7 +131,7 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 | 配置 | API 导出策略 |
 | --- | --- |
 | 自定义 `model_provider` / 模型 / effort / `model_catalog_json` | 保留 API 模式已有导出 |
-| `env_key` / `requires_openai_auth = false` / Responses wire API | 保留，密钥通过客户端环境变量提供 |
+| `experimental_bearer_token` / `requires_openai_auth = false` / Responses wire API | 保留；`experimental_bearer_token` 写入当前本地服务 API Key，不再输出 `env_key` |
 | `supports_websockets = false` | 保留，仅使用已有 HTTP/SSE transport |
 | `web_search = "disabled"` | 保留，不调用被禁止的原生搜索端点 |
 | `[features] multi_agent = true` | Compatibility V1 模式导出，与自动集成一致 |
@@ -141,7 +141,7 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 | `openai_base_url` | 排除；API 模式使用自定义 provider 的 `base_url` |
 | `experimental_realtime_webrtc_call_base_url` | 排除；它依赖原生 OpenAI 身份，与独立 API 接入目标冲突 |
 | `[hooks.state] trusted_hash` | 排除；用户选择的目标文件与 hook index 未知，不伪造预批准状态 |
-| 密钥、OAuth、Tunnel 凭证 | 永不导出 |
+| 自定义上游 API Key、OAuth、Tunnel 凭证 | 永不导出；本地服务 API Key 只在用户显式执行 Codex 敏感导出时写入 TOML |
 
 从共享 feature builder 生成值之后，移除自动管理注释：手动导出的设置归用户，不冒充新的一次受 journal 管理的安装。
 
@@ -154,8 +154,8 @@ Interrupt hook 导出的是声明，不是自动授权。用户合并后按 Code
 1. 完成原有 ChatGPT/运行时初始化；也可以先保存接入模式，之后初始化。
 2. Settings 中选择 API Key，必要时输入/生成密钥并保存。
 3. 确认状态已生效；若提示待重启，结束任务后重试。
-4. 查看或复制密钥，复制/导出 Codex 配置，手动合并到目标 `CODEX_HOME/config.toml`。
-5. 给客户端设置 `CODEX_CHATGPT_WEB_API_KEY`，重新启动 Codex。浏览器登录仍独立存在。
+4. 查看或复制密钥，复制/导出含本地 API Key 的敏感 Codex 配置，并手动合并到目标 `CODEX_HOME/config.toml`；同时按导出结果设置独立的 Codex 进程代理环境。
+5. 重新启动 Codex。导出的 provider 已通过 `experimental_bearer_token` 携带本地服务 API Key，不再要求 Codex 通过 `env_key` 读取它。浏览器登录仍独立存在。
 
 ### CLI
 
@@ -167,7 +167,8 @@ export CODEX_CHATGPT_WEB_API_KEY
 # 显式重试有 journal 记录的旧注入清理。
 bun run src/cli.ts api-key cleanup
 
-# 输出 TOML，由用户选择保存位置；不会写入 ~/.codex/config.toml。
+# CODEX_CHATGPT_WEB_API_KEY 必须仍是当前 policy 对应的本地密钥。
+# 输出的 TOML 含该本地密钥，并另外输出 Codex 进程代理环境；不会写入 ~/.codex/config.toml。
 bun run src/cli.ts api-key codex-config
 ```
 
@@ -175,9 +176,9 @@ CLI 修改仍需通过已有服务管理方式重启。GUI 的「查看」仅能
 
 ## 8. HTTP、代理与执行边界
 
-本次不修改既有 API 鉴权与 Web-only 路由：所有 `/v1/*` 请求先检查本地 Bearer；可用的 `/models`、`/responses`、`/responses/compact` 才进入原有处理。原生模型和原生搜索/图片端点不转发。浏览器推理所需的账号权限仍由 ChatGPT 决定。
+所有 `/v1/*` 请求仍先检查本地 Bearer。未配置可用上游时，API Key 模式保持 Web-only：`/models`、`/responses`、`/responses/compact` 使用本地 ChatGPT Web 路由，非 Web 模型和 search/images 端点继续拒绝。配置可用上游后，`/models` 合并经过筛选的上游目录，允许的非 Web `/responses` 与 `/responses/compact` 转发到上游，并开放 `/v1/alpha/search`、`/v1/images/generations`、`/v1/images/edits`。`chatgpt-web/*` 始终走本地 Web 路由，不能被上游覆盖。
 
-继续仅监听 `127.0.0.1`，不新增公网部署、多密钥或租户隔离。全局网络代理仍处理原来的出站网络连接；本地 URL 应保持 loopback/NO_PROXY 直连。应用自己的 control token 与用户 API key 仍分离。
+继续仅监听 `127.0.0.1`，不新增公网部署、多密钥或租户隔离。自定义上游网络使用三态策略：`global` 复用当前全局代理，`direct` 强制直连且不修改进程代理环境，`custom` 只使用指定 HTTP/HTTPS 代理。Codex 客户端始终连接本地 loopback；导出的启动环境把 loopback 合并到 `NO_PROXY`，并仅在 Launcher 有全局代理时导出对应代理变量。应用自己的 control token、本地客户端 API Key 与上游 API Key 仍严格分离。
 
 JSON/SSE、MCP tool loop、continuation、v1/v2 compaction、Luna checkpoint 使用原实现。本次仅在配置导出中把相应客户端能力声明补齐。
 
@@ -188,16 +189,27 @@ JSON/SSE、MCP tool loop、continuation、v1/v2 compaction、Luna checkpoint 使
 | `launcher/src/ApiAccessSettings.tsx`、`api-access.css` | 简化模式切换、密钥和复制/导出界面 |
 | `launcher/electron/api-access-settings.cjs` | 保存优先、受控重启、清理与生效状态 |
 | `launcher/electron/api-key-vault.cjs` | OS 加密副本、显式解密、会话内退化 |
+| `launcher/electron/upstream-api-key-vault.cjs` | 上游 API Key 的独立 OS 加密副本与会话内退化 |
+| `launcher/electron/upstream-provider-config.cjs`、`upstream-provider-network.cjs` | 上游配置校验/原子保存与 Launcher 手动模型获取网络 |
 | `launcher/electron/api-access-ipc.cjs`、`preload.cjs` | 可信 renderer 的最小 IPC 表面 |
 | `src/api-key-integration.ts` | 基于 journal 的旧配置清理 |
 | `src/setup.ts`、`src/cli.ts`、`src/api-key-cli.ts` | 防止 API 模式自动注入的入口守卫 |
-| `src/api-key-codex-config.ts` | 复用转发模式的兼容配置并仅渲染导出 |
+| `src/api-key-codex-config.ts` | 渲染包含本地 bearer 的敏感 Codex 配置，并生成分离的进程代理环境 |
+| `src/upstream-provider.ts`、`upstream-provider-config.ts` | daemon 上游配置、运行时快照、筛选与 revision |
+| `src/upstream-network.ts`、`upstream-passthrough.ts` | 三态 transport 与 OpenAI 兼容上游转发 |
+| `src/upstream-model-catalog.ts` | 合并并筛选本地与上游模型目录 |
 
 ## 10. 验证与验收
 
-实现提交前实际执行 Node 控制器、vault、IPC 回归测试。它们使用真实文件系统与注入的 supervisor/safeStorage 模拟，不代表真实 Electron OS 密钥库或账户端到端测试。仓库同时增加 Bun 配置清理、导出与 preflight 测试。
+实现已在 Bun 1.4.0 环境完成仓库验证。为避免本机已启用的 API Key policy 和进程启动时继承的代理变量污染测试，完整 Core/`verify` 使用临时 `CODEX_CHATGPT_WEB_HOME`，并在启动测试进程前清除继承的 HTTP(S)/ALL proxy 变量。该隔离只影响测试进程，不修改真实 Launcher 或用户配置。
 
-当前开发环境没有 Bun、完整仓库依赖及运行中的 ChatGPT/Codex。未将 TypeScript 转译检查当作全仓库类型检查；完整 `bun run verify`、真实 Electron 点击、三平台打包和账号工具闭环仍需 CI/维护者验收。
+- `bun test ./tests`：通过。
+- `bun run --cwd launcher test`：通过。
+- `bun run typecheck`、`bun run --cwd launcher typecheck`：通过。
+- `bun run --cwd launcher build`、`bun run build`：通过。
+- `bun run verify`：通过；包括版本检查、根/Launcher 依赖审计、上述全量测试与类型检查、Launcher 构建、runtime bundle、第三方 notices 和 release smoke。
+
+自动化测试使用真实文件系统与注入的 supervisor/safeStorage 模拟。它不等同于真实 Electron OS 密钥库、真实第三方上游或 ChatGPT 账户端到端测试；这些场景仍应在发布验收时按需复核。
 
 建议复核：
 
@@ -206,6 +218,7 @@ JSON/SSE、MCP tool loop、continuation、v1/v2 compaction、Luna checkpoint 使
 3. 关闭/重开 Launcher 后，通过系统加密副本查看新密钥；Linux 无密钥库时只有会话内可查看且不落明文。
 4. 从 OpenAI 注入迁移，确认 route/features/hook 被清理，而手动 provider、MCP、skills 保留；修改 hook 的冲突不能误删。
 5. API 模式反复 setup、升级、切换浏览器模式/子代理协议、重启，不重新生成 Codex 注入。无 journal 的手动配置逐字节不变。
-6. 手动导出的 TOML 可解析；包含对应 V1 子代理配置和 Interrupt 声明，不包含原生路由、密钥或路径相关 trust state。
-7. 用无 OAuth 的客户端连接，验证 models、流式回答、MCP 工具循环、取消及压缩；未授权请求仍被拒绝。
-8. 检查本 fork 全局代理以及最新上游 Skills as files 设置不受此次改动影响。
+6. 手动导出的 TOML 可解析；包含当前本地服务 API Key 的 `experimental_bearer_token`、对应 V1 子代理配置和 Interrupt 声明，不包含上游 API Key、原生路由或路径相关 trust state；代理环境保持独立输出。
+7. 配置一个测试上游，分别验证 `global`、`direct`、`custom` 网络模式、模型筛选、手动获取模型、Responses/compact、search/images，以及 `/models` 上游失败时回退到本地新鲜目录。
+8. 用无 OAuth 的客户端连接，验证本地 Web models、流式回答、MCP 工具循环、取消及压缩；未授权请求仍被拒绝，`chatgpt-web/*` 不被自定义上游覆盖。
+9. 检查本 fork 全局代理以及最新上游 Skills as files 设置不受此次改动影响。

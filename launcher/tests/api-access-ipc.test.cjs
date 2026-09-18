@@ -7,7 +7,8 @@ function harness() {
   const frame = { url: "file:///application/index.html" };
   const contents = { mainFrame: frame, isDestroyed: () => false };
   const window = { webContents: contents, isDestroyed: () => false };
-  const controller = Object.fromEntries(["status", "reveal", "generate", "apply", "copyKey", "copyBaseUrl", "exportConfig", "dispose"]
+  const controller = Object.fromEntries(["status", "reveal", "generate", "apply", "copyKey", "copyBaseUrl", "exportConfig",
+    "saveUpstream", "deleteUpstream", "fetchUpstreamModels", "dispose"]
     .map(name => [name, (...args) => { calls.push([name, ...args]); return "safe-value"; }]));
   const dispose = registerApiAccessIpc({ ipcMain: { handle: (name, fn) => handlers.set(name, fn), removeHandler: name => handlers.delete(name) },
     controller, getWindow: () => window, rendererNavigationAllowed: url => url === frame.url });
@@ -41,8 +42,23 @@ test("known codes survive and no arbitrary error code is reflected", async () =>
   assert.deepEqual(await h.handlers.get("launcher:api-access-apply")(h.event, {}), { ok: false, code: "unavailable" });
 });
 test("dispose unregisters every method and clears owned clipboard", () => {
-  const h = harness(); assert.equal(h.handlers.size, 7); h.dispose();
+  const h = harness(); assert.equal(h.handlers.size, 10); h.dispose();
   assert.equal(h.handlers.size, 0); assert.deepEqual(h.calls, [["dispose"]]);
+});
+
+test("upstream mutation and discovery IPC remain trusted one-argument calls", async () => {
+  const h = harness();
+  for (const [channel, method] of [
+    ["launcher:api-access-upstream-save", "saveUpstream"],
+    ["launcher:api-access-upstream-delete", "deleteUpstream"],
+    ["launcher:api-access-upstream-models", "fetchUpstreamModels"],
+  ]) {
+    const invoke = h.handlers.get(channel);
+    assert.deepEqual(await invoke({ sender: {}, senderFrame: h.frame }, { secret: "never accepted" }), { ok: false, code: "untrusted-sender" });
+    assert.deepEqual(await invoke(h.event), { ok: false, code: "invalid-input" });
+    assert.deepEqual(await invoke(h.event, { draft: true }), { ok: true, value: "safe-value" });
+    assert.equal(h.calls.at(-1)[0], method);
+  }
 });
 
 test("reveal is available only to the trusted renderer with no arguments", async () => {

@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { upstreamModelAllowed, type UpstreamProviderRuntime } from "./upstream-provider";
 
 /** HTTP access is orthogonal to browser-only/full and automatic/manual execution. */
 export type ApiAccessPolicy =
@@ -64,14 +65,20 @@ export function authenticateApiRequest(req: Request, policy: ApiAccessPolicy): R
 }
 
 /** Authenticate before parsing bodies or dispatching any public API endpoint. */
-export function guardApiRequest(req: Request, policy: ApiAccessPolicy): Response | undefined {
+export function guardApiRequest(
+  req: Request,
+  policy: ApiAccessPolicy,
+  upstream?: UpstreamProviderRuntime,
+): Response | undefined {
   const path = new URL(req.url).pathname;
   if (policy.mode !== "api-key" || (path !== "/v1" && !path.startsWith("/v1/"))) return undefined;
   const denied = authenticateApiRequest(req, policy);
   if (denied) return denied;
   const methods = path === "/v1/models" ? ["GET"]
     : path === "/v1/responses" ? ["GET", "POST"]
-      : path === "/v1/responses/compact" ? ["POST"] : undefined;
+      : path === "/v1/responses/compact" ? ["POST"]
+        : upstream?.available && ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits"].includes(path)
+          ? ["POST"] : undefined;
   if (!methods) {
     return apiAccessError(404, "endpoint_not_supported", "API key mode only exposes ChatGPT Web models and Responses endpoints");
   }
@@ -83,12 +90,17 @@ export function guardApiRequest(req: Request, policy: ApiAccessPolicy): Response
   return undefined;
 }
 
-export function requireWebModelInApiKeyMode(model: unknown, policy: ApiAccessPolicy): Response | undefined {
+export function requireWebModelInApiKeyMode(
+  model: unknown,
+  policy: ApiAccessPolicy,
+  upstream?: UpstreamProviderRuntime,
+): Response | undefined {
   if (policy.mode !== "api-key") return undefined;
   // Exact account/mode eligibility remains owned by requireChatGptWebModelRoute. This guard
   // closes the native passthrough branch before parsing can start any adapter or continuation.
   if (typeof model === "string" && model.startsWith("chatgpt-web/")) return undefined;
-  return apiAccessError(400, "model_not_supported", "API key mode requires an available chatgpt-web/* model; native forwarding is disabled");
+  if (upstream?.available && upstream.config && upstreamModelAllowed(model, upstream.config)) return undefined;
+  return apiAccessError(400, "model_not_supported", "API key mode requires a chatgpt-web/* model or a model allowed by the configured upstream provider");
 }
 
 /** Client authentication must not reach the browser, connector, traces or any upstream. */

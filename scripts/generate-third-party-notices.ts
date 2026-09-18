@@ -16,6 +16,7 @@ const includeLauncher = argumentsList.includes("--include-launcher");
 const destinationArgument = argumentsList.find(argument => argument !== "--include-launcher");
 const visited = new Map<string, { directory: string; manifest: PackageJson }>();
 const bundledLicenseOverrides = new Map([
+  ["proxy-agent-negotiate@1.1.0", join(root, "LICENSES", "proxy-agent-negotiate-MIT.txt")],
   ["tiktoken@1.0.22", join(root, "LICENSES", "tiktoken-MIT.txt")],
 ]);
 

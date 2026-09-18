@@ -370,6 +370,11 @@ class RuntimeSupervisor {
     this.lastChildFailure = { daemon: null, tunnel: null };
     this.lastChildOutput = { daemon: null, tunnel: null };
     this.lastTunnelConfig = null;
+    this.daemonEnvironmentProvider = null;
+  }
+
+  setDaemonEnvironmentProvider(provider) {
+    this.daemonEnvironmentProvider = typeof provider === "function" ? provider : null;
   }
 
   readConfig() {
@@ -496,13 +501,16 @@ class RuntimeSupervisor {
   }
 
   spawnChild(name, invocation) {
+    const environment = { ...process.env };
+    delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
+    Object.assign(environment, {
+      CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
+      ...(name === "daemon" && this.daemonEnvironmentProvider ? this.daemonEnvironmentProvider() : {}),
+    });
     const child = spawn(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       detached: DETACH_OWNED_CHILD,
-      env: {
-        ...process.env,
-        CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
-      },
+      env: environment,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

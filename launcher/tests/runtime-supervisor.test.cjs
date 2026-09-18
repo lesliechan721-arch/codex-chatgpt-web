@@ -1284,6 +1284,38 @@ test("crash-loop diagnostics include the last redacted child failure", () => {
   }
 });
 
+test("upstream provider key is injected only into the managed daemon child", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-upstream-env-"));
+  const descriptorPath = path.join(root, "launcher.json");
+  const daemonResult = path.join(root, "daemon-env.txt");
+  const tunnelResult = path.join(root, "tunnel-env.txt");
+  const previous = process.env.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
+  process.env.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY = "ambient-value-must-not-propagate";
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root,
+    coreHome: root,
+    browserDescriptorPath: descriptorPath,
+  });
+  supervisor.setDaemonEnvironmentProvider(() => ({ CODEX_CHATGPT_WEB_UPSTREAM_API_KEY: "daemon-only-value" }));
+  supervisor.stopping = true;
+  try {
+    const script = target => `require("node:fs").writeFileSync(${JSON.stringify(target)}, process.env.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY || "missing")`;
+    const daemon = supervisor.spawnChild("daemon", { executable: process.execPath, args: ["-e", script(daemonResult)], cwd: root });
+    await new Promise(resolve => daemon.once("close", resolve));
+    const tunnel = supervisor.spawnChild("tunnel", { executable: process.execPath, args: ["-e", script(tunnelResult)], cwd: root });
+    await new Promise(resolve => tunnel.once("close", resolve));
+    assert.equal(fs.readFileSync(daemonResult, "utf8"), "daemon-only-value");
+    assert.equal(fs.readFileSync(tunnelResult, "utf8"), "missing");
+  } finally {
+    supervisor.stopping = false;
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
+    else process.env.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("authenticated proxy URLs never reach runtime logs, state, failures, operations, or exports", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-proxy-redaction-"));
   const filePath = path.join(root, "launcher.jsonl");

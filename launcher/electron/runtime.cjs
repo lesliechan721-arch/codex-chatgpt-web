@@ -632,6 +632,7 @@ class RuntimeHost {
         const environment = options.environment
           ? { ...options.environment }
           : { ...process.env };
+        delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
         Object.assign(environment, {
           CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
           ...(options.env || {}),
@@ -651,10 +652,12 @@ class RuntimeHost {
           pipeErrors.push(`${name} ${stream} pipe failed: ${error instanceof Error ? error.message : String(error)}`);
         };
         collect(child.stdout, stdout, (line) => {
+          if (options.sensitiveOutput) return;
           this.logger.info("runtime.stdout", { operation: name, line });
           this.publishOperation?.({ name, status: "running", message: redactText(line) });
         }, recordPipeError("stdout"));
         collect(child.stderr, stderr, (line) => {
+          if (options.sensitiveOutput) return;
           this.logger.warn("runtime.stderr", { operation: name, line });
           this.publishOperation?.({ name, status: "running", message: redactText(line) });
         }, recordPipeError("stderr"));
@@ -744,6 +747,7 @@ class RuntimeHost {
       });
       const acceptedExitCodes = options.acceptedExitCodes || [0];
       if (!acceptedExitCodes.includes(result.code)) {
+        if (options.sensitiveOutput) throw new Error(`Sensitive operation failed with exit ${result.code}`);
         const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`;
         throw new Error(detail);
       }

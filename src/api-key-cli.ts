@@ -13,7 +13,8 @@ import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
 import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
-import { renderApiKeyCodexConfig } from "./api-key-codex-config";
+import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
+import { loadUpstreamProviderConfig } from "./upstream-provider-config";
 
 async function readKeyFromStdin(): Promise<string> {
   if (stdin.isTTY) throw new Error("--key-stdin requires piped input; use --generate for a random key");
@@ -49,15 +50,17 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     }
     saveApiAccessPolicy(policy);
     // stdout contains only the newly generated secret, so callers can capture it without parsing.
-    // Imported secrets are never echoed, and status/config export never reveals any secret/hash.
+    // Imported secrets are never echoed by enable/rotate or status. codex-config is an explicit
+    // sensitive export action and includes the current local client key.
     if (generated) stdout.write(`${key}\n`);
     try { cleanupApiKeyCodexIntegration(); }
     catch { stderr.write("Saved, but recorded Codex injection needs manual conflict resolution; run api-key cleanup.\n"); }
     stderr.write(`API key mode saved. Restart the service/Launcher to apply it; an already-running process keeps its previous policy.\n`);
-    stderr.write(`Set ${API_KEY_ENV} in the Codex client environment. Browser ChatGPT login and Full-mode tunnel credentials remain separate.\n`);
+    stderr.write(`Keep ${API_KEY_ENV} available to API clients and for explicit api-key codex-config export. Browser ChatGPT login and Full-mode tunnel credentials remain separate.\n`);
     return;
   }
-  if (args.length) throw new Error(`api-key ${action} does not accept additional arguments`);
+  const jsonExport = action === "codex-config" && args.length === 1 && args[0] === "--json";
+  if (args.length && !jsonExport) throw new Error(`api-key ${action} does not accept additional arguments`);
   if (action === "disable") {
     // Explicit recovery command can replace malformed policy files without an insecure runtime fallback.
     saveApiAccessPolicy(OPENAI_ACCESS);
@@ -86,19 +89,33 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     return;
   }
   if (policy.mode !== "api-key") throw new Error("Enable API key mode before exporting its Codex configuration");
+  const localApiKey = process.env[API_KEY_ENV];
+  if (!localApiKey || !apiKeyMatches(localApiKey, policy)) {
+    throw new Error(`${API_KEY_ENV} must contain the current local API key before export`);
+  }
   const config = loadConfig();
   const route = availableChatGptWebModelRoutes(config)[0];
   if (!route) throw new Error("No ChatGPT Web models are available in the current account/mode configuration");
   const catalogPath = join(getConfigDir(), "api-key-models.json");
   const catalog = buildStandaloneModelCatalog(config);
   atomicWriteFile(catalogPath, `${JSON.stringify({ models: catalog.models }, null, 2)}\n`);
-  stdout.write(renderApiKeyCodexConfig({
+  const upstream = loadUpstreamProviderConfig();
+  const rendered = renderApiKeyCodexConfig({
     port: config.port,
     catalogPath,
     model: route.slug,
     reasoningEffort: route.codexEffort,
+    apiKey: localApiKey,
+    supportsOpenAiServerCompaction: upstream?.supportsOpenAiServerCompaction === true,
     subagentProtocol: config.subagentProtocol,
     runtimeCommand: config.runtimeCommand,
-  }));
-  stderr.write("Local model catalog exported. Re-export after account capabilities, browser mode or context settings change.\n");
+  });
+  const environment = codexProxyEnvironment();
+  if (jsonExport) {
+    stdout.write(`${JSON.stringify({ config: rendered, catalogPath, environment })}\n`);
+  } else {
+    stdout.write(rendered);
+    stderr.write(`Codex process environment: ${JSON.stringify(environment)}\n`);
+  }
+  stderr.write("Sensitive client configuration exported. Re-export after account capabilities, browser mode or context settings change.\n");
 }
