@@ -8,6 +8,10 @@ export interface IncomingMeta {
 
 export interface ProviderAdapter {
   name: string;
+  preflight?(
+    parsed: CodexParsedRequest,
+    incoming: IncomingMeta,
+  ): Promise<void> | void;
   runTurn(
     parsed: CodexParsedRequest,
     incoming: IncomingMeta,

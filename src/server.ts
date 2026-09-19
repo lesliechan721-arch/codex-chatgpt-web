@@ -730,18 +730,50 @@ export async function responseRequest(
     return formatErrorResponse(503, "server_error", "ChatGPT web turn broker is unavailable; restart the runtime before submitting new Web work");
   }
   const adapter = adapterFactory(provider);
-  const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();
   if (req.signal.aborted) abort.abort();
   else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  const incoming = { headers: adapterRequestHeaders(req.headers, accessPolicy), abortSignal: abort.signal };
+  const adapterErrorEvent = (error: unknown): Extract<AdapterEvent, { type: "error" }> => ({
+    type: "error",
+    message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof ChatGptWebAdapterError ? {
+      status: error.status, errorType: error.errorType, code: error.code, retryable: error.retryable,
+    } : {}),
+  });
+  const environmentFailureResponse = (event: AdapterEvent | undefined): Response | undefined => {
+    if (event?.type !== "error"
+      || (event.code !== "missing_trusted_codex_environment" && event.code !== "invalid_trusted_codex_environment")
+      || event.status !== 400 || event.retryable !== false) return undefined;
+    return Response.json({ error: {
+      message: event.message, type: event.errorType, code: event.code,
+    } }, { status: 400 });
+  };
+  if (adapter.preflight) {
+    try {
+      await adapter.preflight(parsed, incoming);
+    } catch (error) {
+      const event = adapterErrorEvent(error);
+      options.onAdapterEvent?.(event);
+      const rejected = environmentFailureResponse(event);
+      if (rejected) return rejected;
+      if (error instanceof ChatGptWebAdapterError) {
+        return Response.json({ error: {
+          message: error.message, type: error.errorType, code: error.code,
+        } }, { status: error.status });
+      }
+      return formatErrorResponse(500, "server_error", event.message);
+    }
+  }
+  const queue = new AsyncEventQueue<AdapterEvent>();
   const run = async () => {
     try {
-      await adapter.runTurn!(parsed, { headers: adapterRequestHeaders(req.headers, accessPolicy), abortSignal: abort.signal }, event => {
+      await adapter.runTurn!(parsed, incoming, event => {
         options.onAdapterEvent?.(event);
         queue.push(event);
       });
     } catch (error) {
-      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      const event = adapterErrorEvent(error);
       options.onAdapterEvent?.(event);
       queue.push(event);
     } finally {
@@ -782,6 +814,8 @@ export async function responseRequest(
 
   await run();
   const events = await queue.collect();
+  const rejected = environmentFailureResponse(events[0]);
+  if (rejected) return rejected;
   const json = buildResponseJSON(events, responseModel, {
     hideThinkingSummary: parsed.options.hideThinkingSummary,
     toolNsMap: maps.toolNsMap,
