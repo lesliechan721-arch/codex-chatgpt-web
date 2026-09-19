@@ -131,6 +131,63 @@ function rawMessageHasEnvironmentContext(value: Record<string, unknown>): boolea
   });
 }
 
+function messageContentKinds(value: Record<string, unknown>): string[] | undefined {
+  const kinds = record(value.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  return Array.isArray(kinds) && kinds.every(kind => typeof kind === "string")
+    ? kinds as string[]
+    : undefined;
+}
+
+interface CurrentChatGptEnvironmentPart {
+  item: Record<string, unknown>;
+  text: string;
+  kind?: string;
+}
+
+function rawMessageEnvironmentParts(item: Record<string, unknown>): CurrentChatGptEnvironmentPart[] {
+  const kinds = messageContentKinds(item);
+  if (typeof item.content === "string") {
+    return /<\/?environment_context\b/i.test(item.content)
+      ? [{ item, text: item.content, ...(kinds?.length === 1 ? { kind: kinds[0] } : {}) }]
+      : [];
+  }
+  if (!Array.isArray(item.content)) return [];
+  return item.content.flatMap((value, index) => {
+    const text = record(value)?.text;
+    if (typeof text !== "string" || !/<\/?environment_context\b/i.test(text)) return [];
+    return [{ item, text, ...(typeof kinds?.[index] === "string" ? { kind: kinds[index] } : {}) }];
+  });
+}
+
+function currentChatGptEnvironmentParts(parsed: CodexParsedRequest): CurrentChatGptEnvironmentPart[] {
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  if (!turnId) {
+    return input.flatMap(value => {
+      const item = record(value);
+      return inputItemType(item) === "message" && item ? rawMessageEnvironmentParts(item) : [];
+    });
+  }
+  const parts: CurrentChatGptEnvironmentPart[] = [];
+  let laterAssistantOutput = false;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = record(input[index]);
+    if (!item) continue;
+    const type = inputItemType(item);
+    if ((type === "message" && item.role === "assistant")
+      || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
+      laterAssistantOutput = true;
+    }
+    if (type !== "message") continue;
+    const owner = itemTurnId(item);
+    if (owner === turnId || (owner === undefined && !laterAssistantOutput)) {
+      parts.push(...rawMessageEnvironmentParts(item));
+    }
+  }
+  return parts;
+}
+
 /** True when the raw Responses input attempted to carry an environment envelope, valid or not. */
 export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {
   const body = record(parsed._rawBody);
@@ -144,24 +201,40 @@ export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boo
 
 /** Historical XML is not a current environment update, including in old untagged rollouts. */
 export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {
-  const turnId = extractChatGptTurnIdentity(parsed).turnId;
-  if (!turnId) return hasRawChatGptEnvironmentContext(parsed);
-  const body = record(parsed._rawBody);
-  const input = Array.isArray(body?.input) ? body.input : [];
-  let laterAssistantOutput = false;
-  for (let index = input.length - 1; index >= 0; index -= 1) {
-    const item = record(input[index]);
-    if (!item) continue;
-    const type = inputItemType(item);
-    if ((type === "message" && item.role === "assistant")
-      || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
-      laterAssistantOutput = true;
-    }
-    if (type !== "message" || !rawMessageHasEnvironmentContext(item)) continue;
-    const owner = itemTurnId(item);
-    if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
+  return currentChatGptEnvironmentParts(parsed).length > 0;
+}
+
+function isCanonicalRolloutEnvironmentMarker(text: string): boolean {
+  const match = /^<environment_context>([\s\S]*)<\/environment_context>$/.exec(text.trim());
+  if (!match) return false;
+  const body = match[1]!;
+  const tag = /<(shell|current_date|timezone)>([^<]+)<\/\1>/g;
+  const seen = new Set<string>();
+  let cursor = 0;
+  for (const current of body.matchAll(tag)) {
+    if (body.slice(cursor, current.index).trim() || seen.has(current[1]!)) return false;
+    seen.add(current[1]!);
+    cursor = current.index! + current[0].length;
   }
-  return false;
+  return seen.size > 0 && !body.slice(cursor).trim();
+}
+
+/**
+ * Paginated Codex turns can synthesize a current environment envelope that carries lifecycle
+ * provenance but omits filesystem authority. That marker must never create authority itself; it
+ * may only allow the caller to recover the same turn from Codex's native rollout.
+ */
+export function hasCurrentChatGptRolloutEnvironmentMarker(parsed: CodexParsedRequest): boolean {
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!turnId) return false;
+  const parts = currentChatGptEnvironmentParts(parsed);
+  if (parts.length !== 1) return false;
+  const marker = parts[0]!;
+  return marker.item.role === "user"
+    && typeof marker.item.id === "string" && marker.item.id.length > 0
+    && itemTurnId(marker.item) === turnId
+    && marker.kind === "environments.environment_context"
+    && isCanonicalRolloutEnvironmentMarker(marker.text);
 }
 
 function countPattern(text: string, pattern: RegExp): number {

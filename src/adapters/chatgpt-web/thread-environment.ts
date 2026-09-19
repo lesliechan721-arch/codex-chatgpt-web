@@ -12,6 +12,7 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
+  hasCurrentChatGptRolloutEnvironmentMarker,
   hasCurrentChatGptEnvironmentContext,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
@@ -340,7 +341,9 @@ export class ChatGptThreadEnvironmentStore {
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
       const historicalMessages = hasCurrentContext && !currentCompaction && lineage
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !historicalMessages) {
+      const rolloutMarker = hasCurrentContext && !currentCompaction
+        && hasCurrentChatGptRolloutEnvironmentMarker(parsed);
+      if (hasCurrentContext && !currentCompaction && !historicalMessages && !rolloutMarker) {
         diagnostics.recovery_stage = "current_update_rejected";
         throw error;
       }

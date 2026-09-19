@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   MissingTrustedCodexEnvironmentError,
   TrustedCodexEnvironmentValidationError,
@@ -31,7 +31,10 @@ function request(xml?: string, metadata: Record<string, unknown> = {}) {
     ].map(({ id, text }) => ({
       type: "message", role: "user", id,
       content: [{ type: "input_text", text }],
-      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      internal_chat_message_metadata_passthrough: {
+        turn_id: turnId,
+        content_item_kinds: [id === "msg_environment" ? "environments.environment_context" : "user.text"],
+      },
     })),
   });
 }
@@ -138,6 +141,79 @@ test("a rejected current update reports that recovery was blocked even with a va
   const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
   expect(() => store.resolve(request(environment.replace(`<cwd>${root}</cwd>`, "<cwd/>")), diagnostics))
     .toThrow(MissingTrustedCodexEnvironmentError);
+  expect(diagnostics).toEqual({
+    recovery_stage: "current_update_rejected", rollout_lookup: "not_attempted",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("a current cwd-less rollout marker recovers only from the matching native turn", () => {
+  const codexHome = join(home, "rollout-marker-codex-home");
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-00-00-${threadId}.jsonl`);
+  mkdirSync(dirname(rolloutPath), { recursive: true });
+  writeFileSync(rolloutPath, [
+    JSON.stringify({ type: "session_meta", payload: { id: threadId, source: "vscode" } }),
+    JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: turnId,
+        cwd: root,
+        workspace_roots: [root],
+        approval_policy: "never",
+        sandbox_policy: { type: "danger-full-access" },
+        permission_profile: { type: "disabled" },
+        model: "chatgpt-web/pro",
+        summary: "auto",
+      },
+    }),
+  ].join("\n") + "\n");
+
+  const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  expect(store.resolve(request(marker), diagnostics)).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+
+  for (const rejected of [
+    "<environment_context><cwd/></environment_context>",
+    "<environment_context><sandbox_mode>read-only</sandbox_mode></environment_context>",
+    "<environment_context><permission_profile type=\"managed\"><file_system type=\"restricted\" /></permission_profile></environment_context>",
+  ]) {
+    expect(() => store.resolve(request(rejected), diagnostics))
+      .toThrow(MissingTrustedCodexEnvironmentError);
+    expect(diagnostics).toEqual({
+      recovery_stage: "current_update_rejected", rollout_lookup: "not_attempted",
+      thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+    });
+  }
+
+  const mixed = request(marker);
+  const mixedInput = (mixed._rawBody as { input: Array<Record<string, unknown>> }).input;
+  mixedInput.splice(1, 0, {
+    type: "message", role: "user", id: "msg_malformed_environment",
+    content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }],
+    internal_chat_message_metadata_passthrough: {
+      content_item_kinds: ["environments.environment_context"],
+    },
+  });
+  expect(() => store.resolve(mixed, diagnostics)).toThrow(MissingTrustedCodexEnvironmentError);
+  expect(diagnostics).toEqual({
+    recovery_stage: "current_update_rejected", rollout_lookup: "not_attempted",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+
+  const humanMarker = request(marker);
+  const humanInput = (humanMarker._rawBody as {
+    input: Array<{ internal_chat_message_metadata_passthrough?: { content_item_kinds?: string[] } }>;
+  }).input;
+  humanInput[0]!.internal_chat_message_metadata_passthrough!.content_item_kinds = ["user.text"];
+  expect(() => store.resolve(humanMarker, diagnostics)).toThrow(MissingTrustedCodexEnvironmentError);
   expect(diagnostics).toEqual({
     recovery_stage: "current_update_rejected", rollout_lookup: "not_attempted",
     thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
