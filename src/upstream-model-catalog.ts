@@ -37,8 +37,12 @@ function catalogRows(value: unknown): { data: JsonObject[]; models: JsonObject[]
     throw new Error("Upstream model catalog must be a JSON object");
   }
   const raw = value as JsonObject;
-  const standard = raw.object === "list" && Array.isArray(raw.data);
+  const standardDeclared = Object.hasOwn(raw, "data");
+  const standard = Array.isArray(raw.data) && (raw.object === undefined || raw.object === "list");
   const richDeclared = Object.hasOwn(raw, "models");
+  if (standardDeclared && !standard) {
+    throw new Error("Upstream model catalog is incompatible");
+  }
   let models: JsonObject[] = [];
   if (richDeclared) {
     if (!Array.isArray(raw.models) || !raw.models.every(compatibleCodexRichModel)) {

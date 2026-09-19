@@ -120,6 +120,17 @@ test("API-key model catalog merges filtered upstream rows and keeps the local We
   assert.ok(!payload.models.some(row => row.slug === "other-filtered"));
 });
 
+test("API-key model catalog accepts OpenAI-compatible data arrays without an object marker", async () => {
+  const response = await modelsRequest(
+    new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
+    config(), undefined, undefined, accessPolicy, undefined, upstream(),
+    async () => Response.json({ data: [{ id: "gpt-upstream", object: "model" }] }),
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json() as { data: Array<{ id: string }> };
+  assert.ok(payload.data.some(row => row.id === "gpt-upstream"));
+});
+
 test("upstream catalog failures return the complete local catalog without stale data", async () => {
   let failure: unknown;
   const response = await modelsRequest(
@@ -167,6 +178,12 @@ test("upstream catalog HTTP and schema failures also fall back to a fresh local 
     [new Response("provider rejected", { status: 503 }), "upstream"],
     [new Response("{", { status: 200, headers: { "content-type": "application/json" } }), "catalog"],
     [Response.json({ object: "unexpected", data: [] }), "catalog"],
+    [Response.json({
+      object: "unexpected",
+      data: [{ id: "gpt-standard", object: "model" }],
+      models: [{ slug: "gpt-rich", display_name: "Rich upstream", visibility: "list", supported_in_api: true,
+        supported_reasoning_levels: [], tool_mode: null, context_window: 128_000 }],
+    }), "catalog"],
     [Response.json({ models: [{ slug: "gpt-incomplete" }] }), "catalog"],
   ] as const) {
     let failure: { stage: string } | undefined;

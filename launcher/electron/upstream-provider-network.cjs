@@ -6,30 +6,6 @@ const { normalizeModelId } = require("./upstream-provider-config.cjs");
 
 const MAX_MODELS_BYTES = 4 * 1024 * 1024;
 
-function nonEmptyString(value) {
-  return typeof value === "string" && value.length > 0;
-}
-
-function compatibleReasoningLevels(value) {
-  return Array.isArray(value) && value.every(level => {
-    if (!level || typeof level !== "object" || Array.isArray(level)) return false;
-    return nonEmptyString(level.effort) && typeof level.description === "string";
-  });
-}
-
-function compatibleCodexRichModel(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return nonEmptyString(value.slug)
-    && nonEmptyString(value.display_name)
-    && nonEmptyString(value.visibility)
-    && typeof value.supported_in_api === "boolean"
-    && compatibleReasoningLevels(value.supported_reasoning_levels)
-    && (value.tool_mode === null || nonEmptyString(value.tool_mode))
-    && typeof value.context_window === "number"
-    && Number.isSafeInteger(value.context_window)
-    && value.context_window > 0;
-}
-
 function proxyUrlFromPac(value) {
   if (typeof value !== "string") throw new Error("upstream-fetch-failed");
   const first = value.split(";")[0]?.trim();
@@ -82,15 +58,15 @@ async function requestModels(target, apiKey, proxyUrl) {
 function extractModelIds(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("upstream-fetch-failed");
   const candidates = [];
-  const standard = value.object === "list" && Array.isArray(value.data);
+  const standardDeclared = Object.hasOwn(value, "data");
+  const standard = Array.isArray(value.data) && (value.object === undefined || value.object === "list");
   const richDeclared = Object.hasOwn(value, "models");
+  if (standardDeclared && !standard) throw new Error("upstream-fetch-failed");
   if (standard) {
     for (const row of value.data) if (row && typeof row === "object" && !Array.isArray(row)) candidates.push(row.id);
   }
   if (richDeclared) {
-    if (!Array.isArray(value.models) || !value.models.every(compatibleCodexRichModel)) {
-      throw new Error("upstream-fetch-failed");
-    }
+    if (!Array.isArray(value.models)) throw new Error("upstream-fetch-failed");
     for (const row of value.models) if (row && typeof row === "object" && !Array.isArray(row)) candidates.push(row.slug);
   }
   if (!standard && !richDeclared) throw new Error("upstream-fetch-failed");

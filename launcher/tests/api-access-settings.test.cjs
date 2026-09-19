@@ -434,6 +434,7 @@ test("manual model discovery uses draft settings and does not persist provider i
   const address = server.address();
   assert.ok(address && typeof address === "object");
   const result = await f.controller.fetchUpstreamModels({
+    expectedRevision: before.revision,
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     apiKey: UPSTREAM_KEY,
     proxy: { mode: "direct" },
@@ -444,12 +445,19 @@ test("manual model discovery uses draft settings and does not persist provider i
   assert.equal(after.upstream.configured, false);
 });
 
-test("manual model discovery rejects slug-only incompatible Codex rich rows", () => {
-  assert.throws(() => extractModelIds({
+test("manual model discovery only needs requestable IDs from Codex-style model rows", () => {
+  assert.deepEqual(extractModelIds({
     object: "list",
     data: [{ id: "gpt-standard" }],
     models: [{ slug: "gpt-slug-only" }],
-  }), /upstream-fetch-failed/);
+  }), ["gpt-standard", "gpt-slug-only"]);
+  assert.deepEqual(extractModelIds({ models: [{ slug: "gpt-slug-only" }] }), ["gpt-slug-only"]);
+  assert.throws(() => extractModelIds({ models: "not-an-array" }), /upstream-fetch-failed/);
+});
+
+test("manual model discovery accepts OpenAI-compatible data arrays without an object marker", () => {
+  assert.deepEqual(extractModelIds({ data: [{ id: "gpt-standard" }] }), ["gpt-standard"]);
+  assert.throws(() => extractModelIds({ object: "unexpected", data: [{ id: "gpt-standard" }] }), /upstream-fetch-failed/);
 });
 
 test("manual model discovery reuses the authenticated Launcher global proxy", async t => {
@@ -468,6 +476,7 @@ test("manual model discovery reuses the authenticated Launcher global proxy", as
   proxyUrl.password = "proxy-pass";
   const f = fixture(t, { networkProxyUrl: proxyUrl.href }); await f.apply();
   const result = await f.controller.fetchUpstreamModels({
+    expectedRevision: (await f.controller.status()).revision,
     baseUrl: "http://models-target.invalid/v1",
     apiKey: UPSTREAM_KEY,
     proxy: { mode: "global" },
@@ -478,13 +487,8 @@ test("manual model discovery reuses the authenticated Launcher global proxy", as
 
 test("manual model discovery can reuse the saved provider key", async t => {
   const f = fixture(t); await f.apply();
-  await f.controller.saveUpstream({
-    expectedRevision: (await f.controller.status()).revision,
-    baseUrl: "https://saved-provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "direct" }, modelFilter: { mode: "selected", models: ["gpt-saved"] },
-    supportsOpenAiServerCompaction: false,
-  });
-  const server = http.createServer((_request, response) => {
+  const server = http.createServer((request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${UPSTREAM_KEY}`);
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ object: "list", data: [{ id: "gpt-live" }] }));
   });
@@ -492,11 +496,69 @@ test("manual model discovery can reuse the saved provider key", async t => {
   t.after(() => server.close());
   const address = server.address();
   assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl, apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, modelFilter: { mode: "selected", models: ["gpt-saved"] },
+    supportsOpenAiServerCompaction: false,
+  });
+  const baseline = (await f.controller.status()).revision;
   const fetched = await f.controller.fetchUpstreamModels({
-    baseUrl: `http://127.0.0.1:${address.port}/v1`, proxy: { mode: "direct" },
+    expectedRevision: baseline, baseUrl, proxy: { mode: "direct" },
   });
   assert.deepEqual(fetched.models, ["gpt-live"]);
   assert.deepEqual((await f.controller.status()).upstream.modelFilter, { mode: "selected", models: ["gpt-saved"] });
+});
+
+test("manual model discovery never reuses a saved key for another Base URL", async t => {
+  const f = fixture(t); await f.apply();
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://saved-provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    supportsOpenAiServerCompaction: false,
+  });
+  const baseline = (await f.controller.status()).revision;
+  await assert.rejects(f.controller.fetchUpstreamModels({
+    expectedRevision: baseline,
+    baseUrl: "https://other-provider.example/v1",
+    proxy: { mode: "direct" },
+  }), /upstream-key-required/);
+});
+
+test("stale model discovery cannot reuse a key saved by an external update", async t => {
+  const f = fixture(t); await f.apply();
+  let requests = 0;
+  const server = http.createServer((_request, response) => {
+    requests++;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ object: "list", data: [{ id: "should-not-load" }] }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const staleBaseUrl = `http://127.0.0.1:${address.port}/v1`;
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: staleBaseUrl, apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    supportsOpenAiServerCompaction: false,
+  });
+  const staleRevision = (await f.controller.status()).revision;
+  await f.controller.saveUpstream({
+    expectedRevision: staleRevision,
+    baseUrl: "https://provider-b.example/v1", apiKey: "provider-b-key",
+    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    supportsOpenAiServerCompaction: false,
+  });
+  await assert.rejects(f.controller.fetchUpstreamModels({
+    expectedRevision: staleRevision,
+    baseUrl: staleBaseUrl,
+    proxy: { mode: "direct" },
+  }), /stale-settings/);
+  assert.equal(requests, 0);
 });
 test("DEV profile cannot change production API access", async t => {
   const f = fixture(t, { profile: "development" }); await assert.rejects(f.controller.status(), /dev-profile/);

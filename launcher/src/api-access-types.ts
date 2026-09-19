@@ -48,5 +48,10 @@ export interface ApiAccessApi {
     supportsOpenAiServerCompaction: boolean;
   }): Promise<ApiAccessResult<{ status: ApiAccessStatus }>>;
   apiAccessUpstreamDelete(input: { expectedRevision: string }): Promise<ApiAccessResult<{ status: ApiAccessStatus }>>;
-  apiAccessUpstreamModels(input: { baseUrl: string; apiKey?: string; proxy: UpstreamProxy }): Promise<ApiAccessResult<{ models: string[] }>>;
+  apiAccessUpstreamModels(input: {
+    expectedRevision: string;
+    baseUrl: string;
+    apiKey?: string;
+    proxy: UpstreamProxy;
+  }): Promise<ApiAccessResult<{ models: string[] }>>;
 }
