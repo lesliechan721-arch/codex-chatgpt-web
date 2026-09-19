@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1041,6 +1041,97 @@ test("a full-mode runtime exposes its broker endpoint before any turn registers"
   } finally {
     await server.stop(true);
     await closeTurnBrokers();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("health reports a failed broker startup without deleting the conflicting file", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join("/tmp", "cgw-health-fail-"));
+  const path = join(root, "broker.sock");
+  writeFileSync(path, "not a socket");
+  const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
+  const broker = TurnBroker.forSocket(path);
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ status: "degraded", broker_available: false, accepting_turns: false });
+    expect(readFileSync(path, "utf8")).toBe("not a socket");
+  } finally {
+    await server.stop(true);
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("health checks the broker protocol and detects a subsequently lost endpoint", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join("/tmp", "cgw-health-lost-"));
+  const path = join(root, "broker.sock");
+  const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
+  const broker = TurnBroker.forSocket(path);
+  try {
+    const endpoint = `http://127.0.0.1:${server.port}/healthz`;
+    const ready = await fetch(endpoint);
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toMatchObject({ status: "ok", broker_available: true });
+    unlinkSync(path);
+    const lost = await fetch(endpoint);
+    expect(lost.status).toBe(503);
+    expect(await lost.json()).toMatchObject({ status: "degraded", broker_available: false, accepting_turns: false });
+  } finally {
+    await server.stop(true);
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a lost broker rejects new Web work and cannot be made ready by resume", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync("/tmp/cgw-admission-");
+  const path = join(root, "broker.sock");
+  const config = { ...defaultConfig("full"), port: 0, brokerSocketPath: path };
+  let adapterCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: { version: 1, mode: "openai" },
+    adapterFactory: () => { adapterCalls += 1; throw new Error("must reject before creating a browser"); },
+    fetchUpstream: async () => Response.json({ unaffected: true }),
+  });
+  const broker = TurnBroker.forSocket(path);
+  const base = `http://127.0.0.1:${server.port}`;
+  try {
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    unlinkSync(path);
+    for (const route of ["responses", "responses/compact"]) {
+      const response = await fetch(`${base}/v1/${route}`, {
+        method: "POST",
+        headers: { "authorization": "Bearer test-codex-session", "content-type": "application/json" },
+        body: JSON.stringify({ model: "chatgpt-web/high", input: "hello", stream: false }),
+      });
+      expect(response.status).toBe(503);
+      expect((await response.json() as { error: { message: string } }).error.message).toContain("broker");
+    }
+    expect(adapterCalls).toBe(0);
+    const native = await fetch(`${base}/v1/alpha/search`, {
+      method: "POST",
+      headers: { "authorization": "Bearer test-codex-session", "content-type": "application/json" },
+      body: JSON.stringify({ query: "independent native request" }),
+    });
+    expect(native.status).toBe(200);
+    expect(await native.json()).toEqual({ unaffected: true });
+    const resumed = await fetch(`${base}/admin/resume`, {
+      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(resumed.status).toBe(503);
+    expect(await resumed.json()).toMatchObject({ accepting_turns: false, broker_available: false });
+    const drained = await fetch(`${base}/admin/drain`, {
+      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
+    });
+    expect(drained.status).toBe(200);
+    expect(await drained.json()).toMatchObject({ accepting_turns: false, active_http_turns: 0 });
+  } finally {
+    await server.stop(true);
+    await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

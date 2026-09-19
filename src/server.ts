@@ -389,6 +389,8 @@ export interface ResponseRequestOptions {
   upstreamRuntime?: UpstreamProviderRuntime;
   /** Test seam for the custom upstream transport. */
   fetchUpstreamProvider?: UpstreamFetch;
+  /** Check only routed Web work; native upstream requests do not use the local broker. */
+  brokerAvailable?: () => Promise<boolean>;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -724,6 +726,9 @@ export async function responseRequest(
       headers: { "content-type": "application/json" },
     });
   }
+  if (options.brokerAvailable && !await options.brokerAvailable()) {
+    return formatErrorResponse(503, "server_error", "ChatGPT web turn broker is unavailable; restart the runtime before submitting new Web work");
+  }
   const adapter = adapterFactory(provider);
   const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();
@@ -794,7 +799,7 @@ export async function compactRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: Pick<
     ResponseRequestOptions,
-    "onTurnIdentity" | "accessPolicy" | "upstreamRuntime" | "fetchUpstreamProvider"
+    "onTurnIdentity" | "accessPolicy" | "upstreamRuntime" | "fetchUpstreamProvider" | "brokerAvailable"
   > = {},
 ): Promise<Response> {
   const accessPolicy = options.accessPolicy ?? OPENAI_ACCESS;
@@ -951,13 +956,14 @@ export function startServer(
   }
   const startedAt = Date.now();
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
-  if (config.mode === "full") {
-    void turnBroker!.listen().catch(error => {
-      console.error(
-        `[chatgpt-web] turn broker endpoint is unavailable: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
-  }
+  const brokerStarted = turnBroker?.listen().then(() => true, error => {
+    console.error(
+      `[chatgpt-web] turn broker endpoint is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  });
+  const brokerAvailable = async (): Promise<boolean> => !turnBroker
+    || Boolean(await brokerStarted) && await turnBroker.checkHealth();
   let draining = false;
   let shutdownPromise: Promise<void> | undefined;
   let successfulModelCatalogRequests = 0;
@@ -986,8 +992,10 @@ export function startServer(
       if (denied) return denied;
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
+        const available = turnBroker ? await brokerAvailable() : null;
+        const healthy = available !== false;
         return Response.json({
-          status: "ok",
+          status: healthy ? "ok" : "degraded",
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
@@ -1002,16 +1010,23 @@ export function startServer(
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
-          accepting_turns: !draining,
+          accepting_turns: !draining && healthy,
+          broker_available: available,
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
           model_catalog_requests: modelCatalogRequests,
           last_model_catalog_result: lastModelCatalogResult,
           ...activity(),
-        });
+        }, { status: healthy ? 200 : 503 });
       }
       if (req.method === "POST" && (url.pathname === "/admin/drain" || url.pathname === "/admin/resume")) {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        if (url.pathname === "/admin/resume" && !await brokerAvailable()) {
+          turnBroker?.setExternalOwnersAccepted(false);
+          return Response.json({
+            status: "degraded", accepting_turns: false, broker_available: false, ...activity(),
+          }, { status: 503 });
+        }
         draining = url.pathname === "/admin/drain";
         turnBroker?.setExternalOwnersAccepted(!draining);
         return Response.json({ status: "ok", accepting_turns: !draining, ...activity() });
@@ -1221,6 +1236,7 @@ export function startServer(
               accessPolicy,
               upstreamRuntime,
               fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+              brokerAvailable,
             },
           ),
           req.signal,
@@ -1240,6 +1256,7 @@ export function startServer(
               accessPolicy,
               upstreamRuntime,
               fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+              brokerAvailable,
             },
           ),
           req.signal,

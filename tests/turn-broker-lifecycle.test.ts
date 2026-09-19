@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
-import { createServer, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, closeTurnBrokers, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
 
 test("explicit browser-turn cancellation aborts and removes every registered session", async () => {
@@ -282,7 +282,7 @@ test(`closing a retired broker preserves its replacement and registry entry (ove
     const closing = retired.close();
     if (!overlap) {
       await closing;
-      if (process.platform !== "win32") expect(existsSync(socketPath)).toBe(false);
+      await expect(callTurnBroker(socketPath, { method: "owner_status" })).rejects.toThrow("unavailable");
     }
     replacement = TurnBroker.forSocket(socketPath);
     await replacement.listen();
@@ -294,6 +294,57 @@ test(`closing a retired broker preserves its replacement and registry entry (ove
   } finally {
     await retired.close();
     await replacement?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("closing an unstarted replacement preserves the previous close barrier", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join("/tmp", "cgw-broker-close-chain-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const retired = TurnBroker.forSocket(socketPath);
+  let heldConnection: Socket | undefined;
+  let replacement: TurnBroker | undefined;
+  let closingRetired: Promise<void> | undefined;
+  let closingUnused: Promise<void> | undefined;
+  let closingAll: Promise<void> | undefined;
+  let replacementListen: Promise<void> | undefined;
+  try {
+    await retired.listen();
+    heldConnection = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      heldConnection!.once("connect", resolve);
+      heldConnection!.once("error", reject);
+    });
+
+    closingRetired = retired.close();
+    await Bun.sleep(0);
+
+    const unused = TurnBroker.forSocket(socketPath);
+    closingUnused = unused.close();
+    closingAll = closeTurnBrokers();
+    replacement = TurnBroker.forSocket(socketPath);
+    replacementListen = replacement.listen();
+
+    let allSettled = false;
+    let replacementSettled = false;
+    void closingAll.then(() => { allSettled = true; }, () => { allSettled = true; });
+    void replacementListen.then(() => { replacementSettled = true; }, () => { replacementSettled = true; });
+    await Bun.sleep(10);
+
+    expect(allSettled).toBeFalse();
+    expect(replacementSettled).toBeFalse();
+
+    heldConnection.destroy();
+    heldConnection = undefined;
+    await Promise.all([closingRetired, closingUnused, closingAll, replacementListen]);
+  } finally {
+    heldConnection?.destroy();
+    await closingRetired?.catch(() => {});
+    await closingUnused?.catch(() => {});
+    await closingAll?.catch(() => {});
+    await replacementListen?.catch(() => {});
+    await replacement?.close().catch(() => {});
     rmSync(root, { recursive: true, force: true });
   }
 });

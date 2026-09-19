@@ -1,8 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, readlinkSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isWindowsPipeEndpoint } from "../../config";
+import { VERSION } from "../../version";
+import { acquireBrokerSocketLock, brokerSocketLockOwnedBy } from "./turn-broker-lock";
+import { listenOnUnixBrokerSocket } from "./turn-broker-unix";
 import {
   CompactionTransactionStore,
   type CompactionTransactionHandle,
@@ -139,12 +142,18 @@ interface BrokerResponse {
 }
 
 const brokers = new Map<string, TurnBroker>();
+const closingBrokers = new Map<string, Promise<void>>();
 const MAX_BROKER_LINE_CHARS = 67_108_864;
 const MAX_RETIRED_TURN_HANDLES = 64;
+const BROKER_CLOSE_GRACE_MS = 250;
+const BROKER_ENDPOINT_CHECK_MS = 1_000;
+const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
+
+class EndpointMetadataRaceError extends Error {}
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
-  const results = await Promise.allSettled(active.map(broker => broker.close()));
+  const results = await Promise.allSettled([...closingBrokers.values(), ...active.map(broker => broker.close())]);
   const failures = results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
     .map(result => result.reason);
@@ -238,6 +247,17 @@ export interface TurnBrokerOwner {
  */
 const MAX_UNIX_SOCKET_PATH_BYTES = 103;
 
+// Keep the public link stable across cooperating owners. Neither this private pathname nor the
+// lock excludes noncooperating peers; Unix listeners must be adopted by fd, without native unlink.
+function privateBrokerSocketPath(socketPath: string): string {
+  if (isWindowsPipeEndpoint(socketPath)) return socketPath;
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+  const identity = createHash("sha256").update(`${uid}\0${socketPath}`).digest("hex").slice(0, 32);
+  const sibling = join(dirname(socketPath), `.turn-broker-${identity}.sock`);
+  if (Buffer.byteLength(sibling) <= MAX_UNIX_SOCKET_PATH_BYTES) return sibling;
+  return `/tmp/codex-chatgpt-web-${identity}.sock`;
+}
+
 export class TurnBroker implements TurnBrokerOwner {
   static forSocket(path: string): TurnBroker {
     let broker = brokers.get(path);
@@ -260,9 +280,22 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
-  private ownedSocket?: { dev: number; ino: number };
+  private closePromise?: Promise<void>;
+  private closeFailure?: Error;
+  private rejectNewConnections = false;
+  private endpointFailure?: Error;
+  private endpointMonitor?: ReturnType<typeof setInterval>;
+  private endpointHealthCheck?: Promise<boolean>;
+  private endpointTransportFailures = 0;
+  private readonly sockets = new Set<Socket>();
+  private readonly ownerId = `${process.pid}-${randomBytes(16).toString("hex")}`;
+  private readonly listenerPath: string;
+  private releaseSocketLock?: () => void;
+  private ownedSocket?: { dev: number; ino: number; ctimeMs: number };
 
-  private constructor(readonly socketPath: string) {}
+  private constructor(readonly socketPath: string) {
+    this.listenerPath = privateBrokerSocketPath(socketPath);
+  }
 
   /**
    * A ChatGPT turn outlives the request that started it, and its Codex Native calls arrive from a
@@ -645,7 +678,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   setExternalOwnersAccepted(accepted: boolean): void {
-    this.acceptingExternalOwners = accepted;
+    this.acceptingExternalOwners = accepted && !this.endpointFailure && !this.closePromise;
   }
 
   private retire(history: Map<string, string>, handle: string, traceId: string): void {
@@ -719,33 +752,242 @@ export class TurnBroker implements TurnBrokerOwner {
     waiters.clear();
   }
 
-  async close(): Promise<void> {
-    this.compactionTransactions.close();
-    for (const token of [...this.channels.keys()]) this.revoke(token);
-    const server = this.server;
-    const ownedSocket = this.ownedSocket;
-    this.server = undefined;
-    this.startPromise = undefined;
-    this.ownedSocket = undefined;
-    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
-    if (server?.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
-        if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
-        else rejectClose(error);
-      }));
-    }
-    // Failed/unused instances never own the path. A replacement can also bind while close waits.
-    if (ownedSocket && existsSync(this.socketPath)) {
-      const current = lstatSync(this.socketPath);
-      if (current.isSocket() && current.dev === ownedSocket.dev && current.ino === ownedSocket.ino) {
-        unlinkSync(this.socketPath);
+  private lifecycle(event: string, details: Record<string, unknown> = {}): void {
+    let currentSocket: { dev: number; ino: number; ctimeMs: number; isSocket: boolean } | null | "unreadable" = null;
+    if (!isWindowsPipeEndpoint(this.socketPath)) {
+      try {
+        const stat = statSync(this.socketPath, { throwIfNoEntry: false });
+        if (stat) currentSocket = { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs, isSocket: stat.isSocket() };
+      } catch {
+        currentSocket = "unreadable";
       }
+    }
+    console.info(`[chatgpt-web] broker lifecycle ${JSON.stringify({
+      event, pid: process.pid, version: VERSION, socketPath: this.socketPath, owner: this.ownerId,
+      currentSocket, ...details,
+    })}`);
+  }
+
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    clearInterval(this.endpointMonitor);
+    this.endpointMonitor = undefined;
+    this.lifecycle("close_requested", { ownedSocket: this.ownedSocket ?? null });
+    const previousClose = closingBrokers.get(this.socketPath);
+    const closing = Promise.resolve().then(async () => {
+      // Keep one ordered close barrier per path. An unused replacement can be closed before it
+      // ever starts, but it must not hide a still-running close that owns this path's lock.
+      await previousClose;
+      // A pending listen must settle before closing its server. Otherwise its callback can
+      // recreate a live endpoint after close has already returned.
+      await this.startPromise?.catch(() => {});
+      this.compactionTransactions.close();
+      for (const token of [...this.channels.keys()]) this.revoke(token, this.endpointFailure);
+      const server = this.server;
+      if (server?.listening) {
+        if (!isWindowsPipeEndpoint(this.socketPath)) {
+          const current = statSync(this.socketPath, { throwIfNoEntry: false });
+          if (current && (!current.isSocket() || current.dev !== this.ownedSocket?.dev
+            || current.ino !== this.ownedSocket.ino)) {
+            // Preserve the existing fail-closed signal when the public endpoint was already lost.
+            // The fd-only listener cannot unlink either pathname, even during runtime teardown.
+            this.lifecycle("cleanup_skipped", { reason: "endpoint_replaced_before_close", ownedSocket: this.ownedSocket });
+            throw new Error("ChatGPT web broker endpoint was replaced; refusing native close until runtime exit");
+          }
+          if (current && current.ctimeMs !== this.ownedSocket?.ctimeMs) {
+            const changed = { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
+            try {
+              await this.verifySocketMetadataChange(changed);
+            } catch (error) {
+              this.lifecycle("cleanup_skipped", {
+                reason: "endpoint_metadata_unverified_before_close",
+                ownedSocket: this.ownedSocket,
+                verificationError: errorOf(error).message,
+              });
+              throw new Error(
+                "ChatGPT web broker endpoint metadata changed and ownership could not be verified; refusing native close until runtime exit",
+                { cause: error },
+              );
+            }
+          }
+        }
+        // Metadata verification can call owner_status through this server. Reject later sockets
+        // only after that ownership check is complete, before native close starts waiting on them.
+        this.rejectNewConnections = true;
+        this.lifecycle("runtime_close_requested", { ownedSocket: this.ownedSocket ?? null });
+        const deadline = setTimeout(() => {
+          this.lifecycle("connections_forced_closed", { connections: this.sockets.size });
+          for (const socket of this.sockets) socket.destroy();
+        }, BROKER_CLOSE_GRACE_MS);
+        try {
+          // Unix listeners were adopted by fd. Native close cannot unlink a pathname, even if
+          // a noncooperating process replaced the real listener after the last ownership check.
+          await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
+            if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
+            else rejectClose(error);
+          }));
+        } finally {
+          clearTimeout(deadline);
+        }
+      }
+      // Keep both filesystem entries. Closing an fd leaves a stale socket (ECONNREFUSED), not a
+      // dangling link; the next cooperating owner handles it through the locked startup probe.
+      this.lifecycle("close_complete", {
+        cleanup: this.ownedSocket ? "fd_closed_path_retained" : "skipped_non_owner",
+        ownedSocket: this.ownedSocket ?? null,
+      });
+      this.server = undefined;
+      this.ownedSocket = undefined;
+      if (this.releaseSocketLock) {
+        this.releaseSocketLock();
+        this.releaseSocketLock = undefined;
+        this.lifecycle("lock_released");
+      }
+    }).then(() => {
+      if (closingBrokers.get(this.socketPath) === closing) closingBrokers.delete(this.socketPath);
+      if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
+    }, error => {
+      this.closeFailure = errorOf(error);
+      for (const socket of this.sockets) socket.destroy();
+      this.server?.unref();
+      this.lifecycle("close_failed", { reason: this.closeFailure.message, lockRetained: Boolean(this.releaseSocketLock) });
+      throw error;
+    });
+    this.closePromise = closing;
+    closingBrokers.set(this.socketPath, closing);
+    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
+    return closing;
+  }
+
+  private assertListening(): { dev: number; ino: number; ctimeMs: number } | undefined {
+    if (this.closePromise) throw new Error("ChatGPT web turn broker is closed");
+    if (this.endpointFailure) throw this.endpointFailure;
+    try {
+      if (!this.server?.listening) throw new Error("ChatGPT web turn broker endpoint is not listening");
+      if (!isWindowsPipeEndpoint(this.socketPath)) {
+        const current = statSync(this.socketPath, { throwIfNoEntry: false });
+        if (!current?.isSocket() || current.dev !== this.ownedSocket?.dev || current.ino !== this.ownedSocket.ino) {
+          throw new Error("ChatGPT web turn broker endpoint is missing or replaced; a controlled runtime restart is required");
+        }
+        if (current.ctimeMs !== this.ownedSocket.ctimeMs) {
+          if (!brokerSocketLockOwnedBy(this.socketPath, this.ownerId)) {
+            throw new Error("ChatGPT web turn broker ownership lock changed; a controlled runtime restart is required");
+          }
+          return { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
+        }
+      }
+      return undefined;
+    } catch (error) {
+      this.failEndpoint(errorOf(error));
+    }
+  }
+
+  private async verifyProtocolOwner(): Promise<void> {
+    const status = await callTurnBroker<{ protocolVersion: number; owner: string }>(
+      this.socketPath, { method: "owner_status" }, 500,
+    );
+    if (status?.protocolVersion !== 5 || status.owner !== this.ownerId) {
+      this.failEndpoint(new Error("ChatGPT web turn broker endpoint owner mismatch; a runtime restart is required"));
+    }
+    this.endpointTransportFailures = 0;
+  }
+
+  private async verifySocketMetadataChange(changed: { dev: number; ino: number; ctimeMs: number }): Promise<void> {
+    if (!brokerSocketLockOwnedBy(this.socketPath, this.ownerId)) {
+      this.failEndpoint(new Error("ChatGPT web turn broker ownership lock changed; a controlled runtime restart is required"));
+    }
+    await this.verifyProtocolOwner();
+    const current = statSync(this.socketPath, { throwIfNoEntry: false });
+    if (!current?.isSocket() || current.dev !== changed.dev || current.ino !== changed.ino) {
+      this.failEndpoint(new Error("ChatGPT web turn broker endpoint changed during ownership verification; a runtime restart is required"));
+    }
+    if (!brokerSocketLockOwnedBy(this.socketPath, this.ownerId)) {
+      this.failEndpoint(new Error("ChatGPT web turn broker ownership lock changed during verification; a controlled runtime restart is required"));
+    }
+    if (current.ctimeMs !== changed.ctimeMs) {
+      throw new EndpointMetadataRaceError("ChatGPT web turn broker endpoint metadata changed during ownership verification");
+    }
+    this.ownedSocket = { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
+    this.lifecycle("endpoint_metadata_verified", { ownedSocket: this.ownedSocket });
+  }
+
+  private async assertEndpointReady(): Promise<void> {
+    const changed = this.assertListening();
+    if (changed) await this.verifySocketMetadataChange(changed);
+    const changedAfterProbe = this.assertListening();
+    if (changedAfterProbe) await this.verifySocketMetadataChange(changedAfterProbe);
+  }
+
+  private failEndpoint(error: Error): never {
+    if (!this.endpointFailure) {
+      this.endpointFailure = error;
+      clearInterval(this.endpointMonitor);
+      this.endpointMonitor = undefined;
+      this.acceptingExternalOwners = false;
+      this.lifecycle("endpoint_unavailable", { reason: error.message, ownedSocket: this.ownedSocket });
+      this.compactionTransactions.close();
+      for (const token of [...this.channels.keys()]) this.revoke(token, error);
+      for (const socket of this.sockets) socket.destroy();
+    }
+    throw this.endpointFailure;
+  }
+
+  checkHealth(): Promise<boolean> {
+    if (this.endpointHealthCheck) return this.endpointHealthCheck;
+    const checking = this.checkHealthOnce().finally(() => {
+      if (this.endpointHealthCheck === checking) this.endpointHealthCheck = undefined;
+    });
+    this.endpointHealthCheck = checking;
+    return checking;
+  }
+
+  private async checkHealthOnce(): Promise<boolean> {
+    try {
+      const changed = this.assertListening();
+      if (changed) await this.verifySocketMetadataChange(changed);
+      else await this.verifyProtocolOwner();
+      const changedAfterProbe = this.assertListening();
+      if (changedAfterProbe) await this.verifySocketMetadataChange(changedAfterProbe);
+      this.endpointTransportFailures = 0;
+      return true;
+    } catch (error) {
+      if (!(error instanceof EndpointMetadataRaceError) && !this.endpointFailure && !this.closePromise) {
+        this.endpointTransportFailures += 1;
+        if (this.endpointTransportFailures >= BROKER_ENDPOINT_FAILURE_LIMIT) {
+          try {
+            this.failEndpoint(new Error(
+              `ChatGPT web turn broker protocol remained unreachable after ${BROKER_ENDPOINT_FAILURE_LIMIT} consecutive health checks; a controlled runtime restart is required`,
+              { cause: error },
+            ));
+          } catch { /* failEndpoint retired the affected waits */ }
+        }
+      }
+      return false;
     }
   }
 
   private start(): Promise<void> {
-    if (this.startPromise) return this.startPromise;
-    this.startPromise = new Promise<void>((resolveStart, rejectStart) => {
+    if (this.closePromise) return Promise.reject(new Error("ChatGPT web turn broker is closed"));
+    if (this.endpointFailure) return Promise.reject(this.endpointFailure);
+    if (!this.startPromise) {
+      const previousClose = closingBrokers.get(this.socketPath);
+      this.startPromise = (async () => {
+        await previousClose;
+        if (this.closePromise) throw new Error("ChatGPT web turn broker is closed");
+        this.lifecycle("start_requested");
+        await this.openEndpoint();
+      })();
+    }
+    return this.startPromise.then(() => this.assertEndpointReady(), async error => {
+      // close waits on the original startup promise, not on this caller's cleanup continuation.
+      // A failed listen must not retain a live-PID lock indefinitely.
+      try { await this.close(); } catch { /* close logged the retained ownership evidence */ }
+      throw error;
+    });
+  }
+
+  private openEndpoint(): Promise<void> {
+    return new Promise<void>((resolveStart, rejectStart) => {
       const windowsPipe = isWindowsPipeEndpoint(this.socketPath);
       if (!windowsPipe) {
         // sun_path is a fixed-size field in the kernel, so an over-long path fails inside listen()
@@ -760,8 +1002,10 @@ export class TurnBroker implements TurnBrokerOwner {
           return;
         }
         mkdirSync(dirname(this.socketPath), { recursive: true, mode: 0o700 });
+        this.releaseSocketLock = acquireBrokerSocketLock(this.socketPath, this.ownerId);
+        this.lifecycle("lock_acquired");
       }
-      const listen = () => {
+      const listen = (publishLink = false) => {
         const server = createServer(socket => this.handleSocket(socket));
         this.server = server;
         server.once("error", rejectStart);
@@ -770,82 +1014,160 @@ export class TurnBroker implements TurnBrokerOwner {
             `[chatgpt-web] turn broker server error at ${this.socketPath}: ${errorOf(error).message}`,
           );
         });
-        server.listen(this.socketPath, () => {
+        const onListening = () => {
           server.off("error", rejectStart);
-          if (!windowsPipe) {
-            this.ownedSocket = lstatSync(this.socketPath);
-            chmodSync(this.socketPath, 0o600);
+          try {
+            if (!windowsPipe) {
+              const stat = lstatSync(this.listenerPath);
+              this.ownedSocket = { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
+              if (publishLink) symlinkSync(this.listenerPath, this.socketPath);
+              const published = lstatSync(this.socketPath, { throwIfNoEntry: false });
+              const target = published?.isSymbolicLink()
+                ? resolve(dirname(this.socketPath), readlinkSync(this.socketPath))
+                : undefined;
+              const resolved = statSync(this.socketPath, { throwIfNoEntry: false });
+              if (!published?.isSymbolicLink() || target !== this.listenerPath || !resolved?.isSocket()
+                || resolved.dev !== stat.dev || resolved.ino !== stat.ino) {
+                throw new Error("ChatGPT web broker public endpoint changed while the listener was starting");
+              }
+            }
+            this.lifecycle("listening", { ownedSocket: this.ownedSocket ?? null });
+            if (!this.closePromise) {
+              // Detect loss even while every existing turn is waiting. This never rebinds,
+              // retries a tool, or restarts the daemon; confirmed faults only fail pending work.
+              this.endpointMonitor = setInterval(() => { void this.checkHealth(); }, BROKER_ENDPOINT_CHECK_MS);
+              this.endpointMonitor.unref();
+            }
+            resolveStart();
+          } catch (error) {
+            rejectStart(errorOf(error));
           }
-          resolveStart();
-        });
+        };
+        if (windowsPipe) server.listen(this.listenerPath, onListening);
+        else listenOnUnixBrokerSocket(server, this.listenerPath, onListening);
       };
 
       if (windowsPipe) {
         listen();
         return;
       }
-      if (!existsSync(this.socketPath)) {
-        listen();
+      const getuid = process.getuid;
+      const validateSocket = (path: string, socketStat: Stats, label: string): boolean => {
+        if (typeof getuid === "function" && socketStat.uid !== getuid()) {
+          rejectStart(new Error(`ChatGPT web broker ${label} is not owned by the current user: ${path}`));
+          return false;
+        }
+        if ((socketStat.mode & 0o077) !== 0) {
+          rejectStart(new Error(`ChatGPT web broker ${label} has unsafe permissions: ${path}`));
+          return false;
+        }
+        return true;
+      };
+      const probeStaleSocket = (
+        path: string,
+        socketStat: Stats,
+        onStale: () => void,
+      ) => {
+        const probe = createConnection(path);
+        this.lifecycle("probe_started", {
+          probedSocket: { dev: socketStat.dev, ino: socketStat.ino, ctimeMs: socketStat.ctimeMs },
+        });
+        let probeSettled = false;
+        const finishProbe = (action: () => void) => {
+          if (probeSettled) return;
+          probeSettled = true;
+          probe.destroy();
+          action();
+        };
+        probe.setTimeout(2_000, () => finishProbe(() => {
+          rejectStart(new Error(`Timed out while checking existing ChatGPT web broker socket: ${this.socketPath}`));
+        }));
+        probe.once("connect", () => {
+          finishProbe(() => {
+            rejectStart(new Error(`ChatGPT web broker socket is already owned by another process: ${this.socketPath}`));
+          });
+        });
+        probe.once("error", error => {
+          finishProbe(() => {
+            const code = (error as NodeJS.ErrnoException).code;
+            this.lifecycle("probe_failed", { code: code ?? "unknown" });
+            if (code !== "ECONNREFUSED" && code !== "ENOENT") {
+              rejectStart(new Error(
+                `Could not verify existing ChatGPT web broker socket ${this.socketPath}: ${error.message}`,
+              ));
+              return;
+            }
+            try {
+              const current = lstatSync(path, { throwIfNoEntry: false });
+              if (current) {
+                if (code !== "ECONNREFUSED" || !current.isSocket()
+                  || current.dev !== socketStat.dev || current.ino !== socketStat.ino
+                  || current.ctimeMs !== socketStat.ctimeMs) {
+                  this.lifecycle("cleanup_skipped", { reason: "socket_changed_during_probe" });
+                  rejectStart(new Error(`ChatGPT web broker endpoint changed during stale-socket probe: ${this.socketPath}`));
+                  return;
+                }
+                const before = { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
+                this.lifecycle("unlink_requested", { reason: "stale_socket", before });
+                unlinkSync(path);
+                this.lifecycle("unlink_complete", { reason: "stale_socket", before });
+              }
+              onStale();
+            } catch (cleanupError) {
+              rejectStart(errorOf(cleanupError));
+            }
+          });
+        });
+      };
+      const prepareListener = (publishLink: boolean) => {
+        const listenerStat = lstatSync(this.listenerPath, { throwIfNoEntry: false });
+        if (!listenerStat) {
+          listen(publishLink);
+          return;
+        }
+        if (!listenerStat.isSocket()) {
+          rejectStart(new Error(`ChatGPT web broker private listener path exists and is not a socket: ${this.listenerPath}`));
+          return;
+        }
+        if (!validateSocket(this.listenerPath, listenerStat, "private listener")) return;
+        probeStaleSocket(this.listenerPath, listenerStat, () => listen(publishLink));
+      };
+
+      const published = lstatSync(this.socketPath, { throwIfNoEntry: false });
+      if (!published) {
+        prepareListener(true);
         return;
       }
-      if (!lstatSync(this.socketPath).isSocket()) {
+      if (published.isSymbolicLink()) {
+        const target = resolve(dirname(this.socketPath), readlinkSync(this.socketPath));
+        if (target !== this.listenerPath) {
+          rejectStart(new Error(`ChatGPT web broker path is an unexpected symbolic link: ${this.socketPath}`));
+          return;
+        }
+        prepareListener(false);
+        return;
+      }
+      if (!published.isSocket()) {
         rejectStart(new Error(`ChatGPT web broker path exists and is not a socket: ${this.socketPath}`));
         return;
       }
-      const socketStat = lstatSync(this.socketPath);
-      const getuid = process.getuid;
-      if (typeof getuid === "function" && socketStat.uid !== getuid()) {
-        rejectStart(new Error(`ChatGPT web broker socket is not owned by the current user: ${this.socketPath}`));
-        return;
-      }
-      if ((socketStat.mode & 0o077) !== 0) {
-        rejectStart(new Error(`ChatGPT web broker socket has unsafe permissions: ${this.socketPath}`));
-        return;
-      }
-      const probe = createConnection(this.socketPath);
-      let probeSettled = false;
-      const finishProbe = (action: () => void) => {
-        if (probeSettled) return;
-        probeSettled = true;
-        probe.destroy();
-        action();
-      };
-      probe.setTimeout(2_000, () => finishProbe(() => {
-        rejectStart(new Error(`Timed out while checking existing ChatGPT web broker socket: ${this.socketPath}`));
-      }));
-      probe.once("connect", () => {
-        finishProbe(() => {
-          rejectStart(new Error(`ChatGPT web broker socket is already owned by another process: ${this.socketPath}`));
-        });
-      });
-      probe.once("error", error => {
-        finishProbe(() => {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code !== "ECONNREFUSED" && code !== "ENOENT") {
-            rejectStart(new Error(
-              `Could not verify existing ChatGPT web broker socket ${this.socketPath}: ${error.message}`,
-            ));
-            return;
-          }
-          try {
-            if (existsSync(this.socketPath)) unlinkSync(this.socketPath);
-            listen();
-          } catch (cleanupError) {
-            rejectStart(errorOf(cleanupError));
-          }
-        });
-      });
+      if (!validateSocket(this.socketPath, published, "socket")) return;
+      probeStaleSocket(this.socketPath, published, () => prepareListener(true));
     });
-    return this.startPromise;
   }
 
   private handleSocket(socket: Socket): void {
+    if (this.endpointFailure || this.closeFailure || this.rejectNewConnections) { socket.destroy(); return; }
+    this.sockets.add(socket);
     let buffered = "";
     let handled = false;
     const disconnected = new AbortController();
     socket.setEncoding("utf8");
     socket.on("error", () => {});
-    socket.once("close", () => disconnected.abort());
+    socket.once("close", () => {
+      this.sockets.delete(socket);
+      disconnected.abort();
+    });
     socket.on("data", chunk => {
       if (handled) return;
       buffered += chunk;
@@ -893,6 +1215,9 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private async dispatch(request: BrokerRequest, socketSignal?: AbortSignal): Promise<unknown> {
+    if (this.closePromise && request.method !== "owner_status") {
+      throw new Error("ChatGPT web turn broker is closed");
+    }
     this.prune();
     if (request.method === "safe_start") {
       if (!request.token) throw new Error("Zero Risk request_id is required");
@@ -923,7 +1248,7 @@ export class TurnBroker implements TurnBrokerOwner {
       return { submitted: true };
     }
     if (request.method === "owner_status") {
-      return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners };
+      return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners, owner: this.ownerId };
     }
     if (request.method === "owner_register") {
       const environment = ownerEnvironment(request.environment);
@@ -1017,7 +1342,7 @@ export class TurnBroker implements TurnBrokerOwner {
       const channel = this.channels.get(token);
       let activeChannel = channel && !channel.completionCommitted ? channel : undefined;
       const retiredTurn = channel?.completionCommitted ? channel.traceId : this.retiredTokens.get(token);
-      console.error(
+      (activeChannel ? console.info : console.warn)(
         `[chatgpt-web] broker claim received (tokenChars=${token.length}, tokenHash=${handleFingerprint(token)}, valid=${Boolean(activeChannel)}`
         + `${activeChannel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
       );
@@ -1263,7 +1588,10 @@ export async function callTurnBroker<T>(
       return;
     }
     socket.setEncoding("utf8");
-    socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
+    socket.once("error", error => finishError(Object.assign(
+      new Error(`ChatGPT web turn broker unavailable: ${error.message}`, { cause: error }),
+      { code: (error as NodeJS.ErrnoException).code },
+    )));
     // The server owns response termination. Waiting for the pipe/socket to close before resolving
     // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
     socket.once("close", finishResponse);

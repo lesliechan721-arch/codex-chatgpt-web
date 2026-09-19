@@ -26,6 +26,34 @@ import {
   resolveCurrentCodexRolloutMessageIdAliases,
 } from "./codex-rollout-environment";
 
+/** Only fixed reason labels enter diagnostics; filesystem errors can contain private paths. */
+export function trustedEnvironmentFailureDetails(error: unknown): {
+  errorType: string; reason: string; errorCode?: string;
+} {
+  const errorType = error instanceof Error
+    && ["Error", "TypeError", "SyntaxError", "RangeError", "MissingTrustedCodexEnvironmentError"].includes(error.name)
+    ? error.name : "UnknownError";
+  const reasons: Record<string, string> = {
+    "ChatGPT web turn is missing cwd in trusted Codex environment context": "missing_cwd",
+    "ChatGPT web turn is missing workspace_roots in trusted Codex environment context": "missing_workspace_roots",
+    "ChatGPT web cwd must contain absolute paths": "relative_cwd",
+    "ChatGPT web workspace_roots must contain absolute paths": "relative_workspace_roots",
+    "ChatGPT web turn has conflicting trusted Codex cwd values": "conflicting_cwd",
+    "ChatGPT web cwd is outside the trusted Codex workspace roots": "cwd_outside_roots",
+    "ChatGPT web turn requires one explicit trusted Codex sandbox mode": "missing_sandbox_mode",
+    "Compaction continuation requires one current native environment claim": "invalid_compaction_claim",
+    "Compaction continuation environment conflicts with its current Codex rollout": "compaction_authority_conflict",
+    "ChatGPT Web subagent sandbox metadata conflicts with its trusted parent thread": "parent_sandbox_conflict",
+    "ChatGPT Web subagent workspace metadata does not contain its trusted parent cwd": "parent_cwd_conflict",
+    "ChatGPT Web subagent workspace metadata conflicts with its trusted parent roots": "parent_roots_conflict",
+  };
+  const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  const errorCode = code && ["ENOENT", "EACCES", "EPERM", "EIO", "ENOTDIR", "EISDIR"].includes(code) ? code : undefined;
+  const message = error instanceof Error ? error.message : "";
+  const reason = Object.hasOwn(reasons, message) ? reasons[message]! : "unclassified_environment_error";
+  return { errorType, reason, ...(errorCode ? { errorCode } : {}) };
+}
+
 interface StoredThreadEnvironment {
   cwd: string;
   roots: string[];
