@@ -22,7 +22,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
+import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds, trustedEnvironmentRequestDetails, trustedEnvironmentRequestFingerprint } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
@@ -30,7 +30,7 @@ import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
-import { ChatGptThreadEnvironmentStore } from "./thread-environment";
+import { ChatGptThreadEnvironmentStore, trustedEnvironmentFailureDetails, type ChatGptEnvironmentResolutionDiagnostics } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
   type CapturedChatGptLunaCheckpoint,
@@ -341,6 +341,7 @@ export function createChatGptWebAdapter(
   dependencies: {
     broker?: TurnBrokerOwner;
     zeroRiskManualControl?: ChatGptZeroRiskManualControl;
+    codexHome?: string;
   } = {},
 ): ProviderAdapter {
   const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -383,6 +384,8 @@ export function createChatGptWebAdapter(
     provider.chatgptWeb?.threadEnvironmentStatePath
       ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
       : undefined,
+    Date.now,
+    dependencies.codexHome,
   );
   const lunaCheckpointStore = new ChatGptLunaCheckpointStore(
     provider.chatgptWeb?.lunaCheckpointStatePath
@@ -394,6 +397,46 @@ export function createChatGptWebAdapter(
       ? lunaCheckpointStore.apply(parsed).parsed
       : parsed
   );
+  let preparedEnvironment: {
+    parsed: CodexParsedRequest;
+    environment: ReturnType<typeof extractChatGptTurnEnvironment>;
+  } | undefined;
+  const resolveTrustedEnvironment = (
+    parsed: CodexParsedRequest,
+  ): ReturnType<typeof extractChatGptTurnEnvironment> => {
+    const resolution: ChatGptEnvironmentResolutionDiagnostics = {};
+    try {
+      return environmentStore.resolve(parsed, resolution);
+    } catch (error) {
+      const identity = extractChatGptTurnIdentity(parsed);
+      const failure = trustedEnvironmentFailureDetails(error);
+      const diagnostics = {
+        request_fingerprint: trustedEnvironmentRequestFingerprint(parsed),
+        ...trustedEnvironmentRequestDetails(parsed),
+        ...resolution,
+      };
+      console.warn(
+        `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ? "present" : "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length}, error_type=${failure.errorType}, reason=${failure.reason}, error_code=${failure.errorCode ?? "none"}, ${Object.entries(diagnostics).map(([key, value]) => `${key}=${value}`).join(", ")})`,
+      );
+      throw error;
+    }
+  };
+  const prepareTrustedEnvironment = (parsed: CodexParsedRequest): void => {
+    preparedEnvironment = undefined;
+    const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
+    if (manualRequest !== manualInteraction) return;
+    const turnCapabilities = parsed._compactionRequest && !manualRequest
+      ? { ...configuredCapabilities, localToolsEnabled: false }
+      : configuredCapabilities;
+    const mode = manualRequest
+      ? { localTools: true }
+      : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
+    // Preserve runTurn's deterministic validation order before accepting trusted authority.
+    if (!parsed._compactionRequest) createChatGptStructuredOutputValidator(parsed.options.outputFormat);
+    const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
+    if (chatGptWebTurnRetryPolicy.exhaustedError(retryKey) || !mode.localTools) return;
+    preparedEnvironment = { parsed, environment: resolveTrustedEnvironment(parsed) };
+  };
 
   const startRuntime = (
     parsed: CodexParsedRequest,
@@ -807,6 +850,9 @@ export function createChatGptWebAdapter(
 
   return {
     name: "chatgpt-web",
+    preflight(parsed) {
+      prepareTrustedEnvironment(parsed);
+    },
     async runTurn(parsed, incoming, emit) {
       const runChatGptWebTurn = async (): Promise<void> => {
         const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -848,14 +894,11 @@ export function createChatGptWebAdapter(
         }
         let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
         if (mode.localTools) {
-          try {
-            environment = environmentStore.resolve(parsed);
-          } catch (error) {
-            const identity = extractChatGptTurnIdentity(parsed);
-            console.warn(
-              `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
-            );
-            throw error;
+          if (preparedEnvironment?.parsed === parsed) {
+            environment = preparedEnvironment.environment;
+            preparedEnvironment = undefined;
+          } else {
+            environment = resolveTrustedEnvironment(parsed);
           }
         }
         if (parsed._compactionRequest) {
@@ -1437,13 +1480,14 @@ export function createChatGptWebAdapter(
         }
       };
 
-      // Arm this before any awaited work, including environment lookup and owner retirement.
+      // Emit initial liveness immediately. HTTP callers run trusted-environment preflight first,
+      // while direct adapter callers keep the original runTurn event contract.
+      emit({ type: "heartbeat" });
       const heartbeat = setInterval(
         () => emit({ type: "heartbeat" }),
         CHATGPT_WEB_ADAPTER_HEARTBEAT_MS,
       );
       try {
-        emit({ type: "heartbeat" });
         await runChatGptWebTurn();
       } finally {
         clearInterval(heartbeat);

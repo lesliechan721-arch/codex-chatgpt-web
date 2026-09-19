@@ -64,6 +64,23 @@ export class NativeTurnIdleRegistry {
     return controller.signal;
   }
 
+  assertCanSignal(identity: NativeTurnIdleIdentity): void {
+    const key = identityKey(identity);
+    const terminal = this.terminal.get(key);
+    if (terminal) throw terminal.signal.reason;
+    if (this.active.has(key)) return;
+    if (this.active.size + this.terminal.size < this.terminalLimit || this.active.size === 0) return;
+    throw new ChatGptWebAdapterError(
+      "Remote Codex terminal tombstone capacity is temporarily exhausted while active turns still own the current authority epoch",
+      {
+        status: 503,
+        errorType: "server_error",
+        code: "client_turn_idle_tombstone_capacity",
+        retryable: true,
+      },
+    );
+  }
+
   touch(identity: NativeTurnIdleIdentity): boolean {
     const key = identityKey(identity);
     const entry = this.active.get(key);

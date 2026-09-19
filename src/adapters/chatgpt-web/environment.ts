@@ -1,8 +1,10 @@
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
+import { ChatGptWebAdapterError } from "./adapter-error";
 
 export type ChatGptSandboxPolicy =
   | { type: "dangerFullAccess" }
@@ -49,9 +51,24 @@ export interface ChatGptTurnUserRevision {
 export const CHATGPT_TURN_REVISION_CONFLICT_MESSAGE =
   "ChatGPT web current user message conflicts with native Codex turn_id metadata";
 
-export class MissingTrustedCodexEnvironmentError extends Error {
+export class TrustedCodexEnvironmentValidationError extends ChatGptWebAdapterError {
+  constructor(message: string, code = "invalid_trusted_codex_environment") {
+    super(message, {
+      status: 400,
+      errorType: "invalid_request_error",
+      code,
+      retryable: false,
+    });
+    this.name = "TrustedCodexEnvironmentValidationError";
+  }
+}
+
+export class MissingTrustedCodexEnvironmentError extends TrustedCodexEnvironmentValidationError {
   constructor(field: string) {
-    super(`ChatGPT web turn is missing ${field} in trusted Codex environment context`);
+    super(
+      `ChatGPT web turn is missing ${field} in trusted Codex environment context`,
+      "missing_trusted_codex_environment",
+    );
     this.name = "MissingTrustedCodexEnvironmentError";
   }
 }
@@ -105,6 +122,15 @@ function rawMessageText(value: Record<string, unknown>): string {
     .join("\n");
 }
 
+function rawMessageHasEnvironmentContext(value: Record<string, unknown>): boolean {
+  if (typeof value.content === "string") return /<\/?environment_context\b/i.test(value.content);
+  if (!Array.isArray(value.content)) return false;
+  return value.content.some(part => {
+    const text = record(part)?.text;
+    return typeof text === "string" && /<\/?environment_context\b/i.test(text);
+  });
+}
+
 /** True when the raw Responses input attempted to carry an environment envelope, valid or not. */
 export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boolean {
   const body = record(parsed._rawBody);
@@ -112,7 +138,7 @@ export function hasRawChatGptEnvironmentContext(parsed: CodexParsedRequest): boo
   return input.some(value => {
     const item = record(value);
     return inputItemType(item) === "message" && item !== undefined
-      && /<\/?environment_context\b/i.test(rawMessageText(item));
+      && rawMessageHasEnvironmentContext(item);
   });
 }
 
@@ -131,11 +157,97 @@ export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest):
       || item.type === "function_call" || item.type === "reasoning" || item.type === "compaction") {
       laterAssistantOutput = true;
     }
-    if (type !== "message" || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+    if (type !== "message" || !rawMessageHasEnvironmentContext(item)) continue;
     const owner = itemTurnId(item);
     if (owner === turnId || (owner === undefined && !laterAssistantOutput)) return true;
   }
   return false;
+}
+
+function countPattern(text: string, pattern: RegExp): number {
+  let count = 0;
+  for (const _match of text.matchAll(pattern)) count += 1;
+  return count;
+}
+
+/** Stable retry correlation from bounded request structure only; message content is never hashed. */
+export function trustedEnvironmentRequestFingerprint(parsed: CodexParsedRequest): string {
+  const hash = createHash("sha256");
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const identity = extractChatGptTurnIdentity(parsed);
+  const update = (value: unknown): void => {
+    const text = typeof value === "string" ? value : value === undefined ? "" : String(value);
+    hash.update(String(text.length)).update(":").update(text).update("|");
+  };
+  update(parsed.modelId);
+  update(identity.threadId);
+  update(identity.turnId);
+  update(parsed.previousResponseId);
+  update(parsed._replayPrefixLen ?? 0);
+  update(input.length);
+  for (const value of input) {
+    const item = record(value);
+    update(inputItemType(item));
+    update(item?.role);
+    update(item?.id);
+    update(itemTurnId(item));
+  }
+  return hash.digest("hex").slice(0, 12);
+}
+
+/** Structural evidence only, never filesystem authority or raw user/environment content. */
+export function trustedEnvironmentRequestDetails(parsed: CodexParsedRequest): Record<string, string | boolean | number> {
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const metadata = clientTurnMetadata(parsed);
+  const kind = metadata?.request_kind;
+  let environmentMessages = 0;
+  let environmentMessagesWithId = 0;
+  let environmentMessagesWithTurnId = 0;
+  let environmentContextCount = 0;
+  let cwdCount = 0;
+  let cwdValueCount = 0;
+  let workspaceRootsCount = 0;
+  let rootCount = 0;
+  let environmentCount = 0;
+  for (const value of input) {
+    const item = record(value);
+    if (!item || inputItemType(item) !== "message" || !rawMessageHasEnvironmentContext(item)) continue;
+    environmentMessages += 1;
+    if (typeof item.id === "string" && item.id.length > 0) environmentMessagesWithId += 1;
+    if (itemTurnId(item) !== undefined) environmentMessagesWithTurnId += 1;
+    const parts = typeof item.content === "string"
+      ? [item.content]
+      : Array.isArray(item.content)
+        ? item.content.map(part => record(part)?.text).filter((text): text is string => typeof text === "string")
+        : [];
+    for (const text of parts) {
+      environmentContextCount += countPattern(text, /<environment_context\b[^>]*>/gi);
+      cwdCount += countPattern(text, /<cwd\b[^>]*>/gi);
+      cwdValueCount += countPattern(text, /<cwd>\s*[^<\s][^<]*<\/cwd>/gi);
+      workspaceRootsCount += countPattern(text, /<workspace_roots\b[^>]*>/gi);
+      rootCount += countPattern(text, /<root\b[^>]*>/gi);
+      environmentCount += countPattern(text, /<environment\b[^>]*>/gi);
+    }
+  }
+  return {
+    has_raw_environment_context: environmentMessages > 0,
+    has_current_environment_context: hasCurrentChatGptEnvironmentContext(parsed),
+    request_kind: kind === "turn" || kind === "compaction" ? kind : kind === undefined ? "missing" : "unknown",
+    compaction_request: parsed._compactionRequest === true,
+    rollout_identity_available: Boolean(extractChatGptThreadSpawnLineage(parsed) ?? extractChatGptRootThreadMetadata(parsed)),
+    input_items: input.length,
+    environment_messages: environmentMessages,
+    environment_messages_with_id: environmentMessagesWithId,
+    environment_messages_with_turn_id: environmentMessagesWithTurnId,
+    environment_context_count: environmentContextCount,
+    cwd_count: cwdCount,
+    cwd_value_count: cwdValueCount,
+    workspace_roots_count: workspaceRootsCount,
+    root_count: rootCount,
+    environment_count: environmentCount,
+  };
 }
 
 export interface ChatGptUnattributedEnvironmentMessage {
@@ -154,7 +266,7 @@ export function unattributedChatGptEnvironmentMessages(
   for (const value of input) {
     const item = record(value);
     if (inputItemType(item) !== "message" || !item
-      || !/<\/?environment_context\b/i.test(rawMessageText(item))) continue;
+      || !rawMessageHasEnvironmentContext(item)) continue;
     // Explicit current provenance must keep the normal current-update rejection. A native item
     // without provenance is historical only if the canonical rollout proves that exact message.
     const owner = itemTurnId(item);
@@ -312,7 +424,11 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
       return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text) ? [text] : [];
     });
   });
-  if (updates.length !== 1) throw new Error("Compaction continuation requires one current native environment claim");
+  if (updates.length !== 1) {
+    throw new TrustedCodexEnvironmentValidationError(
+      "Compaction continuation requires one current native environment claim",
+    );
+  }
   return parseChatGptEnvironmentText(parsed, updates[0]!);
 }
 
@@ -694,7 +810,9 @@ function environmentCwdMatches(text: string, preferredRoots: string[] = []): str
 function uniqueAbsolutePaths(values: string[], field: string): string[] {
   const decoded = values.map(value => decodeXmlText(value.trim()));
   if (decoded.length === 0) throw new MissingTrustedCodexEnvironmentError(field);
-  if (decoded.some(path => !isAbsolute(path))) throw new Error(`ChatGPT web ${field} must contain absolute paths`);
+  if (decoded.some(path => !isAbsolute(path))) {
+    throw new TrustedCodexEnvironmentValidationError(`ChatGPT web ${field} must contain absolute paths`);
+  }
   const unique = new Map<string, string>();
   for (const path of decoded.map(value => resolve(value))) {
     if (!unique.has(pathIdentity(path))) unique.set(pathIdentity(path), path);
@@ -714,14 +832,16 @@ export function extractChatGptTurnEnvironment(parsed: CodexParsedRequest): ChatG
 function parseChatGptEnvironmentText(parsed: CodexParsedRequest, text: string): ChatGptTurnEnvironment {
   const cwdMatches = environmentCwdMatches(text, clientMetadataWorkspaceRoots(parsed));
   const cwdCandidates = uniqueAbsolutePaths(cwdMatches, "cwd");
-  if (cwdCandidates.length !== 1) throw new Error("ChatGPT web turn has conflicting trusted Codex cwd values");
+  if (cwdCandidates.length !== 1) {
+    throw new TrustedCodexEnvironmentValidationError("ChatGPT web turn has conflicting trusted Codex cwd values");
+  }
   const cwd = cwdCandidates[0]!;
 
   const rootMatches = [...text.matchAll(/<workspace_roots>[\s\S]*?<\/workspace_roots>/g)]
     .flatMap(section => [...section[0].matchAll(/<root>([^<]+)<\/root>/g)].map(match => match[1] ?? ""));
   const roots = rootMatches.length > 0 ? uniqueAbsolutePaths(rootMatches, "workspace_roots") : [cwd];
   if (!roots.some(root => matchesPath(root, cwd))) {
-    throw new Error("ChatGPT web cwd is outside the trusted Codex workspace roots");
+    throw new TrustedCodexEnvironmentValidationError("ChatGPT web cwd is outside the trusted Codex workspace roots");
   }
 
   const sandboxType = sandboxTypeFromEnvironment(text);
@@ -729,7 +849,7 @@ function parseChatGptEnvironmentText(parsed: CodexParsedRequest, text: string): 
     || /network access is enabled/i.test(text);
 
   if (!sandboxType) {
-    throw new Error("ChatGPT web turn requires one explicit trusted Codex sandbox mode");
+    throw new TrustedCodexEnvironmentValidationError("ChatGPT web turn requires one explicit trusted Codex sandbox mode");
   }
   if (sandboxType === "dangerFullAccess") {
     return { cwd, roots, writableRoots: roots, sandboxPolicy: { type: "dangerFullAccess" }, tools: parsed.context.tools ?? [] };

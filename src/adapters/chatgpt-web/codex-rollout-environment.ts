@@ -15,6 +15,7 @@ import { isDeepStrictEqual } from "node:util";
 import { expandUserPath } from "../../config";
 import { findTopLevelAssignment } from "../../codex-integration-document";
 import type { CodexTool } from "../../types";
+import { TrustedCodexEnvironmentValidationError } from "./environment";
 import type {
   ChatGptRootThreadMetadata,
   ChatGptThreadSpawnLineage,
@@ -412,7 +413,9 @@ function verifyHistoricalEnvironmentMessages(
   messages: ChatGptUnattributedEnvironmentMessage[],
 ): void {
   const pending = new Map(messages.map(message => [message.id, message.content]));
-  if (pending.size !== messages.length) throw new Error("Codex environment history repeats a message id");
+  if (pending.size !== messages.length) {
+    throw new TrustedCodexEnvironmentValidationError("Codex environment history repeats a message id");
+  }
   let position = 0;
   let carry = Buffer.alloc(0);
   while (position < size) {
@@ -435,12 +438,16 @@ function verifyHistoricalEnvironmentMessages(
       // XML somewhere in the file would also accept a current update as historical.
       if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
         if (pending.size === 0) return;
-        throw new Error("Codex rollout does not authenticate the historical environment messages");
+        throw new TrustedCodexEnvironmentValidationError(
+          "Codex rollout does not authenticate the historical environment messages",
+        );
       }
       if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
         || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
       if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
-        throw new Error("Historical environment message differs from its native Codex record");
+        throw new TrustedCodexEnvironmentValidationError(
+          "Historical environment message differs from its native Codex record",
+        );
       }
       pending.delete(payload.id);
     }
@@ -760,16 +767,22 @@ function validateMetadataConsistency(
   if (lineage.sandboxType === "platform"
     ? environment.sandboxPolicy.type === "dangerFullAccess"
     : environment.sandboxPolicy.type !== lineage.sandboxType) {
-    throw new Error(`ChatGPT Web ${owner} sandbox metadata conflicts with its Codex rollout`);
+    throw new TrustedCodexEnvironmentValidationError(
+      `ChatGPT Web ${owner} sandbox metadata conflicts with its Codex rollout`,
+    );
   }
   if (lineage.workspaceRoots.length > 0
     && !lineage.workspaceRoots.some(root => contains(root, environment.cwd))) {
-    throw new Error(`ChatGPT Web ${owner} workspace metadata does not contain its Codex rollout cwd`);
+    throw new TrustedCodexEnvironmentValidationError(
+      `ChatGPT Web ${owner} workspace metadata does not contain its Codex rollout cwd`,
+    );
   }
   if (lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
     contains(rolloutRoot, root) || contains(root, rolloutRoot)
   )))) {
-    throw new Error(`ChatGPT Web ${owner} workspace metadata conflicts with its Codex rollout roots`);
+    throw new TrustedCodexEnvironmentValidationError(
+      `ChatGPT Web ${owner} workspace metadata conflicts with its Codex rollout roots`,
+    );
   }
 }
 
@@ -789,7 +802,9 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   if (!nativeThreadId && !nativeTurnId) return undefined;
   if (!nativeThreadId || !nativeTurnId || (compactionSourceTurnId !== undefined && !CODEX_ID.test(compactionSourceTurnId))
     || ("parentThreadId" in lineage && !CODEX_ID.test(lineage.parentThreadId))) {
-    throw new Error("Codex thread metadata contains an invalid native identifier");
+    throw new TrustedCodexEnvironmentValidationError(
+      "Codex thread metadata contains an invalid native identifier",
+    );
   }
 
   const indexed = indexedRollout(configuredSqliteHome(codexHome, options.sqliteHome), lineage);

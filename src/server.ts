@@ -418,6 +418,11 @@ export interface ResponseRequestOptions {
   onTurnInputProgress?: (identity: NativeCodexTurnIdentity, progressKey: string) => void;
   /** Release the remote native-turn lease after authoritative logical completion. */
   onTurnComplete?: () => void;
+  /** Check remote-turn admission before constructing the Web adapter, without creating its idle lease. */
+  onTurnAdmission?: (
+    identity: NativeCodexTurnIdentity,
+    options?: { remoteIdleTimeout: boolean },
+  ) => void;
   /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
   onTurnIdentity?: (
     identity: NativeCodexTurnIdentity,
@@ -427,6 +432,8 @@ export interface ResponseRequestOptions {
   upstreamRuntime?: UpstreamProviderRuntime;
   /** Test seam for the custom upstream transport. */
   fetchUpstreamProvider?: UpstreamFetch;
+  /** Check only routed Web work; native upstream requests do not use the local broker. */
+  brokerAvailable?: () => Promise<boolean>;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -821,30 +828,77 @@ export async function responseRequest(
       headers: { "content-type": "application/json" },
     });
   }
+  if (options.brokerAvailable && !await options.brokerAvailable()) {
+    return formatErrorResponse(503, "server_error", "ChatGPT web turn broker is unavailable; restart the runtime before submitting new Web work");
+  }
+  let webTurnIdentity: NativeCodexTurnIdentity | undefined;
   try {
     const identity = extractChatGptTurnIdentity(parsed);
     if (identity.threadId && identity.turnId) {
-      bindTurnIdentity({ threadId: identity.threadId, turnId: identity.turnId }, true);
+      webTurnIdentity = { threadId: identity.threadId, turnId: identity.turnId };
+      if (options.onTurnAdmission) options.onTurnAdmission(webTurnIdentity, { remoteIdleTimeout: true });
+      else bindTurnIdentity(webTurnIdentity, true);
     }
   } catch (error) {
     if (error instanceof ChatGptWebAdapterError) return adapterErrorResponse(error);
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
   const adapter = adapterFactory(provider);
-  const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();
-  const incomingSignal = turnIdleSignal
-    ? AbortSignal.any([req.signal, turnIdleSignal])
-    : req.signal;
-  if (incomingSignal.aborted) abort.abort(incomingSignal.reason);
-  else incomingSignal.addEventListener("abort", () => abort.abort(incomingSignal.reason), { once: true });
+  const forwardAbort = (signal: AbortSignal): void => {
+    if (signal.aborted) abort.abort(signal.reason);
+    else signal.addEventListener("abort", () => abort.abort(signal.reason), { once: true });
+  };
+  forwardAbort(req.signal);
+  const incoming = {
+    headers: adapterRequestHeaders(req.headers, accessPolicy),
+    abortSignal: abort.signal,
+    onProgress: options.onTurnProgress,
+  };
+  const adapterErrorEvent = (error: unknown): Extract<AdapterEvent, { type: "error" }> => ({
+    type: "error",
+    message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof ChatGptWebAdapterError ? {
+      status: error.status, errorType: error.errorType, code: error.code, retryable: error.retryable,
+    } : {}),
+  });
+  const environmentFailureResponse = (event: AdapterEvent | undefined): Response | undefined => {
+    if (event?.type !== "error"
+      || (event.code !== "missing_trusted_codex_environment" && event.code !== "invalid_trusted_codex_environment")
+      || event.status !== 400 || event.retryable !== false) return undefined;
+    return Response.json({ error: {
+      message: event.message, type: event.errorType, code: event.code,
+    } }, { status: 400 });
+  };
+  if (adapter.preflight) {
+    try {
+      await adapter.preflight(parsed, incoming);
+    } catch (error) {
+      const event = adapterErrorEvent(error);
+      options.onAdapterEvent?.(event, { compaction });
+      const rejected = environmentFailureResponse(event);
+      if (rejected) return rejected;
+      if (error instanceof ChatGptWebAdapterError) {
+        return Response.json({ error: {
+          message: error.message, type: error.errorType, code: error.code,
+        } }, { status: error.status });
+      }
+      return formatErrorResponse(500, "server_error", event.message);
+    }
+  }
+  try {
+    if (webTurnIdentity && options.onTurnAdmission) {
+      bindTurnIdentity(webTurnIdentity, true);
+      if (turnIdleSignal) forwardAbort(turnIdleSignal);
+    }
+  } catch (error) {
+    if (error instanceof ChatGptWebAdapterError) return adapterErrorResponse(error);
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  const queue = new AsyncEventQueue<AdapterEvent>();
   const run = async () => {
     try {
-      await adapter.runTurn!(parsed, {
-        headers: adapterRequestHeaders(req.headers, accessPolicy),
-        abortSignal: abort.signal,
-        onProgress: options.onTurnProgress,
-      }, event => {
+      await adapter.runTurn!(parsed, incoming, event => {
         options.onAdapterEvent?.(event, { compaction });
         queue.push(event);
       });
@@ -853,16 +907,7 @@ export async function responseRequest(
         && turnIdleSignal.reason instanceof ChatGptWebAdapterError
         ? turnIdleSignal.reason
         : error;
-      const event: AdapterEvent = terminalError instanceof ChatGptWebAdapterError
-        ? {
-            type: "error",
-            message: terminalError.message,
-            status: terminalError.status,
-            errorType: terminalError.errorType,
-            code: terminalError.code,
-            retryable: terminalError.retryable,
-          }
-        : { type: "error", message: terminalError instanceof Error ? terminalError.message : String(terminalError) };
+      const event = adapterErrorEvent(terminalError);
       options.onAdapterEvent?.(event, { compaction });
       queue.push(event);
     } finally {
@@ -903,6 +948,8 @@ export async function responseRequest(
 
   await run();
   const events = await queue.collect();
+  const rejected = environmentFailureResponse(events[0]);
+  if (rejected) return rejected;
   const json = buildResponseJSON(events, responseModel, {
     hideThinkingSummary: parsed.options.hideThinkingSummary,
     toolNsMap: maps.toolNsMap,
@@ -920,7 +967,7 @@ export async function compactRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: Pick<
     ResponseRequestOptions,
-    "onTurnIdentity" | "onAdapterEvent" | "onTurnProgress" | "accessPolicy" | "upstreamRuntime" | "fetchUpstreamProvider"
+    "onTurnAdmission" | "onTurnIdentity" | "onAdapterEvent" | "onTurnProgress" | "accessPolicy" | "upstreamRuntime" | "fetchUpstreamProvider" | "brokerAvailable"
   > = {},
 ): Promise<Response> {
   const accessPolicy = options.accessPolicy ?? OPENAI_ACCESS;
@@ -1097,13 +1144,14 @@ export function startServer(
   }
   const startedAt = Date.now();
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
-  if (config.mode === "full") {
-    void turnBroker!.listen().catch(error => {
-      console.error(
-        `[chatgpt-web] turn broker endpoint is unavailable: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
-  }
+  const brokerStarted = turnBroker?.listen().then(() => true, error => {
+    console.error(
+      `[chatgpt-web] turn broker endpoint is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  });
+  const brokerAvailable = async (): Promise<boolean> => !turnBroker
+    || Boolean(await brokerStarted) && await turnBroker.checkHealth();
   let draining = false;
   let shutdownPromise: Promise<void> | undefined;
   let successfulModelCatalogRequests = 0;
@@ -1193,8 +1241,10 @@ export function startServer(
       if (denied) return denied;
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
+        const available = turnBroker ? await brokerAvailable() : null;
+        const healthy = available !== false;
         return Response.json({
-          status: "ok",
+          status: healthy ? "ok" : "degraded",
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
@@ -1213,16 +1263,23 @@ export function startServer(
           active_remote_turn_idle_leases: turnIdleLeases?.count() ?? 0,
           remote_turn_idle_epoch: turnIdleLeases?.epoch() ?? null,
           uptime: (Date.now() - startedAt) / 1_000,
-          accepting_turns: !draining,
+          accepting_turns: !draining && healthy,
+          broker_available: available,
           successful_model_catalog_requests: successfulModelCatalogRequests,
           last_successful_model_catalog_request_at: lastSuccessfulModelCatalogRequestAt,
           model_catalog_requests: modelCatalogRequests,
           last_model_catalog_result: lastModelCatalogResult,
           ...activity(),
-        });
+        }, { status: healthy ? 200 : 503 });
       }
       if (req.method === "POST" && (url.pathname === "/admin/drain" || url.pathname === "/admin/resume")) {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        if (url.pathname === "/admin/resume" && !await brokerAvailable()) {
+          turnBroker?.setExternalOwnersAccepted(false);
+          return Response.json({
+            status: "degraded", accepting_turns: false, broker_available: false, ...activity(),
+          }, { status: 503 });
+        }
         draining = url.pathname === "/admin/drain";
         turnBroker?.setExternalOwnersAccepted(!draining);
         return Response.json({ status: "ok", accepting_turns: !draining, ...activity() });
@@ -1408,6 +1465,11 @@ export function startServer(
             config,
             dependencies.adapterFactory,
             {
+              onTurnAdmission: (identity, options) => {
+                if (options?.remoteIdleTimeout === true && turnIdleLeases) {
+                  turnIdleLeases.assertCanSignal(identity);
+                }
+              },
               onTurnIdentity: (identity, options) => {
                 boundIdentity = identity;
                 remoteManaged = options?.remoteIdleTimeout === true && turnIdleLeases !== undefined;
@@ -1436,6 +1498,7 @@ export function startServer(
               accessPolicy,
               upstreamRuntime,
               fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+              brokerAvailable,
             },
           ),
           req.signal,
@@ -1456,6 +1519,11 @@ export function startServer(
             config,
             dependencies.adapterFactory,
             {
+              onTurnAdmission: (identity, options) => {
+                if (options?.remoteIdleTimeout === true && turnIdleLeases) {
+                  turnIdleLeases.assertCanSignal(identity);
+                }
+              },
               onTurnIdentity: (identity, options) => {
                 boundIdentity = identity;
                 remoteManaged = options?.remoteIdleTimeout === true && turnIdleLeases !== undefined;
@@ -1472,6 +1540,7 @@ export function startServer(
               accessPolicy,
               upstreamRuntime,
               fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+              brokerAvailable,
             },
           ),
           req.signal,
