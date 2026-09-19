@@ -56,12 +56,14 @@ interface TraceWaiter {
 export class ChatGptTraceFeed {
   private readonly queued: ChatGptTraceEvent[] = [];
   private readonly waiters = new Set<TraceWaiter>();
+  private readonly observers = new Set<() => void>();
 
   push(event: ChatGptTraceEvent): void {
     const normalized = event.continuation ? event.text : event.text.trim();
     if (!normalized) return;
     const normalizedEvent = { ...event, text: normalized };
     this.queued.push(normalizedEvent);
+    for (const observer of this.observers) observer();
     const waiter = this.waiters.values().next().value as TraceWaiter | undefined;
     if (!waiter) return;
     this.waiters.delete(waiter);
@@ -71,6 +73,12 @@ export class ChatGptTraceFeed {
 
   drain(): ChatGptTraceEvent[] {
     return this.queued.splice(0);
+  }
+
+  observe(observer: () => void): () => void {
+    this.observers.add(observer);
+    if (this.queued.length > 0) observer();
+    return () => this.observers.delete(observer);
   }
 
   wait(signal?: AbortSignal): Promise<void> {
@@ -101,12 +109,14 @@ interface TextWaiter {
 export class ChatGptTextFeed {
   private readonly queued: string[] = [];
   private readonly waiters = new Set<TextWaiter>();
+  private readonly observers = new Set<() => void>();
   private text = "";
 
   push(delta: string): void {
     if (!delta) return;
     this.text += delta;
     this.queued.push(delta);
+    for (const observer of this.observers) observer();
     const waiter = this.waiters.values().next().value as TextWaiter | undefined;
     if (!waiter) return;
     this.waiters.delete(waiter);
@@ -116,6 +126,12 @@ export class ChatGptTextFeed {
 
   drain(): string[] {
     return this.queued.splice(0);
+  }
+
+  observe(observer: () => void): () => void {
+    this.observers.add(observer);
+    if (this.queued.length > 0) observer();
+    return () => this.observers.delete(observer);
   }
 
   value(): string {

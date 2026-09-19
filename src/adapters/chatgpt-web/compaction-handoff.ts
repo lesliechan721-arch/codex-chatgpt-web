@@ -16,7 +16,7 @@ import {
   zeroRiskActiveCompactionToolResultInstruction,
 } from "./native-compaction-control";
 import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broker";
-import type { ChatGptTurnSession } from "./turn-execution";
+import type { ChatGptBrowserOutcome, ChatGptTurnSession } from "./turn-execution";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -176,11 +176,28 @@ function withCompactionAbort<T>(promise: Promise<T>, signal?: AbortSignal): Prom
   });
 }
 
+async function waitForActiveCompactionBrowserOutcome(
+  source: ChatGptTurnSession,
+  signal?: AbortSignal,
+  onProgress?: () => void,
+): Promise<ChatGptBrowserOutcome> {
+  const reportProgress = (): void => onProgress?.();
+  const stopTraceObservation = source.runtime.trace.observe(reportProgress);
+  const stopTextObservation = source.runtime.text.observe(reportProgress);
+  try {
+    return await withCompactionAbort(source.browserOutcome, signal);
+  } finally {
+    stopTraceObservation();
+    stopTextObservation();
+  }
+}
+
 export async function settleActiveCompactionSource(
   parsed: CodexParsedRequest,
   source: ChatGptTurnSession,
   broker: TurnBroker,
   signal?: AbortSignal,
+  onProgress?: () => void,
 ): Promise<{ answer: string; compactionInstructionDelivered: boolean }> {
   return source.runExclusive(async () => {
     if (signal?.aborted) {
@@ -209,9 +226,10 @@ export async function settleActiveCompactionSource(
           toolResult(result),
         );
         source.runtime.externalProgress.recordToolResult();
+        onProgress?.();
         source.markResultDelivered(request.callId);
       }
-      const browserOutcome = await withCompactionAbort(source.browserOutcome, signal);
+      const browserOutcome = await waitForActiveCompactionBrowserOutcome(source, signal, onProgress);
       if (browserOutcome.type === "error") throw browserOutcome.error;
       const compactionInstructionDelivered = broker.compactionDeliveryCount(token) > 0;
       // The one structured checkpoint message reuses this exact retained tab. It must not race the
@@ -237,6 +255,7 @@ export async function settleActiveZeroRiskCompactionSource(
   source: ChatGptTurnSession,
   broker: TurnBrokerOwner,
   signal?: AbortSignal,
+  onProgress?: () => void,
 ): Promise<string | undefined> {
   const compactPrompt = compactionPrompt(parsed);
   return source.runExclusive(async () => {
@@ -272,9 +291,10 @@ export async function settleActiveZeroRiskCompactionSource(
             : canonical,
         );
         source.runtime.externalProgress.recordToolResult();
+        onProgress?.();
         source.markResultDelivered(request.callId);
       }
-      const browserOutcome = await withCompactionAbort(source.browserOutcome, signal);
+      const browserOutcome = await waitForActiveCompactionBrowserOutcome(source, signal, onProgress);
       if (browserOutcome.type === "error") throw browserOutcome.error;
       await withCompactionAbort(source.physicalSettlement, signal);
       const instructionDelivered = outstanding.length > 0
@@ -301,6 +321,7 @@ export async function requestRetainedCompactionHandoff(
   traceId: string,
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
+  onProgress?: () => void,
 ): Promise<string> {
   const conversationKey = source.conversationKey();
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
@@ -343,7 +364,7 @@ export async function requestRetainedCompactionHandoff(
       conversationKey,
       requireRetainedConversation: true,
       abortSignal: browserAbort.signal,
-      onTextDelta: () => {},
+      onTextDelta: () => { onProgress?.(); },
     });
     const browserFailure = browser.then<never>(
       () => new Promise<never>(() => {}),
@@ -356,6 +377,7 @@ export async function requestRetainedCompactionHandoff(
       ]),
       operationSignal,
     );
+    onProgress?.();
     // The one-shot control submission is the terminal event for this purpose-built response.
     // ChatGPT may render no assistant text after a tool-only response, and therefore no Copy
     // action. End our owned turn explicitly and wait for the launcher/helper cleanup handshake.

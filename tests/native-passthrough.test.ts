@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { forwardNativeCodexRequest } from "../src/native-passthrough";
+import { forwardNativeCodexRequest, observeNativeResponsesLifecycle } from "../src/native-passthrough";
 
 test("forwards native Codex requests verbatim to the official backend", async () => {
   const originalBody = Bun.zstdCompressSync(Buffer.from('{"model":"gpt-5.6-sol","stream":true}'));
@@ -443,4 +443,28 @@ test("a non-event-stream body is passed through untouched", async () => {
   );
 
   expect(await response.text()).toBe('{"ok":true}');
+});
+
+test("native Responses lifecycle ignores heartbeats but observes text, reasoning and tool progress", async () => {
+  const frames = [
+    'event: response.heartbeat\ndata: {"type":"response.heartbeat"}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"answer"}\n\n',
+    'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"think"}\n\n',
+    'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"}}\n\n',
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{}"}]}}\n\n',
+    'data: [DONE]\n\n',
+  ].join("");
+  let progress = 0;
+  let final = 0;
+  const observed = observeNativeResponsesLifecycle(
+    new Response(frames, { headers: { "content-type": "text/event-stream" } }),
+    {
+      onProgress: () => { progress += 1; },
+      onFinalResponse: () => { final += 1; },
+    },
+  );
+
+  expect(await observed.text()).toBe(frames);
+  expect(progress).toBe(4);
+  expect(final).toBe(0);
 });

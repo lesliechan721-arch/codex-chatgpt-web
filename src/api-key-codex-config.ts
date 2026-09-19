@@ -6,6 +6,7 @@ import { codexInterruptHookCommand } from "./codex-interrupt-hook";
 /** Render only. Neither the caller's config.toml nor auth.json is ever written here. */
 export function renderApiKeyCodexConfig(options: {
   port: number;
+  baseUrl?: string;
   catalogPath: string;
   model: string;
   reasoningEffort: string;
@@ -20,6 +21,7 @@ export function renderApiKeyCodexConfig(options: {
   if (!options.model.startsWith("chatgpt-web/")) throw new Error("A ChatGPT Web model is required");
   apiKeyPolicy(options.apiKey);
   const quote = (value: string) => JSON.stringify(value);
+  const baseUrl = options.baseUrl?.trim() || `http://127.0.0.1:${options.port}/v1`;
   let text = [
     '# Sensitive manual client configuration: contains the local service API key.',
     '# Merge tables with existing settings instead of duplicating TOML table headers.',
@@ -31,7 +33,7 @@ export function renderApiKeyCodexConfig(options: {
     '',
     '[model_providers.chatgpt_web]',
     `name = ${quote(options.supportsOpenAiServerCompaction === true ? "OpenAI" : "ChatGPT Web (local API key)")}`,
-    `base_url = "http://127.0.0.1:${options.port}/v1"`,
+    `base_url = ${quote(baseUrl)}`,
     'wire_api = "responses"',
     `experimental_bearer_token = ${quote(options.apiKey)}`,
     'requires_openai_auth = false',

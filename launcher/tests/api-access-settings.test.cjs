@@ -71,6 +71,8 @@ function fixture(t, options = {}) {
       return { stdout: args[1] === "codex-config"
         ? `${JSON.stringify({
           config: `requires_openai_auth = false\nexperimental_bearer_token = ${JSON.stringify(runOptions.env?.CODEX_CHATGPT_WEB_API_KEY)}\n`,
+          catalogPath: path.join(coreHome, "api-key-models.json"),
+          catalog: '{"models":[]}\n',
           environment: { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" },
         })}\n` : '{"changed":false}\n' };
     },
@@ -119,6 +121,41 @@ test("mode/key are saved first, then the supervised runtime restarts", async t =
   assert.equal(result.status.keyAvailable, true); assert.equal(f.controller.reveal(), KEY);
   const status = JSON.stringify(await f.controller.status()); assert.ok(!status.includes(KEY));
   assert.ok(!status.includes(keyPolicy(KEY).keySha256));
+});
+test("manual server mode GUI apply leaves old Codex ownership files byte-for-byte unchanged", async t => {
+  const previous = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+  process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = "1";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    else process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = previous;
+  });
+  const f = fixture(t);
+  const codexHome = path.join(f.coreHome, "codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  const files = [
+    [path.join(codexHome, "config.toml"), Buffer.from('model_provider = "user-owned"\n')],
+    [path.join(codexHome, "integration-journal.json"), Buffer.from('{"version":1,"sentinel":"old-owner"}\n')],
+    [path.join(codexHome, "models.json"), Buffer.from('{"sentinel":"user-cache"}\n')],
+  ];
+  for (const [file, bytes] of files) fs.writeFileSync(file, bytes);
+  const before = files.map(([file]) => fs.readFileSync(file));
+
+  const result = await f.apply();
+
+  assert.equal(result.status.configuredMode, "api-key");
+  assert.equal(result.status.cleanupPending, false);
+  assert.equal(f.state.commands.some(args => args[0] === "api-key" && args[1] === "cleanup"), false);
+  files.forEach(([file], index) => assert.deepEqual(fs.readFileSync(file), before[index]));
+});
+test("server host port override is used for the Launcher client Base URL fallback", async t => {
+  const previous = process.env.CODEX_CHATGPT_WEB_CLIENT_PORT;
+  process.env.CODEX_CHATGPT_WEB_CLIENT_PORT = "27841";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_CLIENT_PORT;
+    else process.env.CODEX_CHATGPT_WEB_CLIENT_PORT = previous;
+  });
+  const f = fixture(t);
+  assert.equal((await f.controller.status()).baseUrl, "http://127.0.0.1:27841/v1");
 });
 test("missing key prevents first enable, without any write or restart", async t => {
   const f = fixture(t);
@@ -218,6 +255,8 @@ test("export is an explicit sensitive action that embeds only the local key and 
   const f = fixture(t); await f.apply(); const result = await f.controller.exportConfig();
   assert.ok(result.config.includes("requires_openai_auth = false")); assert.ok(result.config.includes(KEY));
   assert.ok(!result.config.includes(UPSTREAM_KEY));
+  assert.equal(result.catalog, '{"models":[]}\n');
+  assert.equal(result.catalogPath, path.join(f.coreHome, "api-key-models.json"));
   assert.equal(result.environment.NO_PROXY, "localhost,127.0.0.1,::1");
   assert.deepEqual(f.state.commands.at(-1), ["api-key", "codex-config", "--json"]);
   assert.equal(f.state.lastRunOptions.sensitiveOutput, true);

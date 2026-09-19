@@ -1,0 +1,131 @@
+# Server remote desktop deployment (Phase 1)
+
+This deployment runs the packaged Linux x64 Launcher in one long-running Docker container. It keeps the existing Launcher ownership model: the container supervisor owns the desktop processes and the Launcher process only. The Launcher continues to own the Responses daemon, Tunnel, MCP runtime, browser helper, and task browser views.
+
+## Requirements
+
+- Linux x86_64 server with Docker Engine and Docker Compose.
+- A production Linux x64 AppImage in `launcher/artifacts/`. The existing `bun run --cwd launcher package:linux` path writes its public AppImage there on Linux x64. You can also copy a controlled release artifact there. Do not use `dev:launcher` or a DEV profile.
+- A persistent Docker volume for `/home/codex`.
+- A private VNC password file on the host for remote desktop authentication.
+- A separate private GNOME Keyring password file on the host. Keep this keyring secret stable when reusing the HOME volume. It is intentionally independent from the VNC password, so the VNC password can be rotated without changing the safeStorage keyring credential.
+- An existing HTTPS reverse proxy. This deployment does not install or manage TLS termination.
+- A Codex client outside the container. It can run on the same Linux host or on another trusted machine that can reach the HTTPS reverse proxy.
+
+The container user is named `codex`. Its default uid/gid is `10001:10001`; this avoids the `1000:1000` `node` user already present in the base image. Set `CODEX_UID` and `CODEX_GID` at image build time when the dedicated host account uses different, unused IDs. The build fails instead of silently sharing an existing container identity when those IDs already exist. Both password files must be readable by that identity. The password files should be mode `0400` or `0600` and must not be committed to Git.
+
+VNC authentication uses the legacy VNC password mechanism. Use at least 8 random characters; only the first 8 characters are significant to this protocol. HTTPS at the existing reverse proxy is required for public access.
+
+## Build and start
+
+Copy the environment template and set real values:
+
+```sh
+cp deploy/server/.env.example deploy/server/.env
+```
+
+The image does not install Codex CLI. The Launcher and its packaged runtime are the server-side product; Codex runs outside the container. The image records only the AppImage SHA-256 digest in `/opt/codex-server/build/appimage.sha256`.
+
+Build and start:
+
+```sh
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml build
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml up -d
+```
+
+The image build must run for `linux/amd64`. The Compose file fixes that platform and the Dockerfile rejects a non-amd64 userspace.
+
+Inspect the packaged Launcher digest:
+
+```sh
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml exec desktop cat /opt/codex-server/build/appimage.sha256
+```
+
+## Network contract
+
+The default Compose file publishes noVNC and Responses only on host loopback:
+
+```text
+127.0.0.1:${NOVNC_HOST_PORT:-6080} -> container 6080 (noVNC/websockify)
+127.0.0.1:${RESPONSES_HOST_PORT:-17841} -> container 17841 (Responses)
+container 127.0.0.1:5900                -> x11vnc only
+container loopback CDP                  -> Launcher browser diagnostics only
+```
+
+The deployment requests `CODEX_CHATGPT_WEB_BIND_HOST=0.0.0.0` inside the container so Docker can reach the Responses listener. The runtime honors that request only when the saved API access policy is `api-key`; OpenAI forwarding remains loopback-only. Do not change the host publication to `0.0.0.0`, and do not use host networking.
+
+For external URLs such as `https://server.example.com/desktop/` and `https://server.example.com/v1`, the existing reverse proxy must:
+
+1. terminate HTTPS;
+2. proxy `/desktop/` to `http://127.0.0.1:${NOVNC_HOST_PORT}/` and strip the `/desktop/` prefix; the image landing page opens `vnc.html` with noVNC's WebSocket path set to `desktop/websockify`;
+3. pass the WebSocket upgrade for `/desktop/websockify`; after the same `/desktop/` prefix strip, this reaches `http://127.0.0.1:${NOVNC_HOST_PORT}/websockify`;
+4. proxy `/v1/` to `http://127.0.0.1:${RESPONSES_HOST_PORT}/v1/` with streaming/SSE buffering disabled;
+5. do not proxy `/healthz`, `/admin/*`, VNC, CDP, or any other control endpoint.
+
+If the reverse proxy itself runs in Docker, use an explicit private shared Docker network and remove the host-loopback port publication in a local Compose override. Do not replace it with a `0.0.0.0` publication.
+
+Set `CODEX_PUBLIC_BASE_URL=https://server.example.com/v1` when Codex runs on another machine. Leave it empty when Codex runs on the same server host; exported client configuration then uses `http://127.0.0.1:${RESPONSES_HOST_PORT}/v1`.
+
+## External Codex client
+
+Server deployment sets `CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG=1`. Setup and runtime operations therefore do not create or modify any Codex `config.toml`, `auth.json`, or hook. Configure the client explicitly:
+
+1. In Launcher Settings, switch API access to **API Key** and save a client key.
+2. Use **Copy Codex config** or **Export TOML**. The provider `base_url` uses `CODEX_PUBLIC_BASE_URL`, or the host-loopback fallback when that value is empty.
+3. Copy the exported TOML into the external Codex configuration and copy the exported model catalog to `CODEX_CLIENT_CATALOG_PATH` on that client. The default destination is `~/.codex/api-key-models.json`.
+4. Restart the external Codex client.
+
+The server export deliberately contains no container-local Interrupt command and no daemon control token. Normal HTTP disconnect cancellation is still used, and the server deployment adds `REMOTE_TURN_IDLE_TIMEOUT_SEC` as a no-progress fallback. Its default is 600 seconds. It is not a total turn duration limit. Real text/reasoning progress, tool-call creation, tool results, and compaction progress refresh the native `thread_id + turn_id` idle lease; transport/helper heartbeats and retries do not. A tool call that never returns therefore still times out and releases its ownership.
+
+## Desktop and persistence
+
+The supervisor starts these top-level processes:
+
+```text
+Xvfb
+GNOME Keyring Secret Service
+Openbox
+xterm (maintenance shell under the container HOME)
+x11vnc (loopback only, password required)
+noVNC/websockify
+production Codex Web GPT AppImage
+```
+
+The AppImage receives `APPIMAGE_EXTRACT_AND_RUN=1`, so FUSE is not required. It runs as the non-root `codex` user and is not started with `--no-sandbox`.
+
+The named `codex_home` volume persists all application-user state under `/home/codex`, including:
+
+- `~/.codex-chatgpt-web`;
+- Electron `userData` at `~/.config/Codex Web GPT`;
+- the persistent ChatGPT browser partition and cookies;
+- Launcher state and logs;
+- GNOME Keyring data used by Electron safeStorage.
+
+The external Codex client owns its own `CODEX_HOME`, project files, sandbox, and command side effects. They are not mounted into this container.
+
+To upgrade, build a new image from the new production AppImage, then recreate the container with the same HOME volume. To roll back, start the previous image with the same persistent data. The AppImage self-updater is not the authoritative server update path.
+
+## Health behavior
+
+The container health check verifies that Xvfb, keyring, Openbox, xterm, VNC, noVNC, and the Launcher are all under supervisor control and running. It also fetches the noVNC page.
+
+Before Launcher setup is complete, the desktop can be healthy without a Responses runtime. Once `coreSetupComplete` has been observed, the health check writes a marker in the persistent application home, reads the persisted Responses port from `~/.codex-chatgpt-web/config.json`, and requires the container-local `/healthz` endpoint to report the existing `codex-chatgpt-web` healthy contract. The public reverse proxy must not expose that endpoint.
+
+## Secure storage validation
+
+The image installs D-Bus, GNOME Keyring, and libsecret. Launcher startup waits for `org.freedesktop.secrets` and explicitly selects Electron's `gnome-libsecret` password store. A dedicated keyring secret is supplied to `gnome-keyring-daemon --unlock` over standard input, never in a process argument. The keyring secret is not derived from the VNC password. The entry point records only the non-secret D-Bus session address in the private runtime directory so `docker compose exec` validation commands can reach the same Secret Service.
+
+After the container is running, verify that the Secret Service can write and read a value:
+
+```sh
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml exec desktop \
+  /opt/codex-server/bin/check-secret-service.sh
+```
+
+This probe validates the Secret Service substrate, but it does not replace the Spec's final Electron acceptance. On the target Linux x86_64 host, record `safeStorage.isEncryptionAvailable()` and `safeStorage.getSelectedStorageBackend()` from the final packaged Launcher. The backend must be `gnome_libsecret` (not `basic_text` or `unknown`). Then store a key through the existing safeStorage-backed product path, recreate the container while keeping the HOME volume and the same keyring secret, and confirm that the key remains readable. Rotate only the VNC password, recreate the container again, and confirm that the same safeStorage-backed key is still readable. Do not relax the existing vault check if this validation fails.
+
+Changing the VNC password does not change the keyring unlock credential. Changing the keyring password is a keyring migration event; do not rotate it independently while expecting existing safeStorage entries to remain readable unless the keyring password is migrated first.
+
+## Runtime acceptance on the target server
+
+The final Linux x86_64 acceptance still needs real server evidence. At minimum, verify the production Launcher window without `--no-sandbox`, wrong/correct VNC password behavior, HTTPS `/desktop/` HTTP and WebSocket routing, API-key rejection/acceptance on HTTPS `/v1`, ChatGPT login/MFA, one real external-Codex turn, Automatic/Zero Risk, an MCP round trip, compaction, prompt client-disconnect cleanup, a short configured no-progress idle-timeout test, container recreation with persistent HOME, restart recovery, and absence of public raw listeners for Responses, health/admin, VNC, and CDP.

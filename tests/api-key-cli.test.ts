@@ -95,8 +95,49 @@ test("CLI Codex export requires the current local key and emits sensitive TOML p
   const payload = JSON.parse(exported.out);
   assert.ok(payload.config.includes(`experimental_bearer_token = "${localKey}"`));
   assert.ok(!payload.config.includes("env_key ="));
+  assert.equal(payload.catalogPath, join(home, "api-key-models.json"));
+  assert.deepEqual(JSON.parse(payload.catalog), JSON.parse(readFileSync(payload.catalogPath, "utf8")));
   assert.equal(payload.environment.HTTP_PROXY, "http://proxy.example:8080");
   for (const host of ["localhost", "127.0.0.1", "::1"]) assert.ok(payload.environment.NO_PROXY.includes(host));
+}));
+
+test("CLI Codex export supports an external HTTPS client without server-local paths or Interrupt hook", () => withHome(home => {
+  const localKey = "cgw_" + "r".repeat(43);
+  writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  const clientCatalog = "/home/remote/.codex/api-key-models.json";
+  const exported = cli(home, ["codex-config", "--json"], undefined, {
+    CODEX_CHATGPT_WEB_API_KEY: localKey,
+    CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+    CODEX_CHATGPT_WEB_PUBLIC_BASE_URL: "https://server.example.com/v1/",
+    CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH: clientCatalog,
+  });
+  assert.equal(exported.code, 0, exported.err);
+  const payload = JSON.parse(exported.out);
+  assert.equal(payload.baseUrl, "https://server.example.com/v1");
+  assert.equal(payload.catalogPath, clientCatalog);
+  assert.ok(payload.config.includes('base_url = "https://server.example.com/v1"'));
+  assert.ok(payload.config.includes(`model_catalog_json = "${clientCatalog}"`));
+  assert.ok(!payload.config.includes("[[hooks.Interrupt]]"));
+  assert.ok(!payload.config.includes(home));
+  assert.ok(Array.isArray(JSON.parse(payload.catalog).models));
+  assert.equal(existsSync(join(home, "api-key-models.json")), false);
+}));
+
+test("CLI Codex export uses the host-mapped Responses port when public Base URL is empty", () => withHome(home => {
+  const localKey = "cgw_" + "h".repeat(43);
+  writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  const exported = cli(home, ["codex-config", "--json"], undefined, {
+    CODEX_CHATGPT_WEB_API_KEY: localKey,
+    CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+    CODEX_CHATGPT_WEB_PUBLIC_BASE_URL: "",
+    CODEX_CHATGPT_WEB_CLIENT_PORT: "27841",
+  });
+  assert.equal(exported.code, 0, exported.err);
+  const payload = JSON.parse(exported.out);
+  assert.equal(payload.baseUrl, "http://127.0.0.1:27841/v1");
+  assert.ok(payload.config.includes('base_url = "http://127.0.0.1:27841/v1"'));
 }));
 
 test("CLI Codex export uses saved server-compaction intent for provider naming without exporting the upstream key", () => withHome(home => {

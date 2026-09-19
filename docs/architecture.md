@@ -2,7 +2,7 @@
 
 ```text
 Codex app / CLI
-      │ Responses API on loopback
+      │ Responses API on loopback by default
       ▼
 launcher-owned codex-chatgpt-web daemon
   ├─ official /models passthrough + fixed ChatGPT Web models
@@ -227,7 +227,10 @@ launcher error.
 
 ## Security invariants
 
-- Bind the Responses proxy and health endpoint to loopback only.
+- Normal local installs bind the Responses proxy and health endpoint to loopback. The server
+  remote-desktop deployment may bind Responses to the private container interface only in API-Key
+  mode; host publication stays private/loopback and the external reverse proxy exposes only `/v1`.
+  Health and lifecycle control endpoints remain non-public.
 - Store browser state and tunnel credentials under the application home with mode `0600`.
 - Protect lifecycle control endpoints with a random application-owned bearer token.
 - Never place secret values in command-line arguments, logs, generated profiles, or Git.

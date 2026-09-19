@@ -43,6 +43,7 @@ import {
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { manualCodexConfigurationOnly } from "./server-remote-config";
 
 export interface SetupOptions {
   mode: RuntimeMode;
@@ -475,7 +476,9 @@ export function preflightSetup(options: SetupOptions): void {
       throw new Error("Automatic and Zero Risk require different Tunnel IDs and separate ChatGPT connectors");
     }
   }
-  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
+  if (manualCodexConfigurationOnly()) {
+    // Server deployments export client configuration; they never mutate a Codex installation.
+  } else if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
   else preflightCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
@@ -483,7 +486,9 @@ export function preflightSetup(options: SetupOptions): void {
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
   const { existing, config, launcherOwned } = prepareSetup(options);
-  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
+  if (manualCodexConfigurationOnly()) {
+    // Server deployments export client configuration; they never mutate a Codex installation.
+  } else if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration(true);
   else preflightCodexIntegration(config, {
     replaceExistingRoute: options.replaceCodexRoute,
   });
@@ -628,7 +633,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
   // API mode owns no Codex config. Setup/upgrades may only remove prior recorded injection.
-  if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration();
+  if (manualCodexConfigurationOnly()) {
+    // Deliberately leave any external Codex home untouched. The user applies exported settings.
+  } else if (loadApiAccessPolicy().mode === "api-key") cleanupApiKeyCodexIntegration();
   else {
     installCodexIntegration(config, {
       replaceExistingRoute: options.replaceCodexRoute,

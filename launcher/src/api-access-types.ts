@@ -38,7 +38,12 @@ export interface ApiAccessApi {
   apiAccessApply(input: ApiAccessChange): Promise<ApiAccessResult<{ cancelled: boolean; status: ApiAccessStatus }>>;
   apiAccessCopyKey(key: string): Promise<ApiAccessResult<boolean>>;
   apiAccessCopyUrl(): Promise<ApiAccessResult<boolean>>;
-  apiAccessExport(): Promise<ApiAccessResult<{ config: string; environment: Record<string, string>; catalogPath: string }>>;
+  apiAccessExport(): Promise<ApiAccessResult<{
+    config: string;
+    environment: Record<string, string>;
+    catalogPath: string;
+    catalog: string;
+  }>>;
   apiAccessUpstreamSave(input: {
     expectedRevision: string;
     baseUrl: string;

@@ -4,9 +4,12 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
 import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
@@ -20,6 +23,15 @@ async function waitForTurnCount(turns: HttpTurnCounter, expected: number): Promi
   const deadline = Date.now() + 1_000;
   while (turns.count() !== expected && Date.now() < deadline) await Bun.sleep(5);
   expect(turns.count()).toBe(expected);
+}
+
+function tombstoneCapacityError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError("remote turn tombstone capacity exhausted", {
+    status: 503,
+    errorType: "server_error",
+    code: "client_turn_idle_tombstone_capacity",
+    retryable: true,
+  });
 }
 
 test("HTTP turn tracking follows the response stream instead of Bun's global request count", async () => {
@@ -215,6 +227,7 @@ test("a real HTTP peer disconnect releases a streaming turn", async () => {
   let markSourceReady!: () => void;
   const sourceReady = new Promise<void>(resolve => { markSourceReady = resolve; });
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async () => new Response(new ReadableStream<Uint8Array>({
       start(controller) {
         source = controller;
@@ -286,6 +299,29 @@ test("HTTP turn cancellation aborts the tracked request and waits for lifecycle 
   await expect(tracked).rejects.toBe("launcher quit");
   expect(observedAbort).toBe(true);
   expect(turns.count()).toBe(0);
+});
+
+test("HTTP turn cancellation releases ownership even when stream cancellation never settles", async () => {
+  const turns = new HttpTurnCounter();
+  const identity = { threadId: "thread_backpressure", turnId: "turn_backpressure" };
+  let cancelStarted = false;
+  const response = await turns.track((_signal, bindIdentity) => {
+    bindIdentity(identity);
+    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelStarted = true;
+        return new Promise<void>(() => {});
+      },
+    })));
+  });
+
+  expect(turns.count()).toBe(1);
+  const cancellation = turns.beginCancelTurn(identity, new Error("idle timeout"));
+  expect(cancellation.cancelled).toBe(1);
+  await cancellation.settlement;
+  expect(turns.count()).toBe(0);
+  expect(cancelStarted).toBe(true);
+  expect(response.body).not.toBeNull();
 });
 
 test("native Codex interrupt cancels only HTTP streams owned by the exact thread and turn", async () => {
@@ -380,6 +416,77 @@ test("native passthrough response and compaction requests expose their exact int
   expect(compact.status).toBe(502);
 });
 
+test("Web Responses returns tombstone capacity as structured 503 before constructing an adapter", async () => {
+  const config = defaultConfig("browser-only");
+  const identity = { threadId: "thread_web_capacity", turnId: "turn_web_capacity" };
+  let adapterConstructions = 0;
+  const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "chatgpt-web/high",
+      stream: false,
+      prompt_cache_key: identity.threadId,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: identity.threadId, turn_id: identity.turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "capacity check" }],
+        internal_chat_message_metadata_passthrough: { turn_id: identity.turnId },
+      }],
+    }),
+  }), config, () => {
+    adapterConstructions += 1;
+    throw new Error("capacity failure must not construct a Web adapter");
+  }, {
+    onTurnIdentity: () => { throw tombstoneCapacityError(); },
+  });
+
+  expect(response.status).toBe(503);
+  expect(await response.json()).toMatchObject({
+    error: { type: "server_error", code: "client_turn_idle_tombstone_capacity" },
+    retryable: true,
+  });
+  expect(adapterConstructions).toBe(0);
+});
+
+test("Web compact returns tombstone capacity as structured 503 before constructing an adapter", async () => {
+  const config = defaultConfig("browser-only");
+  const identity = { threadId: "thread_web_compact_capacity", turnId: "turn_web_compact_capacity" };
+  let adapterConstructions = 0;
+  const response = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: identity.threadId, turn_id: identity.turnId }),
+    },
+    body: JSON.stringify({
+      model: "chatgpt-web/high",
+      prompt_cache_key: identity.threadId,
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "compact capacity check" }],
+        internal_chat_message_metadata_passthrough: { turn_id: identity.turnId },
+      }],
+    }),
+  }), config, () => {
+    adapterConstructions += 1;
+    throw new Error("capacity failure must not construct a Web compact adapter");
+  }, {
+    onTurnIdentity: () => { throw tombstoneCapacityError(); },
+  });
+
+  expect(response.status).toBe(503);
+  expect(await response.json()).toMatchObject({
+    error: { type: "server_error", code: "client_turn_idle_tombstone_capacity" },
+    retryable: true,
+  });
+  expect(adapterConstructions).toBe(0);
+});
+
 test("authenticated Interrupt hook endpoint releases the exact routed Web turn", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const threadId = "thread_interrupt_hook";
@@ -401,6 +508,7 @@ test("authenticated Interrupt hook endpoint releases the exact routed Web turn",
     },
   }), "interrupt-hook-trace", "interrupt-hook-owner", turnId, threadId);
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     adapterFactory: () => ({
       name: "interrupt-test",
       runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
@@ -462,12 +570,1129 @@ test("authenticated Interrupt hook endpoint releases the exact routed Web turn",
   }
 });
 
+test("remote turn idle timeout ignores heartbeats and cancels exact HTTP and browser ownership", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_remote_timeout";
+  const turnId = "turn_remote_timeout";
+  let adapterConstructions = 0;
+  let adapterRuns = 0;
+  let adapterAborted = false;
+  let browserAborted = false;
+  let rejectBrowser!: (error: Error) => void;
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("remote-timeout-browser", () => ({
+    mode: "read-only",
+    browser,
+    physicalSettlement: browser.then(() => undefined, () => undefined),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => {
+      browserAborted = true;
+      rejectBrowser(reason ?? new Error("remote turn timed out"));
+    },
+  }), "remote-timeout-trace", "remote-timeout-owner", turnId, threadId);
+  const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
+    adapterFactory: () => {
+      adapterConstructions += 1;
+      return {
+        name: "remote-timeout-test",
+        runTurn: (_parsed, incoming, emit) => {
+          adapterRuns += 1;
+          return new Promise<void>((_resolve, reject) => {
+            const heartbeat = setInterval(() => emit({ type: "heartbeat" }), 100);
+            incoming.abortSignal!.addEventListener("abort", () => {
+              clearInterval(heartbeat);
+              adapterAborted = true;
+              reject(incoming.abortSignal!.reason);
+            }, { once: true });
+          });
+        },
+      };
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const requestBody = JSON.stringify({
+    model: "chatgpt-web/high",
+    stream: true,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "wait for remote timeout" }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }],
+  });
+
+  try {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    });
+    const body = await response.text();
+    expect(body).toContain("client_turn_idle_timeout");
+    expect(adapterAborted).toBeTrue();
+    expect(browserAborted).toBeTrue();
+    expect(adapterConstructions).toBe(1);
+    expect(adapterRuns).toBe(1);
+
+    const retry = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: requestBody,
+    });
+    expect(retry.status).toBe(504);
+    expect(await retry.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(adapterConstructions).toBe(1);
+    expect(adapterRuns).toBe(1);
+    const health = await (await fetch(`${endpoint}/healthz`)).json() as {
+      active_http_turns: number;
+      active_browser_turns: number;
+      active_remote_turn_idle_leases: number;
+      remote_turn_idle_timeout_sec: number;
+    };
+    expect(health).toMatchObject({
+      active_http_turns: 0,
+      active_browser_turns: 0,
+      active_remote_turn_idle_leases: 0,
+      remote_turn_idle_timeout_sec: 1,
+    });
+  } finally {
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web Responses idle timeout aborts upstream and releases HTTP ownership", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"n".repeat(43)}`;
+  const threadId = "thread_remote_native_timeout";
+  const turnId = "turn_remote_native_timeout";
+  let upstreamCalls = 0;
+  let upstreamAborted = false;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: request => {
+      upstreamCalls += 1;
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => {
+          upstreamAborted = true;
+          reject(request.signal.reason);
+        }, { once: true });
+      });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const requestBody = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: true,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "wait for native passthrough timeout" }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }],
+  });
+
+  try {
+    const pending = fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body: requestBody,
+    });
+
+    const deadline = Date.now() + 750;
+    let health = { active_http_turns: 0, active_remote_turn_idle_leases: 0 };
+    while (Date.now() < deadline) {
+      health = await (await fetch(`${endpoint}/healthz`)).json() as typeof health;
+      if (health.active_http_turns === 1 && health.active_remote_turn_idle_leases === 1) break;
+      await Bun.sleep(5);
+    }
+    expect(health).toMatchObject({
+      active_http_turns: 1,
+      active_remote_turn_idle_leases: 1,
+    });
+
+    const response = await pending;
+    expect(response.status).toBe(504);
+    expect(await response.json()).toMatchObject({
+      error: {
+        type: "server_error",
+        code: "client_turn_idle_timeout",
+      },
+      retryable: false,
+    });
+    expect(upstreamAborted).toBeTrue();
+    expect(upstreamCalls).toBe(1);
+
+    const retry = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body: requestBody,
+    });
+    expect(retry.status).toBe(504);
+    expect(await retry.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(upstreamCalls).toBe(1);
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web JSON emits a terminal idle-timeout body after upstream headers", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"h".repeat(43)}`;
+  const threadId = "thread_remote_native_json_timeout";
+  const turnId = "turn_remote_native_json_timeout";
+  let upstreamAborted = false;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: request => {
+      let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+        },
+      });
+      request.signal.addEventListener("abort", () => {
+        upstreamAborted = true;
+        bodyController.error(request.signal.reason);
+      }, { once: true });
+      return Promise.resolve(new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+        },
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "wait after JSON headers" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      status: "failed",
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(upstreamAborted).toBeTrue();
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web continuation renews once for a new tool result but not for its replay", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"r".repeat(43)}`;
+  const threadId = "thread_remote_native_tool_result";
+  const turnId = "turn_remote_native_tool_result";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: request => {
+      upstreamCalls += 1;
+      const callId = upstreamCalls === 1 ? "call_1" : upstreamCalls === 2 ? "call_2" : "call_3";
+      const response = () => Response.json({
+        id: `resp_${callId}`,
+        object: "response",
+        status: "completed",
+        output: [{ type: "function_call", call_id: callId, name: "exec_command", arguments: "{}" }],
+      });
+      if (upstreamCalls === 1) return Promise.resolve(response());
+      return new Promise<Response>((resolve, reject) => {
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(request.signal.reason);
+        };
+        const timer = setTimeout(() => {
+          request.signal.removeEventListener("abort", onAbort);
+          resolve(response());
+        }, 600);
+        if (request.signal.aborted) onAbort();
+        else request.signal.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const request = (input: unknown[]) => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${clientKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input,
+    }),
+  });
+  const initialInput = [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "call one tool" }],
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  }];
+  const toolResultInput = [
+    { type: "function_call", call_id: "call_1", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_1", output: "tool result" },
+  ];
+
+  try {
+    const first = await request(initialInput);
+    expect(first.status).toBe(200);
+    expect((await first.json() as { output?: Array<{ call_id?: string }> }).output?.[0]?.call_id).toBe("call_1");
+
+    await Bun.sleep(600);
+    const continued = await request(toolResultInput);
+    expect(continued.status).toBe(200);
+    expect((await continued.json() as { output?: Array<{ call_id?: string }> }).output?.[0]?.call_id).toBe("call_2");
+
+    await Bun.sleep(600);
+    const replay = await request(toolResultInput);
+    expect(replay.status).toBe(504);
+    expect(await replay.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(upstreamCalls).toBe(3);
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web Responses real SSE progress renews the idle lease and final completion releases it", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"p".repeat(43)}`;
+  const threadId = "thread_remote_native_progress";
+  const turnId = "turn_remote_native_progress";
+  const encoder = new TextEncoder();
+  let chunks = 0;
+  let upstreamAborted = false;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async request => {
+      request.signal.addEventListener("abort", () => { upstreamAborted = true; }, { once: true });
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await Bun.sleep(275);
+          if (chunks < 5) {
+            chunks += 1;
+            controller.enqueue(encoder.encode(
+              `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: String(chunks) })}\n\n`,
+            ));
+            return;
+          }
+          controller.enqueue(encoder.encode(
+            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message"}]}}\n\n'
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: true,
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+        },
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "keep making real progress" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain("response.completed");
+    expect(chunks).toBe(5);
+    expect(upstreamAborted).toBeFalse();
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+      remote_turn_idle_timeout_sec: 1,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web JSON final completion releases the idle lease", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"j".repeat(43)}`;
+  const threadId = "thread_remote_native_json";
+  const turnId = "turn_remote_native_json";
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => Response.json({
+      id: "resp_native_json",
+      object: "response",
+      status: "completed",
+      output: [{ type: "message", role: "assistant", content: [] }],
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+        },
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "finish immediately" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json() as { status?: string }).status).toBe("completed");
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote non-Web compaction real progress renews the idle lease without completing the native turn", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"k".repeat(43)}`;
+  const threadId = "thread_remote_native_compact";
+  const turnId = "turn_remote_native_compact";
+  const encoder = new TextEncoder();
+  let chunks = 0;
+  let upstreamAborted = false;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 1,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: true,
+      },
+    },
+    fetchUpstreamProvider: async request => {
+      request.signal.addEventListener("abort", () => { upstreamAborted = true; }, { once: true });
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await Bun.sleep(275);
+          if (chunks < 5) {
+            chunks += 1;
+            controller.enqueue(encoder.encode(
+              `event: response.compaction.delta\ndata: ${JSON.stringify({ type: "response.compaction.delta", delta: String(chunks) })}\n\n`,
+            ));
+            return;
+          }
+          controller.enqueue(encoder.encode(
+            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"}]}}\n\n'
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const response = await fetch(`${endpoint}/v1/responses/compact`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "compact this native history" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain("response.completed");
+    expect(chunks).toBe(5);
+    expect(upstreamAborted).toBeFalse();
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 1,
+      remote_turn_idle_timeout_sec: 1,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote real-adapter tool replay does not refresh the native turn idle lease", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const root = mkdtempSync(join(tmpdir(), "cgw-remote-replay-idle-"));
+  const config = {
+    ...defaultConfig("full"),
+    port: 0,
+    brokerSocketPath: defaultBrokerEndpoint(root),
+  };
+  const provider = providerConfig(config);
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  await TurnBroker.forSocket(config.brokerSocketPath).listen();
+  const threadId = "thread_remote_replay_idle";
+  const turnId = "turn_remote_replay_idle";
+  const environment = [
+    "<environment_context>",
+    "  <cwd>" + root + "</cwd>",
+    "  <filesystem><workspace_roots><root>" + root + "</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>",
+    "</environment_context>",
+  ].join("\n");
+  const body = {
+    model: "chatgpt-web/high",
+    stream: true,
+    prompt_cache_key: threadId,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    tools: [{
+      type: "function",
+      name: "exec_command",
+      description: "Run a command",
+      parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
+    }],
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: environment }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }, {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Run one command and wait for its result." }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }],
+  };
+  let browserStarts = 0;
+  let browserCancelled = false;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    browserStarts += 1;
+    const prepared = await turn.prepare();
+    try {
+      const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+      if (!token) throw new Error("remote replay fixture has no turn token");
+      const claimed = await callTurnBroker<{ bindingId: string }>(
+        config.brokerSocketPath,
+        { method: "claim", token },
+      );
+      const progress = turn.externalProgress;
+      if (!progress) throw new Error("remote replay fixture has no tool progress transport");
+      const previousBatchRevision = progress.snapshot().lastToolBatchRevision;
+      const invocation = callTurnBroker<unknown>(config.brokerSocketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "exec_command",
+        freeform: false,
+        arguments: { cmd: "pwd" },
+      }, 30_000);
+      let snapshot = progress.snapshot();
+      while (snapshot.lastToolBatchRevision <= previousBatchRevision) {
+        snapshot = await progress.waitForChange(snapshot.revision, turn.abortSignal);
+      }
+      await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
+      try {
+        await invocation;
+        throw new Error("remote replay fixture unexpectedly received a tool result");
+      } catch (error) {
+        if (turn.abortSignal?.aborted) {
+          browserCancelled = true;
+          throw turn.abortSignal.reason ?? error;
+        }
+        throw error;
+      }
+    } finally {
+      prepared.release();
+    }
+  };
+  const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
+  const endpoint = "http://127.0.0.1:" + server.port;
+  const request = () => fetch(endpoint + "/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const callId = (text: string): string | undefined => /"call_id":"([^"]+)"/.exec(text)?.[1];
+
+  try {
+    const first = await request();
+    expect(first.status).toBe(200);
+    const originalCallId = callId(await first.text());
+    expect(originalCallId).toBeDefined();
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await Bun.sleep(250);
+      const replay = await request();
+      expect(replay.status).toBe(200);
+      expect(callId(await replay.text())).toBe(originalCallId);
+    }
+    await Bun.sleep(500);
+
+    const health = await (await fetch(endpoint + "/healthz")).json() as {
+      active_browser_turns: number;
+      active_remote_turn_idle_leases: number;
+    };
+    expect(health.active_remote_turn_idle_leases).toBe(0);
+    expect(health.active_browser_turns).toBe(0);
+    expect(browserStarts).toBe(1);
+    expect(browserCancelled).toBeTrue();
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+    await closeTurnBrokers();
+    rmSync(root, { recursive: true, force: true });
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote real-adapter structured text deltas refresh the native turn idle lease", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const provider = providerConfig(config);
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const chunks = ['{"value":"', "a", "b", "c", '"}'];
+  const answer = chunks.join("");
+  let producedChunks = 0;
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    const prepared = await turn.prepare();
+    try {
+      for (const chunk of chunks) {
+        await Bun.sleep(300);
+        turn.onTextDelta(chunk);
+        producedChunks += 1;
+      }
+      return answer;
+    } finally {
+      prepared.release();
+    }
+  };
+  const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
+  const endpoint = "http://127.0.0.1:" + server.port;
+  const threadId = "thread_remote_structured_idle";
+  const turnId = "turn_remote_structured_idle";
+
+  try {
+    const response = await fetch(endpoint + "/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "chatgpt-web/high",
+        stream: false,
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+        },
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Return one JSON object." }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "remote_idle_payload",
+            strict: true,
+            schema: {
+              type: "object",
+              properties: { value: { type: "string" } },
+              required: ["value"],
+              additionalProperties: false,
+            },
+          },
+        },
+      }),
+    });
+    expect(response.status).toBe(200);
+    const result = await response.json() as {
+      status?: string;
+      output?: Array<{ phase?: string; content?: Array<{ text?: string }> }>;
+    };
+    expect(result.status).toBe("completed");
+    expect(result.output?.find(item => item.phase === "final_answer")?.content?.[0]?.text).toBe(answer);
+    expect(producedChunks).toBe(chunks.length);
+  } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote compaction progress refreshes the existing native turn idle lease without completing it", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_remote_compact_idle";
+  const turnId = "turn_remote_compact_idle";
+  const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
+    adapterFactory: () => ({
+      name: "remote-compaction-idle-test",
+      async runTurn(parsed, incoming, emit) {
+        incoming.onProgress?.();
+        emit({
+          type: "text_delta",
+          text: parsed._compactionRequest ? "checkpoint" : "tool round",
+          phase: "final_answer",
+        });
+        emit({ type: "done", stopReason: "stop", endTurn: parsed._compactionRequest === true });
+      },
+    }),
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  try {
+    const first = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "chatgpt-web/high",
+        stream: true,
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+        },
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "start a tool round" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(first.status).toBe(200);
+    await first.text();
+    await Bun.sleep(650);
+
+    const response = await fetch(`${endpoint}/v1/responses/compact`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      body: JSON.stringify({
+        model: "chatgpt-web/high",
+        input: [{
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "compact me" }],
+          internal_chat_message_metadata_passthrough: { turn_id: turnId },
+        }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    await Bun.sleep(500);
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 1,
+      remote_turn_idle_timeout_sec: 1,
+    });
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("pre-adapter 400 and 409 responses do not create remote native turn idle leases", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  let adapterConstructions = 0;
+  const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
+    adapterFactory: () => {
+      adapterConstructions += 1;
+      throw new Error("pre-adapter rejection must not construct an adapter");
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+
+  const request = (body: unknown) => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const health = async () => await (await fetch(`${endpoint}/healthz`)).json() as {
+    active_http_turns: number;
+    active_remote_turn_idle_leases: number;
+  };
+
+  try {
+    const invalidThreadId = "thread_remote_invalid_before_adapter";
+    const invalidTurnId = "turn_remote_invalid_before_adapter";
+    const invalid = await request({
+      model: "chatgpt-web/high",
+      stream: false,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: invalidThreadId,
+          turn_id: invalidTurnId,
+        }),
+      },
+      input: 42,
+    });
+    expect(invalid.status).toBe(400);
+    expect(await health()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+
+    const missingThreadId = "thread_remote_missing_continuation";
+    const missingTurnId = "turn_remote_missing_continuation";
+    const missingContinuation = await request({
+      model: "chatgpt-web/high",
+      stream: false,
+      previous_response_id: "resp_state_not_available",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: missingThreadId,
+          turn_id: missingTurnId,
+        }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "This continuation has no local state." }],
+        internal_chat_message_metadata_passthrough: { turn_id: missingTurnId },
+      }],
+    });
+    expect(missingContinuation.status).toBe(409);
+    expect(await health()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+    expect(adapterConstructions).toBe(0);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote peer disconnect immediately cancels exact browser and structured compaction ownership", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "600";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const threadId = "thread_remote_disconnect";
+  const turnId = "turn_remote_disconnect";
+  let adapterAborted = false;
+  let browserAborted = false;
+  let compactionAborted = false;
+  let rejectBrowser!: (error: Error) => void;
+  const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+  chatGptTurnSessions.clear();
+  chatGptTurnSessions.getOrCreate("remote-disconnect-browser", () => ({
+    mode: "read-only",
+    browser,
+    physicalSettlement: browser.then(() => undefined, () => undefined),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: reason => {
+      browserAborted = true;
+      rejectBrowser(reason ?? new Error("remote client disconnected"));
+    },
+  }), "remote-disconnect-trace", "remote-disconnect-owner", turnId, threadId);
+  const compaction = runStructuredCompactionOnce(
+    "remote-disconnect-compaction",
+    {
+      ownerKey: "remote-disconnect-owner",
+      traceIds: ["remote-disconnect-compaction-trace"],
+      nativeThreadId: threadId,
+      nativeTurnId: turnId,
+    },
+    signal => new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        compactionAborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  );
+  void compaction.catch(() => {});
+  const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
+    adapterFactory: () => ({
+      name: "remote-disconnect-test",
+      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
+        incoming.abortSignal!.addEventListener("abort", () => {
+          adapterAborted = true;
+          reject(incoming.abortSignal!.reason);
+        }, { once: true });
+      }),
+    }),
+  });
+  const port = server.port;
+  if (port === undefined) throw new Error("test server did not bind a TCP port");
+  const endpoint = `http://127.0.0.1:${port}`;
+  const socket = createConnection({ host: "127.0.0.1", port });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    const body = JSON.stringify({
+      model: "chatgpt-web/high",
+      stream: true,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "wait until the client disconnects" }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    });
+    socket.write([
+      "POST /v1/responses HTTP/1.1",
+      "Host: 127.0.0.1",
+      "Content-Type: application/json",
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      "Connection: keep-alive",
+      "",
+      body,
+    ].join("\r\n"));
+    await new Promise<void>((resolve, reject) => {
+      socket.once("data", () => resolve());
+      socket.once("error", reject);
+    });
+
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 1,
+      active_browser_turns: 1,
+      active_remote_turn_idle_leases: 1,
+    });
+    socket.destroy();
+
+    const deadline = Date.now() + 1_000;
+    let health = {
+      active_http_turns: 1,
+      active_browser_turns: 1,
+      active_remote_turn_idle_leases: 1,
+    };
+    while (Date.now() < deadline) {
+      health = await (await fetch(`${endpoint}/healthz`)).json() as typeof health;
+      if (health.active_http_turns === 0
+        && health.active_browser_turns === 0
+        && health.active_remote_turn_idle_leases === 0
+        && adapterAborted
+        && browserAborted
+        && compactionAborted) break;
+      await Bun.sleep(10);
+    }
+    expect(health).toMatchObject({
+      active_http_turns: 0,
+      active_browser_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+    expect(adapterAborted).toBeTrue();
+    expect(browserAborted).toBeTrue();
+    expect(compactionAborted).toBeTrue();
+    await Promise.allSettled([compaction]);
+  } finally {
+    socket.destroy();
+    chatGptTurnSessions.clear();
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
 test("authenticated Interrupt hook endpoint also releases the exact native compaction request", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const threadId = "thread_interrupt_compact";
   const turnId = "turn_interrupt_compact";
   let adapterAborted = false;
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     adapterFactory: () => ({
       name: "interrupt-compact-test",
       runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {

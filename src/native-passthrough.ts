@@ -31,6 +31,12 @@ export type NativeFetch = (request: Request) => Promise<Response>;
 export type NativeImageEndpoint = "images/generations" | "images/edits";
 export type NativeCodexEndpoint = "models" | "responses" | "responses/compact" | "alpha/search" | NativeImageEndpoint;
 
+export interface NativeResponsesLifecycleObserver {
+  onProgress?: () => void;
+  onFinalResponse?: () => void;
+  terminalSignal?: AbortSignal;
+}
+
 type JsonObject = Record<string, unknown>;
 type BridgeCompactionItem = JsonObject & { type: "compaction"; encrypted_content: string };
 
@@ -202,6 +208,195 @@ export function withUncleanCloseTolerance(
     cancel(reason) {
       return reader.cancel(reason);
     },
+  });
+}
+
+function nativeToolCallItem(value: unknown): boolean {
+  if (!isObject(value) || typeof value.type !== "string") return false;
+  return value.type === "function_call"
+    || value.type === "custom_tool_call"
+    || value.type === "tool_search_call"
+    || value.type === "web_search_call"
+    || value.type === "computer_call"
+    || value.type === "local_shell_call"
+    || value.type === "mcp_call";
+}
+
+function nativeBusinessProgress(type: string, payload: JsonObject): boolean {
+  if (type.endsWith(".delta")) {
+    return typeof payload.delta !== "string" || payload.delta.length > 0;
+  }
+  if (type === "response.output_item.added" || type === "response.output_item.done") return true;
+  return type.startsWith("response.function_call_")
+    || type.startsWith("response.custom_tool_call_")
+    || type.startsWith("response.tool_search_call_")
+    || type.startsWith("response.compaction.");
+}
+
+function terminalSignalError(signal: AbortSignal | undefined): {
+  message: string;
+  type: string;
+  code: string;
+  retryable: boolean;
+} | undefined {
+  if (!signal?.aborted || !(signal.reason instanceof Error)) return undefined;
+  const reason = signal.reason as Error & {
+    errorType?: unknown;
+    code?: unknown;
+    retryable?: unknown;
+  };
+  if (typeof reason.errorType !== "string" || typeof reason.code !== "string") return undefined;
+  return {
+    message: reason.message,
+    type: reason.errorType,
+    code: reason.code,
+    retryable: reason.retryable === true,
+  };
+}
+
+/**
+ * Observe native Responses output without consuming or rewriting normal upstream bytes. Only
+ * semantic Responses events renew the remote-turn lease; transport chunks and heartbeat events do
+ * not. A final response releases the logical turn only when it does not hand control back for a
+ * tool call.
+ */
+export function observeNativeResponsesLifecycle(
+  response: Response,
+  observer: NativeResponsesLifecycleObserver,
+): Response {
+  if (!response.body || !response.ok) return response;
+  const isEventStream = (response.headers.get("content-type") ?? "").toLowerCase().includes("text/event-stream");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let sseBuffer = "";
+  let jsonBuffer = "";
+  const jsonChunks: Uint8Array[] = [];
+  let sawToolCall = false;
+  let finalReported = false;
+  let terminalReported = false;
+
+  const inspectPayload = (value: unknown, eventName?: string): void => {
+    if (!isObject(value)) return;
+    const type = typeof value.type === "string" ? value.type : eventName;
+    if (type && nativeBusinessProgress(type, value)) observer.onProgress?.();
+    if ((type === "response.output_item.added" || type === "response.output_item.done")
+      && nativeToolCallItem(value.item)) {
+      sawToolCall = true;
+    }
+
+    const completed = type === "response.completed" || value.status === "completed";
+    if (!completed) return;
+    observer.onProgress?.();
+    const completedResponse = isObject(value.response) ? value.response : value;
+    const output = Array.isArray(completedResponse.output) ? completedResponse.output : [];
+    const requiresToolContinuation = sawToolCall || output.some(nativeToolCallItem);
+    const endTurn = completedResponse.end_turn;
+    if (!finalReported && (endTurn === true || (endTurn !== false && !requiresToolContinuation))) {
+      finalReported = true;
+      observer.onFinalResponse?.();
+    }
+  };
+
+  const inspectSse = (text: string, flush = false): void => {
+    sseBuffer += text;
+    for (;;) {
+      const boundary = /\r?\n\r?\n/.exec(sseBuffer);
+      if (!boundary) break;
+      const frame = sseBuffer.slice(0, boundary.index);
+      sseBuffer = sseBuffer.slice(boundary.index + boundary[0].length);
+      const lines = frame.split(/\r?\n/);
+      const eventName = lines.find(line => line.startsWith("event:"))?.slice("event:".length).trim();
+      const data = lines.filter(line => line.startsWith("data:"))
+        .map(line => line.slice("data:".length).trimStart()).join("\n");
+      if (!data || data === "[DONE]") continue;
+      try { inspectPayload(JSON.parse(data), eventName); } catch { /* Preserve malformed upstream bytes verbatim. */ }
+    }
+    if (!flush || !sseBuffer.trim()) return;
+    const lines = sseBuffer.split(/\r?\n/);
+    const eventName = lines.find(line => line.startsWith("event:"))?.slice("event:".length).trim();
+    const data = lines.filter(line => line.startsWith("data:"))
+      .map(line => line.slice("data:".length).trimStart()).join("\n");
+    if (data && data !== "[DONE]") {
+      try { inspectPayload(JSON.parse(data), eventName); } catch { /* Preserve malformed upstream bytes verbatim. */ }
+    }
+    sseBuffer = "";
+  };
+
+  const emitTerminalTimeout = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
+    const error = terminalSignalError(observer.terminalSignal);
+    if (!error || terminalReported) return false;
+    terminalReported = true;
+    if (isEventStream) {
+      controller.enqueue(encoder.encode(
+        `event: response.failed\ndata: ${JSON.stringify({
+          type: "response.failed",
+          response: { status: "failed", error, retryable: error.retryable },
+        })}\n\ndata: [DONE]\n\n`,
+      ));
+    } else {
+      controller.enqueue(encoder.encode(JSON.stringify({
+        object: "response",
+        status: "failed",
+        output: [],
+        error,
+        last_error: error,
+        retryable: error.retryable,
+      })));
+    }
+    controller.close();
+    return true;
+  };
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (terminalSignalError(observer.terminalSignal)) {
+        await reader.cancel(observer.terminalSignal?.reason).catch(() => {});
+        if (emitTerminalTimeout(controller)) return;
+      }
+      try {
+        const chunk = await reader.read();
+        if (terminalSignalError(observer.terminalSignal)) {
+          await reader.cancel(observer.terminalSignal?.reason).catch(() => {});
+          if (emitTerminalTimeout(controller)) return;
+        }
+        if (chunk.done) {
+          const tail = decoder.decode();
+          if (isEventStream) inspectSse(tail, true);
+          else {
+            jsonBuffer += tail;
+            if (jsonBuffer) {
+              try { inspectPayload(JSON.parse(jsonBuffer)); } catch { /* Preserve invalid upstream JSON. */ }
+            }
+            for (const buffered of jsonChunks) controller.enqueue(buffered);
+          }
+          controller.close();
+          return;
+        }
+        const text = decoder.decode(chunk.value, { stream: true });
+        if (isEventStream) {
+          inspectSse(text);
+          controller.enqueue(chunk.value);
+        } else {
+          jsonBuffer += text;
+          jsonChunks.push(chunk.value);
+        }
+      } catch (error) {
+        if (emitTerminalTimeout(controller)) return;
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+
+  const headers = new Headers(response.headers);
+  if (!isEventStream) headers.delete("content-length");
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
