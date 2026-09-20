@@ -24,6 +24,7 @@ import {
   type ChatGptTurnUserRevision,
 } from "./environment";
 import {
+  CodexRolloutPublicationPendingError,
   resolveCurrentCodexRolloutEnvironment,
   resolveCurrentCodexRolloutMessageIdAliases,
 } from "./codex-rollout-environment";
@@ -92,6 +93,41 @@ interface StoredThreadEnvironmentFile {
 
 const MAX_THREAD_ENVIRONMENTS = 256;
 const THREAD_ENVIRONMENT_TTL_MS = 30 * 24 * 60 * 60_000;
+const ROLLOUT_PUBLICATION_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800] as const;
+
+function rolloutPublicationAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("Codex rollout publication retry aborted", "AbortError");
+}
+
+function throwIfRolloutPublicationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw rolloutPublicationAbortError(signal);
+}
+
+function waitForRolloutPublicationRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise<void>(resolveDelay => {
+      setTimeout(resolveDelay, delayMs);
+    });
+  }
+  if (signal.aborted) return Promise.reject(rolloutPublicationAbortError(signal));
+  return new Promise<void>((resolveDelay, rejectDelay) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      if (error) rejectDelay(error);
+      else resolveDelay();
+    };
+    const onAbort = () => finish(rolloutPublicationAbortError(signal));
+    const timer = setTimeout(() => finish(), delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
 
 type EnvironmentLookupOutcome = "not_attempted" | "identity_unavailable" | "error" | "miss" | "hit";
 
@@ -324,12 +360,46 @@ export class ChatGptThreadEnvironmentStore {
     parsed: CodexParsedRequest,
     diagnostics: ChatGptEnvironmentResolutionDiagnostics = {},
   ): ChatGptTurnEnvironment {
+    return this.resolveOnce(parsed, diagnostics, false);
+  }
+
+  async resolveWithRolloutPublicationRetry(
+    parsed: CodexParsedRequest,
+    diagnostics: ChatGptEnvironmentResolutionDiagnostics = {},
+    signal?: AbortSignal,
+  ): Promise<ChatGptTurnEnvironment> {
+    throwIfRolloutPublicationAborted(signal);
+    for (let attempt = 0; attempt <= ROLLOUT_PUBLICATION_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (attempt > 0) {
+        await waitForRolloutPublicationRetry(ROLLOUT_PUBLICATION_RETRY_DELAYS_MS[attempt - 1]!, signal);
+      }
+      throwIfRolloutPublicationAborted(signal);
+      const finalAttempt = attempt === ROLLOUT_PUBLICATION_RETRY_DELAYS_MS.length;
+      try {
+        const environment = this.resolveOnce(parsed, diagnostics, !finalAttempt, false);
+        throwIfRolloutPublicationAborted(signal);
+        const identity = extractChatGptTurnIdentity(parsed);
+        this.attachNativeMessageIdAliases(parsed, identity.turnId);
+        return environment;
+      } catch (error) {
+        if (!(error instanceof CodexRolloutPublicationPendingError) || finalAttempt) throw error;
+      }
+    }
+    throw new Error("Unreachable rollout publication retry state");
+  }
+
+  private resolveOnce(
+    parsed: CodexParsedRequest,
+    diagnostics: ChatGptEnvironmentResolutionDiagnostics,
+    publicationPendingIsTransient: boolean,
+    recoverNativeMessageIdAliases = true,
+  ): ChatGptTurnEnvironment {
     diagnostics.recovery_stage = "request";
     diagnostics.rollout_lookup = "not_attempted";
     diagnostics.thread_cache_lookup = "not_attempted";
     diagnostics.parent_cache_lookup = "not_attempted";
     const identity = extractChatGptTurnIdentity(parsed);
-    this.attachNativeMessageIdAliases(parsed, identity.turnId);
+    if (recoverNativeMessageIdAliases) this.attachNativeMessageIdAliases(parsed, identity.turnId);
     try {
       const environment = extractChatGptTurnEnvironment(parsed);
       if (identity.threadId) this.set(identity.threadId, environment, parsed);
@@ -367,7 +437,13 @@ export class ChatGptThreadEnvironmentStore {
           ...(compactionSource && !compactionSource.turnId ? { compactionSource } : {}),
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
           tools: parsed.context.tools,
+          publicationPendingIsTransient: publicationPendingIsTransient && rolloutMarker,
         });
+        if (!rolloutEnvironment && rolloutMarker && publicationPendingIsTransient) {
+          throw new CodexRolloutPublicationPendingError(
+            "Codex canonical rollout is not published yet",
+          );
+        }
         diagnostics.rollout_lookup = rolloutEnvironment ? "hit" : "miss";
         if (rolloutEnvironment) {
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {

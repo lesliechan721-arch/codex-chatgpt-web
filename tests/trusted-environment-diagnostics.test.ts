@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,6 +38,26 @@ function request(xml?: string, metadata: Record<string, unknown> = {}) {
       },
     })),
   });
+}
+
+function createIndexedRollout(options: {
+  codexHome: string;
+  threadId: string;
+  rolloutPath: string;
+  agentPath?: string;
+  parentThreadId?: string;
+}): void {
+  mkdirSync(options.codexHome, { recursive: true });
+  const database = new Database(join(options.codexHome, "state_5.sqlite"), { create: true });
+  database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_path TEXT)");
+  database.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
+  database.query("INSERT INTO threads (id, rollout_path, agent_path) VALUES (?, ?, ?)")
+    .run(options.threadId, options.rolloutPath, options.agentPath ?? null);
+  if (options.parentThreadId) {
+    database.query("INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)")
+      .run(options.parentThreadId, options.threadId, "open");
+  }
+  database.close();
 }
 
 test("trusted environment diagnostics distinguish missing authority and conflicting authority", () => {
@@ -218,6 +239,442 @@ test("a current cwd-less rollout marker recovers only from the matching native t
     recovery_stage: "current_update_rejected", rollout_lookup: "not_attempted",
     thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
   });
+});
+
+test("a current cwd-less rollout marker tolerates a published rollout before turn_context is complete", async () => {
+  const codexHome = join(home, "delayed-rollout-marker-codex-home");
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-00-00-${threadId}.jsonl`);
+  const sessionMeta = JSON.stringify({ type: "session_meta", payload: { id: threadId, source: "cli" } }) + "\n";
+  const turnContext = JSON.stringify({
+    type: "turn_context",
+    payload: {
+      turn_id: turnId,
+      cwd: root,
+      workspace_roots: [root],
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      permission_profile: { type: "disabled" },
+      model: "chatgpt-web/pro",
+      summary: "auto",
+    },
+  }) + "\n";
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
+      "import { dirname } from 'node:path';",
+      "await Bun.sleep(40);",
+      "mkdirSync(dirname(process.env.TEST_ROLLOUT_PATH!), { recursive: true });",
+      "writeFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_SESSION_META!);",
+      "await Bun.sleep(80);",
+      "appendFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_TURN_CONTEXT!);",
+    ].join(" ")],
+    env: {
+      ...process.env,
+      TEST_ROLLOUT_PATH: rolloutPath,
+      TEST_SESSION_META: sessionMeta,
+      TEST_TURN_CONTEXT: turnContext,
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 10);
+  const resolving = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(request(marker), diagnostics);
+  await Bun.sleep(30);
+  expect(timerFired).toBe(true);
+  const resolved = await resolving;
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("a current child rollout marker tolerates delayed canonical rollout publication", async () => {
+  const codexHome = join(home, "delayed-child-rollout-marker-codex-home");
+  const childThreadId = "01a06c66-1000-75c6-a0df-318f890ef6de";
+  const childTurnId = "01a06c66-1001-75c6-a0df-318f890ef6de";
+  const parentThreadId = "01a06c66-1002-75c6-a0df-318f890ef6de";
+  const agentName = "/root/child";
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-10-00-${childThreadId}.jsonl`);
+  const rollout = [
+    JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: childThreadId,
+        parent_thread_id: parentThreadId,
+        source: { subagent: { thread_spawn: { parent_thread_id: parentThreadId, agent_path: agentName } } },
+        thread_source: "subagent",
+        agent_path: agentName,
+      },
+    }),
+    JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: childTurnId,
+        cwd: root,
+        workspace_roots: [root],
+        approval_policy: "never",
+        sandbox_policy: { type: "danger-full-access" },
+        permission_profile: { type: "disabled" },
+        model: "chatgpt-web/pro",
+        summary: "auto",
+      },
+    }),
+  ].join("\n") + "\n";
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { mkdirSync, writeFileSync } from 'node:fs';",
+      "import { dirname } from 'node:path';",
+      "await Bun.sleep(40);",
+      "mkdirSync(dirname(process.env.TEST_ROLLOUT_PATH!), { recursive: true });",
+      "writeFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_ROLLOUT_BODY!);",
+    ].join(" ")],
+    env: { ...process.env, TEST_ROLLOUT_PATH: rolloutPath, TEST_ROLLOUT_BODY: rollout },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  const child = parseRequest({
+    model: "gpt-5.6-sol",
+    stream: true,
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+      request_kind: "turn",
+      thread_id: childThreadId,
+      turn_id: childTurnId,
+      parent_thread_id: parentThreadId,
+      agent_name: agentName,
+      subagent_kind: "thread_spawn",
+      sandbox_mode: "danger-full-access",
+      workspaces: { [root]: {} },
+    }) },
+    input: [
+      { id: "msg_environment", text: marker, kind: "environments.environment_context" },
+      { id: "msg_user", text: "private-user-prompt", kind: "user.text" },
+    ].map(({ id, text, kind }) => ({
+      type: "message",
+      role: "user",
+      id,
+      content: [{ type: "input_text", text }],
+      internal_chat_message_metadata_passthrough: { turn_id: childTurnId, content_item_kinds: [kind] },
+    })),
+  });
+
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const resolved = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(child, diagnostics);
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("an indexed root rollout marker tolerates the SQLite row appearing before the rollout file", async () => {
+  const codexHome = join(home, "indexed-delayed-root-rollout-codex-home");
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-20-00-${threadId}.jsonl`);
+  mkdirSync(dirname(rolloutPath), { recursive: true });
+  createIndexedRollout({ codexHome, threadId, rolloutPath });
+  const rollout = [
+    JSON.stringify({ type: "session_meta", payload: { id: threadId, source: "cli" } }),
+    JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: turnId,
+        cwd: root,
+        workspace_roots: [root],
+        approval_policy: "never",
+        sandbox_policy: { type: "danger-full-access" },
+        permission_profile: { type: "disabled" },
+        model: "chatgpt-web/pro",
+        summary: "auto",
+      },
+    }),
+  ].join("\n") + "\n";
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { writeFileSync } from 'node:fs';",
+      "await Bun.sleep(80);",
+      "writeFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_ROLLOUT_BODY!);",
+    ].join(" ")],
+    env: { ...process.env, TEST_ROLLOUT_PATH: rolloutPath, TEST_ROLLOUT_BODY: rollout },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const resolved = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(request(marker), diagnostics);
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("an indexed child rollout marker tolerates the SQLite row appearing before the rollout file", async () => {
+  const codexHome = join(home, "indexed-delayed-child-rollout-codex-home");
+  const childThreadId = "01a06c66-2000-75c6-a0df-318f890ef6de";
+  const childTurnId = "01a06c66-2001-75c6-a0df-318f890ef6de";
+  const parentThreadId = "01a06c66-2002-75c6-a0df-318f890ef6de";
+  const agentName = "/root/child";
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-30-00-${childThreadId}.jsonl`);
+  mkdirSync(dirname(rolloutPath), { recursive: true });
+  createIndexedRollout({
+    codexHome,
+    threadId: childThreadId,
+    rolloutPath,
+    agentPath: agentName,
+    parentThreadId,
+  });
+  const rollout = [
+    JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: childThreadId,
+        parent_thread_id: parentThreadId,
+        source: { subagent: { thread_spawn: { parent_thread_id: parentThreadId, agent_path: agentName } } },
+        thread_source: "subagent",
+        agent_path: agentName,
+      },
+    }),
+    JSON.stringify({
+      type: "turn_context",
+      payload: {
+        turn_id: childTurnId,
+        cwd: root,
+        workspace_roots: [root],
+        approval_policy: "never",
+        sandbox_policy: { type: "danger-full-access" },
+        permission_profile: { type: "disabled" },
+        model: "chatgpt-web/pro",
+        summary: "auto",
+      },
+    }),
+  ].join("\n") + "\n";
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { writeFileSync } from 'node:fs';",
+      "await Bun.sleep(80);",
+      "writeFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_ROLLOUT_BODY!);",
+    ].join(" ")],
+    env: { ...process.env, TEST_ROLLOUT_PATH: rolloutPath, TEST_ROLLOUT_BODY: rollout },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  const child = parseRequest({
+    model: "gpt-5.6-sol",
+    stream: true,
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+      request_kind: "turn",
+      thread_id: childThreadId,
+      turn_id: childTurnId,
+      parent_thread_id: parentThreadId,
+      agent_name: agentName,
+      subagent_kind: "thread_spawn",
+      sandbox_mode: "danger-full-access",
+      workspaces: { [root]: {} },
+    }) },
+    input: [
+      { id: "msg_environment", text: marker, kind: "environments.environment_context" },
+      { id: "msg_user", text: "private-user-prompt", kind: "user.text" },
+    ].map(({ id, text, kind }) => ({
+      type: "message",
+      role: "user",
+      id,
+      content: [{ type: "input_text", text }],
+      internal_chat_message_metadata_passthrough: { turn_id: childTurnId, content_item_kinds: [kind] },
+    })),
+  });
+
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const resolved = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(child, diagnostics);
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("an indexed root rollout marker tolerates the previous turn while the current turn_context is publishing", async () => {
+  const codexHome = join(home, "indexed-stale-root-turn-codex-home");
+  const previousTurnId = "01a06c66-3000-75c6-a0df-318f890ef6de";
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-40-00-${threadId}.jsonl`);
+  mkdirSync(dirname(rolloutPath), { recursive: true });
+  createIndexedRollout({ codexHome, threadId, rolloutPath });
+  const turnContext = (currentTurnId: string) => JSON.stringify({
+    type: "turn_context",
+    payload: {
+      turn_id: currentTurnId,
+      cwd: root,
+      workspace_roots: [root],
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      permission_profile: { type: "disabled" },
+      model: "chatgpt-web/pro",
+      summary: "auto",
+    },
+  }) + "\n";
+  writeFileSync(rolloutPath,
+    JSON.stringify({ type: "session_meta", payload: { id: threadId, source: "cli" } }) + "\n"
+    + turnContext(previousTurnId));
+
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request(marker)))
+    .toThrow("Latest Codex rollout turn context does not belong to the requested turn");
+
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { appendFileSync } from 'node:fs';",
+      "await Bun.sleep(80);",
+      "appendFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_TURN_CONTEXT!);",
+    ].join(" ")],
+    env: { ...process.env, TEST_ROLLOUT_PATH: rolloutPath, TEST_TURN_CONTEXT: turnContext(turnId) },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const resolved = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(request(marker), diagnostics);
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("an unindexed child rollout marker tolerates the previous turn while the current turn_context is publishing", async () => {
+  const codexHome = join(home, "unindexed-stale-child-turn-codex-home");
+  const childThreadId = "01a06c66-4000-75c6-a0df-318f890ef6de";
+  const childTurnId = "01a06c66-4001-75c6-a0df-318f890ef6de";
+  const previousChildTurnId = "01a06c66-4002-75c6-a0df-318f890ef6de";
+  const parentThreadId = "01a06c66-4003-75c6-a0df-318f890ef6de";
+  const agentName = "/root/child";
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "19",
+    `rollout-2026-09-19T14-50-00-${childThreadId}.jsonl`);
+  mkdirSync(dirname(rolloutPath), { recursive: true });
+  const sessionMeta = JSON.stringify({
+    type: "session_meta",
+    payload: {
+      id: childThreadId,
+      parent_thread_id: parentThreadId,
+      source: { subagent: { thread_spawn: { parent_thread_id: parentThreadId, agent_path: agentName } } },
+      thread_source: "subagent",
+      agent_path: agentName,
+    },
+  }) + "\n";
+  const turnContext = (currentTurnId: string) => JSON.stringify({
+    type: "turn_context",
+    payload: {
+      turn_id: currentTurnId,
+      cwd: root,
+      workspace_roots: [root],
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      permission_profile: { type: "disabled" },
+      model: "chatgpt-web/pro",
+      summary: "auto",
+    },
+  }) + "\n";
+  writeFileSync(rolloutPath, sessionMeta + turnContext(previousChildTurnId));
+
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  const child = parseRequest({
+    model: "gpt-5.6-sol",
+    stream: true,
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+      request_kind: "turn",
+      thread_id: childThreadId,
+      turn_id: childTurnId,
+      parent_thread_id: parentThreadId,
+      agent_name: agentName,
+      subagent_kind: "thread_spawn",
+      sandbox_mode: "danger-full-access",
+      workspaces: { [root]: {} },
+    }) },
+    input: [
+      { id: "msg_environment", text: marker, kind: "environments.environment_context" },
+      { id: "msg_user", text: "private-user-prompt", kind: "user.text" },
+    ].map(({ id, text, kind }) => ({
+      type: "message",
+      role: "user",
+      id,
+      content: [{ type: "input_text", text }],
+      internal_chat_message_metadata_passthrough: { turn_id: childTurnId, content_item_kinds: [kind] },
+    })),
+  });
+  const publisher = Bun.spawn({
+    cmd: [process.execPath, "-e", [
+      "import { appendFileSync } from 'node:fs';",
+      "await Bun.sleep(80);",
+      "appendFileSync(process.env.TEST_ROLLOUT_PATH!, process.env.TEST_TURN_CONTEXT!);",
+    ].join(" ")],
+    env: { ...process.env, TEST_ROLLOUT_PATH: rolloutPath, TEST_TURN_CONTEXT: turnContext(childTurnId) },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+
+  const diagnostics: ChatGptEnvironmentResolutionDiagnostics = {};
+  const resolved = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(child, diagnostics);
+  const exitCode = await publisher.exited;
+  if (exitCode !== 0) throw new Error(await new Response(publisher.stderr).text());
+
+  expect(resolved).toMatchObject({
+    cwd: root, roots: [root], writableRoots: [root], sandboxPolicy: { type: "dangerFullAccess" },
+  });
+  expect(diagnostics).toEqual({
+    recovery_stage: "rollout", rollout_lookup: "hit",
+    thread_cache_lookup: "not_attempted", parent_cache_lookup: "not_attempted",
+  });
+});
+
+test("rollout publication retry stops when the request is aborted", async () => {
+  const codexHome = join(home, "aborted-rollout-marker-codex-home");
+  mkdirSync(join(codexHome, "sessions"), { recursive: true });
+  const marker = "<environment_context><current_date>2026-09-19</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+  const controller = new AbortController();
+  const resolving = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+    .resolveWithRolloutPublicationRetry(request(marker), {}, controller.signal);
+  await Bun.sleep(10);
+  controller.abort();
+  await expect(resolving).rejects.toMatchObject({ name: "AbortError" });
 });
 
 test("environment-less requests distinguish rollout misses from unavailable metadata and cache hits", () => {
