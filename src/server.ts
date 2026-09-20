@@ -432,8 +432,16 @@ export async function modelsRequest(
   if (denied) return denied;
   if (accessPolicy.mode === "api-key") {
     const local = buildStandaloneModelCatalog(config);
+    const catalogHeaders = {
+      "cache-control": "no-store",
+      "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(accessPolicy, config.controlToken),
+      ...(upstreamRuntime?.config ? {
+        "x-codex-chatgpt-web-upstream-provider-revision":
+          upstreamProviderRevision(upstreamRuntime.config, config.controlToken),
+      } : {}),
+    };
     if (!upstreamRuntime?.available || !upstreamRuntime.config) {
-      return Response.json(local, { headers: { "cache-control": "no-store" } });
+      return Response.json(local, { headers: catalogHeaders });
     }
     let upstream: Response;
     const timeout = new AbortController();
@@ -461,23 +469,23 @@ export async function modelsRequest(
       ]);
     } catch (error) {
       reportFailure?.(modelCatalogFailure("transport", error));
-      return Response.json(local, { headers: { "cache-control": "no-store" } });
+      return Response.json(local, { headers: catalogHeaders });
     } finally {
       clearTimeout(timer);
       if (onAbort) signal.removeEventListener("abort", onAbort);
     }
     if (!upstream.ok) {
       reportFailure?.({ stage: "upstream" });
-      return Response.json(local, { headers: { "cache-control": "no-store" } });
+      return Response.json(local, { headers: catalogHeaders });
     }
     try {
       const raw = await upstream.json();
       return Response.json(mergeUpstreamModelCatalog(local, raw, upstreamRuntime.config), {
-        headers: { "cache-control": "no-store" },
+        headers: catalogHeaders,
       });
     } catch (error) {
       reportFailure?.(modelCatalogFailure("catalog", error));
-      return Response.json(local, { headers: { "cache-control": "no-store" } });
+      return Response.json(local, { headers: catalogHeaders });
     }
   }
   let upstream: Response;
