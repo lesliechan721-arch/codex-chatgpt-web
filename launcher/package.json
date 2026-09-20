@@ -22,6 +22,7 @@
     "start": "electron ."
   },
   "dependencies": {
+    "ajv": "8.20.0",
     "http-proxy-agent": "^7.0.2",
     "https-proxy-agent": "^7.0.6",
     "motion": "^12.42.2",

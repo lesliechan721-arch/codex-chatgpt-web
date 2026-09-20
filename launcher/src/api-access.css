@@ -20,7 +20,12 @@
 .api-access-upstream h3 { margin: 0 0 4px; font-size: 13px; }
 .api-access-checkbox, .api-access-model-list label { display: flex; align-items: center; gap: 8px; font-weight: 400 !important; }
 .api-access-checkbox input, .api-access-model-list input { width: auto; }
-.api-access-model-list { display: grid; gap: 6px; max-height: 180px; overflow: auto; padding: 8px; border: 1px solid var(--border-subtle, #444); border-radius: 6px; }
+.api-access-model-list { display: grid; gap: 8px; max-height: 420px; overflow: auto; padding: 8px; border: 1px solid var(--border-subtle, #444); border-radius: 6px; }
+.api-access-model-entry { display: grid; gap: 6px; padding: 4px 2px 10px; border-bottom: 1px solid var(--border-subtle, #444); }
+.api-access-model-entry:last-child { border-bottom: 0; }
+.api-access-model-metadata { display: grid; gap: 6px; padding-left: 24px; }
+.api-access-model-metadata label { display: grid; gap: 4px; }
+.api-access-model-metadata textarea { min-height: 96px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .api-access-model-empty { padding: 6px 2px; }
 .api-access-upstream-link { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 18px; margin-top: 12px; text-align: left; }
 .api-access-upstream-link > span:first-child { display: grid; gap: 3px; }

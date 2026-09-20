@@ -4,16 +4,28 @@ import type {
   ApiAccessMode,
   ApiAccessResult,
   ApiAccessStatus,
-  UpstreamModelFilter,
+  MetadataBaseMode,
+  ModelMetadataConfig,
+  UpstreamModelCandidate,
+  UpstreamModelConfig,
+  UpstreamModelPreview,
   UpstreamProxy,
 } from "./api-access-types";
 import {
+  automaticMetadataMode,
+  customMetadataBaseMode,
   filterModelCandidates,
+  metadataModeChoices,
+  modelDiscoveryState,
   modelCandidateEmptyState,
   resetDiscoveredModelCandidates,
+  retainBundledMetadataFacts,
   retainSelectedModelCandidates,
 } from "./api-access-model-selection";
 import {
+  customOverrideTextFor,
+  parseCustomOverrideText,
+  recordValue,
   recoverApiAccessActionFailure,
   shouldShowUpstreamMissingKey,
   upstreamDraftDiscoveryRevision,
@@ -42,14 +54,21 @@ const labels = {
     client: "Codex 配置通过 experimental_bearer_token 包含本地 API Key；不会自动写入 Codex 配置或认证文件。代理启动环境与 TOML 分开显示。",
     processEnv: "Codex 启动环境",
     upstreamTitle: "OpenAI 兼容上游", upstreamBase: "上游 Base URL", upstreamKey: "上游 API Key",
-    upstreamDescription: "配置第三方 OpenAI 兼容服务、代理和模型筛选。详细配置放在独立页面，避免设置首页过长。",
+    upstreamDescription: "配置第三方 OpenAI 兼容服务、代理、显式模型列表和 Codex 模型元数据。详细配置放在独立页面。",
     upstreamOpen: "配置上游", upstreamBack: "返回接入模式", upstreamConfigured: "已配置", upstreamNotConfigured: "未配置",
     upstreamKeyHint: "留空时，仅在 Base URL 与已保存上游一致时复用可恢复密钥。密钥不会返回到 Renderer。",
     proxyMode: "上游代理", proxyGlobal: "使用全局代理", proxyDirect: "不使用代理", proxyCustom: "单独代理",
-    proxyUrl: "单独代理 URL", filterMode: "模型筛选", filterAll: "全部模型", filterRegex: "正则筛选", filterSelected: "手动选择",
-    regex: "模型 ID 正则", fetchModels: "获取模型", modelSearch: "搜索模型", saveUpstream: "保存上游", reloadUpstream: "重新加载", deleteUpstream: "删除上游",
+    proxyUrl: "单独代理 URL", fetchModels: "获取模型", modelSearch: "搜索模型", saveUpstream: "保存上游", reloadUpstream: "重新加载", deleteUpstream: "删除上游",
     modelEmpty: "尚未获取到模型。请先点击“获取模型”。", modelFetchedEmpty: "上游未返回可用模型。",
     modelNoMatch: "没有匹配当前搜索条件的模型。",
+    modelDiscovered: "本次已发现。", modelStale: "本次目录获取成功，但该模型未被发现。保存不会自动删除它。",
+    modelDiscoveryUnavailable: "未获取当前模型目录，或最近一次获取失败。",
+    metadataMode: "元数据来源", metadataAuto: "推荐值", metadataUseRecommended: "使用推荐值", metadataUpstream: "上游", metadataDefault: "Codex 默认", metadataFallback: "保守回退", metadataCustom: "自定义",
+    metadataBase: "自定义基础", metadataOverrides: "字段覆盖 JSON", metadataEffective: "当前有效来源", metadataDegraded: "配置来源当前不可用，已降级。",
+    metadataUnavailable: "当前不可用", metadataSchema: "可覆盖字段 schema", metadataProtected: "受保护字段",
+    metadataPreview: "最终模型预览", metadataValidationPending: "请重新获取模型以校验当前自定义元数据后再保存。",
+    metadataInvalid: "当前自定义元数据未通过最终 ModelInfo 校验：",
+    legacyUpstreamReset: "检测到旧版 v1 上游配置。旧配置已移除且旧上游密钥已清理，请重新配置 v2 上游。",
     compaction: "上游支持 OpenAI Responses compaction_trigger（remote compaction v2）",
     compactionHint: "仅当上游真实兼容服务端 compaction_trigger 协议时启用。",
     upstreamMissingKey: "已保存上游配置，但当前会话无法恢复上游密钥。请重新输入并保存。",
@@ -62,10 +81,13 @@ const labels = {
       "control-key-reuse": "API Key 不能与后台管理令牌相同。",
       "save-failed": "无法保存配置，请检查文件权限。", "runtime-busy": "另一个设置操作正在执行。",
       "not-configured": "请先初始化运行时。", "export-failed": "配置导出失败。",
-      "invalid-upstream-config": "上游 Base URL 无效。", "invalid-upstream-filter": "模型筛选配置无效。",
+      "invalid-upstream-config": "上游 Base URL 无效。", "invalid-upstream-models": "模型列表无效。", "invalid-upstream-metadata": "模型元数据配置无效。",
       "invalid-upstream-proxy": "上游代理配置无效。", "invalid-upstream-key": "上游 API Key 无效。",
       "upstream-key-required": "请输入上游 API Key，或先解锁可恢复的已保存密钥。",
       "upstream-fetch-failed": "获取上游模型失败。请检查地址、密钥和代理。",
+      "upstream-discovery-required": "新增模型前必须成功获取一次当前上游模型列表。",
+      "upstream-metadata-unavailable": "所选元数据来源当前不可用。请重新获取模型或选择其它来源。",
+      "upstream-legacy-cleanup-failed": "旧版上游配置或密钥清理失败。为避免旧密钥复用，当前操作已停止。",
     } as Record<string, string>,
   },
   en: {
@@ -86,14 +108,21 @@ const labels = {
     client: "The Codex provider uses experimental_bearer_token with the local API key. Nothing is written automatically to Codex config or authentication files. Process proxy environment is shown separately from TOML.",
     processEnv: "Codex process environment",
     upstreamTitle: "OpenAI-compatible upstream", upstreamBase: "Upstream Base URL", upstreamKey: "Upstream API key",
-    upstreamDescription: "Configure a third-party OpenAI-compatible service, proxy and model filter on a separate detail page.",
+    upstreamDescription: "Configure a third-party OpenAI-compatible service, proxy, explicit model list, and Codex model metadata on a separate detail page.",
     upstreamOpen: "Configure upstream", upstreamBack: "Back to access mode", upstreamConfigured: "Configured", upstreamNotConfigured: "Not configured",
     upstreamKeyHint: "Leave blank to reuse a recoverable saved key only when the Base URL still matches. The saved key is never returned to the Renderer.",
     proxyMode: "Upstream proxy", proxyGlobal: "Use global proxy", proxyDirect: "Direct", proxyCustom: "Custom proxy",
-    proxyUrl: "Custom proxy URL", filterMode: "Model filter", filterAll: "All models", filterRegex: "Regex", filterSelected: "Manual selection",
-    regex: "Model ID regex", fetchModels: "Fetch models", modelSearch: "Search models", saveUpstream: "Save upstream", reloadUpstream: "Reload", deleteUpstream: "Delete upstream",
+    proxyUrl: "Custom proxy URL", fetchModels: "Fetch models", modelSearch: "Search models", saveUpstream: "Save upstream", reloadUpstream: "Reload", deleteUpstream: "Delete upstream",
     modelEmpty: "No models loaded yet. Select Fetch models first.", modelFetchedEmpty: "The upstream returned no available models.",
     modelNoMatch: "No models match the current search.",
+    modelDiscovered: "Discovered in the current catalog.", modelStale: "The current catalog was fetched successfully, but this model was not found. Saving does not remove it automatically.",
+    modelDiscoveryUnavailable: "No current model catalog is available, or the latest fetch failed.",
+    metadataMode: "Metadata source", metadataAuto: "Recommended", metadataUseRecommended: "Use recommended", metadataUpstream: "Upstream", metadataDefault: "Codex default", metadataFallback: "Conservative fallback", metadataCustom: "Custom",
+    metadataBase: "Custom base", metadataOverrides: "Field overrides JSON", metadataEffective: "Effective source", metadataDegraded: "The configured source is unavailable; metadata is degraded.",
+    metadataUnavailable: "Currently unavailable", metadataSchema: "Override field schema", metadataProtected: "Protected fields",
+    metadataPreview: "Final model preview", metadataValidationPending: "Fetch models again to validate the current custom metadata before saving.",
+    metadataInvalid: "The current custom metadata failed final ModelInfo validation: ",
+    legacyUpstreamReset: "A legacy v1 upstream configuration was removed and its stored upstream key was cleared. Configure the v2 upstream again.",
     compaction: "Upstream supports OpenAI Responses compaction_trigger (remote compaction v2)",
     compactionHint: "Enable only when the upstream really implements the server-side compaction_trigger protocol.",
     upstreamMissingKey: "The upstream configuration is saved, but its key cannot be recovered in this session. Enter the key and save again.",
@@ -106,10 +135,13 @@ const labels = {
       "control-key-reuse": "The API key must differ from the daemon management token.",
       "save-failed": "Could not save the configuration. Check file permissions.", "runtime-busy": "Another settings operation is running.",
       "not-configured": "Initialize the runtime first.", "export-failed": "Configuration export failed.",
-      "invalid-upstream-config": "Invalid upstream Base URL.", "invalid-upstream-filter": "Invalid model filter.",
+      "invalid-upstream-config": "Invalid upstream Base URL.", "invalid-upstream-models": "Invalid model list.", "invalid-upstream-metadata": "Invalid model metadata configuration.",
       "invalid-upstream-proxy": "Invalid upstream proxy configuration.", "invalid-upstream-key": "Invalid upstream API key.",
       "upstream-key-required": "Enter the upstream API key or unlock the recoverable saved key first.",
       "upstream-fetch-failed": "Could not fetch upstream models. Check the URL, key and proxy.",
+      "upstream-discovery-required": "Fetch the current upstream model list before adding a new model.",
+      "upstream-metadata-unavailable": "The selected metadata source is currently unavailable. Fetch models again or select another source.",
+      "upstream-legacy-cleanup-failed": "Legacy upstream configuration or key cleanup failed. The operation stopped to prevent old-key reuse.",
     } as Record<string, string>,
   },
 };
@@ -145,12 +177,16 @@ export function ApiAccessSettings({
   const [upstreamKey, setUpstreamKey] = useState("");
   const [proxyMode, setProxyMode] = useState<UpstreamProxy["mode"]>("global");
   const [proxyUrl, setProxyUrl] = useState("");
-  const [filterMode, setFilterMode] = useState<UpstreamModelFilter["mode"]>("all");
-  const [regexPattern, setRegexPattern] = useState("");
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [modelMetadata, setModelMetadata] = useState<Record<string, ModelMetadataConfig | undefined>>({});
+  const [metadataTouched, setMetadataTouched] = useState<Record<string, true>>({});
+  const [customOverrideText, setCustomOverrideText] = useState<Record<string, string>>({});
   const [candidateModels, setCandidateModels] = useState<string[]>([]);
+  const [candidateFacts, setCandidateFacts] = useState<Record<string, UpstreamModelCandidate>>({});
+  const [modelPreviews, setModelPreviews] = useState<Record<string, UpstreamModelPreview>>({});
   const [modelSearch, setModelSearch] = useState("");
   const [modelDiscoveryComplete, setModelDiscoveryComplete] = useState(false);
+  const [modelDiscoveryFailed, setModelDiscoveryFailed] = useState(false);
   const [serverCompaction, setServerCompaction] = useState(false);
   const mounted = useRef(false);
   const locked = useRef(false);
@@ -160,10 +196,6 @@ export function ApiAccessSettings({
   const upstreamDraftRevision = useRef<string | null>(null);
   const isApi = status?.configuredMode === "api-key";
   const keyValid = /^[A-Za-z0-9_-]{32,256}$/.test(draft);
-  const regexValid = (() => {
-    if (filterMode !== "regex" || regexPattern.length > 512) return filterMode !== "regex";
-    try { new RegExp(regexPattern); return true; } catch { return false; }
-  })();
 
   function adopt(next: ApiAccessStatus, preserveUpstreamDraft = false) {
     if (!mounted.current) return;
@@ -175,12 +207,20 @@ export function ApiAccessSettings({
       setUpstreamKey("");
       setProxyMode(upstream?.proxy?.mode ?? "global");
       setProxyUrl(upstream?.proxy?.mode === "custom" ? upstream.proxy.url : "");
-      setFilterMode(upstream?.modelFilter?.mode ?? "all");
-      setRegexPattern(upstream?.modelFilter?.mode === "regex" ? upstream.modelFilter.pattern : "");
-      setSelectedModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
-      setCandidateModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
+      const savedModels = upstream?.models ?? [];
+      setSelectedModels(savedModels.map(model => model.id));
+      setModelMetadata(Object.fromEntries(savedModels.map(model => [model.id, model.metadata])));
+      setMetadataTouched({});
+      setCustomOverrideText(Object.fromEntries(savedModels
+        .filter(model => model.metadata?.mode === "custom")
+        .map(model => [model.id, JSON.stringify(model.metadata?.mode === "custom" ? model.metadata.overrides : {}, null, 2)])));
+      setCandidateModels(savedModels.map(model => model.id));
+      const metadataStatus = upstream?.metadata ?? [];
+      setCandidateFacts(Object.fromEntries(metadataStatus.map(item => [item.id, item])));
+      setModelPreviews(Object.fromEntries(metadataStatus.map(item => [item.id, item])));
       setModelSearch("");
       setModelDiscoveryComplete(false);
+      setModelDiscoveryFailed(false);
       setServerCompaction(upstream?.supportsOpenAiServerCompaction === true);
       upstreamDirty.current = false;
       upstreamDraftRevision.current = next.revision;
@@ -260,9 +300,49 @@ export function ApiAccessSettings({
   const draftProxy = (): UpstreamProxy => proxyMode === "custom"
     ? { mode: "custom", url: proxyUrl }
     : { mode: proxyMode };
-  const draftFilter = (): UpstreamModelFilter => filterMode === "regex"
-    ? { mode: "regex", pattern: regexPattern }
-    : filterMode === "selected" ? { mode: "selected", models: selectedModels } : { mode: "all" };
+  function parseCustomOverrides(modelId: string): Record<string, unknown> {
+    return parseCustomOverrideText(customOverrideText, modelId);
+  }
+  function draftModels(): UpstreamModelConfig[] {
+    return selectedModels.map(id => {
+      const configured = recordValue(modelMetadata, id);
+      if (configured?.mode !== "custom") return { id, ...(configured ? { metadata: configured } : {}) };
+      return { id, metadata: { ...configured, overrides: parseCustomOverrides(id) } };
+    });
+  }
+  function markMetadataDirty(modelId: string) {
+    markUpstreamDirty();
+    setMetadataTouched(current => ({ ...current, [modelId]: true }));
+    setModelPreviews(current => {
+      if (!recordValue(current, modelId)) return current;
+      const next = { ...current };
+      delete next[modelId];
+      return next;
+    });
+  }
+  function setMetadataMode(modelId: string, mode: MetadataBaseMode | "custom") {
+    markMetadataDirty(modelId);
+    setModelMetadata(current => {
+      if (mode !== "custom") return { ...current, [modelId]: { mode } };
+      const previous = recordValue(current, modelId);
+      const baseMode = customMetadataBaseMode(previous, recordValue(candidateFacts, modelId), recordValue(modelPreviews, modelId));
+      return { ...current, [modelId]: { mode: "custom", baseMode, overrides: {} } };
+    });
+    if (mode === "custom") {
+      setCustomOverrideText(current => ({ ...current, [modelId]: customOverrideTextFor(current, modelId) }));
+    }
+  }
+  function restoreAutomaticMetadata(modelId: string) {
+    markMetadataDirty(modelId);
+    setModelMetadata(current => ({ ...current, [modelId]: undefined }));
+  }
+  function setCustomBaseMode(modelId: string, baseMode: MetadataBaseMode) {
+    markMetadataDirty(modelId);
+    setModelMetadata(current => ({
+      ...current,
+      [modelId]: { mode: "custom", baseMode, overrides: {} },
+    }));
+  }
   async function saveUpstream() {
     const revision = upstreamDraftMutationRevision(upstreamDraftRevision.current, status?.revision ?? null);
     if (!revision) throw new Error("stale-settings");
@@ -271,7 +351,7 @@ export function ApiAccessSettings({
       baseUrl: upstreamBaseUrl,
       ...(upstreamKey ? { apiKey: upstreamKey } : {}),
       proxy: draftProxy(),
-      modelFilter: draftFilter(),
+      models: draftModels(),
       supportsOpenAiServerCompaction: serverCompaction,
     }));
     adopt(result.status);
@@ -289,17 +369,42 @@ export function ApiAccessSettings({
       upstreamKey.length > 0,
     );
     if (!revision) throw new Error("stale-settings");
-    invalidateDiscoveredModels();
-    const result = value(await api.apiAccessUpstreamModels({
-      expectedRevision: revision,
-      baseUrl: upstreamBaseUrl,
-      ...(upstreamKey ? { apiKey: upstreamKey } : {}),
-      proxy: draftProxy(),
-    }));
-    if (mounted.current) {
-      markUpstreamDirty();
-      setCandidateModels(retainSelectedModelCandidates(result.models, selectedModels));
-      setModelDiscoveryComplete(true);
+    try {
+      const result = value(await api.apiAccessUpstreamModels({
+        expectedRevision: revision,
+        baseUrl: upstreamBaseUrl,
+        ...(upstreamKey ? { apiKey: upstreamKey } : {}),
+        proxy: draftProxy(),
+        models: draftModels(),
+      }));
+      if (mounted.current) {
+        markUpstreamDirty();
+        setCandidateModels(retainSelectedModelCandidates(result.models, selectedModels));
+        setCandidateFacts(Object.fromEntries(
+          [...result.preview, ...result.candidates].map(item => [item.id, item]),
+        ));
+        setModelPreviews(Object.fromEntries(result.preview.map(item => [item.id, item])));
+        setModelDiscoveryComplete(true);
+        setModelDiscoveryFailed(false);
+      }
+    } catch (cause) {
+      const discoveryFailed = cause instanceof Error && cause.message === "upstream-fetch-failed";
+      if (mounted.current && discoveryFailed) {
+        setCandidateModels(resetDiscoveredModelCandidates(selectedModels));
+        setCandidateFacts(current => retainBundledMetadataFacts(current));
+        setModelPreviews({});
+        setModelDiscoveryComplete(false);
+        setModelDiscoveryFailed(true);
+      }
+      if (discoveryFailed) {
+        try {
+          const refreshed = value(await api.apiAccessStatus());
+          if (mounted.current) {
+            setStatus(refreshed);
+          }
+        } catch {}
+      }
+      throw cause;
     }
   }
   const pending = status?.runtimeState === "restart-required" || status?.runtimeState === "stopped";
@@ -307,7 +412,10 @@ export function ApiAccessSettings({
   const markUpstreamDirty = () => { upstreamDirty.current = true; };
   const invalidateDiscoveredModels = () => {
     setCandidateModels(resetDiscoveredModelCandidates(selectedModels));
+    setCandidateFacts(current => retainBundledMetadataFacts(current));
+    setModelPreviews({});
     setModelDiscoveryComplete(false);
+    setModelDiscoveryFailed(false);
   };
   const markUpstreamIdentityDirty = () => { markUpstreamDirty(); invalidateDiscoveredModels(); };
   const upstreamRevisionConflict = upstreamDraftRevisionConflict(
@@ -331,7 +439,23 @@ export function ApiAccessSettings({
   );
   const candidateEmptyMessage = candidateEmptyState === "empty" ? copy.modelFetchedEmpty
     : candidateEmptyState === "no-match" ? copy.modelNoMatch : copy.modelEmpty;
+  const metadataLabel = (mode: MetadataBaseMode | "custom") => mode === "upstream" ? copy.metadataUpstream
+    : mode === "default" ? copy.metadataDefault
+      : mode === "fallback" ? copy.metadataFallback : copy.metadataCustom;
+  function metadataModesFor(modelId: string): Array<MetadataBaseMode | "custom"> {
+    return metadataModeChoices(recordValue(candidateFacts, modelId), recordValue(modelPreviews, modelId)).modes;
+  }
+  function customBaseModesFor(modelId: string): MetadataBaseMode[] {
+    return metadataModeChoices(recordValue(candidateFacts, modelId), recordValue(modelPreviews, modelId)).baseModes;
+  }
+  const customMetadataBlocked = selectedModels.some(modelId => {
+    if (!recordValue(metadataTouched, modelId) || recordValue(modelMetadata, modelId)?.mode !== "custom") return false;
+    const preview = recordValue(modelPreviews, modelId);
+    return !preview || preview.customInvalid || !preview.configuredSourceAvailable;
+  });
   const upstreamEditor = <div className={`api-access-upstream${view === "upstream" ? " is-detail" : ""}`}>
+    {status?.upstream?.resetReason === "legacy-v1-removed"
+      ? <p className="api-access-warning">{copy.legacyUpstreamReset}</p> : null}
     <label htmlFor="api-upstream-base">{copy.upstreamBase}</label>
     <input id="api-upstream-base" value={upstreamBaseUrl} disabled={busy} spellCheck={false}
       placeholder="https://provider.example/v1" onChange={event => { markUpstreamIdentityDirty(); setUpstreamBaseUrl(event.target.value); }} />
@@ -349,37 +473,90 @@ export function ApiAccessSettings({
     {proxyMode === "custom" ? <><label htmlFor="api-upstream-proxy-url">{copy.proxyUrl}</label>
       <input id="api-upstream-proxy-url" value={proxyUrl} disabled={busy} spellCheck={false}
         placeholder="http://user:password@proxy.example:8080" onChange={event => { markUpstreamIdentityDirty(); setProxyUrl(event.target.value); }} /></> : null}
-    <label htmlFor="api-upstream-filter-mode">{copy.filterMode}</label>
-    <select id="api-upstream-filter-mode" value={filterMode} disabled={busy}
-      onChange={event => { markUpstreamDirty(); setFilterMode(event.target.value as UpstreamModelFilter["mode"]); }}>
-      <option value="all">{copy.filterAll}</option><option value="regex">{copy.filterRegex}</option>
-      <option value="selected">{copy.filterSelected}</option>
-    </select>
-    {filterMode === "regex" ? <><label htmlFor="api-upstream-regex">{copy.regex}</label>
-      <input id="api-upstream-regex" value={regexPattern} disabled={busy} maxLength={512} spellCheck={false}
-        onChange={event => { markUpstreamDirty(); setRegexPattern(event.target.value); }} />
-      {!regexValid ? <small className="api-access-error" role="alert">{copy.errors["invalid-upstream-filter"]}</small> : null}</> : null}
-    {filterMode === "selected" ? <>
-      <button type="button"
-        disabled={busy || !upstreamBaseUrl || !upstreamDiscoveryRevision}
-        onClick={() => void perform(fetchUpstreamModels, "preserve-draft")}>{copy.fetchModels}</button>
-      <label htmlFor="api-upstream-model-search">{copy.modelSearch}</label>
-      <input id="api-upstream-model-search" type="search" value={modelSearch} disabled={busy}
-        onChange={event => setModelSearch(event.target.value)} />
-      <div className="api-access-model-list">
-        {filteredCandidateModels.length > 0 ? filteredCandidateModels.map(model => <label key={model}>
-          <input type="checkbox" checked={selectedModels.includes(model)}
-          disabled={busy} onChange={event => { markUpstreamDirty(); setSelectedModels(current => event.target.checked
-            ? current.includes(model) ? current : [...current, model]
-            : current.filter(item => item !== model)); }} />{model}</label>)
-          : <small className="api-access-model-empty">{candidateEmptyMessage}</small>}
-      </div>
-    </> : null}
+    <button type="button"
+      disabled={busy || !upstreamBaseUrl || !upstreamDiscoveryRevision}
+      onClick={() => void perform(fetchUpstreamModels, "preserve-draft")}>{copy.fetchModels}</button>
+    {modelDiscoveryFailed ? <small className="api-access-warning">{copy.errors["upstream-fetch-failed"]}</small> : null}
+    <label htmlFor="api-upstream-model-search">{copy.modelSearch}</label>
+    <input id="api-upstream-model-search" type="search" value={modelSearch} disabled={busy}
+      onChange={event => setModelSearch(event.target.value)} />
+    <div className="api-access-model-list">
+      {filteredCandidateModels.length > 0 ? filteredCandidateModels.map(model => {
+        const selected = selectedModels.includes(model);
+        const configured = recordValue(modelMetadata, model);
+        const preview = recordValue(modelPreviews, model);
+        const candidate = recordValue(candidateFacts, model);
+        const discoveryState = modelDiscoveryState(candidate, preview, modelDiscoveryComplete);
+        const availableModes = metadataModesFor(model);
+        const automaticMode = automaticMetadataMode(candidate, preview);
+        const configuredModeUnavailable = configured && !availableModes.includes(configured.mode);
+        const availableBaseModes = customBaseModesFor(model);
+        const configuredBaseUnavailable = configured?.mode === "custom"
+          && !availableBaseModes.includes(configured.baseMode);
+        return <div className="api-access-model-entry" key={model}>
+          <label><input type="checkbox" checked={selected} disabled={busy}
+            onChange={event => { markUpstreamDirty(); setSelectedModels(current => event.target.checked
+              ? current.includes(model) ? current : [...current, model]
+              : current.filter(item => item !== model)); }} />{model}</label>
+          {discoveryState === "discovered" ? <small>{copy.modelDiscovered}</small>
+            : <small className="api-access-warning">
+              {discoveryState === "missing" ? copy.modelStale : copy.modelDiscoveryUnavailable}
+            </small>}
+          {selected ? <div className="api-access-model-metadata">
+            <label>{copy.metadataMode}
+              <select value={configured?.mode ?? automaticMode} disabled={busy}
+                onChange={event => setMetadataMode(model, event.target.value as MetadataBaseMode | "custom")}>
+                {configuredModeUnavailable ? <option value={configured.mode} disabled>
+                  {metadataLabel(configured.mode)} · {copy.metadataUnavailable}
+                </option> : null}
+                {availableModes.map(mode => <option value={mode} key={mode}>{metadataLabel(mode)}</option>)}
+              </select>
+            </label>
+            {configured
+              ? <button type="button" disabled={busy} onClick={() => restoreAutomaticMetadata(model)}>
+                {copy.metadataUseRecommended}
+              </button>
+              : <small>{copy.metadataAuto}: {metadataLabel(automaticMode)}</small>}
+            {configured?.mode === "custom" ? <>
+              <label>{copy.metadataBase}
+                <select value={configured.baseMode} disabled={busy}
+                  onChange={event => setCustomBaseMode(model, event.target.value as MetadataBaseMode)}>
+                  {configuredBaseUnavailable ? <option value={configured.baseMode} disabled>
+                    {metadataLabel(configured.baseMode)} · {copy.metadataUnavailable}
+                  </option> : null}
+                  {availableBaseModes.map(mode => <option value={mode} key={mode}>{metadataLabel(mode)}</option>)}
+                </select>
+              </label>
+              <label>{copy.metadataOverrides}
+                <textarea value={customOverrideTextFor(customOverrideText, model)} disabled={busy} spellCheck={false}
+                  onChange={event => { markMetadataDirty(model); setCustomOverrideText(current => ({ ...current, [model]: event.target.value })); }} />
+              </label>
+              <small>{copy.metadataProtected}: {status?.upstream?.protectedMetadataFields?.join(", ") ?? "—"}</small>
+              <details><summary>{copy.metadataSchema}</summary>
+                <pre tabIndex={0}>{JSON.stringify(status?.upstream?.metadataSchema ?? {}, null, 2)}</pre>
+              </details>
+            </> : null}
+            {preview ? <small>{copy.metadataEffective}: {preview.effectiveMode === "custom"
+              ? `${copy.metadataCustom} / ${metadataLabel(preview.effectiveBaseMode)}`
+              : metadataLabel(preview.effectiveMode)}</small> : null}
+            {preview?.degraded ? <small className="api-access-warning">{copy.metadataDegraded}</small> : null}
+            {configured?.mode === "custom" && recordValue(metadataTouched, model) && !preview
+              ? <small className="api-access-warning">{copy.metadataValidationPending}</small> : null}
+            {preview?.customInvalid ? <small className="api-access-warning">
+              {copy.metadataInvalid}{preview.customError ?? copy.errors["invalid-upstream-metadata"]}
+            </small> : null}
+            {preview ? <details><summary>{copy.metadataPreview}</summary>
+              <pre tabIndex={0}>{JSON.stringify(preview.model, null, 2)}</pre>
+            </details> : null}
+          </div> : null}
+        </div>;
+      }) : <small className="api-access-model-empty">{candidateEmptyMessage}</small>}
+    </div>
     <label className="api-access-checkbox"><input type="checkbox" checked={serverCompaction} disabled={busy}
       onChange={event => { markUpstreamDirty(); setServerCompaction(event.target.checked); }} />{copy.compaction}</label>
     <small>{copy.compactionHint}</small>
     <div className="api-access-actions">
-      <button type="button" disabled={busy || !upstreamBaseUrl || !regexValid || !upstreamMutationRevision || upstreamRevisionConflict}
+      <button type="button" disabled={busy || !upstreamBaseUrl || !upstreamMutationRevision || upstreamRevisionConflict || customMetadataBlocked}
         onClick={() => void perform(saveUpstream)}>{copy.saveUpstream}</button>
       <button type="button" disabled={busy} onClick={() => void perform(async () => {
         adopt(value(await api.apiAccessStatus()));
@@ -459,7 +636,7 @@ export function ApiAccessSettings({
     <div role="status" aria-live="polite">
       {busy ? copy.busy : status?.runtimeState === "in-sync" ? copy.saved
         : status?.runtimeState === "unconfigured" ? copy.unconfigured
-          : status?.runtimeState === "invalid" ? copy.invalid
+          : status?.runtimeState === "invalid" ? (status.errorCode ? copy.errors[status.errorCode] ?? copy.invalid : copy.invalid)
             : pending ? copy.pending + (status?.effectiveMode === "api-key" ? copy.api
               : status?.effectiveMode === "openai" ? copy.openai : copy.unknown) : null}
     </div>

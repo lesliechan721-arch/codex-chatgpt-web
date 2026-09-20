@@ -230,18 +230,151 @@ test("upstream settings persist no plaintext key and expose the key only to the 
     baseUrl: "http://127.0.0.1:11434/v1",
     apiKey: UPSTREAM_KEY,
     proxy: { mode: "direct" },
-    modelFilter: { mode: "selected", models: ["gpt-b", "gpt-b", "gpt-a"] },
+    models: [],
     supportsOpenAiServerCompaction: true,
   });
   const saved = JSON.parse(fs.readFileSync(path.join(f.coreHome, "upstream-provider.json"), "utf8"));
   assert.equal(saved.baseUrl, "http://127.0.0.1:11434/v1/");
-  assert.deepEqual(saved.modelFilter, { mode: "selected", models: ["gpt-b", "gpt-a"] });
+  assert.deepEqual(saved.models, []);
   assert.equal(saved.supportsOpenAiServerCompaction, true);
   assert.ok(!JSON.stringify(saved).includes(UPSTREAM_KEY));
   assert.deepEqual(f.controller.daemonEnvironment(), { CODEX_CHATGPT_WEB_UPSTREAM_API_KEY: UPSTREAM_KEY });
   assert.equal(result.status.upstream.keyAvailable, true);
   assert.equal(result.status.upstream.runtimeAvailable, true);
+  assert.equal(result.status.upstream.metadataSchema.type, "object");
+  assert.ok(result.status.upstream.metadataSchema.properties.display_name);
+  assert.ok(result.status.upstream.protectedMetadataFields.includes("model_messages"));
+  assert.ok(result.status.upstream.protectedMetadataFields.includes("slug"));
   assert.equal(result.status.runtimeState, "in-sync");
+});
+
+test("legacy v1 upstream cleanup clears the old vault before a new v2 key can be saved or reused", async t => {
+  const f = fixture(t); await f.apply();
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  const upstreamFile = path.join(f.coreHome, "upstream-provider.json");
+  const upstreamVault = path.join(f.coreHome, "secrets", "upstream-api-key.json");
+  assert.equal(fs.existsSync(upstreamVault), true);
+  fs.writeFileSync(upstreamFile, `${JSON.stringify({
+    version: 1,
+    baseUrl: "https://legacy.example/v1/",
+    apiKeySha256: "a".repeat(64),
+    proxy: { mode: "global" },
+    modelFilter: { mode: "regex", pattern: "^legacy-" },
+    supportsOpenAiServerCompaction: false,
+  })}\n`);
+
+  const reset = await f.controller.status();
+  assert.equal(reset.upstream.configured, false);
+  assert.equal(reset.upstream.resetReason, "legacy-v1-removed");
+  assert.equal(fs.existsSync(upstreamFile), false);
+  assert.equal(fs.existsSync(upstreamVault), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.coreHome, "upstream-provider-reset.json"), "utf8")), {
+    version: 1,
+    reason: "legacy-v1-removed",
+  });
+  await assert.rejects(f.controller.saveUpstream({
+    expectedRevision: reset.revision,
+    baseUrl: "https://provider.example/v1",
+    proxy: { mode: "direct" }, models: [], supportsOpenAiServerCompaction: false,
+  }), /upstream-key-required/);
+
+  const replacementKey = "replacement-provider-key";
+  const saved = await f.controller.saveUpstream({
+    expectedRevision: reset.revision,
+    baseUrl: "https://provider.example/v1", apiKey: replacementKey,
+    proxy: { mode: "direct" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  assert.equal(saved.status.upstream.resetReason, undefined);
+  assert.equal(fs.existsSync(path.join(f.coreHome, "upstream-provider-reset.json")), false);
+  assert.deepEqual(f.controller.daemonEnvironment(), { CODEX_CHATGPT_WEB_UPSTREAM_API_KEY: replacementKey });
+});
+
+test("legacy v1 vault cleanup failure stays fail-closed and exposes an actionable status code", async t => {
+  const f = fixture(t); await f.apply();
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  const upstreamFile = path.join(f.coreHome, "upstream-provider.json");
+  const upstreamVault = path.join(f.coreHome, "secrets", "upstream-api-key.json");
+  fs.writeFileSync(upstreamFile, `${JSON.stringify({
+    version: 1,
+    baseUrl: "https://legacy.example/v1/",
+    apiKeySha256: "a".repeat(64),
+    proxy: { mode: "global" },
+    modelFilter: { mode: "all" },
+    supportsOpenAiServerCompaction: false,
+  })}\n`);
+  fs.rmSync(upstreamVault, { force: true });
+  fs.mkdirSync(upstreamVault);
+
+  const status = await f.controller.status();
+  assert.equal(status.configuredMode, "invalid");
+  assert.equal(status.runtimeState, "invalid");
+  assert.equal(status.canApply, false);
+  assert.equal(status.errorCode, "upstream-legacy-cleanup-failed");
+  assert.equal(fs.existsSync(upstreamFile), false);
+  assert.equal(fs.existsSync(path.join(f.coreHome, "upstream-provider-reset.json")), true);
+});
+
+test("persisted-invalid custom metadata round-trips on unrelated saves but must validate when edited", async t => {
+  const f = fixture(t); await f.apply();
+  const server = http.createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ models: [{ slug: "gpt-live", display_name: "Live model" }] }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const initial = await f.controller.status();
+  await f.controller.fetchUpstreamModels({
+    expectedRevision: initial.revision,
+    baseUrl, apiKey: UPSTREAM_KEY, proxy: { mode: "direct" }, models: [],
+  });
+  await f.controller.saveUpstream({
+    expectedRevision: initial.revision,
+    baseUrl, apiKey: UPSTREAM_KEY, proxy: { mode: "direct" },
+    models: [{ id: "gpt-live", metadata: {
+      mode: "custom", baseMode: "fallback", overrides: { display_name: "Valid custom" },
+    } }],
+    supportsOpenAiServerCompaction: false,
+  });
+
+  const upstreamFile = path.join(f.coreHome, "upstream-provider.json");
+  const persisted = JSON.parse(fs.readFileSync(upstreamFile, "utf8"));
+  persisted.models[0].metadata.overrides = { unknown_field: "persisted-invalid" };
+  fs.writeFileSync(upstreamFile, `${JSON.stringify(persisted, null, 2)}\n`);
+  const degraded = await f.controller.status();
+  assert.equal(degraded.upstream.metadata[0].configuredMode, "custom");
+  assert.equal(degraded.upstream.metadata[0].customInvalid, true);
+  assert.equal(degraded.upstream.metadata[0].effectiveMode, "fallback");
+
+  await f.controller.saveUpstream({
+    expectedRevision: degraded.revision,
+    baseUrl, proxy: { mode: "direct" },
+    models: persisted.models,
+    supportsOpenAiServerCompaction: true,
+  });
+  const roundTripped = JSON.parse(fs.readFileSync(upstreamFile, "utf8"));
+  assert.deepEqual(roundTripped.models[0].metadata, persisted.models[0].metadata);
+  assert.equal(roundTripped.supportsOpenAiServerCompaction, true);
+
+  const latest = await f.controller.status();
+  await assert.rejects(f.controller.saveUpstream({
+    expectedRevision: latest.revision,
+    baseUrl, proxy: { mode: "direct" },
+    models: [{ id: "gpt-live", metadata: {
+      mode: "custom", baseMode: "fallback", overrides: { unknown_field: "edited-invalid" },
+    } }],
+    supportsOpenAiServerCompaction: true,
+  }), /invalid-upstream-metadata/);
 });
 
 test("stale upstream health stays pending when the old daemon still reports its provider available", async t => {
@@ -249,14 +382,14 @@ test("stale upstream health stays pending when the old daemon still reports its 
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   f.state.active = 1;
   const result = await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1",
-    proxy: { mode: "global" }, modelFilter: { mode: "regex", pattern: "^gpt-next$" },
-    supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [],
+    supportsOpenAiServerCompaction: true,
   });
   assert.equal(result.status.runtimeState, "restart-required");
   assert.equal(result.status.upstream.runtimeAvailable, false);
@@ -267,7 +400,7 @@ test("OS-encrypted upstream key is recoverable by a restarted Launcher controlle
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   f.controller.dispose();
   const restarted = f.create(); t.after(() => restarted.dispose());
@@ -287,7 +420,7 @@ for (const [scenario, breakDecrypt] of [
     await f.controller.saveUpstream({
       expectedRevision: (await f.controller.status()).revision,
       baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-      proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+      proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
     });
     f.controller.dispose();
     breakDecrypt(safeStorage);
@@ -306,7 +439,7 @@ test("deleting upstream settings clears both provider intent and recoverable key
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   const result = await f.controller.deleteUpstream({ expectedRevision: (await f.controller.status()).revision });
   assert.equal(result.status.upstream.configured, false);
@@ -320,7 +453,7 @@ test("saved upstream settings do not affect OpenAI forwarding mode or its daemon
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   const result = await f.controller.apply({ mode: "openai", expectedRevision: (await f.controller.status()).revision });
   assert.equal(result.status.configuredMode, "openai");
@@ -334,7 +467,7 @@ test("upstream key is session-only when OS encryption is unavailable", async t =
   const result = await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   assert.equal(result.status.upstream.keyStorage, "session");
   assert.equal(fs.existsSync(path.join(f.coreHome, "secrets", "upstream-api-key.json")), false);
@@ -369,20 +502,20 @@ test("OpenAI forwarding ignores a malformed inactive upstream configuration", as
   assert.equal(fs.readFileSync(upstreamFile, "utf8"), "{malformed\n");
 });
 
-test("invalid upstream filters and stale revisions cannot overwrite provider settings", async t => {
+test("invalid upstream model configuration and stale revisions cannot overwrite provider settings", async t => {
   const f = fixture(t); await f.apply(); const revision = (await f.controller.status()).revision;
   await assert.rejects(f.controller.saveUpstream({
     expectedRevision: revision, baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "regex", pattern: "[" }, supportsOpenAiServerCompaction: false,
-  }), /invalid-upstream-filter/);
+    proxy: { mode: "global" }, models: [{ id: "chatgpt-web/high" }], supportsOpenAiServerCompaction: false,
+  }), /invalid-upstream-models/);
   assert.equal(fs.existsSync(path.join(f.coreHome, "upstream-provider.json")), false);
   await f.controller.saveUpstream({
     expectedRevision: revision, baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
   await assert.rejects(f.controller.saveUpstream({
     expectedRevision: revision, baseUrl: "https://other.example/v1",
-    proxy: { mode: "global" }, modelFilter: { mode: "all" }, supportsOpenAiServerCompaction: false,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   }), /stale-settings/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.coreHome, "upstream-provider.json"), "utf8")).baseUrl,
     "https://provider.example/v1/");
@@ -445,6 +578,41 @@ test("manual model discovery uses draft settings and does not persist provider i
   assert.equal(after.upstream.configured, false);
 });
 
+test("new upstream models require current discovery before save", async t => {
+  const f = fixture(t); await f.apply();
+  const server = http.createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data: [{ id: "gpt-discovered" }] }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const revision = (await f.controller.status()).revision;
+
+  await assert.rejects(f.controller.saveUpstream({
+    expectedRevision: revision,
+    baseUrl, apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [{ id: "gpt-discovered" }],
+    supportsOpenAiServerCompaction: false,
+  }), /upstream-discovery-required/);
+
+  const fetched = await f.controller.fetchUpstreamModels({
+    expectedRevision: revision,
+    baseUrl, apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [],
+  });
+  assert.deepEqual(fetched.models, ["gpt-discovered"]);
+  const saved = await f.controller.saveUpstream({
+    expectedRevision: revision,
+    baseUrl, apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [{ id: "gpt-discovered" }],
+    supportsOpenAiServerCompaction: false,
+  });
+  assert.deepEqual(saved.status.upstream.models.map(model => model.id), ["gpt-discovered"]);
+});
+
 test("manual model discovery only needs requestable IDs from Codex-style model rows", () => {
   assert.deepEqual(extractModelIds({
     object: "list",
@@ -500,7 +668,7 @@ test("manual model discovery can reuse the saved provider key", async t => {
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl, apiKey: UPSTREAM_KEY,
-    proxy: { mode: "direct" }, modelFilter: { mode: "selected", models: ["gpt-saved"] },
+    proxy: { mode: "direct" }, models: [],
     supportsOpenAiServerCompaction: false,
   });
   const baseline = (await f.controller.status()).revision;
@@ -508,7 +676,7 @@ test("manual model discovery can reuse the saved provider key", async t => {
     expectedRevision: baseline, baseUrl, proxy: { mode: "direct" },
   });
   assert.deepEqual(fetched.models, ["gpt-live"]);
-  assert.deepEqual((await f.controller.status()).upstream.modelFilter, { mode: "selected", models: ["gpt-saved"] });
+  assert.deepEqual((await f.controller.status()).upstream.models, []);
 });
 
 test("manual model discovery never reuses a saved key for another Base URL", async t => {
@@ -516,7 +684,7 @@ test("manual model discovery never reuses a saved key for another Base URL", asy
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: "https://saved-provider.example/v1", apiKey: UPSTREAM_KEY,
-    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    proxy: { mode: "direct" }, models: [],
     supportsOpenAiServerCompaction: false,
   });
   const baseline = (await f.controller.status()).revision;
@@ -543,14 +711,14 @@ test("stale model discovery cannot reuse a key saved by an external update", asy
   await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
     baseUrl: staleBaseUrl, apiKey: UPSTREAM_KEY,
-    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    proxy: { mode: "direct" }, models: [],
     supportsOpenAiServerCompaction: false,
   });
   const staleRevision = (await f.controller.status()).revision;
   await f.controller.saveUpstream({
     expectedRevision: staleRevision,
     baseUrl: "https://provider-b.example/v1", apiKey: "provider-b-key",
-    proxy: { mode: "direct" }, modelFilter: { mode: "all" },
+    proxy: { mode: "direct" }, models: [],
     supportsOpenAiServerCompaction: false,
   });
   await assert.rejects(f.controller.fetchUpstreamModels({

@@ -42,7 +42,7 @@ import {
   upstreamProviderRevision,
   type UpstreamProviderRuntime,
 } from "./upstream-provider";
-import { mergeUpstreamModelCatalog } from "./upstream-model-catalog";
+import { mergeUpstreamModelCatalog, upstreamMetadataRepairCount } from "./upstream-model-catalog";
 import {
   forwardUpstreamProviderRequest,
   type UpstreamFetch,
@@ -480,7 +480,12 @@ export async function modelsRequest(
     }
     try {
       const raw = await upstream.json();
-      return Response.json(mergeUpstreamModelCatalog(local, raw, upstreamRuntime.config), {
+      return Response.json(mergeUpstreamModelCatalog(
+        local,
+        raw,
+        upstreamRuntime.config,
+        config.mode === "full" ? "unified_exec" : "disabled",
+      ), {
         headers: catalogHeaders,
       });
     } catch (error) {
@@ -993,6 +998,12 @@ export function startServer(
   const upstreamRuntime: UpstreamProviderRuntime = accessPolicy.mode === "api-key"
     ? dependencies.upstreamRuntime ?? loadUpstreamProviderRuntime()
     : { available: false, keyMatches: false };
+  const upstreamMetadataRepairs = upstreamRuntime.config
+    ? upstreamMetadataRepairCount(
+        upstreamRuntime.config,
+        config.mode === "full" ? "unified_exec" : "disabled",
+      )
+    : 0;
   if (apiKeyMatches(config.controlToken, accessPolicy)) {
     throw new Error("Client API key must not be the daemon control token");
   }
@@ -1049,6 +1060,7 @@ export function startServer(
           upstream_provider_revision: upstreamRuntime.config
             ? upstreamProviderRevision(upstreamRuntime.config, config.controlToken)
             : null,
+          upstream_metadata_repair_count: upstreamMetadataRepairs,
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,

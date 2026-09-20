@@ -11,23 +11,23 @@ import type { NativeFetch } from "../src/native-passthrough";
 import {
   upstreamApiKeyDigest,
   upstreamProviderRevision,
-  type UpstreamModelFilter,
+  type UpstreamModelConfig,
   type UpstreamProviderRuntime,
 } from "../src/upstream-provider";
 
 const key = "cgw_" + "a".repeat(43);
 const accessPolicy = apiKeyPolicy(key);
 const providerKey = "provider-key.with punctuation/value";
-const upstream = (modelFilter: UpstreamModelFilter = { mode: "regex", pattern: "^gpt-" }): UpstreamProviderRuntime => ({
+const upstream = (models: UpstreamModelConfig[] = [{ id: "gpt-upstream" }, { id: "gpt-rich" }]): UpstreamProviderRuntime => ({
     available: true,
     keyMatches: true,
     apiKey: providerKey,
     config: {
-      version: 1,
+      version: 2,
       baseUrl: "https://provider.example/openai/v1/",
       apiKeySha256: upstreamApiKeyDigest(providerKey),
       proxy: { mode: "direct" },
-      modelFilter,
+      models,
       supportsOpenAiServerCompaction: false,
     },
   });
@@ -80,7 +80,7 @@ test("API-key model catalog never calls upstream or the installed OAuth catalog 
   assert.ok((payload as { models: unknown[] }).models.length > 0);
 });
 
-test("API-key model catalog merges filtered upstream rows and keeps the local Web namespace", async () => {
+test("API-key model catalog publishes only selected discovered upstream rows and keeps the local Web namespace", async () => {
   const runtime = upstream();
   const cfg = config();
   let forwarded: Request | undefined;
@@ -178,19 +178,13 @@ test("upstream catalog timeout returns the fresh local catalog", async () => {
   }
 });
 
-test("upstream catalog HTTP and schema failures also fall back to a fresh local catalog", async () => {
+test("upstream catalog HTTP and whole-schema failures also fall back to a fresh local catalog", async () => {
   const local = buildStandaloneModelCatalog(config());
   for (const [upstreamResponse, stage] of [
     [new Response("provider rejected", { status: 503 }), "upstream"],
     [new Response("{", { status: 200, headers: { "content-type": "application/json" } }), "catalog"],
     [Response.json({ object: "unexpected", data: [] }), "catalog"],
-    [Response.json({
-      object: "unexpected",
-      data: [{ id: "gpt-standard", object: "model" }],
-      models: [{ slug: "gpt-rich", display_name: "Rich upstream", visibility: "list", supported_in_api: true,
-        supported_reasoning_levels: [], tool_mode: null, context_window: 128_000 }],
-    }), "catalog"],
-    [Response.json({ models: [{ slug: "gpt-incomplete" }] }), "catalog"],
+    [Response.json({ data: "invalid", models: "invalid" }), "catalog"],
   ] as const) {
     let failure: { stage: string } | undefined;
     const response = await modelsRequest(
@@ -202,6 +196,39 @@ test("upstream catalog HTTP and schema failures also fall back to a fresh local 
     assert.deepEqual(await response.json(), local);
     assert.equal(failure?.stage, stage);
   }
+});
+
+test("upstream discovery sources fail independently and partial metadata is normalized safely", async () => {
+  const modelsOnly = await modelsRequest(
+    new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
+    config(), undefined, undefined, accessPolicy, undefined, upstream([{ id: "gpt-rich" }]),
+    async () => Response.json({
+      object: "unexpected",
+      data: [{ id: "ignored-data" }],
+      models: [{
+        slug: "gpt-rich",
+        display_name: "Partial upstream name",
+        context_window: "invalid",
+        model_messages: { instructions_template: "untrusted" },
+      }],
+    }),
+  );
+  assert.equal(modelsOnly.status, 200);
+  const modelsOnlyBody = await modelsOnly.json() as { models: Array<Record<string, unknown>> };
+  const rich = modelsOnlyBody.models.find(model => model.slug === "gpt-rich");
+  assert.equal(rich?.display_name, "Partial upstream name");
+  assert.notEqual((rich?.model_messages as { instructions_template?: string } | undefined)?.instructions_template, "untrusted");
+  assert.notEqual(rich?.context_window, "invalid");
+
+  const dataOnly = await modelsRequest(
+    new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
+    config(), undefined, undefined, accessPolicy, undefined, upstream([{ id: "gpt-upstream" }]),
+    async () => Response.json({ data: [{ id: "gpt-upstream" }], models: "invalid" }),
+  );
+  assert.equal(dataOnly.status, 200);
+  const dataOnlyBody = await dataOnly.json() as { data: Array<{ id: string }>; models: Array<{ slug: string }> };
+  assert.ok(dataOnlyBody.data.some(model => model.id === "gpt-upstream"));
+  assert.ok(dataOnlyBody.models.some(model => model.slug === "gpt-upstream"));
 });
 
 test("unauthorized requests stop before JSON parsing, model fetch or adapter construction", async () => {
@@ -268,11 +295,11 @@ test("allowed non-Web responses and compaction use the configured upstream beare
   }
 });
 
-test("model filters are enforced before any custom upstream request", async () => {
+test("the v2 model allowlist is enforced before any custom upstream request", async () => {
   let calls = 0;
   const options = {
     accessPolicy,
-    upstreamRuntime: upstream({ mode: "selected", models: ["gpt-allowed"] }),
+    upstreamRuntime: upstream([{ id: "gpt-allowed" }]),
     fetchUpstreamProvider: async () => { calls++; return Response.json({}); },
   };
   const denied = await responseRequest(jsonRequest("/v1/responses", {
@@ -284,7 +311,7 @@ test("model filters are enforced before any custom upstream request", async () =
 });
 
 test("selected models missing from the current catalog are not invented but remain routable", async () => {
-  const runtime = upstream({ mode: "selected", models: ["gpt-selected"] });
+  const runtime = upstream([{ id: "gpt-selected" }]);
   const catalog = await modelsRequest(
     new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
     config(), undefined, undefined, accessPolicy, undefined, runtime,
@@ -312,7 +339,7 @@ test("Web models remain local when a custom upstream is available", async () => 
     stream: false,
   }), config(), silentAdapter, {
     accessPolicy,
-    upstreamRuntime: upstream({ mode: "all" }),
+    upstreamRuntime: upstream([]),
     fetchUpstreamProvider: async () => { forwarded++; throw new Error("must stay local"); },
     rememberState: false,
   });
@@ -411,7 +438,7 @@ test("HTTP dispatcher blocks all native endpoints and keeps admin authority sepa
 
 test("HTTP dispatcher exposes search and images only through an available custom upstream", async () => {
   const cfg = { ...config(), port: 0, controlToken: generateApiKey() };
-  const runtime = upstream({ mode: "all" });
+  const runtime = upstream([]);
   const beforeInt = new Set(process.listeners("SIGINT"));
   const beforeTerm = new Set(process.listeners("SIGTERM"));
   const seen: Array<{ url: string; authorization: string | null }> = [];
@@ -461,6 +488,36 @@ test("HTTP dispatcher exposes search and images only through an available custom
   }
 });
 
+test("health reports persisted invalid custom metadata without exposing its contents", async () => {
+  const cfg = { ...config(), port: 0, controlToken: generateApiKey() };
+  const runtime = upstream([{
+    id: "gpt-upstream",
+    metadata: {
+      mode: "custom",
+      baseMode: "fallback",
+      overrides: { removed_schema_field: "private-metadata-value" },
+    },
+  }]);
+  const beforeInt = new Set(process.listeners("SIGINT"));
+  const beforeTerm = new Set(process.listeners("SIGTERM"));
+  const server = startServer(cfg, { accessPolicy, upstreamRuntime: runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/healthz`);
+    assert.equal(response.status, 200);
+    const health = await response.json() as Record<string, unknown>;
+    assert.equal(health.upstream_metadata_repair_count, 1);
+    const text = JSON.stringify(health);
+    assert.ok(!text.includes("removed_schema_field"));
+    assert.ok(!text.includes("private-metadata-value"));
+    assert.ok(!text.includes("provider.example"));
+    assert.ok(!text.includes(providerKey));
+  } finally {
+    await server.stop(true);
+    for (const listener of process.listeners("SIGINT")) if (!beforeInt.has(listener)) process.removeListener("SIGINT", listener);
+    for (const listener of process.listeners("SIGTERM")) if (!beforeTerm.has(listener)) process.removeListener("SIGTERM", listener);
+  }
+});
+
 test("custom upstream failures are returned without falling back to official native forwarding", async () => {
   const cfg = { ...config(), port: 0, controlToken: generateApiKey() };
   const beforeInt = new Set(process.listeners("SIGINT"));
@@ -469,7 +526,7 @@ test("custom upstream failures are returned without falling back to official nat
   let customCalls = 0;
   const server = startServer(cfg, {
     accessPolicy,
-    upstreamRuntime: upstream({ mode: "all" }),
+    upstreamRuntime: upstream([{ id: "gpt-upstream" }]),
     fetchUpstream: async () => { nativeCalls++; return new Response("native fallback", { status: 200 }); },
     fetchUpstreamProvider: async () => {
       customCalls++;

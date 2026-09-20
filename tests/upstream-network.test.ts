@@ -22,11 +22,11 @@ afterEach(() => {
 
 function config(proxy: UpstreamProxyConfig): UpstreamProviderConfig {
   return {
-    version: 1,
+    version: 2,
     baseUrl: "http://provider.invalid/v1/",
     apiKeySha256: "a".repeat(64),
     proxy,
-    modelFilter: { mode: "all" },
+    models: [{ id: "gpt-test" }],
     supportsOpenAiServerCompaction: false,
   };
 }

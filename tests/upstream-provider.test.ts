@@ -1,13 +1,12 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadUpstreamProviderConfig, loadUpstreamProviderRuntime } from "../src/upstream-provider-config";
 import {
   UPSTREAM_API_KEY_ENV,
   normalizeUpstreamBaseUrl,
-  normalizeUpstreamModelFilter,
   normalizeUpstreamProxyUrl,
   parseUpstreamProviderConfig,
   upstreamApiKeyDigest,
@@ -20,11 +19,11 @@ import {
 
 const KEY = "upstream-secret-not-openai-format";
 const base = () => ({
-  version: 1 as const,
+  version: 2 as const,
   baseUrl: "https://example.test/v1/",
   apiKeySha256: upstreamApiKeyDigest(KEY),
   proxy: { mode: "global" as const },
-  modelFilter: { mode: "all" as const },
+  models: [{ id: "gpt-one" }],
   supportsOpenAiServerCompaction: false,
 });
 
@@ -57,25 +56,60 @@ test("custom proxy validation matches the launcher HTTP and HTTPS proxy contract
   }
 });
 
-test("model filters compile before save, dedupe selected ids, and never allow the Web namespace", () => {
-  assert.deepEqual(normalizeUpstreamModelFilter({ mode: "selected", models: ["alpha", "alpha", "beta"] }), {
-    mode: "selected", models: ["alpha", "beta"],
+test("v2 model configuration dedupes identical rows and is the only upstream routing allowlist", () => {
+  const config = parseUpstreamProviderConfig({
+    ...base(),
+    models: [{ id: "beta" }, { id: "alpha" }, { id: "alpha" }],
   });
-  assert.throws(() => normalizeUpstreamModelFilter({ mode: "regex", pattern: "[" }));
-  assert.throws(() => normalizeUpstreamModelFilter({ mode: "selected", models: ["chatgpt-web/high"] }));
-  const regex = parseUpstreamProviderConfig({ ...base(), modelFilter: { mode: "regex", pattern: "^gpt-[0-9]+$" } });
-  assert.equal(upstreamModelAllowed("gpt-7", regex), true);
-  assert.equal(upstreamModelAllowed("GPT-7", regex), false);
-  assert.equal(upstreamModelAllowed("chatgpt-web/high", regex), false);
+  assert.deepEqual(config.models, [{ id: "alpha" }, { id: "beta" }]);
+  assert.equal(upstreamModelAllowed("alpha", config), true);
+  assert.equal(upstreamModelAllowed("other", config), false);
+  assert.equal(upstreamModelAllowed("chatgpt-web/high", config), false);
+  assert.throws(() => parseUpstreamProviderConfig({ ...base(), models: [{ id: "chatgpt-web/high" }] }));
+  assert.throws(() => parseUpstreamProviderConfig({
+    ...base(),
+    models: [{ id: "alpha" }, { id: "alpha", metadata: { mode: "fallback" } }],
+  }));
 });
 
-test("old provider files default server compaction to false and unknown fields fail closed", () => {
+test("v2 provider files default server compaction to false and unknown fields fail closed", () => {
   const old = { ...base() } as Record<string, unknown>;
   delete old.supportsOpenAiServerCompaction;
   assert.equal(parseUpstreamProviderConfig(old).supportsOpenAiServerCompaction, false);
   assert.throws(() => parseUpstreamProviderConfig({ ...base(), secret: KEY }));
   assert.ok(!JSON.stringify(parseUpstreamProviderConfig(base())).includes(KEY));
 });
+
+for (const modelFilter of [
+  { mode: "selected", models: ["gpt-one"] },
+  { mode: "all" },
+  { mode: "regex", pattern: "^gpt-" },
+]) {
+  test(`legacy v1 ${modelFilter.mode} provider configuration is deleted, marked, and never executed`, () => {
+    const home = mkdtempSync(join(tmpdir(), "cgw-upstream-provider-v1-"));
+    try {
+      const path = join(home, "upstream-provider.json");
+      writeFileSync(path, `${JSON.stringify({
+        version: 1,
+        baseUrl: "https://example.test/v1/",
+        apiKeySha256: upstreamApiKeyDigest(KEY),
+        proxy: { mode: "global" },
+        modelFilter,
+        supportsOpenAiServerCompaction: false,
+      })}\n`);
+      assert.equal(loadUpstreamProviderConfig(home), undefined);
+      assert.equal(existsSync(path), false);
+      assert.deepEqual(JSON.parse(readFileSync(join(home, "upstream-provider-reset.json"), "utf8")), {
+        version: 1,
+        reason: "legacy-v1-removed",
+      });
+      assert.deepEqual(loadUpstreamProviderRuntime(home, { [UPSTREAM_API_KEY_ENV]: KEY }), {
+        available: false,
+        keyMatches: false,
+      });
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+}
 
 test("runtime provider is available only when the explicit daemon key matches the saved digest", () => {
   const home = mkdtempSync(join(tmpdir(), "cgw-upstream-provider-"));
@@ -93,12 +127,14 @@ test("runtime provider is available only when the explicit daemon key matches th
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test("provider revision changes with model filtering and server-compaction capability", () => {
+test("provider revision changes with selected models, metadata, and server-compaction capability", () => {
   const token = "control-token-for-revision-test";
   const first = parseUpstreamProviderConfig(base());
-  const regex = parseUpstreamProviderConfig({ ...base(), modelFilter: { mode: "regex", pattern: "^gpt-" } });
-  const selected = parseUpstreamProviderConfig({ ...base(), modelFilter: { mode: "selected", models: ["gpt-one"] } });
+  const selected = parseUpstreamProviderConfig({ ...base(), models: [{ id: "gpt-two" }] });
+  const metadata = parseUpstreamProviderConfig({
+    ...base(), models: [{ id: "gpt-one", metadata: { mode: "fallback" } }],
+  });
   const compaction = parseUpstreamProviderConfig({ ...base(), supportsOpenAiServerCompaction: true });
-  const revisions = [first, regex, selected, compaction].map(config => upstreamProviderRevision(config, token));
+  const revisions = [first, selected, metadata, compaction].map(config => upstreamProviderRevision(config, token));
   assert.equal(new Set(revisions).size, revisions.length);
 });
