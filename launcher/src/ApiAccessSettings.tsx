@@ -9,11 +9,16 @@ import type {
 } from "./api-access-types";
 import {
   filterModelCandidates,
+  modelCandidateEmptyState,
+  resetDiscoveredModelCandidates,
   retainSelectedModelCandidates,
 } from "./api-access-model-selection";
 import {
   recoverApiAccessActionFailure,
   shouldShowUpstreamMissingKey,
+  upstreamDraftDiscoveryRevision,
+  upstreamDraftMutationRevision,
+  upstreamDraftRevisionConflict,
   type ActionFailureRecovery,
 } from "./api-access-renderer-state";
 import "./api-access.css";
@@ -37,10 +42,14 @@ const labels = {
     client: "Codex 配置通过 experimental_bearer_token 包含本地 API Key；不会自动写入 Codex 配置或认证文件。代理启动环境与 TOML 分开显示。",
     processEnv: "Codex 启动环境", catalogPath: "模型目录保存路径", catalog: "模型目录内容",
     upstreamTitle: "OpenAI 兼容上游", upstreamBase: "上游 Base URL", upstreamKey: "上游 API Key",
-    upstreamKeyHint: "留空可复用当前可恢复的上游密钥。密钥不会返回到 Renderer。",
+    upstreamDescription: "配置第三方 OpenAI 兼容服务、代理和模型筛选。详细配置放在独立页面，避免设置首页过长。",
+    upstreamOpen: "配置上游", upstreamBack: "返回接入模式", upstreamConfigured: "已配置", upstreamNotConfigured: "未配置",
+    upstreamKeyHint: "留空时，仅在 Base URL 与已保存上游一致时复用可恢复密钥。密钥不会返回到 Renderer。",
     proxyMode: "上游代理", proxyGlobal: "使用全局代理", proxyDirect: "不使用代理", proxyCustom: "单独代理",
     proxyUrl: "单独代理 URL", filterMode: "模型筛选", filterAll: "全部模型", filterRegex: "正则筛选", filterSelected: "手动选择",
-    regex: "模型 ID 正则", fetchModels: "获取模型", modelSearch: "搜索模型", saveUpstream: "保存上游", deleteUpstream: "删除上游",
+    regex: "模型 ID 正则", fetchModels: "获取模型", modelSearch: "搜索模型", saveUpstream: "保存上游", reloadUpstream: "重新加载", deleteUpstream: "删除上游",
+    modelEmpty: "尚未获取到模型。请先点击“获取模型”。", modelFetchedEmpty: "上游未返回可用模型。",
+    modelNoMatch: "没有匹配当前搜索条件的模型。",
     compaction: "上游支持 OpenAI Responses compaction_trigger（remote compaction v2）",
     compactionHint: "仅当上游真实兼容服务端 compaction_trigger 协议时启用。",
     upstreamMissingKey: "已保存上游配置，但当前会话无法恢复上游密钥。请重新输入并保存。",
@@ -77,10 +86,14 @@ const labels = {
     client: "The Codex provider uses experimental_bearer_token with the local API key. Nothing is written automatically to Codex config or authentication files. Process proxy environment is shown separately from TOML.",
     processEnv: "Codex process environment", catalogPath: "Model catalog destination", catalog: "Model catalog content",
     upstreamTitle: "OpenAI-compatible upstream", upstreamBase: "Upstream Base URL", upstreamKey: "Upstream API key",
-    upstreamKeyHint: "Leave blank to reuse the currently recoverable upstream key. The saved key is never returned to the Renderer.",
+    upstreamDescription: "Configure a third-party OpenAI-compatible service, proxy and model filter on a separate detail page.",
+    upstreamOpen: "Configure upstream", upstreamBack: "Back to access mode", upstreamConfigured: "Configured", upstreamNotConfigured: "Not configured",
+    upstreamKeyHint: "Leave blank to reuse a recoverable saved key only when the Base URL still matches. The saved key is never returned to the Renderer.",
     proxyMode: "Upstream proxy", proxyGlobal: "Use global proxy", proxyDirect: "Direct", proxyCustom: "Custom proxy",
     proxyUrl: "Custom proxy URL", filterMode: "Model filter", filterAll: "All models", filterRegex: "Regex", filterSelected: "Manual selection",
-    regex: "Model ID regex", fetchModels: "Fetch models", modelSearch: "Search models", saveUpstream: "Save upstream", deleteUpstream: "Delete upstream",
+    regex: "Model ID regex", fetchModels: "Fetch models", modelSearch: "Search models", saveUpstream: "Save upstream", reloadUpstream: "Reload", deleteUpstream: "Delete upstream",
+    modelEmpty: "No models loaded yet. Select Fetch models first.", modelFetchedEmpty: "The upstream returned no available models.",
+    modelNoMatch: "No models match the current search.",
     compaction: "Upstream supports OpenAI Responses compaction_trigger (remote compaction v2)",
     compactionHint: "Enable only when the upstream really implements the server-side compaction_trigger protocol.",
     upstreamMissingKey: "The upstream configuration is saved, but its key cannot be recovered in this session. Enter the key and save again.",
@@ -106,7 +119,17 @@ function value<T>(result: ApiAccessResult<T>): T {
   return result.value;
 }
 
-export function ApiAccessSettings({ language }: { language: Language }) {
+export function ApiAccessSettings({
+  language,
+  onCloseUpstream,
+  onOpenUpstream,
+  view = "overview",
+}: {
+  language: Language;
+  onCloseUpstream?: () => void;
+  onOpenUpstream?: () => void;
+  view?: "overview" | "upstream";
+}) {
   const copy = labels[language.startsWith("zh") ? "zh" : "en"];
   const api = window.codexWebLauncher!;
   const [status, setStatus] = useState<ApiAccessStatus | null>(null);
@@ -129,11 +152,14 @@ export function ApiAccessSettings({ language }: { language: Language }) {
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [candidateModels, setCandidateModels] = useState<string[]>([]);
   const [modelSearch, setModelSearch] = useState("");
+  const [modelDiscoveryComplete, setModelDiscoveryComplete] = useState(false);
   const [serverCompaction, setServerCompaction] = useState(false);
   const mounted = useRef(false);
   const locked = useRef(false);
   const generation = useRef(0);
   const visibility = useRef(0);
+  const upstreamDirty = useRef(false);
+  const upstreamDraftRevision = useRef<string | null>(null);
   const isApi = status?.configuredMode === "api-key";
   const keyValid = /^[A-Za-z0-9_-]{32,256}$/.test(draft);
   const regexValid = (() => {
@@ -141,38 +167,47 @@ export function ApiAccessSettings({ language }: { language: Language }) {
     try { new RegExp(regexPattern); return true; } catch { return false; }
   })();
 
-  function adopt(next: ApiAccessStatus) {
+  function adopt(next: ApiAccessStatus, preserveUpstreamDraft = false) {
     if (!mounted.current) return;
     setStatus(next);
     setVisibleKey(null);
-    const upstream = next.upstream;
-    setUpstreamBaseUrl(upstream?.baseUrl ?? "");
-    setUpstreamKey("");
-    setProxyMode(upstream?.proxy?.mode ?? "global");
-    setProxyUrl(upstream?.proxy?.mode === "custom" ? upstream.proxy.url : "");
-    setFilterMode(upstream?.modelFilter?.mode ?? "all");
-    setRegexPattern(upstream?.modelFilter?.mode === "regex" ? upstream.modelFilter.pattern : "");
-    setSelectedModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
-    setCandidateModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
-    setServerCompaction(upstream?.supportsOpenAiServerCompaction === true);
+    if (!preserveUpstreamDraft || !upstreamDirty.current) {
+      const upstream = next.upstream;
+      setUpstreamBaseUrl(upstream?.baseUrl ?? "");
+      setUpstreamKey("");
+      setProxyMode(upstream?.proxy?.mode ?? "global");
+      setProxyUrl(upstream?.proxy?.mode === "custom" ? upstream.proxy.url : "");
+      setFilterMode(upstream?.modelFilter?.mode ?? "all");
+      setRegexPattern(upstream?.modelFilter?.mode === "regex" ? upstream.modelFilter.pattern : "");
+      setSelectedModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
+      setCandidateModels(upstream?.modelFilter?.mode === "selected" ? upstream.modelFilter.models : []);
+      setModelSearch("");
+      setModelDiscoveryComplete(false);
+      setServerCompaction(upstream?.supportsOpenAiServerCompaction === true);
+      upstreamDirty.current = false;
+      upstreamDraftRevision.current = next.revision;
+    } else if (upstreamDraftRevisionConflict(true, upstreamDraftRevision.current, next.revision)) {
+      setError("stale-settings");
+    }
     visibility.current++;
   }
   useEffect(() => {
     mounted.current = true;
-    const load = () => {
+    const load = (preserveUpstreamDraft = false) => {
       if (locked.current) return;
       const request = ++generation.current;
       void api.apiAccessStatus().then(result => {
-        if (mounted.current && request === generation.current && !locked.current) adopt(value(result));
+        if (mounted.current && request === generation.current && !locked.current) adopt(value(result), preserveUpstreamDraft);
       }).catch(() => { if (mounted.current) setError("unavailable"); });
     };
     const hide = () => { visibility.current++; setVisibleKey(null); };
     load();
-    window.addEventListener("focus", load);
+    const restore = () => load(true);
+    window.addEventListener("focus", restore);
     window.addEventListener("blur", hide);
     return () => {
       mounted.current = false; generation.current++; visibility.current++;
-      window.removeEventListener("focus", load); window.removeEventListener("blur", hide);
+      window.removeEventListener("focus", restore); window.removeEventListener("blur", hide);
     };
   }, [api]);
 
@@ -182,7 +217,7 @@ export function ApiAccessSettings({ language }: { language: Language }) {
     try { await action(); }
     catch (cause) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : "unavailable");
-      await recoverApiAccessActionFailure(recovery, async () => adopt(value(await api.apiAccessStatus())));
+      await recoverApiAccessActionFailure(recovery, async () => adopt(value(await api.apiAccessStatus()), true));
     } finally { locked.current = false; if (mounted.current) setBusy(false); }
   }
   function edit(enabling: boolean) {
@@ -241,9 +276,10 @@ export function ApiAccessSettings({ language }: { language: Language }) {
     ? { mode: "regex", pattern: regexPattern }
     : filterMode === "selected" ? { mode: "selected", models: selectedModels } : { mode: "all" };
   async function saveUpstream() {
-    if (!status?.revision) return;
+    const revision = upstreamDraftMutationRevision(upstreamDraftRevision.current, status?.revision ?? null);
+    if (!revision) throw new Error("stale-settings");
     const result = value(await api.apiAccessUpstreamSave({
-      expectedRevision: status.revision,
+      expectedRevision: revision,
       baseUrl: upstreamBaseUrl,
       ...(upstreamKey ? { apiKey: upstreamKey } : {}),
       proxy: draftProxy(),
@@ -252,7 +288,128 @@ export function ApiAccessSettings({ language }: { language: Language }) {
     }));
     adopt(result.status);
   }
+  async function deleteUpstream() {
+    const revision = upstreamDraftMutationRevision(upstreamDraftRevision.current, status?.revision ?? null);
+    if (!revision) throw new Error("stale-settings");
+    const result = value(await api.apiAccessUpstreamDelete({ expectedRevision: revision }));
+    adopt(result.status);
+  }
+  async function fetchUpstreamModels() {
+    const revision = upstreamDraftDiscoveryRevision(
+      upstreamDraftRevision.current,
+      status?.revision ?? null,
+      upstreamKey.length > 0,
+    );
+    if (!revision) throw new Error("stale-settings");
+    invalidateDiscoveredModels();
+    const result = value(await api.apiAccessUpstreamModels({
+      expectedRevision: revision,
+      baseUrl: upstreamBaseUrl,
+      ...(upstreamKey ? { apiKey: upstreamKey } : {}),
+      proxy: draftProxy(),
+    }));
+    if (mounted.current) {
+      markUpstreamDirty();
+      setCandidateModels(retainSelectedModelCandidates(result.models, selectedModels));
+      setModelDiscoveryComplete(true);
+    }
+  }
   const pending = status?.runtimeState === "restart-required" || status?.runtimeState === "stopped";
+  const filteredCandidateModels = filterModelCandidates(candidateModels, modelSearch);
+  const markUpstreamDirty = () => { upstreamDirty.current = true; };
+  const invalidateDiscoveredModels = () => {
+    setCandidateModels(resetDiscoveredModelCandidates(selectedModels));
+    setModelDiscoveryComplete(false);
+  };
+  const markUpstreamIdentityDirty = () => { markUpstreamDirty(); invalidateDiscoveredModels(); };
+  const upstreamRevisionConflict = upstreamDraftRevisionConflict(
+    upstreamDirty.current,
+    upstreamDraftRevision.current,
+    status?.revision ?? null,
+  );
+  const upstreamMutationRevision = upstreamDraftMutationRevision(
+    upstreamDraftRevision.current,
+    status?.revision ?? null,
+  );
+  const upstreamDiscoveryRevision = upstreamDraftDiscoveryRevision(
+    upstreamDraftRevision.current,
+    status?.revision ?? null,
+    upstreamKey.length > 0,
+  );
+  const candidateEmptyState = modelCandidateEmptyState(
+    candidateModels,
+    filteredCandidateModels,
+    modelDiscoveryComplete,
+  );
+  const candidateEmptyMessage = candidateEmptyState === "empty" ? copy.modelFetchedEmpty
+    : candidateEmptyState === "no-match" ? copy.modelNoMatch : copy.modelEmpty;
+  const upstreamEditor = <div className={`api-access-upstream${view === "upstream" ? " is-detail" : ""}`}>
+    <label htmlFor="api-upstream-base">{copy.upstreamBase}</label>
+    <input id="api-upstream-base" value={upstreamBaseUrl} disabled={busy} spellCheck={false}
+      placeholder="https://provider.example/v1" onChange={event => { markUpstreamIdentityDirty(); setUpstreamBaseUrl(event.target.value); }} />
+    <label htmlFor="api-upstream-key">{copy.upstreamKey}</label>
+    <input id="api-upstream-key" type="password" value={upstreamKey} disabled={busy} autoComplete="new-password"
+      maxLength={4096} spellCheck={false} onChange={event => { markUpstreamIdentityDirty(); setUpstreamKey(event.target.value); }} />
+    <small>{copy.upstreamKeyHint}</small>
+    {shouldShowUpstreamMissingKey(status) ? <small className="api-access-warning">{copy.upstreamMissingKey}</small> : null}
+    <label htmlFor="api-upstream-proxy-mode">{copy.proxyMode}</label>
+    <select id="api-upstream-proxy-mode" value={proxyMode} disabled={busy}
+      onChange={event => { markUpstreamIdentityDirty(); setProxyMode(event.target.value as UpstreamProxy["mode"]); }}>
+      <option value="global">{copy.proxyGlobal}</option><option value="direct">{copy.proxyDirect}</option>
+      <option value="custom">{copy.proxyCustom}</option>
+    </select>
+    {proxyMode === "custom" ? <><label htmlFor="api-upstream-proxy-url">{copy.proxyUrl}</label>
+      <input id="api-upstream-proxy-url" value={proxyUrl} disabled={busy} spellCheck={false}
+        placeholder="http://user:password@proxy.example:8080" onChange={event => { markUpstreamIdentityDirty(); setProxyUrl(event.target.value); }} /></> : null}
+    <label htmlFor="api-upstream-filter-mode">{copy.filterMode}</label>
+    <select id="api-upstream-filter-mode" value={filterMode} disabled={busy}
+      onChange={event => { markUpstreamDirty(); setFilterMode(event.target.value as UpstreamModelFilter["mode"]); }}>
+      <option value="all">{copy.filterAll}</option><option value="regex">{copy.filterRegex}</option>
+      <option value="selected">{copy.filterSelected}</option>
+    </select>
+    {filterMode === "regex" ? <><label htmlFor="api-upstream-regex">{copy.regex}</label>
+      <input id="api-upstream-regex" value={regexPattern} disabled={busy} maxLength={512} spellCheck={false}
+        onChange={event => { markUpstreamDirty(); setRegexPattern(event.target.value); }} />
+      {!regexValid ? <small className="api-access-error" role="alert">{copy.errors["invalid-upstream-filter"]}</small> : null}</> : null}
+    {filterMode === "selected" ? <>
+      <button type="button"
+        disabled={busy || !upstreamBaseUrl || !upstreamDiscoveryRevision}
+        onClick={() => void perform(fetchUpstreamModels, "preserve-draft")}>{copy.fetchModels}</button>
+      <label htmlFor="api-upstream-model-search">{copy.modelSearch}</label>
+      <input id="api-upstream-model-search" type="search" value={modelSearch} disabled={busy}
+        onChange={event => setModelSearch(event.target.value)} />
+      <div className="api-access-model-list">
+        {filteredCandidateModels.length > 0 ? filteredCandidateModels.map(model => <label key={model}>
+          <input type="checkbox" checked={selectedModels.includes(model)}
+          disabled={busy} onChange={event => { markUpstreamDirty(); setSelectedModels(current => event.target.checked
+            ? current.includes(model) ? current : [...current, model]
+            : current.filter(item => item !== model)); }} />{model}</label>)
+          : <small className="api-access-model-empty">{candidateEmptyMessage}</small>}
+      </div>
+    </> : null}
+    <label className="api-access-checkbox"><input type="checkbox" checked={serverCompaction} disabled={busy}
+      onChange={event => { markUpstreamDirty(); setServerCompaction(event.target.checked); }} />{copy.compaction}</label>
+    <small>{copy.compactionHint}</small>
+    <div className="api-access-actions">
+      <button type="button" disabled={busy || !upstreamBaseUrl || !regexValid || !upstreamMutationRevision || upstreamRevisionConflict}
+        onClick={() => void perform(saveUpstream)}>{copy.saveUpstream}</button>
+      <button type="button" disabled={busy} onClick={() => void perform(async () => {
+        adopt(value(await api.apiAccessStatus()));
+      })}>{copy.reloadUpstream}</button>
+      {status?.upstream?.configured ? <button type="button" disabled={busy || !upstreamMutationRevision || upstreamRevisionConflict}
+        onClick={() => void perform(deleteUpstream)}>{copy.deleteUpstream}</button> : null}
+    </div>
+    {status?.upstream?.configured ? <small>{status.upstream.runtimeAvailable ? copy.upstreamReady : copy.upstreamPending}</small> : null}
+  </div>;
+
+  if (view === "upstream") return <section className="api-access-settings api-access-settings-detail" aria-labelledby="api-access-upstream-title">
+    <button className="api-access-back" type="button" onClick={onCloseUpstream}>{copy.upstreamBack}</button>
+    <h2 id="api-access-upstream-title">{copy.upstreamTitle}</h2>
+    <p>{copy.upstreamDescription}</p>
+    {upstreamEditor}
+    {error ? <p role="alert" className="api-access-error">{copy.errors[error] ?? copy.failed}</p> : null}
+  </section>;
+
   return <section className="api-access-settings" aria-labelledby="api-access-title">
     <h2 id="api-access-title">{copy.title}</h2><p>{copy.description}</p>
     <div className="api-access-modes" role="group" aria-label={copy.title}>
@@ -306,66 +463,12 @@ export function ApiAccessSettings({ language }: { language: Language }) {
         <label>{copy.catalogPath}</label><code>{catalogPath}</code>
         <label>{copy.catalog}</label><pre tabIndex={0}>{catalogText}</pre>
         <label>{copy.processEnv}</label><pre tabIndex={0}>{environmentText}</pre></details> : null}
-      <div className="api-access-upstream">
-        <h3>{copy.upstreamTitle}</h3>
-        <label htmlFor="api-upstream-base">{copy.upstreamBase}</label>
-        <input id="api-upstream-base" value={upstreamBaseUrl} disabled={busy} spellCheck={false}
-          placeholder="https://provider.example/v1" onChange={event => setUpstreamBaseUrl(event.target.value)} />
-        <label htmlFor="api-upstream-key">{copy.upstreamKey}</label>
-        <input id="api-upstream-key" type="password" value={upstreamKey} disabled={busy} autoComplete="new-password"
-          maxLength={4096} spellCheck={false} onChange={event => setUpstreamKey(event.target.value)} />
-        <small>{copy.upstreamKeyHint}</small>
-        {shouldShowUpstreamMissingKey(status) ? <small className="api-access-warning">{copy.upstreamMissingKey}</small> : null}
-        <label htmlFor="api-upstream-proxy-mode">{copy.proxyMode}</label>
-        <select id="api-upstream-proxy-mode" value={proxyMode} disabled={busy}
-          onChange={event => setProxyMode(event.target.value as UpstreamProxy["mode"])}>
-          <option value="global">{copy.proxyGlobal}</option><option value="direct">{copy.proxyDirect}</option>
-          <option value="custom">{copy.proxyCustom}</option>
-        </select>
-        {proxyMode === "custom" ? <><label htmlFor="api-upstream-proxy-url">{copy.proxyUrl}</label>
-          <input id="api-upstream-proxy-url" value={proxyUrl} disabled={busy} spellCheck={false}
-            placeholder="http://user:password@proxy.example:8080" onChange={event => setProxyUrl(event.target.value)} /></> : null}
-        <label htmlFor="api-upstream-filter-mode">{copy.filterMode}</label>
-        <select id="api-upstream-filter-mode" value={filterMode} disabled={busy}
-          onChange={event => setFilterMode(event.target.value as UpstreamModelFilter["mode"])}>
-          <option value="all">{copy.filterAll}</option><option value="regex">{copy.filterRegex}</option>
-          <option value="selected">{copy.filterSelected}</option>
-        </select>
-        {filterMode === "regex" ? <><label htmlFor="api-upstream-regex">{copy.regex}</label>
-          <input id="api-upstream-regex" value={regexPattern} disabled={busy} maxLength={512} spellCheck={false}
-            onChange={event => setRegexPattern(event.target.value)} />
-          {!regexValid ? <small className="api-access-error" role="alert">{copy.errors["invalid-upstream-filter"]}</small> : null}</> : null}
-        {filterMode === "selected" ? <>
-          <button type="button" disabled={busy || !upstreamBaseUrl} onClick={() => void perform(async () => {
-            const result = value(await api.apiAccessUpstreamModels({
-              baseUrl: upstreamBaseUrl,
-              ...(upstreamKey ? { apiKey: upstreamKey } : {}),
-              proxy: draftProxy(),
-            }));
-            if (mounted.current) setCandidateModels(retainSelectedModelCandidates(result.models, selectedModels));
-          }, "preserve-draft")}>{copy.fetchModels}</button>
-          <label htmlFor="api-upstream-model-search">{copy.modelSearch}</label>
-          <input id="api-upstream-model-search" type="search" value={modelSearch} disabled={busy}
-            onChange={event => setModelSearch(event.target.value)} />
-          <div className="api-access-model-list">
-            {filterModelCandidates(candidateModels, modelSearch).map(model => <label key={model}>
-              <input type="checkbox" checked={selectedModels.includes(model)}
-              disabled={busy} onChange={event => setSelectedModels(current => event.target.checked
-                ? current.includes(model) ? current : [...current, model]
-                : current.filter(item => item !== model))} />{model}</label>)}
-          </div>
-        </> : null}
-        <label className="api-access-checkbox"><input type="checkbox" checked={serverCompaction} disabled={busy}
-          onChange={event => setServerCompaction(event.target.checked)} />{copy.compaction}</label>
-        <small>{copy.compactionHint}</small>
-        <div className="api-access-actions">
-          <button type="button" disabled={busy || !upstreamBaseUrl || !regexValid} onClick={() => void perform(saveUpstream)}>{copy.saveUpstream}</button>
-          {status.upstream?.configured ? <button type="button" disabled={busy || !status.revision} onClick={() => void perform(async () => {
-            const result = value(await api.apiAccessUpstreamDelete({ expectedRevision: status.revision! })); adopt(result.status);
-          })}>{copy.deleteUpstream}</button> : null}
-        </div>
-        {status.upstream?.configured ? <small>{status.upstream.runtimeAvailable ? copy.upstreamReady : copy.upstreamPending}</small> : null}
-      </div>
+      <button className="api-access-upstream-link" type="button" disabled={busy} onClick={onOpenUpstream}>
+        <span><strong>{copy.upstreamTitle}</strong><small>{copy.upstreamDescription}</small></span>
+        <span className="api-access-upstream-link-status">
+          {status.upstream?.configured ? copy.upstreamConfigured : copy.upstreamNotConfigured} · {copy.upstreamOpen}
+        </span>
+      </button>
     </div> : null}
     <div role="status" aria-live="polite">
       {busy ? copy.busy : status?.runtimeState === "in-sync" ? copy.saved

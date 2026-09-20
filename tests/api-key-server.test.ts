@@ -4,12 +4,13 @@ import { mock } from "node:test";
 import { defaultConfig, type AppConfig } from "../src/config";
 import { availableChatGptWebModelRoutes } from "../src/chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "../src/standalone-model-catalog";
-import { apiKeyPolicy, generateApiKey, OPENAI_ACCESS } from "../src/api-access";
+import { apiAccessRevision, apiKeyPolicy, generateApiKey, OPENAI_ACCESS } from "../src/api-access";
 import { compactRequest, modelsRequest, responseRequest, startServer } from "../src/server";
 import type { ProviderAdapter } from "../src/adapters/base";
 import type { NativeFetch } from "../src/native-passthrough";
 import {
   upstreamApiKeyDigest,
+  upstreamProviderRevision,
   type UpstreamModelFilter,
   type UpstreamProviderRuntime,
 } from "../src/upstream-provider";
@@ -81,10 +82,11 @@ test("API-key model catalog never calls upstream or the installed OAuth catalog 
 
 test("API-key model catalog merges filtered upstream rows and keeps the local Web namespace", async () => {
   const runtime = upstream();
+  const cfg = config();
   let forwarded: Request | undefined;
   const response = await modelsRequest(
     new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}`, cookie: "private=1" } }),
-    config(),
+    cfg,
     undefined,
     undefined,
     accessPolicy,
@@ -109,6 +111,10 @@ test("API-key model catalog merges filtered upstream rows and keeps the local We
     },
   );
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-codex-chatgpt-web-api-access-revision"),
+    apiAccessRevision(accessPolicy, cfg.controlToken));
+  assert.equal(response.headers.get("x-codex-chatgpt-web-upstream-provider-revision"),
+    upstreamProviderRevision(runtime.config!, cfg.controlToken));
   assert.equal(forwarded?.url, "https://provider.example/openai/v1/models");
   assert.equal(forwarded?.headers.get("authorization"), `Bearer ${providerKey}`);
   assert.equal(forwarded?.headers.get("cookie"), null);
@@ -118,6 +124,17 @@ test("API-key model catalog merges filtered upstream rows and keeps the local We
   assert.ok(!payload.data.some(row => row.id === "claude-filtered"));
   assert.ok(payload.models.some(row => row.slug === "gpt-rich"));
   assert.ok(!payload.models.some(row => row.slug === "other-filtered"));
+});
+
+test("API-key model catalog accepts OpenAI-compatible data arrays without an object marker", async () => {
+  const response = await modelsRequest(
+    new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
+    config(), undefined, undefined, accessPolicy, undefined, upstream(),
+    async () => Response.json({ data: [{ id: "gpt-upstream", object: "model" }] }),
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json() as { data: Array<{ id: string }> };
+  assert.ok(payload.data.some(row => row.id === "gpt-upstream"));
 });
 
 test("upstream catalog failures return the complete local catalog without stale data", async () => {
@@ -167,6 +184,12 @@ test("upstream catalog HTTP and schema failures also fall back to a fresh local 
     [new Response("provider rejected", { status: 503 }), "upstream"],
     [new Response("{", { status: 200, headers: { "content-type": "application/json" } }), "catalog"],
     [Response.json({ object: "unexpected", data: [] }), "catalog"],
+    [Response.json({
+      object: "unexpected",
+      data: [{ id: "gpt-standard", object: "model" }],
+      models: [{ slug: "gpt-rich", display_name: "Rich upstream", visibility: "list", supported_in_api: true,
+        supported_reasoning_levels: [], tool_mode: null, context_window: 128_000 }],
+    }), "catalog"],
     [Response.json({ models: [{ slug: "gpt-incomplete" }] }), "catalog"],
   ] as const) {
     let failure: { stage: string } | undefined;

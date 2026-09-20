@@ -372,11 +372,12 @@ function createApiAccessSettings({
     assertProduction();
     if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
     if (!raw || typeof raw !== "object" || Array.isArray(raw)
-      || !Object.keys(raw).every(key => ["baseUrl", "apiKey", "proxy"].includes(key))) fail("invalid-input");
+      || !Object.keys(raw).every(key => ["expectedRevision", "baseUrl", "apiKey", "proxy"].includes(key))
+      || typeof raw.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(raw.expectedRevision)) fail("invalid-input");
     let draft;
     try {
       draft = validateUpstreamChange({
-        expectedRevision: "0".repeat(64),
+        expectedRevision: raw.expectedRevision,
         baseUrl: raw.baseUrl,
         ...(raw.apiKey !== undefined && raw.apiKey !== "" ? { apiKey: raw.apiKey } : {}),
         proxy: raw.proxy,
@@ -387,8 +388,9 @@ function createApiAccessSettings({
     let key = draft.apiKey;
     if (key !== undefined && !validUpstreamApiKey(key)) fail("invalid-upstream-key");
     if (!key) {
-      const saved = readUpstreamConfig(upstreamFilePath).config;
-      key = saved ? upstreamVault.read(saved.apiKeySha256) : null;
+      const saved = assertUnchanged(draft.expectedRevision).upstream.config;
+      if (!saved || saved.baseUrl !== draft.baseUrl) fail("upstream-key-required");
+      key = upstreamVault.read(saved.apiKeySha256);
       if (!key) fail("upstream-key-required");
     }
     try {

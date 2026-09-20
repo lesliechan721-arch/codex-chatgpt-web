@@ -1600,6 +1600,7 @@ function SettingsSurface({
   const [busy, setBusy] = useState(false);
   const [turnsCancelled, setTurnsCancelled] = useState(false);
   const [integrationRemoved, setIntegrationRemoved] = useState(false);
+  const [apiUpstreamOpen, setApiUpstreamOpen] = useState(false);
 
   const updateLanguage = async (next: Language) => {
     try {
@@ -1683,9 +1684,9 @@ function SettingsSurface({
 
   return (
     <ContentSurface narrow title={devProfile ? copy.devSettingsTitle : copy.settingsTitle}>
-      {!devProfile ? <ApiAccessSettings language={language} /> : null}
-      <SectionHeading label={copy.general} />
-      <div className="settings-list">
+      <div hidden={apiUpstreamOpen}>
+        <SectionHeading label={copy.general} />
+        <div className="settings-list">
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} flushAfter label={copy.launchAtLogin}>
           <Switch
             checked={snapshot.state.autoStart}
@@ -1742,50 +1743,60 @@ function SettingsSurface({
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
           <LanguageMenu copy={copy} language={language} onChange={(next) => void updateLanguage(next)} />
         </SettingRow>
+        </div>
       </div>
 
-      {!devProfile && snapshot.state.codexRestartRequired ? (
-        <NoticeRow icon="alert" tone="warning">
-          {copy.restartCodex}
-        </NoticeRow>
-      ) : null}
+      {!devProfile ? <ApiAccessSettings
+        language={language}
+        onCloseUpstream={() => setApiUpstreamOpen(false)}
+        onOpenUpstream={() => setApiUpstreamOpen(true)}
+        view={apiUpstreamOpen ? "upstream" : "overview"}
+      /> : null}
 
-      <SectionHeading label={copy.diagnostics} spaced />
-      <button className="diagnostic-row" disabled={busy} onClick={() => void runDoctor()} type="button">
+      <div hidden={apiUpstreamOpen}>
+        {!devProfile && snapshot.state.codexRestartRequired ? (
+          <NoticeRow icon="alert" tone="warning">
+            {copy.restartCodex}
+          </NoticeRow>
+        ) : null}
+
+        <SectionHeading label={copy.diagnostics} spaced />
+        <button className="diagnostic-row" disabled={busy} onClick={() => void runDoctor()} type="button">
         <Icon name="activity" />
         <span>
           <strong>{copy.runDoctor}</strong>
           <small>{doctor ? (doctor.ok ? copy.healthy : copy.needsAttention) : copy.status}</small>
         </span>
         <Icon name="chevron" />
-      </button>
-      {!devProfile ? <button className="diagnostic-row" disabled={busy} onClick={() => void cancelTurns()} type="button">
+        </button>
+        {!devProfile ? <button className="diagnostic-row" disabled={busy} onClick={() => void cancelTurns()} type="button">
         <Icon name="close" />
         <span>
           <strong>{copy.cancelTurns}</strong>
           <small>{turnsCancelled ? copy.turnsCancelled : copy.cancelTurnsBody}</small>
         </span>
         <Icon name="chevron" />
-      </button> : null}
-      {!devProfile ? <button className="diagnostic-row" disabled={busy} onClick={() => void uninstallIntegration()} type="button">
+        </button> : null}
+        {!devProfile ? <button className="diagnostic-row" disabled={busy} onClick={() => void uninstallIntegration()} type="button">
         <Icon name="close" />
         <span>
           <strong>{copy.uninstallIntegration}</strong>
           <small>{integrationRemoved ? copy.integrationRemoved : copy.uninstallIntegrationBody}</small>
         </span>
         <Icon name="chevron" />
-      </button> : null}
-      {doctor ? <DoctorSummary copy={copy} language={language} report={doctor} /> : null}
+        </button> : null}
+        {doctor ? <DoctorSummary copy={copy} language={language} report={doctor} /> : null}
 
-      <div className="about-row">
-        <BrandMark small />
-        <span>
-          <strong>{copy.product}</strong>
-          <small>
-            {devProfile ? `${copy.devBadge} · ${snapshot.profilePaths.coreHome} · ` : ""}
-            {platformLabel(snapshot.platform)} · v{snapshot.version}
-          </small>
-        </span>
+        <div className="about-row">
+          <BrandMark small />
+          <span>
+            <strong>{copy.product}</strong>
+            <small>
+              {devProfile ? `${copy.devBadge} · ${snapshot.profilePaths.coreHome} · ` : ""}
+              {platformLabel(snapshot.platform)} · v{snapshot.version}
+            </small>
+          </span>
+        </div>
       </div>
     </ContentSurface>
   );

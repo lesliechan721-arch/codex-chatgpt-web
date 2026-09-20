@@ -137,7 +137,7 @@ Authorization: Bearer <upstream-api-key>
 
 1. 先构建现有本地 `buildStandaloneModelCatalog(config)`。
 2. 请求上游 `<baseUrl>/models`。
-3. 上游返回标准 OpenAI `object: "list"` / `data` 数组时，先按当前筛选规则过滤，再合并有效 `data` 项。
+3. 上游返回标准 OpenAI `object: "list"` / `data` 数组时，先按当前筛选规则过滤，再合并有效 `data` 项。为兼容只省略 `object` 标记、仍返回 `data` 数组的 OpenAI 兼容服务，也接受该形式；显式的其它 `object` 值仍视为不兼容。
 4. 本地 `chatgpt-web/*` 命名空间永久保留给本地路由。上游 `data[].id` 与本地模型同名时丢弃上游项。
 5. 如果上游明确返回兼容的 Codex 富 `models` 数组，可以合并其有效行；同样先应用当前筛选规则，并丢弃 `chatgpt-web/*` 冲突项。
 6. 如果上游只有标准 `data`，不得根据本地模板猜测或合成上游模型的 context window、reasoning level、tool capability、compaction limit、multi-agent capability 或其它 Codex 富元数据。此时上游模型仍可按模型名直接请求，但不会因为猜测数据而出现在 Codex 富 `models` 列表中。
@@ -196,9 +196,9 @@ Launcher 在上游编辑区提供显式的“获取模型”动作。它只由�
 获取流程：
 
 1. 使用编辑器当前的 `baseUrl`、代理模式和代理 URL。
-2. 若用户当前填写了新的上游 API Key，使用该 draft key；否则使用与当前已保存上游配置匹配且可读取的安全存储密钥。
+2. 若用户当前填写了新的上游 API Key，使用该 draft key；否则只能在草稿 baseline revision 仍是当前 revision，且当前 draft `baseUrl` 与该 baseline 中已保存的上游 `baseUrl` 一致时，使用其可读取的安全存储密钥。任一条件不满足时不得把其它配置的密钥发送到当前 draft 地址。
 3. 调用当前 draft 配置对应的 `<baseUrl>/models`。
-4. 从标准 `data[].id` 和兼容 Codex `models[].slug` 中提取可请求模型标识，去重，并排除所有 `chatgpt-web/*`。
+4. 从标准 `data[].id` 和 Codex 风格 `models[].slug` 中提取可请求模型标识，去重，并排除所有 `chatgpt-web/*`。手动选择只需要可请求 ID，不要求 `models[]` 行同时具备完整 Codex 富模型元数据；完整富目录是否可合并仍由运行时目录校验决定。
 5. 把结果返回给可信 Renderer，供用户搜索、勾选或取消选择；获取结果本身不写配置、不改变运行时、不触发重启。
 6. 用户选择“手动选择”模式并保存后，才把所选模型 ID 写入上游配置并走正常的保存/受控重启流程。
 
@@ -482,7 +482,7 @@ Codex 当前源码依据：`codex-rs/model-provider-info/src/lib.rs` 定义 `exp
 
 ### 7. Launcher UI 与 IPC
 
-上游服务商设置放在现有 **Settings → 接入模式 → API Key** 区域中，只在 API Key 模式下显示。
+设置首页先显示常用的通用设置，再显示 **接入模式**，最后显示诊断项。上游服务商在 **Settings → 接入模式 → API Key** 中只保留摘要入口；详细编辑表单进入二级页面，只在 API Key 模式下可进入。
 
 最小界面需要：
 
@@ -493,9 +493,9 @@ Codex 当前源码依据：`codex-rs/model-provider-info/src/lib.rs` 定义 `exp
 - 模型筛选方式：`全部模型` / `正则筛选` / `手动选择`；
 - OpenAI 服务端压缩能力：显式布尔选项，默认关闭，并提示只有真实支持 Responses `compaction_trigger` 的上游才能启用；
 - `正则筛选` 显示正则输入框，并在保存前反馈语法错误；
-- `手动选择` 提供“获取模型”按钮和可勾选模型列表；
+- `手动选择` 提供“获取模型”按钮和可勾选模型列表；没有结果或搜索无匹配时显示明确空状态，不能只显示空白列表；
 - 手动获取使用当前 draft 上游配置，允许用户在正式保存前验证 baseUrl、API Key 和代理是否可以访问 `/models`；
-- 保存/更新和删除上游配置；
+- 保存/更新和删除上游配置；窗口失焦并重新获得焦点时可以刷新后台状态，但不得覆盖尚未保存的上游编辑草稿；
 - 上游密钥不可恢复时显示需要重新输入；
 - 已保存但 daemon 尚未加载时沿用现有“待重启”状态。
 
@@ -506,7 +506,7 @@ API Key Codex 导出 UI 同步调整：
 - 同一导出结果还要展示/返回 Codex 进程代理环境配置，供用户启动外部 Codex 时应用；
 - Renderer 可以接收本次用户显式导出的 TOML 和代理环境文本，但不得把内容持久化到普通 Launcher state，也不得在错误上报中附带导出正文。
 
-不要求新增多 provider 列表、provider 名称、模型映射器或独立设置页面。
+不要求新增多 provider 列表、provider 名称或模型映射器。上游详细配置使用 Settings 内的二级页面，不新增独立顶级导航项。
 
 IPC 继续使用 optimistic revision，避免两个窗口/外部修改发生 lost update。Renderer 不接收已保存的上游明文密钥，除非实现者明确增加与现有“查看本地 API Key”等价的独立用户动作；本任务不要求该查看/复制功能。
 
@@ -514,9 +514,9 @@ IPC 继续使用 optimistic revision，避免两个窗口/外部修改发生 los
 
 - 只接受可信主窗口调用；
 - 输入可以包含用户当前正在编辑的 draft API Key，但主进程不得把该值记录到日志、状态、operation 或普通错误；
-- 没有 draft key 时，只能由主进程内部读取当前匹配的安全存储密钥，不能把密钥先返回 Renderer 再发回；
+- 没有 draft key 时，只能由主进程在确认草稿 baseline revision 未变化、且 draft `baseUrl` 与该 baseline 的已保存上游一致后，读取对应的安全存储密钥；不能把密钥先返回 Renderer 再发回；
 - 返回值只包含规范化后的模型 ID 列表和必要的非敏感展示状态；
-- 获取动作不持久化配置，也不使用配置 revision 做写入提交；真正保存时仍必须检查 optimistic revision。
+- 获取动作不持久化配置；它携带草稿 baseline revision 只用于约束已保存密钥的安全复用，不把该 revision 当作写入提交。真正保存时仍必须检查 optimistic revision。
 
 ## 与现有设计的兼容关系
 
