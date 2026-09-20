@@ -50,7 +50,11 @@ describe("Zero Risk turn broker lifecycle", () => {
       // The TTL bounds human setup, not local named-pipe scheduling. Keep enough margin for loaded
       // Windows CI, then cross that exact boundary after activation to prove the turn remains live.
       const setupTtlMs = 5_000;
-      const requestId = await broker.registerSafe(environment(), nonceA, setupTtlMs, "safe-lifecycle");
+      const requestId = await broker.registerSafe(environment([{
+        name: "exec_command",
+        description: "Run command",
+        parameters: { type: "object" },
+      }]), nonceA, setupTtlMs, "safe-lifecycle");
       const earlyClaim = callTurnBroker<{ bindingId: string }>(
         socketPath,
         { method: "claim", token: requestId, contract: "safe" },
@@ -84,7 +88,11 @@ describe("Zero Risk turn broker lifecycle", () => {
       expect(broker.startSafeTurn(requestId)).toEqual({ started: true, duplicate: true });
 
       await Bun.sleep(setupTtlMs + 25);
-      const claimed = await callTurnBroker<{ bindingId: string; activityId: string }>(socketPath, {
+      const claimed = await callTurnBroker<{
+        bindingId: string;
+        activityId: string;
+        environment: { registryGeneration: number };
+      }>(socketPath, {
         method: "claim",
         token: requestId,
         contract: "safe",
@@ -94,6 +102,7 @@ describe("Zero Risk turn broker lifecycle", () => {
         bindingId: claimed.bindingId,
         wireName: "exec_command",
         freeform: false,
+        registryGeneration: claimed.environment.registryGeneration,
         arguments: { cmd: "pwd" },
       }, null);
       const [request] = await ownerBatch;
@@ -254,6 +263,80 @@ describe("Zero Risk turn broker lifecycle", () => {
 });
 
 describe("Zero Risk public MCP ABI", () => {
+  test("keeps the turn token after a stale claim is rejected before admission", async () => {
+    const socketPath = endpoint("stale-admission");
+    const broker = TurnBroker.forSocket(socketPath);
+    const requestId = await broker.registerSafe({
+      authorityMode: "delegated",
+      threadId: "thread-stale-admission",
+      turnId: "turn-stale-admission",
+      tools: [{
+        name: "tool_a",
+        description: "Old tool",
+        parameters: { type: "object", properties: {} },
+      }],
+    }, nonceA, 60_000, "safe-stale-admission");
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", socketPath],
+      cwd: process.cwd(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "codex-safe-stale-admission-test", version: "1.0.0" });
+    const internals = broker as unknown as {
+      dispatch: (request: { method?: string }, signal?: AbortSignal) => Promise<unknown>;
+    };
+    const originalDispatch = internals.dispatch.bind(broker);
+    let replacedAfterClaim = false;
+    internals.dispatch = async (request, signal) => {
+      const response = await originalDispatch(request, signal);
+      if (!replacedAfterClaim && request.method === "claim") {
+        replacedAfterClaim = true;
+        broker.updateEnvironment(requestId, {
+          authorityMode: "delegated",
+          threadId: "thread-stale-admission",
+          turnId: "turn-stale-admission",
+          tools: [{
+            name: "tool_b",
+            description: "Current tool",
+            parameters: { type: "object", properties: {} },
+          }],
+        });
+      }
+      return response;
+    };
+    try {
+      await client.connect(transport);
+      broker.confirmSafeTurnSent(requestId, nonceA);
+      await client.callTool({
+        name: "codex_turn_start",
+        arguments: { request_id: requestId },
+      });
+
+      const rejected = await client.callTool({
+        name: "codex_tool_call",
+        arguments: { request_id: requestId, wire_name: "tool_a", arguments: {} },
+      });
+      expect(replacedAfterClaim).toBe(true);
+      expect(rejected.isError).toBe(true);
+      expect(JSON.stringify(rejected.content)).toContain("does not advertise tool_a");
+
+      const allowed = client.callTool({
+        name: "codex_tool_call",
+        arguments: { request_id: requestId, wire_name: "tool_b", arguments: {} },
+      });
+      const [request] = await broker.nextToolBatch(requestId);
+      expect(request).toMatchObject({ wireName: "tool_b", arguments: {} });
+      broker.completeTool(requestId, request!.callId, toolResult({ ok: true }));
+      expect((await allowed).structuredContent).toEqual({ ok: true });
+    } finally {
+      internals.dispatch = originalDispatch;
+      await client.close().catch(() => {});
+      broker.revoke(requestId);
+      await broker.close();
+    }
+  }, 30_000);
+
   test("exposes start and completion while hiding the bridge namespace", async () => {
     const socketPath = endpoint("stdio-contract");
     const broker = TurnBroker.forSocket(socketPath);

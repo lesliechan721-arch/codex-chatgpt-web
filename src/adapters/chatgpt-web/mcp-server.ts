@@ -4,15 +4,20 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
-import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
-import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
+import {
+  callTurnBroker,
+  TurnBrokerAdmissionError,
+  TurnBrokerTimeoutError,
+  type BrokerToolResult,
+  type BrokerTurnSnapshot,
+} from "./turn-broker";
 import { observeMcpToolCalls } from "./mcp-observation";
 
 interface ClaimedTurn {
   bindingId: string;
   activityId: string;
-  environment: ChatGptTurnEnvironment & { expiresAt?: number };
+  environment: BrokerTurnSnapshot;
 }
 
 export type ChatGptMcpContract = "native" | "safe";
@@ -115,7 +120,7 @@ function wireName(tool: CodexTool): string {
   return namespacedToolName(tool.namespace, tool.name);
 }
 
-function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool | undefined {
+function exactTool(environment: Pick<BrokerTurnSnapshot, "tools">, name: string): CodexTool | undefined {
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
 }
 
@@ -123,7 +128,7 @@ function gatewayToolNameIsValid(name: string): boolean {
   return /^[A-Za-z0-9_$]+$/.test(name);
 }
 
-function safeVisibleTools(environment: ChatGptTurnEnvironment, contract: ChatGptMcpContract): CodexTool[] {
+function safeVisibleTools(environment: Pick<BrokerTurnSnapshot, "tools">, contract: ChatGptMcpContract): CodexTool[] {
   if (contract === "native") return environment.tools;
   const bridgeNamespaces = new Set(environment.tools
     .filter(tool => tool.namespace && BRIDGE_TOOL_NAMES.has(tool.name))
@@ -205,8 +210,8 @@ function assertGatewayToolArguments(name: string, args: Record<string, unknown>)
   }
 }
 
-export function chatGptMcpInvocationTimeout(
-  environment: ChatGptTurnEnvironment & { expiresAt?: number },
+export function chatGptMcpInvocationTimeout<T extends object>(
+  environment: T & { expiresAt?: number },
   now = Date.now(),
 ): number {
   const remaining = environment.expiresAt === undefined
@@ -228,7 +233,7 @@ function asMcpResult(value: BrokerToolResult) {
   };
 }
 
-function execGateway(environment: ChatGptTurnEnvironment): CodexTool | undefined {
+function execGateway(environment: Pick<BrokerTurnSnapshot, "tools">): CodexTool | undefined {
   const tool = exactTool(environment, "exec");
   return tool?.freeform ? tool : undefined;
 }
@@ -545,7 +550,7 @@ export async function runChatGptMcpServer(options: {
 
   const invoke = async (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt?: number },
+    bound: BrokerTurnSnapshot,
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
     signal?: AbortSignal,
@@ -557,13 +562,17 @@ export async function runChatGptMcpServer(options: {
         bindingId,
         wireName: wireName(tool),
         freeform: tool.freeform === true,
+        registryGeneration: bound.registryGeneration,
         ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
       }, timeoutMs, signal);
       return asMcpResult(response);
     } catch (error) {
-      // A cancelled/timed-out MCP request no longer has a consumer for the native result. Revoke
-      // the whole turn capability so the broker drops the pending invocation and every later call
-      // from that abandoned ChatGPT response fails explicitly against its retired binding.
+      // A deterministic broker admission rejection creates no callId. It must not retire the
+      // bearer capability because the same native turn can continue with its current registry.
+      if (error instanceof TurnBrokerAdmissionError) throw error;
+      // A cancelled/timed-out/transport-uncertain MCP request may already have been admitted and
+      // no longer has a reliable consumer for its native result. Revoke the whole turn capability
+      // so the broker drops any pending invocation and later calls fail against the retired binding.
       try {
         await callTurnBroker(options.brokerSocketPath, {
           method: "release",
@@ -594,7 +603,7 @@ export async function runChatGptMcpServer(options: {
 
   const invokeNestedNative = (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt?: number },
+    bound: BrokerTurnSnapshot,
     nestedToolName: string,
     freeform: boolean,
     payload: { arguments?: Record<string, unknown>; input?: string },

@@ -98,14 +98,15 @@ function noManualTerminal(): Promise<never> {
 }
 
 for (const scenario of [
-  { format: "v1", finalWins: false, apiKey: false },
-  { format: "v2", finalWins: false, apiKey: false },
-  { format: "v2", finalWins: true, apiKey: false },
-  { format: "v1", finalWins: false, apiKey: true },
-  { format: "v2", finalWins: false, apiKey: true },
-  { format: "local", finalWins: false, apiKey: true },
-  { format: "local", finalWins: true, apiKey: true },
-] as const) test(`Zero Risk ${scenario.format} compaction resumes with exact launcher ownership (final wins: ${scenario.finalWins}, API key: ${scenario.apiKey})`, async () => {
+  { format: "v1", finalWins: false, apiKey: false, delegated: false },
+  { format: "v2", finalWins: false, apiKey: false, delegated: false },
+  { format: "v2", finalWins: true, apiKey: false, delegated: false },
+  { format: "v2", finalWins: true, apiKey: false, delegated: true },
+  { format: "v1", finalWins: false, apiKey: true, delegated: false },
+  { format: "v2", finalWins: false, apiKey: true, delegated: false },
+  { format: "local", finalWins: false, apiKey: true, delegated: false },
+  { format: "local", finalWins: true, apiKey: true, delegated: false },
+] as const) test(`Zero Risk ${scenario.format} compaction resumes with exact launcher ownership (final wins: ${scenario.finalWins}, API key: ${scenario.apiKey}, delegated: ${scenario.delegated})`, async () => {
   // Real adapter, broker, and launcher lifecycle. Only the Electron view/clipboard and the
   // human/model actions are simulated: a mock start/end that omits tombstones misses #318.
   const require = createRequire(import.meta.url);
@@ -149,8 +150,12 @@ for (const scenario of [
       }),
     ].join("\n") + "\n");
   }
-  const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}`);
-  config.chatgptWeb!.threadEnvironmentStatePath = join(root, `environment-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}.json`);
+  const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}-${scenario.delegated}`);
+  if (scenario.delegated) config.chatgptWeb!.toolAuthorityMode = "delegated";
+  config.chatgptWeb!.threadEnvironmentStatePath = join(
+    root,
+    `environment-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}-${scenario.delegated}.json`,
+  );
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
   const localCompactPrompt = "CUSTOM_LOCAL_COMPACT_PROMPT preserve database migration and rollback steps.";
@@ -210,11 +215,16 @@ for (const scenario of [
         return;
       }
       modelAction = (async () => {
-        const claim = await callTurnBroker<{ bindingId: string; activityId: string }>(socket, {
+        const claim = await callTurnBroker<{
+          bindingId: string;
+          activityId: string;
+          environment: { registryGeneration: number };
+        }>(socket, {
           method: "claim", token, contract: "safe",
         });
         const result = await callTurnBroker<BrokerToolResult>(socket, {
           method: "invoke", bindingId: claim.bindingId, wireName: "exec_command", freeform: false,
+          registryGeneration: claim.environment.registryGeneration,
           arguments: { cmd: "pwd" },
         }, null);
         if (!scenario.finalWins) expect(JSON.stringify(result)).toContain("codex_turn_complete");
@@ -400,6 +410,14 @@ for (const scenario of [
     }
     await modelAction;
     expect(checkpoint.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    if (scenario.delegated) {
+      expect(checkpoint.at(-1)).toMatchObject({
+        responseMetadata: {
+          codex_chatgpt_web_compaction_path: "fresh",
+          codex_chatgpt_web_compaction_fallback_reason: "zero_risk_source_already_completed",
+        },
+      });
+    }
     expect(host.manualCompletionSignals.has(starts[0])).toBeTrue();
     expect(logs).toContain("browser.retained_conversation_released");
     const summary = checkpoint.filter(event => event.type === "text_delta").map(event => event.text).join("");
@@ -552,6 +570,40 @@ test("Zero Risk adapter never starts the automatic browser worker and completes 
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await broker.close();
+  }
+});
+
+test("delegated Zero Risk starts without filesystem environment authority", async () => {
+  const config = provider("delegated-envless");
+  config.chatgptWeb!.toolAuthorityMode = "delegated";
+  const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  let exactBinding: ReturnType<typeof binding> | undefined;
+  const control: ChatGptZeroRiskManualControl = {
+    async start(_path, activity) { exactBinding = binding(activity.prompt); },
+    async waitSent() { broker.startSafeTurn(exactBinding!.request_id); },
+    waitTerminal: noManualTerminal,
+    async markStarted() { broker.completeSafeTurn(exactBinding!.request_id, "Delegated Zero Risk answer"); },
+    async end() {},
+    async cancel() {},
+  };
+  const parsed = request("turn_safe_delegated_envless");
+  parsed.context.messages = parsed.context.messages.filter(message => message.role !== "developer");
+  const raw = parsed._rawBody as { input: Array<Record<string, unknown>> };
+  raw.input = raw.input.slice(1);
+  try {
+    const events: AdapterEvent[] = [];
+    await createChatGptWebAdapter(config, {
+      broker,
+      zeroRiskManualControl: control,
+      codexHome: join(root, "missing-client-codex-home"),
+    }).runTurn!(parsed, { headers: new Headers() }, event => events.push(event));
+    expect(events.filter((event): event is Extract<AdapterEvent, { type: "text_delta" }> => (
+      event.type === "text_delta" && event.phase === "final_answer"
+    )).map(event => event.text).join("")).toBe("Delegated Zero Risk answer");
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
     chatGptTurnSessions.clear();
     await broker.close();
   }

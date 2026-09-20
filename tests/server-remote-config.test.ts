@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   clientBaseUrl,
   clientCatalogPath,
+  effectiveToolAuthorityMode,
   manualCodexConfigurationOnly,
   remoteTurnIdleTimeoutSec,
   responsesListenHost,
@@ -64,4 +65,28 @@ test("remote client catalog and turn idle timeout are explicit deployment settin
   expect(() => remoteTurnIdleTimeoutSec({ CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC: "999999999" })).toThrow();
   expect(manualCodexConfigurationOnly({ CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1" })).toBe(true);
   expect(manualCodexConfigurationOnly({ CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "0" })).toBe(false);
+});
+
+test("tool authority defaults locally and a deployment override fails on persisted conflict", () => {
+  expect(effectiveToolAuthorityMode(undefined, {})).toBe("verified-environment");
+  expect(effectiveToolAuthorityMode("delegated", {})).toBe("delegated");
+  expect(effectiveToolAuthorityMode(undefined, {
+    CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated",
+  })).toBe("delegated");
+  expect(effectiveToolAuthorityMode(undefined, {
+    CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
+  })).toBe("delegated");
+  expect(() => effectiveToolAuthorityMode("verified-environment", {
+    CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated",
+  })).toThrow("conflicts");
+  expect(() => effectiveToolAuthorityMode("verified-environment", {
+    CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
+  })).toThrow("conflicts");
+  expect(() => effectiveToolAuthorityMode(undefined, {
+    CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
+    CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "verified-environment",
+  })).toThrow("requires delegated");
+  expect(() => effectiveToolAuthorityMode(undefined, {
+    CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "unknown",
+  })).toThrow("must be verified-environment or delegated");
 });

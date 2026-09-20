@@ -2,7 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { lstatSync, mkdirSync, readlinkSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import Ajv from "ajv";
 import { isWindowsPipeEndpoint } from "../../config";
+import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import { acquireBrokerSocketLock, brokerSocketLockOwnedBy } from "./turn-broker-lock";
 import { listenOnUnixBrokerSocket } from "./turn-broker-unix";
@@ -10,9 +12,17 @@ import {
   CompactionTransactionStore,
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
-import type { ChatGptTurnEnvironment } from "./environment";
+import type { ChatGptTurnCapability, ChatGptTurnEnvironment } from "./environment";
 
-interface PendingTurn extends ChatGptTurnEnvironment {
+interface PendingTurnAuthority {
+  capability: ChatGptTurnCapability;
+  registryGeneration: number;
+  expiresAt?: number;
+}
+
+export interface BrokerTurnSnapshot {
+  tools: CodexTool[];
+  registryGeneration: number;
   expiresAt?: number;
 }
 
@@ -67,7 +77,7 @@ interface SafeTurnControl {
 interface TurnChannel {
   traceId: string;
   externalOwner: boolean;
-  environment: PendingTurn;
+  authority: PendingTurnAuthority;
   bindingId?: string;
   queuedCallIds: string[];
   deliveredCallIds: Set<string>;
@@ -119,9 +129,10 @@ interface BrokerRequest {
   bindingId?: string;
   wireName?: string;
   freeform?: boolean;
+  registryGeneration?: number;
   arguments?: Record<string, unknown>;
   input?: string;
-  environment?: ChatGptTurnEnvironment;
+  environment?: ChatGptTurnCapability;
   ttlMs?: number;
   traceId?: string;
   callId?: string;
@@ -139,6 +150,7 @@ interface BrokerResponse {
   id: string;
   result?: unknown;
   error?: string;
+  errorKind?: "admission_rejected";
 }
 
 const brokers = new Map<string, TurnBroker>();
@@ -150,6 +162,22 @@ const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
 
 class EndpointMetadataRaceError extends Error {}
+
+export class TurnBrokerAdmissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TurnBrokerAdmissionError";
+  }
+}
+
+const toolArgumentsAjv = new Ajv({
+  allErrors: true,
+  strict: false,
+  coerceTypes: false,
+  removeAdditional: false,
+  useDefaults: false,
+  validateFormats: false,
+});
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
@@ -187,6 +215,12 @@ function environmentIdentity(environment: ChatGptTurnEnvironment): string {
   });
 }
 
+function validTools(value: unknown): value is CodexTool[] {
+  return Array.isArray(value)
+    && value.every(tool => tool && typeof tool.name === "string" && typeof tool.description === "string"
+      && tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters));
+}
+
 function ownerEnvironment(value: unknown): ChatGptTurnEnvironment {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("turn owner environment is invalid");
   const environment = value as Partial<ChatGptTurnEnvironment>;
@@ -201,12 +235,84 @@ function ownerEnvironment(value: unknown): ChatGptTurnEnvironment {
       return nested === "" || (!nested.startsWith("..") && !isAbsolute(nested));
     })
     || !environment.sandboxPolicy || !["dangerFullAccess", "workspaceWrite", "readOnly"].includes(environment.sandboxPolicy.type)
-    || !Array.isArray(environment.tools)
-    || environment.tools.some(tool => !tool || typeof tool.name !== "string" || typeof tool.description !== "string"
-      || !tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters))) {
+    || !validTools(environment.tools)) {
     throw new Error("turn owner environment is invalid");
   }
   return structuredClone(environment as ChatGptTurnEnvironment);
+}
+
+function ownerCapability(value: unknown): ChatGptTurnCapability {
+  if (value && typeof value === "object" && !Array.isArray(value)
+    && (value as { authorityMode?: unknown }).authorityMode === "delegated") {
+    const delegated = value as {
+      authorityMode: "delegated";
+      threadId?: unknown;
+      turnId?: unknown;
+      tools?: unknown;
+    };
+    if (typeof delegated.threadId !== "string" || !delegated.threadId.trim()
+      || typeof delegated.turnId !== "string" || !delegated.turnId.trim()
+      || !validTools(delegated.tools)) {
+      throw new Error("turn owner delegated authority is invalid");
+    }
+    return structuredClone({
+      authorityMode: "delegated",
+      threadId: delegated.threadId.trim(),
+      turnId: delegated.turnId.trim(),
+      tools: delegated.tools,
+    });
+  }
+  return ownerEnvironment(value);
+}
+
+function capabilityIdentity(capability: ChatGptTurnCapability): string {
+  if ("authorityMode" in capability && capability.authorityMode === "delegated") {
+    return JSON.stringify({
+      authorityMode: capability.authorityMode,
+      threadId: capability.threadId,
+      turnId: capability.turnId,
+    });
+  }
+  return environmentIdentity(capability as ChatGptTurnEnvironment);
+}
+
+function turnSnapshot(channel: TurnChannel): BrokerTurnSnapshot {
+  return {
+    tools: structuredClone(channel.authority.capability.tools),
+    registryGeneration: channel.authority.registryGeneration,
+    ...(channel.authority.expiresAt !== undefined ? { expiresAt: channel.authority.expiresAt } : {}),
+  };
+}
+
+function currentTool(channel: TurnChannel, wireName: string): CodexTool | undefined {
+  return channel.authority.capability.tools.find(
+    tool => namespacedToolName(tool.namespace, tool.name) === wireName,
+  );
+}
+
+function assertCurrentToolInvocation(tool: CodexTool, request: BrokerRequest, wireName: string): boolean {
+  const freeform = tool.freeform === true;
+  if ((request.freeform === true) !== freeform) {
+    throw new TurnBrokerAdmissionError(
+      "The current Codex tool definition changed and no longer accepts this invocation shape for " + wireName,
+    );
+  }
+  if (freeform) return true;
+
+  const args = request.arguments ?? {};
+  let validate;
+  try {
+    validate = toolArgumentsAjv.compile(tool.parameters);
+  } catch (error) {
+    throw new TurnBrokerAdmissionError(
+      `The current Codex tool definition for ${wireName} is invalid: ${errorOf(error).message}`,
+    );
+  }
+  if (validate(args)) return false;
+  const detail = toolArgumentsAjv.errorsText(validate.errors, { separator: "; " });
+  throw new TurnBrokerAdmissionError(
+    `The current Codex tool definition does not accept these arguments for ${wireName}${detail ? `: ${detail}` : ""}`,
+  );
 }
 
 function assertSurfaceNonce(value: unknown): asserts value is string {
@@ -216,14 +322,14 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
-  register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId?: string): Promise<string>;
+  register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string): Promise<string>;
   registerSafe(
-    environment: ChatGptTurnEnvironment,
+    environment: ChatGptTurnCapability,
     surfaceNonce: string,
     ttlMs?: number,
     traceId?: string,
   ): Promise<string>;
-  updateEnvironment(token: string, environment: ChatGptTurnEnvironment): void | Promise<void>;
+  updateEnvironment(token: string, environment: ChatGptTurnCapability): void | Promise<void>;
   confirmSafeTurnSent(
     token: string,
     surfaceNonce: string,
@@ -308,7 +414,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   async register(
-    environment: ChatGptTurnEnvironment,
+    environment: ChatGptTurnCapability,
     ttlMs?: number,
     traceId = "unknown",
     externalOwner = false,
@@ -326,8 +432,9 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel: TurnChannel = {
       traceId,
       externalOwner,
-      environment: {
-        ...environment,
+      authority: {
+        capability: structuredClone(environment),
+        registryGeneration: 1,
         ...(ttlMs !== undefined ? { expiresAt: Date.now() + ttlMs } : {}),
       },
       queuedCallIds: [],
@@ -349,7 +456,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   async registerSafe(
-    environment: ChatGptTurnEnvironment,
+    environment: ChatGptTurnCapability,
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
@@ -391,23 +498,19 @@ export class TurnBroker implements TurnBrokerOwner {
     this.compactionTransactions.abortTrace(traceId);
   }
 
-  updateEnvironment(token: string, environment: ChatGptTurnEnvironment): void {
+  updateEnvironment(token: string, environment: ChatGptTurnCapability): void {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
-    if (environmentIdentity(channel.environment) !== environmentIdentity(environment)) {
-      throw new Error("Codex turn environment changed during an active ChatGPT tool loop");
+    if (capabilityIdentity(channel.authority.capability) !== capabilityIdentity(environment)) {
+      throw new Error("Codex turn authority changed during an active ChatGPT tool loop");
     }
     if (channel.safe?.state === "revoked") throw new Error("Zero Risk turn is already terminal");
     // A no-tool Zero Risk answer can complete before its outer Responses observer reaches this owner
-    // readback. The environment is already proven identical, so completion makes this a no-op.
+    // readback. The authority is already proven identical, so completion makes this a no-op.
     if (channel.safe?.state === "completed") return;
-    channel.environment = {
-      ...environment,
-      ...(channel.environment.expiresAt !== undefined
-        ? { expiresAt: channel.environment.expiresAt }
-        : {}),
-    };
+    channel.authority.capability = structuredClone(environment);
+    channel.authority.registryGeneration += 1;
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -700,7 +803,7 @@ export class TurnBroker implements TurnBrokerOwner {
     safe.state = "running";
     // The setup window may be bounded, but a turn authorized by the user and bound by the
     // Zero Risk connector remains live until completion, cancellation, or runtime shutdown.
-    delete channel.environment.expiresAt;
+    delete channel.authority.expiresAt;
     this.resolveSafeWaiters(safe.startWaiters, undefined);
   }
 
@@ -1191,7 +1294,11 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       void Promise.resolve().then(() => this.dispatch(request!, disconnected.signal)).then(
         result => this.writeSocketResponse(socket, { id: request!.id, result }),
-        error => this.writeSocketResponse(socket, { id: request!.id, error: errorOf(error).message }),
+        error => this.writeSocketResponse(socket, {
+          id: request!.id,
+          error: errorOf(error).message,
+          ...(error instanceof TurnBrokerAdmissionError ? { errorKind: "admission_rejected" as const } : {}),
+        }),
       );
     });
   }
@@ -1251,14 +1358,14 @@ export class TurnBroker implements TurnBrokerOwner {
       return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners, owner: this.ownerId };
     }
     if (request.method === "owner_register") {
-      const environment = ownerEnvironment(request.environment);
+      const environment = ownerCapability(request.environment);
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
       return this.register(environment, request.ttlMs, request.traceId, true).then(token => ({ token }));
     }
     if (request.method === "owner_register_safe") {
-      const environment = ownerEnvironment(request.environment);
+      const environment = ownerCapability(request.environment);
       assertSurfaceNonce(request.surfaceNonce);
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
@@ -1273,7 +1380,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_update") {
       if (!request.token) throw new Error("turn owner token is required");
-      this.updateEnvironment(request.token, ownerEnvironment(request.environment));
+      this.updateEnvironment(request.token, ownerCapability(request.environment));
       return { updated: true };
     }
     if (request.method === "owner_safe_sent") {
@@ -1385,13 +1492,13 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
+        return { bindingId: activeChannel.bindingId, activityId, environment: turnSnapshot(activeChannel) };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: activeChannel.environment };
+      return { bindingId, activityId, environment: turnSnapshot(activeChannel) };
     }
 
     const bindingId = request.bindingId;
@@ -1435,7 +1542,7 @@ export class TurnBroker implements TurnBrokerOwner {
       this.revoke(binding.token);
       return { released: true };
     }
-    if (request.method === "resolve") return { environment: binding.channel.environment };
+    if (request.method === "resolve") return { environment: turnSnapshot(binding.channel) };
     this.assertSafeHarnessRunning(binding.channel);
     if (binding.channel.compactionRequested) {
       const result = binding.channel.compactionResult;
@@ -1448,13 +1555,30 @@ export class TurnBroker implements TurnBrokerOwner {
     }
 
     const wireName = request.wireName?.trim();
-    if (!wireName) throw new Error("wire tool name is required");
+    if (!wireName) throw new TurnBrokerAdmissionError("wire tool name is required");
+    const tool = currentTool(binding.channel, wireName);
+    if (!tool) {
+      throw new TurnBrokerAdmissionError("The current Codex tool registry does not advertise " + wireName);
+    }
+    const delegatedAuthority = "authorityMode" in binding.channel.authority.capability
+      && binding.channel.authority.capability.authorityMode === "delegated";
+    const registryGeneration = request.registryGeneration
+      ?? (delegatedAuthority
+        ? (binding.channel.authority.registryGeneration === 1 ? 1 : undefined)
+        : binding.channel.authority.registryGeneration);
+    if (!Number.isInteger(registryGeneration) || registryGeneration! < 1) {
+      throw new TurnBrokerAdmissionError("turn registry generation is required after the tool registry changes");
+    }
+    if (registryGeneration! > binding.channel.authority.registryGeneration) {
+      throw new TurnBrokerAdmissionError("The requested Codex tool registry generation is newer than the current registry");
+    }
+    const freeform = assertCurrentToolInvocation(tool, request, wireName);
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,
       wireName,
-      freeform: request.freeform === true,
-      ...(request.freeform === true ? { input: request.input ?? "" } : { arguments: request.arguments ?? {} }),
+      freeform,
+      ...(freeform ? { input: request.input ?? "" } : { arguments: request.arguments ?? {} }),
     };
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
       binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
@@ -1519,7 +1643,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private prune(): void {
     const now = Date.now();
     for (const [token, channel] of this.channels) {
-      if (channel.environment.expiresAt === undefined || channel.environment.expiresAt > now) continue;
+      if (channel.authority.expiresAt === undefined || channel.authority.expiresAt > now) continue;
       this.revoke(token);
     }
   }
@@ -1576,7 +1700,11 @@ export async function callTurnBroker<T>(
       settled = true;
       clearTimeout(timer);
       cleanup();
-      if (response.error) rejectCall(new Error(response.error));
+      if (response.error) {
+        rejectCall(response.errorKind === "admission_rejected"
+          ? new TurnBrokerAdmissionError(response.error)
+          : new Error(response.error));
+      }
       else resolveCall(response.result as T);
     };
     const timer = timeoutMs === null
@@ -1653,7 +1781,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
-  async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {
+  async register(environment: ChatGptTurnCapability, ttlMs?: number, traceId = "unknown"): Promise<string> {
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
       method: "owner_register",
       environment,
@@ -1667,7 +1795,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
   }
 
   async registerSafe(
-    environment: ChatGptTurnEnvironment,
+    environment: ChatGptTurnCapability,
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
@@ -1686,7 +1814,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.token;
   }
 
-  async updateEnvironment(token: string, environment: ChatGptTurnEnvironment): Promise<void> {
+  async updateEnvironment(token: string, environment: ChatGptTurnCapability): Promise<void> {
     await callTurnBroker(this.socketPath, { method: "owner_update", token, environment });
   }
 

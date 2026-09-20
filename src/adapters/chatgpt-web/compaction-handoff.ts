@@ -412,7 +412,7 @@ interface CachedCompactionRun {
   nativeTurnId?: string;
   abort: AbortController;
   active: boolean;
-  promise: Promise<string>;
+  promise: Promise<unknown>;
   settlement: Promise<void>;
 }
 
@@ -479,19 +479,19 @@ function pruneStructuredCompactionRuns(): void {
 }
 
 /** Return the canonical result of an exact compact request, even after its source was retired. */
-export function existingStructuredCompactionRun(key: string): Promise<string> | undefined {
+export function existingStructuredCompactionRun<T = string>(key: string): Promise<T> | undefined {
   pruneStructuredCompactionRuns();
-  return structuredCompactionRuns.get(key)?.promise;
+  return structuredCompactionRuns.get(key)?.promise as Promise<T> | undefined;
 }
 
-export function runStructuredCompactionOnce(
+export function runStructuredCompactionOnce<T = string>(
   key: string,
   owner: StructuredCompactionOwner,
-  start: (operatorSignal: AbortSignal, retainOwnershipUntil: (settlement: Promise<void>) => void) => Promise<string>,
-): Promise<string> {
+  start: (operatorSignal: AbortSignal, retainOwnershipUntil: (settlement: Promise<void>) => void) => Promise<T>,
+): Promise<T> {
   pruneStructuredCompactionRuns();
   const existing = structuredCompactionRuns.get(key);
-  if (existing) return existing.promise;
+  if (existing) return existing.promise as Promise<T>;
   const interrupted = structuredCompactionInterruption(owner);
   if (interrupted) return Promise.reject(interrupted);
   const abort = new AbortController();

@@ -607,6 +607,7 @@ export function bridgeToResponsesSSE(
                 const response = {
                   ...responseSnapshot("incomplete", finishedItems, event.endTurn),
                   usage: responsesUsage(event.usage),
+                  ...(event.responseMetadata ? { metadata: event.responseMetadata } : {}),
                   incomplete_details: {
                     reason: event.stopReason === "max_tokens" ? "max_output_tokens" : "content_filter",
                   },
@@ -617,7 +618,11 @@ export function bridgeToResponsesSSE(
                 emit("response.incomplete", { response });
                 reportTerminal("incomplete");
               } else {
-                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.usage) };
+                const response = {
+                  ...responseSnapshot("completed", finishedItems, event.endTurn),
+                  usage: responsesUsage(event.usage),
+                  ...(event.responseMetadata ? { metadata: event.responseMetadata } : {}),
+                };
                 options?.onCompletedResponse?.(response, event.providerState);
                 emit("response.completed", {
                   response,
@@ -867,6 +872,7 @@ export function buildResponseJSON(
   let incompleteEvent: Extract<AdapterEvent, { type: "incomplete" }> | undefined;
   let endTurn: boolean | undefined;
   let stopReason: string | undefined;
+  let responseMetadata: Record<string, string> | undefined;
   let compactionText = "";
 
   let currentText = "";
@@ -1034,6 +1040,7 @@ export function buildResponseJSON(
       case "done":
         usage = e.usage;
         endTurn = e.endTurn;
+        responseMetadata = e.responseMetadata ?? responseMetadata;
         if (e.providerState) options?.onProviderState?.(e.providerState);
         if (e.stopReason === "max_tokens") stopReason = "max_tokens";
         break;
@@ -1060,6 +1067,7 @@ export function buildResponseJSON(
     created_at: Math.floor(Date.now() / 1000),
     status,
     model: modelId, output,
+    ...(responseMetadata ? { metadata: responseMetadata } : {}),
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
     ...(errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),

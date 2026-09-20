@@ -19,6 +19,15 @@ export interface ChatGptTurnEnvironment {
   tools: CodexTool[];
 }
 
+export interface ChatGptDelegatedTurnCapability {
+  authorityMode: "delegated";
+  threadId: string;
+  turnId: string;
+  tools: CodexTool[];
+}
+
+export type ChatGptTurnCapability = ChatGptTurnEnvironment | ChatGptDelegatedTurnCapability;
+
 export interface ChatGptTurnIdentity {
   threadId?: string;
   turnId?: string;
@@ -900,6 +909,31 @@ function matchesPath(root: string, path: string): boolean {
 
 export function extractChatGptTurnEnvironment(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
   return parseChatGptEnvironmentText(parsed, trustedEnvironmentText(parsed));
+}
+
+export function extractChatGptDelegatedTurnCapability(
+  parsed: CodexParsedRequest,
+): ChatGptDelegatedTurnCapability {
+  const identity = extractChatGptTurnIdentity(parsed);
+  const threadId = identity.threadId?.trim();
+  const turnId = identity.turnId?.trim();
+  if (!threadId || !turnId) {
+    throw new ChatGptWebAdapterError(
+      "Delegated ChatGPT tool authority requires native Codex thread_id and turn_id metadata",
+      {
+        status: 400,
+        errorType: "invalid_request_error",
+        code: "missing_delegated_turn_identity",
+        retryable: false,
+      },
+    );
+  }
+  return {
+    authorityMode: "delegated",
+    threadId,
+    turnId,
+    tools: structuredClone(parsed.context.tools ?? []),
+  };
 }
 
 function parseChatGptEnvironmentText(parsed: CodexParsedRequest, text: string): ChatGptTurnEnvironment {
