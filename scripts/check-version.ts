@@ -43,8 +43,8 @@ for (const path of ["README.md", "README.zh-CN.md", "README.ja.md", "README.ko.m
   }
 }
 const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release.yml"), "utf8");
-if (releaseWorkflow.split(`bun-version: ${bunVersion}`).length - 1 !== 2) {
-  throw new Error(`release.yml must pin Bun ${bunVersion} in both jobs`);
+if (releaseWorkflow.split(`bun-version: ${bunVersion}`).length - 1 !== 3) {
+  throw new Error(`release.yml must pin Bun ${bunVersion} in all three jobs`);
 }
 const launcherVersion = (JSON.parse(readFileSync(resolve(root, "launcher/package.json"), "utf8")) as { version?: string }).version;
 if (launcherVersion !== packageVersion) throw new Error(`launcher/package.json is not synchronized to ${packageVersion}`);

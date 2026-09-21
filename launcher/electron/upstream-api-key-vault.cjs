@@ -66,12 +66,12 @@ function createUpstreamApiKeyVault({ coreHome, safeStorage, platform = process.p
     }
     return "session";
   }
-  function clear() {
+  function clearStrict() {
     memory = null;
     ignoreDisk = true;
-    try { fs.rmSync(filePath, { force: true }); } catch {}
+    fs.rmSync(filePath, { force: true });
   }
-  return { info, read, store, clear, dispose: () => { memory = null; } };
+  return { info, read, store, clearStrict, dispose: () => { memory = null; } };
 }
 
 module.exports = { createUpstreamApiKeyVault, validUpstreamApiKey: validKey };

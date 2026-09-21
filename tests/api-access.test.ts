@@ -15,11 +15,11 @@ const upstreamRuntime: UpstreamProviderRuntime = {
   keyMatches: true,
   apiKey: upstreamKey,
   config: {
-    version: 1,
+    version: 2,
     baseUrl: "https://provider.example/v1/",
     apiKeySha256: upstreamApiKeyDigest(upstreamKey),
     proxy: { mode: "global" },
-    modelFilter: { mode: "regex", pattern: "^gpt-" },
+    models: [{ id: "gpt-upstream" }],
     supportsOpenAiServerCompaction: false,
   },
 };

@@ -9,6 +9,38 @@ permissions:
   contents: read
 
 jobs:
+  codex-model-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: launcher
+      - name: Checkout locked Codex source
+        shell: bash
+        run: |
+          repository="$(node -p "require('./launcher/electron/generated/codex-source-lock.json').repository")"
+          revision="$(node -p "require('./launcher/electron/generated/codex-source-lock.json').revision")"
+          source_dir="$RUNNER_TEMP/codex-source"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin "$repository"
+          git -C "$source_dir" fetch --depth=1 origin "$revision"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          echo "CODEX_SOURCE_DIR=$source_dir" >> "$GITHUB_ENV"
+      - name: Cache locked Codex build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/codex-source/codex-rs/target
+          key: codex-model-gate-${{ hashFiles('launcher/electron/generated/codex-source-lock.json') }}
+      - run: bun run generate:codex-model-metadata --check
+      - run: bun run smoke:codex
+
   verify:
     strategy:
       fail-fast: false

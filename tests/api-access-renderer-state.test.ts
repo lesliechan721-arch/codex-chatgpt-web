@@ -1,11 +1,20 @@
 import { expect, test } from "bun:test";
+import type { UpstreamModelCandidate, UpstreamModelPreview } from "../launcher/src/api-access-types";
 import {
+  automaticMetadataMode,
+  customMetadataBaseMode,
   filterModelCandidates,
+  metadataModeChoices,
   modelCandidateEmptyState,
+  modelDiscoveryState,
   resetDiscoveredModelCandidates,
+  retainBundledMetadataFacts,
   retainSelectedModelCandidates,
 } from "../launcher/src/api-access-model-selection";
 import {
+  customOverrideTextFor,
+  parseCustomOverrideText,
+  recordValue,
   recoverApiAccessActionFailure,
   shouldShowUpstreamMissingKey,
   upstreamDraftDiscoveryRevision,
@@ -36,6 +45,106 @@ test("manual model empty states distinguish not fetched, empty results, and sear
   expect(modelCandidateEmptyState([], [], true)).toBe("empty");
   expect(modelCandidateEmptyState(["gpt-one"], [], true)).toBe("no-match");
   expect(modelCandidateEmptyState(["gpt-one"], ["gpt-one"], true)).toBeNull();
+});
+
+test("stale selected bundled models keep choices and use the viewed default for Auto to Custom", () => {
+  const preview: UpstreamModelPreview = {
+    id: "gpt-stale",
+    discovered: false,
+    hasUpstreamMetadata: false,
+    hasBundledMetadata: true,
+    availableModes: ["default", "fallback", "custom"],
+    automaticMode: "default",
+    configuredMode: "default",
+    configuredSourceAvailable: true,
+    effectiveMode: "default",
+    effectiveBaseMode: "default",
+    degraded: false,
+    customInvalid: false,
+    model: {},
+  };
+  expect(metadataModeChoices(undefined, preview)).toEqual({
+    modes: ["default", "fallback", "custom"],
+    baseModes: ["default", "fallback"],
+  });
+  expect(automaticMetadataMode(undefined, preview)).toBe("default");
+  expect(customMetadataBaseMode(undefined, undefined, preview)).toBe("default");
+  expect(customMetadataBaseMode(undefined, preview, undefined)).toBe("default");
+});
+
+test("saved model discovery state distinguishes discovered, successful absence, and no current result", () => {
+  const preview: UpstreamModelPreview = {
+    id: "gpt-saved",
+    discovered: false,
+    hasUpstreamMetadata: false,
+    hasBundledMetadata: false,
+    availableModes: ["fallback", "custom"],
+    automaticMode: "fallback",
+    configuredMode: null,
+    configuredSourceAvailable: true,
+    effectiveMode: "fallback",
+    effectiveBaseMode: "fallback",
+    degraded: false,
+    customInvalid: false,
+    model: {},
+  };
+  expect(modelDiscoveryState(undefined, preview, false)).toBe("unavailable");
+  expect(modelDiscoveryState(undefined, preview, true)).toBe("missing");
+  expect(modelDiscoveryState(preview, undefined, true)).toBe("missing");
+  const candidate: UpstreamModelCandidate = {
+    id: preview.id,
+    hasUpstreamMetadata: preview.hasUpstreamMetadata,
+    hasBundledMetadata: preview.hasBundledMetadata,
+    availableModes: preview.availableModes,
+    automaticMode: preview.automaticMode,
+  };
+  expect(modelDiscoveryState(candidate, preview, true)).toBe("discovered");
+  expect(modelDiscoveryState(undefined, { ...preview, discovered: true }, false)).toBe("discovered");
+});
+
+test("provider identity invalidation keeps only exact bundled metadata facts", () => {
+  const preview: UpstreamModelPreview = {
+    id: "gpt-bundled",
+    discovered: true,
+    hasUpstreamMetadata: true,
+    hasBundledMetadata: true,
+    availableModes: ["upstream", "default", "fallback", "custom"],
+    automaticMode: "upstream",
+    configuredMode: null,
+    configuredSourceAvailable: true,
+    effectiveMode: "upstream",
+    effectiveBaseMode: "upstream",
+    degraded: false,
+    customInvalid: false,
+    model: { slug: "gpt-bundled" },
+  };
+  const facts = retainBundledMetadataFacts({
+    [preview.id]: preview,
+    "provider-only": { ...preview, id: "provider-only", hasBundledMetadata: false },
+  });
+  const bundled = recordValue(facts, preview.id);
+  expect(Object.keys(facts)).toEqual([preview.id]);
+  expect(metadataModeChoices(bundled, undefined)).toEqual({
+    modes: ["default", "fallback", "custom"],
+    baseModes: ["default", "fallback"],
+  });
+  expect(automaticMetadataMode(bundled, undefined)).toBe("default");
+  expect(customMetadataBaseMode(undefined, bundled, undefined)).toBe("default");
+  expect(modelDiscoveryState(bundled, undefined, false)).toBe("unavailable");
+});
+
+test("Renderer custom override state treats prototype-named model IDs as ordinary keys", () => {
+  for (const modelId of ["__proto__", "constructor", "toString"]) {
+    let overrideText: Record<string, string> = {};
+    expect(recordValue(overrideText, modelId)).toBeUndefined();
+
+    overrideText = { ...overrideText, [modelId]: customOverrideTextFor(overrideText, modelId) };
+    expect(recordValue(overrideText, modelId)).toBe("{}");
+
+    overrideText = { ...overrideText, [modelId]: '{"support_verbosity":false}' };
+    expect(customOverrideTextFor(overrideText, modelId)).toBe('{"support_verbosity":false}');
+    expect(parseCustomOverrideText(overrideText, modelId)).toEqual({ support_verbosity: false });
+  }
 });
 
 test("manual model discovery failure preserves the draft but not the previous transient candidates", async () => {

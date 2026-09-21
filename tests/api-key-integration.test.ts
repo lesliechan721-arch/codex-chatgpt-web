@@ -22,6 +22,7 @@ import { installCompatibilityV1Features } from "../src/codex-integration-documen
 import { codexInterruptHookCommand } from "../src/codex-interrupt-hook";
 import { preflightSetup } from "../src/setup";
 import { upstreamApiKeyDigest, upstreamProviderRevision, type UpstreamProviderConfig } from "../src/upstream-provider";
+import codexModelMetadata from "../launcher/electron/codex-model-metadata.cjs";
 
 let home: string;
 let oldCore: string | undefined;
@@ -203,14 +204,15 @@ test("native subagent export does not inject Compatibility V1 feature overrides"
 
 test("API-key export catalog includes only validated rich models from the current upstream runtime", async () => {
   const config = defaultConfig();
+  const localCatalog = buildStandaloneModelCatalog(config);
   const localKey = "cgw_" + "a".repeat(43);
   const policy = apiKeyPolicy(localKey);
   const upstream: UpstreamProviderConfig = {
-    version: 1,
+    version: 2,
     baseUrl: "https://provider.example/v1/",
     apiKeySha256: upstreamApiKeyDigest("provider-key"),
     proxy: { mode: "direct" },
-    modelFilter: { mode: "selected", models: ["gpt-rich", "gpt-standard"] },
+    models: [{ id: "gpt-rich" }, { id: "gpt-standard" }],
     supportsOpenAiServerCompaction: false,
   };
   const requests: Request[] = [];
@@ -227,14 +229,27 @@ test("API-key export catalog includes only validated rich models from the curren
         upstream_provider_revision: upstreamProviderRevision(upstream, config.controlToken),
       }, { status: 503 });
     }
-    return Response.json({
+    const responseCatalog = {
       object: "list",
-      data: [{ id: "gpt-standard", object: "model" }],
-      models: [{
-        slug: "gpt-rich", display_name: "Rich upstream", visibility: "list", supported_in_api: true,
-        supported_reasoning_levels: [], tool_mode: null, context_window: 128_000,
+      data: [
+        ...localCatalog.data,
+        { id: "gpt-standard", object: "model", created: 0, owned_by: "configured-upstream" },
+      ],
+      models: [...localCatalog.models, {
+        slug: "gpt-standard",
+        display_name: "Normalized standard row",
+        supported_reasoning_levels: [],
+        shell_type: "disabled",
+        visibility: "list",
+        supported_in_api: true,
+        priority: 99,
+        support_verbosity: false,
+        truncation_policy: { mode: "bytes", limit: 10_000 },
+        experimental_supported_tools: [],
+        model_messages: { instructions_template: "Project-owned instructions" },
       }],
-    }, { headers: {
+    };
+    return Response.json(responseCatalog, { headers: {
       "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(policy, config.controlToken),
       "x-codex-chatgpt-web-upstream-provider-revision": upstreamProviderRevision(upstream, config.controlToken),
     } });
@@ -242,8 +257,47 @@ test("API-key export catalog includes only validated rich models from the curren
   expect(requests.map(request => new URL(request.url).pathname)).toEqual(["/healthz", "/v1/models"]);
   expect(requests[0]?.headers.get("authorization")).toBeNull();
   expect(requests[1]?.headers.get("authorization")).toBe(`Bearer ${localKey}`);
-  expect(catalog.models.some(model => model.slug === "gpt-rich")).toBe(true);
-  expect(catalog.models.some(model => model.slug === "gpt-standard")).toBe(false);
+  expect(catalog.data).toHaveLength(localCatalog.data.length + 1);
+  expect(catalog.models).toHaveLength(localCatalog.models.length + 1);
+  expect(catalog.models.some(model => model.slug === "gpt-standard")).toBe(true);
+  expect(catalog.models.map(model => codexModelMetadata.finalModelError(model))).toEqual(
+    Array(catalog.models.length).fill(null),
+  );
+});
+
+test("API-key export catalog rejects a loopback catalog with an invalid final ModelInfo row", async () => {
+  const config = defaultConfig();
+  const localKey = "cgw_" + "a".repeat(43);
+  const policy = apiKeyPolicy(localKey);
+  const upstream: UpstreamProviderConfig = {
+    version: 2,
+    baseUrl: "https://provider.example/v1/",
+    apiKeySha256: upstreamApiKeyDigest("provider-key"),
+    proxy: { mode: "direct" },
+    models: [{ id: "gpt-standard" }],
+    supportsOpenAiServerCompaction: false,
+  };
+  const catalog = await buildApiKeyExportModelCatalog(config, policy, localKey, upstream, async (input) => {
+    if (new URL(String(input)).pathname === "/healthz") {
+      return Response.json({
+        status: "degraded",
+        service: "codex-chatgpt-web",
+        access_mode: "api-key",
+        api_access_revision: apiAccessRevision(policy, config.controlToken),
+        upstream_provider_available: true,
+        upstream_provider_revision: upstreamProviderRevision(upstream, config.controlToken),
+      });
+    }
+    return Response.json({
+      object: "list",
+      data: [{ id: "gpt-standard", object: "model", created: 0, owned_by: "configured-upstream" }],
+      models: [{ slug: "gpt-standard", display_name: "Incomplete final row" }],
+    }, { headers: {
+      "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(policy, config.controlToken),
+      "x-codex-chatgpt-web-upstream-provider-revision": upstreamProviderRevision(upstream, config.controlToken),
+    } });
+  });
+  expect(catalog).toEqual(buildStandaloneModelCatalog(config));
 });
 
 test("API-key export catalog refuses metadata from a stale upstream runtime", async () => {
@@ -251,11 +305,11 @@ test("API-key export catalog refuses metadata from a stale upstream runtime", as
   const localKey = "cgw_" + "a".repeat(43);
   const policy = apiKeyPolicy(localKey);
   const upstream: UpstreamProviderConfig = {
-    version: 1,
+    version: 2,
     baseUrl: "https://provider.example/v1/",
     apiKeySha256: upstreamApiKeyDigest("provider-key"),
     proxy: { mode: "direct" },
-    modelFilter: { mode: "selected", models: ["gpt-rich"] },
+    models: [{ id: "gpt-rich" }],
     supportsOpenAiServerCompaction: false,
   };
   let requests = 0;
@@ -281,11 +335,11 @@ test("API-key export catalog times out a stalled health request and returns the 
     const localKey = "cgw_" + "a".repeat(43);
     const policy = apiKeyPolicy(localKey);
     const upstream: UpstreamProviderConfig = {
-      version: 1,
+      version: 2,
       baseUrl: "https://provider.example/v1/",
       apiKeySha256: upstreamApiKeyDigest("provider-key"),
       proxy: { mode: "direct" },
-      modelFilter: { mode: "all" },
+      models: [],
       supportsOpenAiServerCompaction: false,
     };
     const pending = buildApiKeyExportModelCatalog(
@@ -310,11 +364,11 @@ test("API-key export catalog times out a stalled models request and returns the 
     const localKey = "cgw_" + "a".repeat(43);
     const policy = apiKeyPolicy(localKey);
     const upstream: UpstreamProviderConfig = {
-      version: 1,
+      version: 2,
       baseUrl: "https://provider.example/v1/",
       apiKeySha256: upstreamApiKeyDigest("provider-key"),
       proxy: { mode: "direct" },
-      modelFilter: { mode: "all" },
+      models: [],
       supportsOpenAiServerCompaction: false,
     };
     let requests = 0;
@@ -345,11 +399,11 @@ test("API-key export catalog refuses models from a daemon swapped after health v
   const localKey = "cgw_" + "a".repeat(43);
   const policy = apiKeyPolicy(localKey);
   const upstream: UpstreamProviderConfig = {
-    version: 1,
+    version: 2,
     baseUrl: "https://provider.example/v1/",
     apiKeySha256: upstreamApiKeyDigest("provider-key"),
     proxy: { mode: "direct" },
-    modelFilter: { mode: "all" },
+    models: [{ id: "gpt-rich" }],
     supportsOpenAiServerCompaction: false,
   };
   let requests = 0;

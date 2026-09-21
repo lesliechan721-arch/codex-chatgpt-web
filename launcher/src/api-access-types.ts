@@ -1,18 +1,30 @@
 export type ApiAccessMode = "openai" | "api-key";
 export type UpstreamProxy = { mode: "global" } | { mode: "direct" } | { mode: "custom"; url: string };
-export type UpstreamModelFilter = { mode: "all" } | { mode: "regex"; pattern: string } | { mode: "selected"; models: string[] };
+export type MetadataBaseMode = "upstream" | "default" | "fallback";
+export type ModelMetadataConfig =
+  | { mode: MetadataBaseMode }
+  | { mode: "custom"; baseMode: MetadataBaseMode; overrides: Record<string, unknown> };
+export interface UpstreamModelConfig {
+  id: string;
+  metadata?: ModelMetadataConfig;
+}
 export interface UpstreamStatus {
   configured: boolean;
   baseUrl?: string;
   proxy?: UpstreamProxy;
-  modelFilter?: UpstreamModelFilter;
+  models?: UpstreamModelConfig[];
   supportsOpenAiServerCompaction?: boolean;
   keyAvailable: boolean;
   keyStorage: "os" | "session" | "unavailable";
   runtimeAvailable: boolean;
+  resetReason?: "legacy-v1-removed";
+  metadata?: UpstreamModelPreview[];
+  metadataSchema?: Record<string, unknown>;
+  protectedMetadataFields?: string[];
 }
 export interface ApiAccessStatus {
   configuredMode: ApiAccessMode | "invalid";
+  errorCode?: string;
   effectiveMode: ApiAccessMode | null;
   revision: string | null;
   keyConfigured: boolean;
@@ -30,6 +42,24 @@ export interface ApiAccessChange {
   mode: ApiAccessMode;
   key?: string;
   expectedRevision: string;
+}
+export interface UpstreamModelCandidate {
+  id: string;
+  hasUpstreamMetadata: boolean;
+  hasBundledMetadata: boolean;
+  availableModes: Array<MetadataBaseMode | "custom">;
+  automaticMode: MetadataBaseMode;
+}
+export interface UpstreamModelPreview extends UpstreamModelCandidate {
+  discovered: boolean;
+  configuredMode: MetadataBaseMode | "custom" | null;
+  configuredSourceAvailable: boolean;
+  effectiveMode: MetadataBaseMode | "custom";
+  effectiveBaseMode: MetadataBaseMode;
+  degraded: boolean;
+  customInvalid: boolean;
+  customError?: string | null;
+  model: Record<string, unknown>;
 }
 export interface ApiAccessApi {
   apiAccessStatus(): Promise<ApiAccessResult<ApiAccessStatus>>;
@@ -49,7 +79,7 @@ export interface ApiAccessApi {
     baseUrl: string;
     apiKey?: string;
     proxy: UpstreamProxy;
-    modelFilter: UpstreamModelFilter;
+    models: UpstreamModelConfig[];
     supportsOpenAiServerCompaction: boolean;
   }): Promise<ApiAccessResult<{ status: ApiAccessStatus }>>;
   apiAccessUpstreamDelete(input: { expectedRevision: string }): Promise<ApiAccessResult<{ status: ApiAccessStatus }>>;
@@ -58,5 +88,11 @@ export interface ApiAccessApi {
     baseUrl: string;
     apiKey?: string;
     proxy: UpstreamProxy;
-  }): Promise<ApiAccessResult<{ models: string[] }>>;
+    models: UpstreamModelConfig[];
+  }): Promise<ApiAccessResult<{
+    models: string[];
+    candidates: UpstreamModelCandidate[];
+    preview: UpstreamModelPreview[];
+    sources: { data: boolean; models: boolean };
+  }>>;
 }

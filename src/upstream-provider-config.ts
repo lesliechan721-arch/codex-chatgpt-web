@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile, getConfigDir } from "./config";
 import {
@@ -15,6 +15,23 @@ export function upstreamProviderConfigPath(home = getConfigDir()): string {
   return join(home, "upstream-provider.json");
 }
 
+export function upstreamProviderResetPath(home = getConfigDir()): string {
+  return join(home, "upstream-provider-reset.json");
+}
+
+function removeLegacyV1Config(home: string): void {
+  try {
+    atomicWriteFile(upstreamProviderResetPath(home), `${JSON.stringify({
+      version: 1,
+      reason: "legacy-v1-removed",
+    }, null, 2)}\n`);
+  } catch {
+    throw new Error("Cannot record legacy upstream provider reset state");
+  }
+  try { rmSync(upstreamProviderConfigPath(home)); }
+  catch { throw new Error("Cannot remove legacy upstream provider configuration"); }
+}
+
 export function loadUpstreamProviderConfig(home = getConfigDir()): UpstreamProviderConfig | undefined {
   const path = upstreamProviderConfigPath(home);
   let stat: ReturnType<typeof lstatSync>;
@@ -27,6 +44,11 @@ export function loadUpstreamProviderConfig(home = getConfigDir()): UpstreamProvi
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch { throw new Error("Invalid upstream provider configuration"); }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    && (parsed as Record<string, unknown>).version === 1) {
+    removeLegacyV1Config(home);
+    return undefined;
+  }
   return parseUpstreamProviderConfig(parsed);
 }
 

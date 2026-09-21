@@ -392,7 +392,18 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
       message: "API key mode leaves Codex model routing to manual client configuration",
     });
 
-    health = { ...health, access_mode: "openai", api_access_revision: "0".repeat(64) };
+    health = { ...health, upstream_metadata_repair_count: 1 };
+    const repair = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+    expect(repair.checks.find((check: { id: string }) => check.id === "proxy")).toMatchObject({
+      status: "warning",
+      message: "Responses proxy is healthy but 1 upstream model metadata configuration requires repair",
+    });
+    expect(repair.checks.find((check: { id: string }) => check.id === "codex")).toMatchObject({
+      status: "ok",
+      message: "API key mode leaves Codex model routing to manual client configuration",
+    });
+
+    health = { ...health, upstream_metadata_repair_count: 0, access_mode: "openai", api_access_revision: "0".repeat(64) };
     const stale = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
     expect(stale.checks.find((check: { id: string }) => check.id === "proxy")).toMatchObject({
       status: "error",

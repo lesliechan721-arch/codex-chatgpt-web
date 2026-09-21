@@ -2,7 +2,7 @@ const http = require("node:http");
 const https = require("node:https");
 const { HttpProxyAgent } = require("http-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const { normalizeModelId } = require("./upstream-provider-config.cjs");
+const modelMetadata = require("./codex-model-metadata.cjs");
 
 const MAX_MODELS_BYTES = 4 * 1024 * 1024;
 
@@ -56,31 +56,11 @@ async function requestModels(target, apiKey, proxyUrl) {
 }
 
 function extractModelIds(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("upstream-fetch-failed");
-  const candidates = [];
-  const standardDeclared = Object.hasOwn(value, "data");
-  const standard = Array.isArray(value.data) && (value.object === undefined || value.object === "list");
-  const richDeclared = Object.hasOwn(value, "models");
-  if (standardDeclared && !standard) throw new Error("upstream-fetch-failed");
-  if (standard) {
-    for (const row of value.data) if (row && typeof row === "object" && !Array.isArray(row)) candidates.push(row.id);
-  }
-  if (richDeclared) {
-    if (!Array.isArray(value.models)) throw new Error("upstream-fetch-failed");
-    for (const row of value.models) if (row && typeof row === "object" && !Array.isArray(row)) candidates.push(row.slug);
-  }
-  if (!standard && !richDeclared) throw new Error("upstream-fetch-failed");
-  const result = [];
-  const seen = new Set();
-  for (const candidate of candidates) {
-    let model;
-    try { model = normalizeModelId(candidate); } catch { continue; }
-    if (!seen.has(model)) { seen.add(model); result.push(model); }
-  }
-  return result;
+  try { return modelMetadata.parseUpstreamDiscovery(value).ids; }
+  catch { throw new Error("upstream-fetch-failed"); }
 }
 
-async function fetchUpstreamModelIds({ baseUrl, apiKey, proxy, resolveProxy, globalProxyUrl }) {
+async function fetchUpstreamModelCatalog({ baseUrl, apiKey, proxy, resolveProxy, globalProxyUrl }) {
   const target = new URL("models", baseUrl);
   let proxyUrl = null;
   if (proxy.mode === "custom") proxyUrl = proxy.url;
@@ -92,8 +72,16 @@ async function fetchUpstreamModelIds({ baseUrl, apiKey, proxy, resolveProxy, glo
   let text;
   try { text = await requestModels(target, apiKey, proxyUrl); }
   catch { throw new Error("upstream-fetch-failed"); }
-  try { return extractModelIds(JSON.parse(text)); }
+  try {
+    const raw = JSON.parse(text);
+    const discovery = modelMetadata.parseUpstreamDiscovery(raw);
+    return { raw, discovery };
+  }
   catch { throw new Error("upstream-fetch-failed"); }
 }
 
-module.exports = { extractModelIds, fetchUpstreamModelIds, proxyUrlFromPac };
+async function fetchUpstreamModelIds(input) {
+  return (await fetchUpstreamModelCatalog(input)).discovery.ids;
+}
+
+module.exports = { extractModelIds, fetchUpstreamModelCatalog, fetchUpstreamModelIds, proxyUrlFromPac };
