@@ -384,7 +384,7 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
 test("tool authority UI shows effective forced state and permits pre-setup selection when unmanaged", async () => {
   assert.match(
     electronMain,
-    /toolAuthority:\s*runtimeHost\.toolAuthorityControl\(stateStore\.read\(\)\.toolAuthorityMode\)/,
+    /toolAuthority:\s*runtimeHost\.toolAuthorityControl\(state\.toolAuthorityMode\)/,
   );
   assert.match(
     appSource,
@@ -532,12 +532,114 @@ test("external model catalog export-required state directs the user to export in
   assert.doesNotMatch(retryCondition, /export-required/);
 });
 
-test("MCP connection remains unavailable until the model catalog is verified", () => {
+test("API-key and remote forwarding bypass catalog validation while invalid policy fails closed", () => {
   assert.match(
     appSource,
-    /manualInteraction \|\| configuringInactiveMode \|\| snapshot\.state\.codexCatalogVerified[\s\S]*?copy\.mcpStepTwoHint[\s\S]*?copy\.mcpCatalogRequired/,
+    /function requiresCodexCatalog[\s\S]*?snapshot\.apiAccessMode !== "api-key"[\s\S]*?snapshot\.toolAuthority\.source !== "remote-bind"/,
   );
-  assert.match(appSource, /!manualInteraction && !configuringInactiveMode && !snapshot\.state\.codexCatalogVerified/);
+  assert.match(
+    appSource,
+    /function codexCatalogReady[\s\S]*?snapshot\.apiAccessMode !== "invalid"[\s\S]*?!requiresCodexCatalog\(snapshot\)[\s\S]*?snapshot\.state\.codexCatalogVerified === true/,
+  );
+  assert.match(
+    electronMain,
+    /function codexCatalogRequiredForState[\s\S]*?apiAccessMode === "api-key"[\s\S]*?source !== "remote-bind"/,
+  );
+  assert.match(
+    electronMain,
+    /apiAccessMode === "invalid"[\s\S]*?invalidPolicyObserved = true;[\s\S]*?return;/,
+  );
+  assert.match(
+    appSource,
+    /manualInteraction[\s\S]*?\|\| configuringInactiveMode[\s\S]*?\|\| catalogReady[\s\S]*?copy\.mcpStepTwoHint/,
+  );
+  assert.match(appSource, /snapshot\.state\.coreSetupComplete !== true[\s\S]*?\|\| !catalogReady/);
+});
+
+test("API access mode changes refresh the catalog requirement", () => {
+  assert.match(electronMain, /apiAccessMode:\s*currentApiAccessMode\(\)/);
+  assert.match(appSource, /onModeChange=\{onApiAccessModeChange\}/);
+  const adopt = apiAccessSettingsSource.slice(
+    apiAccessSettingsSource.indexOf("function adopt("),
+    apiAccessSettingsSource.indexOf("useEffect(() =>", apiAccessSettingsSource.indexOf("function adopt(")),
+  );
+  assert.ok(adopt.indexOf("onModeChange?.(next.configuredMode)") >= 0);
+  assert.ok(
+    adopt.indexOf("onModeChange?.(next.configuredMode)") < adopt.indexOf("if (!mounted.current) return"),
+    "completed saves must notify the parent even if Settings unmounted while the apply was running",
+  );
+});
+
+test("API access mode transitions reset and resume local OpenAI catalog verification", () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function resetCodexCatalogVerification(");
+  const end = electronMain.indexOf("\nfunction startCatalogVerificationMonitor(", start);
+  const state = { coreSetupComplete: true, codexCatalogVerified: true, codexRestartRequired: false };
+  let required = true;
+  let stopped = 0;
+  let started = 0;
+  const sandbox = {
+    stopCatalogVerificationMonitor: () => { stopped++; },
+    codexCatalogRequiredForState: () => required,
+    startCatalogVerificationMonitor: () => { started++; },
+    send() {},
+  };
+  vm.runInNewContext(electronMain.slice(start, end), sandbox);
+  const stateStore = { read: () => state, update: patch => Object.assign(state, patch) };
+
+  sandbox.handleApiAccessModeCommitted({ logger: {}, stateStore });
+  assert.equal(stopped, 1);
+  assert.equal(state.codexCatalogVerified, false);
+  assert.equal(state.codexRestartRequired, true);
+  sandbox.handleApiAccessModeSettled({ logger: {}, stateStore });
+  assert.equal(started, 1);
+
+  required = false;
+  state.codexCatalogVerified = true;
+  state.codexRestartRequired = false;
+  sandbox.handleApiAccessModeCommitted({ logger: {}, stateStore });
+  sandbox.handleApiAccessModeSettled({ logger: {}, stateStore });
+  assert.equal(stopped, 2);
+  assert.equal(started, 1);
+  assert.equal(state.codexCatalogVerified, true);
+  assert.equal(state.codexRestartRequired, false);
+});
+
+test("API access settle retries catalog state reset after the committed notification cannot persist", () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function resetCodexCatalogVerification(");
+  const end = electronMain.indexOf("\nfunction startCatalogVerificationMonitor(", start);
+  const state = { coreSetupComplete: true, codexCatalogVerified: true, codexRestartRequired: false };
+  const warnings = [];
+  let failNextUpdate = true;
+  let started = 0;
+  const sandbox = {
+    stopCatalogVerificationMonitor() {},
+    codexCatalogRequiredForState: () => true,
+    startCatalogVerificationMonitor: () => { started++; },
+    send() {},
+  };
+  vm.runInNewContext(electronMain.slice(start, end), sandbox);
+  const stateStore = {
+    read: () => state,
+    update: patch => {
+      if (failNextUpdate) {
+        failNextUpdate = false;
+        throw new Error("disk write failed");
+      }
+      return Object.assign(state, patch);
+    },
+  };
+  const logger = { warn: (...args) => warnings.push(args) };
+
+  sandbox.handleApiAccessModeCommitted({ logger, stateStore });
+  assert.equal(state.codexCatalogVerified, true);
+  sandbox.handleApiAccessModeSettled({ logger, stateStore });
+
+  assert.equal(state.codexCatalogVerified, false);
+  assert.equal(state.codexRestartRequired, true);
+  assert.equal(started, 1);
+  assert.equal(warnings.length, 1);
 });
 
 test("MCP navigation remains locked while an operation is active", () => {
@@ -621,7 +723,10 @@ test("catalog verification reports a failed request instead of requesting anothe
   let tick;
   let payload = { pid: 10, successful_model_catalog_requests: 0, model_catalog_requests: 0, last_model_catalog_result: null };
   vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", {
-    catalogVerificationInFlight: false, catalogVerificationTimer: null, lastOperation: null,
+    catalogVerificationInFlight: false, catalogVerificationTimer: null, catalogVerificationGeneration: 0, lastOperation: null,
+    codexCatalogRequiredForState: () => true,
+    currentApiAccessMode: () => "openai",
+    resetCodexCatalogVerification: () => state,
     stopCatalogVerificationMonitor() {},
     runtimeSupervisor: { readConfig: () => ({}), proxyHealthPayload: async () => payload },
     stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
@@ -651,4 +756,91 @@ test("catalog verification reports a failed request instead of requesting anothe
   assert.equal(state.codexCatalogVerified, true);
   assert.equal(state.codexRestartRequired, false);
   assert.ok(events.some(([event]) => event === "codex.model_catalog_verified"));
+});
+
+test("catalog verification ignores an in-flight result after its generation is invalidated", async () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function startCatalogVerificationMonitor(");
+  const end = electronMain.indexOf("\nfunction ", start + 1);
+  const source = electronMain.slice(start, end);
+  const state = { coreSetupComplete: true, codexCatalogVerified: false, codexRestartRequired: true, language: "en" };
+  let resolveHealth;
+  const health = new Promise(resolve => { resolveHealth = resolve; });
+  const sandbox = {
+    catalogVerificationInFlight: false,
+    catalogVerificationTimer: null,
+    catalogVerificationGeneration: 0,
+    lastOperation: null,
+    codexCatalogRequiredForState: () => true,
+    currentApiAccessMode: () => "openai",
+    resetCodexCatalogVerification: () => state,
+    stopCatalogVerificationMonitor() {},
+    runtimeSupervisor: { readConfig: () => ({}), proxyHealthPayload: () => health },
+    stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+    setInterval: () => ({ unref() {} }),
+    logger: { info() {}, warn() {}, debug() {} },
+    send() {}, publishOperation() {},
+    nativeCopyFor: () => ({ catalogFailure: "Catalog failed (HTTP {status}; {reason})." }),
+  };
+  vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", sandbox);
+  sandbox.catalogVerificationGeneration++;
+  resolveHealth({ pid: 10, successful_model_catalog_requests: 1, last_successful_model_catalog_request_at: "2026-09-22T10:00:00Z" });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(state.codexCatalogVerified, false);
+  assert.equal(state.codexRestartRequired, true);
+});
+
+test("catalog verification keeps polling through an invalid policy and revalidates after recovery", async () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf("function startCatalogVerificationMonitor(");
+  const end = electronMain.indexOf("\nfunction ", start + 1);
+  const source = electronMain.slice(start, end);
+  const state = { coreSetupComplete: true, codexCatalogVerified: true, codexRestartRequired: false, language: "en" };
+  let mode = "invalid";
+  let tick;
+  let stopCalls = 0;
+  let healthCalls = 0;
+  let resets = 0;
+  const sandbox = {
+    catalogVerificationInFlight: false,
+    catalogVerificationTimer: null,
+    catalogVerificationGeneration: 0,
+    lastOperation: null,
+    currentApiAccessMode: () => mode,
+    codexCatalogRequiredForState: () => true,
+    resetCodexCatalogVerification: () => {
+      resets++;
+      Object.assign(state, { codexCatalogVerified: false, codexRestartRequired: true });
+      return state;
+    },
+    stopCatalogVerificationMonitor: () => { stopCalls++; },
+    runtimeSupervisor: {
+      readConfig: () => ({}),
+      proxyHealthPayload: async () => {
+        healthCalls++;
+        return { pid: 10, successful_model_catalog_requests: 0, last_model_catalog_result: null };
+      },
+    },
+    stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+    setInterval: callback => { tick = callback; return { unref() {} }; },
+    logger: { info() {}, warn() {}, debug() {} },
+    send() {}, publishOperation() {},
+    nativeCopyFor: () => ({ catalogFailure: "Catalog failed (HTTP {status}; {reason})." }),
+  };
+
+  vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", sandbox);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopCalls, 1, "starting a new monitor invalidates only the previous generation");
+  assert.equal(healthCalls, 0);
+  assert.equal(state.codexCatalogVerified, true);
+
+  mode = "openai";
+  await tick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(resets, 1);
+  assert.equal(healthCalls, 1);
+  assert.equal(state.codexCatalogVerified, false);
+  assert.equal(state.codexRestartRequired, true);
+  assert.equal(stopCalls, 1, "invalid policy must not permanently stop the monitor");
 });

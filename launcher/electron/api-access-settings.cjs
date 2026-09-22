@@ -124,7 +124,7 @@ function validateChange(input) {
 function createApiAccessSettings({
   coreHome, runtimeHost, supervisor, browserHost,
   clipboard, setTimer = setTimeout, clearTimer = clearTimeout, safeStorage,
-  resolveProxy, getNetworkProxyUrl,
+  resolveProxy, getNetworkProxyUrl, onModeCommitted, onModeSettled,
 }) {
   if (safeStorage === undefined) {
     try { safeStorage = require("electron").safeStorage; } catch { /* Node tests / headless host. */ }
@@ -405,6 +405,7 @@ function createApiAccessSettings({
       }
       const next = input.mode === "openai" ? OPENAI_POLICY
         : key !== undefined ? keyPolicy(key) : before.policy;
+      const modeChanged = before.policy.mode !== next.mode;
       const controlToken = runtimeSnapshot().config?.controlToken;
       if (next.mode === "api-key" && typeof controlToken === "string"
         && createHash("sha256").update(controlToken).digest("hex") === next.keySha256) fail("control-key-reuse");
@@ -412,6 +413,10 @@ function createApiAccessSettings({
       assertUnchanged(input.expectedRevision);
       try { writePrivateFileAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`); }
       catch { return fail("save-failed"); }
+      if (modeChanged) {
+        try { onModeCommitted?.({ previousMode: before.policy.mode, mode: next.mode }); }
+        catch { /* Post-commit notifications must not skip runtime reconciliation. */ }
+      }
       clearOwnedClipboard();
       // An external CLI rotation must not make disabling/re-enabling resurrect an old GUI key.
       if (input.mode === "openai" && before.policy.mode === "api-key") {
@@ -419,12 +424,19 @@ function createApiAccessSettings({
         vault.allowReuse(before.policy.keySha256);
       }
       if (key !== undefined) vault.store(key);
-      if (next.mode === "api-key") {
-        return { cancelled: false, status: await reconcileModelCatalog("api-access-settings") };
+      try {
+        if (next.mode === "api-key") {
+          return { cancelled: false, status: await reconcileModelCatalog("api-access-settings") };
+        }
+        cancelModelCatalogRetry();
+        try { await reconcile("api-access-settings"); } catch { /* Saved policy is authoritative. */ }
+        return { cancelled: false, status: await status() };
+      } finally {
+        if (modeChanged) {
+          try { onModeSettled?.({ previousMode: before.policy.mode, mode: next.mode }); }
+          catch { /* Saved policy remains authoritative even if a notification fails. */ }
+        }
       }
-      cancelModelCatalogRetry();
-      try { await reconcile("api-access-settings"); } catch { /* Saved policy is authoritative. */ }
-      return { cancelled: false, status: await status() };
     } finally { applying = false; }
   }
   async function saveUpstream(raw) {

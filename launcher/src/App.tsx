@@ -14,6 +14,7 @@ import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import { NetworkProxySettings } from "./NetworkProxySettings";
 import { ApiAccessSettings } from "./ApiAccessSettings";
+import type { ApiAccessMode } from "./api-access-types";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -35,6 +36,17 @@ const MCP_GUIDE_MEDIA = [
   new URL("./assets/mcp-connect-connector.mp4", import.meta.url).href,
   new URL("./assets/mcp-connect-connector.mp4", import.meta.url).href,
 ] as const;
+
+function requiresCodexCatalog(snapshot: LauncherSnapshot): boolean {
+  return snapshot.profile !== "development"
+    && snapshot.apiAccessMode !== "api-key"
+    && snapshot.toolAuthority.source !== "remote-bind";
+}
+
+function codexCatalogReady(snapshot: LauncherSnapshot): boolean {
+  return snapshot.apiAccessMode !== "invalid"
+    && (!requiresCodexCatalog(snapshot) || snapshot.state.codexCatalogVerified === true);
+}
 
 export function App() {
   const [snapshot, setSnapshot] = useState<LauncherSnapshot | null>(null);
@@ -100,6 +112,9 @@ export function App() {
         }
       : current);
   }, []);
+  const updateApiAccessMode = useCallback((apiAccessMode: ApiAccessMode | "invalid") => {
+    setSnapshot((current) => current ? { ...current, apiAccessMode } : current);
+  }, []);
 
   if (!api) return <FatalMessage message="Launcher IPC is unavailable." />;
   if (!snapshot) return <LaunchLoading />;
@@ -131,6 +146,7 @@ export function App() {
             key="launcher"
             language={language}
             logs={logs}
+            onApiAccessModeChange={updateApiAccessMode}
             operation={operation}
             setError={setError}
             snapshot={snapshot}
@@ -320,6 +336,7 @@ function LauncherShell({
   copy,
   language,
   logs,
+  onApiAccessModeChange,
   operation,
   setError,
   snapshot,
@@ -329,14 +346,16 @@ function LauncherShell({
   copy: Copy;
   language: Language;
   logs: LogRecord[];
+  onApiAccessModeChange: (mode: ApiAccessMode | "invalid") => void;
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
+  const catalogReady = codexCatalogReady(snapshot);
   const interactionSetupComplete = snapshot.state.coreSetupComplete === true
     && (snapshot.state.browserInteractionMode === "manual"
-      || snapshot.state.codexCatalogVerified === true);
+      || catalogReady);
   const firstRunZeroRiskSetup = snapshot.state.browserInteractionMode === "manual"
     && snapshot.state.coreSetupComplete !== true;
   const [surface, setSurface] = useState<Surface>(
@@ -366,7 +385,8 @@ function LauncherShell({
     && browser?.authenticated !== true;
   const needsSetup = !needsBrowser && !interactionSetupComplete;
   const mcpOptional = snapshot.state.browserInteractionMode === "automatic"
-    && snapshot.state.codexCatalogVerified === true
+    && snapshot.state.coreSetupComplete === true
+    && catalogReady
     && snapshot.state.mcpSetupComplete !== true;
   const updateVisible = ["available", "downloading", "installing"].includes(snapshot.update.status);
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
@@ -706,6 +726,7 @@ function LauncherShell({
                 copy={copy}
                 devProfile={devProfile}
                 language={language}
+                onApiAccessModeChange={onApiAccessModeChange}
                 setError={setError}
                 snapshot={snapshot}
                 updateState={updateState}
@@ -1113,6 +1134,8 @@ function SetupSurface({
 }) {
   const [localBusy, setLocalBusy] = useState(false);
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
+  const codexCatalogRequired = requiresCodexCatalog(snapshot);
+  const catalogReady = codexCatalogReady(snapshot);
   const busy = localBusy
     || operation?.status === "running"
     || (!manualInteraction && (
@@ -1186,7 +1209,8 @@ function SetupSurface({
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall
             : devProfile ? copy.devInstall : copy.install}
-          complete={snapshot.state.codexCatalogVerified === true}
+          complete={snapshot.state.coreSetupComplete === true
+            && catalogReady}
           description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody}
           disabled={busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
           index={manualInteraction ? 1 : 3}
@@ -1204,7 +1228,7 @@ function SetupSurface({
         />
       </div>
 
-      {!devProfile && snapshot.state.codexRestartRequired ? (
+      {!devProfile && codexCatalogRequired && snapshot.state.codexRestartRequired ? (
         <NoticeRow icon="alert" tone="warning">
           {copy.restartCodex}
         </NoticeRow>
@@ -1213,7 +1237,10 @@ function SetupSurface({
       <SectionHeading label="MCP" meta={manualInteraction ? copy.required : copy.optional} spaced />
       <button
         className="next-surface-row"
-        disabled={!manualInteraction && !snapshot.state.codexCatalogVerified}
+        disabled={!manualInteraction && (
+          snapshot.state.coreSetupComplete !== true
+          || !catalogReady
+        )}
         onClick={showMcp}
         type="button"
       >
@@ -1251,6 +1278,7 @@ function McpSurface({
   updateState: (state: LauncherState) => void;
 }) {
   const configuringInactiveMode = interactionMode !== snapshot.state.browserInteractionMode;
+  const catalogReady = codexCatalogReady(snapshot);
   const [step, setStep] = useState(
     configuringInactiveMode ? 1 : Math.min(2, Math.max(0, snapshot.state.mcpGuideStep || 0)),
   );
@@ -1342,7 +1370,9 @@ function McpSurface({
       subtitle={devProfile ? copy.devMcpSubtitle : copy.mcpSubtitle}
       title={devProfile ? copy.devMcpTitle : "MCP"}
     >
-      {!manualInteraction && !configuringInactiveMode && !snapshot.state.codexCatalogVerified ? (
+      {!manualInteraction
+        && !configuringInactiveMode
+        && !catalogReady ? (
         <NoticeRow icon="setup" tone="warning">{copy.mcpCatalogRequired}</NoticeRow>
       ) : null}
 
@@ -1457,7 +1487,9 @@ function McpSurface({
             ) : null}
             {step === 1 ? (
               <p className="mcp-step-two-hint">
-                {manualInteraction || configuringInactiveMode || snapshot.state.codexCatalogVerified
+                {manualInteraction
+                  || configuringInactiveMode
+                  || catalogReady
                   ? copy.mcpStepTwoHint
                   : copy.mcpCatalogRequired}
               </p>
@@ -1504,7 +1536,10 @@ function McpSurface({
           <PrimaryButton
             disabled={
               busy
-              || (!manualInteraction && !configuringInactiveMode && !snapshot.state.codexCatalogVerified)
+              || (!manualInteraction && !configuringInactiveMode && (
+                snapshot.state.coreSetupComplete !== true
+                || !catalogReady
+              ))
               || ((!credentialsConfigured || replacingCredentials) && (!tunnelId || !runtimeKey))
             }
             onClick={() => void install()}
@@ -1585,6 +1620,7 @@ function SettingsSurface({
   copy,
   devProfile,
   language,
+  onApiAccessModeChange,
   setError,
   snapshot,
   updateState,
@@ -1593,6 +1629,7 @@ function SettingsSurface({
   copy: Copy;
   devProfile: boolean;
   language: Language;
+  onApiAccessModeChange: (mode: ApiAccessMode | "invalid") => void;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
@@ -1777,13 +1814,14 @@ function SettingsSurface({
 
       {!devProfile ? <ApiAccessSettings
         language={language}
+        onModeChange={onApiAccessModeChange}
         onCloseUpstream={() => setApiUpstreamOpen(false)}
         onOpenUpstream={() => setApiUpstreamOpen(true)}
         view={apiUpstreamOpen ? "upstream" : "overview"}
       /> : null}
 
       <div hidden={apiUpstreamOpen}>
-        {!devProfile && snapshot.state.codexRestartRequired ? (
+        {!devProfile && requiresCodexCatalog(snapshot) && snapshot.state.codexRestartRequired ? (
           <NoticeRow icon="alert" tone="warning">
             {copy.restartCodex}
           </NoticeRow>

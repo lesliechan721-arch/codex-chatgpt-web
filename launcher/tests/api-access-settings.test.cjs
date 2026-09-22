@@ -118,6 +118,8 @@ function fixture(t, options = {}) {
     safeStorage, browserHost: { get activeTraceId() { return state.browserActive ? "trace" : null; }, currentOperation: () => null },
     resolveProxy: async () => "DIRECT",
     getNetworkProxyUrl: () => state.networkProxyUrl ?? null,
+    onModeCommitted: options.onModeCommitted,
+    onModeSettled: options.onModeSettled,
     confirmChange: () => { throw new Error("mode changes no longer require a second confirmation"); },
     clipboard: { readText: () => state.clipboard, writeText: text => { state.clipboard = text; }, clear: () => { state.clipboard = ""; } },
     setTimer: fn => { state.timer = fn; state.timerSchedules++; return { unref() {} }; }, clearTimer: () => { state.timer = null; },
@@ -136,6 +138,45 @@ test("mode/key are saved first, then the supervised runtime restarts", async t =
   assert.equal(result.status.keyAvailable, true); assert.equal(f.controller.reveal(), KEY);
   const status = JSON.stringify(await f.controller.status()); assert.ok(!status.includes(KEY));
   assert.ok(!status.includes(keyPolicy(KEY).keySha256));
+});
+test("API access mode transition hooks run only when the saved mode changes", async t => {
+  const events = [];
+  const f = fixture(t, {
+    onModeCommitted: change => events.push(["committed", change]),
+    onModeSettled: change => events.push(["settled", change]),
+  });
+
+  await f.apply();
+  await f.apply("api-key", undefined);
+  await f.apply("openai", undefined);
+
+  assert.deepEqual(events, [
+    ["committed", { previousMode: "openai", mode: "api-key" }],
+    ["settled", { previousMode: "openai", mode: "api-key" }],
+    ["committed", { previousMode: "api-key", mode: "openai" }],
+    ["settled", { previousMode: "api-key", mode: "openai" }],
+  ]);
+});
+test("mode transition hook failures do not interrupt committed reconciliation or settle", async t => {
+  const events = [];
+  const f = fixture(t, {
+    onModeCommitted: () => {
+      events.push("committed");
+      throw new Error("state persistence failed");
+    },
+    onModeSettled: () => {
+      events.push("settled");
+      throw new Error("settle notification failed");
+    },
+  });
+
+  const result = await f.apply();
+
+  assert.equal(result.status.configuredMode, "api-key");
+  assert.equal(result.status.runtimeState, "in-sync");
+  assert.equal(f.state.stops, 1);
+  assert.equal(f.state.starts, 1);
+  assert.deepEqual(events, ["committed", "settled"]);
 });
 test("manual server mode GUI apply leaves old Codex ownership files byte-for-byte unchanged", async t => {
   const previous = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;

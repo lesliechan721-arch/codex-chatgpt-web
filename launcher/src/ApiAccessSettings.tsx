@@ -162,11 +162,13 @@ function value<T>(result: ApiAccessResult<T>): T {
 export function ApiAccessSettings({
   language,
   onCloseUpstream,
+  onModeChange,
   onOpenUpstream,
   view = "overview",
 }: {
   language: Language;
   onCloseUpstream?: () => void;
+  onModeChange?: (mode: ApiAccessMode | "invalid") => void;
   onOpenUpstream?: () => void;
   view?: "overview" | "upstream";
 }) {
@@ -208,6 +210,7 @@ export function ApiAccessSettings({
   const keyValid = /^[A-Za-z0-9_-]{32,256}$/.test(draft);
 
   function adopt(next: ApiAccessStatus, preserveUpstreamDraft = false) {
+    onModeChange?.(next.configuredMode);
     if (!mounted.current) return;
     setStatus(next);
     setVisibleKey(null);

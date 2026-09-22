@@ -107,6 +107,7 @@ let cdpPort = 0;
 let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
+let catalogVerificationGeneration = 0;
 let updateController = null;
 
 function findFreePort() {
@@ -185,14 +186,80 @@ function publishOperation(operation) {
 function stopCatalogVerificationMonitor() {
   if (catalogVerificationTimer) clearInterval(catalogVerificationTimer);
   catalogVerificationTimer = null;
+  catalogVerificationGeneration++;
+}
+
+function currentApiAccessMode() {
+  try {
+    return readPolicyFile(path.join(CORE_HOME, "api-access.json")).policy.mode;
+  } catch {
+    return "invalid";
+  }
+}
+
+function codexCatalogRequiredForState(state, apiAccessMode = currentApiAccessMode()) {
+  if (IS_DEV_PROFILE || apiAccessMode === "api-key") return false;
+  return runtimeHost.toolAuthorityControl(state.toolAuthorityMode).source !== "remote-bind";
+}
+
+function resetCodexCatalogVerification({ logger, stateStore }) {
+  const current = stateStore.read();
+  if (current.coreSetupComplete !== true) return current;
+  if (current.codexCatalogVerified === false && current.codexRestartRequired === true) return current;
+  try {
+    const state = stateStore.update({
+      codexCatalogVerified: false,
+      codexRestartRequired: true,
+    });
+    send("launcher:state-changed", state);
+    return state;
+  } catch (error) {
+    logger?.warn("codex.model_catalog_state_reset_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function handleApiAccessModeCommitted({ logger, stateStore }) {
+  stopCatalogVerificationMonitor();
+  const current = stateStore.read();
+  if (!codexCatalogRequiredForState(current) || current.coreSetupComplete !== true) return;
+  resetCodexCatalogVerification({ logger, stateStore });
+}
+
+function handleApiAccessModeSettled({ logger, stateStore }) {
+  const current = stateStore.read();
+  if (!codexCatalogRequiredForState(current)
+    || current.coreSetupComplete !== true) return;
+  const state = resetCodexCatalogVerification({ logger, stateStore });
+  if (!state || state.codexCatalogVerified === true) return;
+  startCatalogVerificationMonitor({ logger, stateStore });
 }
 
 function startCatalogVerificationMonitor({ logger, stateStore }) {
   stopCatalogVerificationMonitor();
+  const generation = catalogVerificationGeneration;
   let reportedFailure = null;
+  let invalidPolicyObserved = false;
   const check = async () => {
-    const current = stateStore.read();
-    if (current.coreSetupComplete !== true || current.codexCatalogVerified === true) {
+    let current = stateStore.read();
+    const apiAccessMode = currentApiAccessMode();
+    if (apiAccessMode === "invalid") {
+      invalidPolicyObserved = true;
+      return;
+    }
+    if (invalidPolicyObserved) {
+      invalidPolicyObserved = false;
+      if (apiAccessMode === "openai" && codexCatalogRequiredForState(current, apiAccessMode)) {
+        const reset = resetCodexCatalogVerification({ logger, stateStore });
+        if (!reset) return;
+        current = reset;
+      }
+    }
+    if (!codexCatalogRequiredForState(current, apiAccessMode)
+      || current.coreSetupComplete !== true
+      || current.codexCatalogVerified === true) {
       stopCatalogVerificationMonitor();
       return;
     }
@@ -201,6 +268,16 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
     try {
       const config = runtimeSupervisor.readConfig();
       const health = await runtimeSupervisor.proxyHealthPayload(config);
+      const latest = stateStore.read();
+      const latestApiAccessMode = currentApiAccessMode();
+      if (latestApiAccessMode === "invalid") {
+        invalidPolicyObserved = true;
+        return;
+      }
+      if (generation !== catalogVerificationGeneration
+        || !codexCatalogRequiredForState(latest, latestApiAccessMode)
+        || latest.coreSetupComplete !== true
+        || latest.codexCatalogVerified === true) return;
       if (!Number.isInteger(health?.successful_model_catalog_requests)
         || health.successful_model_catalog_requests < 1) {
         const result = health?.last_model_catalog_result;
@@ -568,6 +645,8 @@ function registerIpc({ logger, stateStore }) {
     clipboard,
     resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
     getNetworkProxyUrl: () => stateStore.read().networkProxyUrl,
+    onModeCommitted: () => handleApiAccessModeCommitted({ logger, stateStore }),
+    onModeSettled: () => handleApiAccessModeSettled({ logger, stateStore }),
     confirmChange: async ({ mode, replacingKey, configured }) => {
       const chinese = (stateStore.read().language || "en").startsWith("zh");
       const result = await dialog.showMessageBox(mainWindow, {
@@ -600,31 +679,35 @@ function registerIpc({ logger, stateStore }) {
     rendererNavigationAllowed,
   });
   app.once("will-quit", disposeApiAccessIpc);
-  handle("launcher:snapshot", async () => ({
-    profile: LAUNCHER_PROFILE.kind,
-    profilePaths: {
-      coreHome: CORE_HOME,
-      codexHome: LAUNCHER_PROFILE.codexHome,
-      userData: launcherUserData,
-    },
-    state: stateStore.read(),
-    browser: browserHost?.snapshot() ?? null,
-    connectorName: runtimeHost.browserConnectorName(),
-    connectorNames: {
-      automatic: runtimeHost.setupConnectorName(),
-      manual: "Codex Zero Risk",
-    },
-    toolAuthority: runtimeHost.toolAuthorityControl(stateStore.read().toolAuthorityMode),
-    mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
-    logs: logger.recent(),
-    urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
-    platform: process.platform,
-    packaged: app.isPackaged,
-    version: app.getVersion(),
-    smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(stateStore.read()),
-    operation: lastOperation,
-    update: updateController?.getState() ?? { status: "disabled" },
-  }));
+  handle("launcher:snapshot", async () => {
+    const state = stateStore.read();
+    return {
+      profile: LAUNCHER_PROFILE.kind,
+      profilePaths: {
+        coreHome: CORE_HOME,
+        codexHome: LAUNCHER_PROFILE.codexHome,
+        userData: launcherUserData,
+      },
+      state,
+      browser: browserHost?.snapshot() ?? null,
+      connectorName: runtimeHost.browserConnectorName(),
+      connectorNames: {
+        automatic: runtimeHost.setupConnectorName(),
+        manual: "Codex Zero Risk",
+      },
+      toolAuthority: runtimeHost.toolAuthorityControl(state.toolAuthorityMode),
+      apiAccessMode: currentApiAccessMode(),
+      mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
+      logs: logger.recent(),
+      urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
+      platform: process.platform,
+      packaged: app.isPackaged,
+      version: app.getVersion(),
+      smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(state),
+      operation: lastOperation,
+      update: updateController?.getState() ?? { status: "disabled" },
+    };
+  });
 
   handle("launcher:set-language", (_event, language) => {
     const state = stateStore.update({ language: validateLanguage(language) });

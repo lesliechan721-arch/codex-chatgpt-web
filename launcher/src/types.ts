@@ -1,5 +1,5 @@
 import languages from "../electron/languages.json";
-import type { ApiAccessApi } from "./api-access-types";
+import type { ApiAccessApi, ApiAccessMode } from "./api-access-types";
 
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
@@ -114,6 +114,7 @@ export interface LauncherSnapshot {
     forced: boolean;
     source: "environment" | "remote-bind" | null;
   };
+  apiAccessMode: ApiAccessMode | "invalid";
   mcpCredentialsConfigured: boolean;
   logs: LogRecord[];
   urls: {
