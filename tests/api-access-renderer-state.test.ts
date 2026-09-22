@@ -204,6 +204,7 @@ test("configured upstream with an unreadable key shows the missing-key state", (
     keyAvailable: true,
     keyStorage: "os",
     runtimeState: "restart-required",
+    modelCatalogState: "pending",
     baseUrl: "http://127.0.0.1:17841/v1",
     canApply: true,
     cleanupPending: false,

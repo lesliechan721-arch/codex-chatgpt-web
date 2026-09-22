@@ -133,6 +133,7 @@ test("API-key model catalog accepts OpenAI-compatible data arrays without an obj
     async () => Response.json({ data: [{ id: "gpt-upstream", object: "model" }] }),
   );
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-codex-chatgpt-web-model-catalog-status"), "complete");
   const payload = await response.json() as { data: Array<{ id: string }> };
   assert.ok(payload.data.some(row => row.id === "gpt-upstream"));
 });
@@ -150,6 +151,7 @@ test("upstream catalog failures return the complete local catalog without stale 
     async () => { throw new Error("PRIVATE provider host should not escape diagnostics"); },
   );
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-codex-chatgpt-web-model-catalog-status"), "fallback");
   assert.deepEqual(await response.json(), buildStandaloneModelCatalog(config()));
   assert.deepEqual(failure, { stage: "transport" });
 });

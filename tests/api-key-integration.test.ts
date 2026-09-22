@@ -7,7 +7,7 @@ import { mock } from "node:test";
 import { defaultConfig, saveConfig } from "../src/config";
 import { apiAccessRevision, apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { saveApiAccessPolicy } from "../src/api-access-config";
-import { buildApiKeyExportModelCatalog } from "../src/api-key-cli";
+import { buildApiKeyExportModelCatalog, buildApiKeyRefreshModelCatalog } from "../src/api-key-cli";
 import { buildStandaloneModelCatalog } from "../src/standalone-model-catalog";
 import {
   installCodexIntegration,
@@ -313,7 +313,7 @@ test("API-key export catalog refuses metadata from a stale upstream runtime", as
     supportsOpenAiServerCompaction: false,
   };
   let requests = 0;
-  const catalog = await buildApiKeyExportModelCatalog(config, policy, localKey, upstream, async () => {
+  await expect(buildApiKeyExportModelCatalog(config, policy, localKey, upstream, async () => {
     requests++;
     return Response.json({
       status: "ok",
@@ -323,9 +323,8 @@ test("API-key export catalog refuses metadata from a stale upstream runtime", as
       upstream_provider_available: true,
       upstream_provider_revision: "0".repeat(64),
     });
-  });
+  })).rejects.toThrow("Upstream provider runtime is not synchronized");
   expect(requests).toBe(1);
-  expect(catalog.models.every(model => String(model.slug).startsWith("chatgpt-web/"))).toBe(true);
 });
 
 test("API-key export catalog times out a stalled health request and returns the local catalog", async () => {
@@ -394,6 +393,56 @@ test("API-key export catalog times out a stalled models request and returns the 
   }
 });
 
+test("API-key model refresh fails instead of replacing the previous catalog with a local fallback", async () => {
+  const config = defaultConfig();
+  const localKey = "cgw_" + "a".repeat(43);
+  const policy = apiKeyPolicy(localKey);
+  const upstream: UpstreamProviderConfig = {
+    version: 2,
+    baseUrl: "https://provider.example/v1/",
+    apiKeySha256: upstreamApiKeyDigest("provider-key"),
+    proxy: { mode: "direct" },
+    models: [],
+    supportsOpenAiServerCompaction: false,
+  };
+  await expect(buildApiKeyRefreshModelCatalog(config, policy, localKey, upstream, async () => {
+    throw new Error("temporary loopback failure");
+  })).rejects.toThrow("Upstream model catalog refresh failed");
+});
+
+test("API-key model refresh rejects a successful loopback response that reports upstream fallback", async () => {
+  const config = defaultConfig();
+  const localKey = "cgw_" + "a".repeat(43);
+  const policy = apiKeyPolicy(localKey);
+  const upstream: UpstreamProviderConfig = {
+    version: 2,
+    baseUrl: "https://provider.example/v1/",
+    apiKeySha256: upstreamApiKeyDigest("provider-key"),
+    proxy: { mode: "direct" },
+    models: [],
+    supportsOpenAiServerCompaction: false,
+  };
+  let requests = 0;
+  await expect(buildApiKeyRefreshModelCatalog(config, policy, localKey, upstream, async () => {
+    requests++;
+    if (requests === 1) {
+      return Response.json({
+        service: "codex-chatgpt-web",
+        access_mode: "api-key",
+        api_access_revision: apiAccessRevision(policy, config.controlToken),
+        upstream_provider_available: true,
+        upstream_provider_revision: upstreamProviderRevision(upstream, config.controlToken),
+      });
+    }
+    return Response.json(buildStandaloneModelCatalog(config), { headers: {
+      "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(policy, config.controlToken),
+      "x-codex-chatgpt-web-upstream-provider-revision": upstreamProviderRevision(upstream, config.controlToken),
+      "x-codex-chatgpt-web-model-catalog-status": "fallback",
+    } });
+  })).rejects.toThrow("Upstream model catalog refresh failed");
+  expect(requests).toBe(2);
+});
+
 test("API-key export catalog refuses models from a daemon swapped after health validation", async () => {
   const config = defaultConfig();
   const localKey = "cgw_" + "a".repeat(43);
@@ -407,7 +456,7 @@ test("API-key export catalog refuses models from a daemon swapped after health v
     supportsOpenAiServerCompaction: false,
   };
   let requests = 0;
-  const catalog = await buildApiKeyExportModelCatalog(config, policy, localKey, upstream, async () => {
+  await expect(buildApiKeyExportModelCatalog(config, policy, localKey, upstream, async () => {
     requests++;
     if (requests === 1) {
       return Response.json({
@@ -429,7 +478,6 @@ test("API-key export catalog refuses models from a daemon swapped after health v
       "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(policy, config.controlToken),
       "x-codex-chatgpt-web-upstream-provider-revision": "0".repeat(64),
     } });
-  });
+  })).rejects.toThrow("Upstream provider runtime is not synchronized");
   expect(requests).toBe(2);
-  expect(catalog).toEqual(buildStandaloneModelCatalog(config));
 });

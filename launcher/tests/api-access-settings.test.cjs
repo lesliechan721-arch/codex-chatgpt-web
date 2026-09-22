@@ -14,6 +14,7 @@ const {
   upstreamProviderRevision,
   validateChange,
 } = require("../electron/api-access-settings.cjs");
+const { acquireModelCatalogCommandLock } = require("../electron/model-catalog-command-lock.cjs");
 const { normalizeBaseUrl } = require("../electron/upstream-provider-config.cjs");
 const { extractModelIds } = require("../electron/upstream-provider-network.cjs");
 const KEY = "cgw_" + "a".repeat(43);
@@ -50,11 +51,12 @@ function fixture(t, options = {}) {
   const coreHome = fs.mkdtempSync(path.join(os.tmpdir(), "api-access-test-"));
   t.after(() => fs.rmSync(coreHome, { recursive: true, force: true }));
   const file = path.join(coreHome, "api-access.json");
+  const modelCatalogPendingPath = path.join(coreHome, "api-key-models-refresh-pending.json");
   const config = { port: 17841, controlToken: "c".repeat(43) };
   const state = { configured: true, owner: "launcher", effective: { version: 1, mode: "openai" },
     effectiveUpstream: null,
     active: 0, operation: null, stopped: false, stopError: false, startError: false, cleanupError: false,
-    stops: 0, starts: 0, commands: [], clipboard: "", timer: null, ...options };
+    stops: 0, starts: 0, commands: [], clipboard: "", timer: null, timerSchedules: 0, ...options };
   const host = {
     launcherProfile: state.profile ?? "production",
     currentOperation: () => state.operation,
@@ -68,6 +70,19 @@ function fixture(t, options = {}) {
       state.lastRunOptions = runOptions;
       if (args[1] === "reconnect" && state.reconnectError) throw new Error("route conflict");
       if (args[1] === "cleanup" && state.cleanupError) throw new Error("private arbitrary error");
+      if (args[1] === "refresh-models" && state.refreshError) throw new Error("model catalog refresh failed");
+      if (args[1] === "codex-config" && state.exportStale) {
+        state.effectiveUpstream = null;
+        throw new Error("upstream runtime changed");
+      }
+      if (args[1] === "refresh-models") {
+        const externalClient = runOptions.environment?.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG?.trim() === "1"
+          || Boolean(runOptions.environment?.CODEX_CHATGPT_WEB_PUBLIC_BASE_URL?.trim());
+        if (externalClient) fs.writeFileSync(modelCatalogPendingPath, '{"version":2,"state":"export-required"}\n');
+        else fs.rmSync(modelCatalogPendingPath, { force: true });
+      }
+      if (args[1] === "codex-config") fs.rmSync(modelCatalogPendingPath, { force: true });
+      if (typeof state.afterRun === "function") await state.afterRun(args, { coreHome, modelCatalogPendingPath });
       return { stdout: args[1] === "codex-config"
         ? `${JSON.stringify({
           config: `requires_openai_auth = false\nexperimental_bearer_token = ${JSON.stringify(runOptions.env?.CODEX_CHATGPT_WEB_API_KEY)}\n`,
@@ -105,7 +120,7 @@ function fixture(t, options = {}) {
     getNetworkProxyUrl: () => state.networkProxyUrl ?? null,
     confirmChange: () => { throw new Error("mode changes no longer require a second confirmation"); },
     clipboard: { readText: () => state.clipboard, writeText: text => { state.clipboard = text; }, clear: () => { state.clipboard = ""; } },
-    setTimer: fn => { state.timer = fn; return { unref() {} }; }, clearTimer: () => { state.timer = null; },
+    setTimer: fn => { state.timer = fn; state.timerSchedules++; return { unref() {} }; }, clearTimer: () => { state.timer = null; },
   });
   const controller = create(); t.after(() => controller.dispose());
   const apply = async (mode = "api-key", key = KEY) => controller.apply({ mode,
@@ -146,6 +161,125 @@ test("manual server mode GUI apply leaves old Codex ownership files byte-for-byt
   assert.equal(result.status.cleanupPending, false);
   assert.equal(f.state.commands.some(args => args[0] === "api-key" && args[1] === "cleanup"), false);
   files.forEach(([file], index) => assert.deepEqual(fs.readFileSync(file), before[index]));
+});
+test("manual server mode records export-required after refresh until explicit export", async t => {
+  const previous = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+  process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = "1";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    else process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = previous;
+  });
+  const f = fixture(t); await f.apply();
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+
+  const refreshed = await f.controller.refreshModelCatalog();
+  assert.equal(refreshed.modelCatalogState, "export-required");
+  assert.equal(fs.existsSync(pendingPath), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pendingPath, "utf8")), { version: 2, state: "export-required" });
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+  const schedulesBeforeRestart = f.state.timerSchedules;
+
+  f.controller.dispose();
+  const restarted = f.create(); t.after(() => restarted.dispose());
+  assert.equal((await restarted.status()).modelCatalogState, "export-required");
+  assert.equal(f.state.timerSchedules, schedulesBeforeRestart);
+
+  await restarted.exportConfig();
+  assert.equal(fs.existsSync(pendingPath), false);
+  assert.equal((await restarted.status()).modelCatalogState, "ready");
+});
+test("Launcher does not overwrite a newer external catalog marker transition", async t => {
+  const previous = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+  process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = "1";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    else process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = previous;
+  });
+  const f = fixture(t); await f.apply();
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+
+  f.state.afterRun = async (args, context) => {
+    if (args[1] === "refresh-models") fs.rmSync(context.modelCatalogPendingPath, { force: true });
+  };
+  const refreshed = await f.controller.refreshModelCatalog();
+  assert.equal(refreshed.modelCatalogState, "ready");
+  assert.equal(fs.existsSync(pendingPath), false);
+
+  fs.writeFileSync(pendingPath, '{"version":2,"state":"export-required"}\n');
+  f.state.afterRun = async (args, context) => {
+    if (args[1] === "codex-config") {
+      fs.writeFileSync(context.modelCatalogPendingPath, '{"version":2,"state":"export-required"}\n');
+    }
+  };
+  await f.controller.exportConfig();
+  assert.equal((await f.controller.status()).modelCatalogState, "export-required");
+  assert.deepEqual(JSON.parse(fs.readFileSync(pendingPath, "utf8")), { version: 2, state: "export-required" });
+});
+test("Launcher waits for an older catalog command before publishing a newer pending marker", async t => {
+  const previous = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+  process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = "1";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    else process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = previous;
+  });
+  const f = fixture(t); await f.apply();
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+  const release = await acquireModelCatalogCommandLock(pendingPath);
+  let released = false;
+  try {
+    let settled = false;
+    const refreshing = f.controller.refreshModelCatalog().then(result => {
+      settled = true;
+      return result;
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(settled, false);
+    assert.equal(fs.existsSync(pendingPath), false);
+    // Simulate the older export's final marker cleanup while it still owns the command lock.
+    fs.rmSync(pendingPath, { force: true });
+    release(); released = true;
+    const refreshed = await refreshing;
+    assert.equal(refreshed.modelCatalogState, "export-required");
+    assert.deepEqual(JSON.parse(fs.readFileSync(pendingPath, "utf8")), { version: 2, state: "export-required" });
+    assert.equal(f.state.lastRunOptions.timeoutMs, 30_000);
+  } finally {
+    if (!released) release();
+  }
+});
+test("upstream save rechecks its revision after waiting for the catalog command lock", async t => {
+  const f = fixture(t); await f.apply();
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+  const upstreamPath = path.join(f.coreHome, "upstream-provider.json");
+  const expectedRevision = (await f.controller.status()).revision;
+  const release = await acquireModelCatalogCommandLock(pendingPath);
+  let released = false;
+  try {
+    const saving = f.controller.saveUpstream({
+      expectedRevision,
+      baseUrl: "https://stale.example/v1",
+      apiKey: UPSTREAM_KEY,
+      proxy: { mode: "direct" },
+      models: [],
+      supportsOpenAiServerCompaction: false,
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const external = {
+      version: 2,
+      baseUrl: "https://external.example/v1/",
+      apiKeySha256: "d".repeat(64),
+      proxy: { mode: "direct" },
+      models: [],
+      supportsOpenAiServerCompaction: false,
+    };
+    fs.writeFileSync(upstreamPath, `${JSON.stringify(external, null, 2)}\n`);
+    release(); released = true;
+
+    await assert.rejects(saving, /stale-settings/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(upstreamPath, "utf8")), external);
+    assert.equal(fs.existsSync(pendingPath), false);
+  } finally {
+    if (!released) release();
+  }
 });
 test("server host port override is used for the Launcher client Base URL fallback", async t => {
   const previous = process.env.CODEX_CHATGPT_WEB_CLIENT_PORT;
@@ -261,6 +395,7 @@ test("export is an explicit sensitive action that embeds only the local key and 
   assert.deepEqual(f.state.commands.at(-1), ["api-key", "codex-config", "--json"]);
   assert.equal(f.state.lastRunOptions.sensitiveOutput, true);
   assert.equal(f.state.lastRunOptions.env.CODEX_CHATGPT_WEB_API_KEY, KEY);
+  assert.equal(f.state.lastRunOptions.timeoutMs, 30_000);
 });
 test("upstream settings persist no plaintext key and expose the key only to the daemon environment", async t => {
   const f = fixture(t); await f.apply();
@@ -285,6 +420,49 @@ test("upstream settings persist no plaintext key and expose the key only to the 
   assert.ok(result.status.upstream.protectedMetadataFields.includes("model_messages"));
   assert.ok(result.status.upstream.protectedMetadataFields.includes("slug"));
   assert.equal(result.status.runtimeState, "in-sync");
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+  assert.equal(f.state.lastRunOptions.env.CODEX_CHATGPT_WEB_API_KEY, KEY);
+  assert.equal(f.state.lastRunOptions.sensitiveOutput, undefined);
+  assert.equal(f.state.lastRunOptions.timeoutMs, 30_000);
+});
+
+test("failed automatic model-catalog refresh stays visible and can be retried", async t => {
+  const f = fixture(t, { refreshError: true }); await f.apply();
+  const result = await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+  assert.equal(result.status.runtimeState, "in-sync");
+  assert.equal(result.status.modelCatalogState, "failed");
+  assert.equal(fs.existsSync(pendingPath), true);
+
+  f.state.refreshError = false;
+  const retried = await f.controller.apply({ mode: "api-key", expectedRevision: result.status.revision });
+  assert.equal(retried.status.modelCatalogState, "ready");
+  assert.equal(fs.existsSync(pendingPath), false);
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+});
+
+test("runtime model-profile changes can request an API-key model-catalog refresh", async t => {
+  const f = fixture(t); await f.apply();
+  const refreshesBefore = f.state.commands.filter(args => args[1] === "refresh-models").length;
+  const status = await f.controller.refreshModelCatalog();
+  assert.equal(status.modelCatalogState, "ready");
+  assert.equal(f.state.commands.filter(args => args[1] === "refresh-models").length, refreshesBefore + 1);
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+});
+
+test("export reports restart-required when the runtime changes after its preflight", async t => {
+  const f = fixture(t); await f.apply();
+  await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  f.state.exportStale = true;
+  await assert.rejects(f.controller.exportConfig(), /restart-required/);
 });
 
 test("legacy v1 upstream cleanup clears the old vault before a new v2 key can be saved or reused", async t => {
@@ -423,6 +601,7 @@ test("stale upstream health stays pending when the old daemon still reports its 
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
     proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
+  const refreshesBefore = f.state.commands.filter(args => args[1] === "refresh-models").length;
   f.state.active = 1;
   const result = await f.controller.saveUpstream({
     expectedRevision: (await f.controller.status()).revision,
@@ -431,7 +610,104 @@ test("stale upstream health stays pending when the old daemon still reports its 
     supportsOpenAiServerCompaction: true,
   });
   assert.equal(result.status.runtimeState, "restart-required");
+  assert.equal(result.status.modelCatalogState, "pending");
   assert.equal(result.status.upstream.runtimeAvailable, false);
+  assert.equal(f.state.commands.filter(args => args[1] === "refresh-models").length, refreshesBefore);
+  const exportsBefore = f.state.commands.filter(args => args[1] === "codex-config").length;
+  await assert.rejects(f.controller.exportConfig(), /restart-required/);
+  assert.equal(f.state.commands.filter(args => args[1] === "codex-config").length, exportsBefore);
+  const retry = f.state.timer;
+  assert.equal(typeof retry, "function");
+  f.state.active = 0;
+  await retry();
+  const applied = await f.controller.status();
+  assert.equal(applied.runtimeState, "in-sync");
+  assert.equal(applied.modelCatalogState, "ready");
+  assert.equal(f.state.commands.filter(args => args[1] === "refresh-models").length, refreshesBefore + 1);
+});
+
+test("pending model refresh does not restart a runtime when the saved upstream key is unavailable", async t => {
+  const safeStorage = encryption();
+  const f = fixture(t, { safeStorage }); await f.apply();
+  f.state.active = 1;
+  const result = await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  assert.equal(result.status.modelCatalogState, "pending");
+  f.controller.dispose();
+  safeStorage.decryptString = () => { throw new Error("locked"); };
+  const restarted = f.create(); t.after(() => restarted.dispose());
+  const stopsBefore = f.state.stops;
+  const startsBefore = f.state.starts;
+  const retry = f.state.timer;
+  assert.equal(typeof retry, "function");
+  f.state.active = 0;
+  await retry();
+  const status = await restarted.status();
+  assert.equal(status.upstream.keyAvailable, false);
+  assert.equal(status.modelCatalogState, "failed");
+  assert.equal(f.state.stops, stopsBefore);
+  assert.equal(f.state.starts, startsBefore);
+});
+
+test("pending model refresh stops automatic retries after a managed runtime restart fails", async t => {
+  const f = fixture(t); await f.apply();
+  f.state.active = 1;
+  const result = await f.controller.saveUpstream({
+    expectedRevision: (await f.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  assert.equal(result.status.modelCatalogState, "pending");
+  const retry = f.state.timer;
+  const schedulesBefore = f.state.timerSchedules;
+  const stopsBefore = f.state.stops;
+  const startsBefore = f.state.starts;
+  f.state.active = 0;
+  f.state.startError = true;
+  await retry();
+  const status = await f.controller.status();
+  assert.equal(status.modelCatalogState, "failed");
+  assert.equal(f.state.stops, stopsBefore + 1);
+  assert.equal(f.state.starts, startsBefore + 1);
+  assert.equal(f.state.timerSchedules, schedulesBefore);
+});
+
+test("unconfigured runtimes keep a pending model refresh alive until runtime initialization", async t => {
+  const f = fixture(t, { configured: false }); await f.apply();
+  const pending = await f.controller.refreshModelCatalog();
+  assert.equal(pending.runtimeState, "unconfigured");
+  assert.equal(pending.modelCatalogState, "pending");
+  const firstRetry = f.state.timer;
+  const schedulesBefore = f.state.timerSchedules;
+  await firstRetry();
+  assert.equal(f.state.timerSchedules, schedulesBefore + 1);
+  const secondRetry = f.state.timer;
+  f.state.configured = true;
+  f.state.effective = JSON.parse(fs.readFileSync(f.file, "utf8"));
+  await secondRetry();
+  const refreshed = await f.controller.status();
+  assert.equal(refreshed.runtimeState, "in-sync");
+  assert.equal(refreshed.modelCatalogState, "ready");
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+});
+
+test("external runtimes keep checking a pending model refresh until they become synchronized", async t => {
+  const f = fixture(t, { owner: "external" }); await f.apply();
+  const pending = await f.controller.refreshModelCatalog();
+  assert.equal(pending.modelCatalogState, "pending");
+  const retry = f.state.timer;
+  assert.equal(typeof retry, "function");
+  f.state.effective = JSON.parse(fs.readFileSync(f.file, "utf8"));
+  await retry();
+  const refreshed = await f.controller.status();
+  assert.equal(refreshed.runtimeState, "in-sync");
+  assert.equal(refreshed.modelCatalogState, "ready");
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
+  assert.equal(f.state.stops, 0);
+  assert.equal(f.state.starts, 0);
 });
 
 test("OS-encrypted upstream key is recoverable by a restarted Launcher controller", async t => {
@@ -480,11 +756,32 @@ test("deleting upstream settings clears both provider intent and recoverable key
     baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
     proxy: { mode: "global" }, models: [], supportsOpenAiServerCompaction: false,
   });
-  const result = await f.controller.deleteUpstream({ expectedRevision: (await f.controller.status()).revision });
+  const pendingPath = path.join(f.coreHome, "api-key-models-refresh-pending.json");
+  const upstreamPath = path.join(f.coreHome, "upstream-provider.json");
+  const release = await acquireModelCatalogCommandLock(pendingPath);
+  let released = false;
+  let result;
+  try {
+    let settled = false;
+    const deleting = f.controller.deleteUpstream({
+      expectedRevision: (await f.controller.status()).revision,
+    }).then(value => {
+      settled = true;
+      return value;
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(settled, false);
+    assert.equal(fs.existsSync(upstreamPath), true);
+    release(); released = true;
+    result = await deleting;
+  } finally {
+    if (!released) release();
+  }
   assert.equal(result.status.upstream.configured, false);
-  assert.equal(fs.existsSync(path.join(f.coreHome, "upstream-provider.json")), false);
+  assert.equal(fs.existsSync(upstreamPath), false);
   assert.equal(fs.existsSync(path.join(f.coreHome, "secrets", "upstream-api-key.json")), false);
   assert.deepEqual(f.controller.daemonEnvironment(), {});
+  assert.deepEqual(f.state.commands.at(-1), ["api-key", "refresh-models"]);
 });
 
 test("saved upstream settings do not affect OpenAI forwarding mode or its daemon environment", async t => {

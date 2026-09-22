@@ -31,6 +31,7 @@ export interface ApiAccessStatus {
   keyAvailable: boolean;
   keyStorage: "os" | "session" | "unavailable";
   runtimeState: "invalid" | "unconfigured" | "stopped" | "in-sync" | "restart-required";
+  modelCatalogState: "ready" | "pending" | "export-required" | "failed";
   baseUrl: string | null;
   canApply: boolean;
   cleanupPending: boolean;

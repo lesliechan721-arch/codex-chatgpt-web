@@ -468,3 +468,66 @@ test("native Responses lifecycle ignores heartbeats but observes text, reasoning
   expect(progress).toBe(4);
   expect(final).toBe(0);
 });
+
+test("native Responses lifecycle reports semantic terminal failures without reporting final completion", async () => {
+  const cases = [
+    new Response(
+      'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","output":[]}}\n\ndata: [DONE]\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+    Response.json({ status: "incomplete", output: [] }),
+  ];
+  for (const response of cases) {
+    let failures = 0;
+    let final = 0;
+    const observed = observeNativeResponsesLifecycle(response, {
+      onTerminalFailure: () => { failures += 1; },
+      onFinalResponse: () => { final += 1; },
+    });
+
+    await observed.text();
+    expect(failures).toBe(1);
+    expect(final).toBe(0);
+  }
+});
+
+test("native Responses lifecycle reports a terminal failure when the upstream body fails", async () => {
+  let failures = 0;
+  const observed = observeNativeResponsesLifecycle(
+    new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"status":"completed"'));
+        controller.error(new Error("upstream body failed"));
+      },
+    }), { headers: { "content-type": "application/json" } }),
+    { onTerminalFailure: () => { failures += 1; } },
+  );
+
+  await expect(observed.text()).rejects.toThrow("upstream body failed");
+  expect(failures).toBe(1);
+});
+
+test("native Responses lifecycle emits terminal timeout without waiting for a stalled upstream cancel", async () => {
+  const terminal = new AbortController();
+  const observed = observeNativeResponsesLifecycle(
+    new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        return new Promise<void>(() => {});
+      },
+    }), { headers: { "content-type": "application/json" } }),
+    { terminalSignal: terminal.signal },
+  );
+  const reading = observed.json();
+  await Bun.sleep(0);
+  terminal.abort(Object.assign(new Error("remote turn idle timeout"), {
+    errorType: "server_error",
+    code: "client_turn_idle_timeout",
+    retryable: false,
+  }));
+
+  await expect(reading).resolves.toMatchObject({
+    status: "failed",
+    error: { type: "server_error", code: "client_turn_idle_timeout" },
+    retryable: false,
+  });
+});

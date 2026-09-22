@@ -14,6 +14,7 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
@@ -28,7 +29,9 @@ import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
 import { loadApiAccessPolicy } from "./api-access-config";
 import {
   OPENAI_ACCESS,
+  MODEL_CATALOG_STATUS_HEADER,
   adapterRequestHeaders,
+  apiAccessError,
   apiKeyMatches,
   authenticateApiRequest,
   guardApiRequest,
@@ -39,10 +42,14 @@ import {
 } from "./api-access";
 import { loadUpstreamProviderRuntime } from "./upstream-provider-config";
 import {
+  upstreamModelAllowed,
   upstreamProviderRevision,
   type UpstreamProviderRuntime,
 } from "./upstream-provider";
-import { mergeUpstreamModelCatalog, upstreamMetadataRepairCount } from "./upstream-model-catalog";
+import {
+  mergeUpstreamModelCatalog,
+  upstreamMetadataRepairCount,
+} from "./upstream-model-catalog";
 import {
   forwardUpstreamProviderRequest,
   type UpstreamFetch,
@@ -432,6 +439,8 @@ export interface ResponseRequestOptions {
   upstreamRuntime?: UpstreamProviderRuntime;
   /** Test seam for the custom upstream transport. */
   fetchUpstreamProvider?: UpstreamFetch;
+  /** Test seam for native ChatGPT Codex passthrough. */
+  fetchNative?: NativeFetch;
   /** Check only routed Web work; native upstream requests do not use the local broker. */
   brokerAvailable?: () => Promise<boolean>;
 }
@@ -509,14 +518,16 @@ export async function modelsRequest(
     const local = buildStandaloneModelCatalog(config);
     const catalogHeaders = {
       "cache-control": "no-store",
+      [MODEL_CATALOG_STATUS_HEADER]: "complete",
       "x-codex-chatgpt-web-api-access-revision": apiAccessRevision(accessPolicy, config.controlToken),
       ...(upstreamRuntime?.config ? {
         "x-codex-chatgpt-web-upstream-provider-revision":
           upstreamProviderRevision(upstreamRuntime.config, config.controlToken),
       } : {}),
     };
+    const fallbackHeaders = { ...catalogHeaders, [MODEL_CATALOG_STATUS_HEADER]: "fallback" };
     if (!upstreamRuntime?.available || !upstreamRuntime.config) {
-      return Response.json(local, { headers: catalogHeaders });
+      return Response.json(local, { headers: upstreamRuntime?.config ? fallbackHeaders : catalogHeaders });
     }
     let upstream: Response;
     const timeout = new AbortController();
@@ -544,14 +555,14 @@ export async function modelsRequest(
       ]);
     } catch (error) {
       reportFailure?.(modelCatalogFailure("transport", error));
-      return Response.json(local, { headers: catalogHeaders });
+      return Response.json(local, { headers: fallbackHeaders });
     } finally {
       clearTimeout(timer);
       if (onAbort) signal.removeEventListener("abort", onAbort);
     }
     if (!upstream.ok) {
       reportFailure?.({ stage: "upstream" });
-      return Response.json(local, { headers: catalogHeaders });
+      return Response.json(local, { headers: fallbackHeaders });
     }
     try {
       const raw = await upstream.json();
@@ -565,7 +576,7 @@ export async function modelsRequest(
       });
     } catch (error) {
       reportFailure?.(modelCatalogFailure("catalog", error));
-      return Response.json(local, { headers: catalogHeaders });
+      return Response.json(local, { headers: fallbackHeaders });
     }
   }
   let upstream: Response;
@@ -642,6 +653,135 @@ function toolBridgeMaps(parsed: CodexParsedRequest): {
   return { toolNsMap, freeformToolNames, toolSearchToolNames };
 }
 
+function jsonRequestWithBody(request: Request, body: Record<string, unknown>): Request {
+  const headers = new Headers(request.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  return new Request(request.url, {
+    method: request.method,
+    headers,
+    body: JSON.stringify(body),
+    signal: request.signal,
+  });
+}
+
+async function threadTitleRequest(
+  request: Request,
+  raw: Record<string, unknown>,
+  requestedModel: string,
+  config: AppConfig,
+  accessPolicy: ApiAccessPolicy,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  const webModel = isChatGptWebModelSlug(requestedModel);
+  if (webModel) {
+    try {
+      requireChatGptWebModelRoute(requestedModel, config);
+    } catch (error) {
+      return formatErrorResponse(
+        400,
+        "invalid_request_error",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+  const upstreamModel = webModel ? CHATGPT_WEB_LUNA_BACKEND_MODEL : requestedModel;
+
+  if (accessPolicy.mode === "api-key") {
+    const runtime = options.upstreamRuntime;
+    if (!runtime?.config || !upstreamModelAllowed(upstreamModel, runtime.config)) {
+      return apiAccessError(
+        400,
+        "model_not_supported",
+        "Thread title generation requires a model enabled by the configured upstream provider",
+      );
+    }
+  }
+
+  let turnIdleSignal: AbortSignal | undefined;
+  let turnBound = false;
+  let turnCompleted = false;
+  const terminalIdleError = (): ChatGptWebAdapterError | undefined => (
+    turnIdleSignal?.aborted && turnIdleSignal.reason instanceof ChatGptWebAdapterError
+      ? turnIdleSignal.reason
+      : undefined
+  );
+  const completeBoundTurn = (): void => {
+    if (!turnBound || turnCompleted) return;
+    turnCompleted = true;
+    options.onTurnComplete?.();
+  };
+  try {
+    const identity = extractCodexTurnIdentityFromBody(raw);
+    if (identity.threadId && identity.turnId) {
+      const nativeIdentity = { threadId: identity.threadId, turnId: identity.turnId };
+      const signal = options.onTurnIdentity?.(nativeIdentity, { remoteIdleTimeout: true });
+      turnBound = true;
+      if (signal) turnIdleSignal = signal;
+      for (const progressKey of nativeToolResultProgressKeys(raw)) {
+        options.onTurnInputProgress?.(nativeIdentity, progressKey);
+      }
+    }
+  } catch (error) {
+    if (error instanceof ChatGptWebAdapterError) return adapterErrorResponse(error);
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+
+  const forwardedBody = upstreamModel === requestedModel ? raw : { ...raw, model: upstreamModel };
+  const lifecycleRequest = turnIdleSignal
+    ? new Request(request, { signal: AbortSignal.any([request.signal, turnIdleSignal]) })
+    : request;
+  const forwardedRequest = upstreamModel === requestedModel
+    ? lifecycleRequest
+    : jsonRequestWithBody(lifecycleRequest, forwardedBody);
+  try {
+    let upstream: Response;
+    if (accessPolicy.mode === "api-key") {
+      upstream = await forwardUpstreamProviderRequest(
+        forwardedRequest,
+        "responses",
+        options.upstreamRuntime!,
+        options.fetchUpstreamProvider,
+        forwardedBody,
+      );
+    } else {
+      upstream = await forwardNativeCodexRequest(
+        forwardedRequest,
+        "responses",
+        options.fetchNative ?? fetchNativeCodex,
+        forwardedBody,
+      );
+    }
+    const terminalError = terminalIdleError();
+    if (terminalError) {
+      await upstream.body?.cancel(terminalError).catch(() => {});
+      return adapterErrorResponse(terminalError);
+    }
+    if (!upstream.ok) {
+      completeBoundTurn();
+      return upstream;
+    }
+    return observeNativeResponsesLifecycle(upstream, {
+      onProgress: options.onTurnProgress,
+      onFinalResponse: completeBoundTurn,
+      onTerminalFailure: completeBoundTurn,
+      terminalSignal: turnIdleSignal,
+    });
+  } catch (error) {
+    const terminalError = terminalIdleError();
+    if (terminalError) return adapterErrorResponse(terminalError);
+    completeBoundTurn();
+    return formatErrorResponse(
+      502,
+      "upstream_error",
+      accessPolicy.mode === "api-key"
+        ? "Configured upstream request failed"
+        : error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
@@ -676,8 +816,24 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
-  const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy, options.upstreamRuntime);
-  if (rejectedModel) return rejectedModel;
+  const threadTitle = isCodexThreadTitleRequestFromBody(raw);
+  if (!threadTitle) {
+    const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy, options.upstreamRuntime);
+    if (rejectedModel) return rejectedModel;
+  }
+  if (threadTitle) {
+    if (typeof requestedModel !== "string" || !requestedModel) {
+      return apiAccessError(400, "model_not_supported", "Thread title generation requires a model");
+    }
+    return await threadTitleRequest(
+      nativeRequest,
+      raw as Record<string, unknown>,
+      requestedModel,
+      config,
+      accessPolicy,
+      options,
+    );
+  }
   const requestedWebModel = typeof requestedModel === "string" && isChatGptWebModelSlug(requestedModel);
   try {
     const identity = extractCodexTurnIdentityFromBody(raw);
@@ -707,18 +863,37 @@ export async function responseRequest(
           raw,
         );
       } else {
-        upstream = await forwardNativeCodexRequest(forwardedRequest, "responses", undefined, raw);
+        upstream = await forwardNativeCodexRequest(
+          forwardedRequest,
+          "responses",
+          options.fetchNative ?? fetchNativeCodex,
+          raw,
+        );
+      }
+      const terminalError = turnIdleSignal?.aborted && turnIdleSignal.reason instanceof ChatGptWebAdapterError
+        ? turnIdleSignal.reason
+        : undefined;
+      if (terminalError) {
+        await upstream.body?.cancel(terminalError).catch(() => {});
+        return adapterErrorResponse(terminalError);
+      }
+      if (!upstream.ok) {
+        if (boundTurnIdentity) options.onTurnComplete?.();
+        return upstream;
       }
       return observeNativeResponsesLifecycle(upstream, {
         onProgress: options.onTurnProgress,
         onFinalResponse: options.onTurnComplete,
+        onTerminalFailure: options.onTurnComplete,
         terminalSignal: turnIdleSignal,
       });
     } catch (error) {
       const terminalError = turnIdleSignal?.aborted && turnIdleSignal.reason instanceof ChatGptWebAdapterError
         ? turnIdleSignal.reason
-        : error;
+        : undefined;
       if (terminalError instanceof ChatGptWebAdapterError) return adapterErrorResponse(terminalError);
+      if (boundTurnIdentity) options.onTurnComplete?.();
+      if (error instanceof ChatGptWebAdapterError) return adapterErrorResponse(error);
       return formatErrorResponse(
         502,
         "upstream_error",

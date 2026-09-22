@@ -1117,6 +1117,516 @@ test("remote non-Web JSON final completion releases the idle lease", async () =>
   }
 });
 
+test("remote non-Web failed and incomplete responses release the idle lease without leaving a tombstone", async () => {
+  for (const terminalStatus of ["failed", "incomplete"] as const) {
+    const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+    const config = { ...defaultConfig("browser-only"), port: 0 };
+    const clientKey = `cgw_${terminalStatus === "failed" ? "x".repeat(43) : "y".repeat(43)}`;
+    const threadId = `thread_remote_native_${terminalStatus}`;
+    const turnId = `turn_remote_native_${terminalStatus}`;
+    let upstreamCalls = 0;
+    const server = startServer(config, {
+      accessPolicy: apiKeyPolicy(clientKey),
+      upstreamRuntime: {
+        available: true,
+        keyMatches: true,
+        apiKey: "provider-test-key",
+        config: {
+          version: 2,
+          baseUrl: "https://provider.example/v1/",
+          apiKeySha256: "a".repeat(64),
+          proxy: { mode: "direct" },
+          models: [{ id: "gpt-5.6-sol" }],
+          supportsOpenAiServerCompaction: false,
+        },
+      },
+      fetchUpstreamProvider: async () => {
+        upstreamCalls += 1;
+        return Response.json({
+          id: `resp_native_${terminalStatus}_${upstreamCalls}`,
+          object: "response",
+          status: terminalStatus,
+          output: [],
+        });
+      },
+    });
+    const endpoint = `http://127.0.0.1:${server.port}`;
+    const body = JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `finish as ${terminalStatus}` }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    });
+    const request = () => fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${clientKey}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const response = await request();
+        expect(response.status).toBe(200);
+        expect((await response.json() as { status?: string }).status).toBe(terminalStatus);
+        expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+          active_http_turns: 0,
+          active_remote_turn_idle_leases: 0,
+        });
+        if (attempt === 0) await Bun.sleep(1_100);
+      }
+      expect(upstreamCalls).toBe(2);
+    } finally {
+      await server.stop(true);
+      if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+      else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+    }
+  }
+});
+
+test("remote non-Web upstream failures release the idle lease and permit the same turn retry", async () => {
+  for (const scenario of ["http-error", "transport-error"] as const) {
+    const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+    const config = { ...defaultConfig("browser-only"), port: 0 };
+    const clientKey = `cgw_${scenario === "http-error" ? "h".repeat(43) : "q".repeat(43)}`;
+    const threadId = `thread_remote_native_${scenario}`;
+    const turnId = `turn_remote_native_${scenario}`;
+    let upstreamCalls = 0;
+    const server = startServer(config, {
+      accessPolicy: apiKeyPolicy(clientKey),
+      upstreamRuntime: {
+        available: true,
+        keyMatches: true,
+        apiKey: "provider-test-key",
+        config: {
+          version: 2,
+          baseUrl: "https://provider.example/v1/",
+          apiKeySha256: "a".repeat(64),
+          proxy: { mode: "direct" },
+          models: [{ id: "gpt-5.6-sol" }],
+          supportsOpenAiServerCompaction: false,
+        },
+      },
+      fetchUpstreamProvider: async () => {
+        upstreamCalls += 1;
+        if (scenario === "transport-error") throw new Error("upstream transport failed");
+        return Response.json({ error: { message: "rate limited" } }, { status: 429 });
+      },
+    });
+    const endpoint = `http://127.0.0.1:${server.port}`;
+    const body = JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: false,
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+      input: [{
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "fail upstream" }],
+        internal_chat_message_metadata_passthrough: { turn_id: turnId },
+      }],
+    });
+    const request = () => fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+      body,
+    });
+
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const response = await request();
+        expect(response.status).toBe(scenario === "http-error" ? 429 : 502);
+        await response.text();
+        expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+          active_http_turns: 0,
+          active_remote_turn_idle_leases: 0,
+        });
+        if (attempt === 0) await Bun.sleep(1_100);
+      }
+      expect(upstreamCalls).toBe(2);
+    } finally {
+      await server.stop(true);
+      if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+      else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+    }
+  }
+});
+
+test("remote non-Web idle timeout wins over a late upstream rejection", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"z".repeat(43)}`;
+  const threadId = "thread_remote_native_late_rejection";
+  const turnId = "turn_remote_native_late_rejection";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 2,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        models: [{ id: "gpt-5.6-sol" }],
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => {
+      upstreamCalls += 1;
+      await Bun.sleep(1_100);
+      return Response.json({ error: { message: "late rate limit" } }, { status: 429 });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: false,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+    },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "wait past the idle timeout" }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId },
+    }],
+  });
+  const request = () => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+    body,
+  });
+
+  try {
+    const first = await request();
+    expect(first.status).toBe(504);
+    expect(await first.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    const second = await request();
+    expect(second.status).toBe(504);
+    expect(await second.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(upstreamCalls).toBe(1);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote thread_title final completion releases the idle lease without leaving a tombstone", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"t".repeat(43)}`;
+  const threadId = "thread_remote_title_json";
+  const turnId = "turn_remote_title_json";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 2,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        models: [{ id: "gpt-5.6-sol" }],
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => {
+      upstreamCalls += 1;
+      return Response.json({
+        id: `resp_title_${upstreamCalls}`,
+        object: "response",
+        status: "completed",
+        output: [{ type: "message", role: "assistant", content: [] }],
+      });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: false,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        thread_source: "thread_title",
+        thread_id: threadId,
+        turn_id: turnId,
+      }),
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+  });
+
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`${endpoint}/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${clientKey}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+      expect(response.status).toBe(200);
+      expect((await response.json() as { status?: string }).status).toBe("completed");
+      expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+        active_http_turns: 0,
+        active_remote_turn_idle_leases: 0,
+      });
+      if (attempt === 0) await Bun.sleep(1_100);
+    }
+    expect(upstreamCalls).toBe(2);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote thread_title upstream rejection releases the idle lease without leaving a tombstone", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"u".repeat(43)}`;
+  const threadId = "thread_remote_title_rejected";
+  const turnId = "turn_remote_title_rejected";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 2,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        models: [{ id: "gpt-5.6-sol" }],
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => {
+      upstreamCalls += 1;
+      return Response.json({ error: { message: "rate limited" } }, { status: 429 });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: false,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        thread_source: "thread_title",
+        thread_id: threadId,
+        turn_id: turnId,
+      }),
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+  });
+  const request = () => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+    body,
+  });
+
+  try {
+    const rejected = await request();
+    expect(rejected.status).toBe(429);
+    await rejected.text();
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+    await Bun.sleep(1_100);
+    const retried = await request();
+    expect(retried.status).toBe(429);
+    await retried.text();
+    expect(upstreamCalls).toBe(2);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote thread_title idle timeout wins over a late upstream rejection", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"w".repeat(43)}`;
+  const threadId = "thread_remote_title_late_rejection";
+  const turnId = "turn_remote_title_late_rejection";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 2,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        models: [{ id: "gpt-5.6-sol" }],
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => {
+      upstreamCalls += 1;
+      // Deliberately ignore the request AbortSignal to prove that a late transport result cannot
+      // replace the idle timeout that already established terminal authority for this turn.
+      await Bun.sleep(1_100);
+      return Response.json({ error: { message: "late rate limit" } }, { status: 429 });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: false,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        thread_source: "thread_title",
+        thread_id: threadId,
+        turn_id: turnId,
+      }),
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+  });
+  const request = () => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+    body,
+  });
+
+  try {
+    const first = await request();
+    expect(first.status).toBe(504);
+    expect(await first.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+
+    const second = await request();
+    expect(second.status).toBe(504);
+    expect(await second.json()).toMatchObject({
+      error: { type: "server_error", code: "client_turn_idle_timeout" },
+      retryable: false,
+    });
+    expect(upstreamCalls).toBe(1);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
+test("remote thread_title body transport failure releases the idle lease and permits the same turn retry", async () => {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const clientKey = `cgw_${"v".repeat(43)}`;
+  const threadId = "thread_remote_title_body_failure";
+  const turnId = "turn_remote_title_body_failure";
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    accessPolicy: apiKeyPolicy(clientKey),
+    upstreamRuntime: {
+      available: true,
+      keyMatches: true,
+      apiKey: "provider-test-key",
+      config: {
+        version: 2,
+        baseUrl: "https://provider.example/v1/",
+        apiKeySha256: "a".repeat(64),
+        proxy: { mode: "direct" },
+        models: [{ id: "gpt-5.6-sol" }],
+        supportsOpenAiServerCompaction: false,
+      },
+    },
+    fetchUpstreamProvider: async () => {
+      upstreamCalls += 1;
+      const encoder = new TextEncoder();
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('{"status":"completed"'));
+          controller.error(new Error("upstream body failed"));
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const body = JSON.stringify({
+    model: "gpt-5.6-sol",
+    stream: false,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        thread_source: "thread_title",
+        thread_id: threadId,
+        turn_id: turnId,
+      }),
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+  });
+  const request = () => fetch(`${endpoint}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+    body,
+  });
+
+  try {
+    const first = await request();
+    expect(first.status).toBe(200);
+    await first.text().catch(() => "");
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0,
+      active_remote_turn_idle_leases: 0,
+    });
+    await Bun.sleep(1_100);
+    const second = await request();
+    expect(second.status).toBe(200);
+    await second.text().catch(() => "");
+    expect(upstreamCalls).toBe(2);
+  } finally {
+    await server.stop(true);
+    if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
+  }
+});
+
 test("remote non-Web compaction real progress renews the idle lease without completing the native turn", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
   process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";

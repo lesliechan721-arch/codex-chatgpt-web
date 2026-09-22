@@ -73,6 +73,10 @@ const labels = {
     compactionHint: "仅当上游真实兼容服务端 compaction_trigger 协议时启用。",
     upstreamMissingKey: "已保存上游配置，但当前会话无法恢复上游密钥。请重新输入并保存。",
     upstreamReady: "上游已加载。", upstreamPending: "上游已保存，等待后台加载。",
+    catalogPending: "上游已加载，正在刷新 Codex 模型目录。",
+    catalogExportRequired: "Codex 模型目录已刷新。请导出更新后的 Codex 配置和模型目录，并复制到外部客户端。",
+    exportCatalog: "导出更新后的配置",
+    catalogFailed: "上游已加载，但 Codex 模型目录刷新失败；旧目录仍保留。请重试。",
     unconfigured: "配置已保存；初始化运行时后生效。", invalid: "接入配置无效，请修复 api-access.json。",
     failed: "操作未完成，请刷新状态后重试。", errors: {
       "invalid-key": "密钥格式不正确。", "key-required": "请先填写或生成密钥。",
@@ -80,7 +84,7 @@ const labels = {
       "stale-settings": "配置已在其他位置修改，请刷新后重试。",
       "control-key-reuse": "API Key 不能与后台管理令牌相同。",
       "save-failed": "无法保存配置，请检查文件权限。", "runtime-busy": "另一个设置操作正在执行。",
-      "not-configured": "请先初始化运行时。", "export-failed": "配置导出失败。",
+      "not-configured": "请先初始化运行时。", "restart-required": "上游配置尚未由运行时加载，请等待重启完成后再导出。", "export-failed": "配置导出失败。",
       "invalid-upstream-config": "上游 Base URL 无效。", "invalid-upstream-models": "模型列表无效。", "invalid-upstream-metadata": "模型元数据配置无效。",
       "invalid-upstream-proxy": "上游代理配置无效。", "invalid-upstream-key": "上游 API Key 无效。",
       "upstream-key-required": "请输入上游 API Key，或先解锁可恢复的已保存密钥。",
@@ -127,6 +131,10 @@ const labels = {
     compactionHint: "Enable only when the upstream really implements the server-side compaction_trigger protocol.",
     upstreamMissingKey: "The upstream configuration is saved, but its key cannot be recovered in this session. Enter the key and save again.",
     upstreamReady: "Upstream is loaded.", upstreamPending: "Upstream is saved and waiting for the runtime to load it.",
+    catalogPending: "The upstream is loaded and the Codex model catalog is refreshing.",
+    catalogExportRequired: "The Codex model catalog is refreshed. Export the updated Codex config and model catalog, then copy them to the external client.",
+    exportCatalog: "Export updated config",
+    catalogFailed: "The upstream is loaded, but the Codex model catalog refresh failed. The previous catalog is still in use. Retry the operation.",
     unconfigured: "Saved for the next runtime initialization.", invalid: "Invalid access configuration. Repair api-access.json.",
     failed: "The operation could not complete. Refresh status and retry.", errors: {
       "invalid-key": "Invalid API key format.", "key-required": "Enter or generate a key first.",
@@ -134,7 +142,7 @@ const labels = {
       "stale-settings": "Settings changed elsewhere. Refresh and retry.",
       "control-key-reuse": "The API key must differ from the daemon management token.",
       "save-failed": "Could not save the configuration. Check file permissions.", "runtime-busy": "Another settings operation is running.",
-      "not-configured": "Initialize the runtime first.", "export-failed": "Configuration export failed.",
+      "not-configured": "Initialize the runtime first.", "restart-required": "The runtime has not loaded the upstream settings yet. Export after the restart completes.", "export-failed": "Configuration export failed.",
       "invalid-upstream-config": "Invalid upstream Base URL.", "invalid-upstream-models": "Invalid model list.", "invalid-upstream-metadata": "Invalid model metadata configuration.",
       "invalid-upstream-proxy": "Invalid upstream proxy configuration.", "invalid-upstream-key": "Invalid upstream API key.",
       "upstream-key-required": "Enter the upstream API key or unlock the recoverable saved key first.",
@@ -308,6 +316,7 @@ export function ApiAccessSettings({
       setCatalogPath(result.catalogPath);
       setNotice(copy.exported);
     }
+    adopt(value(await api.apiAccessStatus()), true);
   }
   const draftProxy = (): UpstreamProxy => proxyMode === "custom"
     ? { mode: "custom", url: proxyUrl }
@@ -577,6 +586,13 @@ export function ApiAccessSettings({
         onClick={() => void perform(deleteUpstream)}>{copy.deleteUpstream}</button> : null}
     </div>
     {status?.upstream?.configured ? <small>{status.upstream.runtimeAvailable ? copy.upstreamReady : copy.upstreamPending}</small> : null}
+    {status?.modelCatalogState === "pending" ? <small className="api-access-warning">{copy.catalogPending}</small> : null}
+    {status?.modelCatalogState === "export-required" ? <>
+      <small className="api-access-warning">{copy.catalogExportRequired}</small>
+      <div className="api-access-actions"><button type="button" disabled={busy || !status.baseUrl}
+        onClick={() => void perform(() => exportConfig(true))}>{copy.exportCatalog}</button></div>
+    </> : null}
+    {status?.modelCatalogState === "failed" ? <small className="api-access-warning">{copy.catalogFailed}</small> : null}
   </div>;
 
   if (view === "upstream") return <section className="api-access-settings api-access-settings-detail" aria-labelledby="api-access-upstream-title">
@@ -648,7 +664,9 @@ export function ApiAccessSettings({
       </button>
     </div> : null}
     <div role="status" aria-live="polite">
-      {busy ? copy.busy : status?.runtimeState === "in-sync" ? copy.saved
+      {busy ? copy.busy : status?.runtimeState === "in-sync" && status.modelCatalogState === "export-required" ? copy.catalogExportRequired
+        : status?.runtimeState === "in-sync" && status.modelCatalogState === "pending" ? copy.catalogPending
+        : status?.runtimeState === "in-sync" ? copy.saved
         : status?.runtimeState === "unconfigured" ? copy.unconfigured
           : status?.runtimeState === "invalid" ? (status.errorCode ? copy.errors[status.errorCode] ?? copy.invalid : copy.invalid)
             : pending ? copy.pending + (status?.effectiveMode === "api-key" ? copy.api
@@ -656,9 +674,14 @@ export function ApiAccessSettings({
     </div>
     {status?.routingPending ? <p className="api-access-warning">{copy.routing}</p> : null}
     {status?.cleanupPending ? <p className="api-access-warning">{copy.cleanup}</p> : null}
+    {status?.modelCatalogState === "export-required" ? <p className="api-access-warning">{copy.catalogExportRequired}</p> : null}
+    {status?.modelCatalogState === "failed" ? <p className="api-access-warning">{copy.catalogFailed}</p> : null}
     <div className="api-access-actions">
-      {pending || status?.cleanupPending || status?.routingPending ? <button type="button" disabled={busy || !status?.canApply}
+      {pending || status?.cleanupPending || status?.routingPending
+        || status?.modelCatalogState === "pending" || status?.modelCatalogState === "failed" ? <button type="button" disabled={busy || !status?.canApply}
         onClick={() => void perform(() => save(isApi ? "api-key" : "openai"))}>{copy.retry}</button> : null}
+      {status?.modelCatalogState === "export-required" ? <button type="button" disabled={busy || !status.baseUrl}
+        onClick={() => void perform(() => exportConfig(true))}>{copy.exportCatalog}</button> : null}
       <button type="button" disabled={busy} onClick={() => void perform(async () => {
         adopt(value(await api.apiAccessStatus())); setEditor(null); setDraft("");
       })}>{copy.refresh}</button>

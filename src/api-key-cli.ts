@@ -1,9 +1,10 @@
 import { stdin, stdout, stderr } from "node:process";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
 import {
   API_KEY_ENV,
+  MODEL_CATALOG_STATUS_HEADER,
   OPENAI_ACCESS,
   apiAccessRevision,
   apiKeyMatches,
@@ -20,6 +21,7 @@ import {
 import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
 import codexModelMetadata from "../launcher/electron/codex-model-metadata.cjs";
+import modelCatalogCommandLock from "../launcher/electron/model-catalog-command-lock.cjs";
 import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
@@ -35,6 +37,11 @@ type FetchLike = (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>
 const LOOPBACK_EXPORT_REQUEST_TIMEOUT_MS = 5_000;
 const API_ACCESS_REVISION_HEADER = "x-codex-chatgpt-web-api-access-revision";
 const UPSTREAM_PROVIDER_REVISION_HEADER = "x-codex-chatgpt-web-upstream-provider-revision";
+const UPSTREAM_RUNTIME_NOT_READY = "Upstream provider runtime is not synchronized; restart the service before exporting";
+const UPSTREAM_MODEL_CATALOG_REFRESH_FAILED = "Upstream model catalog refresh failed";
+const { acquireModelCatalogCommandLock } = modelCatalogCommandLock as {
+  acquireModelCatalogCommandLock: (markerPath: string) => Promise<() => void>;
+};
 
 async function withLoopbackExportTimeout<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController();
@@ -54,15 +61,20 @@ async function withLoopbackExportTimeout<T>(operation: (signal: AbortSignal) => 
   }
 }
 
-export async function buildApiKeyExportModelCatalog(
+async function buildApiKeyModelCatalog(
   config: AppConfig,
   policy: ApiAccessPolicy,
   localApiKey: string,
   upstream: UpstreamProviderConfig | undefined,
   fetchImpl: FetchLike = fetch,
+  allowLocalFallback = true,
 ): Promise<ReturnType<typeof buildStandaloneModelCatalog>> {
   const local = buildStandaloneModelCatalog(config);
   if (!upstream) return local;
+  const fallback = () => {
+    if (!allowLocalFallback) throw new Error(UPSTREAM_MODEL_CATALOG_REFRESH_FAILED);
+    return local;
+  };
   const baseUrl = `http://127.0.0.1:${config.port}`;
   const expectedApiAccessRevision = apiAccessRevision(policy, config.controlToken);
   const expectedUpstreamRevision = upstreamProviderRevision(upstream, config.controlToken);
@@ -79,7 +91,7 @@ export async function buildApiKeyExportModelCatalog(
       || health.api_access_revision !== expectedApiAccessRevision
       || health.upstream_provider_available !== true
       || health.upstream_provider_revision !== expectedUpstreamRevision) {
-      return local;
+      throw new Error(UPSTREAM_RUNTIME_NOT_READY);
     }
     const upstreamCatalog = await withLoopbackExportTimeout(async signal => {
       const response = await fetchImpl(`${baseUrl}/v1/models`, {
@@ -87,22 +99,44 @@ export async function buildApiKeyExportModelCatalog(
         cache: "no-store",
         signal,
       });
-      if (!response.ok
-        || response.headers.get(API_ACCESS_REVISION_HEADER) !== expectedApiAccessRevision
+      if (response.headers.get(API_ACCESS_REVISION_HEADER) !== expectedApiAccessRevision
         || response.headers.get(UPSTREAM_PROVIDER_REVISION_HEADER) !== expectedUpstreamRevision) {
-        return undefined;
+        throw new Error(UPSTREAM_RUNTIME_NOT_READY);
       }
+      if (!response.ok) return undefined;
+      if (!allowLocalFallback && response.headers.get(MODEL_CATALOG_STATUS_HEADER) !== "complete") return undefined;
       return await response.json();
     });
     if (upstreamCatalog === undefined || !upstreamCatalog || typeof upstreamCatalog !== "object"
-      || Array.isArray(upstreamCatalog)) return local;
+      || Array.isArray(upstreamCatalog)) return fallback();
     const raw = upstreamCatalog as Record<string, unknown>;
-    if (raw.object !== "list" || !Array.isArray(raw.data) || !Array.isArray(raw.models)) return local;
-    if (raw.models.some(model => codexModelMetadata.finalModelError(model) !== null)) return local;
+    if (raw.object !== "list" || !Array.isArray(raw.data) || !Array.isArray(raw.models)) return fallback();
+    if (raw.models.some(model => codexModelMetadata.finalModelError(model) !== null)) return fallback();
     return raw as ReturnType<typeof buildStandaloneModelCatalog>;
-  } catch {
-    return local;
+  } catch (error) {
+    if (error instanceof Error && error.message === UPSTREAM_RUNTIME_NOT_READY) throw error;
+    return fallback();
   }
+}
+
+export async function buildApiKeyExportModelCatalog(
+  config: AppConfig,
+  policy: ApiAccessPolicy,
+  localApiKey: string,
+  upstream: UpstreamProviderConfig | undefined,
+  fetchImpl: FetchLike = fetch,
+): Promise<ReturnType<typeof buildStandaloneModelCatalog>> {
+  return buildApiKeyModelCatalog(config, policy, localApiKey, upstream, fetchImpl, true);
+}
+
+export async function buildApiKeyRefreshModelCatalog(
+  config: AppConfig,
+  policy: ApiAccessPolicy,
+  localApiKey: string,
+  upstream: UpstreamProviderConfig | undefined,
+  fetchImpl: FetchLike = fetch,
+): Promise<ReturnType<typeof buildStandaloneModelCatalog>> {
+  return buildApiKeyModelCatalog(config, policy, localApiKey, upstream, fetchImpl, false);
 }
 
 async function readKeyFromStdin(): Promise<string> {
@@ -121,8 +155,8 @@ async function readKeyFromStdin(): Promise<string> {
 
 export async function runApiKeyCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
-  if (!["enable", "rotate", "disable", "status", "codex-config", "cleanup", "reconnect"].includes(action)) {
-    throw new Error("API key command must be enable, rotate, disable, status, codex-config, cleanup or reconnect");
+  if (!["enable", "rotate", "disable", "status", "codex-config", "refresh-models", "cleanup", "reconnect"].includes(action)) {
+    throw new Error("API key command must be enable, rotate, disable, status, codex-config, refresh-models, cleanup or reconnect");
   }
   if (action === "enable" || action === "rotate") {
     if (args.length !== 1 || (args[0] !== "--generate" && args[0] !== "--key-stdin")) {
@@ -193,43 +227,64 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   if (!localApiKey || !apiKeyMatches(localApiKey, policy)) {
     throw new Error(`${API_KEY_ENV} must contain the current local API key before export`);
   }
-  const config = loadConfig();
-  const route = availableChatGptWebModelRoutes(config)[0];
-  if (!route) throw new Error("No ChatGPT Web models are available in the current account/mode configuration");
   const localCatalogPath = join(getConfigDir(), "api-key-models.json");
-  const clientRoute = clientBaseUrl(config.port);
-  const externalClient = clientRoute.remote || manualCodexConfigurationOnly();
-  const catalogPath = clientCatalogPath(localCatalogPath, externalClient);
-  const upstream = loadUpstreamProviderConfig();
-  const catalog = await buildApiKeyExportModelCatalog(config, policy, localApiKey, upstream);
-  const catalogText = `${JSON.stringify({ models: catalog.models }, null, 2)}\n`;
-  if (!externalClient) atomicWriteFile(localCatalogPath, catalogText);
-  const rendered = renderApiKeyCodexConfig({
-    port: config.port,
-    baseUrl: clientRoute.baseUrl,
-    catalogPath,
-    model: route.slug,
-    reasoningEffort: route.codexEffort,
-    apiKey: localApiKey,
-    supportsOpenAiServerCompaction: upstream?.supportsOpenAiServerCompaction === true,
-    subagentProtocol: config.subagentProtocol,
-    runtimeCommand: externalClient ? undefined : config.runtimeCommand,
-  });
-  const environment = codexProxyEnvironment();
-  if (jsonExport) {
-    stdout.write(`${JSON.stringify({
-      config: rendered,
-      catalogPath,
-      catalog: catalogText,
-      baseUrl: clientRoute.baseUrl,
-      environment,
-    })}\n`);
-  } else {
-    stdout.write(rendered);
-    stderr.write(`Codex process environment: ${JSON.stringify(environment)}\n`);
-    if (externalClient) {
-      stderr.write(`Copy the exported model catalog to ${catalogPath}; use --json to retrieve its content.\n`);
+  const modelCatalogPendingPath = join(getConfigDir(), "api-key-models-refresh-pending.json");
+  // Keep catalog generation and its marker transition in one cross-process transaction. Without
+  // this lock, an older export/refresh can finish after a newer command and overwrite its state.
+  const releaseCatalogCommandLock = await acquireModelCatalogCommandLock(modelCatalogPendingPath);
+  try {
+    const config = loadConfig();
+    const route = availableChatGptWebModelRoutes(config)[0];
+    if (!route) throw new Error("No ChatGPT Web models are available in the current account/mode configuration");
+    const clientRoute = clientBaseUrl(config.port);
+    const externalClient = clientRoute.remote || manualCodexConfigurationOnly();
+    const catalogPath = clientCatalogPath(localCatalogPath, externalClient);
+    const upstream = loadUpstreamProviderConfig();
+    const requireCompleteCatalog = action === "refresh-models"
+      || (action === "codex-config" && upstream !== undefined && existsSync(modelCatalogPendingPath));
+    const catalog = requireCompleteCatalog
+      ? await buildApiKeyRefreshModelCatalog(config, policy, localApiKey, upstream)
+      : await buildApiKeyExportModelCatalog(config, policy, localApiKey, upstream);
+    const catalogText = `${JSON.stringify({ models: catalog.models }, null, 2)}\n`;
+    if (!externalClient) atomicWriteFile(localCatalogPath, catalogText);
+    if (!externalClient) rmSync(modelCatalogPendingPath, { force: true });
+    if (action === "refresh-models") {
+      if (externalClient) {
+        atomicWriteFile(modelCatalogPendingPath, '{"version":2,"state":"export-required"}\n');
+      }
+      stdout.write(`${JSON.stringify({ catalogPath })}\n`);
+      return;
     }
+    const rendered = renderApiKeyCodexConfig({
+      port: config.port,
+      baseUrl: clientRoute.baseUrl,
+      catalogPath,
+      model: route.slug,
+      reasoningEffort: route.codexEffort,
+      apiKey: localApiKey,
+      supportsOpenAiServerCompaction: upstream?.supportsOpenAiServerCompaction === true,
+      subagentProtocol: config.subagentProtocol,
+      runtimeCommand: externalClient ? undefined : config.runtimeCommand,
+    });
+    const environment = codexProxyEnvironment();
+    if (jsonExport) {
+      stdout.write(`${JSON.stringify({
+        config: rendered,
+        catalogPath,
+        catalog: catalogText,
+        baseUrl: clientRoute.baseUrl,
+        environment,
+      })}\n`);
+    } else {
+      stdout.write(rendered);
+      stderr.write(`Codex process environment: ${JSON.stringify(environment)}\n`);
+      if (externalClient) {
+        stderr.write(`Copy the exported model catalog to ${catalogPath}; use --json to retrieve its content.\n`);
+      }
+    }
+    stderr.write("Sensitive client configuration exported. Re-export after account capabilities, browser mode or context settings change.\n");
+    if (externalClient && jsonExport) rmSync(modelCatalogPendingPath, { force: true });
+  } finally {
+    releaseCatalogCommandLock();
   }
-  stderr.write("Sensitive client configuration exported. Re-export after account capabilities, browser mode or context settings change.\n");
 }

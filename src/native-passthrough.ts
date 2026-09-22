@@ -34,6 +34,7 @@ export type NativeCodexEndpoint = "models" | "responses" | "responses/compact" |
 export interface NativeResponsesLifecycleObserver {
   onProgress?: () => void;
   onFinalResponse?: () => void;
+  onTerminalFailure?: () => void;
   terminalSignal?: AbortSignal;
 }
 
@@ -274,7 +275,14 @@ export function observeNativeResponsesLifecycle(
   const jsonChunks: Uint8Array[] = [];
   let sawToolCall = false;
   let finalReported = false;
+  let failureReported = false;
   let terminalReported = false;
+
+  const reportTerminalFailure = (): void => {
+    if (finalReported || failureReported) return;
+    failureReported = true;
+    observer.onTerminalFailure?.();
+  };
 
   const inspectPayload = (value: unknown, eventName?: string): void => {
     if (!isObject(value)) return;
@@ -285,10 +293,17 @@ export function observeNativeResponsesLifecycle(
       sawToolCall = true;
     }
 
+    const response = isObject(value.response) ? value.response : value;
+    const status = typeof response.status === "string" ? response.status : undefined;
+    if (type === "response.failed" || type === "response.incomplete"
+      || status === "failed" || status === "incomplete") {
+      reportTerminalFailure();
+      return;
+    }
     const completed = type === "response.completed" || value.status === "completed";
-    if (!completed) return;
+    if (!completed || failureReported) return;
     observer.onProgress?.();
-    const completedResponse = isObject(value.response) ? value.response : value;
+    const completedResponse = response;
     const output = Array.isArray(completedResponse.output) ? completedResponse.output : [];
     const requiresToolContinuation = sawToolCall || output.some(nativeToolCallItem);
     const endTurn = completedResponse.end_turn;
@@ -348,41 +363,67 @@ export function observeNativeResponsesLifecycle(
     return true;
   };
 
+  const readChunkOrTerminal = async () => {
+    const signal = observer.terminalSignal;
+    if (!signal) return await reader.read();
+    if (signal.aborted) return undefined;
+    let onAbort: (() => void) | undefined;
+    const terminal = new Promise<undefined>(resolve => {
+      onAbort = () => resolve(undefined);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([reader.read(), terminal]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  };
+
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
-      if (terminalSignalError(observer.terminalSignal)) {
-        await reader.cancel(observer.terminalSignal?.reason).catch(() => {});
-        if (emitTerminalTimeout(controller)) return;
-      }
       try {
-        const chunk = await reader.read();
-        if (terminalSignalError(observer.terminalSignal)) {
-          await reader.cancel(observer.terminalSignal?.reason).catch(() => {});
-          if (emitTerminalTimeout(controller)) return;
-        }
-        if (chunk.done) {
-          const tail = decoder.decode();
-          if (isEventStream) inspectSse(tail, true);
-          else {
-            jsonBuffer += tail;
-            if (jsonBuffer) {
-              try { inspectPayload(JSON.parse(jsonBuffer)); } catch { /* Preserve invalid upstream JSON. */ }
-            }
-            for (const buffered of jsonChunks) controller.enqueue(buffered);
+        for (;;) {
+          if (observer.terminalSignal?.aborted) {
+            void reader.cancel(observer.terminalSignal.reason).catch(() => {});
+            if (emitTerminalTimeout(controller)) return;
+            throw observer.terminalSignal.reason ?? new Error("Native Responses stream aborted");
           }
-          controller.close();
-          return;
-        }
-        const text = decoder.decode(chunk.value, { stream: true });
-        if (isEventStream) {
-          inspectSse(text);
-          controller.enqueue(chunk.value);
-        } else {
+          const chunk = await readChunkOrTerminal();
+          if (!chunk) {
+            void reader.cancel(observer.terminalSignal?.reason).catch(() => {});
+            if (emitTerminalTimeout(controller)) return;
+            throw observer.terminalSignal?.reason ?? new Error("Native Responses stream aborted");
+          }
+          if (observer.terminalSignal?.aborted) {
+            void reader.cancel(observer.terminalSignal.reason).catch(() => {});
+            if (emitTerminalTimeout(controller)) return;
+            throw observer.terminalSignal.reason ?? new Error("Native Responses stream aborted");
+          }
+          if (chunk.done) {
+            const tail = decoder.decode();
+            if (isEventStream) inspectSse(tail, true);
+            else {
+              jsonBuffer += tail;
+              if (jsonBuffer) {
+                try { inspectPayload(JSON.parse(jsonBuffer)); } catch { /* Preserve invalid upstream JSON. */ }
+              }
+              for (const buffered of jsonChunks) controller.enqueue(buffered);
+            }
+            controller.close();
+            return;
+          }
+          const text = decoder.decode(chunk.value, { stream: true });
+          if (isEventStream) {
+            inspectSse(text);
+            controller.enqueue(chunk.value);
+            return;
+          }
           jsonBuffer += text;
           jsonChunks.push(chunk.value);
         }
       } catch (error) {
         if (emitTerminalTimeout(controller)) return;
+        reportTerminalFailure();
         controller.error(error);
       }
     },

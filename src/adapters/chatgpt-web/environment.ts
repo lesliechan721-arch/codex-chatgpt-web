@@ -113,6 +113,11 @@ function clientTurnMetadataFromBody(value: unknown): Record<string, unknown> | u
   return record(raw);
 }
 
+export function isCodexThreadTitleRequestFromBody(value: unknown): boolean {
+  const metadata = clientTurnMetadataFromBody(value);
+  return metadata?.request_kind === "turn" && metadata?.thread_source === "thread_title";
+}
+
 function clientTurnMetadata(parsed: CodexParsedRequest): Record<string, unknown> | undefined {
   return clientTurnMetadataFromBody(parsed._rawBody);
 }

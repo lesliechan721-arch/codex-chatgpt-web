@@ -11,6 +11,7 @@ const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.c
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
 const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "NetworkProxySettings.tsx"), "utf8");
+const apiAccessSettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "ApiAccessSettings.tsx"), "utf8");
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -438,6 +439,29 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
   assert.doesNotMatch(modeSwitchHandler, /const pending = stateStore\.update|catch \(error\)/);
   assert.match(electronMain, /browserInteractionMode === "manual"[\s\S]*?Local Zero Risk runtime is healthy/);
 
+});
+
+test("Zero Risk Pro commits Launcher state before a best-effort API-key model catalog refresh", () => {
+  const handler = electronMain.slice(
+    electronMain.indexOf('handle("launcher:zero-risk-pro"'),
+    electronMain.indexOf('handle("launcher:browser-interaction-mode"'),
+  );
+  const runtimeCommit = handler.indexOf("await runtimeHost.setZeroRiskPro(enabled === true)");
+  const stateCommit = handler.indexOf("const state = stateStore.update");
+  const catalogRefresh = handler.indexOf("await apiAccessSettings.refreshModelCatalog()");
+  assert.ok(runtimeCommit >= 0 && runtimeCommit < stateCommit && stateCommit < catalogRefresh);
+  assert.match(handler, /try \{ await apiAccessSettings\.refreshModelCatalog\(\); \}[\s\S]*?catch \{ logger\.warn\("api_access\.model_catalog_refresh_deferred", \{\}\); \}/);
+  assert.match(handler, /catch[\s\S]*?startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
+});
+
+test("external model catalog export-required state directs the user to export instead of retrying refresh", () => {
+  assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?copy\.catalogExportRequired/);
+  assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?exportConfig\(true\)[\s\S]*?copy\.exportCatalog/);
+  const retryCondition = apiAccessSettingsSource.slice(
+    apiAccessSettingsSource.indexOf("{pending || status?.cleanupPending"),
+    apiAccessSettingsSource.indexOf("{status?.modelCatalogState === \"export-required\" ? <button", apiAccessSettingsSource.indexOf("{pending || status?.cleanupPending")),
+  );
+  assert.doesNotMatch(retryCondition, /export-required/);
 });
 
 test("MCP connection remains unavailable until the model catalog is verified", () => {

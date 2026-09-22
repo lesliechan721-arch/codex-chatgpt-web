@@ -8,6 +8,7 @@ export type ApiAccessPolicy =
 
 export const OPENAI_ACCESS: ApiAccessPolicy = Object.freeze({ version: 1, mode: "openai" });
 export const API_KEY_ENV = "CODEX_CHATGPT_WEB_API_KEY";
+export const MODEL_CATALOG_STATUS_HEADER = "x-codex-chatgpt-web-model-catalog-status";
 const KEY_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
 
 export function generateApiKey(): string {
