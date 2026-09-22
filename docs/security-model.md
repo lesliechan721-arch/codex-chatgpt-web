@@ -2,13 +2,18 @@
 
 ## Trust boundaries
 
-The user trusts the local Codex app, this loopback daemon, the launcher's private Electron browser
-profile, the selected ChatGPT workspace, OpenAI's tunnel service, and the exact MCP connector they
-created. Repository contents, tool output, websites, and prompt text are untrusted data.
+The user trusts the Codex client, the daemon's configured listener boundary, the launcher's private
+Electron browser profile, the selected ChatGPT workspace, OpenAI's tunnel service, and the exact MCP
+connector they created. Normal local installs keep the daemon on loopback. The server remote-desktop
+deployment may place an API-Key-protected Responses listener on the private container interface while
+the host and HTTPS reverse proxy remain the external network boundary. Repository contents, tool
+output, websites, and prompt text are untrusted data.
 
 ## Full-mode capability flow
 
-1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+1. The daemon accepts a Codex Responses turn on its configured Responses listener. Normal local
+   installs use `127.0.0.1`. The server remote-desktop deployment can bind the private container
+   listener to `0.0.0.0` only after API-Key access is enabled.
 2. It extracts `cwd`, workspace roots, and sandbox policy from the native Codex envelope. When a
    resumed root task or subagent omits that envelope, its canonical local rollout must prove the
    exact thread and current turn (or latest source turn for standalone compaction). Request metadata
@@ -69,11 +74,13 @@ argument or generated profile. Rotate it after suspected exposure.
 
 ### Same-user local process
 
-The Responses endpoint is loopback-only, but it has no independent bearer secret because the
-built-in Codex OpenAI provider cannot be configured with a bridge-specific credential while
-preserving the native provider/task identity. Another process under the same OS user can reach the
-port. Run on a trusted single-user account and treat local code execution as inside the trust
-boundary.
+In the default OpenAI-forwarding path, the Responses endpoint remains loopback-only and has no
+independent bearer secret because the built-in Codex OpenAI provider cannot be configured with a
+bridge-specific credential while preserving the native provider/task identity. Another process under
+the same OS user can reach that port. API-Key mode requires the client bearer before `/v1/*` is
+served. The server remote-desktop deployment permits a non-loopback container listener only in this
+API-Key mode; Compose publishes it on host loopback and the intended remote path is the existing
+HTTPS reverse proxy.
 
 The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
 `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
@@ -112,7 +119,11 @@ assistant prose as a structured handoff.
 
 ## Network exposure
 
-- Responses and health listeners bind to `127.0.0.1` only.
+- Normal local installs bind Responses and health to `127.0.0.1`.
+- In the server remote-desktop deployment, Responses may bind to `0.0.0.0` inside the private
+  container only in API-Key mode. The default Compose publication is host-loopback only, and the
+  external HTTPS reverse proxy exposes only `/v1`. It must not expose `/healthz`, `/admin/*`,
+  CDP, or raw VNC.
 - Full mode uses OpenAI's outbound HTTPS Secure MCP Tunnel; it opens no public listener or inbound
   firewall rule.
 - The embedded browser connects to ChatGPT, the selected identity provider during explicit sign-in,

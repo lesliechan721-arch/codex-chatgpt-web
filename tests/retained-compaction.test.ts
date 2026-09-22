@@ -47,6 +47,7 @@ import {
   structuredCompactionHandoffInstruction,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
+import { NativeTurnIdleRegistry } from "../src/native-turn-idle";
 
 /**
  * These fixtures hand the turn broker a Unix socket under their temp root. macOS puts TMPDIR at
@@ -756,6 +757,70 @@ test("active compaction aborts its source when the shared handoff deadline expir
   expect(cancellations).toBe(1);
 });
 
+test.each([false, true])(
+  "active compaction reports real trace/text feed progress while settling (Zero Risk=%s)",
+  async zeroRisk => {
+    const trace = new ChatGptTraceFeed();
+    const text = new ChatGptTextFeed();
+    let finishBrowser!: (answer: string) => void;
+    const browser = new Promise<string>(resolve => { finishBrowser = resolve; });
+    const source = new ChatGptTurnSession({
+      mode: "tools",
+      token: Promise.resolve(zeroRisk ? "turn_zero_risk_progress" : "turn_active_progress"),
+      externalProgress: { recordToolResult() {} } as never,
+      ...(zeroRisk ? { manualControl: { surfaceNonce: "p".repeat(24) } } : {}),
+      browser,
+      physicalSettlement: browser.then(() => undefined),
+      trace,
+      text,
+      cancel() {},
+    });
+    source.setOutstanding([{ callId: "call_progress", wireName: "exec_command", freeform: false }]);
+    const parsed = request(true);
+    parsed.context.messages.push({
+      role: "toolResult",
+      toolCallId: "call_progress",
+      toolName: "exec_command",
+      content: "canonical result",
+      isError: false,
+      timestamp: 4,
+    });
+    const broker = {
+      requestCompaction: () => 0,
+      compactionDeliveryCount: () => 0,
+      completeTool: async () => {
+        setTimeout(() => trace.push({ kind: "reasoning", text: "reasoning delta" }), 10);
+        setTimeout(() => text.push("summary delta"), 20);
+        setTimeout(() => finishBrowser(zeroRisk ? "Zero Risk checkpoint" : "ordinary final"), 30);
+      },
+      revoke() {},
+    } as unknown as TurnBroker;
+    let progress = 0;
+
+    if (zeroRisk) {
+      await expect(settleActiveZeroRiskCompactionSource(
+        parsed,
+        source,
+        broker,
+        undefined,
+        () => { progress += 1; },
+      )).resolves.toBe("Zero Risk checkpoint");
+    } else {
+      await expect(settleActiveCompactionSource(
+        parsed,
+        source,
+        broker,
+        undefined,
+        () => { progress += 1; },
+      )).resolves.toEqual({
+        answer: "ordinary final",
+        compactionInstructionDelivered: false,
+      });
+    }
+    expect(progress).toBeGreaterThanOrEqual(3);
+  },
+);
+
 test("Zero Risk active compaction returns through its explicit completion control", async () => {
   const completed: BrokerToolResult[] = [];
   const broker = {
@@ -1107,6 +1172,126 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
     expect(chatGptTurnSessions.findConversationHead(conversationKey)).toBeUndefined();
     expect(releases).toBe(1);
   } finally {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    chatGptTurnSessions.clear();
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("real adapter active-source compaction keeps a 1s idle lease alive with 300ms text progress", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-active-compact-idle-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://active-compact-idle-${Date.now()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      appName: "Codex Native DEV",
+      localToolsEnabled: true,
+      solAvailable: true,
+      extraHighAvailable: true,
+      proAvailable: true,
+    },
+  };
+  const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const sourceRequest = request(false);
+  const namespace = chatGptWebExecutionNamespace(provider);
+  const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  const conversationKey = chatGptConversationKey(sourceRequest, namespace)!;
+  const token = await broker.register({
+    cwd: root,
+    roots: [root],
+    writableRoots: [root],
+    sandboxPolicy: { type: "dangerFullAccess" },
+    tools: [{
+      name: "exec_command",
+      description: "Run one command",
+      parameters: { type: "object" },
+    }],
+  }, 10_000, "trace_active_compact_idle");
+  const claimed = await callTurnBroker<{ bindingId: string }>(broker.socketPath, {
+    method: "claim",
+    token,
+  });
+  const invocation = callTurnBroker<BrokerToolResult>(broker.socketPath, {
+    method: "invoke",
+    bindingId: claimed.bindingId,
+    wireName: "exec_command",
+    arguments: { cmd: "synthetic" },
+  });
+  const outstanding = await broker.nextToolBatch(token);
+  expect(outstanding).toHaveLength(1);
+  const trace = new ChatGptTraceFeed();
+  const text = new ChatGptTextFeed();
+  const browser = invocation.then(async result => {
+    expect(result.content).toEqual([{ type: "text", text: "canonical result" }]);
+    for (const chunk of ["a", "b", "c", "d", "e"]) {
+      await Bun.sleep(300);
+      text.push(chunk);
+    }
+    return "abcde";
+  });
+  const source = chatGptTurnSessions.getOrCreate(sourceKey, () => ({
+    mode: "tools",
+    token: Promise.resolve(token),
+    externalProgress: { recordToolResult() {} } as never,
+    browser,
+    physicalSettlement: browser.then(() => undefined),
+    trace,
+    text,
+    usageInput: sourceRequest,
+    conversationKey,
+    cancel() {},
+  }));
+  source.setOutstanding(outstanding);
+  const compact = request(true);
+  compact.context.messages.push({
+    role: "toolResult",
+    toolCallId: outstanding[0]!.callId,
+    toolName: "exec_command",
+    content: "canonical result",
+    isError: false,
+    timestamp: 4,
+  });
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    const prepared = await turn.prepareResume!();
+    const binding = controlBinding(prepared.text);
+    prepared.release();
+    await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, {
+      method: "submit_compaction_handoff",
+      token: binding.token,
+      handoffId: binding.handoffId,
+      summary: "Remote idle checkpoint",
+    });
+    return "Checkpoint submitted through MCP";
+  };
+  const identity = { threadId: "thread_retained_compaction", turnId: "turn_compact" };
+  let expirations = 0;
+  const idle = new NativeTurnIdleRegistry(1, () => { expirations += 1; });
+  const idleSignal = idle.signal(identity);
+  const events: AdapterEvent[] = [];
+  const startedAt = Date.now();
+  try {
+    await createChatGptWebAdapter(provider, { broker }).runTurn!(
+      compact,
+      {
+        headers: new Headers(),
+        abortSignal: idleSignal,
+        onProgress: () => { idle.touch(identity); },
+      },
+      event => events.push(event),
+    );
+    expect(Date.now() - startedAt).toBeGreaterThan(1_000);
+    expect(expirations).toBe(0);
+    expect(idleSignal.aborted).toBeFalse();
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    idle.release(identity);
+    idle.clear();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
     await broker.close();

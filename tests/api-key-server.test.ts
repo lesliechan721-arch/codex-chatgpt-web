@@ -245,6 +245,36 @@ test("allowed non-Web responses and compaction use the configured upstream beare
   }
 });
 
+test("allowed non-Web responses and compaction opt into the remote native-turn idle lease", async () => {
+  const runtime = upstream();
+  for (const [path, handler] of [
+    ["/v1/responses", responseRequest] as const,
+    ["/v1/responses/compact", compactRequest] as const,
+  ]) {
+    let remoteIdleTimeout: boolean | undefined;
+    const request = jsonRequest(path, {
+      model: "gpt-upstream",
+      input: [{ role: "user", content: "hello" }],
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_remote", turn_id: "turn_remote" }),
+      },
+    });
+    const options = {
+      accessPolicy,
+      upstreamRuntime: runtime,
+      fetchUpstreamProvider: async () => Response.json({ ok: true }),
+      onTurnIdentity: (_identity: { threadId: string; turnId: string }, binding?: { remoteIdleTimeout: boolean }) => {
+        remoteIdleTimeout = binding?.remoteIdleTimeout;
+      },
+    };
+    const response = handler === responseRequest
+      ? await responseRequest(request, config(), () => { throw new Error("Web adapter must not run"); }, options)
+      : await compactRequest(request, config(), () => { throw new Error("Web adapter must not run"); }, options);
+    assert.equal(response.status, 200);
+    assert.equal(remoteIdleTimeout, true);
+  }
+});
+
 test("model filters are enforced before any custom upstream request", async () => {
   let calls = 0;
   const options = {

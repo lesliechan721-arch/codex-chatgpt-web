@@ -1,0 +1,3 @@
+**
+!deploy/server/**
+!launcher/artifacts/*.AppImage

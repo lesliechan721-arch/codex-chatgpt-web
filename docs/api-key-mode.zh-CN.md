@@ -106,7 +106,9 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 - 子代理协议切换；
 - daemon `serve` 启动。
 
-它们只允许清理先前有 ownership journal 记录的注入。`auth.json`、用户手动维护的 provider/table 不会被自动生成或覆盖。GUI 导出只生成应用目录内的 `api-key-models.json` 并返回 TOML；用户自行选择粘贴/合并位置，或通过下载保存 TOML。
+它们只允许清理先前有 ownership journal 记录的注入。`auth.json`、用户手动维护的 provider/table 不会被自动生成或覆盖。普通本地安装的 GUI 导出会生成应用目录内的 `api-key-models.json` 并返回 TOML；用户自行选择粘贴/合并位置，或通过下载保存 TOML。
+
+服务端远程桌面部署使用 `CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG=1`。该模式下，setup、route、subagents 和 reconnect 都不会修改容器内或外部客户端的 Codex 配置。导出结果同时返回 TOML、模型目录内容和客户端目标路径；服务端不会为了外部 Codex 把模型目录写到自己的 HOME。外部客户端必须自行复制这两个文件。
 
 ### 5.2 旧注入清理
 
@@ -137,7 +139,7 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 | `[features] multi_agent = true` | Compatibility V1 模式导出，与自动集成一致 |
 | `[features] multi_agent_v2 = false` | Compatibility V1 模式导出；native 模式不强制降级 |
 | `[agents] max_depth` | 复用 V1 默认值，当前为 2；用户已有更高值可自行保留 |
-| `[[hooks.Interrupt]]` | 导出相同 runtime command、应用 home 与 timeout=3 |
+| `[[hooks.Interrupt]]` | 普通本地 API 模式导出相同 runtime command、应用 home 与 timeout=3；服务端远程桌面部署不导出容器内命令 hook |
 | `openai_base_url` | 排除；API 模式使用自定义 provider 的 `base_url` |
 | `experimental_realtime_webrtc_call_base_url` | 排除；它依赖原生 OpenAI 身份，与独立 API 接入目标冲突 |
 | `[hooks.state] trusted_hash` | 排除；用户选择的目标文件与 hook index 未知，不伪造预批准状态 |
@@ -145,7 +147,7 @@ API 模式下，以下路径均不安装新的 Codex 路由、provider 或 hooks
 
 从共享 feature builder 生成值之后，移除自动管理注释：手动导出的设置归用户，不冒充新的一次受 journal 管理的安装。
 
-Interrupt hook 导出的是声明，不是自动授权。用户合并后按 Codex 的提示批准该命令。已有 `[features]`、`[agents]` 或 hooks 时按字段合并，不要直接追加重复 TOML table，也不要重复导入同一个 hook。
+普通本地安装的 Interrupt hook 导出的是声明，不是自动授权。用户合并后按 Codex 的提示批准该命令。服务端远程桌面部署不依赖客户端命令 hook 来保证正确性；它继续使用 HTTP 断开取消，并额外启用 native turn 的无进展 idle timeout。已有 `[features]`、`[agents]` 或 hooks 时按字段合并，不要直接追加重复 TOML table，也不要重复导入同一个 hook。
 
 ## 7. 使用示例
 
@@ -178,7 +180,11 @@ CLI 修改仍需通过已有服务管理方式重启。GUI 的「查看」仅能
 
 所有 `/v1/*` 请求仍先检查本地 Bearer。未配置可用上游时，API Key 模式保持 Web-only：`/models`、`/responses`、`/responses/compact` 使用本地 ChatGPT Web 路由，非 Web 模型和 search/images 端点继续拒绝。配置可用上游后，`/models` 合并经过筛选的上游目录，允许的非 Web `/responses` 与 `/responses/compact` 转发到上游，并开放 `/v1/alpha/search`、`/v1/images/generations`、`/v1/images/edits`。`chatgpt-web/*` 始终走本地 Web 路由，不能被上游覆盖。
 
-继续仅监听 `127.0.0.1`，不新增公网部署、多密钥或租户隔离。自定义上游网络使用三态策略：`global` 复用当前全局代理，`direct` 强制直连且不修改进程代理环境，`custom` 只使用指定 HTTP/HTTPS 代理。Codex 客户端始终连接本地 loopback；导出的启动环境把 loopback 合并到 `NO_PROXY`，并仅在 Launcher 有全局代理时导出对应代理变量。应用自己的 control token、本地客户端 API Key 与上游 API Key 仍严格分离。
+普通本地安装继续仅监听 `127.0.0.1`。服务端远程桌面部署是受约束的例外：只有已保存的接入策略为 API Key 时，部署环境才允许 Responses 在容器内监听 `0.0.0.0`；Compose 仍只把该端口发布到宿主机 loopback，外部 Codex 通过现有 HTTPS 反向代理访问 `/v1`。反向代理不能公开 `/healthz`、`/admin/*`、CDP 或原始 VNC 端口。配置远程公开 Base URL 时必须使用以 `/v1` 结尾的 HTTPS URL；留空表示同宿主机客户端使用 `http://127.0.0.1:<port>/v1`。
+
+服务端远程桌面部署还可以设置 native turn 无进展 idle timeout，当前部署变量为 `REMOTE_TURN_IDLE_TIMEOUT_SEC`，默认值为 600 秒。它不限制整个 turn 的总执行时间。同一个 `thread_id + turn_id` 共用一份 idle lease；文本/推理增量、工具调用产生、工具结果返回和 compaction 实际进展可以续租，retry/continuation 请求本身、adapter/browser heartbeat 和 TCP 存活不能续租。工具调用发出后若一直没有结果，idle 时间继续累计。超时后会终止对应 HTTP/browser/compaction ownership，并拒绝同 identity 重新建立 lease。普通本地安装不默认启用这项部署超时。
+
+自定义上游网络使用三态策略：`global` 复用当前全局代理，`direct` 强制直连且不修改进程代理环境，`custom` 只使用指定 HTTP/HTTPS 代理。普通本地 Codex 客户端连接 loopback；服务端部署的外部 Codex 使用导出的公开 Base URL 或宿主机 loopback fallback。导出的启动环境把 loopback 合并到 `NO_PROXY`，并仅在 Launcher 有全局代理时导出对应代理变量。应用自己的 control token、本地客户端 API Key 与上游 API Key 仍严格分离。
 
 JSON/SSE、MCP tool loop、continuation、v1/v2 compaction、Luna checkpoint 使用原实现。本次仅在配置导出中把相应客户端能力声明补齐。
 

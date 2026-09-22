@@ -1,0 +1,55 @@
+services:
+  desktop:
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+      args:
+        APPIMAGE_FILE: ${APPIMAGE_FILE:?Set APPIMAGE_FILE to the Linux x64 AppImage filename in launcher/artifacts}
+        CODEX_UID: ${CODEX_UID:-10001}
+        CODEX_GID: ${CODEX_GID:-10001}
+    restart: unless-stopped
+    shm_size: 1gb
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HOME: /home/codex
+      DISPLAY: :99
+      XDG_RUNTIME_DIR: /tmp/codex-runtime
+      CODEX_CHATGPT_WEB_HOME: /home/codex/.codex-chatgpt-web
+      CODEX_WEB_GPT_LAUNCHER_DATA_DIR: /home/codex/.config/Codex Web GPT
+      CODEX_CHATGPT_WEB_BIND_HOST: 0.0.0.0
+      CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1"
+      CODEX_CHATGPT_WEB_PUBLIC_BASE_URL: ${CODEX_PUBLIC_BASE_URL:-}
+      CODEX_CHATGPT_WEB_CLIENT_PORT: ${RESPONSES_HOST_PORT:-17841}
+      CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH: ${CODEX_CLIENT_CATALOG_PATH:-~/.codex/api-key-models.json}
+      CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC: ${REMOTE_TURN_IDLE_TIMEOUT_SEC:-600}
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      APPIMAGE_PATH: /opt/codex/Codex-Web-GPT.AppImage
+      VNC_PASSWORD_FILE: /run/secrets/vnc_password
+      KEYRING_PASSWORD_FILE: /run/secrets/keyring_password
+    ports:
+      - "127.0.0.1:${NOVNC_HOST_PORT:-6080}:6080"
+      - "127.0.0.1:${RESPONSES_HOST_PORT:-17841}:17841"
+    volumes:
+      - codex_home:/home/codex
+    secrets:
+      - vnc_password
+      - keyring_password
+    healthcheck:
+      test: ["CMD", "/opt/codex-server/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  codex_home:
+
+secrets:
+  vnc_password:
+    file: ${VNC_PASSWORD_FILE:?Set VNC_PASSWORD_FILE to a private host file}
+  keyring_password:
+    file: ${KEYRING_PASSWORD_FILE:?Set KEYRING_PASSWORD_FILE to a private host file}

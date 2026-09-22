@@ -33,6 +33,7 @@ import { runDevCommand } from "./dev-chat/cli";
 import { runApiKeyCommand } from "./api-key-cli";
 import { clearOpenAiRoutingPending, loadApiAccessPolicy } from "./api-access-config";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
+import { manualCodexConfigurationOnly, responsesListenHost } from "./server-remote-config";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -389,8 +390,11 @@ async function doctorCommand(args: string[]): Promise<void> {
 async function routeCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
-  if (loadApiAccessPolicy().mode === "api-key" && (action === "connect" || action === "disconnect")) {
-    const result = cleanupApiKeyCodexIntegration();
+  if ((loadApiAccessPolicy().mode === "api-key" || manualCodexConfigurationOnly())
+    && (action === "connect" || action === "disconnect")) {
+    const result = loadApiAccessPolicy().mode === "api-key" && !manualCodexConfigurationOnly()
+      ? cleanupApiKeyCodexIntegration()
+      : { changed: false };
     stdout.write(`${JSON.stringify({ ...result, installed: false, active: false, manualConfigurationRequired: true, errors: [] })}\n`);
     return;
   }
@@ -433,9 +437,11 @@ async function subagentsCommand(args: string[]): Promise<void> {
   if (action !== "compatibility-v1" && action !== "native") {
     throw new Error("Subagent protocol must be one of: status, compatibility-v1, native");
   }
-  if (loadApiAccessPolicy().mode === "api-key") {
+  if (loadApiAccessPolicy().mode === "api-key" || manualCodexConfigurationOnly()) {
     saveConfig({ ...config, subagentProtocol: action });
-    cleanupApiKeyCodexIntegration();
+    if (loadApiAccessPolicy().mode === "api-key" && !manualCodexConfigurationOnly()) {
+      cleanupApiKeyCodexIntegration();
+    }
     stdout.write(`${JSON.stringify({ protocol: action, manualConfigurationRequired: true, launcherRestartRequired: true })}\n`);
     return;
   }
@@ -612,12 +618,13 @@ async function main(): Promise<void> {
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
-    if (loadApiAccessPolicy().mode === "api-key") {
+    if (loadApiAccessPolicy().mode === "api-key" && !manualCodexConfigurationOnly()) {
       try { cleanupApiKeyCodexIntegration(); }
       catch { process.stderr.write("API mode: recorded Codex injection could not be cleaned; inspect conflicts or run api-key cleanup.\n"); }
     }
     const server = startServer(config);
-    stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`);
+    const listenHost = responsesListenHost(config.host, loadApiAccessPolicy());
+    stdout.write(`codex-chatgpt-web ${VERSION} listening on http://${listenHost}:${server.port}/v1 (${config.mode})\n`);
     await new Promise<void>(() => {});
   } else if (command === "dev") await runDevCommand(args);
   else if (command === "mcp") await runChatGptMcpMain(args);

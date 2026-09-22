@@ -35,7 +35,7 @@ const labels = {
     url: "服务 Base URL", copyUrl: "复制地址", copyConfig: "复制 Codex 配置", exportConfig: "导出 TOML",
     exported: "敏感配置已生成，包含本地 API Key。", preview: "查看导出的敏感配置",
     client: "Codex 配置通过 experimental_bearer_token 包含本地 API Key；不会自动写入 Codex 配置或认证文件。代理启动环境与 TOML 分开显示。",
-    processEnv: "Codex 启动环境",
+    processEnv: "Codex 启动环境", catalogPath: "模型目录保存路径", catalog: "模型目录内容",
     upstreamTitle: "OpenAI 兼容上游", upstreamBase: "上游 Base URL", upstreamKey: "上游 API Key",
     upstreamKeyHint: "留空可复用当前可恢复的上游密钥。密钥不会返回到 Renderer。",
     proxyMode: "上游代理", proxyGlobal: "使用全局代理", proxyDirect: "不使用代理", proxyCustom: "单独代理",
@@ -75,7 +75,7 @@ const labels = {
     url: "Service Base URL", copyUrl: "Copy URL", copyConfig: "Copy Codex config", exportConfig: "Export TOML",
     exported: "Sensitive configuration generated with the local API key.", preview: "View sensitive exported configuration",
     client: "The Codex provider uses experimental_bearer_token with the local API key. Nothing is written automatically to Codex config or authentication files. Process proxy environment is shown separately from TOML.",
-    processEnv: "Codex process environment",
+    processEnv: "Codex process environment", catalogPath: "Model catalog destination", catalog: "Model catalog content",
     upstreamTitle: "OpenAI-compatible upstream", upstreamBase: "Upstream Base URL", upstreamKey: "Upstream API key",
     upstreamKeyHint: "Leave blank to reuse the currently recoverable upstream key. The saved key is never returned to the Renderer.",
     proxyMode: "Upstream proxy", proxyGlobal: "Use global proxy", proxyDirect: "Direct", proxyCustom: "Custom proxy",
@@ -118,6 +118,8 @@ export function ApiAccessSettings({ language }: { language: Language }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [configText, setConfigText] = useState<string | null>(null);
   const [environmentText, setEnvironmentText] = useState<string | null>(null);
+  const [catalogText, setCatalogText] = useState<string | null>(null);
+  const [catalogPath, setCatalogPath] = useState<string | null>(null);
   const [upstreamBaseUrl, setUpstreamBaseUrl] = useState("");
   const [upstreamKey, setUpstreamKey] = useState("");
   const [proxyMode, setProxyMode] = useState<UpstreamProxy["mode"]>("global");
@@ -193,7 +195,10 @@ export function ApiAccessSettings({ language }: { language: Language }) {
     if (!revision) return;
     const result = value(await api.apiAccessApply({ mode, expectedRevision: revision, ...(key !== undefined ? { key } : {}) }));
     adopt(result.status);
-    if (mounted.current) { setEditor(null); setDraft(""); setConfigText(null); setEnvironmentText(null); }
+    if (mounted.current) {
+      setEditor(null); setDraft(""); setConfigText(null); setEnvironmentText(null);
+      setCatalogText(null); setCatalogPath(null);
+    }
   }
   function switchMode(mode: ApiAccessMode) {
     if (busy || mode === status?.configuredMode) return;
@@ -211,14 +216,21 @@ export function ApiAccessSettings({ language }: { language: Language }) {
   async function exportConfig(download: boolean) {
     const result = value(await api.apiAccessExport());
     if (download) {
-      const url = URL.createObjectURL(new Blob([result.config], { type: "text/plain;charset=utf-8" }));
-      const link = document.createElement("a");
-      link.href = url; link.download = "codex-api-key.toml"; document.body.append(link); link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      for (const [name, body, type] of [
+        ["codex-api-key.toml", result.config, "text/plain;charset=utf-8"],
+        ["api-key-models.json", result.catalog, "application/json;charset=utf-8"],
+      ] as const) {
+        const url = URL.createObjectURL(new Blob([body], { type }));
+        const link = document.createElement("a");
+        link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
     }
     if (mounted.current) {
       setConfigText(result.config);
       setEnvironmentText(Object.entries(result.environment).map(([key, item]) => `${key}=${item}`).join("\n"));
+      setCatalogText(result.catalog);
+      setCatalogPath(result.catalogPath);
       setNotice(copy.exported);
     }
   }
@@ -291,6 +303,8 @@ export function ApiAccessSettings({ language }: { language: Language }) {
       </div>
       <p>{copy.client}</p>
       {configText ? <details><summary>{copy.preview}</summary><pre tabIndex={0}>{configText}</pre>
+        <label>{copy.catalogPath}</label><code>{catalogPath}</code>
+        <label>{copy.catalog}</label><pre tabIndex={0}>{catalogText}</pre>
         <label>{copy.processEnv}</label><pre tabIndex={0}>{environmentText}</pre></details> : null}
       <div className="api-access-upstream">
         <h3>{copy.upstreamTitle}</h3>

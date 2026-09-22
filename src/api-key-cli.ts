@@ -15,6 +15,11 @@ import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
 import { loadUpstreamProviderConfig } from "./upstream-provider-config";
+import {
+  clientBaseUrl,
+  clientCatalogPath,
+  manualCodexConfigurationOnly,
+} from "./server-remote-config";
 
 async function readKeyFromStdin(): Promise<string> {
   if (stdin.isTTY) throw new Error("--key-stdin requires piped input; use --generate for a random key");
@@ -53,8 +58,10 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
     // Imported secrets are never echoed by enable/rotate or status. codex-config is an explicit
     // sensitive export action and includes the current local client key.
     if (generated) stdout.write(`${key}\n`);
-    try { cleanupApiKeyCodexIntegration(); }
-    catch { stderr.write("Saved, but recorded Codex injection needs manual conflict resolution; run api-key cleanup.\n"); }
+    if (!manualCodexConfigurationOnly()) {
+      try { cleanupApiKeyCodexIntegration(); }
+      catch { stderr.write("Saved, but recorded Codex injection needs manual conflict resolution; run api-key cleanup.\n"); }
+    }
     stderr.write(`API key mode saved. Restart the service/Launcher to apply it; an already-running process keeps its previous policy.\n`);
     stderr.write(`Keep ${API_KEY_ENV} available to API clients and for explicit api-key codex-config export. Browser ChatGPT login and Full-mode tunnel credentials remain separate.\n`);
     return;
@@ -70,12 +77,21 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   const policy = loadApiAccessPolicy();
   if (action === "reconnect") {
     if (policy.mode !== "openai") throw new Error("API Key mode never installs Codex configuration");
+    if (manualCodexConfigurationOnly()) {
+      clearOpenAiRoutingPending();
+      stdout.write(`${JSON.stringify({ installed: false, manualConfigurationRequired: true })}\n`);
+      return;
+    }
     installCodexIntegration(loadConfig());
     clearOpenAiRoutingPending();
     stdout.write(`${JSON.stringify({ installed: true })}\n`);
     return;
   }
   if (action === "cleanup") {
+    if (manualCodexConfigurationOnly()) {
+      stdout.write(`${JSON.stringify({ changed: false, manualConfigurationRequired: true })}\n`);
+      return;
+    }
     stdout.write(`${JSON.stringify(cleanupApiKeyCodexIntegration())}\n`);
     return;
   }
@@ -96,26 +112,40 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   const config = loadConfig();
   const route = availableChatGptWebModelRoutes(config)[0];
   if (!route) throw new Error("No ChatGPT Web models are available in the current account/mode configuration");
-  const catalogPath = join(getConfigDir(), "api-key-models.json");
+  const localCatalogPath = join(getConfigDir(), "api-key-models.json");
+  const clientRoute = clientBaseUrl(config.port);
+  const externalClient = clientRoute.remote || manualCodexConfigurationOnly();
+  const catalogPath = clientCatalogPath(localCatalogPath, externalClient);
   const catalog = buildStandaloneModelCatalog(config);
-  atomicWriteFile(catalogPath, `${JSON.stringify({ models: catalog.models }, null, 2)}\n`);
+  const catalogText = `${JSON.stringify({ models: catalog.models }, null, 2)}\n`;
+  if (!externalClient) atomicWriteFile(localCatalogPath, catalogText);
   const upstream = loadUpstreamProviderConfig();
   const rendered = renderApiKeyCodexConfig({
     port: config.port,
+    baseUrl: clientRoute.baseUrl,
     catalogPath,
     model: route.slug,
     reasoningEffort: route.codexEffort,
     apiKey: localApiKey,
     supportsOpenAiServerCompaction: upstream?.supportsOpenAiServerCompaction === true,
     subagentProtocol: config.subagentProtocol,
-    runtimeCommand: config.runtimeCommand,
+    runtimeCommand: externalClient ? undefined : config.runtimeCommand,
   });
   const environment = codexProxyEnvironment();
   if (jsonExport) {
-    stdout.write(`${JSON.stringify({ config: rendered, catalogPath, environment })}\n`);
+    stdout.write(`${JSON.stringify({
+      config: rendered,
+      catalogPath,
+      catalog: catalogText,
+      baseUrl: clientRoute.baseUrl,
+      environment,
+    })}\n`);
   } else {
     stdout.write(rendered);
     stderr.write(`Codex process environment: ${JSON.stringify(environment)}\n`);
+    if (externalClient) {
+      stderr.write(`Copy the exported model catalog to ${catalogPath}; use --json to retrieve its content.\n`);
+    }
   }
   stderr.write("Sensitive client configuration exported. Re-export after account capabilities, browser mode or context settings change.\n");
 }

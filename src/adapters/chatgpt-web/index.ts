@@ -930,6 +930,10 @@ export function createChatGptWebAdapter(
                     );
                     handoffTimer.unref?.();
                   };
+                  const reportCompactionProgress = (): void => {
+                    armHandoffDeadline();
+                    incoming.onProgress?.();
+                  };
                   armHandoffDeadline();
                   const operationSignal = AbortSignal.any([operatorSignal, handoffDeadline.signal]);
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
@@ -944,7 +948,7 @@ export function createChatGptWebAdapter(
                       manualRequest ? environment : undefined,
                       `${handoffTraceId}_fallback`,
                       turnCapabilities,
-                      { onCompactionProgress: armHandoffDeadline },
+                      { onCompactionProgress: reportCompactionProgress },
                     );
                     retainOwnershipUntil(fallbackRuntime.physicalSettlement);
                     try {
@@ -986,6 +990,7 @@ export function createChatGptWebAdapter(
                         source,
                         broker,
                         operationSignal,
+                        incoming.onProgress,
                       );
                       if (zeroRiskSummary === undefined) {
                         preserveFinalResponse = true;
@@ -1007,6 +1012,7 @@ export function createChatGptWebAdapter(
                         source,
                         structuredBroker!,
                         operationSignal,
+                        incoming.onProgress,
                       );
                       preserveFinalResponse = !settlement.compactionInstructionDelivered;
                       rawSummary = await requestRetainedCompactionHandoff(
@@ -1018,6 +1024,7 @@ export function createChatGptWebAdapter(
                         handoffTraceId,
                         operationSignal,
                         handoffTimeoutMs,
+                        incoming.onProgress,
                       );
                     } else {
                       if (source.isActive()) {
@@ -1035,6 +1042,7 @@ export function createChatGptWebAdapter(
                         handoffTraceId,
                         operationSignal,
                         handoffTimeoutMs,
+                        incoming.onProgress,
                       );
                     }
                     const summary = canonicalizeCompactionHandoff(parsed, rawSummary);
@@ -1170,6 +1178,7 @@ export function createChatGptWebAdapter(
               if (settled.type === "error") throw settled.error;
               const trace = session.runtime.trace.drain();
               const completedTextDeltas = session.runtime.text.drain();
+              if (trace.length > 0 || completedTextDeltas.length > 0) incoming.onProgress?.();
               const finalReplay = replay.length === 0
                 && trace.length === 0
                 && completedTextDeltas.length === 0
@@ -1234,6 +1243,7 @@ export function createChatGptWebAdapter(
                 for (const message of results) {
                   await broker.completeTool(turnToken, message.toolCallId, brokerResult(message));
                   session.runtime.externalProgress.recordToolResult();
+                  incoming.onProgress?.();
                   session.markResultDelivered(message.toolCallId);
                 }
               }
@@ -1245,11 +1255,13 @@ export function createChatGptWebAdapter(
             try {
               const roundReasoning = session.roundReasoning(roundKey);
               const emitNewTrace = (trace: ChatGptTraceEvent[]) => {
+                if (trace.length > 0) incoming.onProgress?.();
                 roundReasoning.push(...trace.map(event => event.text));
                 session.appendRoundReasoning(roundKey, trace.map(event => event.text));
                 emitRoundBatch(buffer => emitTraceEvents(trace, buffer));
               };
               const emitNewText = (deltas: string[]) => {
+                if (deltas.length > 0) incoming.onProgress?.();
                 if (!bufferStructuredOutput) emitRoundBatch(buffer => emitTextDeltas(deltas, buffer));
               };
               if (replay.length === 0 && !parsed._compactionRequest) {
@@ -1267,6 +1279,7 @@ export function createChatGptWebAdapter(
                   }
                   if (requests.length > 0) {
                     const revision = externalProgress.recordToolBatch(requests.length);
+                    incoming.onProgress?.();
                     if (!session.runtime.manualControl) {
                       // The browser outcome is in the same race below and owns the semantic DOM and
                       // renderer deadlines. A second fixed timer here can retire an accepted turn

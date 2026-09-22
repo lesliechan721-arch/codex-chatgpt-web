@@ -16,6 +16,9 @@ const { mergeNoProxy, PROXY_ENV_KEYS } = require("./network-proxy-config.cjs");
 const KEY_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
 const OPENAI_POLICY = Object.freeze({ version: 1, mode: "openai" });
 const MAX_POLICY_BYTES = 4096;
+const PUBLIC_BASE_URL_ENV = "CODEX_CHATGPT_WEB_PUBLIC_BASE_URL";
+const CLIENT_PORT_ENV = "CODEX_CHATGPT_WEB_CLIENT_PORT";
+const MANUAL_CODEX_CONFIG_ENV = "CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG";
 const ERROR_CODES = new Set([
   "invalid-policy", "invalid-input", "invalid-key", "key-required", "control-key-reuse",
   "stale-settings", "runtime-busy", "external-runtime", "dev-profile", "not-configured",
@@ -30,6 +33,27 @@ class ApiAccessSettingsError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 const fail = code => { throw new ApiAccessSettingsError(code); };
+
+function clientBaseUrl(config, environment = process.env) {
+  if (!config) return null;
+  const configured = environment[PUBLIC_BASE_URL_ENV]?.trim();
+  if (!configured) {
+    const rawClientPort = environment[CLIENT_PORT_ENV]?.trim();
+    const clientPort = rawClientPort ? Number(rawClientPort) : config.port;
+    if (!Number.isSafeInteger(clientPort) || clientPort <= 0 || clientPort > 65_535) {
+      return fail("invalid-policy");
+    }
+    return `http://127.0.0.1:${clientPort}/v1`;
+  }
+  let url;
+  try { url = new URL(configured); } catch { return fail("invalid-policy"); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    return fail("invalid-policy");
+  }
+  const pathname = url.pathname.replace(/\/+$/, "");
+  if (!pathname.endsWith("/v1")) return fail("invalid-policy");
+  return `${url.origin}${pathname}`;
+}
 
 function parsePolicy(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return fail("invalid-policy");
@@ -159,6 +183,7 @@ function createApiAccessSettings({
     const upstreamApplied = upstreamSaved.config
       ? upstreamKey.available && upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config)
       : upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config);
+    const manualCodexConfig = process.env[MANUAL_CODEX_CONFIG_ENV]?.trim() === "1";
     return {
       configuredMode: saved.policy.mode,
       effectiveMode,
@@ -170,7 +195,7 @@ function createApiAccessSettings({
         : !health ? "stopped"
           : matches && upstreamApplied && health.accepting_turns === true
             ? "in-sync" : "restart-required",
-      baseUrl: config ? `http://127.0.0.1:${config.port}/v1` : null,
+      baseUrl: clientBaseUrl(config),
       canApply: true,
       upstream: upstreamSaved.config ? {
         configured: true,
@@ -189,7 +214,7 @@ function createApiAccessSettings({
       },
       routingPending: saved.policy.mode === "openai"
         && (routingPending || fs.existsSync(routingPendingPath)),
-      cleanupPending: saved.policy.mode === "api-key" && (cleanupPending
+      cleanupPending: !manualCodexConfig && saved.policy.mode === "api-key" && (cleanupPending
         || fs.existsSync(path.join(coreHome, "codex", "integration-journal.json"))
         || fs.existsSync(path.join(coreHome, "codex", "integration-journal.recovery.json"))),
     };
@@ -212,7 +237,8 @@ function createApiAccessSettings({
     // Cleanup is independent of browser activity. A busy setup process defers the operation,
     // not the already committed policy. CLI serve/setup also reconcile on their next entry.
     const configured = readPolicyFile(filePath).policy;
-    cleanupPending = configured.mode === "api-key";
+    const manualCodexConfig = process.env[MANUAL_CODEX_CONFIG_ENV]?.trim() === "1";
+    cleanupPending = configured.mode === "api-key" && !manualCodexConfig;
     routingPending = configured.mode === "openai" && runtimeSnapshot().configured;
     if (routingPending) {
       try { writePrivateFileAtomic(routingPendingPath, '{"version":1}\n'); } catch {}
@@ -221,7 +247,7 @@ function createApiAccessSettings({
     }
     if (runtimeHost.currentOperation()) return;
     await runtimeHost.runLifecycleOperation(name, async () => {
-      if (configured.mode === "api-key") {
+      if (configured.mode === "api-key" && !manualCodexConfig) {
         try {
           await runtimeHost.run(name, ["api-key", "cleanup"], {
             embedded: true, timeoutMs: 15_000,
@@ -445,13 +471,15 @@ function createApiAccessSettings({
         const exported = JSON.parse(result.stdout);
         if (!exported || typeof exported.config !== "string" || !exported.config.includes('requires_openai_auth = false')
           || !exported.config.includes("experimental_bearer_token") || exported.config.includes("env_key =")
+          || typeof exported.catalog !== "string" || typeof exported.catalogPath !== "string"
           || !exported.environment || typeof exported.environment !== "object" || Array.isArray(exported.environment)) fail("export-failed");
         clearOwnedClipboard();
         clipboard.writeText(exported.config);
         return {
           config: exported.config,
           environment: exported.environment,
-          catalogPath: path.join(coreHome, "api-key-models.json"),
+          catalogPath: exported.catalogPath,
+          catalog: exported.catalog,
         };
       } catch { return fail("export-failed"); }
     });

@@ -1,11 +1,18 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { defaultConfig, saveConfig } from "../src/config";
 import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { saveApiAccessPolicy } from "../src/api-access-config";
-import { installCodexIntegration, getCodexConfigPath, getCodexJournalPath } from "../src/codex-integration";
+import {
+  installCodexIntegration,
+  getCodexConfigPath,
+  getCodexJournalPath,
+  getCodexJournalRecoveryPath,
+  getCodexModelsCachePath,
+} from "../src/codex-integration";
 import { cleanupApiKeyCodexIntegration } from "../src/api-key-integration";
 import { renderApiKeyCodexConfig } from "../src/api-key-codex-config";
 import { installCompatibilityV1Features } from "../src/codex-integration-document";
@@ -32,6 +39,47 @@ function injected() {
   writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "custom"\n[model_providers.custom]\nname = "Own provider"\n');
   const config = defaultConfig(); saveConfig(config); installCodexIntegration(config);
   api(); return config;
+}
+
+function clientFileSnapshot(): Array<{ path: string; bytes: string | null }> {
+  return [
+    getCodexConfigPath(),
+    getCodexModelsCachePath(),
+    getCodexJournalPath(),
+    getCodexJournalRecoveryPath(),
+  ].map(path => ({
+    path,
+    bytes: existsSync(path) ? readFileSync(path).toString("base64") : null,
+  }));
+}
+
+async function unusedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test port reservation has no TCP address");
+  const port = address.port;
+  await new Promise<void>((resolveClose, reject) => {
+    server.close(error => error ? reject(error) : resolveClose());
+  });
+  return port;
+}
+
+function cli(args: string[]) {
+  return Bun.spawnSync(
+    [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "--home", process.env.CODEX_CHATGPT_WEB_HOME!, ...args],
+    {
+      env: {
+        ...process.env,
+        CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
 }
 test("API cleanup removes recorded routes/features/hooks but retains the user's provider", () => {
   injected(); expect(cleanupApiKeyCodexIntegration().changed).toBe(true);
@@ -76,6 +124,58 @@ test("OpenAI forwarding is not cleaned by an API-only operation", () => {
 test("API preflight accepts manual providers and creates no Codex injection", () => {
   api(); preflightSetup({ mode: "browser-only", browserHostDescriptorPath: join(home, "browser.json"), acknowledgedUnofficial: true });
   expect(existsSync(getCodexConfigPath())).toBe(false); expect(existsSync(getCodexJournalPath())).toBe(false);
+});
+test("manual server mode leaves recorded Codex client files byte-for-byte unchanged on API enable, rotate and serve", async () => {
+  const port = await unusedPort();
+  saveApiAccessPolicy(OPENAI_ACCESS);
+  writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "custom"\n[model_providers.custom]\nname = "Own provider"\n');
+  const config = { ...defaultConfig(), port };
+  saveConfig(config);
+  installCodexIntegration(config);
+  const before = clientFileSnapshot();
+
+  const enabled = cli(["api-key", "enable", "--generate"]);
+  expect(enabled.exitCode).toBe(0);
+  expect(clientFileSnapshot()).toEqual(before);
+
+  const rotated = cli(["api-key", "rotate", "--generate"]);
+  expect(rotated.exitCode).toBe(0);
+  expect(clientFileSnapshot()).toEqual(before);
+
+  const cleanup = cli(["api-key", "cleanup"]);
+  expect(cleanup.exitCode).toBe(0);
+  expect(JSON.parse(cleanup.stdout.toString())).toEqual({ changed: false, manualConfigurationRequired: true });
+  expect(clientFileSnapshot()).toEqual(before);
+
+  const serve = Bun.spawn(
+    [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "--home", process.env.CODEX_CHATGPT_WEB_HOME!, "serve"],
+    {
+      env: {
+        ...process.env,
+        CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  try {
+    let healthy = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+        if (response.ok) {
+          healthy = true;
+          break;
+        }
+      } catch {}
+      await Bun.sleep(20);
+    }
+    expect(healthy).toBeTrue();
+    expect(clientFileSnapshot()).toEqual(before);
+  } finally {
+    serve.kill();
+    await serve.exited;
+  }
 });
 test("export shares V1 feature defaults and Interrupt command but omits conflicting auth/voice/trust", () => {
   const config = defaultConfig();
