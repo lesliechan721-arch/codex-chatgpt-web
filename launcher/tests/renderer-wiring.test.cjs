@@ -269,7 +269,12 @@ test("setup preserves session-check failures and never installs without verified
       handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
-      runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
+      runtimeHost: {
+        setupCore: run,
+        setupDevCore: run,
+        runtimeConfigSnapshot: () => ({ configured: false, config: {} }),
+        toolAuthorityControl: () => ({ effectiveMode: "verified-environment", forced: false, source: null }),
+      },
       smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
     });
     await assert.rejects(setup, error => error.message === browser.message);
@@ -370,7 +375,70 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
   assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
   assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
+  assert.match(appSource, /api!\.setToolAuthorityMode\(mode\)/);
+  assert.match(preloadSource, /setToolAuthorityMode:[\s\S]*?launcher:tool-authority-mode/);
+  assert.match(electronMain, /runtimeHost\.setToolAuthorityMode\(mode\)/);
   assert.doesNotMatch(electronMain, /IS_DEV_PROFILE && key === "experimentalBiggerContext"/);
+});
+
+test("tool authority UI shows effective forced state and permits pre-setup selection when unmanaged", async () => {
+  assert.match(
+    electronMain,
+    /toolAuthority:\s*runtimeHost\.toolAuthorityControl\(stateStore\.read\(\)\.toolAuthorityMode\)/,
+  );
+  assert.match(
+    appSource,
+    /displayedToolAuthorityMode = snapshot\.toolAuthority\.forced[\s\S]*?snapshot\.toolAuthority\.effectiveMode[\s\S]*?snapshot\.state\.toolAuthorityMode/,
+  );
+  assert.match(appSource, /disabled=\{busy \|\| snapshot\.toolAuthority\.forced\}/);
+  assert.match(appSource, /delegatedToolAuthorityForcedRemote[\s\S]*?delegatedToolAuthorityForcedEnvironment/);
+
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:tool-authority-mode"'),
+    electronMain.indexOf('handle("launcher:skill-attachments"'),
+  );
+  const state = { toolAuthorityMode: "verified-environment", coreSetupComplete: false };
+  const events = [];
+  let runtimeWrites = 0;
+  const runtimeHost = {
+    toolAuthorityControl: () => ({ effectiveMode: state.toolAuthorityMode, forced: false, source: null }),
+    runtimeConfigSnapshot: () => ({ configured: false }),
+    setToolAuthorityMode: async () => {
+      runtimeWrites += 1;
+      return { authorityMode: "delegated" };
+    },
+  };
+  let handler;
+  vm.runInNewContext(source, {
+    handle: (_name, next) => { handler = next; },
+    validateToolAuthorityMode: value => value,
+    stateStore: {
+      read: () => ({ ...state }),
+      update: patch => Object.assign(state, patch),
+    },
+    runtimeHost,
+    browserHost: { activeTraceId: null, currentOperation: () => null },
+    send: (...args) => events.push(args),
+  });
+
+  const selected = await handler(null, "delegated");
+  assert.equal(selected.toolAuthorityMode, "delegated");
+  assert.equal(state.toolAuthorityMode, "delegated");
+  assert.equal(runtimeWrites, 0, "pre-setup selection must not start a setup transaction");
+  assert.equal(events.at(-1)[0], "launcher:state-changed");
+
+  runtimeHost.toolAuthorityControl = () => ({
+    effectiveMode: "delegated",
+    forced: true,
+    source: "environment",
+  });
+  await assert.rejects(
+    handler(null, "verified-environment"),
+    /forced by CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE/,
+  );
+  assert.equal(state.toolAuthorityMode, "delegated");
+  assert.equal(runtimeWrites, 0);
 });
 
 test("macOS passkey sign-in is additive to the unchanged embedded login action", () => {

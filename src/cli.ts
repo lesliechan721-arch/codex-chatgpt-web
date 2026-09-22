@@ -70,6 +70,7 @@ Setup options:
                                Full mode: select, paste, and send in the launcher yourself
   --zero-risk-pro              Zero Risk: also install the explicit Pro-sized model row
   --zero-risk-default          Zero Risk: install only the default model row
+  --tool-authority-mode MODE   verified-environment (default) or delegated
   --port NUMBER                Loopback Responses port (default: 17841)
   --chrome PATH                Google Chrome/Chromium executable used for account login
   --browser-host-descriptor PATH
@@ -294,6 +295,13 @@ async function setupCommand(args: string[]): Promise<void> {
   }
   if (automaticBrowserInteraction || manualBrowserInteraction) {
     options.browserInteractionMode = manualBrowserInteraction ? "manual" : "automatic";
+  }
+  const toolAuthorityMode = takeOption(args, "--tool-authority-mode");
+  if (toolAuthorityMode !== undefined) {
+    if (toolAuthorityMode !== "verified-environment" && toolAuthorityMode !== "delegated") {
+      throw new Error("--tool-authority-mode must be verified-environment or delegated");
+    }
+    options.toolAuthorityMode = toolAuthorityMode;
   }
   const subagentProtocol = takeOption(args, "--subagent-protocol");
   if (subagentProtocol !== undefined) {

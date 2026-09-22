@@ -24,6 +24,7 @@ import type {
   LogRecord,
   OperationState,
   Surface,
+  ToolAuthorityMode,
 } from "./types";
 
 const api = window.codexWebLauncher;
@@ -1601,6 +1602,14 @@ function SettingsSurface({
   const [turnsCancelled, setTurnsCancelled] = useState(false);
   const [integrationRemoved, setIntegrationRemoved] = useState(false);
   const [apiUpstreamOpen, setApiUpstreamOpen] = useState(false);
+  const displayedToolAuthorityMode = snapshot.toolAuthority.forced
+    ? snapshot.toolAuthority.effectiveMode
+    : snapshot.state.toolAuthorityMode;
+  const toolAuthorityBody = snapshot.toolAuthority.forced
+    ? `${copy.delegatedToolAuthorityBody} ${snapshot.toolAuthority.source === "remote-bind"
+      ? copy.delegatedToolAuthorityForcedRemote
+      : copy.delegatedToolAuthorityForcedEnvironment}`
+    : copy.delegatedToolAuthorityBody;
 
   const updateLanguage = async (next: Language) => {
     try {
@@ -1666,6 +1675,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setToolAuthorityMode = async (mode: ToolAuthorityMode) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setToolAuthorityMode(mode));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const uninstallIntegration = async () => {
     setBusy(true);
     setError(null);
@@ -1701,6 +1721,15 @@ function SettingsSurface({
           mode={snapshot.state.browserInteractionMode}
           onChange={(mode) => void setInteractionMode(mode)}
         />
+        <SettingRow body={toolAuthorityBody} label={copy.delegatedToolAuthority}>
+          <Switch
+            checked={displayedToolAuthorityMode === "delegated"}
+            disabled={busy || snapshot.toolAuthority.forced}
+            onChange={(checked) => void setToolAuthorityMode(
+              checked ? "delegated" : "verified-environment",
+            )}
+          />
+        </SettingRow>
         <SettingRow body={devProfile ? copy.devKeepRunningBody : copy.keepRunningOnCloseBody} label={copy.keepRunningOnClose}>
           <Switch
             checked={snapshot.state.keepRunningOnClose}

@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import type { AppConfig, BrowserInteractionMode, RuntimeMode, SubagentProtocol } from "./config";
+import type { ToolAuthorityMode } from "./types";
 import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
@@ -43,11 +44,12 @@ import {
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
-import { manualCodexConfigurationOnly } from "./server-remote-config";
+import { effectiveToolAuthorityMode, manualCodexConfigurationOnly } from "./server-remote-config";
 
 export interface SetupOptions {
   mode: RuntimeMode;
   browserInteractionMode?: BrowserInteractionMode;
+  toolAuthorityMode?: ToolAuthorityMode;
   subagentProtocol?: SubagentProtocol;
   port?: number;
   chromeExecutablePath?: string;
@@ -139,6 +141,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     manualAppName: before.manualAppName,
     browserHost: before.browserHost,
     browserInteractionMode: before.browserInteractionMode,
+    toolAuthorityMode: before.toolAuthorityMode,
     browserHostDescriptorPath: before.browserHostDescriptorPath,
     chromeExecutablePath: before.chromeExecutablePath,
     storageStatePath: before.storageStatePath,
@@ -168,6 +171,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     manualAppName: after.manualAppName,
     browserHost: after.browserHost,
     browserInteractionMode: after.browserInteractionMode,
+    toolAuthorityMode: after.toolAuthorityMode,
     browserHostDescriptorPath: after.browserHostDescriptorPath,
     chromeExecutablePath: after.chromeExecutablePath,
     storageStatePath: after.storageStatePath,
@@ -252,6 +256,7 @@ function baseConfig(
   const config = existing ? structuredClone(existing) : defaultConfig(options.mode);
   config.mode = options.mode;
   if (options.browserInteractionMode) config.browserInteractionMode = options.browserInteractionMode;
+  if (options.toolAuthorityMode) config.toolAuthorityMode = options.toolAuthorityMode;
   Object.assign(config, resolveInteractionConnectorIdentities(
     config.browserInteractionMode,
     profile,
@@ -432,6 +437,7 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
     subagentProtocol: options.subagentProtocol
       ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
   });
+  effectiveToolAuthorityMode(config.toolAuthorityMode);
   delete config.purpose;
   const launcherOwned = config.browserHost === "launcher";
   if (!launcherOwned && process.platform !== "darwin") {
@@ -668,6 +674,7 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     throw new Error("DEV profile setup requires the isolated launcher browser descriptor");
   }
   const config = baseConfig(existing, options, DEV_LAUNCHER_PROFILE);
+  effectiveToolAuthorityMode(config.toolAuthorityMode);
   if (config.browserHost !== "launcher") {
     throw new Error("DEV profile setup requires the desktop launcher browser host");
   }

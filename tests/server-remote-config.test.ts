@@ -78,10 +78,10 @@ test("tool authority defaults locally and a deployment override fails on persist
   })).toBe("delegated");
   expect(() => effectiveToolAuthorityMode("verified-environment", {
     CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated",
-  })).toThrow("conflicts");
+  })).toThrow("conflicts with CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE=delegated");
   expect(() => effectiveToolAuthorityMode("verified-environment", {
     CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
-  })).toThrow("conflicts");
+  })).toThrow("conflicts with CODEX_CHATGPT_WEB_BIND_HOST=0.0.0.0 (remote Responses bind)");
   expect(() => effectiveToolAuthorityMode(undefined, {
     CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
     CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "verified-environment",

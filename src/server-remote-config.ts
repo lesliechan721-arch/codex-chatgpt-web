@@ -31,9 +31,12 @@ export function effectiveToolAuthorityMode(
     : requested as ToolAuthorityMode | undefined;
   if (!forced) return configured ?? "verified-environment";
   if (configured !== undefined && configured !== forced) {
+    const forcedSource = remoteRequested
+      ? `${RESPONSES_BIND_HOST_ENV}=0.0.0.0 (remote Responses bind)`
+      : `${TOOL_AUTHORITY_MODE_ENV}=${forced}`;
     throw new Error(
       "Configured toolAuthorityMode " + JSON.stringify(configured)
-      + " conflicts with " + TOOL_AUTHORITY_MODE_ENV + "=" + forced,
+      + " conflicts with " + forcedSource,
     );
   }
   return forced;

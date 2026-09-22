@@ -171,6 +171,205 @@ test("manual setup rejects capability refresh and Bigger Context", async () => {
   }
 }, 20_000);
 
+test("setup rejects an invalid tool authority mode", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-tool-authority-"));
+  try {
+    const result = await runCli([
+      "setup",
+      "--browser-only",
+      "--tool-authority-mode",
+      "unsafe",
+      "--acknowledge-unofficial",
+    ], {
+      ...process.env,
+      CODEX_HOME: join(root, "codex"),
+      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("--tool-authority-mode must be verified-environment or delegated");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production setup preflight rejects tool authority conflicts with forced deployment modes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-tool-authority-forced-"));
+  try {
+    const baseEnvironment = { ...process.env };
+    delete baseEnvironment.CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE;
+    delete baseEnvironment.CODEX_CHATGPT_WEB_BIND_HOST;
+    for (const { environment, expected } of [
+      {
+        environment: { CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated" },
+        expected: "conflicts with CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE=delegated",
+      },
+      {
+        environment: { CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0" },
+        expected: "conflicts with CODEX_CHATGPT_WEB_BIND_HOST=0.0.0.0 (remote Responses bind)",
+      },
+    ]) {
+      const result = await runCli([
+        "setup",
+        "--preflight-only",
+        "--browser-only",
+        "--browser-host-descriptor",
+        join(root, "nonexistent-launcher.json"),
+        "--tool-authority-mode",
+        "verified-environment",
+        "--acknowledge-unofficial",
+      ], {
+        ...baseEnvironment,
+        CODEX_HOME: join(root, "codex"),
+        CODEX_CHATGPT_WEB_HOME: join(root, "app"),
+        CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+        ...environment,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(expected);
+    }
+    expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("DEV setup rejects tool authority conflicts with forced deployment modes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-dev-tool-authority-forced-"));
+  try {
+    const baseEnvironment = { ...process.env };
+    delete baseEnvironment.CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE;
+    delete baseEnvironment.CODEX_CHATGPT_WEB_BIND_HOST;
+    for (const { environment, expected } of [
+      {
+        environment: { CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated" },
+        expected: "conflicts with CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE=delegated",
+      },
+      {
+        environment: { CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0" },
+        expected: "conflicts with CODEX_CHATGPT_WEB_BIND_HOST=0.0.0.0 (remote Responses bind)",
+      },
+    ]) {
+      const result = await runCli([
+        "dev",
+        "setup",
+        "--browser-only",
+        "--browser-host-descriptor",
+        join(root, "nonexistent-dev-launcher.json"),
+        "--tool-authority-mode",
+        "verified-environment",
+        "--acknowledge-unofficial",
+      ], {
+        ...baseEnvironment,
+        CODEX_WEB_GPT_DEV_HOME: join(root, "dev"),
+        CODEX_CHATGPT_WEB_HOME: join(root, "production"),
+        CODEX_HOME: join(root, "production-codex"),
+        ...environment,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(expected);
+    }
+    expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production setup saves and reloads delegated tool authority", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-tool-authority-save-"));
+  const appHome = join(root, "app");
+  const descriptorPath = join(appHome, "runtime", "launcher-browser.json");
+  const helperScript = join(root, "helper.cjs");
+  const controlToken = "prod-launcher-control-token-0123456789abcdefghijklmnop";
+  let inspections = 0;
+  const control = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    inspections += 1;
+    expect(request.url).toBe("/v1/session/inspect");
+    expect(request.headers.authorization).toBe(`Bearer ${controlToken}`);
+    const inspection = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    expect(typeof inspection.detectCapabilities).toBe("boolean");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      authenticated: true,
+      temporary: true,
+      solAvailable: true,
+      extraHighAvailable: false,
+      proAvailable: false,
+      url: "https://chatgpt.com/?temporary-chat=true",
+    }));
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    control.once("error", rejectListen);
+    control.listen(0, "127.0.0.1", resolveListen);
+  });
+  try {
+    const port = await unusedPort();
+    const address = control.address();
+    if (!address || typeof address === "string") throw new Error("control server has no port");
+    mkdirSync(join(appHome, "runtime"), { recursive: true });
+    writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
+    writeFileSync(descriptorPath, `${JSON.stringify({
+      version: 3,
+      kind: "codex-web-gpt-launcher",
+      profile: "production",
+      pid: process.pid,
+      endpoint: "http://127.0.0.1:48111",
+      control: { endpoint: `http://127.0.0.1:${address.port}`, token: controlToken },
+      helper: { executable: process.execPath, script: helperScript },
+      partition: "persist:codex-web-gpt-chatgpt",
+      idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+      surfaceId: "p".repeat(32),
+      surfaceTargets: { ["p".repeat(32)]: "native-owned-target" },
+      createdAt: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
+    const env = {
+      ...process.env,
+      CODEX_HOME: join(root, "codex"),
+      CODEX_CHATGPT_WEB_HOME: appHome,
+      CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1",
+      CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: undefined,
+      CODEX_CHATGPT_WEB_BIND_HOST: undefined,
+    };
+
+    const first = await runCli([
+      "setup",
+      "--browser-only",
+      "--browser-host-descriptor",
+      descriptorPath,
+      "--port",
+      String(port),
+      "--tool-authority-mode",
+      "delegated",
+      "--acknowledge-unofficial",
+    ], env);
+    expect({ exitCode: first.exitCode, stderr: first.stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"))).toMatchObject({
+      mode: "browser-only",
+      browserHost: "launcher",
+      toolAuthorityMode: "delegated",
+    });
+
+    const second = await runCli([
+      "setup",
+      "--browser-only",
+      "--browser-host-descriptor",
+      descriptorPath,
+      "--acknowledge-unofficial",
+    ], env);
+    expect({ exitCode: second.exitCode, stderr: second.stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"))).toMatchObject({
+      mode: "browser-only",
+      browserHost: "launcher",
+      toolAuthorityMode: "delegated",
+    });
+    expect(inspections).toBeGreaterThanOrEqual(1);
+  } finally {
+    await new Promise<void>(resolveClose => control.close(() => resolveClose()));
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
 test("passkey capture cannot be invoked outside the live Launcher control channel", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-passkey-auth-"));
   try {
@@ -473,6 +672,8 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       "--browser-only",
       "--browser-host-descriptor",
       descriptorPath,
+      "--tool-authority-mode",
+      "delegated",
       "--acknowledge-unofficial",
     ], {
       ...process.env,
@@ -491,6 +692,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       appName: "Codex Native2 DEV",
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
+      toolAuthorityMode: "delegated",
       solAvailable: true,
       extraHighAvailable: false, proAvailable: false,
     });

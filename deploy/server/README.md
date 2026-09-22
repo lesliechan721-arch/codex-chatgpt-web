@@ -5,14 +5,14 @@ This deployment runs the packaged Linux x64 Launcher in one long-running Docker 
 ## Requirements
 
 - Linux x86_64 server with Docker Engine and Docker Compose.
-- A production Linux x64 AppImage in `launcher/artifacts/`. The existing `bun run --cwd launcher package:linux` path writes its public AppImage there on Linux x64. You can also copy a controlled release artifact there. Do not use `dev:launcher` or a DEV profile.
+- Network access during the image build for Bun dependencies, Electron/AppImage build tools, and the pinned libnotify source. The Docker build packages the production Linux x64 AppImage from this source tree; no prebuilt `launcher/artifacts/*.AppImage` is required.
 - A persistent Docker volume for `/home/codex`.
-- A private VNC password file on the host for remote desktop authentication.
-- A separate private GNOME Keyring password file on the host. Keep this keyring secret stable when reusing the HOME volume. It is intentionally independent from the VNC password, so the VNC password can be rotated without changing the safeStorage keyring credential.
+- A private `VNC_PASSWORD` environment variable for remote desktop authentication.
+- A separate private `KEYRING_PASSWORD` environment variable. Keep this keyring secret stable when reusing the HOME volume. It is intentionally independent from the VNC password, so the VNC password can be rotated without changing the safeStorage keyring credential.
 - An existing HTTPS reverse proxy. This deployment does not install or manage TLS termination.
 - A Codex client outside the container. It can run on the same Linux host or on another trusted machine that can reach the HTTPS reverse proxy.
 
-The container user is named `codex`. Its default uid/gid is `10001:10001`; this avoids the `1000:1000` `node` user already present in the base image. Set `CODEX_UID` and `CODEX_GID` at image build time when the dedicated host account uses different, unused IDs. The build fails instead of silently sharing an existing container identity when those IDs already exist. Both password files must be readable by that identity. The password files should be mode `0400` or `0600` and must not be committed to Git.
+The container user is named `codex`. Its default uid/gid is `10001:10001`; this avoids the `1000:1000` `node` user already present in the base image. Set `CODEX_UID` and `CODEX_GID` at image build time when the dedicated host account uses different, unused IDs. The build fails instead of silently sharing an existing container identity when those IDs already exist. Docker Compose reads the two password values from the invoking process environment and mounts them into the container as separate Compose secrets; the values are not part of `deploy/server/.env`.
 
 VNC authentication uses the legacy VNC password mechanism. Use at least 8 random characters; only the first 8 characters are significant to this protocol. HTTPS at the existing reverse proxy is required for public access.
 
@@ -24,7 +24,14 @@ Copy the environment template and set real values:
 cp deploy/server/.env.example deploy/server/.env
 ```
 
-The image does not install Codex CLI. The Launcher and its packaged runtime are the server-side product; Codex runs outside the container. The image records only the AppImage SHA-256 digest in `/opt/codex-server/build/appimage.sha256`.
+Export the two secrets in the same shell before running Docker Compose:
+
+```sh
+export VNC_PASSWORD='replace-with-a-random-password'
+export KEYRING_PASSWORD='replace-with-an-independent-stable-password'
+```
+
+The image does not install Codex CLI. The Launcher and its packaged runtime are the server-side product; Codex runs outside the container. A dedicated build stage installs the locked root and Launcher dependencies, prepares the Linux AppImage toolset, and runs `bun run --cwd launcher package:linux`. Only the resulting AppImage is copied into the runtime image. The image records its SHA-256 digest in `/opt/codex-server/build/appimage.sha256`.
 
 Build and start:
 
@@ -111,7 +118,7 @@ The named `codex_home` volume persists all application-user state under `/home/c
 
 The external Codex client owns its own `CODEX_HOME`, project files, sandbox, and command side effects. They are not mounted into this container.
 
-To upgrade, build a new image from the new production AppImage, then recreate the container with the same HOME volume. To roll back, start the previous image with the same persistent data. The AppImage self-updater is not the authoritative server update path.
+To upgrade, build a new image from the new source revision, then recreate the container with the same HOME volume. To roll back, start the previous image with the same persistent data. The AppImage self-updater is not the authoritative server update path.
 
 ## Health behavior
 

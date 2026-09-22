@@ -4,6 +4,7 @@ import type { ApiAccessApi } from "./api-access-types";
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
+export type ToolAuthorityMode = "verified-environment" | "delegated";
 export type Surface = "browser" | "setup" | "mcp" | "activity" | "settings";
 
 export interface LauncherState {
@@ -16,6 +17,7 @@ export interface LauncherState {
   keepRunningOnClose: boolean;
   showBrowserDuringTurns: boolean;
   browserInteractionMode: BrowserInteractionMode;
+  toolAuthorityMode: ToolAuthorityMode;
   experimentalBiggerContext: boolean;
   experimentalSkillAttachments: boolean;
   zeroRiskProEnabled: boolean;
@@ -107,6 +109,11 @@ export interface LauncherSnapshot {
   browser: BrowserState | null;
   connectorName: string;
   connectorNames: Record<BrowserInteractionMode, string>;
+  toolAuthority: {
+    effectiveMode: ToolAuthorityMode;
+    forced: boolean;
+    source: "environment" | "remote-bind" | null;
+  };
   mcpCredentialsConfigured: boolean;
   logs: LogRecord[];
   urls: {
@@ -167,6 +174,7 @@ export interface LauncherApi extends ApiAccessApi {
     credentialsRequired: boolean;
     targetMode: BrowserInteractionMode;
   }>;
+  setToolAuthorityMode(mode: ToolAuthorityMode): Promise<LauncherState>;
   setNetworkProxy(proxyUrl: string | null): Promise<LauncherState>;
   setPreference(
     key: "keepRunningOnClose" | "showBrowserDuringTurns",

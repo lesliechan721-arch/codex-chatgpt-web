@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   setSkillAttachments: (enabled) => ipcRenderer.invoke("launcher:skill-attachments", enabled),
   setZeroRiskPro: (enabled) => ipcRenderer.invoke("launcher:zero-risk-pro", enabled),
   setBrowserInteractionMode: (mode) => ipcRenderer.invoke("launcher:browser-interaction-mode", mode),
+  setToolAuthorityMode: (mode) => ipcRenderer.invoke("launcher:tool-authority-mode", mode),
   setNetworkProxy: (proxyUrl) => ipcRenderer.invoke("launcher:network-proxy", proxyUrl),
   setPreference: (key, value) => ipcRenderer.invoke("launcher:set-preference", key, value),
   setSidebarState: (state) => ipcRenderer.invoke("launcher:sidebar-state", state),

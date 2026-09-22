@@ -1,8 +1,50 @@
 # syntax=docker/dockerfile:1.7
 
+FROM node:22-bookworm-slim AS launcher-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /build
+
+RUN test "$(dpkg --print-architecture)" = "amd64" \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+    binutils \
+    build-essential \
+    ca-certificates \
+    curl \
+    libgdk-pixbuf-2.0-dev \
+    libglib2.0-dev \
+    meson \
+    ninja-build \
+    pkg-config \
+    xz-utils \
+  && npm install --global bun@1.4.0 \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package.json bun.lock ./
+COPY launcher/package.json launcher/bun.lock ./launcher/
+
+RUN bun install --frozen-lockfile \
+  && cd launcher \
+  && bun install --frozen-lockfile
+
+COPY . .
+
+RUN CODEX_WEB_GPT_LINUX_LIBNOTIFY="$(./scripts/prepare-linux-libnotify.sh)" \
+  && export CODEX_WEB_GPT_LINUX_LIBNOTIFY \
+  && CODEX_WEB_GPT_APPIMAGE_TOOLS_OUTPUT=/build/launcher/build/appimage-tools \
+  && export CODEX_WEB_GPT_APPIMAGE_TOOLS_OUTPUT \
+  && bun run launcher/scripts/prepare-linux-appimage-tools.cjs \
+  && APPIMAGE_TOOLS_PATH="$CODEX_WEB_GPT_APPIMAGE_TOOLS_OUTPUT" \
+  && export APPIMAGE_TOOLS_PATH \
+  && bun run --cwd launcher package:linux \
+  && APPIMAGE_FILE="$(find launcher/artifacts -maxdepth 1 -type f -name '*-linux-x64.AppImage' -print -quit)" \
+  && test -n "$APPIMAGE_FILE" \
+  && cp "$APPIMAGE_FILE" /tmp/Codex-Web-GPT.AppImage
+
 FROM node:22-bookworm-slim
 
-ARG APPIMAGE_FILE
 ARG CODEX_UID=10001
 ARG CODEX_GID=10001
 
@@ -59,7 +101,7 @@ RUN groupadd --gid "$CODEX_GID" codex \
 
 COPY deploy/server/bin/ /opt/codex-server/bin/
 COPY deploy/server/supervisord.conf /etc/supervisor/conf.d/codex-server.conf
-COPY launcher/artifacts/${APPIMAGE_FILE} /opt/codex/Codex-Web-GPT.AppImage
+COPY --from=launcher-builder /tmp/Codex-Web-GPT.AppImage /opt/codex/Codex-Web-GPT.AppImage
 
 RUN chmod 0755 /opt/codex/Codex-Web-GPT.AppImage /opt/codex-server/bin/*.sh \
   && file /opt/codex/Codex-Web-GPT.AppImage | grep -q 'x86-64' \

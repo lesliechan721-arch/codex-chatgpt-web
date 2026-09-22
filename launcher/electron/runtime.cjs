@@ -26,6 +26,47 @@ const MAX_CHECKPOINT_FILE_BYTES = 16 * 1024 * 1024;
 const PASSKEY_LOGIN_TIMEOUT_MS = 10 * 60_000;
 const MAX_PASSKEY_STATE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_PASSKEY_MARKER_FILE_BYTES = 64 * 1024;
+const RESPONSES_BIND_HOST_ENV = "CODEX_CHATGPT_WEB_BIND_HOST";
+const TOOL_AUTHORITY_MODE_ENV = "CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE";
+
+function resolveToolAuthorityControl(
+  configuredMode,
+  preferredMode = "verified-environment",
+  environment = process.env,
+) {
+  if (configuredMode !== undefined
+    && configuredMode !== "verified-environment"
+    && configuredMode !== "delegated") {
+    throw new Error("Configured tool authority mode must be verified-environment or delegated");
+  }
+  if (preferredMode !== "verified-environment" && preferredMode !== "delegated") {
+    throw new Error("Tool authority mode must be verified-environment or delegated");
+  }
+  const requested = environment[TOOL_AUTHORITY_MODE_ENV]?.trim();
+  if (requested && requested !== "verified-environment" && requested !== "delegated") {
+    throw new Error(`${TOOL_AUTHORITY_MODE_ENV} must be verified-environment or delegated`);
+  }
+  const remoteRequested = environment[RESPONSES_BIND_HOST_ENV]?.trim() === "0.0.0.0";
+  if (remoteRequested && requested === "verified-environment") {
+    throw new Error("Remote Responses deployment requires delegated tool authority");
+  }
+  const forcedMode = remoteRequested ? "delegated" : requested || null;
+  if (forcedMode && configuredMode !== undefined && configuredMode !== forcedMode) {
+    const forcedSource = remoteRequested
+      ? `${RESPONSES_BIND_HOST_ENV}=0.0.0.0 (remote Responses bind)`
+      : `${TOOL_AUTHORITY_MODE_ENV}=${forcedMode}`;
+    throw new Error(
+      `Configured toolAuthorityMode ${JSON.stringify(configuredMode)}`
+      + ` conflicts with ${forcedSource}`,
+    );
+  }
+  return {
+    effectiveMode: forcedMode || configuredMode || preferredMode,
+    forced: forcedMode !== null,
+    source: remoteRequested ? "remote-bind" : requested ? "environment" : null,
+  };
+}
+
 function collect(stream, chunks, onLine, onError) {
   let buffered = "";
   let bytes = 0;
@@ -453,6 +494,20 @@ class RuntimeHost {
       serialized: JSON.stringify(config),
       config: structuredClone(config),
     };
+  }
+
+  toolAuthorityControl(preferredMode = "verified-environment") {
+    const current = this.runtimeConfigSnapshot();
+    return resolveToolAuthorityControl(
+      current.configured ? current.config?.toolAuthorityMode : undefined,
+      current.configured ? "verified-environment" : preferredMode,
+    );
+  }
+
+  toolAuthoritySetupArgs(preferredMode) {
+    if (preferredMode === undefined) return [];
+    const control = this.toolAuthorityControl(preferredMode);
+    return control.forced ? [] : ["--tool-authority-mode", control.effectiveMode];
   }
 
   mcpCredentialsConfigured(requestedMode) {
@@ -1005,7 +1060,7 @@ class RuntimeHost {
     }
   }
 
-  async setupCore() {
+  async setupCore({ toolAuthorityMode } = {}) {
     this.assertProductionProfile("Codex integration setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
@@ -1025,6 +1080,7 @@ class RuntimeHost {
         mode: interactionMode,
         refreshCapabilities: interactionMode === "automatic",
       }),
+      ...this.toolAuthoritySetupArgs(toolAuthorityMode),
       "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -1037,7 +1093,7 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setupDevCore() {
+  async setupDevCore({ toolAuthorityMode } = {}) {
     if (this.launcherProfile !== "development") {
       throw new Error("DEV profile setup requires the isolated DEV launcher");
     }
@@ -1057,6 +1113,7 @@ class RuntimeHost {
         mode: interactionMode,
         refreshCapabilities: interactionMode === "automatic",
       }),
+      ...this.toolAuthoritySetupArgs(toolAuthorityMode),
       "--acknowledge-unofficial",
     ];
     const result = await this.runDevSetup("dev-profile-setup", args, {
@@ -1111,6 +1168,53 @@ class RuntimeHost {
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     });
     return { ...result, mode, enabled: enabled === true };
+  }
+
+  async setToolAuthorityMode(authorityMode) {
+    if (authorityMode !== "verified-environment" && authorityMode !== "delegated") {
+      throw new Error("Tool authority mode must be verified-environment or delegated");
+    }
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) {
+      throw new Error("Initialize the runtime before changing tool authority mode");
+    }
+    const control = this.toolAuthorityControl();
+    if (control.forced) {
+      throw new Error(
+        control.source === "remote-bind"
+          ? "Tool authority mode is forced by the remote Responses deployment"
+          : `Tool authority mode is forced by ${TOOL_AUTHORITY_MODE_ENV}`,
+      );
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor",
+      this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      ...(development ? [] : ["--replace-codex-route"]),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--restart-service"]),
+      "--tool-authority-mode",
+      authorityMode,
+    ];
+    if (!development && current.config?.autoApproveToolCalls === true) {
+      args.push("--auto-approve-tool-calls");
+    }
+    const options = {
+      message: authorityMode === "delegated"
+        ? "Enabling delegated tool authority"
+        : "Restoring verified tool authority",
+      successMessage: authorityMode === "delegated"
+        ? "Delegated tool authority enabled"
+        : "Verified tool authority restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("tool-authority-mode", args, options)
+      : await this.runSetup("tool-authority-mode", args, options);
+    return { ...result, authorityMode };
   }
 
   async setSkillAttachments(enabled) {
@@ -1236,7 +1340,7 @@ class RuntimeHost {
     };
   }
 
-  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, toolAuthorityMode } = {}, afterRuntimeReady) {
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
@@ -1253,6 +1357,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
+      ...this.toolAuthoritySetupArgs(toolAuthorityMode),
       "--replace-codex-route",
     ];
     if (reuseSavedCredentials) {
@@ -1285,7 +1390,7 @@ class RuntimeHost {
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
-  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, toolAuthorityMode } = {}, afterRuntimeReady) {
     if (this.launcherProfile !== "development") {
       throw new Error("DEV MCP setup requires the isolated DEV launcher");
     }
@@ -1305,6 +1410,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
+      ...this.toolAuthoritySetupArgs(toolAuthorityMode),
       "--acknowledge-unofficial",
     ];
     if (reuseSavedCredentials) {
@@ -1464,4 +1570,4 @@ class RuntimeHost {
   }
 }
 
-module.exports = { CURRENT_CONNECTOR_NAME, RuntimeHost };
+module.exports = { CURRENT_CONNECTOR_NAME, RuntimeHost, resolveToolAuthorityControl };

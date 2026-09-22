@@ -539,6 +539,13 @@ function validateBrowserInteractionMode(value) {
   return value;
 }
 
+function validateToolAuthorityMode(value) {
+  if (value !== "verified-environment" && value !== "delegated") {
+    throw new Error("Tool authority mode must be verified-environment or delegated");
+  }
+  return value;
+}
+
 function validateBounds(value) {
   if (!value || typeof value !== "object") throw new Error("Browser bounds are required");
   for (const key of ["x", "y", "width", "height"]) {
@@ -607,6 +614,7 @@ function registerIpc({ logger, stateStore }) {
       automatic: runtimeHost.setupConnectorName(),
       manual: "Codex Zero Risk",
     },
+    toolAuthority: runtimeHost.toolAuthorityControl(stateStore.read().toolAuthorityMode),
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
     logs: logger.recent(),
     urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
@@ -825,6 +833,7 @@ function registerIpc({ logger, stateStore }) {
       mcpGuideStep: 0,
       codexRestartRequired: true,
       browserInteractionMode: "automatic",
+      toolAuthorityMode: "verified-environment",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
       zeroRiskProEnabled: false,
@@ -855,11 +864,19 @@ function registerIpc({ logger, stateStore }) {
           : "Run the browser smoke test before installing the Codex integration",
       );
     }
-    const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
+    const configured = runtimeHost.runtimeConfigSnapshot().configured;
+    const toolAuthority = runtimeHost.toolAuthorityControl(setupState.toolAuthorityMode);
+    const setupOptions = !configured && !toolAuthority.forced && setupState.toolAuthorityMode === "delegated"
+      ? { toolAuthorityMode: "delegated" }
+      : undefined;
+    const result = IS_DEV_PROFILE
+      ? await runtimeHost.setupDevCore(setupOptions)
+      : await runtimeHost.setupCore(setupOptions);
     stateStore.update({
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       ...(result.mode === "full" ? {
         mcpRuntimeInstalled: true,
@@ -880,11 +897,14 @@ function registerIpc({ logger, stateStore }) {
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
-    const currentMode = stateStore.read().browserInteractionMode;
+    const currentState = stateStore.read();
+    const currentMode = currentState.browserInteractionMode;
     const interactionMode = input?.interactionMode === undefined
       ? currentMode
       : validateBrowserInteractionMode(input.interactionMode);
     const interactionModeChange = interactionMode !== currentMode;
+    const configured = runtimeHost.runtimeConfigSnapshot().configured;
+    const toolAuthority = runtimeHost.toolAuthorityControl(currentState.toolAuthorityMode);
     const setup = IS_DEV_PROFILE
       ? runtimeHost.setupDevMcp.bind(runtimeHost)
       : runtimeHost.setupMcp.bind(runtimeHost);
@@ -893,6 +913,9 @@ function registerIpc({ logger, stateStore }) {
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
       interactionMode,
+      toolAuthorityMode: !configured && !toolAuthority.forced && currentState.toolAuthorityMode === "delegated"
+        ? "delegated"
+        : undefined,
     }, afterRuntimeReady);
     if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
     const result = interactionModeChange
@@ -901,6 +924,7 @@ function registerIpc({ logger, stateStore }) {
     const state = stateStore.update({
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
+      toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -937,6 +961,36 @@ function registerIpc({ logger, stateStore }) {
     });
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:tool-authority-mode", async (_event, rawMode) => {
+    const mode = validateToolAuthorityMode(rawMode);
+    const current = stateStore.read();
+    const toolAuthority = runtimeHost.toolAuthorityControl(current.toolAuthorityMode);
+    if (toolAuthority.forced) {
+      throw new Error(
+        toolAuthority.source === "remote-bind"
+          ? "Tool authority mode is forced by the remote Responses deployment"
+          : "Tool authority mode is forced by CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE",
+      );
+    }
+    if (current.toolAuthorityMode === mode) return current;
+    if (!runtimeHost.runtimeConfigSnapshot().configured) {
+      const state = stateStore.update({ toolAuthorityMode: mode });
+      send("launcher:state-changed", state);
+      return state;
+    }
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing tool authority mode"
+          : `Finish ${browserOperation} before changing tool authority mode`,
+      );
+    }
+    const result = await runtimeHost.setToolAuthorityMode(mode);
+    const state = stateStore.update({ toolAuthorityMode: result.authorityMode });
+    send("launcher:state-changed", state);
     return state;
   });
   handle("launcher:skill-attachments", async (_event, enabled) => {
@@ -1337,6 +1391,7 @@ async function start() {
       ...(config?.mode !== "full" ? { mcpSetupComplete: false, mcpGuideStep: 0 } : {}),
       codexRestartRequired: false,
       autoStart: false,
+      toolAuthorityMode: config?.toolAuthorityMode ?? stateStore.read().toolAuthorityMode,
       experimentalBiggerContext: config?.experimentalBiggerContext === true,
       experimentalSkillAttachments: config?.experimentalSkillAttachments === true,
       zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
@@ -1364,6 +1419,7 @@ async function start() {
         coreSetupComplete: true,
         codexCatalogVerified: false,
         codexRestartRequired: true,
+        toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
         zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
@@ -1390,11 +1446,18 @@ async function start() {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
       const experimentalSkillAttachments = configuredRuntime.config?.experimentalSkillAttachments === true;
       const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
+      const toolAuthorityMode = configuredRuntime.config?.toolAuthorityMode ?? "verified-environment";
       const saved = stateStore.read();
       if (saved.experimentalSkillAttachments !== experimentalSkillAttachments
         || saved.experimentalBiggerContext !== enabled
-        || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled, experimentalSkillAttachments, zeroRiskProEnabled });
+        || saved.zeroRiskProEnabled !== zeroRiskProEnabled
+        || saved.toolAuthorityMode !== toolAuthorityMode) {
+        const state = stateStore.update({
+          experimentalBiggerContext: enabled,
+          experimentalSkillAttachments,
+          zeroRiskProEnabled,
+          toolAuthorityMode,
+        });
         send("launcher:state-changed", state);
       }
     }
@@ -1412,6 +1475,7 @@ async function start() {
       const patch = {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
+        toolAuthorityMode: config.toolAuthorityMode ?? "verified-environment",
         experimentalBiggerContext: config.experimentalBiggerContext === true,
         experimentalSkillAttachments: config.experimentalSkillAttachments === true,
         zeroRiskProEnabled: config.zeroRiskProEnabled === true,

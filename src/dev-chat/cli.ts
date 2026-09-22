@@ -350,6 +350,12 @@ export async function runDevCommand(args: string[]): Promise<void> {
     if (automaticBrowserInteraction && manualBrowserInteraction) {
       throw new Error("Choose at most one browser interaction mode");
     }
+    const toolAuthorityMode = takeOption(args, "--tool-authority-mode");
+    if (toolAuthorityMode !== undefined
+      && toolAuthorityMode !== "verified-environment"
+      && toolAuthorityMode !== "delegated") {
+      throw new Error("--tool-authority-mode must be verified-environment or delegated");
+    }
     const skillAttachments = takeFlag(args, "--skill-attachments");
     const inlineSkills = takeFlag(args, "--inline-skills");
     if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
@@ -367,6 +373,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
       ...(automaticBrowserInteraction || manualBrowserInteraction
         ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
         : {}),
+      ...(toolAuthorityMode ? { toolAuthorityMode } : {}),
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
       ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
       ...(tunnelId ? { tunnelId } : {}),

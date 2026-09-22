@@ -209,6 +209,7 @@ test("Linux packaging replaces libnotify in an owned AppImage toolset before ass
     assert.match(contract, /notify_notification_get_activation_app_launch_context/);
   }
   assert.match(prepare, /4be15202ec4184fce1ac15997ece5530d2be32fe9573875aeb10e3b573858748/);
+  assert.match(prepare, /! -name '\*\.symbols'/);
   assert.match(source, /getAppImageTools\("0\.0\.0", Arch\.x64\)/);
   assert.match(source, /APPIMAGE_TOOLS_PATH/);
   assert.match(source, /must not replace the shared download cache/);

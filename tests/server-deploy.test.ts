@@ -1,15 +1,150 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
 const deploy = resolve(root, "deploy/server");
+const dockerPath = Bun.which("docker");
+const dockerAvailable = dockerPath !== null && Bun.spawnSync(
+  [dockerPath, "version", "--format", "{{.Server.Version}}"],
+  { stdout: "ignore", stderr: "ignore" },
+).exitCode === 0;
 
 function read(relativePath: string): string {
   return readFileSync(resolve(deploy, relativePath), "utf8");
 }
 
+function filesUnder(directory: string, prefix = ""): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      return filesUnder(resolve(directory, entry.name), relative);
+    }
+    return entry.isFile() ? [relative] : [];
+  });
+}
+
+function writeFixtureFile(directory: string, relativePath: string): void {
+  const path = resolve(directory, relativePath);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${relativePath}\n`);
+}
+
+function buildDockerContextProbe(dockerignore: string, fixturePaths: string[]): string[] {
+  if (dockerPath === null) throw new Error("Docker is not available");
+
+  const probeRoot = mkdtempSync(join(tmpdir(), "codex-web-gpt-dockerignore-"));
+  const contextRoot = resolve(probeRoot, "context");
+  const outputRoot = resolve(probeRoot, "output");
+  const buildxConfig = resolve(probeRoot, "buildx");
+  mkdirSync(contextRoot, { recursive: true });
+  mkdirSync(buildxConfig, { recursive: true });
+
+  try {
+    writeFileSync(resolve(contextRoot, ".dockerignore"), dockerignore);
+    writeFileSync(resolve(contextRoot, "Dockerfile"), "FROM scratch\nCOPY . /context\n");
+    for (const path of fixturePaths) writeFixtureFile(contextRoot, path);
+
+    const result = Bun.spawnSync(
+      [
+        dockerPath,
+        "build",
+        "--progress=plain",
+        "--output",
+        `type=local,dest=${outputRoot}`,
+        contextRoot,
+      ],
+      {
+        env: { ...process.env, BUILDX_CONFIG: buildxConfig },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `Docker context probe failed (exit ${result.exitCode})\n${result.stdout.toString()}\n${result.stderr.toString()}`,
+      );
+    }
+    return filesUnder(resolve(outputRoot, "context")).sort();
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
 describe("server remote desktop deployment", () => {
+  test("builds the production AppImage inside the Docker image build", () => {
+    const dockerfile = read("Dockerfile");
+    const dockerignore = read("Dockerfile.dockerignore");
+    const compose = read("compose.yaml");
+    const envExample = read(".env.example");
+
+    expect(dockerfile).toContain("FROM node:22-bookworm-slim AS launcher-builder");
+    expect(dockerfile).toContain("./scripts/prepare-linux-libnotify.sh");
+    expect(dockerfile).toContain("launcher/scripts/prepare-linux-appimage-tools.cjs");
+    expect(dockerfile).toContain("CODEX_WEB_GPT_APPIMAGE_TOOLS_OUTPUT=/build/launcher/build/appimage-tools");
+    expect(dockerfile).toContain('APPIMAGE_TOOLS_PATH="$CODEX_WEB_GPT_APPIMAGE_TOOLS_OUTPUT"');
+    expect(dockerfile).not.toContain('APPIMAGE_TOOLS_PATH="$(bun run launcher/scripts/prepare-linux-appimage-tools.cjs)"');
+    expect(dockerfile).toContain("bun run --cwd launcher package:linux");
+    expect(dockerfile).toContain(
+      "COPY --from=launcher-builder /tmp/Codex-Web-GPT.AppImage /opt/codex/Codex-Web-GPT.AppImage",
+    );
+    expect(dockerfile).not.toContain("ARG APPIMAGE_FILE");
+    expect(compose).not.toContain("APPIMAGE_FILE");
+    expect(envExample).not.toContain("APPIMAGE_FILE");
+    expect(dockerignore.split(/\r?\n/)[0]).toBe("**");
+  });
+
+  test.skipIf(!dockerAvailable)("keeps generated launcher directories out of the Docker build context", () => {
+    const allowedPaths = [
+      "package.json",
+      "bun.lock",
+      "LICENSE",
+      "LICENSES/dependency.md",
+      "src/cli.ts",
+      "src/nested/helper.js",
+      "scripts/build-runtime-bundle.ts",
+      "scripts/generate-third-party-notices.ts",
+      "scripts/prepare-linux-libnotify.sh",
+      "launcher/package.json",
+      "launcher/bun.lock",
+      "launcher/tsconfig.json",
+      "launcher/vite.config.ts",
+      "launcher/index.html",
+      "launcher/assets/icon.png",
+      "launcher/assets/linux-appimage-runner.sh",
+      "launcher/assets/mcp-mark.svg",
+      "launcher/electron/main.cjs",
+      "launcher/electron/nested/helper.txt",
+      "launcher/scripts/package.cjs",
+      "launcher/scripts/prepare-runtime.cjs",
+      "launcher/scripts/prepare-linux-appimage-tools.cjs",
+      "launcher/src/App.tsx",
+      "launcher/src/nested/helper.js",
+      "deploy/server/bin/start-vnc.sh",
+      "deploy/server/novnc-index.html",
+      "deploy/server/supervisord.conf",
+    ];
+    const blockedPaths = [
+      "README.md",
+      ".npmrc",
+      "scripts/private.ts",
+      "launcher/.npmrc",
+      "launcher/node_modules/example/index.js",
+      "launcher/artifacts/Codex-Web-GPT.AppImage",
+      "launcher/build/generated.txt",
+      "launcher/dist/generated.js",
+      "launcher/release/generated.txt",
+      "deploy/server/.env.production",
+    ];
+
+    const actualPaths = buildDockerContextProbe(
+      read("Dockerfile.dockerignore"),
+      [...allowedPaths, ...blockedPaths],
+    );
+    expect(actualPaths).toEqual([...allowedPaths].sort());
+  });
+
   test("runs the production AppImage as a non-root user without sandbox bypasses", () => {
     const dockerfile = read("Dockerfile");
     const compose = read("compose.yaml");
@@ -21,7 +156,6 @@ describe("server remote desktop deployment", () => {
     expect(dockerfile).toContain("ARG CODEX_GID=10001");
     expect(compose).toContain("CODEX_UID: ${CODEX_UID:-10001}");
     expect(compose).toContain("CODEX_GID: ${CODEX_GID:-10001}");
-    expect(dockerfile).toContain("launcher/artifacts/${APPIMAGE_FILE}");
     expect(dockerfile).toContain("APPIMAGE_EXTRACT_AND_RUN=1");
     expect(launcher).toContain('exec "$APPIMAGE_PATH" --password-store=gnome-libsecret');
     expect(all).not.toContain("--no-sandbox");
@@ -59,7 +193,7 @@ describe("server remote desktop deployment", () => {
     expect(readme).toContain("do not proxy `/healthz`, `/admin/*`");
   });
 
-  test("persists HOME without a Codex workspace and keeps VNC and keyring credentials in separate secret files", () => {
+  test("persists HOME without a Codex workspace and sources VNC and keyring secrets from environment variables", () => {
     const dockerfile = read("Dockerfile");
     const compose = read("compose.yaml");
     const envExample = read(".env.example");
@@ -81,8 +215,14 @@ describe("server remote desktop deployment", () => {
     expect(compose).toContain("KEYRING_PASSWORD_FILE: /run/secrets/keyring_password");
     expect(compose).toContain("- vnc_password");
     expect(compose).toContain("- keyring_password");
-    expect(envExample).toContain("VNC_PASSWORD_FILE=/etc/codex-web-gpt/vnc-password");
-    expect(envExample).toContain("KEYRING_PASSWORD_FILE=/etc/codex-web-gpt/keyring-password");
+    expect(compose).toContain("environment: VNC_PASSWORD");
+    expect(compose).toContain("environment: KEYRING_PASSWORD");
+    expect(compose).not.toContain("file: ${VNC_PASSWORD_FILE");
+    expect(compose).not.toContain("file: ${KEYRING_PASSWORD_FILE");
+    expect(envExample).not.toContain("VNC_PASSWORD_FILE=");
+    expect(envExample).not.toContain("KEYRING_PASSWORD_FILE=");
+    expect(envExample).not.toMatch(/^VNC_PASSWORD=/m);
+    expect(envExample).not.toMatch(/^KEYRING_PASSWORD=/m);
     expect(vnc).toContain('head -n 1 "$VNC_PASSWORD_FILE"');
     expect(vnc).toContain("tigervncpasswd -f");
     expect(vnc).not.toMatch(/-passwd\s+\$?vnc_password/);

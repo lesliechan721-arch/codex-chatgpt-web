@@ -4,7 +4,41 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
-const { RuntimeHost } = require("../electron/runtime.cjs");
+const { RuntimeHost, resolveToolAuthorityControl } = require("../electron/runtime.cjs");
+
+test("tool authority control reports the effective forced mode and its source", () => {
+  assert.deepEqual(
+    resolveToolAuthorityControl(undefined, "verified-environment", {
+      CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated",
+    }),
+    { effectiveMode: "delegated", forced: true, source: "environment" },
+  );
+  assert.deepEqual(
+    resolveToolAuthorityControl(undefined, "verified-environment", {
+      CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
+    }),
+    { effectiveMode: "delegated", forced: true, source: "remote-bind" },
+  );
+  assert.deepEqual(
+    resolveToolAuthorityControl(undefined, "delegated", {}),
+    { effectiveMode: "delegated", forced: false, source: null },
+  );
+});
+
+test("tool authority conflict reports the actual forcing source", () => {
+  assert.throws(
+    () => resolveToolAuthorityControl("verified-environment", "verified-environment", {
+      CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: "delegated",
+    }),
+    /conflicts with CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE=delegated/,
+  );
+  assert.throws(
+    () => resolveToolAuthorityControl("verified-environment", "verified-environment", {
+      CODEX_CHATGPT_WEB_BIND_HOST: "0.0.0.0",
+    }),
+    /conflicts with CODEX_CHATGPT_WEB_BIND_HOST=0\.0\.0\.0 \(remote Responses bind\)/,
+  );
+});
 
 function hostFor(existingConfig, interactionMode = "automatic") {
   const host = new RuntimeHost({
@@ -92,6 +126,15 @@ test("core setup starts in browser-only mode when no installation exists", async
   assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
   assert.equal(fixture.invocation().args.includes("--chrome"), false);
+});
+
+test("fresh core setup accepts a delegated authority preference from the launcher", async () => {
+  const fixture = hostFor(null);
+  await fixture.host.setupCore({ toolAuthorityMode: "delegated" });
+  const args = fixture.invocation().args;
+  const authorityFlag = args.indexOf("--tool-authority-mode");
+  assert.ok(authorityFlag >= 0);
+  assert.equal(args[authorityFlag + 1], "delegated");
 });
 
 test("core setup refuses an implicit Automatic fallback for a new Zero Risk installation", async () => {
@@ -207,6 +250,47 @@ test("Bigger Context updates the isolated DEV config without installing a Codex 
       "--automatic-browser-interaction",
       "--acknowledge-unofficial",
       "--standard-context",
+    ],
+  });
+});
+
+test("tool authority mode uses the setup transaction in production", async () => {
+  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
+  const result = await fixture.host.setToolAuthorityMode("delegated");
+  assert.equal(result.authorityMode, "delegated");
+  assert.deepEqual(fixture.invocation(), {
+    name: "tool-authority-mode",
+    args: [
+      "setup",
+      "--full",
+      "--browser-host-descriptor",
+      "/runtime/launcher-browser.json",
+      "--automatic-browser-interaction",
+      "--replace-codex-route",
+      "--acknowledge-unofficial",
+      "--restart-service",
+      "--tool-authority-mode",
+      "delegated",
+    ],
+  });
+});
+
+test("tool authority mode updates the isolated DEV config without installing a Codex route", async () => {
+  const fixture = devHostFor({ mode: "browser-only" });
+  const result = await fixture.host.setToolAuthorityMode("verified-environment");
+  assert.equal(result.authorityMode, "verified-environment");
+  assert.deepEqual(fixture.invocation(), {
+    name: "tool-authority-mode",
+    args: [
+      "dev",
+      "setup",
+      "--browser-only",
+      "--browser-host-descriptor",
+      "/dev/runtime/launcher-browser.json",
+      "--automatic-browser-interaction",
+      "--acknowledge-unofficial",
+      "--tool-authority-mode",
+      "verified-environment",
     ],
   });
 });
@@ -508,6 +592,7 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
     replace: true,
     tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
     runtimeKey: "new-private-runtime-key",
+    toolAuthorityMode: "delegated",
   });
 
   assert.deepEqual(fixture.invocation().args.slice(0, 5), [
@@ -518,6 +603,13 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
     "--automatic-browser-interaction",
   ]);
   assert.equal(fixture.invocation().args.includes("--app-name"), false);
+  assert.deepEqual(
+    fixture.invocation().args.slice(
+      fixture.invocation().args.indexOf("--tool-authority-mode"),
+      fixture.invocation().args.indexOf("--tool-authority-mode") + 2,
+    ),
+    ["--tool-authority-mode", "delegated"],
+  );
   assert.equal(fixture.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
 });
 

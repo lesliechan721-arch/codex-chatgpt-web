@@ -16,6 +16,7 @@ const DEFAULT_STATE = Object.freeze({
   keepRunningOnClose: true,
   showBrowserDuringTurns: true,
   browserInteractionMode: "automatic",
+  toolAuthorityMode: "verified-environment",
   experimentalBiggerContext: false,
   experimentalSkillAttachments: false,
   zeroRiskProEnabled: false,
@@ -59,6 +60,9 @@ function readState(filePath) {
     }
     if (state.browserInteractionMode !== "automatic" && state.browserInteractionMode !== "manual") {
       state.browserInteractionMode = DEFAULT_STATE.browserInteractionMode;
+    }
+    if (state.toolAuthorityMode !== "verified-environment" && state.toolAuthorityMode !== "delegated") {
+      state.toolAuthorityMode = DEFAULT_STATE.toolAuthorityMode;
     }
     if (state.coreSetupComplete !== true) {
       if (state.onboardingComplete !== true) state.browserInteractionMode = "automatic";

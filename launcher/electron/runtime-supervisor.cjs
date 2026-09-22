@@ -261,6 +261,11 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  if (config.toolAuthorityMode !== undefined
+    && config.toolAuthorityMode !== "verified-environment"
+    && config.toolAuthorityMode !== "delegated") {
+    throw new Error("Runtime configuration has an invalid toolAuthorityMode");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");

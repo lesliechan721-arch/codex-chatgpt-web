@@ -5,7 +5,6 @@ services:
       context: ../..
       dockerfile: deploy/server/Dockerfile
       args:
-        APPIMAGE_FILE: ${APPIMAGE_FILE:?Set APPIMAGE_FILE to the Linux x64 AppImage filename in launcher/artifacts}
         CODEX_UID: ${CODEX_UID:-10001}
         CODEX_GID: ${CODEX_GID:-10001}
     restart: unless-stopped
@@ -51,6 +50,6 @@ volumes:
 
 secrets:
   vnc_password:
-    file: ${VNC_PASSWORD_FILE:?Set VNC_PASSWORD_FILE to a private host file}
+    environment: VNC_PASSWORD
   keyring_password:
-    file: ${KEYRING_PASSWORD_FILE:?Set KEYRING_PASSWORD_FILE to a private host file}
+    environment: KEYRING_PASSWORD

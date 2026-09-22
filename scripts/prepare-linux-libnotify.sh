@@ -36,7 +36,7 @@ meson setup "$TEMP_DIR/build" "$TEMP_DIR/libnotify-$VERSION" \
   -Ddocbook_docs=disabled >/dev/null
 meson compile -C "$TEMP_DIR/build" >/dev/null
 
-LIBRARY="$(find "$TEMP_DIR/build" -type f -name 'libnotify.so.4.*' -print -quit)"
+LIBRARY="$(find "$TEMP_DIR/build" -type f -name 'libnotify.so.4.*' ! -name '*.symbols' -print -quit)"
 if [ -z "$LIBRARY" ]; then
   echo "libnotify build produced no libnotify.so.4" >&2
   exit 1
