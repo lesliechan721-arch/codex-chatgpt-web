@@ -5,18 +5,18 @@ This deployment runs the packaged Linux x64 Launcher in one long-running Docker 
 ## Requirements
 
 - Linux x86_64 server with Docker Engine and Docker Compose.
-- Network access during the image build for Bun dependencies, Electron/AppImage build tools, and the pinned libnotify source. The Docker build packages the production Linux x64 AppImage from this source tree; no prebuilt `launcher/artifacts/*.AppImage` is required.
+- Network access to pull `lesliechan721/codex-chatgpt-web` from Docker Hub.
 - A persistent Docker volume for `/home/codex`.
 - A private `VNC_PASSWORD` environment variable for remote desktop authentication.
 - A separate private `KEYRING_PASSWORD` environment variable. Keep this keyring secret stable when reusing the HOME volume. It is intentionally independent from the VNC password, so the VNC password can be rotated without changing the safeStorage keyring credential.
 - An existing HTTPS reverse proxy. This deployment does not install or manage TLS termination.
 - A Codex client outside the container. It can run on the same Linux host or on another trusted machine that can reach the HTTPS reverse proxy.
 
-The container user is named `codex`. Its default uid/gid is `10001:10001`; this avoids the `1000:1000` `node` user already present in the base image. Set `CODEX_UID` and `CODEX_GID` at image build time when the dedicated host account uses different, unused IDs. The build fails instead of silently sharing an existing container identity when those IDs already exist. Docker Compose reads the two password values from the invoking process environment and mounts them into the container as separate Compose secrets; the values are not part of `deploy/server/.env`.
+The container user is named `codex` and uses uid/gid `10001:10001`; this avoids the `1000:1000` `node` user already present in the base image. Docker Compose reads the two password values from the invoking process environment and mounts them into the container as separate Compose secrets; the values are not part of `deploy/server/.env`.
 
 VNC authentication uses the legacy VNC password mechanism. Use at least 8 random characters; only the first 8 characters are significant to this protocol. HTTPS at the existing reverse proxy is required for public access.
 
-## Build and start
+## Pull and start
 
 Copy the environment template and set real values:
 
@@ -31,22 +31,33 @@ export VNC_PASSWORD='replace-with-a-random-password'
 export KEYRING_PASSWORD='replace-with-an-independent-stable-password'
 ```
 
-The image does not install Codex CLI. The Launcher and its packaged runtime are the server-side product; Codex runs outside the container. A dedicated build stage installs the locked root and Launcher dependencies, prepares the Linux AppImage toolset, and runs `bun run --cwd launcher package:linux`. Only the resulting AppImage is copied into the runtime image. The image records its SHA-256 digest in `/opt/codex-server/build/appimage.sha256`.
+The image does not install Codex CLI. The Launcher and its packaged runtime are the server-side product; Codex runs outside the container. The published image contains the production Linux x64 AppImage and records its SHA-256 digest in `/opt/codex-server/build/appimage.sha256`.
 
-Build and start:
+Pull the published image and start:
 
 ```sh
-docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml build
+docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml pull
 docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml up -d
 ```
 
-The image build must run for `linux/amd64`. The Compose file fixes that platform and the Dockerfile rejects a non-amd64 userspace.
+The published image is built for `linux/amd64`. The Compose file fixes that platform and the Dockerfile rejects a non-amd64 userspace.
 
 Inspect the packaged Launcher digest:
 
 ```sh
 docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml exec desktop cat /opt/codex-server/build/appimage.sha256
 ```
+
+## Publish the server image
+
+Log in to Docker Hub, then run:
+
+```sh
+docker login
+bun run publish:server:image
+```
+
+The publish script builds `deploy/server/Dockerfile` with Docker Buildx for `linux/amd64` and pushes both `lesliechan721/codex-chatgpt-web:<package-version>` and `lesliechan721/codex-chatgpt-web:latest`. The Docker build packages the production Linux x64 AppImage from this source tree; no prebuilt `launcher/artifacts/*.AppImage` is required.
 
 ## Network contract
 
@@ -118,7 +129,7 @@ The named `codex_home` volume persists all application-user state under `/home/c
 
 The external Codex client owns its own `CODEX_HOME`, project files, sandbox, and command side effects. They are not mounted into this container.
 
-To upgrade, build a new image from the new source revision, then recreate the container with the same HOME volume. To roll back, start the previous image with the same persistent data. The AppImage self-updater is not the authoritative server update path.
+To upgrade, pull the new published image, then recreate the container with the same HOME volume. To roll back, use a previously published version tag with the same persistent data. The AppImage self-updater is not the authoritative server update path.
 
 ## Health behavior
 
