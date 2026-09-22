@@ -16,7 +16,16 @@
 .api-access-settings .api-access-warning { color: var(--text-warning, #dfc080); }
 .api-access-settings summary { font-size: 12px; cursor: pointer; }
 .api-access-upstream { display: grid; gap: 8px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-subtle, #444); }
+.api-access-upstream.is-detail { margin-top: 18px; }
 .api-access-upstream h3 { margin: 0 0 4px; font-size: 13px; }
 .api-access-checkbox, .api-access-model-list label { display: flex; align-items: center; gap: 8px; font-weight: 400 !important; }
 .api-access-checkbox input, .api-access-model-list input { width: auto; }
 .api-access-model-list { display: grid; gap: 6px; max-height: 180px; overflow: auto; padding: 8px; border: 1px solid var(--border-subtle, #444); border-radius: 6px; }
+.api-access-model-empty { padding: 6px 2px; }
+.api-access-upstream-link { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 18px; margin-top: 12px; text-align: left; }
+.api-access-upstream-link > span:first-child { display: grid; gap: 3px; }
+.api-access-upstream-link strong { font-size: 12px; }
+.api-access-upstream-link small { font-weight: 400; }
+.api-access-upstream-link-status { flex: 0 0 auto; color: var(--text-secondary, #aaa); white-space: nowrap; }
+.api-access-settings-detail { margin-top: 0; padding-top: 0; border-top: 0; }
+.api-access-back { margin-bottom: 16px; }

@@ -1,8 +1,16 @@
 import { stdin, stdout, stderr } from "node:process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, getConfigDir, getConfigPath, loadConfig } from "./config";
-import { API_KEY_ENV, OPENAI_ACCESS, apiKeyMatches, apiKeyPolicy, generateApiKey } from "./api-access";
+import { atomicWriteFile, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
+import {
+  API_KEY_ENV,
+  OPENAI_ACCESS,
+  apiAccessRevision,
+  apiKeyMatches,
+  apiKeyPolicy,
+  generateApiKey,
+  type ApiAccessPolicy,
+} from "./api-access";
 import {
   apiAccessConfigPath,
   clearOpenAiRoutingPending,
@@ -11,6 +19,7 @@ import {
 } from "./api-access-config";
 import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
+import { mergeUpstreamModelCatalog } from "./upstream-model-catalog";
 import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
@@ -20,6 +29,77 @@ import {
   clientCatalogPath,
   manualCodexConfigurationOnly,
 } from "./server-remote-config";
+import { upstreamProviderRevision, type UpstreamProviderConfig } from "./upstream-provider";
+
+type FetchLike = (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>;
+const LOOPBACK_EXPORT_REQUEST_TIMEOUT_MS = 5_000;
+const API_ACCESS_REVISION_HEADER = "x-codex-chatgpt-web-api-access-revision";
+const UPSTREAM_PROVIDER_REVISION_HEADER = "x-codex-chatgpt-web-upstream-provider-revision";
+
+async function withLoopbackExportTimeout<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timeoutError = new Error("Loopback export request timed out");
+  const timer = setTimeout(() => controller.abort(timeoutError), LOOPBACK_EXPORT_REQUEST_TIMEOUT_MS);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(controller.signal.reason ?? timeoutError);
+    if (controller.signal.aborted) onAbort();
+    else controller.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation(controller.signal), aborted]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+  }
+}
+
+export async function buildApiKeyExportModelCatalog(
+  config: AppConfig,
+  policy: ApiAccessPolicy,
+  localApiKey: string,
+  upstream: UpstreamProviderConfig | undefined,
+  fetchImpl: FetchLike = fetch,
+): Promise<ReturnType<typeof buildStandaloneModelCatalog>> {
+  const local = buildStandaloneModelCatalog(config);
+  if (!upstream) return local;
+  const baseUrl = `http://127.0.0.1:${config.port}`;
+  const expectedApiAccessRevision = apiAccessRevision(policy, config.controlToken);
+  const expectedUpstreamRevision = upstreamProviderRevision(upstream, config.controlToken);
+  try {
+    const health = await withLoopbackExportTimeout(async signal => {
+      const response = await fetchImpl(`${baseUrl}/healthz`, {
+        headers: { accept: "application/json" },
+        cache: "no-store",
+        signal,
+      });
+      return await response.json() as Record<string, unknown>;
+    });
+    if (health.service !== "codex-chatgpt-web" || health.access_mode !== "api-key"
+      || health.api_access_revision !== expectedApiAccessRevision
+      || health.upstream_provider_available !== true
+      || health.upstream_provider_revision !== expectedUpstreamRevision) {
+      return local;
+    }
+    const upstreamCatalog = await withLoopbackExportTimeout(async signal => {
+      const response = await fetchImpl(`${baseUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${localApiKey}`, accept: "application/json" },
+        cache: "no-store",
+        signal,
+      });
+      if (!response.ok
+        || response.headers.get(API_ACCESS_REVISION_HEADER) !== expectedApiAccessRevision
+        || response.headers.get(UPSTREAM_PROVIDER_REVISION_HEADER) !== expectedUpstreamRevision) {
+        return undefined;
+      }
+      return await response.json();
+    });
+    if (upstreamCatalog === undefined) return local;
+    return mergeUpstreamModelCatalog(local, upstreamCatalog, upstream);
+  } catch {
+    return local;
+  }
+}
 
 async function readKeyFromStdin(): Promise<string> {
   if (stdin.isTTY) throw new Error("--key-stdin requires piped input; use --generate for a random key");
@@ -116,10 +196,10 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   const clientRoute = clientBaseUrl(config.port);
   const externalClient = clientRoute.remote || manualCodexConfigurationOnly();
   const catalogPath = clientCatalogPath(localCatalogPath, externalClient);
-  const catalog = buildStandaloneModelCatalog(config);
+  const upstream = loadUpstreamProviderConfig();
+  const catalog = await buildApiKeyExportModelCatalog(config, policy, localApiKey, upstream);
   const catalogText = `${JSON.stringify({ models: catalog.models }, null, 2)}\n`;
   if (!externalClient) atomicWriteFile(localCatalogPath, catalogText);
-  const upstream = loadUpstreamProviderConfig();
   const rendered = renderApiKeyCodexConfig({
     port: config.port,
     baseUrl: clientRoute.baseUrl,
