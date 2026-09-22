@@ -10,7 +10,7 @@ import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adap
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
-import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
+import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptDelegatedTurnCapability, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -19,7 +19,7 @@ import {
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
-import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptDelegatedCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
@@ -317,6 +317,85 @@ describe("ChatGPT outer-native harness v4", () => {
       tools,
     });
     expect(() => chatGptTurnExecutionKey(request)).not.toThrow();
+  });
+
+  test("delegated authority ignores filesystem context and binds a child to its own native identity", () => {
+    const request = rawWireRequest("<environment_context><cwd>forged-relative</cwd></environment_context>");
+    const raw = request._rawBody as {
+      client_metadata: Record<string, unknown>;
+      input: Array<Record<string, unknown>>;
+    };
+    raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_child_123",
+      turn_id: "turn_child_456",
+    });
+    for (const item of raw.input) {
+      if (item.internal_chat_message_metadata_passthrough) {
+        item.internal_chat_message_metadata_passthrough = { turn_id: "turn_child_456" };
+      }
+    }
+
+    expect(extractChatGptDelegatedTurnCapability(request)).toEqual({
+      authorityMode: "delegated",
+      threadId: "thread_child_123",
+      turnId: "turn_child_456",
+      tools,
+    });
+  });
+
+  test("delegated authority fails closed without native thread and turn identity", () => {
+    const request = parsed("<environment_context><cwd>ignored</cwd></environment_context>");
+    request._rawBody = { input: [] };
+
+    expect(() => extractChatGptDelegatedTurnCapability(request))
+      .toThrow("requires native Codex thread_id and turn_id metadata");
+  });
+
+  test("starts a delegated tool turn without a trusted environment or Codex home", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-delegated-envless-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-delegated-envless-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        toolAuthorityMode: "delegated",
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+      if (!token) throw new Error("delegated prompt has no current turn token");
+      const claimed = await callTurnBroker<{
+        environment: { tools: CodexTool[]; registryGeneration: number };
+      }>(socketPath, { method: "claim", token });
+      expect(claimed.environment.registryGeneration).toBeGreaterThanOrEqual(1);
+      expect(claimed.environment.tools).toEqual(tools);
+      expect(claimed.environment).not.toHaveProperty("cwd");
+      expect(claimed.environment).not.toHaveProperty("sandboxPolicy");
+      const answer = "Delegated authority accepted";
+      turn.onTextDelta(answer);
+      return answer;
+    };
+    try {
+      const request = rawWireRequest("<environment_context><cwd>forged-relative</cwd></environment_context>");
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider, {
+        broker,
+        codexHome: join(tempRoot, "missing-delegated-codex-home"),
+      }).runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      await broker.close();
+    }
   });
 
   test("rejects canonical environment and user revision when an item conflicts with the current turn", () => {
@@ -827,6 +906,50 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(chatGptCompactionSourceExecutionKey(laterCompact)).toBe(chatGptTurnExecutionKey(first));
     expect(chatGptThreadOwnershipKey(laterCompact)).toBe(chatGptThreadOwnershipKey(first));
     expect(() => chatGptTurnExecutionKey(parsed(environmentXml))).toThrow("requires native Codex turn_id metadata");
+  });
+
+  test("delegated compaction source identity ignores rollout aliases and requires request-carried turn and item ids", () => {
+    const first = rawWireRequest("<environment_context><cwd>ignored</cwd></environment_context>");
+    const firstRaw = first._rawBody as {
+      client_metadata: Record<string, unknown>;
+      input: Array<Record<string, unknown>>;
+    };
+    firstRaw.input[1]!.id = "msg_source_instruction";
+
+    const compact = structuredClone(first);
+    compact._compactionRequest = true;
+    const compactRaw = compact._rawBody as { client_metadata: Record<string, unknown> };
+    compactRaw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_test_123",
+      turn_id: "turn_compact_456",
+    });
+    compact._chatGptMessageIdAliases = { msg_source_instruction: "rollout_alias" };
+    compact._chatGptCompactionSourceTurnId = "turn_rollout_fallback";
+
+    expect(chatGptDelegatedCompactionSourceExecutionKey(compact)).toBe(chatGptTurnExecutionKey(first));
+
+    const steered = structuredClone(first);
+    const steeredRaw = steered._rawBody as { input: Array<Record<string, unknown>> };
+    steeredRaw.input[1]!.id = "msg_steered_instruction";
+    steeredRaw.input[1]!.content = [{ type: "input_text", text: "Steered instruction" }];
+    const steeredCompact = structuredClone(steered);
+    steeredCompact._compactionRequest = true;
+    const steeredCompactRaw = steeredCompact._rawBody as { client_metadata: Record<string, unknown> };
+    steeredCompactRaw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      thread_id: "thread_test_123",
+      turn_id: "turn_compact_456",
+    });
+    expect(chatGptDelegatedCompactionSourceExecutionKey(steeredCompact)).toBe(chatGptTurnExecutionKey(steered));
+    expect(chatGptDelegatedCompactionSourceExecutionKey(steeredCompact))
+      .not.toBe(chatGptDelegatedCompactionSourceExecutionKey(compact));
+
+    const missingItem = structuredClone(compact);
+    delete ((missingItem._rawBody as { input: Array<Record<string, unknown>> }).input[1]!.id);
+    expect(chatGptDelegatedCompactionSourceExecutionKey(missingItem)).toBeUndefined();
+
+    const missingTurn = structuredClone(compact);
+    delete ((missingTurn._rawBody as { input: Array<Record<string, unknown>> }).input[1]!.internal_chat_message_metadata_passthrough);
+    expect(chatGptDelegatedCompactionSourceExecutionKey(missingTurn)).toBeUndefined();
   });
 
   test("coalesces provider retries onto one browser runtime and preserves outstanding calls", () => {

@@ -1,5 +1,7 @@
 # 服务端远程桌面部署 Phase 1 Spec
 
+> Delegated authority 后续调整：server remote deployment 必须使用 delegated tool authority，不依赖 Server 本机 Codex rollout / SQLite 恢复客户端 filesystem authority。tool authority、tool registry lifecycle、rollout replay、compaction source recovery、retained browser fallback，以及这些要求所需的最小 adapter/broker 调整，都以 [`../delegated-tool-authority/spec.md`](../delegated-tool-authority/spec.md) 为当前规范。若这些主题与本文旧表述冲突，以 delegated Spec 为准；本文其余网络、远程桌面、API Key、Launcher ownership、持久化、idle lifecycle 和单用户合同继续有效。
+
 ## 用户结果与范围
 
 Phase 1 将现有桌面 Launcher 作为长期运行的服务端应用使用。它不是 Launcher 的 Web 化重构。
@@ -37,7 +39,7 @@ Linux x86_64 Server / Docker
 └────────────────────────────────────┘
 ```
 
-本阶段优先保留现有核心行为和 Launcher ownership，只调整服务器部署与客户端接入边界。现有 `WebContentsView`、persistent browser partition、Responses bridge、Automatic/Zero Risk、MCP、compaction 和 Launcher 对 daemon/tunnel 的生命周期所有权保持不变；Codex 客户端从容器内移动到容器外，通过受认证的 HTTPS Responses 接口访问服务。
+本阶段保留核心功能可用性和 Launcher ownership。现有 `WebContentsView`、persistent browser partition、Responses bridge、Automatic/Zero Risk、MCP 能力，以及 Launcher 对 daemon/tunnel 的生命周期所有权继续保留；Codex 客户端从容器内移动到容器外，通过受认证的 HTTPS Responses 接口访问服务。server remote deployment 的 authority、rollout replay 和 compaction source recovery 是明确例外：它们按 delegated Spec 调整，并允许为此修改最小范围的 adapter/broker 行为；source proof 不足时，旧 retained browser epoch 可以被有意退役并建立 fresh epoch。
 
 ### 支持范围
 
@@ -291,7 +293,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 
 - 被接受产物与版本、可访问入口：无视觉原型。当前决定来源为本任务确认的 Phase 1 决定记录。
 - 适用环境：单用户 Linux x86_64 Docker server；浏览器通过现有 HTTPS 反向代理访问 `/desktop/`；容器外 Codex 通过同一反向代理的受 API Key 保护 HTTPS `/v1` 访问 Responses。
-- 须保持的结构和行为：生产 Electron Launcher、persistent partition、`WebContentsView`、Launcher runtime ownership、现有登录和 MCP/compaction 行为；客户端断开继续传播 abort。
+- 须保持的结构和行为：生产 Electron Launcher、persistent partition、`WebContentsView`、Launcher runtime ownership、现有登录、MCP/compaction 的功能可用性、task/session 隔离和正确 ownership；客户端断开继续传播 abort。tool authority、rollout replay、compaction source recovery 和 retained browser fallback 的具体行为由 delegated Spec 覆盖，不要求错误或缺少 source proof 时继续保留原 retained epoch。
 - 允许调整：基础镜像、容器 supervisor、轻量 WM、终端、VNC server/noVNC 的具体包和版本，只要通过本 Spec 的运行、安全和持久化验收。
 - 演示排除项：多人、多租户、ARM64、Guacamole、内置 HTTPS reverse proxy、远程 Responses WebSocket、多客户端密钥管理。
 - 核对方式：仓库静态合同、容器运行 smoke、真实 ChatGPT 登录、容器外真实 Codex turn、API Key/反向代理验证、断连和 idle-timeout 清理、重建/重启验证。
@@ -333,7 +335,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 7. 在反向代理公开 Responses `/v1` 后，缺少或使用错误 API Key 的 `/v1/models`、`/v1/responses` 请求被拒绝；正确 API Key 可以访问。公网访问 `/healthz` 和 `/admin/*` 必须失败或根本没有路由。
 8. 在容器外的真实 Codex 客户端上应用导出配置，完成至少一个真实 ChatGPT Web turn，并覆盖当前项目需要的 Automatic/Zero Risk 路径。客户端工作目录和 `CODEX_HOME` 位于容器外。
 9. Full/Automation 模式下由该外部 Codex 完成至少一个 MCP 工具回合，证明 Tunnel/MCP 与 outer Codex 工具调用仍保持现有合同。
-10. 触发一次现有 compaction 路径，证明远程接入没有改变 retained browser/session ownership。
+10. 触发 delegated compaction 路径，证明 task/session 隔离和 browser/session ownership 仍然正确：exact source execution 可按 delegated Spec 复用；proof 不足或 identity 不精确匹配时，旧 retained conversation 会先退役，再使用 fresh compaction / fresh browser epoch。验收不得要求 retained epoch 在所有情况下保持不变。
 11. 让外部 Codex 在活动流中正常断开 TCP/HTTP 连接，确认对应 HTTP/browser/compaction ownership 被及时取消，活动 turn 计数回到零。
 12. 将远程 native turn idle timeout 临时配置为一个短测试值：持续发送 adapter/browser helper heartbeat 但不产生真实业务进展，确认同一 `thread_id + turn_id` 仍会超时并被强制清理；随后证明文本/推理增量、工具调用产生、工具结果返回或 compaction 实际进展能够续租。工具调用发出后若一直没有结果，计时不得暂停。测试后恢复部署默认 600 秒。
 13. 在宿主机确认 Responses raw port、health、admin、CDP 和 VNC 没有公网监听。Responses/noVNC 端口只允许 reverse proxy 所需的宿主机 loopback 或 private-network 可达范围。
@@ -393,7 +395,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 - 客户端导出可以通过 Launcher UI、CLI 或两者提供；只要产物可复制到另一台主机、不自动写外部 Codex、且不包含服务端本地路径或 control token。
 - 远程 idle lease 可以实现为独立 turn registry，或复用现有 HTTP/session ownership 数据结构；实现必须按 native turn identity 保持单一 lease，并只在真实业务进展时续租，不能简单给每个 HTTP 请求重新计时。
 - 部署资产可以放在 `deploy/server/` 或等价清晰目录；确切文件组织不属于公共运行合同。
-- 当前 `src/config.ts` 明确拒绝非 loopback Responses host，现有 API Key export 又固定本机 URL，因此本次需求预计需要最小核心改动。除网络绑定、客户端导出和远程 idle lifecycle 所需代码外，不应顺带重构 Launcher/adapter 行为。
+- 当前 `src/config.ts` 明确拒绝非 loopback Responses host，现有 API Key export 又固定本机 URL，因此本次需求预计需要最小核心改动。除网络绑定、客户端导出、远程 idle lifecycle，以及 delegated Spec 为 authority、tool registry、rollout replay 和 compaction source recovery 明确要求的最小 adapter/broker 修改外，不应顺带重构 Launcher 或其它无关行为。
 
 ## 来源与开放问题
 

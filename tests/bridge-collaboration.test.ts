@@ -64,4 +64,42 @@ describe("MultiAgent V2 plaintext collaboration contract", () => {
     }) as { output: Array<Record<string, unknown>> };
     expect(response.output.at(-1)).not.toHaveProperty("encrypted_function_args");
   });
+
+  test("forwards explicit adapter response metadata in JSON and SSE terminal responses", async () => {
+    const events: AdapterEvent[] = [{
+      type: "done",
+      endTurn: true,
+      stopReason: "stop",
+      responseMetadata: {
+        codex_chatgpt_web_compaction_path: "fresh",
+        codex_chatgpt_web_compaction_fallback_reason: "zero_risk_source_already_completed",
+      },
+    }];
+    expect(buildResponseJSON(events, "chatgpt-web/zero-risk")).toMatchObject({
+      metadata: {
+        codex_chatgpt_web_compaction_path: "fresh",
+        codex_chatgpt_web_compaction_fallback_reason: "zero_risk_source_already_completed",
+      },
+    });
+
+    const body = await new Response(bridgeToResponsesSSE(
+      streamed(events),
+      "chatgpt-web/zero-risk",
+    )).text();
+    const completed = body
+      .split("\n")
+      .filter(line => line.startsWith("data: "))
+      .flatMap(line => {
+        const payload = line.slice(6);
+        if (payload === "[DONE]") return [];
+        const event = JSON.parse(payload) as { type?: string; response?: Record<string, unknown> };
+        return event.type === "response.completed" && event.response ? [event.response] : [];
+      });
+    expect(completed.at(-1)).toMatchObject({
+      metadata: {
+        codex_chatgpt_web_compaction_path: "fresh",
+        codex_chatgpt_web_compaction_fallback_reason: "zero_risk_source_already_completed",
+      },
+    });
+  });
 });

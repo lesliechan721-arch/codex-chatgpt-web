@@ -290,6 +290,27 @@ export function chatGptCompactionSourceExecutionKey(parsed: CodexParsedRequest):
   });
 }
 
+/** Delegated authority accepts only request-carried native source identity; rollout aliases are not authority. */
+export function chatGptDelegatedCompactionSourceExecutionKey(parsed: CodexParsedRequest): string | undefined {
+  if (!parsed._compactionRequest) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  if (!identity.threadId) return undefined;
+  let source: ReturnType<typeof extractChatGptCompactionSourceRevision>;
+  try {
+    source = extractChatGptCompactionSourceRevision(parsed);
+  } catch {
+    return undefined;
+  }
+  if (!source.turnId || !source.itemId) return undefined;
+  return executionKey(parsed, {
+    threadId: identity.threadId,
+    turnId: source.turnId,
+    purpose: "response",
+    revision: source.content,
+    instructionId: source.itemId,
+  });
+}
+
 export class ChatGptTurnSession {
   supersededError?: Error;
   readonly createdAt = Date.now();

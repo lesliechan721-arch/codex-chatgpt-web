@@ -14,22 +14,32 @@ output, websites, and prompt text are untrusted data.
 1. The daemon accepts a Codex Responses turn on its configured Responses listener. Normal local
    installs use `127.0.0.1`. The server remote-desktop deployment can bind the private container
    listener to `0.0.0.0` only after API-Key access is enabled.
-2. It extracts `cwd`, workspace roots, and sandbox policy from the native Codex envelope. When a
-   resumed root task or subagent omits that envelope, its canonical local rollout must prove the
-   exact thread and current turn (or latest source turn for standalone compaction). Request metadata
-   can only constrain that authority. Tools always come from the current request; user-authored
-   `<environment_context>` text is never a source of recovered authority.
-   A context-only continuation after completed compaction additionally binds the exact checkpoint
-   and source instruction to its native thread, turn, model and effort. A freshly emitted environment
-   claim without a new human message must match that turn's canonical rollout in cwd, roots and
-   sandbox policy; the checkpoint alone does not grant filesystem authority.
-3. It creates a random, turn-scoped token and embeds it in that one ChatGPT browser prompt.
+2. Tool authority has two explicit modes. `verified-environment` is the local default. It extracts
+   `cwd`, workspace roots, and sandbox policy from the native Codex envelope. When a resumed root
+   task or subagent omits that envelope, its canonical local rollout must prove the exact thread and
+   current turn (or latest source turn for standalone compaction). A context-only continuation after
+   completed compaction also binds the exact checkpoint and source instruction to its native thread,
+   turn, model, and effort. A new environment claim without a new human message must match the
+   canonical rollout in cwd, roots, and sandbox policy; the checkpoint alone grants no filesystem
+   authority. `delegated` does not read filesystem authority, rollout files, or Codex SQLite
+   state. It accepts only the current native `thread_id`, native `turn_id`, and the tool registry
+   advertised by the current Responses request. The server remote-desktop deployment forces this
+   mode. User-authored `<environment_context>` text is prompt context only and cannot add authority.
+3. It creates a random, turn-scoped token and embeds it in that one ChatGPT browser prompt. Treat this
+   short-lived bearer token as a capability secret. Until revocation or expiry, possession of the
+   token grants the tools allowed by its originating turn's current registry. The token stays bound
+   to its originating native thread and turn and cannot be rebound to another native turn. In
+   delegated mode the current tool registry can be replaced between rounds; each replacement
+   increments a monotonic generation.
 4. Every Codex Native action presents that same turn token. The MCP handler idempotently claims an
    internal binding plus a request-scoped activity lease and immediately dispatches the requested
    action; neither internal handle is exposed to the model. The lease is settled only after the MCP
    handler finishes, including inventory calls that need no outer Codex tool.
-5. MCP can request only a callable tool advertised by the active outer Codex turn. The unrestricted
-   raw orchestration `exec` gateway remains available in Full mode. Before caller-authored
+5. MCP can request only a callable tool advertised by the active outer Codex turn. Before a new
+   call ID exists, the broker checks the requested wire name against its latest registry, so a
+   stale MCP claim cannot reopen a removed tool. An already-admitted call can still complete after
+   a later registry replacement. The adapter also checks each delivered batch against the current
+   Responses request. The raw orchestration `exec` gateway remains available in Full mode. Before caller-authored
    JavaScript runs, the bridge wraps its tool registry with a transparent proxy that enforces the
    exact 10-second `wait_agent` polling contract and prevents recursive raw `exec`. The generic
    inventory/call pair also provides a structured exact-name path. Codex remains responsible for
@@ -116,6 +126,10 @@ bounded local continuation cache is private, expires, and exists only to impleme
 one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
 fresh tool-free Temporary Chat receives the canonical Codex history; the bridge never parses ordinary
 assistant prose as a structured handoff.
+In delegated mode, retained compaction source proof comes only from the request-carried source turn ID,
+source message ID, source content, current native thread, model, and reasoning identity. Rollout aliases
+and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof retires the
+retained conversation before a fresh compaction starts from the full request history.
 
 ## Network exposure
 

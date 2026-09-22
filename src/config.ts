@@ -7,7 +7,8 @@ import {
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
 } from "./chatgpt-web-models";
-import type { CodexProviderConfig } from "./types";
+import type { CodexProviderConfig, ToolAuthorityMode } from "./types";
+import { effectiveToolAuthorityMode } from "./server-remote-config";
 import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
@@ -67,6 +68,7 @@ export interface AppConfig {
   purpose?: "dev-harness";
   releaseVersion: string;
   mode: RuntimeMode;
+  toolAuthorityMode?: ToolAuthorityMode;
   subagentProtocol: SubagentProtocol;
   host: "127.0.0.1";
   port: number;
@@ -376,6 +378,11 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   if (typeof parsed.releaseVersion !== "string" || !parsed.releaseVersion.trim()) throw new Error(`Missing releaseVersion in ${path}`);
   if (parsed.mode !== "browser-only" && parsed.mode !== "full") throw new Error(`Invalid runtime mode in ${path}`);
+  if (parsed.toolAuthorityMode !== undefined
+    && parsed.toolAuthorityMode !== "verified-environment"
+    && parsed.toolAuthorityMode !== "delegated") {
+    throw new Error("Invalid toolAuthorityMode in " + path);
+  }
   const subagentProtocol = parsed.subagentProtocol ?? "compatibility-v1";
   if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
     throw new Error(`Invalid subagentProtocol in ${path}`);
@@ -546,6 +553,7 @@ export function saveConfig(config: AppConfig): void {
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {
+  const toolAuthorityMode = effectiveToolAuthorityMode(config.toolAuthorityMode);
   const manual = config.browserInteractionMode === "manual";
   const model = manual
     ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
@@ -586,6 +594,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       lunaCheckpointStatePath: join(getConfigDir(), "runtime", "luna-checkpoints.json"),
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
+      toolAuthorityMode,
       solAvailable: manual ? false : config.solAvailable,
       extraHighAvailable: !manual && config.extraHighAvailable === true,
       proAvailable: manual ? false : config.proAvailable,

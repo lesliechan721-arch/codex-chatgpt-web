@@ -50,6 +50,7 @@ describe("server remote desktop deployment", () => {
     expect(supervisor).toContain("0.0.0.0:6080 127.0.0.1:5900");
     expect(compose).toContain("CODEX_CHATGPT_WEB_BIND_HOST: 0.0.0.0");
     expect(compose).toContain('CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: "1"');
+    expect(compose).toContain("CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE: delegated");
     expect(compose).toContain("CODEX_CHATGPT_WEB_PUBLIC_BASE_URL: ${CODEX_PUBLIC_BASE_URL:-}");
     expect(compose).toContain("CODEX_CHATGPT_WEB_CLIENT_PORT: ${RESPONSES_HOST_PORT:-17841}");
     expect(compose).toContain("CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC: ${REMOTE_TURN_IDLE_TIMEOUT_SEC:-600}");
@@ -101,6 +102,35 @@ describe("server remote desktop deployment", () => {
     expect(compose).not.toContain("CODEX_VERSION");
     expect(envExample).not.toContain("CODEX_VERSION");
     expect(readme).toContain("image does not install Codex CLI");
+  });
+
+  test("ships a two-host delegated Codex acceptance harness without sandbox bypass", () => {
+    const acceptance = readFileSync(resolve(root, "scripts/accept-codex-remote-delegated.ts"), "utf8");
+    const packageJson = readFileSync(resolve(root, "package.json"), "utf8");
+    const readme = read("README.md");
+
+    expect(packageJson).toContain('"accept:delegated:server"');
+    expect(packageJson).toContain('"accept:delegated:remote"');
+    expect(packageJson).toContain('"accept:delegated:zero-risk"');
+    expect(acceptance).toContain("serverHostId");
+    expect(acceptance).toContain("clientCodexStatePresent");
+    expect(acceptance).toContain("<environment_context>");
+    expect(acceptance).toContain("pwd && cat child-proof.txt");
+    expect(acceptance).toContain('"read-only"');
+    expect(acceptance).toContain('"workspace-write"');
+    expect(acceptance).toContain("assertNotWritableByProfile");
+    expect(acceptance).toContain("execEvidence(workspaceRoot, outsideTarget)");
+    expect(acceptance).not.toContain('execEvidence(workspaceRoot, "workspace-write-denied.txt")');
+    expect(acceptance).toContain("require_escalated");
+    expect(acceptance).toContain("client-zero-risk");
+    expect(acceptance).toContain("thread/compact/start");
+    expect(acceptance).toContain("ZERO_RISK_FINAL_OK");
+    expect(acceptance).toContain("codex_chatgpt_web_compaction_path");
+    expect(acceptance).toContain("zero_risk_source_already_completed");
+    expect(acceptance).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(readme).toContain("two-host acceptance harness");
+    expect(readme).toContain("bun run accept:delegated:remote");
+    expect(readme).toContain("bun run accept:delegated:zero-risk");
   });
 
   test("container supervisor owns only desktop processes and the top-level Launcher", () => {

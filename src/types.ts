@@ -211,6 +211,8 @@ export type AdapterEvent =
       stopReason?: string;
       endTurn?: boolean;
       providerState?: CodexProviderContinuationState;
+      /** Public Responses metadata for explicit protocol diagnostics. */
+      responseMetadata?: Record<string, string>;
     }
   | {
       type: "incomplete";
@@ -254,6 +256,8 @@ export interface CodexUsage {
   reasoningOutputTokens?: number;
   estimated?: boolean;
 }
+
+export type ToolAuthorityMode = "verified-environment" | "delegated";
 
 /** The only provider configuration supported by this focused runtime. */
 export interface CodexProviderConfig {
@@ -304,6 +308,8 @@ export interface CodexProviderConfig {
     headed?: boolean;
     /** Attach the turn-bound Codex MCP capability for every connector-capable Web model. */
     localToolsEnabled?: boolean;
+    /** Source of truth for native tool authority. Defaults to verified-environment. */
+    toolAuthorityMode?: ToolAuthorityMode;
     /** Account capability proven by the authenticated browser probe. */
     solAvailable?: boolean;
     /** Account capability proven by the authenticated browser probe. */

@@ -70,6 +70,14 @@ Set `CODEX_PUBLIC_BASE_URL=https://server.example.com/v1` when Codex runs on ano
 
 Server deployment sets `CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG=1`. Setup and runtime operations therefore do not create or modify any Codex `config.toml`, `auth.json`, or hook. Configure the client explicitly:
 
+The Compose deployment also fixes `CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE=delegated`. The server
+does not mount or inspect the external client `CODEX_HOME`, rollout files, `sessions/`, or
+`state_5.sqlite`, and it does not need the client workspace path or sandbox policy. Each tool-capable
+turn is authorized only by its native `thread_id`, native `turn_id`, and the tool registry on that
+current Responses request. Tool execution and local-state inspection still happen through the
+external Codex client tools. A browser-only turn without those native tools cannot discover live
+client filesystem or process state.
+
 1. In Launcher Settings, switch API access to **API Key** and save a client key.
 2. Use **Copy Codex config** or **Export TOML**. The provider `base_url` uses `CODEX_PUBLIC_BASE_URL`, or the host-loopback fallback when that value is empty.
 3. Copy the exported TOML into the external Codex configuration and copy the exported model catalog to `CODEX_CLIENT_CATALOG_PATH` on that client. The default destination is `~/.codex/api-key-models.json`.
@@ -129,3 +137,36 @@ Changing the VNC password does not change the keyring unlock credential. Changin
 ## Runtime acceptance on the target server
 
 The final Linux x86_64 acceptance still needs real server evidence. At minimum, verify the production Launcher window without `--no-sandbox`, wrong/correct VNC password behavior, HTTPS `/desktop/` HTTP and WebSocket routing, API-key rejection/acceptance on HTTPS `/v1`, ChatGPT login/MFA, one real external-Codex turn, Automatic/Zero Risk, an MCP round trip, compaction, prompt client-disconnect cleanup, a short configured no-progress idle-timeout test, container recreation with persistent HOME, restart recovery, and absence of public raw listeners for Responses, health/admin, VNC, and CDP.
+
+For delegated tool authority, use the two-host acceptance harness. It is intentionally not a same-workstation mock. First choose one fresh challenge and run the server attestation on the Linux server host:
+
+```sh
+export CODEX_WEB_REMOTE_ACCEPTANCE_CHALLENGE="$(openssl rand -hex 16)"
+bun run accept:delegated:server > /tmp/delegated-server-attestation.json
+```
+
+Copy that JSON file to the separate machine that runs the real Codex client. On that client, use the same challenge and the exported remote API configuration:
+
+```sh
+export CODEX_WEB_REMOTE_ACCEPTANCE_CHALLENGE="<same challenge>"
+export CODEX_WEB_REMOTE_BASE_URL="https://server.example.com/v1"
+export CODEX_WEB_REMOTE_API_KEY="<dedicated acceptance API key>"
+export CODEX_WEB_REMOTE_SERVER_ATTESTATION="/path/to/delegated-server-attestation.json"
+export CODEX_WEB_REMOTE_MODEL_CATALOG="${HOME}/.codex/api-key-models.json"
+bun run accept:delegated:remote
+```
+
+The server phase fails unless the production container uses `delegated`, has no Codex CLI or client `sessions`/`state_5.sqlite`, and has only the expected HOME and secret mounts. The Automatic client phase fails on loopback or when the server and Codex host identities are the same. It runs real Codex against the HTTPS Responses endpoint through a local capture proxy, then verifies a depth-1 child whose first Responses request has no `<environment_context>`, whose native `pwd` and file read resolve in the client workspace, and whose native thread is distinct from the parent. The capture also proves that the parent and child native tool `call_id` values return only on their own native thread, so a child continuation is not rebound to the parent or vice versa.
+
+The Automatic phase also runs real `read-only` and `workspace-write` sandboxes. Its workspace-write escape target is under the client home, not under the system temporary directory. Before the escape is attempted, the harness reads the real native rollout permission profile and fails unless that target is outside every explicit writable root, `project_roots`, `tmpdir`, and `slash_tmp` permission. A separate `approval_policy = "on-request"` run requests `require_escalated` for another out-of-scope write and requires the non-interactive native client to reject it without creating the target file. These checks verify outer Codex sandbox and approval results instead of Server-side fields.
+
+Zero Risk is a separate manual acceptance phase because the Server must be in Zero Risk browser-interaction mode and a human must perform its normal Launcher handshake. Switch the production Launcher to Zero Risk, export a fresh Zero Risk client model catalog, rerun the server attestation, and copy the new attestation to the Codex client. Then use the same remote settings and run:
+
+```sh
+export CODEX_WEB_REMOTE_ZERO_RISK_MODEL="chatgpt-web/zero-risk"
+# Optional: increase this when manual ChatGPT interaction needs more than 15 minutes.
+export CODEX_WEB_REMOTE_ZERO_RISK_TIMEOUT_MS="900000"
+bun run accept:delegated:zero-risk
+```
+
+During this command, complete each visible Zero Risk prompt through the normal Launcher flow: paste/send, confirm **Sent**, use the `Codex Zero Risk` connector for `codex_turn_start`, the requested Native tool, and `codex_turn_complete`. The Server still has no client rollout/Codex filesystem state, so the delegated Zero Risk round has no trusted filesystem environment even if raw environment text is present in the native request. The harness first requires a native `pwd`/read round and final completion. It then asks the real Codex `app-server` for `thread/compact/start`. Because the source Zero Risk turn has already completed, delegated compaction must retire that retained source and use the fresh compaction fallback; complete that second manual Zero Risk prompt too. A final native turn must recover a challenge marker from the compacted context and complete normally. The harness never uses `--dangerously-bypass-approvals-and-sandbox`.

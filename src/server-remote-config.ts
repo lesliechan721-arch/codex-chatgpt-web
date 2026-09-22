@@ -1,4 +1,5 @@
 import type { ApiAccessPolicy } from "./api-access";
+import type { ToolAuthorityMode } from "./types";
 
 export const RESPONSES_BIND_HOST_ENV = "CODEX_CHATGPT_WEB_BIND_HOST";
 export const PUBLIC_BASE_URL_ENV = "CODEX_CHATGPT_WEB_PUBLIC_BASE_URL";
@@ -6,10 +7,36 @@ export const CLIENT_PORT_ENV = "CODEX_CHATGPT_WEB_CLIENT_PORT";
 export const CLIENT_CATALOG_PATH_ENV = "CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH";
 export const REMOTE_TURN_IDLE_TIMEOUT_SEC_ENV = "CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC";
 export const MANUAL_CODEX_CONFIG_ENV = "CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG";
+export const TOOL_AUTHORITY_MODE_ENV = "CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE";
 const MAX_TIMER_SEC = Math.floor(0x7fffffff / 1_000);
 
 export function manualCodexConfigurationOnly(environment: NodeJS.ProcessEnv = process.env): boolean {
   return environment[MANUAL_CODEX_CONFIG_ENV]?.trim() === "1";
+}
+
+export function effectiveToolAuthorityMode(
+  configured: ToolAuthorityMode | undefined,
+  environment: NodeJS.ProcessEnv = process.env,
+): ToolAuthorityMode {
+  const requested = environment[TOOL_AUTHORITY_MODE_ENV]?.trim();
+  if (requested && requested !== "verified-environment" && requested !== "delegated") {
+    throw new Error(TOOL_AUTHORITY_MODE_ENV + " must be verified-environment or delegated");
+  }
+  const remoteRequested = environment[RESPONSES_BIND_HOST_ENV]?.trim() === "0.0.0.0";
+  if (remoteRequested && requested === "verified-environment") {
+    throw new Error("Remote Responses deployment requires delegated tool authority");
+  }
+  const forced: ToolAuthorityMode | undefined = remoteRequested
+    ? "delegated"
+    : requested as ToolAuthorityMode | undefined;
+  if (!forced) return configured ?? "verified-environment";
+  if (configured !== undefined && configured !== forced) {
+    throw new Error(
+      "Configured toolAuthorityMode " + JSON.stringify(configured)
+      + " conflicts with " + TOOL_AUTHORITY_MODE_ENV + "=" + forced,
+    );
+  }
+  return forced;
 }
 
 export function responsesListenHost(

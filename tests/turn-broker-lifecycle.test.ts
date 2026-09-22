@@ -4,7 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { callTurnBroker, closeTurnBrokers, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import {
+  callTurnBroker,
+  closeTurnBrokers,
+  TurnBroker,
+  type BrokerToolResult,
+} from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
 
 test("explicit browser-turn cancellation aborts and removes every registered session", async () => {
@@ -389,6 +394,183 @@ test("turn broker revokes only channels owned by the closed browser trace", asyn
       .rejects.toThrow("already finished");
     await expect(callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token: other }))
       .resolves.toMatchObject({ bindingId: expect.any(String) });
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("delegated broker authority is turn-bound and revalidates the latest tool generation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-delegated-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const execTool = {
+    name: "exec_command",
+    description: "execute",
+    parameters: { type: "object", properties: {} },
+  };
+  const patchTool = {
+    name: "apply_patch",
+    description: "patch",
+    parameters: { type: "object", properties: {} },
+  };
+  try {
+    const token = await broker.register({
+      authorityMode: "delegated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      tools: [execTool],
+    });
+    const claimed = await callTurnBroker<{
+      bindingId: string;
+      environment: { registryGeneration: number; tools: Array<{ name: string }> };
+    }>(socketPath, { method: "claim", token });
+    expect(claimed.environment.registryGeneration).toBe(1);
+    expect(claimed.environment.tools.map(tool => tool.name)).toEqual(["exec_command"]);
+
+    const admitted = callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "exec_command",
+      freeform: false,
+      registryGeneration: claimed.environment.registryGeneration,
+      arguments: { cmd: "pwd" },
+    }, null);
+    const [oldRequest] = await broker.nextToolBatch(token);
+    expect(oldRequest?.wireName).toBe("exec_command");
+
+    broker.updateEnvironment(token, {
+      authorityMode: "delegated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      tools: [patchTool],
+    });
+    const current = await callTurnBroker<{
+      environment: { registryGeneration: number; tools: Array<{ name: string }> };
+    }>(socketPath, { method: "claim", token });
+    expect(current.environment.registryGeneration).toBe(2);
+    expect(current.environment.tools.map(tool => tool.name)).toEqual(["apply_patch"]);
+
+    await expect(callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "exec_command",
+      freeform: false,
+      registryGeneration: claimed.environment.registryGeneration,
+      arguments: { cmd: "pwd" },
+    })).rejects.toThrow("does not advertise exec_command");
+
+    broker.updateEnvironment(token, {
+      authorityMode: "delegated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      tools: [{ ...patchTool, parameters: { type: "object", required: ["patch"] } }],
+    });
+    const latest = await callTurnBroker<{
+      environment: { registryGeneration: number; tools: Array<{ name: string }> };
+    }>(socketPath, { method: "claim", token });
+    expect(latest.environment.registryGeneration).toBe(3);
+
+    await expect(callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "apply_patch",
+      freeform: false,
+      registryGeneration: latest.environment.registryGeneration + 1,
+      arguments: { patch: "*** Begin Patch\n*** End Patch" },
+    })).rejects.toThrow("newer than the current registry");
+    const redelivered = await broker.nextToolBatch(token);
+    expect(redelivered).toHaveLength(1);
+    expect(redelivered[0]?.callId).toBe(oldRequest!.callId);
+
+    await expect(callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "apply_patch",
+      freeform: false,
+      registryGeneration: current.environment.registryGeneration,
+      arguments: {},
+    })).rejects.toThrow("current Codex tool definition");
+
+    broker.completeTool(token, oldRequest!.callId, {
+      content: [{ type: "text", text: "done" }],
+    });
+    await expect(admitted).resolves.toMatchObject({ content: [{ type: "text", text: "done" }] });
+
+    const staleButValid = callTurnBroker<BrokerToolResult>(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "apply_patch",
+      freeform: false,
+      registryGeneration: current.environment.registryGeneration,
+      arguments: { patch: "*** Begin Patch\n*** End Patch" },
+    }, null);
+    const [currentRequest] = await broker.nextToolBatch(token);
+    expect(currentRequest).toMatchObject({
+      wireName: "apply_patch",
+      arguments: { patch: "*** Begin Patch\n*** End Patch" },
+    });
+    broker.completeTool(token, currentRequest!.callId, {
+      content: [{ type: "text", text: "patched" }],
+    });
+    await expect(staleButValid).resolves.toMatchObject({ content: [{ type: "text", text: "patched" }] });
+
+    broker.updateEnvironment(token, {
+      authorityMode: "delegated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      tools: [{ ...patchTool, freeform: true }],
+    });
+    const freeform = await callTurnBroker<{
+      environment: { registryGeneration: number; tools: Array<{ name: string; freeform?: boolean }> };
+    }>(socketPath, { method: "claim", token });
+    expect(freeform.environment.registryGeneration).toBe(4);
+    expect(freeform.environment.tools[0]?.freeform).toBe(true);
+
+    await expect(callTurnBroker(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "apply_patch",
+      freeform: false,
+      registryGeneration: latest.environment.registryGeneration,
+      arguments: { patch: "*** Begin Patch\n*** End Patch" },
+    })).rejects.toThrow("no longer accepts this invocation shape");
+    await expect(broker.nextToolBatch(token, AbortSignal.timeout(20)))
+      .rejects.toThrow("aborted");
+
+    const currentFreeform = callTurnBroker<BrokerToolResult>(socketPath, {
+      method: "invoke",
+      bindingId: claimed.bindingId,
+      wireName: "apply_patch",
+      freeform: true,
+      registryGeneration: freeform.environment.registryGeneration,
+      input: "*** Begin Patch\n*** End Patch",
+    }, null);
+    const [freeformRequest] = await broker.nextToolBatch(token);
+    expect(freeformRequest).toMatchObject({
+      wireName: "apply_patch",
+      freeform: true,
+      input: "*** Begin Patch\n*** End Patch",
+    });
+    broker.completeTool(token, freeformRequest!.callId, {
+      content: [{ type: "text", text: "freeform patched" }],
+    });
+    await expect(currentFreeform).resolves.toMatchObject({
+      content: [{ type: "text", text: "freeform patched" }],
+    });
+
+    expect(() => broker.updateEnvironment(token, {
+      authorityMode: "delegated",
+      threadId: "thread-b",
+      turnId: "turn-a",
+      tools: [patchTool],
+    })).toThrow("authority changed");
+    expect(() => broker.updateEnvironment(token, {
+      authorityMode: "delegated",
+      threadId: "thread-a",
+      turnId: "turn-b",
+      tools: [patchTool],
+    })).toThrow("authority changed");
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });
