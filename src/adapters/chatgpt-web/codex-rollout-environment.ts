@@ -53,6 +53,12 @@ function contains(root: string, path: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+function isEnoent(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as Error & { code?: unknown }).code === "ENOENT";
+}
+
 function matchesAgentPath(value: unknown, expected: string): boolean {
   // V1 reports /root without an assigned path; rollout metadata can omit the field.
   return expected === "/root" ? value == null : value === expected;
@@ -795,6 +801,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   compactionSource?: ChatGptTurnUserRevision;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
+  publicationPendingIsTransient?: boolean;
 }): ChatGptTurnEnvironment | undefined {
   const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
   const nativeThreadId = CODEX_ID.test(lineage.threadId);
@@ -813,24 +820,66 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     : scanCanonicalRollouts(codexHome, lineage.threadId);
   if (candidates.length === 0) {
     if (!("parentThreadId" in lineage)) return undefined;
+    if (options.publicationPendingIsTransient) {
+      throw new CodexRolloutPublicationPendingError(
+        "Codex has no canonical rollout for the requested subagent thread",
+      );
+    }
     throw new Error("Codex has no canonical rollout for the requested subagent thread");
   }
 
   const matching: ChatGptTurnEnvironment[] = [];
+  let sawAuthenticatedStaleTurn = false;
   for (const candidate of candidates) {
-    const rolloutPath = validateRolloutPath(codexHome, candidate, lineage.threadId);
-    const fd = openSync(rolloutPath, "r");
+    let rolloutPath: string;
+    let fd: number;
+    try {
+      rolloutPath = validateRolloutPath(codexHome, candidate, lineage.threadId);
+      fd = openSync(rolloutPath, "r");
+    } catch (error) {
+      if (options.publicationPendingIsTransient && indexed.kind === "found" && isEnoent(error)) {
+        throw new CodexRolloutPublicationPendingError("Codex indexed rollout is not published yet");
+      }
+      throw error;
+    }
     try {
       const size = fstatSync(fd).size;
-      if (!Number.isSafeInteger(size) || size <= 0) throw new Error("Codex rollout is empty");
-      validateSessionMeta(firstRolloutRecord(fd, size), lineage);
+      if (!Number.isSafeInteger(size) || size <= 0) {
+        if (options.publicationPendingIsTransient) {
+          throw new CodexRolloutPublicationPendingError("Codex rollout is empty");
+        }
+        throw new Error("Codex rollout is empty");
+      }
+      let sessionMeta: Record<string, unknown>;
+      try {
+        sessionMeta = firstRolloutRecord(fd, size);
+      } catch (error) {
+        if (options.publicationPendingIsTransient
+          && error instanceof Error
+          && error.message === "Codex rollout has no complete session metadata record") {
+          throw new CodexRolloutPublicationPendingError(error.message);
+        }
+        throw error;
+      }
+      validateSessionMeta(sessionMeta, lineage);
       const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
-      if (!latest) throw new Error("Codex rollout has no complete turn context");
+      if (!latest) {
+        if (options.publicationPendingIsTransient) {
+          throw new CodexRolloutPublicationPendingError("Codex rollout has no complete turn context");
+        }
+        throw new Error("Codex rollout has no complete turn context");
+      }
       if (latest.turn_id !== turnId && (compactionSourceTurnId === undefined || latest.turn_id !== compactionSourceTurnId)
         && !authenticatesCompactionSource(fd, size, options.compactionSource, latest.turn_id)) {
         if (indexed.kind === "found") {
+          if (options.publicationPendingIsTransient) {
+            throw new CodexRolloutPublicationPendingError(
+              "Codex indexed rollout has not published the requested turn context yet",
+            );
+          }
           throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
         }
+        if (options.publicationPendingIsTransient) sawAuthenticatedStaleTurn = true;
         continue;
       }
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
@@ -844,6 +893,11 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     }
   }
   if (matching.length === 0) {
+    if (options.publicationPendingIsTransient && sawAuthenticatedStaleTurn) {
+      throw new CodexRolloutPublicationPendingError(
+        "Codex canonical rollout has not published the requested turn context yet",
+      );
+    }
     throw new Error("Codex has no canonical rollout for the requested current turn");
   }
   if (matching.length > 1) {
@@ -851,3 +905,5 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   }
   return matching[0]!;
 }
+
+export class CodexRolloutPublicationPendingError extends Error {}

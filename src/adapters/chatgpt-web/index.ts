@@ -401,12 +401,13 @@ export function createChatGptWebAdapter(
     parsed: CodexParsedRequest;
     environment: ReturnType<typeof extractChatGptTurnEnvironment>;
   } | undefined;
-  const resolveTrustedEnvironment = (
+  const resolveTrustedEnvironment = async (
     parsed: CodexParsedRequest,
-  ): ReturnType<typeof extractChatGptTurnEnvironment> => {
+    abortSignal?: AbortSignal,
+  ): Promise<ReturnType<typeof extractChatGptTurnEnvironment>> => {
     const resolution: ChatGptEnvironmentResolutionDiagnostics = {};
     try {
-      return environmentStore.resolve(parsed, resolution);
+      return await environmentStore.resolveWithRolloutPublicationRetry(parsed, resolution, abortSignal);
     } catch (error) {
       const identity = extractChatGptTurnIdentity(parsed);
       const failure = trustedEnvironmentFailureDetails(error);
@@ -421,7 +422,10 @@ export function createChatGptWebAdapter(
       throw error;
     }
   };
-  const prepareTrustedEnvironment = (parsed: CodexParsedRequest): void => {
+  const prepareTrustedEnvironment = async (
+    parsed: CodexParsedRequest,
+    abortSignal?: AbortSignal,
+  ): Promise<void> => {
     preparedEnvironment = undefined;
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) return;
@@ -435,7 +439,7 @@ export function createChatGptWebAdapter(
     if (!parsed._compactionRequest) createChatGptStructuredOutputValidator(parsed.options.outputFormat);
     const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
     if (chatGptWebTurnRetryPolicy.exhaustedError(retryKey) || !mode.localTools) return;
-    preparedEnvironment = { parsed, environment: resolveTrustedEnvironment(parsed) };
+    preparedEnvironment = { parsed, environment: await resolveTrustedEnvironment(parsed, abortSignal) };
   };
 
   const startRuntime = (
@@ -850,8 +854,8 @@ export function createChatGptWebAdapter(
 
   return {
     name: "chatgpt-web",
-    preflight(parsed) {
-      prepareTrustedEnvironment(parsed);
+    async preflight(parsed, incoming) {
+      await prepareTrustedEnvironment(parsed, incoming.abortSignal);
     },
     async runTurn(parsed, incoming, emit) {
       const runChatGptWebTurn = async (): Promise<void> => {
@@ -898,7 +902,7 @@ export function createChatGptWebAdapter(
             environment = preparedEnvironment.environment;
             preparedEnvironment = undefined;
           } else {
-            environment = resolveTrustedEnvironment(parsed);
+            environment = await resolveTrustedEnvironment(parsed, incoming.abortSignal);
           }
         }
         if (parsed._compactionRequest) {
