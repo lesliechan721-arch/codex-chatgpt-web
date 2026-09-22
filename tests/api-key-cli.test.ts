@@ -145,11 +145,11 @@ test("CLI Codex export uses saved server-compaction intent for provider naming w
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
   writeFileSync(join(home, "upstream-provider.json"), `${JSON.stringify({
-    version: 1,
+    version: 2,
     baseUrl: "https://provider.example/v1/",
     apiKeySha256: "a".repeat(64),
     proxy: { mode: "global" },
-    modelFilter: { mode: "all" },
+    models: [],
     supportsOpenAiServerCompaction: true,
   })}\n`);
   const exported = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: localKey });

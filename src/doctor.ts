@@ -98,6 +98,17 @@ async function proxyCheck(config: AppConfig, accessPolicy: ApiAccessPolicy): Pro
     if (ownershipError) {
       return { id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError };
     }
+    const metadataRepairCount = body.upstream_metadata_repair_count;
+    if (Number.isInteger(metadataRepairCount) && (metadataRepairCount as number) > 0) {
+      const repairMessage = metadataRepairCount === 1
+        ? "1 upstream model metadata configuration requires repair"
+        : `${String(metadataRepairCount)} upstream model metadata configurations require repair`;
+      return {
+        id: "proxy",
+        status: "warning",
+        message: `Responses proxy is healthy but ${repairMessage}`,
+      };
+    }
     return { id: "proxy", status: "ok", message: `Responses proxy is healthy on 127.0.0.1:${config.port}` };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -171,7 +182,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   }
 
   const proxy = await proxyCheck(config, accessPolicy);
-  const apiKeyMode = accessPolicy.mode === "api-key" && proxy.status === "ok";
+  const apiKeyMode = accessPolicy.mode === "api-key" && proxy.status !== "error";
   const codex = inspectCodexIntegration();
   if (apiKeyMode && !codex.installed) {
     checks.push({

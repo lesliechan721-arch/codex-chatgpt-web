@@ -1,26 +1,28 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import metadata from "../launcher/electron/codex-model-metadata.cjs";
+import type { MetadataBaseMode, ModelMetadataConfig } from "../launcher/electron/codex-model-metadata.cjs";
 
 export const UPSTREAM_API_KEY_ENV = "CODEX_CHATGPT_WEB_UPSTREAM_API_KEY";
 export const MAX_UPSTREAM_API_KEY_CHARS = 4_096;
-export const MAX_UPSTREAM_REGEX_CHARS = 512;
-export const MAX_UPSTREAM_MODEL_ID_CHARS = 256;
 
 export type UpstreamProxyConfig =
   | { mode: "global" }
   | { mode: "direct" }
   | { mode: "custom"; url: string };
 
-export type UpstreamModelFilter =
-  | { mode: "all" }
-  | { mode: "regex"; pattern: string }
-  | { mode: "selected"; models: string[] };
+export type { MetadataBaseMode, ModelMetadataConfig };
+
+export interface UpstreamModelConfig {
+  id: string;
+  metadata?: ModelMetadataConfig;
+}
 
 export interface UpstreamProviderConfig {
-  version: 1;
+  version: 2;
   baseUrl: string;
   apiKeySha256: string;
   proxy: UpstreamProxyConfig;
-  modelFilter: UpstreamModelFilter;
+  models: UpstreamModelConfig[];
   supportsOpenAiServerCompaction: boolean;
 }
 
@@ -111,43 +113,40 @@ export function upstreamApiKeyMatches(value: unknown, digest: string): value is 
 }
 
 export function normalizeUpstreamModelId(value: unknown): string {
-  if (typeof value !== "string" || !value || value.length > MAX_UPSTREAM_MODEL_ID_CHARS
-    || controls(value) || value.trim() !== value || value.startsWith("chatgpt-web/")) {
-    throw new Error("Invalid upstream model ID");
-  }
-  return value;
+  return metadata.normalizeModelId(value);
 }
 
-export function normalizeUpstreamModelFilter(value: unknown): UpstreamModelFilter {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid upstream model filter");
-  const raw = value as Record<string, unknown>;
-  if (raw.mode === "all" && Object.keys(raw).every(key => key === "mode")) return { mode: "all" };
-  if (raw.mode === "regex" && Object.keys(raw).every(key => key === "mode" || key === "pattern")) {
-    if (typeof raw.pattern !== "string" || raw.pattern.length > MAX_UPSTREAM_REGEX_CHARS || controls(raw.pattern)) {
-      throw new Error("Invalid upstream model regex");
+export function normalizeModelMetadataConfig(value: unknown): ModelMetadataConfig | undefined {
+  return metadata.normalizeMetadataConfig(value);
+}
+
+function normalizeUpstreamModels(value: unknown): UpstreamModelConfig[] {
+  if (!Array.isArray(value)) throw new Error("Invalid upstream model configuration");
+  const byId = new Map<string, UpstreamModelConfig>();
+  for (const rawModel of value) {
+    if (!rawModel || typeof rawModel !== "object" || Array.isArray(rawModel)) {
+      throw new Error("Invalid upstream model configuration");
     }
-    try { new RegExp(raw.pattern); }
-    catch { throw new Error("Invalid upstream model regex"); }
-    return { mode: "regex", pattern: raw.pattern };
-  }
-  if (raw.mode === "selected" && Object.keys(raw).every(key => key === "mode" || key === "models")
-    && Array.isArray(raw.models)) {
-    const models: string[] = [];
-    const seen = new Set<string>();
-    for (const candidate of raw.models) {
-      const model = normalizeUpstreamModelId(candidate);
-      if (!seen.has(model)) { seen.add(model); models.push(model); }
+    const raw = rawModel as Record<string, unknown>;
+    if (Object.keys(raw).some(key => key !== "id" && key !== "metadata")) {
+      throw new Error("Invalid upstream model configuration");
     }
-    return { mode: "selected", models };
+    const id = normalizeUpstreamModelId(raw.id);
+    const normalizedMetadata = normalizeModelMetadataConfig(raw.metadata);
+    const model = Object.freeze({ id, ...(normalizedMetadata ? { metadata: normalizedMetadata } : {}) });
+    if (!byId.has(id)) byId.set(id, model);
+    else if (JSON.stringify(byId.get(id)) !== JSON.stringify(model)) {
+      throw new Error("Duplicate upstream model configuration");
+    }
   }
-  throw new Error("Invalid upstream model filter");
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
 }
 
 export function parseUpstreamProviderConfig(value: unknown): UpstreamProviderConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid upstream provider configuration");
   const raw = value as Record<string, unknown>;
-  const allowed = new Set(["version", "baseUrl", "apiKeySha256", "proxy", "modelFilter", "supportsOpenAiServerCompaction"]);
-  if (raw.version !== 1 || Object.keys(raw).some(key => !allowed.has(key))
+  const allowed = new Set(["version", "baseUrl", "apiKeySha256", "proxy", "models", "supportsOpenAiServerCompaction"]);
+  if (raw.version !== 2 || Object.keys(raw).some(key => !allowed.has(key))
     || typeof raw.apiKeySha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.apiKeySha256)) {
     throw new Error("Invalid upstream provider configuration");
   }
@@ -165,11 +164,11 @@ export function parseUpstreamProviderConfig(value: unknown): UpstreamProviderCon
     throw new Error("Invalid upstream provider configuration");
   }
   return Object.freeze({
-    version: 1,
+    version: 2,
     baseUrl: normalizeUpstreamBaseUrl(raw.baseUrl),
     apiKeySha256: raw.apiKeySha256,
     proxy,
-    modelFilter: normalizeUpstreamModelFilter(raw.modelFilter),
+    models: normalizeUpstreamModels(raw.models),
     supportsOpenAiServerCompaction: raw.supportsOpenAiServerCompaction === true,
   });
 }
@@ -178,10 +177,11 @@ export function upstreamModelAllowed(model: unknown, config: UpstreamProviderCon
   let normalized: string;
   try { normalized = normalizeUpstreamModelId(model); }
   catch { return false; }
-  const filter = config.modelFilter;
-  if (filter.mode === "all") return true;
-  if (filter.mode === "regex") return new RegExp(filter.pattern).test(normalized);
-  return filter.models.includes(normalized);
+  return config.models.some(candidate => candidate.id === normalized);
+}
+
+export function upstreamModelConfig(model: string, config: UpstreamProviderConfig): UpstreamModelConfig | undefined {
+  return config.models.find(candidate => candidate.id === model);
 }
 
 export function upstreamEndpoint(config: UpstreamProviderConfig, endpoint: string): string {
@@ -193,6 +193,6 @@ export function upstreamEndpoint(config: UpstreamProviderConfig, endpoint: strin
 
 export function upstreamProviderRevision(config: UpstreamProviderConfig, controlToken: string): string {
   return createHmac("sha256", controlToken)
-    .update(`codex-web-upstream-provider:v1\0${JSON.stringify(config)}`)
+    .update(`codex-web-upstream-provider:v2\0${JSON.stringify(config)}`)
     .digest("hex");
 }

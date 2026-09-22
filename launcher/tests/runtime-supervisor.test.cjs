@@ -76,7 +76,7 @@ function launcherConfig(descriptorPath, overrides = {}) {
 
 test("degraded broker health preserves daemon identity without declaring the runtime ready", async () => {
   const body = {
-    service: "codex-chatgpt-web", status: "degraded", mode: "full", version: "5.0.9-7",
+    service: "codex-chatgpt-web", status: "degraded", mode: "full", version: "5.0.9-8",
     pid: process.pid, broker_available: false, accepting_turns: false,
   };
   const server = await localHealthServer(() => 503, () => JSON.stringify(body));

@@ -19,7 +19,7 @@ import {
 } from "./api-access-config";
 import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
-import { mergeUpstreamModelCatalog } from "./upstream-model-catalog";
+import codexModelMetadata from "../launcher/electron/codex-model-metadata.cjs";
 import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
@@ -94,8 +94,12 @@ export async function buildApiKeyExportModelCatalog(
       }
       return await response.json();
     });
-    if (upstreamCatalog === undefined) return local;
-    return mergeUpstreamModelCatalog(local, upstreamCatalog, upstream);
+    if (upstreamCatalog === undefined || !upstreamCatalog || typeof upstreamCatalog !== "object"
+      || Array.isArray(upstreamCatalog)) return local;
+    const raw = upstreamCatalog as Record<string, unknown>;
+    if (raw.object !== "list" || !Array.isArray(raw.data) || !Array.isArray(raw.models)) return local;
+    if (raw.models.some(model => codexModelMetadata.finalModelError(model) !== null)) return local;
+    return raw as ReturnType<typeof buildStandaloneModelCatalog>;
   } catch {
     return local;
   }

@@ -5,11 +5,13 @@ const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const { createApiKeyVault } = require("./api-key-vault.cjs");
 const { createUpstreamApiKeyVault, validUpstreamApiKey } = require("./upstream-api-key-vault.cjs");
 const {
+  clearResetMarker,
   readUpstreamConfig,
   upstreamKeyDigest,
   validateUpstreamChange,
 } = require("./upstream-provider-config.cjs");
-const { fetchUpstreamModelIds } = require("./upstream-provider-network.cjs");
+const { fetchUpstreamModelCatalog } = require("./upstream-provider-network.cjs");
+const modelMetadata = require("./codex-model-metadata.cjs");
 const { mergeNoProxy, PROXY_ENV_KEYS } = require("./network-proxy-config.cjs");
 
 // Mirrors the version-1 core wire format. Conformance is covered by the core/Bun test.
@@ -25,8 +27,9 @@ const ERROR_CODES = new Set([
   "api-mode-required", "stop-failed", "apply-failed-restored", "saved-runtime-unverified",
   "recovery-failed", "export-failed", "unavailable", "untrusted-sender",
   "save-failed", "key-unavailable",
-  "invalid-upstream-config", "invalid-upstream-filter", "invalid-upstream-proxy",
+  "invalid-upstream-config", "invalid-upstream-models", "invalid-upstream-metadata", "invalid-upstream-proxy",
   "invalid-upstream-key", "upstream-key-required", "upstream-fetch-failed",
+  "upstream-discovery-required", "upstream-metadata-unavailable", "upstream-legacy-cleanup-failed",
 ]);
 
 class ApiAccessSettingsError extends Error {
@@ -82,7 +85,7 @@ function policyRevision(policy, controlToken) {
 
 function upstreamProviderRevision(config, controlToken) {
   return createHmac("sha256", controlToken)
-    .update(`codex-web-upstream-provider:v1\0${JSON.stringify(config)}`)
+    .update(`codex-web-upstream-provider:v2\0${JSON.stringify(config)}`)
     .digest("hex");
 }
 
@@ -132,9 +135,24 @@ function createApiAccessSettings({
   let applying = false;
   let cleanupPending = false;
   let routingPending = false;
-  const upstreamSnapshotForPolicy = policy => policy.mode === "api-key"
-    ? readUpstreamConfig(upstreamFilePath)
-    : { config: null, bytes: null };
+  let lastUpstreamDiscovery = null;
+  const upstreamSnapshotForPolicy = policy => {
+    let snapshot;
+    try { snapshot = readUpstreamConfig(upstreamFilePath); }
+    catch (error) {
+      if (policy.mode !== "api-key" && error?.message === "invalid-upstream-config") {
+        return { config: null, bytes: null, resetReason: null };
+      }
+      throw error;
+    }
+    if (snapshot.resetReason) {
+      try { upstreamVault.clearStrict(); }
+      catch { fail("upstream-legacy-cleanup-failed"); }
+    }
+    return policy.mode === "api-key"
+      ? snapshot
+      : { config: null, bytes: null, resetReason: snapshot.resetReason ?? null };
+  };
   const revisionOf = (snapshot, upstreamSnapshot = upstreamSnapshotForPolicy(snapshot.policy)) => createHmac("sha256", revisionSecret)
     .update(snapshot.bytes ?? "absent-policy-file")
     .update("\0")
@@ -145,6 +163,52 @@ function createApiAccessSettings({
       && health.upstream_provider_revision === upstreamProviderRevision(upstreamConfig, config.controlToken)
       && health.upstream_provider_key_matches === true
       && health.upstream_provider_available === true);
+  const shellType = () => runtimeSnapshot().config?.mode === "full" ? "unified_exec" : "disabled";
+  const emptyDiscovery = () => ({
+    ids: [], upstreamMetadata: new Map(), richIds: new Set(), sources: { data: false, models: false },
+  });
+  const discoveryIdentityFromDigest = (baseUrl, proxy, keySha256) => JSON.stringify({
+    baseUrl,
+    proxy,
+    keySha256,
+  });
+  const discoveryIdentity = (baseUrl, proxy, key) => discoveryIdentityFromDigest(
+    baseUrl,
+    proxy,
+    upstreamKeyDigest(key),
+  );
+  const bundledModels = new Set(modelMetadata.bundledModelIds());
+  const sameJson = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  function discoveryFor(input, key) {
+    const identity = discoveryIdentity(input.baseUrl, input.proxy, key);
+    return lastUpstreamDiscovery?.identity === identity ? lastUpstreamDiscovery.discovery : null;
+  }
+  function validateModelChanges(beforeConfig, input, key) {
+    const beforeModels = new Map((beforeConfig?.models ?? []).map(model => [model.id, model]));
+    const discovery = discoveryFor(input, key);
+    for (const model of input.models) {
+      const previous = beforeModels.get(model.id);
+      if (!previous && !discovery?.ids.includes(model.id)) fail("upstream-discovery-required");
+      if (previous && sameJson(previous.metadata, model.metadata)) continue;
+      const configured = model.metadata;
+      if (!configured) continue;
+      if (configured.mode === "upstream" && !discovery?.richIds.has(model.id)) fail("upstream-metadata-unavailable");
+      if (configured.mode === "default" && !bundledModels.has(model.id)) fail("upstream-metadata-unavailable");
+      if (configured.mode === "custom") {
+        if (configured.baseMode === "upstream" && !discovery?.richIds.has(model.id)) fail("upstream-metadata-unavailable");
+        if (configured.baseMode === "default" && !bundledModels.has(model.id)) fail("upstream-metadata-unavailable");
+        try {
+          modelMetadata.resolveModelMetadata(
+            model.id,
+            configured,
+            discovery ?? emptyDiscovery(),
+            shellType(),
+            { strictCustom: true },
+          );
+        } catch { fail("invalid-upstream-metadata"); }
+      }
+    }
+  }
   const assertProduction = () => {
     if (runtimeHost.launcherProfile === "development") fail("dev-profile");
   };
@@ -167,7 +231,9 @@ function createApiAccessSettings({
       saved = readPolicyFile(filePath);
       upstreamSaved = upstreamSnapshotForPolicy(saved.policy);
     }
-    catch { return { configuredMode: "invalid", effectiveMode: null, revision: null,
+    catch (error) { return { configuredMode: "invalid",
+      ...(error?.message === "upstream-legacy-cleanup-failed" ? { errorCode: "upstream-legacy-cleanup-failed" } : {}),
+      effectiveMode: null, revision: null,
       keyConfigured: false, keyAvailable: false, keyStorage: "unavailable",
       runtimeState: "invalid", baseUrl: null, canApply: false, cleanupPending }; }
     const runtime = runtimeSnapshot();
@@ -184,6 +250,14 @@ function createApiAccessSettings({
       ? upstreamKey.available && upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config)
       : upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config);
     const manualCodexConfig = process.env[MANUAL_CODEX_CONFIG_ENV]?.trim() === "1";
+    const currentDiscovery = upstreamSaved.config
+      && lastUpstreamDiscovery?.identity === discoveryIdentityFromDigest(
+        upstreamSaved.config.baseUrl,
+        upstreamSaved.config.proxy,
+        upstreamSaved.config.apiKeySha256,
+      )
+      ? lastUpstreamDiscovery.discovery
+      : emptyDiscovery();
     return {
       configuredMode: saved.policy.mode,
       effectiveMode,
@@ -201,16 +275,27 @@ function createApiAccessSettings({
         configured: true,
         baseUrl: upstreamSaved.config.baseUrl,
         proxy: upstreamSaved.config.proxy,
-        modelFilter: upstreamSaved.config.modelFilter,
+        models: upstreamSaved.config.models,
+        metadata: modelMetadata.metadataPreview(
+          upstreamSaved.config.models,
+          currentDiscovery,
+          shellType(),
+        ),
         supportsOpenAiServerCompaction: upstreamSaved.config.supportsOpenAiServerCompaction,
         keyAvailable: upstreamKey.available,
         keyStorage: upstreamKey.storage,
         runtimeAvailable: upstreamApplied,
+        resetReason: upstreamSaved.resetReason ?? undefined,
+        metadataSchema: modelMetadata.customMetadataSchema(),
+        protectedMetadataFields: modelMetadata.protectedMetadataFields(),
       } : {
         configured: false,
         keyAvailable: false,
         keyStorage: "unavailable",
         runtimeAvailable: false,
+        resetReason: upstreamSaved.resetReason ?? undefined,
+        metadataSchema: modelMetadata.customMetadataSchema(),
+        protectedMetadataFields: modelMetadata.protectedMetadataFields(),
       },
       routingPending: saved.policy.mode === "openai"
         && (routingPending || fs.existsSync(routingPendingPath)),
@@ -336,15 +421,20 @@ function createApiAccessSettings({
           : null;
         if (!key) fail("upstream-key-required");
       }
+      validateModelChanges(before.upstream.config, input, key);
       const next = {
-        version: 1,
+        version: 2,
         baseUrl: input.baseUrl,
         apiKeySha256: upstreamKeyDigest(key),
         proxy: input.proxy,
-        modelFilter: input.modelFilter,
+        models: input.models,
         supportsOpenAiServerCompaction: input.supportsOpenAiServerCompaction,
       };
       assertUnchanged(input.expectedRevision);
+      if (before.upstream.resetReason) {
+        try { clearResetMarker(upstreamFilePath); }
+        catch { return fail("upstream-legacy-cleanup-failed"); }
+      }
       try { writePrivateFileAtomic(upstreamFilePath, `${JSON.stringify(next, null, 2)}\n`); }
       catch { return fail("save-failed"); }
       if (input.apiKey !== undefined) upstreamVault.store(key);
@@ -360,10 +450,14 @@ function createApiAccessSettings({
     if (applying) fail("runtime-busy");
     applying = true;
     try {
-      assertUnchanged(raw.expectedRevision);
+      const before = assertUnchanged(raw.expectedRevision);
       try { fs.rmSync(upstreamFilePath, { force: true }); }
       catch { return fail("save-failed"); }
-      upstreamVault.clear();
+      try {
+        upstreamVault.clearStrict();
+        if (before.upstream.resetReason) clearResetMarker(upstreamFilePath);
+      } catch { return fail("upstream-legacy-cleanup-failed"); }
+      lastUpstreamDiscovery = null;
       try { await reconcile("api-access-upstream-settings"); } catch {}
       return { status: await status() };
     } finally { applying = false; }
@@ -372,7 +466,7 @@ function createApiAccessSettings({
     assertProduction();
     if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
     if (!raw || typeof raw !== "object" || Array.isArray(raw)
-      || !Object.keys(raw).every(key => ["expectedRevision", "baseUrl", "apiKey", "proxy"].includes(key))
+      || !Object.keys(raw).every(key => ["expectedRevision", "baseUrl", "apiKey", "proxy", "models"].includes(key))
       || typeof raw.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(raw.expectedRevision)) fail("invalid-input");
     let draft;
     try {
@@ -381,7 +475,7 @@ function createApiAccessSettings({
         baseUrl: raw.baseUrl,
         ...(raw.apiKey !== undefined && raw.apiKey !== "" ? { apiKey: raw.apiKey } : {}),
         proxy: raw.proxy,
-        modelFilter: { mode: "all" },
+        models: raw.models ?? [],
         supportsOpenAiServerCompaction: false,
       });
     } catch (error) { return fail(ERROR_CODES.has(error?.message) ? error.message : "invalid-input"); }
@@ -393,23 +487,51 @@ function createApiAccessSettings({
       key = upstreamVault.read(saved.apiKeySha256);
       if (!key) fail("upstream-key-required");
     }
+    const identity = discoveryIdentity(draft.baseUrl, draft.proxy, key);
     try {
-      const models = await fetchUpstreamModelIds({
+      const fetched = await fetchUpstreamModelCatalog({
         baseUrl: draft.baseUrl,
         apiKey: key,
         proxy: draft.proxy,
         resolveProxy,
         globalProxyUrl: typeof getNetworkProxyUrl === "function" ? getNetworkProxyUrl() : null,
       });
-      return { models };
-    } catch { return fail("upstream-fetch-failed"); }
+      lastUpstreamDiscovery = {
+        identity,
+        discovery: fetched.discovery,
+      };
+      const candidatePreview = modelMetadata.metadataPreview(
+        fetched.discovery.ids.map(id => ({ id })),
+        fetched.discovery,
+        shellType(),
+      );
+      return {
+        models: fetched.discovery.ids,
+        candidates: candidatePreview.map(item => ({
+          id: item.id,
+          hasUpstreamMetadata: item.hasUpstreamMetadata,
+          hasBundledMetadata: item.hasBundledMetadata,
+          availableModes: item.availableModes,
+          automaticMode: item.automaticMode,
+        })),
+        preview: modelMetadata.metadataPreview(draft.models, fetched.discovery, shellType()),
+        sources: fetched.discovery.sources,
+      };
+    } catch {
+      if (lastUpstreamDiscovery?.identity === identity) lastUpstreamDiscovery = null;
+      return fail("upstream-fetch-failed");
+    }
   }
   function daemonEnvironment() {
     try {
       if (readPolicyFile(filePath).policy.mode !== "api-key") return {};
     } catch { return {}; }
     let saved;
-    try { saved = readUpstreamConfig(upstreamFilePath).config; }
+    try {
+      const snapshot = readUpstreamConfig(upstreamFilePath);
+      if (snapshot.resetReason) upstreamVault.clearStrict();
+      saved = snapshot.config;
+    }
     catch { return {}; }
     if (!saved) return {};
     const key = upstreamVault.read(saved.apiKeySha256);
