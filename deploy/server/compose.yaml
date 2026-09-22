@@ -29,7 +29,7 @@ services:
       - "127.0.0.1:${NOVNC_HOST_PORT:-6080}:6080"
       - "127.0.0.1:${RESPONSES_HOST_PORT:-17841}:17841"
     volumes:
-      - codex_home:/home/codex
+      - "${CODEX_HOME_MOUNT:-codex_home}:/home/codex"
     secrets:
       - vnc_password
       - keyring_password

@@ -119,13 +119,27 @@ production Codex Web GPT AppImage
 
 The AppImage receives `APPIMAGE_EXTRACT_AND_RUN=1`, so FUSE is not required. It runs as the non-root `codex` user and is not started with `--no-sandbox`.
 
-The named `codex_home` volume persists all application-user state under `/home/codex`, including:
+By default, the named `codex_home` volume persists all application-user state under `/home/codex`, including:
 
 - `~/.codex-chatgpt-web`;
 - Electron `userData` at `~/.config/Codex Web GPT`;
 - the persistent ChatGPT browser partition and cookies;
 - Launcher state and logs;
 - GNOME Keyring data used by Electron safeStorage.
+
+To keep this state in a directly managed host directory instead, set `CODEX_HOME_MOUNT` in `deploy/server/.env` to an absolute host path. The directory must be writable by the container user `10001:10001`. For example:
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0700 /srv/codex-chatgpt-web/home
+```
+
+Then set:
+
+```dotenv
+CODEX_HOME_MOUNT=/srv/codex-chatgpt-web/home
+```
+
+Leave `CODEX_HOME_MOUNT` empty to keep using the Docker-managed `codex_home` volume. Do not switch an existing deployment from the named volume to a host directory without first copying the existing `/home/codex` data; otherwise the new mount starts with a separate empty state.
 
 The external Codex client owns its own `CODEX_HOME`, project files, sandbox, and command side effects. They are not mounted into this container.
 

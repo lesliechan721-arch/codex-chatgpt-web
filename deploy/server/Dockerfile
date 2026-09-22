@@ -59,6 +59,7 @@ RUN apt-get update \
     dbus-x11 \
     file \
     fonts-dejavu-core \
+    fonts-noto-cjk \
     gnome-keyring \
     libasound2 \
     libatk-bridge2.0-0 \

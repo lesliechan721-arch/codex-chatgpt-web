@@ -163,6 +163,12 @@ describe("server remote desktop deployment", () => {
     expect(all).not.toContain("dev:launcher");
   });
 
+  test("installs CJK fonts for localized launcher text", () => {
+    const dockerfile = read("Dockerfile");
+
+    expect(dockerfile).toContain("fonts-noto-cjk");
+  });
+
   test("publishes noVNC and Responses only on host loopback and keeps control surfaces internal", () => {
     const dockerfile = read("Dockerfile");
     const compose = read("compose.yaml");
@@ -203,7 +209,9 @@ describe("server remote desktop deployment", () => {
     const vnc = read("bin/start-vnc.sh");
     const keyring = read("bin/start-keyring.sh");
 
-    expect(compose).toContain("codex_home:/home/codex");
+    expect(compose).toContain('"${CODEX_HOME_MOUNT:-codex_home}:/home/codex"');
+    expect(envExample).toContain("CODEX_HOME_MOUNT=");
+    expect(read("README.md")).toContain("CODEX_HOME_MOUNT=/srv/codex-chatgpt-web/home");
     expect(compose).not.toContain(":/workspace");
     expect(envExample).not.toContain("WORKSPACE_PATH=");
     expect(entrypoint).not.toContain("/workspace");
