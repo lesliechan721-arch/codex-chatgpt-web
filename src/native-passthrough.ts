@@ -128,7 +128,7 @@ export function scrubBridgeArtifactsForNative(value: unknown): { value: unknown;
   return { value: clean, changed: true };
 }
 
-function endToEndHeaders(source: Headers): Headers {
+export function endToEndHeaders(source: Headers): Headers {
   const headers = new Headers();
   for (const [name, value] of source) {
     if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) headers.append(name, value);
@@ -150,7 +150,7 @@ const SSE_TERMINATOR = "data: [DONE]";
  * normally rather than failed. A reset before that genuinely truncated the turn and is still raised,
  * because inventing a terminal event there would tell Codex a turn ended when it did not.
  */
-function withUncleanCloseTolerance(
+export function withUncleanCloseTolerance(
   body: ReadableStream<Uint8Array>,
   isEventStream: boolean,
   onUncleanClose?: (bytes: number) => void,

@@ -10,6 +10,9 @@ function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigati
     "launcher:api-access-copy-key": key => controller.copyKey(key),
     "launcher:api-access-copy-url": () => controller.copyBaseUrl(),
     "launcher:api-access-export": () => controller.exportConfig(),
+    "launcher:api-access-upstream-save": input => controller.saveUpstream(input),
+    "launcher:api-access-upstream-delete": input => controller.deleteUpstream(input),
+    "launcher:api-access-upstream-models": input => controller.fetchUpstreamModels(input),
   };
   for (const [channel, method] of Object.entries(methods)) {
     ipcMain.handle(channel, async (event, ...args) => {
@@ -21,7 +24,13 @@ function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigati
         return { ok: false, code: "untrusted-sender" };
       }
       // Exact arity and validation in the controller keep secrets out of exception messages.
-      const arity = channel === "launcher:api-access-apply" || channel === "launcher:api-access-copy-key" ? 1 : 0;
+      const arity = [
+        "launcher:api-access-apply",
+        "launcher:api-access-copy-key",
+        "launcher:api-access-upstream-save",
+        "launcher:api-access-upstream-delete",
+        "launcher:api-access-upstream-models",
+      ].includes(channel) ? 1 : 0;
       if (args.length !== arity) return { ok: false, code: "invalid-input" };
       try { return { ok: true, value: await method(...args) }; }
       catch (error) {

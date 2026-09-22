@@ -37,6 +37,16 @@ import {
   requireWebModelInApiKeyMode,
   type ApiAccessPolicy,
 } from "./api-access";
+import { loadUpstreamProviderRuntime } from "./upstream-provider-config";
+import {
+  upstreamProviderRevision,
+  type UpstreamProviderRuntime,
+} from "./upstream-provider";
+import { mergeUpstreamModelCatalog } from "./upstream-model-catalog";
+import {
+  forwardUpstreamProviderRequest,
+  type UpstreamFetch,
+} from "./upstream-passthrough";
 import {
   readCodexModelContextOverride,
   readCodexSubagentProtocol,
@@ -375,6 +385,10 @@ export interface ResponseRequestOptions {
   onAdapterEvent?: (event: AdapterEvent) => void;
   /** Bind the physical HTTP stream to the exact native Codex turn that owns it. */
   onTurnIdentity?: (identity: NativeCodexTurnIdentity) => void;
+  /** Startup snapshot for the optional API-key-mode custom upstream. */
+  upstreamRuntime?: UpstreamProviderRuntime;
+  /** Test seam for the custom upstream transport. */
+  fetchUpstreamProvider?: UpstreamFetch;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -393,6 +407,8 @@ interface ModelCatalogFailure {
   code?: string;
 }
 
+const UPSTREAM_MODEL_CATALOG_TIMEOUT_MS = 15_000;
+
 function modelCatalogFailure(stage: ModelCatalogFailure["stage"], error: unknown): ModelCatalogFailure {
   const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
   return { stage, ...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? { code } : {}) };
@@ -405,15 +421,62 @@ export async function modelsRequest(
   contextOverride?: () => CodexModelContextOverride | undefined,
   accessPolicyOrFailure: ApiAccessPolicy | ((failure: ModelCatalogFailure) => void) = OPENAI_ACCESS,
   onFailure?: (failure: ModelCatalogFailure) => void,
+  upstreamRuntime?: UpstreamProviderRuntime,
+  fetchCustomUpstream?: UpstreamFetch,
 ): Promise<Response> {
   const accessPolicy = typeof accessPolicyOrFailure === "function" ? OPENAI_ACCESS : accessPolicyOrFailure;
   const reportFailure = typeof accessPolicyOrFailure === "function" ? accessPolicyOrFailure : onFailure;
   const denied = authenticateApiRequest(req, accessPolicy);
   if (denied) return denied;
   if (accessPolicy.mode === "api-key") {
-    return Response.json(buildStandaloneModelCatalog(config), {
-      headers: { "cache-control": "no-store" },
+    const local = buildStandaloneModelCatalog(config);
+    if (!upstreamRuntime?.available || !upstreamRuntime.config) {
+      return Response.json(local, { headers: { "cache-control": "no-store" } });
+    }
+    let upstream: Response;
+    const timeout = new AbortController();
+    const timeoutError = Object.assign(
+      new Error("Upstream model catalog request timed out"),
+      { code: "UpstreamModelCatalogTimeout" },
+    );
+    const timer = setTimeout(() => timeout.abort(timeoutError), UPSTREAM_MODEL_CATALOG_TIMEOUT_MS);
+    const signal = AbortSignal.any([req.signal, timeout.signal]);
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error("Upstream model catalog request aborted"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
     });
+    try {
+      upstream = await Promise.race([
+        forwardUpstreamProviderRequest(
+          new Request(req, { signal }),
+          "models",
+          upstreamRuntime,
+          fetchCustomUpstream,
+        ),
+        aborted,
+      ]);
+    } catch (error) {
+      reportFailure?.(modelCatalogFailure("transport", error));
+      return Response.json(local, { headers: { "cache-control": "no-store" } });
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+    if (!upstream.ok) {
+      reportFailure?.({ stage: "upstream" });
+      return Response.json(local, { headers: { "cache-control": "no-store" } });
+    }
+    try {
+      const raw = await upstream.json();
+      return Response.json(mergeUpstreamModelCatalog(local, raw, upstreamRuntime.config), {
+        headers: { "cache-control": "no-store" },
+      });
+    } catch (error) {
+      reportFailure?.(modelCatalogFailure("catalog", error));
+      return Response.json(local, { headers: { "cache-control": "no-store" } });
+    }
   }
   let upstream: Response;
   let sent = false;
@@ -512,7 +575,7 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
-  const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy);
+  const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy, options.upstreamRuntime);
   if (rejectedModel) return rejectedModel;
   try {
     const identity = extractCodexTurnIdentityFromBody(raw);
@@ -524,9 +587,24 @@ export async function responseRequest(
   }
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
     try {
+      if (accessPolicy.mode === "api-key") {
+        return await forwardUpstreamProviderRequest(
+          nativeRequest,
+          "responses",
+          options.upstreamRuntime!,
+          options.fetchUpstreamProvider,
+          raw,
+        );
+      }
       return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
     } catch (error) {
-      return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+      return formatErrorResponse(
+        502,
+        "upstream_error",
+        accessPolicy.mode === "api-key"
+          ? "Configured upstream request failed"
+          : error instanceof Error ? error.message : String(error),
+      );
     }
   }
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
@@ -714,7 +792,10 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
-  options: Pick<ResponseRequestOptions, "onTurnIdentity" | "accessPolicy"> = {},
+  options: Pick<
+    ResponseRequestOptions,
+    "onTurnIdentity" | "accessPolicy" | "upstreamRuntime" | "fetchUpstreamProvider"
+  > = {},
 ): Promise<Response> {
   const accessPolicy = options.accessPolicy ?? OPENAI_ACCESS;
   const denied = authenticateApiRequest(req, accessPolicy);
@@ -732,7 +813,7 @@ export async function compactRequest(
       error instanceof Error ? error.message : "Compaction request body must be a JSON object",
     );
   }
-  const rejectedModel = requireWebModelInApiKeyMode(raw.model, accessPolicy);
+  const rejectedModel = requireWebModelInApiKeyMode(raw.model, accessPolicy, options.upstreamRuntime);
   if (rejectedModel) return rejectedModel;
   const headerTurnMetadata = req.headers.get("x-codex-turn-metadata");
   if (headerTurnMetadata) {
@@ -763,9 +844,24 @@ export async function compactRequest(
   }
   if (!isChatGptWebModelSlug(raw.model)) {
     try {
+      if (accessPolicy.mode === "api-key") {
+        return await forwardUpstreamProviderRequest(
+          nativeRequest,
+          "responses/compact",
+          options.upstreamRuntime!,
+          options.fetchUpstreamProvider,
+          raw,
+        );
+      }
       return await forwardNativeCodexRequest(nativeRequest, "responses/compact", undefined, raw);
     } catch (error) {
-      return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+      return formatErrorResponse(
+        502,
+        "upstream_error",
+        accessPolicy.mode === "api-key"
+          ? "Configured upstream request failed"
+          : error instanceof Error ? error.message : String(error),
+      );
     }
   }
   let route: ChatGptWebModelRoute;
@@ -834,13 +930,22 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory; accessPolicy?: ApiAccessPolicy } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    fetchUpstreamProvider?: UpstreamFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    accessPolicy?: ApiAccessPolicy;
+    upstreamRuntime?: UpstreamProviderRuntime;
+  } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
   // Snapshot before opening a socket/broker. Rotation or mode changes require a controlled restart.
   const accessPolicy = parseApiAccessPolicy(dependencies.accessPolicy ?? loadApiAccessPolicy());
+  const upstreamRuntime: UpstreamProviderRuntime = accessPolicy.mode === "api-key"
+    ? dependencies.upstreamRuntime ?? loadUpstreamProviderRuntime()
+    : { available: false, keyMatches: false };
   if (apiKeyMatches(config.controlToken, accessPolicy)) {
     throw new Error("Client API key must not be the daemon control token");
   }
@@ -877,7 +982,7 @@ export function startServer(
     port: config.port,
     idleTimeout: 0,
     async fetch(req) {
-      const denied = guardApiRequest(req, accessPolicy);
+      const denied = guardApiRequest(req, accessPolicy, upstreamRuntime);
       if (denied) return denied;
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/healthz") {
@@ -888,6 +993,12 @@ export function startServer(
           mode: config.mode,
           access_mode: accessPolicy.mode,
           api_access_revision: apiAccessRevision(accessPolicy, config.controlToken),
+          upstream_provider_configured: Boolean(upstreamRuntime.config),
+          upstream_provider_available: upstreamRuntime.available,
+          upstream_provider_key_matches: upstreamRuntime.keyMatches,
+          upstream_provider_revision: upstreamRuntime.config
+            ? upstreamProviderRevision(upstreamRuntime.config, config.controlToken)
+            : null,
           pid: process.pid,
           port: config.port,
           uptime: (Date.now() - startedAt) / 1_000,
@@ -1052,7 +1163,7 @@ export function startServer(
             const result = { request, at: new Date().toISOString(), status: response.status, ...(failure ? { failure } : {}) };
             // An older, slower request must not replace a newer completed result.
             if (!lastModelCatalogResult || request > lastModelCatalogResult.request) lastModelCatalogResult = result;
-            if (!response.ok) {
+            if (!response.ok || failure) {
               try {
                 console.warn(`[codex-chatgpt-web] model_catalog_failed ${JSON.stringify({ ...result, elapsedMs: Date.now() - started })}`);
               } catch { /* Logging must not replace the catalog result. */ }
@@ -1082,6 +1193,8 @@ export function startServer(
             readCodexModelContextOverride,
             accessPolicy,
             value => { failure = value; },
+            upstreamRuntime,
+            dependencies.fetchUpstreamProvider,
           );
           if (response.ok) {
             successfulModelCatalogRequests += 1;
@@ -1103,7 +1216,12 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity, accessPolicy },
+            {
+              onTurnIdentity: bindIdentity,
+              accessPolicy,
+              upstreamRuntime,
+              fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+            },
           ),
           req.signal,
           process.platform,
@@ -1117,7 +1235,12 @@ export function startServer(
             new Request(req, { signal }),
             config,
             dependencies.adapterFactory,
-            { onTurnIdentity: bindIdentity, accessPolicy },
+            {
+              onTurnIdentity: bindIdentity,
+              accessPolicy,
+              upstreamRuntime,
+              fetchUpstreamProvider: dependencies.fetchUpstreamProvider,
+            },
           ),
           req.signal,
           process.platform,
@@ -1127,7 +1250,20 @@ export function startServer(
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
-          signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
+          async signal => {
+            const request = new Request(req, { signal });
+            if (accessPolicy.mode !== "api-key") return nativeSearchRequest(request, dependencies.fetchUpstream);
+            try {
+              return await forwardUpstreamProviderRequest(
+                request,
+                "alpha/search",
+                upstreamRuntime,
+                dependencies.fetchUpstreamProvider,
+              );
+            } catch {
+              return formatErrorResponse(502, "upstream_error", "Configured upstream request failed");
+            }
+          },
           req.signal,
           process.platform,
           "search",
@@ -1140,7 +1276,20 @@ export function startServer(
           ? "images/generations"
           : "images/edits";
         return httpTurns.track(
-          signal => nativeImagesRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
+          async signal => {
+            const request = new Request(req, { signal });
+            if (accessPolicy.mode !== "api-key") return nativeImagesRequest(request, endpoint, dependencies.fetchUpstream);
+            try {
+              return await forwardUpstreamProviderRequest(
+                request,
+                endpoint,
+                upstreamRuntime,
+                dependencies.fetchUpstreamProvider,
+              );
+            } catch {
+              return formatErrorResponse(502, "upstream_error", "Configured upstream request failed");
+            }
+          },
           req.signal,
           process.platform,
           endpoint,

@@ -6,12 +6,17 @@
 .api-access-modes button[aria-pressed="true"] { background: var(--surface-raised, #393939); color: var(--text-primary, #fff); border-color: var(--border-strong, #777); }
 .api-access-settings button { cursor: pointer; border: 1px solid var(--border-subtle, #444); border-radius: 7px; background: transparent; color: inherit; padding: 8px 12px; font: inherit; font-size: 12px; }
 .api-access-settings button:disabled { opacity: .45; cursor: not-allowed; }
-.api-access-settings button:focus-visible, .api-access-settings input:focus-visible { outline: 2px solid var(--text-primary, #eee); outline-offset: 2px; }
+.api-access-settings button:focus-visible, .api-access-settings input:focus-visible, .api-access-settings select:focus-visible { outline: 2px solid var(--text-primary, #eee); outline-offset: 2px; }
 .api-access-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 16px; }
 .api-access-editor, .api-access-client { display: grid; gap: 8px; padding: 14px 0; }
 .api-access-settings label { font-size: 12px; font-weight: 600; }
-.api-access-settings input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--border-subtle, #555); border-radius: 6px; background: var(--surface-base, #222); color: inherit; }
+.api-access-settings input, .api-access-settings select { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--border-subtle, #555); border-radius: 6px; background: var(--surface-base, #222); color: inherit; }
 .api-access-settings code, .api-access-settings pre { font: 12px/1.6 ui-monospace, monospace; padding: 10px; border-radius: 6px; background: var(--surface-base, #222); overflow-wrap: anywhere; white-space: pre-wrap; user-select: text; }
 .api-access-settings .api-access-error { color: var(--text-error, #ffaaaa); }
 .api-access-settings .api-access-warning { color: var(--text-warning, #dfc080); }
 .api-access-settings summary { font-size: 12px; cursor: pointer; }
+.api-access-upstream { display: grid; gap: 8px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-subtle, #444); }
+.api-access-upstream h3 { margin: 0 0 4px; font-size: 13px; }
+.api-access-checkbox, .api-access-model-list label { display: flex; align-items: center; gap: 8px; font-weight: 400 !important; }
+.api-access-checkbox input, .api-access-model-list input { width: auto; }
+.api-access-model-list { display: grid; gap: 6px; max-height: 180px; overflow: auto; padding: 8px; border: 1px solid var(--border-subtle, #444); border-radius: 6px; }

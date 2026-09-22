@@ -559,6 +559,8 @@ function registerIpc({ logger, stateStore }) {
     supervisor: runtimeSupervisor,
     browserHost,
     clipboard,
+    resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
+    getNetworkProxyUrl: () => stateStore.read().networkProxyUrl,
     confirmChange: async ({ mode, replacingKey, configured }) => {
       const chinese = (stateStore.read().language || "en").startsWith("zh");
       const result = await dialog.showMessageBox(mainWindow, {
@@ -583,6 +585,7 @@ function registerIpc({ logger, stateStore }) {
       return result.response === 1;
     },
   });
+  runtimeSupervisor.setDaemonEnvironmentProvider(() => apiAccessSettings.daemonEnvironment());
   const disposeApiAccessIpc = registerApiAccessIpc({
     ipcMain,
     controller: apiAccessSettings,

@@ -3,6 +3,14 @@ const path = require("node:path");
 const { createHash, createHmac, randomBytes } = require("node:crypto");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const { createApiKeyVault } = require("./api-key-vault.cjs");
+const { createUpstreamApiKeyVault, validUpstreamApiKey } = require("./upstream-api-key-vault.cjs");
+const {
+  readUpstreamConfig,
+  upstreamKeyDigest,
+  validateUpstreamChange,
+} = require("./upstream-provider-config.cjs");
+const { fetchUpstreamModelIds } = require("./upstream-provider-network.cjs");
+const { mergeNoProxy, PROXY_ENV_KEYS } = require("./network-proxy-config.cjs");
 
 // Mirrors the version-1 core wire format. Conformance is covered by the core/Bun test.
 const KEY_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
@@ -14,6 +22,8 @@ const ERROR_CODES = new Set([
   "api-mode-required", "stop-failed", "apply-failed-restored", "saved-runtime-unverified",
   "recovery-failed", "export-failed", "unavailable", "untrusted-sender",
   "save-failed", "key-unavailable",
+  "invalid-upstream-config", "invalid-upstream-filter", "invalid-upstream-proxy",
+  "invalid-upstream-key", "upstream-key-required", "upstream-fetch-failed",
 ]);
 
 class ApiAccessSettingsError extends Error {
@@ -43,6 +53,12 @@ function policyRevision(policy, controlToken) {
   // HMAC, not the stored key digest: safe to expose as non-credential health evidence.
   return createHmac("sha256", controlToken)
     .update(`codex-web-api-access:v1\0${policy.mode}\0${policy.mode === "api-key" ? policy.keySha256 : ""}`)
+    .digest("hex");
+}
+
+function upstreamProviderRevision(config, controlToken) {
+  return createHmac("sha256", controlToken)
+    .update(`codex-web-upstream-provider:v1\0${JSON.stringify(config)}`)
     .digest("hex");
 }
 
@@ -76,12 +92,15 @@ function validateChange(input) {
 function createApiAccessSettings({
   coreHome, runtimeHost, supervisor, browserHost,
   clipboard, setTimer = setTimeout, clearTimer = clearTimeout, safeStorage,
+  resolveProxy, getNetworkProxyUrl,
 }) {
   if (safeStorage === undefined) {
     try { safeStorage = require("electron").safeStorage; } catch { /* Node tests / headless host. */ }
   }
   const vault = createApiKeyVault({ coreHome, safeStorage });
+  const upstreamVault = createUpstreamApiKeyVault({ coreHome, safeStorage });
   const filePath = path.join(coreHome, "api-access.json");
+  const upstreamFilePath = path.join(coreHome, "upstream-provider.json");
   const routingPendingPath = path.join(coreHome, "api-access-routing-pending.json");
   const revisionSecret = randomBytes(32);
   let clipboardSecret = null;
@@ -89,8 +108,19 @@ function createApiAccessSettings({
   let applying = false;
   let cleanupPending = false;
   let routingPending = false;
-  const revisionOf = snapshot => createHmac("sha256", revisionSecret)
-    .update(snapshot.bytes ?? "absent-policy-file").digest("hex");
+  const upstreamSnapshotForPolicy = policy => policy.mode === "api-key"
+    ? readUpstreamConfig(upstreamFilePath)
+    : { config: null, bytes: null };
+  const revisionOf = (snapshot, upstreamSnapshot = upstreamSnapshotForPolicy(snapshot.policy)) => createHmac("sha256", revisionSecret)
+    .update(snapshot.bytes ?? "absent-policy-file")
+    .update("\0")
+    .update(upstreamSnapshot.bytes ?? "absent-upstream-provider-file")
+    .digest("hex");
+  const upstreamRuntimeApplied = (policy, upstreamConfig, health, config) => policy.mode !== "api-key" || !upstreamConfig
+    || Boolean(config && health
+      && health.upstream_provider_revision === upstreamProviderRevision(upstreamConfig, config.controlToken)
+      && health.upstream_provider_key_matches === true
+      && health.upstream_provider_available === true);
   const assertProduction = () => {
     if (runtimeHost.launcherProfile === "development") fail("dev-profile");
   };
@@ -108,7 +138,11 @@ function createApiAccessSettings({
   async function status() {
     assertProduction();
     let saved;
-    try { saved = readPolicyFile(filePath); }
+    let upstreamSaved;
+    try {
+      saved = readPolicyFile(filePath);
+      upstreamSaved = upstreamSnapshotForPolicy(saved.policy);
+    }
     catch { return { configuredMode: "invalid", effectiveMode: null, revision: null,
       keyConfigured: false, keyAvailable: false, keyStorage: "unavailable",
       runtimeState: "invalid", baseUrl: null, canApply: false, cleanupPending }; }
@@ -119,17 +153,40 @@ function createApiAccessSettings({
     const matches = Boolean(config && health && health.api_access_revision
       && health.api_access_revision === policyRevision(saved.policy, config.controlToken));
     const key = vault.info(saved.policy.mode === "api-key" ? saved.policy.keySha256 : undefined);
+    const upstreamKey = upstreamSaved.config
+      ? upstreamVault.info(upstreamSaved.config.apiKeySha256)
+      : { available: false, storage: "unavailable" };
+    const upstreamApplied = upstreamSaved.config
+      ? upstreamKey.available && upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config)
+      : upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config);
     return {
       configuredMode: saved.policy.mode,
       effectiveMode,
-      revision: revisionOf(saved),
+      revision: revisionOf(saved, upstreamSaved),
       keyConfigured: saved.policy.mode === "api-key",
       keyAvailable: key.available,
       keyStorage: key.storage,
       runtimeState: !runtime.configured ? "unconfigured"
-        : !health ? "stopped" : matches && health.accepting_turns === true ? "in-sync" : "restart-required",
+        : !health ? "stopped"
+          : matches && upstreamApplied && health.accepting_turns === true
+            ? "in-sync" : "restart-required",
       baseUrl: config ? `http://127.0.0.1:${config.port}/v1` : null,
       canApply: true,
+      upstream: upstreamSaved.config ? {
+        configured: true,
+        baseUrl: upstreamSaved.config.baseUrl,
+        proxy: upstreamSaved.config.proxy,
+        modelFilter: upstreamSaved.config.modelFilter,
+        supportsOpenAiServerCompaction: upstreamSaved.config.supportsOpenAiServerCompaction,
+        keyAvailable: upstreamKey.available,
+        keyStorage: upstreamKey.storage,
+        runtimeAvailable: upstreamApplied,
+      } : {
+        configured: false,
+        keyAvailable: false,
+        keyStorage: "unavailable",
+        runtimeAvailable: false,
+      },
       routingPending: saved.policy.mode === "openai"
         && (routingPending || fs.existsSync(routingPendingPath)),
       cleanupPending: saved.policy.mode === "api-key" && (cleanupPending
@@ -139,8 +196,9 @@ function createApiAccessSettings({
   }
   function assertUnchanged(revision) {
     const current = readPolicyFile(filePath);
-    if (revisionOf(current) !== revision) fail("stale-settings");
-    return current;
+    const upstream = upstreamSnapshotForPolicy(current.policy);
+    if (revisionOf(current, upstream) !== revision) fail("stale-settings");
+    return { ...current, upstream };
   }
   function reveal() {
     assertProduction();
@@ -187,8 +245,11 @@ function createApiAccessSettings({
       }
       if (!runtime.configured || runtime.owner === "external") return;
       const health = await readHealth(runtime.config);
+      const savedPolicy = readPolicyFile(filePath).policy;
+      const savedUpstream = savedPolicy.mode === "api-key" ? readUpstreamConfig(upstreamFilePath).config : null;
       if (health?.accepting_turns === true
-        && health.api_access_revision === policyRevision(readPolicyFile(filePath).policy, runtime.config.controlToken)) return;
+        && health.api_access_revision === policyRevision(savedPolicy, runtime.config.controlToken)
+        && upstreamRuntimeApplied(savedPolicy, savedUpstream, health, runtime.config)) return;
       if (browserHost?.activeTraceId || browserHost?.currentOperation()
         || (health && (health.active_http_turns > 0 || health.active_browser_turns > 0))) return;
       // Restart only supervised runtimes after their existing atomic idle/drain check. No app
@@ -231,6 +292,101 @@ function createApiAccessSettings({
       return { cancelled: false, status: await status() };
     } finally { applying = false; }
   }
+  async function saveUpstream(raw) {
+    assertProduction();
+    if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
+    let input;
+    try { input = validateUpstreamChange(raw); }
+    catch (error) { return fail(ERROR_CODES.has(error?.message) ? error.message : "invalid-input"); }
+    if (applying) fail("runtime-busy");
+    applying = true;
+    try {
+      const before = assertUnchanged(input.expectedRevision);
+      let key = input.apiKey;
+      if (key !== undefined && !validUpstreamApiKey(key)) fail("invalid-upstream-key");
+      if (key === undefined) {
+        key = before.upstream.config
+          ? upstreamVault.read(before.upstream.config.apiKeySha256)
+          : null;
+        if (!key) fail("upstream-key-required");
+      }
+      const next = {
+        version: 1,
+        baseUrl: input.baseUrl,
+        apiKeySha256: upstreamKeyDigest(key),
+        proxy: input.proxy,
+        modelFilter: input.modelFilter,
+        supportsOpenAiServerCompaction: input.supportsOpenAiServerCompaction,
+      };
+      assertUnchanged(input.expectedRevision);
+      try { writePrivateFileAtomic(upstreamFilePath, `${JSON.stringify(next, null, 2)}\n`); }
+      catch { return fail("save-failed"); }
+      if (input.apiKey !== undefined) upstreamVault.store(key);
+      try { await reconcile("api-access-upstream-settings"); } catch {}
+      return { status: await status() };
+    } finally { applying = false; }
+  }
+  async function deleteUpstream(raw) {
+    assertProduction();
+    if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).length !== 1
+      || typeof raw.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(raw.expectedRevision)) fail("invalid-input");
+    if (applying) fail("runtime-busy");
+    applying = true;
+    try {
+      assertUnchanged(raw.expectedRevision);
+      try { fs.rmSync(upstreamFilePath, { force: true }); }
+      catch { return fail("save-failed"); }
+      upstreamVault.clear();
+      try { await reconcile("api-access-upstream-settings"); } catch {}
+      return { status: await status() };
+    } finally { applying = false; }
+  }
+  async function fetchUpstreamModels(raw) {
+    assertProduction();
+    if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)
+      || !Object.keys(raw).every(key => ["baseUrl", "apiKey", "proxy"].includes(key))) fail("invalid-input");
+    let draft;
+    try {
+      draft = validateUpstreamChange({
+        expectedRevision: "0".repeat(64),
+        baseUrl: raw.baseUrl,
+        ...(raw.apiKey !== undefined && raw.apiKey !== "" ? { apiKey: raw.apiKey } : {}),
+        proxy: raw.proxy,
+        modelFilter: { mode: "all" },
+        supportsOpenAiServerCompaction: false,
+      });
+    } catch (error) { return fail(ERROR_CODES.has(error?.message) ? error.message : "invalid-input"); }
+    let key = draft.apiKey;
+    if (key !== undefined && !validUpstreamApiKey(key)) fail("invalid-upstream-key");
+    if (!key) {
+      const saved = readUpstreamConfig(upstreamFilePath).config;
+      key = saved ? upstreamVault.read(saved.apiKeySha256) : null;
+      if (!key) fail("upstream-key-required");
+    }
+    try {
+      const models = await fetchUpstreamModelIds({
+        baseUrl: draft.baseUrl,
+        apiKey: key,
+        proxy: draft.proxy,
+        resolveProxy,
+        globalProxyUrl: typeof getNetworkProxyUrl === "function" ? getNetworkProxyUrl() : null,
+      });
+      return { models };
+    } catch { return fail("upstream-fetch-failed"); }
+  }
+  function daemonEnvironment() {
+    try {
+      if (readPolicyFile(filePath).policy.mode !== "api-key") return {};
+    } catch { return {}; }
+    let saved;
+    try { saved = readUpstreamConfig(upstreamFilePath).config; }
+    catch { return {}; }
+    if (!saved) return {};
+    const key = upstreamVault.read(saved.apiKeySha256);
+    return key ? { CODEX_CHATGPT_WEB_UPSTREAM_API_KEY: key } : {};
+  }
   function clearOwnedClipboard() {
     if (clipboardTimer) clearTimer(clipboardTimer);
     clipboardTimer = null;
@@ -258,33 +414,57 @@ function createApiAccessSettings({
   }
   async function exportConfig() {
     assertProduction();
-    if (readPolicyFile(filePath).policy.mode !== "api-key") fail("api-mode-required");
+    const configuredPolicy = readPolicyFile(filePath).policy;
+    if (configuredPolicy.mode !== "api-key") fail("api-mode-required");
     if (!runtimeHost.runtimeConfigSnapshot().configured) fail("not-configured");
     if (runtimeHost.currentOperation()) fail("runtime-busy");
+    const localKey = vault.read(configuredPolicy.keySha256);
+    if (!localKey) fail("key-unavailable");
     return runtimeHost.runLifecycleOperation("api-access-export", async () => {
       try {
-        const result = await runtimeHost.run("api-access-export", ["api-key", "codex-config"], {
+        const environment = { ...process.env };
+        for (const key of PROXY_ENV_KEYS) delete environment[key];
+        const networkProxyUrl = typeof getNetworkProxyUrl === "function" ? getNetworkProxyUrl() : null;
+        if (networkProxyUrl) {
+          for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+            environment[key] = networkProxyUrl;
+          }
+        }
+        const noProxy = mergeNoProxy(process.env.NO_PROXY, process.env.no_proxy);
+        environment.NO_PROXY = noProxy;
+        environment.no_proxy = noProxy;
+        const result = await runtimeHost.run("api-access-export", ["api-key", "codex-config", "--json"], {
           embedded: true,
-          message: "Exporting API key client configuration (no secret)",
+          message: "Exporting sensitive API key client configuration",
           successMessage: "API key client configuration exported",
           timeoutMs: 15_000,
+          sensitiveOutput: true,
+          environment,
+          env: { CODEX_CHATGPT_WEB_API_KEY: localKey },
         });
-        if (!result.stdout.includes('requires_openai_auth = false')
-          || !result.stdout.includes('env_key = "CODEX_CHATGPT_WEB_API_KEY"')) fail("export-failed");
+        const exported = JSON.parse(result.stdout);
+        if (!exported || typeof exported.config !== "string" || !exported.config.includes('requires_openai_auth = false')
+          || !exported.config.includes("experimental_bearer_token") || exported.config.includes("env_key =")
+          || !exported.environment || typeof exported.environment !== "object" || Array.isArray(exported.environment)) fail("export-failed");
         clearOwnedClipboard();
-        clipboard.writeText(result.stdout);
-        return { config: result.stdout, catalogPath: path.join(coreHome, "api-key-models.json") };
+        clipboard.writeText(exported.config);
+        return {
+          config: exported.config,
+          environment: exported.environment,
+          catalogPath: path.join(coreHome, "api-key-models.json"),
+        };
       } catch { return fail("export-failed"); }
     });
   }
   return {
     status, apply, reveal, copyKey, copyBaseUrl, exportConfig,
+    saveUpstream, deleteUpstream, fetchUpstreamModels, daemonEnvironment,
     generate: () => { assertProduction(); return `cgw_${randomBytes(32).toString("base64url")}`; },
-    dispose: () => { clearOwnedClipboard(); vault.dispose(); },
+    dispose: () => { clearOwnedClipboard(); vault.dispose(); upstreamVault.dispose(); },
   };
 }
 
 module.exports = {
   ApiAccessSettingsError, ERROR_CODES, createApiAccessSettings,
-  keyPolicy, parsePolicy, policyRevision, readPolicyFile, validateChange,
+  keyPolicy, parsePolicy, policyRevision, upstreamProviderRevision, readPolicyFile, validateChange,
 };

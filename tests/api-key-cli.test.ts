@@ -11,10 +11,10 @@ function withHome(run: (home: string) => void): void {
   const home = mkdtempSync(join(tmpdir(), "cgw-api-key-cli-"));
   try { run(home); } finally { rmSync(home, { recursive: true, force: true }); }
 }
-function cli(home: string, args: string[], input?: string) {
+function cli(home: string, args: string[], input?: string, environment: Record<string, string | undefined> = {}) {
   const result = Bun.spawnSync([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
     "--home", home, "api-key", ...args], {
-    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: join(home, "codex") },
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: join(home, "codex"), ...environment },
     stdin: input === undefined ? "ignore" : Buffer.from(input),
     stdout: "pipe", stderr: "pipe",
   });
@@ -71,4 +71,50 @@ test("successful CLI reconnect clears the persisted OpenAI routing warning", () 
   const result = cli(home, ["reconnect"]);
   assert.equal(result.code, 0, result.err);
   assert.equal(existsSync(pending), false);
+}));
+
+test("CLI Codex export requires the current local key and emits sensitive TOML plus separate proxy environment", () => withHome(home => {
+  const localKey = "cgw_" + "q".repeat(43);
+  writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  const missing = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: undefined });
+  assert.notEqual(missing.code, 0);
+  assert.ok(!missing.err.includes(localKey));
+  const wrong = "cgw_" + "z".repeat(43);
+  const mismatched = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: wrong });
+  assert.notEqual(mismatched.code, 0);
+  assert.ok(!mismatched.err.includes(wrong));
+  const exported = cli(home, ["codex-config", "--json"], undefined, {
+    CODEX_CHATGPT_WEB_API_KEY: localKey,
+    HTTP_PROXY: "http://proxy.example:8080",
+    HTTPS_PROXY: "http://proxy.example:8080",
+    ALL_PROXY: "http://proxy.example:8080",
+    NO_PROXY: "internal.example",
+  });
+  assert.equal(exported.code, 0, exported.err);
+  const payload = JSON.parse(exported.out);
+  assert.ok(payload.config.includes(`experimental_bearer_token = "${localKey}"`));
+  assert.ok(!payload.config.includes("env_key ="));
+  assert.equal(payload.environment.HTTP_PROXY, "http://proxy.example:8080");
+  for (const host of ["localhost", "127.0.0.1", "::1"]) assert.ok(payload.environment.NO_PROXY.includes(host));
+}));
+
+test("CLI Codex export uses saved server-compaction intent for provider naming without exporting the upstream key", () => withHome(home => {
+  const localKey = "cgw_" + "m".repeat(43);
+  writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  writeFileSync(join(home, "upstream-provider.json"), `${JSON.stringify({
+    version: 1,
+    baseUrl: "https://provider.example/v1/",
+    apiKeySha256: "a".repeat(64),
+    proxy: { mode: "global" },
+    modelFilter: { mode: "all" },
+    supportsOpenAiServerCompaction: true,
+  })}\n`);
+  const exported = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: localKey });
+  assert.equal(exported.code, 0, exported.err);
+  const text = JSON.parse(exported.out).config;
+  assert.ok(text.includes('name = "OpenAI"'));
+  assert.ok(text.includes(localKey));
+  assert.ok(!text.includes("a".repeat(64)));
 }));

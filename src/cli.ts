@@ -91,7 +91,8 @@ Setup options:
 API key mode:
   --generate                   Generate a 256-bit client key; stdout prints it once
   --key-stdin                  Import a 32–256 character key from piped stdin
-  api-key codex-config         Export custom-provider TOML and a local model catalog
+  api-key codex-config         Export sensitive provider TOML, proxy environment and a local model catalog
+                               CODEX_CHATGPT_WEB_API_KEY must contain the current local API key for this explicit export
                                No Codex OAuth is required; restart the service after mode/key changes
                                See docs/api-key-mode.zh-CN.md for migration and security boundaries
 

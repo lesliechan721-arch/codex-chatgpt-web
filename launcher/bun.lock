@@ -5,6 +5,8 @@
     "": {
       "name": "codex-web-gpt-launcher",
       "dependencies": {
+        "http-proxy-agent": "^7.0.2",
+        "https-proxy-agent": "^7.0.6",
         "motion": "^12.42.2",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
