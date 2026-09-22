@@ -3,7 +3,12 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteFile, getConfigDir, getConfigPath, loadConfig } from "./config";
 import { API_KEY_ENV, OPENAI_ACCESS, apiKeyMatches, apiKeyPolicy, generateApiKey } from "./api-access";
-import { apiAccessConfigPath, loadApiAccessPolicy, saveApiAccessPolicy } from "./api-access-config";
+import {
+  apiAccessConfigPath,
+  clearOpenAiRoutingPending,
+  loadApiAccessPolicy,
+  saveApiAccessPolicy,
+} from "./api-access-config";
 import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
 import { buildStandaloneModelCatalog } from "./standalone-model-catalog";
 import { installCodexIntegration } from "./codex-integration";
@@ -63,6 +68,7 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   if (action === "reconnect") {
     if (policy.mode !== "openai") throw new Error("API Key mode never installs Codex configuration");
     installCodexIntegration(loadConfig());
+    clearOpenAiRoutingPending();
     stdout.write(`${JSON.stringify({ installed: true })}\n`);
     return;
   }

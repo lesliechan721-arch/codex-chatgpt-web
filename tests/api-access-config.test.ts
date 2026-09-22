@@ -1,9 +1,14 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { apiAccessConfigPath, loadApiAccessPolicy, saveApiAccessPolicy } from "../src/api-access-config";
+import {
+  apiAccessConfigPath,
+  apiKeyReuseMarkerPath,
+  loadApiAccessPolicy,
+  saveApiAccessPolicy,
+} from "../src/api-access-config";
 import { OPENAI_ACCESS, apiKeyMatches, apiKeyPolicy, generateApiKey } from "../src/api-access";
 
 function inHome(run: (home: string) => void): void {
@@ -57,4 +62,12 @@ test("rotation and explicit disable are persisted without changing an existing s
   assert.ok(apiKeyMatches(second, loadApiAccessPolicy(home)));
   saveApiAccessPolicy(OPENAI_ACCESS, home);
   assert.deepEqual(loadApiAccessPolicy(home), OPENAI_ACCESS);
+}));
+
+test("an external policy save revokes GUI-only key reuse", () => inHome(home => {
+  const marker = apiKeyReuseMarkerPath(home);
+  mkdirSync(join(home, "secrets"), { recursive: true });
+  writeFileSync(marker, '{"version":1,"digest":"' + "a".repeat(64) + '"}\n');
+  saveApiAccessPolicy(OPENAI_ACCESS, home);
+  assert.equal(existsSync(marker), false);
 }));

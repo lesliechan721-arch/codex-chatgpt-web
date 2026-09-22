@@ -82,6 +82,7 @@ function createApiAccessSettings({
   }
   const vault = createApiKeyVault({ coreHome, safeStorage });
   const filePath = path.join(coreHome, "api-access.json");
+  const routingPendingPath = path.join(coreHome, "api-access-routing-pending.json");
   const revisionSecret = randomBytes(32);
   let clipboardSecret = null;
   let clipboardTimer = null;
@@ -129,7 +130,8 @@ function createApiAccessSettings({
         : !health ? "stopped" : matches && health.accepting_turns === true ? "in-sync" : "restart-required",
       baseUrl: config ? `http://127.0.0.1:${config.port}/v1` : null,
       canApply: true,
-      routingPending: saved.policy.mode === "openai" && routingPending,
+      routingPending: saved.policy.mode === "openai"
+        && (routingPending || fs.existsSync(routingPendingPath)),
       cleanupPending: saved.policy.mode === "api-key" && (cleanupPending
         || fs.existsSync(path.join(coreHome, "codex", "integration-journal.json"))
         || fs.existsSync(path.join(coreHome, "codex", "integration-journal.recovery.json"))),
@@ -154,6 +156,11 @@ function createApiAccessSettings({
     const configured = readPolicyFile(filePath).policy;
     cleanupPending = configured.mode === "api-key";
     routingPending = configured.mode === "openai" && runtimeSnapshot().configured;
+    if (routingPending) {
+      try { writePrivateFileAtomic(routingPendingPath, '{"version":1}\n'); } catch {}
+    } else {
+      try { fs.rmSync(routingPendingPath, { force: true }); } catch {}
+    }
     if (runtimeHost.currentOperation()) return;
     await runtimeHost.runLifecycleOperation(name, async () => {
       if (configured.mode === "api-key") {
@@ -175,6 +182,7 @@ function createApiAccessSettings({
             successMessage: "OpenAI forwarding integration configured",
           });
           routingPending = false;
+          try { fs.rmSync(routingPendingPath, { force: true }); } catch {}
         } catch { /* Conflicting user routes are not force-replaced. */ }
       }
       if (!runtime.configured || runtime.owner === "external") return;
@@ -214,7 +222,10 @@ function createApiAccessSettings({
       catch { return fail("save-failed"); }
       clearOwnedClipboard();
       // An external CLI rotation must not make disabling/re-enabling resurrect an old GUI key.
-      if (input.mode === "openai" && before.policy.mode === "api-key") vault.retainOnly(before.policy.keySha256);
+      if (input.mode === "openai" && before.policy.mode === "api-key") {
+        vault.retainOnly(before.policy.keySha256);
+        vault.allowReuse(before.policy.keySha256);
+      }
       if (key !== undefined) vault.store(key);
       try { await reconcile("api-access-settings"); } catch { /* Saved policy is authoritative. */ }
       return { cancelled: false, status: await status() };

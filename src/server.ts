@@ -562,6 +562,7 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
+  const compactionItemOutput = compaction && parsed._compactionOutput !== "message";
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
       if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
@@ -571,8 +572,12 @@ export async function responseRequest(
     const identity = extractChatGptTurnIdentity(parsed);
     if (!identity.threadId || !identity.turnId || !Array.isArray(response.output) || response.output.length !== 1) return;
     const item = response.output[0];
-    if (item?.type !== "compaction" || typeof item.encrypted_content !== "string") return;
-    const summary = decodeCompactionSummary(item.encrypted_content);
+    const summary = compactionItemOutput
+      ? item?.type === "compaction" && typeof item.encrypted_content === "string"
+        ? decodeCompactionSummary(item.encrypted_content) : undefined
+      : item?.type === "message" && item.role === "assistant" && Array.isArray(item.content)
+        ? item.content.filter((part: { type?: string; text?: unknown }) => part.type === "output_text" && typeof part.text === "string")
+          .map((part: { text: string }) => part.text).join("") : undefined;
     if (!summary) return;
     const source = extractChatGptCompactionSourceRevision(parsed);
     const body = parsed._rawBody as { input?: unknown[] };
@@ -580,7 +585,9 @@ export async function responseRequest(
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
     const v1Source = extractChatGptCompactionSourceRevision({
       ...parsed,
-      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
+      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(
+        parsed._compactionOutput === "message" ? body.input?.slice(0, -1) : body.input,
+      ), summary) },
     });
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
@@ -598,7 +605,9 @@ export async function responseRequest(
     delete parsed.context.tools;
     delete parsed.options.toolChoice;
     delete parsed.options.parallelToolCalls;
-    parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
+    if (parsed._compactionOutput !== "message") {
+      parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
+    }
   }
 
   const provider = providerConfig(config);
@@ -674,7 +683,7 @@ export async function responseRequest(
         ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
           ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
           : {}),
-        ...(compaction ? { compaction: true } : {}),
+        ...(compactionItemOutput ? { compaction: true } : {}),
         onCompletedResponse: rememberCompletedResponse,
       },
     );
@@ -695,7 +704,7 @@ export async function responseRequest(
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
-    ...(compaction ? { compaction: true } : {}),
+    ...(compactionItemOutput ? { compaction: true } : {}),
   });
   rememberCompletedResponse(json);
   return Response.json(json);

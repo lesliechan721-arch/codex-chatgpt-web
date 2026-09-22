@@ -9,6 +9,7 @@ const digest = key => createHash("sha256").update(key).digest("hex");
 /** Optional recoverable copy for the GUI. The daemon continues to use only its SHA-256 policy. */
 function createApiKeyVault({ coreHome, safeStorage, platform = process.platform }) {
   const filePath = path.join(coreHome, "secrets", "api-client-key.json");
+  const reusePath = path.join(coreHome, "secrets", "api-client-key-reuse.json");
   let memory = null;
   let ignoreDisk = false;
   function encryptionAvailable() {
@@ -29,19 +30,33 @@ function createApiKeyVault({ coreHome, safeStorage, platform = process.platform 
       return parsed;
     } catch { return null; }
   }
+  function reusableDigest() {
+    try {
+      const stat = fs.lstatSync(reusePath);
+      if (!stat.isFile() || stat.size > 256) return null;
+      const parsed = JSON.parse(fs.readFileSync(reusePath, "utf8"));
+      return parsed.version === 1 && /^[a-f0-9]{64}$/.test(parsed.digest) ? parsed.digest : null;
+    } catch { return null; }
+  }
+  const permitted = (key, expectedDigest) => {
+    const keyDigest = digest(key);
+    return expectedDigest ? keyDigest === expectedDigest : keyDigest === reusableDigest();
+  };
   function info(expectedDigest) {
-    if (memory && (!expectedDigest || digest(memory) === expectedDigest)) {
+    if (memory && permitted(memory, expectedDigest)) {
       const saved = record();
       return { available: true, storage: saved?.digest === digest(memory) ? "os" : "session" };
     }
     const saved = record();
-    return saved && (!expectedDigest || saved.digest === expectedDigest) && encryptionAvailable()
+    const allowedDigest = expectedDigest ?? reusableDigest();
+    return saved && allowedDigest && saved.digest === allowedDigest && encryptionAvailable()
       ? { available: true, storage: "os" } : { available: false, storage: "unavailable" };
   }
   function read(expectedDigest) {
-    if (memory && (!expectedDigest || digest(memory) === expectedDigest)) return memory;
+    if (memory && permitted(memory, expectedDigest)) return memory;
     const saved = record();
-    if (!saved || (expectedDigest && saved.digest !== expectedDigest) || !encryptionAvailable()) return null;
+    const allowedDigest = expectedDigest ?? reusableDigest();
+    if (!saved || !allowedDigest || saved.digest !== allowedDigest || !encryptionAvailable()) return null;
     try {
       const key = safeStorage.decryptString(Buffer.from(saved.ciphertext, "base64"));
       if (!validKey(key) || digest(key) !== saved.digest) return null;
@@ -51,6 +66,7 @@ function createApiKeyVault({ coreHome, safeStorage, platform = process.platform 
   function store(key) {
     if (!validKey(key)) throw new Error("invalid-key");
     memory = key;
+    try { fs.rmSync(reusePath, { force: true }); } catch {}
     // A failed replacement must not expose the stale sealed copy in this session.
     ignoreDisk = true;
     try { fs.rmSync(filePath, { force: true }); } catch {}
@@ -64,6 +80,14 @@ function createApiKeyVault({ coreHome, safeStorage, platform = process.platform 
     }
     return "session";
   }
+  function allowReuse(expectedDigest) {
+    const key = read(expectedDigest);
+    if (!key) return false;
+    try {
+      writePrivateFileAtomic(reusePath, `${JSON.stringify({ version: 1, digest: expectedDigest })}\n`);
+      return true;
+    } catch { return false; }
+  }
   function retainOnly(expectedDigest) {
     if (memory && digest(memory) !== expectedDigest) memory = null;
     const saved = record();
@@ -71,8 +95,11 @@ function createApiKeyVault({ coreHome, safeStorage, platform = process.platform 
       ignoreDisk = true;
       try { fs.rmSync(filePath, { force: true }); } catch {}
     }
+    if (reusableDigest() !== expectedDigest) {
+      try { fs.rmSync(reusePath, { force: true }); } catch {}
+    }
   }
-  return { info, read, store, retainOnly, dispose: () => { memory = null; } };
+  return { info, read, store, allowReuse, retainOnly, dispose: () => { memory = null; } };
 }
 
 module.exports = { createApiKeyVault };

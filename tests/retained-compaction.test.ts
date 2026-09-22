@@ -291,6 +291,10 @@ test("active compaction drains an MCP call already queued without an outer Codex
 test("a completed retained agent returns an exact checkpoint and its browser is physically retired", async () => {
   expect(MAX_COMPACTION_HANDOFF_TIMEOUT_MS).toBe(5 * 60_000);
   const sourceRequest = request(false);
+  const compactRequest = request(true);
+  const customCompactPrompt = "CUSTOM_COMPACT_PROMPT retain database migration and rollback steps.";
+  compactRequest._compactionOutput = "message";
+  compactRequest.context.messages.push({ role: "user", content: customCompactPrompt, timestamp: 4 });
   const conversationKey = chatGptConversationKey(sourceRequest, "provider")!;
   const source = new ChatGptTurnSession({
     mode: "read-only",
@@ -322,6 +326,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
       captured = turn;
       const prepared = await turn.prepareResume!();
       expect(prepared.text).toContain("wire_name codex.control.compaction_handoff");
+      expect(prepared.text).toContain(customCompactPrompt);
       prepared.release();
       return await new Promise<string>((_resolve, reject) => {
         const onAbort = () => {
@@ -336,7 +341,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
 
   await expect(requestRetainedCompactionHandoff(
     worker as never,
-    request(true),
+    compactRequest,
     source,
     broker,
     { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
