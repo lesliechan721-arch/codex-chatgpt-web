@@ -74,6 +74,69 @@ function launcherConfig(descriptorPath, overrides = {}) {
   };
 }
 
+test("degraded broker health preserves daemon identity without declaring the runtime ready", async () => {
+  const body = {
+    service: "codex-chatgpt-web", status: "degraded", mode: "full", version: "5.0.9-5",
+    pid: process.pid, broker_available: false, accepting_turns: false,
+  };
+  const server = await localHealthServer(() => 503, () => JSON.stringify(body));
+  const url = new URL(server.baseUrl);
+  const supervisor = Object.create(RuntimeSupervisor.prototype);
+  const config = { host: url.hostname, port: Number(url.port), mode: body.mode, releaseVersion: body.version };
+  try {
+    assert.deepEqual(await supervisor.proxyHealthPayload(config), body);
+    assert.equal(await supervisor.proxyHealth(config, 2_000, process.pid, true), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a degraded owned daemon can be stopped, but a mismatching PID cannot", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cgw-degraded-stop-"));
+  const config = { mode: "browser-only", releaseVersion: "0.2.0" };
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: root, browserDescriptorPath: path.join(root, "launcher.json"),
+  });
+  const child = { pid: 123_456_789, exitCode: null, signalCode: null };
+  let observedPid = child.pid + 1;
+  let identityOverrides = {};
+  const actions = [];
+  supervisor.readConfig = () => config;
+  supervisor.readState = () => null;
+  supervisor.clearState = () => {};
+  supervisor.tryWriteState = () => true;
+  supervisor.proxyHealthPayload = async () => ({
+    service: "codex-chatgpt-web", status: "degraded", mode: config.mode,
+    version: config.releaseVersion, pid: observedPid, broker_available: false, accepting_turns: false,
+    ...identityOverrides,
+  });
+  supervisor.control = async (_config, action) => {
+    actions.push(action);
+    return { status: "ok", accepting_turns: false, active_http_turns: 0, active_browser_turns: 0 };
+  };
+  supervisor.waitForChildExit = async () => {};
+  supervisor.waitForPortRelease = async () => {};
+  supervisor.daemon = child;
+  try {
+    await assert.rejects(supervisor.stopForSetup(), /matching.*evidence/);
+    assert.deepEqual(actions, []);
+    observedPid = child.pid;
+    for (const override of [{ service: "another-service" }, { version: "another-version" }, { mode: "full" }]) {
+      identityOverrides = override;
+      await assert.rejects(supervisor.stopForSetup(), /matching.*evidence/);
+      assert.deepEqual(actions, []);
+    }
+    identityOverrides = {};
+    assert.deepEqual(await supervisor.stopForSetup(), { status: "stopped" });
+    assert.deepEqual(actions, ["drain", "shutdown"]);
+    assert.equal(supervisor.daemon, null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("packaged runtime paths are native on Windows and Unix", () => {
   const windows = packagedRuntimePaths("C:\\Program Files\\Codex\\resources", "win32");
   assert.equal(path.basename(windows.executable), "bun.exe");

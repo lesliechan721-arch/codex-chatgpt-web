@@ -588,7 +588,9 @@ class RuntimeSupervisor {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`http://${config.host}:${config.port}/healthz`, { signal: controller.signal });
-      if (!response.ok) return null;
+      // A degraded broker still has a live daemon identity. Keep that evidence for controlled
+      // drain/shutdown; proxyHealth separately requires status=ok before accepting new work.
+      if (!response.ok && response.status !== 503) return null;
       return await response.json();
     } catch {
       return null;
@@ -605,6 +607,16 @@ class RuntimeSupervisor {
       && body?.version === config.releaseVersion
       && (expectedPid === undefined || body?.pid === expectedPid)
       && (!requireAccepting || body?.accepting_turns === true);
+  }
+
+  async proxyIdentity(config, timeoutMs = 2_000, expectedPid) {
+    const body = await this.proxyHealthPayload(config, timeoutMs);
+    // Readiness gates new work; identity gates authenticated drain/shutdown even when degraded.
+    return body?.service === "codex-chatgpt-web"
+      && ["ok", "degraded"].includes(body?.status)
+      && body?.mode === config.mode
+      && body?.version === config.releaseVersion
+      && Number.isInteger(expectedPid) && expectedPid > 0 && body?.pid === expectedPid;
   }
 
   async waitForProxy(config, timeoutMs = 20_000) {
@@ -1387,8 +1399,8 @@ class RuntimeSupervisor {
   async cleanupFailedStart(config) {
     if (this.daemon) {
       const child = this.daemon;
-      const healthy = Number.isInteger(child.pid) && await this.proxyHealth(config, 2_000, child.pid);
-      if (healthy) {
+      const identified = Number.isInteger(child.pid) && await this.proxyIdentity(config, 2_000, child.pid);
+      if (identified) {
         let drained = false;
         try {
           drained = await this.acquireDrain(config);
@@ -2002,8 +2014,8 @@ class RuntimeSupervisor {
       if (this.daemon && config) {
         const daemonPid = this.daemon.pid;
         if (!Number.isInteger(daemonPid)
-          || !await this.proxyHealth(config, 2_000, daemonPid)) {
-          throw new Error("launcher-owned daemon did not provide matching health evidence");
+          || !await this.proxyIdentity(config, 2_000, daemonPid)) {
+          throw new Error("launcher-owned daemon did not provide matching identity evidence");
         }
         drained = await this.acquireDrain(config);
       }
