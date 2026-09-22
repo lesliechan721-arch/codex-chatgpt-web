@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { isCodexThreadTitleRequestFromBody } from "../src/adapters/chatgpt-web/environment";
 import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { defaultConfig } from "../src/config";
 import { responseRequest } from "../src/server";
@@ -19,6 +20,36 @@ function titleBody(model: string, requestKind = "turn") {
       }),
     },
     input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+  };
+}
+
+function systemTitleFallbackBody(model: string) {
+  return {
+    model,
+    stream: false,
+    reasoning: { effort: "low" },
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        thread_source: "system",
+      }),
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "response",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 36 },
+          },
+          required: ["title"],
+          additionalProperties: false,
+        },
+      },
+    },
   };
 }
 
@@ -78,6 +109,33 @@ test("thread_title maps chatgpt-web models to Luna and forwards directly", async
   expect(bodies).toHaveLength(1);
   expect(bodies[0]!.model).toBe("gpt-5.6-luna");
   expect(bodies[0]!.reasoning).toEqual({ effort: "low" });
+});
+
+test("system title compatibility fallback bypasses delegated Web routing", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const response = await responseRequest(
+    request(systemTitleFallbackBody("chatgpt-web/high")),
+    { ...defaultConfig(), toolAuthorityMode: "delegated" },
+    () => { throw new Error("Web adapter must not start for the title-generation thread"); },
+    {
+      accessPolicy: OPENAI_ACCESS,
+      fetchNative: async upstream => {
+        bodies.push(await upstream.clone().json() as Record<string, unknown>);
+        return Response.json({ ok: true });
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0]!.model).toBe("gpt-5.6-luna");
+});
+
+test("system structured requests without the Codex title schema are not treated as thread titles", () => {
+  const body = systemTitleFallbackBody("chatgpt-web/high");
+  body.text.format.schema.properties.title.maxLength = 72;
+
+  expect(isCodexThreadTitleRequestFromBody(body)).toBe(false);
 });
 
 test("thread_title direct routing binds and completes the remote idle lifecycle for native and Web models", async () => {

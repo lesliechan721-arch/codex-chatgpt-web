@@ -14,6 +14,7 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  isCodexGuardianReviewRequestFromBody,
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
@@ -666,36 +667,18 @@ function jsonRequestWithBody(request: Request, body: Record<string, unknown>): R
   });
 }
 
-async function threadTitleRequest(
+async function directResponsesRequest(
   request: Request,
   raw: Record<string, unknown>,
-  requestedModel: string,
-  config: AppConfig,
+  upstreamModel: string,
   accessPolicy: ApiAccessPolicy,
   options: ResponseRequestOptions,
+  apiKeyModelError: string,
 ): Promise<Response> {
-  const webModel = isChatGptWebModelSlug(requestedModel);
-  if (webModel) {
-    try {
-      requireChatGptWebModelRoute(requestedModel, config);
-    } catch (error) {
-      return formatErrorResponse(
-        400,
-        "invalid_request_error",
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-  }
-  const upstreamModel = webModel ? CHATGPT_WEB_LUNA_BACKEND_MODEL : requestedModel;
-
   if (accessPolicy.mode === "api-key") {
     const runtime = options.upstreamRuntime;
     if (!runtime?.config || !upstreamModelAllowed(upstreamModel, runtime.config)) {
-      return apiAccessError(
-        400,
-        "model_not_supported",
-        "Thread title generation requires a model enabled by the configured upstream provider",
-      );
+      return apiAccessError(400, "model_not_supported", apiKeyModelError);
     }
   }
 
@@ -728,11 +711,11 @@ async function threadTitleRequest(
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
 
-  const forwardedBody = upstreamModel === requestedModel ? raw : { ...raw, model: upstreamModel };
+  const forwardedBody = raw.model === upstreamModel ? raw : { ...raw, model: upstreamModel };
   const lifecycleRequest = turnIdleSignal
     ? new Request(request, { signal: AbortSignal.any([request.signal, turnIdleSignal]) })
     : request;
-  const forwardedRequest = upstreamModel === requestedModel
+  const forwardedRequest = raw.model === upstreamModel
     ? lifecycleRequest
     : jsonRequestWithBody(lifecycleRequest, forwardedBody);
   try {
@@ -782,6 +765,139 @@ async function threadTitleRequest(
   }
 }
 
+async function threadTitleRequest(
+  request: Request,
+  raw: Record<string, unknown>,
+  requestedModel: string,
+  config: AppConfig,
+  accessPolicy: ApiAccessPolicy,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  const webModel = isChatGptWebModelSlug(requestedModel);
+  if (webModel) {
+    try {
+      requireChatGptWebModelRoute(requestedModel, config);
+    } catch (error) {
+      return formatErrorResponse(
+        400,
+        "invalid_request_error",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+  const upstreamModel = webModel ? CHATGPT_WEB_LUNA_BACKEND_MODEL : requestedModel;
+  return directResponsesRequest(
+    request,
+    raw,
+    upstreamModel,
+    accessPolicy,
+    options,
+    "Thread title generation requires a model enabled by the configured upstream provider",
+  );
+}
+
+const CODEX_AUTO_REVIEW_MODEL = "codex-auto-review";
+
+async function guardianReviewModel(
+  request: Request,
+  config: AppConfig,
+  accessPolicy: ApiAccessPolicy,
+  options: ResponseRequestOptions,
+): Promise<string | Response> {
+  const headers = new Headers(request.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("content-type");
+  const catalogUrl = new URL(request.url);
+  catalogUrl.pathname = "/v1/models";
+  catalogUrl.search = "";
+  const catalogResponse = await modelsRequest(
+    new Request(catalogUrl, { method: "GET", headers, signal: request.signal }),
+    config,
+    options.fetchNative,
+    undefined,
+    accessPolicy,
+    undefined,
+    options.upstreamRuntime,
+    options.fetchUpstreamProvider,
+  );
+  if (!catalogResponse.ok) return catalogResponse;
+
+  let catalog: unknown;
+  try {
+    catalog = await catalogResponse.json();
+  } catch (error) {
+    return formatErrorResponse(
+      502,
+      "invalid_response_error",
+      "Could not read the model catalog for Codex approval review: "
+        + (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)
+    || !Array.isArray((catalog as { models?: unknown }).models)) {
+    return formatErrorResponse(
+      502,
+      "invalid_response_error",
+      "Model catalog for Codex approval review is missing a models array",
+    );
+  }
+  const slugs = new Set(
+    ((catalog as { models: unknown[] }).models).flatMap(model => (
+      model && typeof model === "object" && !Array.isArray(model)
+        && typeof (model as { slug?: unknown }).slug === "string"
+        ? [(model as { slug: string }).slug]
+        : []
+    )),
+  );
+  if (slugs.has(CODEX_AUTO_REVIEW_MODEL)) return CODEX_AUTO_REVIEW_MODEL;
+  if (slugs.has(CHATGPT_WEB_LUNA_BACKEND_MODEL)) return CHATGPT_WEB_LUNA_BACKEND_MODEL;
+  return apiAccessError(
+    400,
+    "model_not_supported",
+    "Codex approval review requires codex-auto-review or gpt-5.6-luna",
+  );
+}
+
+async function guardianReviewRequest(
+  request: Request,
+  raw: Record<string, unknown>,
+  requestedModel: string,
+  config: AppConfig,
+  accessPolicy: ApiAccessPolicy,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  if (!isChatGptWebModelSlug(requestedModel)) {
+    return directResponsesRequest(
+      request,
+      raw,
+      requestedModel,
+      accessPolicy,
+      options,
+      "Codex approval review requires a model enabled by the configured upstream provider",
+    );
+  }
+  try {
+    requireChatGptWebModelRoute(requestedModel, config);
+  } catch (error) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  const model = await guardianReviewModel(request, config, accessPolicy, options);
+  if (model instanceof Response) return model;
+  return directResponsesRequest(
+    request,
+    raw,
+    model,
+    accessPolicy,
+    options,
+    "Codex approval review requires codex-auto-review or gpt-5.6-luna enabled by the configured upstream provider",
+  );
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
@@ -817,7 +933,8 @@ export async function responseRequest(
     ? (raw as { model?: unknown }).model
     : undefined;
   const threadTitle = isCodexThreadTitleRequestFromBody(raw);
-  if (!threadTitle) {
+  const guardianReview = isCodexGuardianReviewRequestFromBody(raw);
+  if (!threadTitle && !guardianReview) {
     const rejectedModel = requireWebModelInApiKeyMode(requestedModel, accessPolicy, options.upstreamRuntime);
     if (rejectedModel) return rejectedModel;
   }
@@ -826,6 +943,19 @@ export async function responseRequest(
       return apiAccessError(400, "model_not_supported", "Thread title generation requires a model");
     }
     return await threadTitleRequest(
+      nativeRequest,
+      raw as Record<string, unknown>,
+      requestedModel,
+      config,
+      accessPolicy,
+      options,
+    );
+  }
+  if (guardianReview) {
+    if (typeof requestedModel !== "string" || !requestedModel) {
+      return apiAccessError(400, "model_not_supported", "Codex approval review requires a model");
+    }
+    return await guardianReviewRequest(
       nativeRequest,
       raw as Record<string, unknown>,
       requestedModel,

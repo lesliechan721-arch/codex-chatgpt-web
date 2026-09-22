@@ -115,7 +115,34 @@ function clientTurnMetadataFromBody(value: unknown): Record<string, unknown> | u
 
 export function isCodexThreadTitleRequestFromBody(value: unknown): boolean {
   const metadata = clientTurnMetadataFromBody(value);
-  return metadata?.request_kind === "turn" && metadata?.thread_source === "thread_title";
+  if (metadata?.request_kind !== "turn") return false;
+  if (metadata.thread_source === "thread_title") return true;
+  if (metadata.thread_source !== "system") return false;
+
+  const body = record(value);
+  const text = record(body?.text);
+  const format = record(text?.format);
+  const schema = record(format?.schema);
+  const properties = record(schema?.properties);
+  const title = record(properties?.title);
+  const required = schema?.required;
+  return format?.type === "json_schema"
+    && schema?.type === "object"
+    && schema?.additionalProperties === false
+    && properties !== undefined
+    && Object.keys(properties).length === 1
+    && title?.type === "string"
+    && title.minLength === 1
+    && title.maxLength === 36
+    && Array.isArray(required)
+    && required.length === 1
+    && required[0] === "title";
+}
+
+export function isCodexGuardianReviewRequestFromBody(value: unknown): boolean {
+  const metadata = clientTurnMetadataFromBody(value);
+  return metadata?.request_kind === "turn"
+    && (metadata.thread_source === "guardian_review" || metadata.turn_trigger === "guardian_review");
 }
 
 function clientTurnMetadata(parsed: CodexParsedRequest): Record<string, unknown> | undefined {
