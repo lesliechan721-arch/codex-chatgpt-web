@@ -5,6 +5,8 @@ export interface CodexParsedRequest {
   stream: boolean;
   options: CodexRequestOptions;
   _rawBody?: unknown;
+  /** Set only by the trusted Web route, never parsed from caller-supplied model metadata. */
+  _chatgptModelFamily?: "5.6" | "6";
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**
@@ -14,6 +16,8 @@ export interface CodexParsedRequest {
   _compactionRequest?: boolean;
   /** Local Responses compaction consumes assistant text; remote compaction consumes an item. */
   _compactionOutput?: "message";
+  /** Native compact.rs text compaction also consumes assistant text instead of a compaction item. */
+  _compactionResponseFormat?: "message";
   /**
    * Native Codex compaction can rebuild retained message ids. ChatGPT Web fills this map only
    * after the canonical rollout proves an exact replacement-history identity mapping.
@@ -317,8 +321,12 @@ export interface CodexProviderConfig {
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
-    /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
+    /** Experimental transport: adapt one context across one, two, or six ChatGPT messages. */
     experimentalBiggerContext?: boolean;
     experimentalSkillAttachments?: boolean;
+    /** Explicitly rebuild each automatic turn in a fresh browser conversation. */
+    experimentalFreshConversationPerTurn?: boolean;
+    /** Use ordinary ChatGPT history for task conversations. Default: Temporary Chat. */
+    useSavedChats?: boolean;
   };
 }

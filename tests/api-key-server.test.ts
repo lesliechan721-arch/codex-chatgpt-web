@@ -83,6 +83,7 @@ test("API-key model catalog never calls upstream or the installed OAuth catalog 
 test("API-key model catalog publishes only selected discovered upstream rows and keeps the local Web namespace", async () => {
   const runtime = upstream();
   const cfg = config();
+  const localModelId = buildStandaloneModelCatalog(cfg).data[0]!.id;
   let forwarded: Request | undefined;
   const response = await modelsRequest(
     new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}`, cookie: "private=1" } }),
@@ -99,7 +100,7 @@ test("API-key model catalog publishes only selected discovered upstream rows and
         data: [
           { id: "gpt-upstream", object: "model" },
           { id: "claude-filtered", object: "model" },
-          { id: "chatgpt-web/high", object: "model", owned_by: "must-not-win" },
+          { id: localModelId, object: "model", owned_by: "must-not-win" },
         ],
         models: [
           { slug: "gpt-rich", display_name: "Rich upstream", visibility: "list", supported_in_api: true,
@@ -119,7 +120,7 @@ test("API-key model catalog publishes only selected discovered upstream rows and
   assert.equal(forwarded?.headers.get("authorization"), `Bearer ${providerKey}`);
   assert.equal(forwarded?.headers.get("cookie"), null);
   const payload = await response.json() as { data: Array<{ id: string; owned_by?: string }>; models: Array<{ slug: string }> };
-  assert.equal(payload.data.filter(row => row.id === "chatgpt-web/high").length, 1);
+  assert.equal(payload.data.filter(row => row.id === localModelId).length, 1);
   assert.ok(payload.data.some(row => row.id === "gpt-upstream"));
   assert.ok(!payload.data.some(row => row.id === "claude-filtered"));
   assert.ok(payload.models.some(row => row.slug === "gpt-rich"));

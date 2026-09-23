@@ -9,11 +9,13 @@ import {
   chatGptTurnUserRevisionHistory,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
+  extractChatGptSteeringEnvironmentClaim,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptRolloutEnvironmentMarker,
   hasCurrentChatGptEnvironmentContext,
+  hasChatGptCalendarEnvironmentDelta,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
@@ -413,12 +415,16 @@ export class ChatGptThreadEnvironmentStore {
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       const rolloutMarker = hasCurrentContext && !currentCompaction
         && hasCurrentChatGptRolloutEnvironmentMarker(parsed);
-      if (hasCurrentContext && !currentCompaction && !historicalMessages && !rolloutMarker) {
+      const steeringClaim = hasCurrentContext && !currentCompaction
+        ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
+      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
+      if (hasCurrentContext && !currentCompaction
+        && !historicalMessages && !rolloutMarker && !steeringClaim && !calendarDelta) {
         diagnostics.recovery_stage = "current_update_rejected";
         throw error;
       }
       if (currentCompaction) diagnostics.recovery_stage = "compaction_claim";
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       diagnostics.rollout_lookup = "identity_unavailable";
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -446,9 +452,12 @@ export class ChatGptThreadEnvironmentStore {
         }
         diagnostics.rollout_lookup = rolloutEnvironment ? "hit" : "miss";
         if (rolloutEnvironment) {
+          if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
+            throw new Error("Calendar environment delta conflicts with its current Codex rollout");
+          }
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
             throw new TrustedCodexEnvironmentValidationError(
-              "Compaction continuation environment conflicts with its current Codex rollout",
+              `${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`,
             );
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment, parsed);

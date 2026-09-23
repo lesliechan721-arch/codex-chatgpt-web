@@ -41,8 +41,12 @@ afterEach(() => {
 const api = () => saveApiAccessPolicy(apiKeyPolicy("a".repeat(40)));
 function injected() {
   saveApiAccessPolicy(OPENAI_ACCESS);
-  writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "custom"\n[model_providers.custom]\nname = "Own provider"\n');
+  writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "openai"\n[model_providers.custom]\nname = "Own provider"\n');
   const config = defaultConfig(); saveConfig(config); installCodexIntegration(config);
+  writeFileSync(
+    getCodexConfigPath(),
+    readFileSync(getCodexConfigPath(), "utf8").replace('model_provider = "openai"', 'model_provider = "custom"'),
+  );
   api(); return config;
 }
 
@@ -133,10 +137,14 @@ test("API preflight accepts manual providers and creates no Codex injection", ()
 test("manual server mode leaves recorded Codex client files byte-for-byte unchanged on API enable, rotate and serve", async () => {
   const port = await unusedPort();
   saveApiAccessPolicy(OPENAI_ACCESS);
-  writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "custom"\n[model_providers.custom]\nname = "Own provider"\n');
+  writeFileSync(getCodexConfigPath(), '# User config\nmodel_provider = "openai"\n[model_providers.custom]\nname = "Own provider"\n');
   const config = { ...defaultConfig(), port };
   saveConfig(config);
   installCodexIntegration(config);
+  writeFileSync(
+    getCodexConfigPath(),
+    readFileSync(getCodexConfigPath(), "utf8").replace('model_provider = "openai"', 'model_provider = "custom"'),
+  );
   const before = clientFileSnapshot();
 
   const enabled = cli(["api-key", "enable", "--generate"]);
