@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "b5bffd3ec4db487e7e3dec59663875b0ef7b72ca",
+  "revision": "408a77dc1a1cf95413df26b5185623cf245161d7",
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "definitions": {
@@ -75,6 +75,48 @@
         },
         "type": "object"
       },
+      "CodeModeToolMessages": {
+        "description": "Model-owned instructions for Code Mode's exec and wait tools.",
+        "properties": {
+          "deferred_nested_tools_guidance": {
+            "description": "Literal guidance appended when deferred nested tools exist. Missing or null uses bundled text; an empty string omits the section.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exec": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Instructional template supporting `{{ default_exec_yield_time_ms }}` and `{{ image_helper }}`. Runtime tool declarations are appended. Unknown placeholders remain literal. Exec accepts raw JavaScript; `parameters` is not consumed and its grammar is unchanged."
+          },
+          "mcp_typescript_preamble": {
+            "description": "Literal shared TypeScript definitions, emitted when Code Mode Only exposes MCP results. Missing or null uses bundled definitions; an empty string omits the section. Custom definitions must remain compatible with the generated tool declarations.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Complete description and JSON parameter schema, selected independently."
+          }
+        },
+        "type": "object"
+      },
       "CollaborationModeMessages": {
         "properties": {
           "default": {
@@ -120,19 +162,18 @@
         },
         "type": "object"
       },
+      "CyberAccessProgram": {
+        "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
+        "enum": [
+          "standard",
+          "daybreak_blue",
+          "daybreak_red"
+        ],
+        "type": "string"
+      },
       "GuardianModelPolicy": {
-        "description": "A complete model policy. Omitted scopes are disabled; unknown fields are ignored.",
+        "description": "A complete model policy. Omitted scopes are disabled; unknown fields are ignored. Code Mode wrappers have no approval scope; their nested tools follow this policy.",
         "properties": {
-          "code_mode": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/GuardianReviewMode"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "computer_use": {
             "anyOf": [
               {
@@ -151,6 +192,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "initial_cua_call": {
+            "description": "Omission retains the existing allowance for adaptive computer use.",
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "mcp": {
@@ -173,6 +221,15 @@
               }
             ]
           },
+          "other_tools": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/GuardianReviewMode"
+              }
+            ],
+            "default": "disabled",
+            "description": "Coverage for tools without an approval category."
+          },
           "permissions": {
             "anyOf": [
               {
@@ -181,6 +238,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "sandboxed_exec_commands": {
+            "description": "Whether adaptive shell coverage includes ordinary sandboxed commands.",
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "shell": {
@@ -192,6 +256,14 @@
                 "type": "null"
               }
             ]
+          },
+          "unscored_action": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/GuardianUnscoredAction"
+              }
+            ],
+            "default": "invalidate_score"
           }
         },
         "type": "object"
@@ -215,6 +287,15 @@
             "type": "string"
           }
         ]
+      },
+      "GuardianUnscoredAction": {
+        "description": "How actions outside adaptive coverage affect cached classification evidence.",
+        "enum": [
+          "ignore",
+          "age_score",
+          "invalidate_score"
+        ],
+        "type": "string"
       },
       "GuardianV2ModelConfig": {
         "description": "Optional model-owned defaults for Guardian v2 classification experiments.",
@@ -381,6 +462,21 @@
           }
         ]
       },
+      "ModelAccessPrograms": {
+        "properties": {
+          "cyber": {
+            "description": "Accepted explicit selections. An empty list is distinct from missing metadata.",
+            "items": {
+              "$ref": "#/definitions/CyberAccessProgram"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cyber"
+        ],
+        "type": "object"
+      },
       "ModelAvailabilityNux": {
         "properties": {
           "message": {
@@ -438,7 +534,7 @@
         "type": "object"
       },
       "ModelMessages": {
-        "description": "A strongly-typed template for assembling model instructions and developer messages.\n\nWhen `instructions_variables` is absent, `instructions_template` is treated as literal text. When variables are present but incomplete, missing values render as empty strings.",
+        "description": "A strongly-typed template for assembling model instructions and developer messages.\n\n`instructions_template` is literal text. The deprecated `instructions_variables` field is retained to decode catalogs produced before personality selection was removed.",
         "properties": {
           "approvals": {
             "anyOf": [
@@ -689,6 +785,73 @@
         },
         "type": "object"
       },
+      "MultiAgentToolMessages": {
+        "description": "Model-owned descriptions and parameters for Multi-Agent V2 tools, independent of their namespace.",
+        "properties": {
+          "followup_task": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "interrupt_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "list_agents": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "send_message": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "spawn_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Replaces the static description. Missing or null uses the bundled text; an empty string suppresses it. Generated model information and local usage hints are retained."
+          },
+          "wait_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "MultiAgentVersion": {
         "enum": [
           "disabled",
@@ -771,7 +934,14 @@
         "description": "Model-owned messages for a built-in tool.",
         "properties": {
           "description": {
-            "description": "Missing or null uses the built-in description; an empty string leaves the description empty without disabling the tool.",
+            "description": "Missing or null uses the built-in description; an empty string suppresses its static text without disabling the tool. Tool-owned runtime guidance is retained.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameters": {
+            "description": "Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools and Code Mode wait. Uses the harness's supported schema subset; unrecognized keywords are ignored. Missing, null, invalid or unsupported structures, or a root without `type: \"object\"` retains the harness parameters. Schema semantics must remain API-compatible. Overrides must declare harness-encrypted properties so their annotations can be retained. Argument handling is unchanged.",
             "type": [
               "string",
               "null"
@@ -783,6 +953,26 @@
       "ToolMessages": {
         "description": "Model-owned messages for built-in tools.",
         "properties": {
+          "code_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/CodeModeToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "multi_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/MultiAgentToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "send_user_message_async": {
             "anyOf": [
               {
@@ -888,6 +1078,16 @@
           }
         ]
       },
+      "available_access_programs": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/ModelAccessPrograms"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "comp_hash": {
         "description": "Opaque identifier for compaction-compatible model configurations.",
         "type": [
@@ -966,7 +1166,7 @@
             "type": "null"
           }
         ],
-        "description": "Model-owned approval coverage. Absent preserves legacy settings; an empty map disables ordinary Guardian review. Keys are computer_use, shell, code_mode, file_changes, mcp, network, and permissions. This does not override mandatory safety or administrator requirements."
+        "description": "Model-owned approval coverage. Absent preserves legacy settings; an empty map disables ordinary Guardian review. Keys are computer_use, shell, file_changes, mcp, network, and permissions. This does not override mandatory safety or administrator requirements."
       },
       "include_apps_usage_instructions": {
         "default": true,
@@ -1080,6 +1280,11 @@
       },
       "supports_image_detail_original": {
         "default": false,
+        "type": "boolean"
+      },
+      "supports_reasoning_effort_updates": {
+        "default": false,
+        "description": "Whether the model accepts reasoning-effort `configuration_update` items. Missing metadata keeps effort changes on the ordinary request parameter.",
         "type": "boolean"
       },
       "supports_reasoning_summary_parameter": {

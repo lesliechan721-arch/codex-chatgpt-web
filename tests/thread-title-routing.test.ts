@@ -107,7 +107,7 @@ test("thread_title maps chatgpt-web models to Luna and forwards directly", async
 
   expect(response.status).toBe(200);
   expect(bodies).toHaveLength(1);
-  expect(bodies[0]!.model).toBe("gpt-5.6-luna");
+  expect(bodies[0]!.model).toBe("gpt-6-luna");
   expect(bodies[0]!.reasoning).toEqual({ effort: "low" });
 });
 
@@ -128,7 +128,7 @@ test("system title compatibility fallback bypasses delegated Web routing", async
 
   expect(response.status).toBe(200);
   expect(bodies).toHaveLength(1);
-  expect(bodies[0]!.model).toBe("gpt-5.6-luna");
+  expect(bodies[0]!.model).toBe("gpt-6-luna");
 });
 
 test("system structured requests without the Codex title schema are not treated as thread titles", () => {
@@ -316,7 +316,7 @@ test("thread_title Web routing uses the configured API-key model selection witho
       baseUrl: "https://provider.example/openai/v1/",
       apiKeySha256: upstreamApiKeyDigest(providerKey),
       proxy: { mode: "direct" },
-      models: [{ id: "gpt-5.6-luna" }],
+      models: [{ id: "gpt-6-luna" }],
       supportsOpenAiServerCompaction: false,
     },
   };
@@ -340,7 +340,7 @@ test("thread_title Web routing uses the configured API-key model selection witho
     ["POST", "https://provider.example/openai/v1/responses"],
   ]);
   expect(seen[0]!.headers.get("authorization")).toBe(`Bearer ${providerKey}`);
-  expect((await seen[0]!.json() as { model: string }).model).toBe("gpt-5.6-luna");
+  expect((await seen[0]!.json() as { model: string }).model).toBe("gpt-6-luna");
 });
 
 test("thread_title rejects an API-key Web route when mapped Luna is not selected", async () => {

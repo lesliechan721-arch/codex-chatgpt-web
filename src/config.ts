@@ -557,7 +557,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
   const manual = config.browserInteractionMode === "manual";
   const model = manual
     ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
-    : config.solAvailable ? "gpt-5.6-sol" : "gpt-5.6-luna";
+    : config.solAvailable ? "gpt-5.6-sol" : "gpt-6-luna";
   const models = manual
     ? [
       CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,

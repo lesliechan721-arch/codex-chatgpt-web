@@ -92,7 +92,7 @@ async function routeGuardian(
 
 test("Guardian review prefers codex-auto-review and bypasses the Web adapter", async () => {
   const { response, requests } = await routeGuardian([
-    nativeModel("gpt-5.6-luna"),
+    nativeModel("gpt-6-luna"),
     nativeModel("codex-auto-review", "hide"),
   ]);
 
@@ -106,12 +106,12 @@ test("Guardian review prefers codex-auto-review and bypasses the Web adapter", a
 
 test("Guardian review falls back to Luna when codex-auto-review is absent", async () => {
   const { response, requests } = await routeGuardian([
-    nativeModel("gpt-5.6-luna"),
+    nativeModel("gpt-6-luna"),
   ]);
 
   expect(response.status).toBe(200);
   expect(requests).toHaveLength(2);
-  expect(requests[1]!.body?.model).toBe("gpt-5.6-luna");
+  expect(requests[1]!.body?.model).toBe("gpt-6-luna");
 });
 
 test("Guardian review rejects when neither review model exists", async () => {
@@ -127,7 +127,7 @@ test("Guardian review rejects when neither review model exists", async () => {
 
 test("Guardian review rejects unknown Web routes before model discovery", async () => {
   const { response, requests } = await routeGuardian(
-    [nativeModel("gpt-5.6-luna")],
+    [nativeModel("gpt-6-luna")],
     "chatgpt-web/not-enabled",
   );
 
@@ -139,7 +139,7 @@ test("Guardian review rejects unknown Web routes before model discovery", async 
 
 test("Guardian review rejects Web routes unavailable in the current browser mode before discovery", async () => {
   const { response, requests } = await routeGuardian(
-    [nativeModel("gpt-5.6-luna")],
+    [nativeModel("gpt-6-luna")],
     "chatgpt-web/high",
     { ...defaultConfig(), browserInteractionMode: "manual" },
   );
@@ -189,7 +189,7 @@ test("Guardian review uses the same interception in API-key mode", async () => {
       baseUrl: "https://provider.example/openai/v1/",
       apiKeySha256: upstreamApiKeyDigest(providerKey),
       proxy: { mode: "direct" },
-      models: [{ id: "codex-auto-review" }, { id: "gpt-5.6-luna" }],
+      models: [{ id: "codex-auto-review" }, { id: "gpt-6-luna" }],
       supportsOpenAiServerCompaction: false,
     },
   };
@@ -213,7 +213,7 @@ test("Guardian review uses the same interception in API-key mode", async () => {
         if (upstream.method === "GET") {
           return Response.json({
             object: "list",
-            data: [{ id: "codex-auto-review" }, { id: "gpt-5.6-luna" }],
+            data: [{ id: "codex-auto-review" }, { id: "gpt-6-luna" }],
           });
         }
         return Response.json({ status: "completed", output: [] });
@@ -239,13 +239,13 @@ test("Guardian review preserves supported native models in API-key mode", async 
       baseUrl: "https://provider.example/openai/v1/",
       apiKeySha256: upstreamApiKeyDigest(providerKey),
       proxy: { mode: "direct" },
-      models: [{ id: "gpt-5.6-luna" }],
+      models: [{ id: "gpt-6-luna" }],
       supportsOpenAiServerCompaction: false,
     },
   };
   const seen: Array<{ method: string; url: string; body?: Record<string, unknown> }> = [];
   const response = await responseRequest(
-    request(guardianBody("gpt-5.6-luna"), `Bearer ${localKey}`),
+    request(guardianBody("gpt-6-luna"), `Bearer ${localKey}`),
     defaultConfig(),
     () => { throw new Error("Web adapter must not start for Guardian review"); },
     {
@@ -268,7 +268,7 @@ test("Guardian review preserves supported native models in API-key mode", async 
   expect(seen.map(item => [item.method, item.url])).toEqual([
     ["POST", "https://provider.example/openai/v1/responses"],
   ]);
-  expect(seen[0]!.body?.model).toBe("gpt-5.6-luna");
+  expect(seen[0]!.body?.model).toBe("gpt-6-luna");
 });
 
 test("Guardian review rejects unsupported native models in API-key mode without discovery", async () => {
@@ -281,7 +281,7 @@ test("Guardian review rejects unsupported native models in API-key mode without 
       baseUrl: "https://provider.example/openai/v1/",
       apiKeySha256: upstreamApiKeyDigest(providerKey),
       proxy: { mode: "direct" },
-      models: [{ id: "gpt-5.6-luna" }],
+      models: [{ id: "gpt-6-luna" }],
       supportsOpenAiServerCompaction: false,
     },
   };

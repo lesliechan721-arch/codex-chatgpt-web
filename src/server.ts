@@ -855,7 +855,7 @@ async function guardianReviewModel(
   return apiAccessError(
     400,
     "model_not_supported",
-    "Codex approval review requires codex-auto-review or gpt-5.6-luna",
+    "Codex approval review requires codex-auto-review or gpt-6-luna",
   );
 }
 
@@ -894,7 +894,7 @@ async function guardianReviewRequest(
     model,
     accessPolicy,
     options,
-    "Codex approval review requires codex-auto-review or gpt-5.6-luna enabled by the configured upstream provider",
+    "Codex approval review requires codex-auto-review or gpt-6-luna enabled by the configured upstream provider",
   );
 }
 

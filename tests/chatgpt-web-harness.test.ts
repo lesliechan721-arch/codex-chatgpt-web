@@ -1419,7 +1419,7 @@ describe("ChatGPT outer-native harness v4", () => {
     };
     try {
       const request = rawWireRequest(environmentXml);
-      request.modelId = "gpt-5.6-luna";
+      request.modelId = "gpt-6-luna";
       request.options.reasoning = "low";
       const events: AdapterEvent[] = [];
       await expect(createChatGptWebAdapter(provider).runTurn!(
@@ -1501,7 +1501,7 @@ describe("ChatGPT outer-native harness v4", () => {
     };
 
     const request = rawWireRequest(environmentXml);
-    request.modelId = "gpt-5.6-luna";
+    request.modelId = "gpt-6-luna";
     request.options.reasoning = "low";
     const adapter = createChatGptWebAdapter(provider);
     try {

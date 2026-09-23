@@ -2302,7 +2302,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
     activeComposer: async () => composer,
   }, {
     locator: () => hiddenDialog,
-  }, "gpt-5.6-luna", "low", {
+  }, "gpt-6-luna", "low", {
     localToolsEnabled: true,
     solAvailable: false,
     extraHighAvailable: false, proAvailable: false,
@@ -2973,8 +2973,8 @@ test("browser preflight separates model context from one-message transport limit
   );
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(28_000, 19_808, "gpt-5.6-luna", "low", luna)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(28_001, 19_809, "gpt-5.6-luna", "low", luna)).toThrow(
+  expect(() => assertChatGptWebInputWithinLimits(28_000, 19_808, "gpt-6-luna", "low", luna)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(28_001, 19_809, "gpt-6-luna", "low", luna)).toThrow(
     "ChatGPT Free browser transport budget",
   );
 
@@ -3184,7 +3184,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     20_000,
     10_000,
-    "gpt-5.6-luna",
+    "gpt-6-luna",
     "low",
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     40_000,
@@ -3223,7 +3223,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000).effort).toBe("medium");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 104_000, 1_200_000).effort).toBe("max");
   expect(() => resolveChatGptWebMultipartStagingMode(
-    "gpt-5.6-luna",
+    "gpt-6-luna",
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     10_000,
     20_000,
