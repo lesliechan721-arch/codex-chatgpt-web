@@ -326,6 +326,7 @@ test("manual control keeps start idempotency separate from long Sent observation
         reused: false,
         deadlineAt: new Date(Date.now() + 30_000).toISOString(),
         state: "awaiting-user",
+        sentConfirmationRequired: args[6],
       };
     },
     waitManualSent: async (...args) => {
@@ -350,7 +351,10 @@ test("manual control keeps start idempotency separate from long Sent observation
       error() {},
     },
     getBrowserHost: () => host,
-    getPreferences: () => ({ browserInteractionMode: "manual" }),
+    getPreferences: () => ({
+      browserInteractionMode: "manual",
+      zeroRiskRequireSentConfirmation: true,
+    }),
   }).start();
   const descriptor = server.descriptor();
   const post = (path, body) => fetch(`${descriptor.endpoint}${path}`, {
@@ -366,6 +370,7 @@ test("manual control keeps start idempotency separate from long Sent observation
       resumePrompt: "incremental prompt",
       conversationKey: "c".repeat(64),
       compaction: true,
+      sentConfirmationRequired: true,
     })).status, 200);
     assert.equal((await post("/v1/manual/wait-sent", owner)).status, 200);
     assert.equal((await post("/v1/manual/wait-terminal", owner)).status, 200);
@@ -375,11 +380,110 @@ test("manual control keeps start idempotency separate from long Sent observation
     assert.equal(calls[0][3], prompt);
     assert.equal(calls[0][5], "incremental prompt");
     assert.equal(calls[0][6], true);
+    assert.equal(calls[0][7], true);
+    assert.equal(calls[0][8], true);
     assert.equal(calls[1][0], "wait");
     assert.equal(calls[2][0], "wait-terminal");
+    assert.deepEqual(calls[3], ["started", owner.traceId, owner.helperPid]);
     assert.equal(logs.some(([, detail]) => JSON.stringify(detail).includes(prompt)), false);
   } finally {
     await server.close();
+  }
+});
+
+test("manual control captures the Launcher Sent confirmation preference at turn start", async () => {
+  const calls = [];
+  const host = {
+    browserInteractionMode: () => "manual",
+    beginManualTurn: (...args) => {
+      calls.push(["start", ...args]);
+      return {
+        tabId: "manual-tab",
+        reused: false,
+        deadlineAt: new Date(Date.now() + 300_000).toISOString(),
+        state: "awaiting-user",
+        sentConfirmationRequired: args[6],
+      };
+    },
+    markManualTurnStarted: (...args) => calls.push(["started", ...args]),
+  };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} },
+    getBrowserHost: () => host,
+    getPreferences: () => ({
+      browserInteractionMode: "manual",
+      zeroRiskRequireSentConfirmation: false,
+    }),
+  }).start();
+  const descriptor = server.descriptor();
+  const headers = { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" };
+  const owner = { traceId: "manualPolicy123", helperPid: process.pid };
+  try {
+    const start = await fetch(`${descriptor.endpoint}/v1/manual/start`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...owner, prompt: "private prompt", sentConfirmationRequired: false }),
+    });
+    assert.equal(start.status, 200);
+    assert.equal((await start.json()).sentConfirmationRequired, false);
+    const started = await fetch(`${descriptor.endpoint}/v1/manual/started`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(owner),
+    });
+    assert.equal(started.status, 200);
+    assert.deepEqual(calls[0].slice(-2), [false, false]);
+    assert.deepEqual(calls[1], ["started", owner.traceId, owner.helperPid]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("manual start fails closed for both Sent policy mismatch directions", async () => {
+  for (const [launcherPolicy, expectedPolicy] of [[true, false], [false, true]]) {
+    const server = await new BrowserControlServer({
+      logger: { info() {}, warn() {}, error() {} },
+      getBrowserHost: () => ({
+        browserInteractionMode: () => "manual",
+        beginManualTurn: (...args) => {
+          const capturedPolicy = args[6];
+          const callerPolicy = args[7];
+          if (capturedPolicy !== callerPolicy) {
+            const error = new Error("Sent confirmation policy mismatch");
+            error.code = "manual_sent_policy_mismatch";
+            throw error;
+          }
+          throw new Error("mismatch must fail before creating a manual turn");
+        },
+      }),
+      getPreferences: () => ({
+        browserInteractionMode: "manual",
+        zeroRiskRequireSentConfirmation: launcherPolicy,
+      }),
+    }).start();
+    const descriptor = server.descriptor();
+    try {
+      const response = await fetch(`${descriptor.endpoint}/v1/manual/start`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${descriptor.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          traceId: `manualPolicy${launcherPolicy}${expectedPolicy}`,
+          helperPid: process.pid,
+          prompt: "private prompt",
+          sentConfirmationRequired: expectedPolicy,
+        }),
+      });
+      assert.equal(response.status, 409);
+      assert.deepEqual(await response.json(), {
+        error: "Sent confirmation policy mismatch",
+        code: "manual_sent_policy_mismatch",
+      });
+    } finally {
+      await server.close();
+    }
   }
 });
 

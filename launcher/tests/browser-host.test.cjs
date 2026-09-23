@@ -20,14 +20,16 @@ const {
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
+  MANUAL_CONNECTOR_BIND_TIMEOUT_MS,
   MANUAL_SUBMIT_TIMEOUT_MS,
   navigationErrorForLog,
   navigationOriginForLog,
 } = require("../electron/browser-host.cjs");
 
-test("manual prompt handoff keeps ordinary turns at one minute and compaction at two minutes", () => {
+test("manual prompt handoff keeps bounded confirmation windows", () => {
   assert.equal(MANUAL_SUBMIT_TIMEOUT_MS, 60_000);
   assert.equal(MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS, 120_000);
+  assert.equal(MANUAL_CONNECTOR_BIND_TIMEOUT_MS, 300_000);
 });
 
 test("Electron and Bun agree on the exact launcher idle surface", () => {
@@ -2734,7 +2736,14 @@ function manualTurnFixture() {
     showWindow() {},
     show() {},
     writeDescriptor() {},
-    createManualTurnTab(traceId, helperPid, conversationKey, prompt, manualSubmitTimeoutMs) {
+    createManualTurnTab(
+      traceId,
+      helperPid,
+      conversationKey,
+      prompt,
+      manualSubmitTimeoutMs,
+      manualSentConfirmationRequired,
+    ) {
       const tab = {
         id: `manual-${this.turnTabs.size + 1}`,
         traceId,
@@ -2745,6 +2754,7 @@ function manualTurnFixture() {
         loading: false,
         label: `ChatGPT ${this.turnTabs.size + 1}`,
         manualState: "awaiting-user",
+        manualSentConfirmationRequired,
         manualSubmitTimeoutMs,
         manualDeadlineAt: Date.now() + manualSubmitTimeoutMs,
         manualDeadlineTimer: null,
@@ -2770,10 +2780,20 @@ function manualTurnFixture() {
 test("manual start is idempotent and never exposes its private prompt in snapshots", () => {
   const { fixture, clipboardWrites } = manualTurnFixture();
   const first = fixture.beginManualTurn("manual_trace_1", process.pid, "private prompt", "a".repeat(64));
-  const second = fixture.beginManualTurn("manual_trace_1", process.pid, "private prompt", "a".repeat(64));
+  const second = fixture.beginManualTurn(
+    "manual_trace_1",
+    process.pid,
+    "private prompt",
+    "a".repeat(64),
+    undefined,
+    false,
+    false,
+    true,
+  );
   assert.equal(first.tabId, second.tabId);
   assert.equal(first.reused, false);
   assert.equal(second.reused, true);
+  assert.equal(second.sentConfirmationRequired, true);
   assert.deepEqual(clipboardWrites, ["private prompt"]);
   assert.equal(JSON.stringify(fixture.snapshot()).includes("private prompt"), false);
   for (const tab of fixture.turnTabs.values()) clearTimeout(tab.manualDeadlineTimer);
@@ -2868,6 +2888,111 @@ test("manual completion is idempotent and cannot be downgraded after a lost ackn
   ]);
   assert.equal(JSON.stringify(logs).includes("private prompt"), false);
   assert.equal(JSON.stringify(logs).includes("a".repeat(64)), false);
+});
+
+test("manual turn can enter running from connector binding when Sent confirmation is disabled", () => {
+  const { fixture } = manualTurnFixture();
+  const lease = fixture.beginManualTurn(
+    "manual_connector_confirmed",
+    process.pid,
+    "private prompt",
+    undefined,
+    undefined,
+    false,
+    false,
+  );
+  const tab = fixture.turnTabs.get(lease.tabId);
+  const snapshot = BrowserHost.prototype.tabSnapshot.call(fixture, tab);
+  assert.equal(tab.manualState, "awaiting-user");
+  assert.equal(snapshot.manualSentConfirmationRequired, false);
+  assert.notEqual(tab.manualDeadlineAt, null);
+  fixture.markManualTurnStarted("manual_connector_confirmed", process.pid);
+  assert.equal(tab.manualState, "running");
+  assert.equal(tab.manualDeadlineAt, null);
+  assert.equal(tab.manualDeadlineTimer, null);
+  assert.equal(tab.prompt, null);
+  assert.match(tab.sentAt, /^\d{4}-\d{2}-\d{2}T/);
+  fixture.endManualTurn("manual_connector_confirmed", process.pid, "completed");
+});
+
+test("manual turn rejects both Sent policy mismatch directions before exposing the prompt", () => {
+  for (const [launcherPolicy, expectedPolicy] of [[true, false], [false, true]]) {
+    const { fixture, clipboardWrites } = manualTurnFixture();
+    assert.throws(
+      () => fixture.beginManualTurn(
+        `manual_policy_${launcherPolicy}_${expectedPolicy}`,
+        process.pid,
+        "private prompt",
+        undefined,
+        undefined,
+        false,
+        launcherPolicy,
+        expectedPolicy,
+      ),
+      /Sent confirmation policy/i,
+    );
+    assert.equal(fixture.turnTabs.size, 0);
+    assert.deepEqual(clipboardWrites, []);
+  }
+});
+
+test("manual Sent confirmation cannot clear the connector deadline when disabled", () => {
+  const { fixture } = manualTurnFixture();
+  const lease = fixture.beginManualTurn(
+    "manual_connector_sent_bypass",
+    process.pid,
+    "private prompt",
+    undefined,
+    undefined,
+    false,
+    false,
+  );
+  const tab = fixture.turnTabs.get(lease.tabId);
+  const deadlineAt = tab.manualDeadlineAt;
+  const deadlineTimer = tab.manualDeadlineTimer;
+
+  assert.throws(
+    () => fixture.confirmManualSent(lease.tabId),
+    /Sent confirmation is disabled/,
+  );
+  assert.equal(tab.manualState, "awaiting-user");
+  assert.equal(tab.manualDeadlineAt, deadlineAt);
+  assert.equal(tab.manualDeadlineTimer, deadlineTimer);
+  assert.equal(tab.prompt, "private prompt");
+  clearTimeout(tab.manualDeadlineTimer);
+});
+
+test("manual Sent requirement cannot be downgraded by the started caller", () => {
+  const { fixture } = manualTurnFixture();
+  const lease = fixture.beginManualTurn("manual_sent_required", process.pid, "private prompt");
+  const tab = fixture.turnTabs.get(lease.tabId);
+  assert.equal(tab.manualSentConfirmationRequired, true);
+  assert.throws(
+    () => fixture.markManualTurnStarted("manual_sent_required", process.pid, false),
+    /was not confirmed as sent/,
+  );
+  assert.equal(tab.manualState, "awaiting-user");
+  clearTimeout(tab.manualDeadlineTimer);
+});
+
+test("connector confirmation has its own deadline when Sent confirmation is disabled", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+  const { fixture } = manualTurnFixture();
+  const lease = fixture.beginManualTurn(
+    "manual_connector_deadline",
+    process.pid,
+    "private prompt",
+    undefined,
+    undefined,
+    false,
+    false,
+  );
+  const tab = fixture.turnTabs.get(lease.tabId);
+  assert.equal(tab.manualSubmitTimeoutMs, MANUAL_CONNECTOR_BIND_TIMEOUT_MS);
+  t.mock.timers.tick(MANUAL_SUBMIT_TIMEOUT_MS + 1);
+  assert.equal(tab.manualState, "awaiting-user");
+  t.mock.timers.tick(MANUAL_CONNECTOR_BIND_TIMEOUT_MS - MANUAL_SUBMIT_TIMEOUT_MS - 1);
+  assert.equal(tab.manualState, "timed-out");
 });
 
 test("terminal Zero Risk tabs are reclaimed before retained conversations", () => {

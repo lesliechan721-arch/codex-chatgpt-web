@@ -33,6 +33,7 @@ const MAX_BROWSER_TABS = 5;
 const MAX_CANCELLED_TURN_TRACES = 256;
 const MANUAL_SUBMIT_TIMEOUT_MS = 60_000;
 const MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS = 120_000;
+const MANUAL_CONNECTOR_BIND_TIMEOUT_MS = 5 * 60_000;
 const MAX_MANUAL_TERMINAL_SIGNALS = 256;
 const MAX_MANUAL_PROMPT_CHARS = 1_000_000;
 const INTERACTION_MODE_CHANGE_OPERATION = "browser interaction mode change";
@@ -518,8 +519,10 @@ class BrowserHost {
         interactionMode: "manual",
         manualState: tab.manualState,
         ...(tab.manualDeadlineAt ? { manualDeadlineAt: new Date(tab.manualDeadlineAt).toISOString() } : {}),
+        manualSentConfirmationRequired: tab.manualSentConfirmationRequired !== false,
         canCopyPrompt: typeof tab.prompt === "string" && tab.prompt.length > 0,
-        canConfirmSent: tab.manualState === "awaiting-user",
+        canConfirmSent: tab.manualSentConfirmationRequired !== false
+          && tab.manualState === "awaiting-user",
       });
     }
     return snapshot;
@@ -619,7 +622,14 @@ class BrowserHost {
     }
   }
 
-  createManualTurnTab(traceId, helperPid, conversationKey, prompt, manualSubmitTimeoutMs) {
+  createManualTurnTab(
+    traceId,
+    helperPid,
+    conversationKey,
+    prompt,
+    manualSubmitTimeoutMs,
+    manualSentConfirmationRequired,
+  ) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS
       && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
       throw new Error(
@@ -655,9 +665,12 @@ class BrowserHost {
       pageTitle: "ChatGPT",
       url: this.getUseSavedChats() ? "https://chatgpt.com/" : TEMPORARY_CHAT_URL,
       loading: true,
-      message: "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent",
+      message: manualSentConfirmationRequired
+        ? "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent"
+        : "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then send it; the connector will confirm automatically",
       interactionMode: "manual",
       manualState: "awaiting-user",
+      manualSentConfirmationRequired,
       manualSubmitTimeoutMs,
       manualDeadlineAt: Date.now() + manualSubmitTimeoutMs,
       manualDeadlineTimer: null,
@@ -1947,13 +1960,15 @@ class BrowserHost {
         || tab.manualState !== "awaiting-user") return;
       const timeoutSeconds = Math.round(tab.manualSubmitTimeoutMs / 1_000);
       tab.status = "error";
-      tab.message = `Prompt submission was not confirmed within ${timeoutSeconds} seconds`;
+      tab.message = tab.manualSentConfirmationRequired
+        ? `Prompt submission was not confirmed within ${timeoutSeconds} seconds`
+        : `Codex Zero Risk did not connect within ${timeoutSeconds} seconds`;
       this.signalManualTerminal(tab, "timeout");
       this.publishState?.(this.snapshot());
       this.logger.warn("browser.manual_turn_timed_out", {
         tabId: tab.id,
         traceId: tab.traceId,
-        phase: "sent-confirmation",
+        phase: tab.manualSentConfirmationRequired ? "sent-confirmation" : "connector-confirmation",
       });
     }, delay);
     tab.manualDeadlineTimer.unref?.();
@@ -1966,7 +1981,16 @@ class BrowserHost {
     this.clipboard.writeText(prompt);
   }
 
-  beginManualTurn(traceId, helperPid, prompt, conversationKey, resumePrompt, compaction = false) {
+  beginManualTurn(
+    traceId,
+    helperPid,
+    prompt,
+    conversationKey,
+    resumePrompt,
+    compaction = false,
+    manualSentConfirmationRequired = true,
+    expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
+  ) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
@@ -1980,9 +2004,12 @@ class BrowserHost {
       throw new Error(`Manual resume prompt must contain between 1 and ${MAX_MANUAL_PROMPT_CHARS} characters`);
     }
     if (typeof compaction !== "boolean") throw new Error("Manual compaction flag must be boolean");
-    const manualSubmitTimeoutMs = compaction
-      ? MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS
-      : MANUAL_SUBMIT_TIMEOUT_MS;
+    if (typeof manualSentConfirmationRequired !== "boolean") {
+      throw new Error("Manual Sent confirmation preference must be boolean");
+    }
+    if (typeof expectedManualSentConfirmationRequired !== "boolean") {
+      throw new Error("Expected manual Sent confirmation preference must be boolean");
+    }
     const completion = this.manualCompletionSignals.get(traceId);
     if (completion) {
       throw new Error(completion.helperPid === helperPid
@@ -1992,7 +2019,7 @@ class BrowserHost {
     const terminal = this.manualTerminalSignals.get(traceId);
     if (terminal?.helperPid === helperPid) {
       const error = new Error(terminal.status === "timeout"
-        ? `Zero Risk turn ${traceId} timed out before Sent confirmation`
+        ? `Zero Risk turn ${traceId} timed out before confirmation`
         : `Zero Risk turn ${traceId} is already ${terminal.status}`);
       error.code = terminal.status === "timeout" ? "manual_turn_timed_out" : "turn_cancelled";
       throw error;
@@ -2015,7 +2042,15 @@ class BrowserHost {
         error.code = "manual_turn_owner_lost";
         throw error;
       }
-      if (sameTrace.manualSubmitTimeoutMs !== manualSubmitTimeoutMs) {
+      if (sameTrace.manualSentConfirmationRequired !== expectedManualSentConfirmationRequired) {
+        const error = new Error(`Zero Risk turn ${traceId} Sent confirmation policy does not match the caller expectation`);
+        error.code = "manual_sent_policy_mismatch";
+        throw error;
+      }
+      const expectedManualSubmitTimeoutMs = sameTrace.manualSentConfirmationRequired
+        ? (compaction ? MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS : MANUAL_SUBMIT_TIMEOUT_MS)
+        : MANUAL_CONNECTOR_BIND_TIMEOUT_MS;
+      if (sameTrace.manualSubmitTimeoutMs !== expectedManualSubmitTimeoutMs) {
         throw new Error(`Zero Risk turn ${traceId} was retried with a different compaction mode`);
       }
       const retryPrompt = sameTrace.manualConversationReused ? resumePrompt : prompt;
@@ -2033,8 +2068,19 @@ class BrowserHost {
         reused: true,
         deadlineAt: sameTrace.manualDeadlineAt ? new Date(sameTrace.manualDeadlineAt).toISOString() : null,
         state: sameTrace.manualState,
+        sentConfirmationRequired: sameTrace.manualSentConfirmationRequired,
       };
     }
+    if (manualSentConfirmationRequired !== expectedManualSentConfirmationRequired) {
+      const error = new Error(
+        `Zero Risk turn ${traceId} Sent confirmation policy does not match the Launcher policy`,
+      );
+      error.code = "manual_sent_policy_mismatch";
+      throw error;
+    }
+    const manualSubmitTimeoutMs = manualSentConfirmationRequired
+      ? (compaction ? MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS : MANUAL_SUBMIT_TIMEOUT_MS)
+      : MANUAL_CONNECTOR_BIND_TIMEOUT_MS;
     const retained = conversationKey
       ? [...this.turnTabs.values()].filter(tab => (
           tab.interactionMode === "manual"
@@ -2055,8 +2101,11 @@ class BrowserHost {
       tab.helperPid = helperPid;
       tab.status = "running";
       tab.loading = false;
-      tab.message = "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent";
+      tab.message = manualSentConfirmationRequired
+        ? "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then press Sent"
+        : "Paste the copied prompt, add any images yourself because Zero Risk cannot transfer them, choose a model and effort, then send it; the connector will confirm automatically";
       tab.manualState = "awaiting-user";
+      tab.manualSentConfirmationRequired = manualSentConfirmationRequired;
       tab.manualSubmitTimeoutMs = manualSubmitTimeoutMs;
       tab.manualDeadlineAt = Date.now() + manualSubmitTimeoutMs;
       tab.prompt = resumePrompt;
@@ -2071,6 +2120,7 @@ class BrowserHost {
         conversationKey,
         prompt,
         manualSubmitTimeoutMs,
+        manualSentConfirmationRequired,
       );
       try {
         this.writeManualPrompt(prompt);
@@ -2096,6 +2146,7 @@ class BrowserHost {
       reused: retained.length === 1,
       deadlineAt: new Date(tab.manualDeadlineAt).toISOString(),
       state: tab.manualState,
+      sentConfirmationRequired: tab.manualSentConfirmationRequired,
     };
   }
 
@@ -2165,6 +2216,9 @@ class BrowserHost {
   confirmManualSent(tabId) {
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual") throw new Error("Zero Risk tab does not exist");
+    if (tab.manualSentConfirmationRequired === false) {
+      throw new Error("Sent confirmation is disabled for this Zero Risk turn");
+    }
     if (tab.manualState !== "awaiting-user") {
       if (["sent", "running", "completed"].includes(tab.manualState)) return this.snapshot();
       throw new Error("Zero Risk turn can no longer be marked as sent");
@@ -2190,12 +2244,17 @@ class BrowserHost {
     if (!tab || tab.interactionMode !== "manual" || tab.helperPid !== helperPid) {
       throw new Error(`Zero Risk turn ownership mismatch: no browser tab owns ${traceId}`);
     }
-    if (tab.manualState !== "sent" && tab.manualState !== "running") {
+    if (tab.manualState !== "sent" && tab.manualState !== "running"
+      && !(tab.manualSentConfirmationRequired === false && tab.manualState === "awaiting-user")) {
       throw new Error(`Zero Risk turn ${traceId} was not confirmed as sent`);
     }
     if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
     tab.manualDeadlineTimer = null;
     tab.manualDeadlineAt = null;
+    if (tab.manualSentConfirmationRequired === false && tab.manualState === "awaiting-user") {
+      tab.sentAt = new Date().toISOString();
+      tab.prompt = null;
+    }
     tab.manualState = "running";
     tab.message = "ChatGPT is working through the Codex harness";
     tab.lastHeartbeatAt = Date.now();
@@ -3044,6 +3103,7 @@ module.exports = {
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   loadCommittedBrowserSurface,
+  MANUAL_CONNECTOR_BIND_TIMEOUT_MS,
   MANUAL_SUBMIT_TIMEOUT_MS,
   MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS,
   navigationErrorForLog,

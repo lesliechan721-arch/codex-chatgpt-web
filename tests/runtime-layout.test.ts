@@ -99,6 +99,7 @@ test("default setup uses the fixed production connector identities", () => {
   expect(defaultConfig("full").subagentProtocol).toBe("compatibility-v1");
   expect(defaultConfig("full").browserInteractionMode).toBe("automatic");
   expect(defaultConfig("full").zeroRiskProEnabled).toBe(false);
+  expect(defaultConfig("full").zeroRiskRequireSentConfirmation).toBe(true);
 });
 
 test.each([
@@ -177,11 +178,13 @@ test("existing v3 configurations deterministically retain automatic browser inte
   const legacyV3: Record<string, unknown> = { ...defaultConfig("browser-only") };
   delete legacyV3.browserInteractionMode;
   delete legacyV3.zeroRiskProEnabled;
+  delete legacyV3.zeroRiskRequireSentConfirmation;
   writeFileSync(join(root, "config.json"), `${JSON.stringify(legacyV3)}\n`);
 
   expect(loadConfig()).toMatchObject({
     browserInteractionMode: "automatic",
     zeroRiskProEnabled: false,
+    zeroRiskRequireSentConfirmation: true,
   });
   expect(loadConfigForSetup()).toMatchObject({
     appName: CHATGPT_CONNECTOR_NAME,

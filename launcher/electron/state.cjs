@@ -22,6 +22,7 @@ const DEFAULT_STATE = Object.freeze({
   experimentalFreshConversationPerTurn: false,
   useSavedChats: false,
   zeroRiskProEnabled: false,
+  zeroRiskRequireSentConfirmation: true,
   networkProxyUrl: null,
   browserSmokePassed: false,
   browserSmokeVersion: null,
@@ -57,6 +58,7 @@ function readState(filePath) {
       "experimentalFreshConversationPerTurn",
       "useSavedChats",
       "zeroRiskProEnabled",
+      "zeroRiskRequireSentConfirmation",
       "browserSmokePassed",
       "sidebarOpen",
     ]) {

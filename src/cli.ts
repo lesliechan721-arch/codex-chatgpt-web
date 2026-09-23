@@ -70,6 +70,10 @@ Setup options:
                                Full mode: select, paste, and send in the launcher yourself
   --zero-risk-pro              Zero Risk: also install the explicit Pro-sized model row
   --zero-risk-default          Zero Risk: install only the default model row
+  --zero-risk-sent-confirmation
+                               Zero Risk: require the Launcher Sent confirmation (default)
+  --zero-risk-no-sent-confirmation
+                               Zero Risk: use connector binding as the turn confirmation
   --tool-authority-mode MODE   verified-environment (default) or delegated
   --port NUMBER                Loopback Responses port (default: 17841)
   --chrome PATH                Google Chrome/Chromium executable used for account login
@@ -351,6 +355,14 @@ async function setupCommand(args: string[]): Promise<void> {
     throw new Error("Choose at most one Zero Risk model profile: --zero-risk-pro or --zero-risk-default");
   }
   if (zeroRiskPro || zeroRiskDefault) options.zeroRiskProEnabled = zeroRiskPro;
+  const zeroRiskSentConfirmation = takeFlag(args, "--zero-risk-sent-confirmation");
+  const zeroRiskNoSentConfirmation = takeFlag(args, "--zero-risk-no-sent-confirmation");
+  if (zeroRiskSentConfirmation && zeroRiskNoSentConfirmation) {
+    throw new Error("Choose at most one Zero Risk Sent confirmation mode");
+  }
+  if (zeroRiskSentConfirmation || zeroRiskNoSentConfirmation) {
+    options.zeroRiskRequireSentConfirmation = zeroRiskSentConfirmation;
+  }
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);

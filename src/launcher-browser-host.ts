@@ -407,6 +407,8 @@ export interface LauncherManualTurnOwner {
 
 export interface LauncherManualTurnStart extends LauncherManualTurnOwner {
   prompt: string;
+  /** Expected policy from the caller; Launcher must capture the same policy before exposing the prompt. */
+  sentConfirmationRequired: boolean;
   /** Used only when the exact retained ChatGPT conversation already owns the accumulated history. */
   resumePrompt?: string;
   conversationKey?: string;
@@ -419,6 +421,7 @@ export interface LauncherManualTurnLease {
   reused: boolean;
   deadlineAt: string | null;
   state: "awaiting-user" | "sent" | "running" | "completed";
+  sentConfirmationRequired: boolean;
 }
 
 export interface LauncherManualTurnEnd extends LauncherManualTurnOwner {
@@ -470,12 +473,21 @@ async function reconcileLauncherManualMutation(
   timeoutMs: number,
   validAcknowledgement: (body: Record<string, unknown>) => boolean,
   invalidAcknowledgementMessage: string,
+  onInvalidAcknowledgement?: () => Promise<void>,
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   let ambiguousError: unknown;
+  let observedInvalidAcknowledgement = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const result = await launcherManualRequest(descriptor, action, body, timeoutMs);
-      if (!result.response.ok || validAcknowledgement(result.body)) return result;
+      if (!result.response.ok) {
+        if (observedInvalidAcknowledgement && onInvalidAcknowledgement) {
+          try { await onInvalidAcknowledgement(); } catch { /* preserve the causal mutation error */ }
+        }
+        return result;
+      }
+      if (validAcknowledgement(result.body)) return result;
+      observedInvalidAcknowledgement = true;
       ambiguousError = new LauncherManualTurnFailedError(invalidAcknowledgementMessage);
     } catch (error) {
       ambiguousError = error;
@@ -483,6 +495,9 @@ async function reconcileLauncherManualMutation(
   }
   // These mutations are keyed by the exact turn owner and are idempotent in the launcher.
   // The second identical request reconciles one missing or incomplete local acknowledgement.
+  if (observedInvalidAcknowledgement && onInvalidAcknowledgement) {
+    try { await onInvalidAcknowledgement(); } catch { /* preserve the invalid acknowledgement */ }
+  }
   throw ambiguousError;
 }
 
@@ -493,6 +508,7 @@ function isLauncherManualTurnLease(body: Record<string, unknown>): boolean {
     && typeof body.reused === "boolean"
     && (body.deadlineAt === null
       || (typeof body.deadlineAt === "string" && !Number.isNaN(Date.parse(body.deadlineAt))))
+    && typeof body.sentConfirmationRequired === "boolean"
     && ["awaiting-user", "sent", "running", "completed"].includes(String(body.state));
 }
 
@@ -516,13 +532,35 @@ export async function startLauncherManualTurn(
     timeoutMs,
     isLauncherManualTurnLease,
     "Launcher returned an invalid manual turn lease",
+    async () => {
+      try {
+        await endLauncherManualTurn(descriptorPath, {
+          traceId: activity.traceId,
+          helperPid: activity.helperPid,
+          status: "failed",
+        });
+      } catch { /* the lease validation error remains authoritative */ }
+    },
   );
   if (!response.ok) throwManualControlError(response, body);
+  if (body.sentConfirmationRequired !== activity.sentConfirmationRequired) {
+    try {
+      await endLauncherManualTurn(descriptorPath, {
+        traceId: activity.traceId,
+        helperPid: activity.helperPid,
+        status: "failed",
+      });
+    } catch { /* the policy mismatch remains authoritative */ }
+    throw new LauncherManualTurnFailedError(
+      "Launcher Sent confirmation policy does not match the caller expectation",
+    );
+  }
   return {
     tabId: body.tabId as string,
     reused: body.reused as boolean,
     deadlineAt: body.deadlineAt as string | null,
     state: body.state as LauncherManualTurnLease["state"],
+    sentConfirmationRequired: body.sentConfirmationRequired as boolean,
   };
 }
 

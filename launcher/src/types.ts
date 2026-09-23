@@ -24,6 +24,7 @@ export interface LauncherState {
   experimentalFreshConversationPerTurn: boolean;
   useSavedChats: boolean;
   zeroRiskProEnabled: boolean;
+  zeroRiskRequireSentConfirmation: boolean;
   networkProxyUrl: string | null;
   sidebarOpen: boolean;
   sidebarWidth: number;
@@ -66,6 +67,7 @@ export interface BrowserTabState {
   interactionMode?: BrowserInteractionMode;
   manualState?: "awaiting-user" | "sent" | "running" | "completed" | "timed-out" | "cancelled" | "failed";
   manualDeadlineAt?: string;
+  manualSentConfirmationRequired?: boolean;
   canCopyPrompt?: boolean;
   canConfirmSent?: boolean;
 }
@@ -177,6 +179,7 @@ export interface LauncherApi extends ApiAccessApi {
   setFreshConversationPerTurn(enabled: boolean): Promise<LauncherState>;
   setUseSavedChats(enabled: boolean): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
+  setZeroRiskRequireSentConfirmation(enabled: boolean): Promise<LauncherState>;
   setBrowserInteractionMode(mode: BrowserInteractionMode): Promise<{
     state: LauncherState;
     credentialsRequired: boolean;

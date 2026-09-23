@@ -657,6 +657,15 @@ function syncFreshConversationPreference(stateStore, config) {
   return state;
 }
 
+function syncZeroRiskSentConfirmationPreference(stateStore, config) {
+  const enabled = config?.zeroRiskRequireSentConfirmation !== false;
+  const current = stateStore.read();
+  if (runtimeHost?.currentOperation() || current.zeroRiskRequireSentConfirmation === enabled) return current;
+  const state = stateStore.update({ zeroRiskRequireSentConfirmation: enabled });
+  send("launcher:state-changed", state);
+  return state;
+}
+
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
   const apiAccessSettings = createApiAccessSettings({
@@ -707,7 +716,9 @@ function registerIpc({ logger, stateStore }) {
     return limitsController.setup(() => browserHost.inspectLimitsPlan());
   });
   handle("launcher:snapshot", async () => {
-    const state = syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config);
+    const config = runtimeHost.runtimeConfigSnapshot().config;
+    syncFreshConversationPreference(stateStore, config);
+    const state = syncZeroRiskSentConfirmationPreference(stateStore, config);
     return {
       profile: LAUNCHER_PROFILE.kind,
       profilePaths: {
@@ -949,6 +960,7 @@ function registerIpc({ logger, stateStore }) {
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
       zeroRiskProEnabled: false,
+      zeroRiskRequireSentConfirmation: true,
     });
     send("launcher:state-changed", state);
     stopCatalogVerificationMonitor();
@@ -990,6 +1002,7 @@ function registerIpc({ logger, stateStore }) {
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
       useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
       ...(result.mode === "full" ? {
@@ -1040,6 +1053,7 @@ function registerIpc({ logger, stateStore }) {
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
       useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
       coreSetupComplete: true,
@@ -1153,6 +1167,20 @@ function registerIpc({ logger, stateStore }) {
       catch { logger.warn("api_access.model_catalog_refresh_deferred", {}); }
       startCatalogVerificationMonitor({ logger, stateStore });
     }
+    return state;
+  });
+  handle("launcher:zero-risk-sent-confirmation", async (_event, enabled) => {
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing Zero Risk Sent confirmation"
+          : `Finish ${browserOperation} before changing Zero Risk Sent confirmation`,
+      );
+    }
+    const result = await runtimeHost.setZeroRiskRequireSentConfirmation(enabled === true);
+    const state = stateStore.update({ zeroRiskRequireSentConfirmation: result.enabled });
+    send("launcher:state-changed", state);
     return state;
   });
   handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
@@ -1394,7 +1422,11 @@ async function start() {
   browserControl = await new BrowserControlServer({
     logger,
     getBrowserHost: () => browserHost,
-    getPreferences: () => syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config),
+    getPreferences: () => {
+      const config = runtimeHost.runtimeConfigSnapshot().config;
+      syncFreshConversationPreference(stateStore, config);
+      return syncZeroRiskSentConfirmationPreference(stateStore, config);
+    },
     resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
     limits: limitsController,
   }).start();
@@ -1539,6 +1571,7 @@ async function start() {
       experimentalFreshConversationPerTurn: config?.experimentalFreshConversationPerTurn === true,
       useSavedChats: config?.useSavedChats === true,
       zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
+      zeroRiskRequireSentConfirmation: config?.zeroRiskRequireSentConfirmation !== false,
     });
     send("launcher:state-changed", state);
     logger.info("dev_profile.ready", {
@@ -1569,6 +1602,7 @@ async function start() {
         experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
         useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
         zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+        zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
           mcpSetupComplete: false,
@@ -1594,6 +1628,7 @@ async function start() {
       const experimentalFreshConversationPerTurn = configuredRuntime.config?.experimentalFreshConversationPerTurn === true;
       const useSavedChats = configuredRuntime.config?.useSavedChats === true;
       const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
+      const zeroRiskRequireSentConfirmation = configuredRuntime.config?.zeroRiskRequireSentConfirmation !== false;
       const toolAuthorityMode = configuredRuntime.config?.toolAuthorityMode ?? "verified-environment";
       const saved = stateStore.read();
       if (saved.experimentalSkillAttachments !== experimentalSkillAttachments
@@ -1601,6 +1636,7 @@ async function start() {
         || saved.useSavedChats !== useSavedChats
         || saved.experimentalBiggerContext !== enabled
         || saved.zeroRiskProEnabled !== zeroRiskProEnabled
+        || saved.zeroRiskRequireSentConfirmation !== zeroRiskRequireSentConfirmation
         || saved.toolAuthorityMode !== toolAuthorityMode) {
         const state = stateStore.update({
           experimentalBiggerContext: enabled,
@@ -1608,6 +1644,7 @@ async function start() {
           experimentalFreshConversationPerTurn,
           useSavedChats,
           zeroRiskProEnabled,
+          zeroRiskRequireSentConfirmation,
           toolAuthorityMode,
         });
         send("launcher:state-changed", state);
@@ -1633,6 +1670,7 @@ async function start() {
         experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn === true,
         useSavedChats: config.useSavedChats === true,
         zeroRiskProEnabled: config.zeroRiskProEnabled === true,
+        zeroRiskRequireSentConfirmation: config.zeroRiskRequireSentConfirmation !== false,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,
           codexRestartRequired: true,

@@ -93,6 +93,8 @@ export interface AppConfig {
   useSavedChats: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
+  /** Require the user to confirm Sent in the Launcher before a Zero Risk connector can start. */
+  zeroRiskRequireSentConfirmation: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
   stallTimeoutSec?: number;
   autoApproveToolCalls: boolean;
@@ -224,6 +226,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     experimentalFreshConversationPerTurn: false,
     useSavedChats: false,
     zeroRiskProEnabled: false,
+    zeroRiskRequireSentConfirmation: true,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
@@ -512,6 +515,10 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
+  if (parsed.zeroRiskRequireSentConfirmation !== undefined
+    && typeof parsed.zeroRiskRequireSentConfirmation !== "boolean") {
+    throw new Error(`Invalid zeroRiskRequireSentConfirmation in ${path}`);
+  }
   if (parsed.stallTimeoutSec !== undefined
     && (!Number.isFinite(parsed.stallTimeoutSec) || parsed.stallTimeoutSec <= 0)) {
     throw new Error(`Invalid stallTimeoutSec in ${path}`);
@@ -536,6 +543,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
+  const zeroRiskRequireSentConfirmation = parsed.zeroRiskRequireSentConfirmation !== false;
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
     throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
   }
@@ -559,6 +567,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     experimentalFreshConversationPerTurn,
     useSavedChats,
     zeroRiskProEnabled,
+    zeroRiskRequireSentConfirmation,
   } as AppConfig;
 }
 
@@ -611,6 +620,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
       toolAuthorityMode,
+      zeroRiskRequireSentConfirmation: config.zeroRiskRequireSentConfirmation,
       solAvailable: manual ? false : config.solAvailable,
       extraHighAvailable: !manual && config.extraHighAvailable === true,
       proAvailable: manual ? false : config.proAvailable,

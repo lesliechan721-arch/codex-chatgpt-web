@@ -415,7 +415,7 @@ test("health rejects a protocol response from a different broker owner", async (
   try {
     await broker.listen();
     const dispatch = spyOn(broker as any, "dispatch").mockResolvedValue({
-      protocolVersion: 5, acceptingExternalOwners: true, owner: "another-process-instance",
+      protocolVersion: 6, acceptingExternalOwners: true, owner: "another-process-instance",
     });
     try {
       expect(await broker.checkHealth()).toBe(false);

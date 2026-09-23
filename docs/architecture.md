@@ -126,10 +126,17 @@ the installed catalog, and requires a Codex restart. Zero Risk never reads or mu
 For a new ChatGPT chat the adapter provides the complete compiled prompt; for an exactly retained
 chat it also provides an incremental prompt containing only the Codex suffix after the last assistant
 reply. The Launcher chooses between those two prompts from its own retained-tab ownership and writes
-the selected text to the system clipboard. The user has thirty seconds to paste, select the visible
-ChatGPT model, effort, and Zero Risk connector, send, and confirm Sent; a manual compaction handoff
-allows two minutes. Sent ends that confirmation deadline. Waiting for the first MCP bind is part of
-the live turn, which remains subject to explicit cancellation and runtime-owner cleanup.
+the selected text to the system clipboard. The Launcher captures the Sent-confirmation policy for
+each manual turn. The adapter sends its expected policy with `/v1/manual/start`; if that expectation
+does not match the Launcher's captured policy, the start fails before the prompt is exposed. The
+captured policy does not change if the global setting changes while the turn is active.
+
+With Sent confirmation enabled, an ordinary manual handoff allows one minute to paste, select the
+visible ChatGPT model, effort, and Zero Risk connector, send, and confirm Sent; a manual compaction
+handoff allows two minutes. Sent ends that confirmation deadline. With Sent confirmation disabled,
+the Launcher does not show the Sent button and instead allows up to five minutes for the first MCP
+connector bind, which confirms the turn automatically. After either confirmation path succeeds, the
+live turn remains subject to explicit cancellation and runtime-owner cleanup.
 The pasted task carries one opaque `request_id` for routing concurrent requests. Start/completion
 sequencing lives in the Zero Risk MCP server metadata, not in user-authored imperative text; the
 per-tab nonce used to validate the Launcher confirmation never leaves the local runtime.

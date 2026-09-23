@@ -471,6 +471,7 @@ test("manual launcher control separates idempotent start from reconnectable Sent
         reused: false,
         deadlineAt: "2026-08-30T00:01:00.000Z",
         state: "awaiting-user",
+        sentConfirmationRequired: true,
       }));
       return;
     }
@@ -506,10 +507,12 @@ test("manual launcher control separates idempotent start from reconnectable Sent
       ...owner,
       prompt: "private prompt",
       compaction: true,
+      sentConfirmationRequired: true,
     })).resolves.toMatchObject({
       tabId: "manual-tab",
       reused: false,
       state: "awaiting-user",
+      sentConfirmationRequired: true,
     });
     await expect(waitForLauncherManualSent(path, owner)).resolves.toEqual({
       sentAt: "2026-08-30T00:00:30.000Z",
@@ -526,7 +529,110 @@ test("manual launcher control separates idempotent start from reconnectable Sent
       "/v1/manual/wait-terminal",
       "/v1/manual/end",
     ]);
-    expect(requests[0]?.body).toEqual({ ...owner, prompt: "private prompt", compaction: true });
+    expect(requests[0]?.body).toEqual({
+      ...owner,
+      prompt: "private prompt",
+      compaction: true,
+      sentConfirmationRequired: true,
+    });
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  }
+});
+
+test("manual launcher start rejects a lease with a different captured Sent policy", async () => {
+  const requests: Array<{ url: string | undefined; body: Record<string, unknown> }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    requests.push({ url: request.url, body });
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/manual/end") {
+      response.end('{"ok":true,"cancelledByUser":false}');
+      return;
+    }
+    response.end(JSON.stringify({
+      ok: true,
+      tabId: "manual-tab",
+      reused: false,
+      deadlineAt: "2026-08-30T00:01:00.000Z",
+      state: "awaiting-user",
+      sentConfirmationRequired: false,
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(startLauncherManualTurn(path, {
+      traceId: "manualPolicyMismatch",
+      helperPid: process.pid,
+      prompt: "private prompt",
+      sentConfirmationRequired: true,
+    })).rejects.toThrow("does not match the caller expectation");
+    expect(requests.map(request => request.url)).toEqual([
+      "/v1/manual/start",
+      "/v1/manual/end",
+    ]);
+    expect(requests[1]?.body).toEqual({
+      traceId: "manualPolicyMismatch",
+      helperPid: process.pid,
+      status: "failed",
+    });
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  }
+});
+
+test("manual launcher start cleans up an observed turn when its lease is invalid", async () => {
+  const requests: Array<{ url: string | undefined; body: Record<string, unknown> }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    requests.push({ url: request.url, body });
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/manual/end") {
+      response.end('{"ok":true,"cancelledByUser":false}');
+      return;
+    }
+    response.end(JSON.stringify({
+      ok: true,
+      tabId: "manual-tab",
+      reused: false,
+      deadlineAt: "2026-08-30T00:01:00.000Z",
+      state: "awaiting-user",
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(startLauncherManualTurn(path, {
+      traceId: "manualInvalidLease",
+      helperPid: process.pid,
+      prompt: "private prompt",
+      sentConfirmationRequired: true,
+    })).rejects.toThrow("invalid manual turn lease");
+    expect(requests.map(request => request.url)).toEqual([
+      "/v1/manual/start",
+      "/v1/manual/start",
+      "/v1/manual/end",
+    ]);
+    expect(requests[2]?.body).toEqual({
+      traceId: "manualInvalidLease",
+      helperPid: process.pid,
+      status: "failed",
+    });
   } finally {
     await new Promise<void>(resolveClose => server.close(() => resolveClose()));
   }
@@ -551,6 +657,7 @@ test("manual launcher mutations reconcile one lost local response with the same 
         reused: true,
         deadlineAt: "2026-08-30T00:01:00.000Z",
         state: "awaiting-user",
+        sentConfirmationRequired: true,
       }));
       return;
     }
@@ -569,7 +676,11 @@ test("manual launcher mutations reconcile one lost local response with the same 
     if (!address || typeof address === "string") throw new Error("test server has no port");
     const path = descriptorFile(`http://127.0.0.1:${address.port}`);
     const owner = { traceId: "manual_reconcile", helperPid: process.pid };
-    await expect(startLauncherManualTurn(path, { ...owner, prompt: "private prompt" }, 500))
+    await expect(startLauncherManualTurn(path, {
+      ...owner,
+      prompt: "private prompt",
+      sentConfirmationRequired: true,
+    }, 500))
       .resolves.toMatchObject({ tabId: "manual-tab", reused: true });
     await expect(markLauncherManualTurnStarted(path, owner, 500)).resolves.toBeUndefined();
     await expect(endLauncherManualTurn(path, { ...owner, status: "completed" }, 500))

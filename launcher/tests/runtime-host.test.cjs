@@ -331,6 +331,44 @@ test("Zero Risk Pro transaction installs or removes only its explicit model prof
   );
 });
 
+test("Zero Risk Sent confirmation setting delegates persistence to setup", async () => {
+  const config = {
+    mode: "full",
+    browserHost: "launcher",
+    browserInteractionMode: "manual",
+    autoApproveToolCalls: true,
+    zeroRiskRequireSentConfirmation: true,
+  };
+  const disabled = hostFor(config, "manual");
+  const result = await disabled.host.setZeroRiskRequireSentConfirmation(false);
+  assert.equal(result.enabled, false);
+  assert.deepEqual(disabled.invocation(), {
+    name: "zero-risk-sent-confirmation",
+    args: [
+      "setup",
+      "--full",
+      "--browser-host-descriptor",
+      "/runtime/launcher-browser.json",
+      "--zero-risk-browser-interaction",
+      "--acknowledge-unofficial",
+      "--zero-risk-no-sent-confirmation",
+      "--replace-codex-route",
+      "--restart-service",
+      "--auto-approve-tool-calls",
+    ],
+  });
+  assert.equal(config.zeroRiskRequireSentConfirmation, true, "setter must delegate persistence to setup");
+
+  const enabled = devHostFor({ ...config, zeroRiskRequireSentConfirmation: false }, "manual");
+  assert.equal((await enabled.host.setZeroRiskRequireSentConfirmation(true)).enabled, true);
+  assert.equal(enabled.invocation().args.includes("--zero-risk-sent-confirmation"), true);
+  assert.equal(enabled.invocation().args.includes("--restart-service"), false);
+  await assert.rejects(
+    hostFor({ ...config, browserInteractionMode: "automatic" }).host.setZeroRiskRequireSentConfirmation(false),
+    /only while the Full Zero Risk harness is active/,
+  );
+});
+
 test("DEV setup child environment removes launcher-rebound production aliases", async () => {
   const fixture = devHostFor(null);
   assert.deepEqual(fixture.host.devSetupEnvironment({

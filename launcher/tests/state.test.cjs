@@ -31,6 +31,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
       zeroRiskProEnabled: false,
+      zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -64,6 +65,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
       zeroRiskProEnabled: false,
+      zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: "http://user:p%40ss@127.0.0.1:7890/",
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
@@ -148,6 +150,7 @@ test("persisted sidebar and proxy corruption are repaired without changing the r
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
       zeroRiskProEnabled: false,
+      zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -170,8 +173,15 @@ test("browser interaction defaults to Automatic and preserves a completed onboar
     store.update({ browserInteractionMode: "manual", onboardingComplete: true });
     assert.equal(createStateStore(file).read().browserInteractionMode, "manual");
     assert.equal(createStateStore(file).read().zeroRiskProEnabled, false);
-    store.update({ coreSetupComplete: true, zeroRiskProEnabled: true, experimentalFreshConversationPerTurn: true });
+    assert.equal(createStateStore(file).read().zeroRiskRequireSentConfirmation, true);
+    store.update({
+      coreSetupComplete: true,
+      zeroRiskProEnabled: true,
+      zeroRiskRequireSentConfirmation: false,
+      experimentalFreshConversationPerTurn: true,
+    });
     assert.equal(createStateStore(file).read().zeroRiskProEnabled, true);
+    assert.equal(createStateStore(file).read().zeroRiskRequireSentConfirmation, false);
     assert.equal(createStateStore(file).read().experimentalFreshConversationPerTurn, true);
     store.update({ browserInteractionMode: "automatic" });
     assert.equal(createStateStore(file).read().experimentalFreshConversationPerTurn, true);

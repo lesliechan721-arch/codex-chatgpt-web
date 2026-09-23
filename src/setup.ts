@@ -62,6 +62,7 @@ export interface SetupOptions {
   experimentalFreshConversationPerTurn?: boolean;
   useSavedChats?: boolean;
   zeroRiskProEnabled?: boolean;
+  zeroRiskRequireSentConfirmation?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
   acknowledgedUnofficial?: boolean;
@@ -157,6 +158,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
     useSavedChats: before.useSavedChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
+    zeroRiskRequireSentConfirmation: before.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
     runtimeCommand: before.runtimeCommand,
@@ -189,6 +191,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
     useSavedChats: after.useSavedChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
+    zeroRiskRequireSentConfirmation: after.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
     runtimeCommand: after.runtimeCommand,
@@ -299,6 +302,12 @@ function baseConfig(
       throw new Error("Zero Risk Pro can be configured only with --zero-risk-browser-interaction");
     }
     config.zeroRiskProEnabled = options.zeroRiskProEnabled;
+  }
+  if (options.zeroRiskRequireSentConfirmation !== undefined) {
+    if (config.browserInteractionMode !== "manual") {
+      throw new Error("Zero Risk Sent confirmation can be configured only with --zero-risk-browser-interaction");
+    }
+    config.zeroRiskRequireSentConfirmation = options.zeroRiskRequireSentConfirmation;
   }
   if (config.browserInteractionMode === "manual") {
     if (options.experimentalFreshConversationPerTurn === true) {

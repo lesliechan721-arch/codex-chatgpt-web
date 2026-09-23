@@ -1115,6 +1115,7 @@ function ManualTurnGuide({
   const deadline = tab.manualDeadlineAt ? Date.parse(tab.manualDeadlineAt) : Number.NaN;
   const seconds = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - now) / 1_000)) : 0;
   const waiting = tab.manualState === "awaiting-user";
+  const requireSentConfirmation = tab.manualSentConfirmationRequired !== false;
   const status = waiting
     ? `${seconds} ${copy.manualPromptSeconds}`
     : tab.manualState === "sent"
@@ -1128,13 +1129,17 @@ function ManualTurnGuide({
     <div className={`manual-turn-guide${waiting ? " is-waiting" : ""}`}>
       <div>
         <strong>{waiting ? copy.manualPromptTitle : copy.manualPromptWaiting}</strong>
-        {waiting ? <p>{copy.manualPromptInstruction}</p> : null}
+        {waiting ? <p>{requireSentConfirmation
+          ? copy.manualPromptInstruction
+          : copy.manualPromptInstructionAutomaticConfirmation}</p> : null}
       </div>
       <span className="manual-turn-status">{status}</span>
       <div className="manual-turn-actions">
         <SecondaryButton onClick={onCancel}>{copy.manualPromptCancel}</SecondaryButton>
         <SecondaryButton disabled={!tab.canCopyPrompt} onClick={onCopy}>{copy.manualPromptCopy}</SecondaryButton>
-        <PrimaryButton disabled={!tab.canConfirmSent} onClick={onSent}>{copy.manualPromptSent}</PrimaryButton>
+        {requireSentConfirmation
+          ? <PrimaryButton disabled={!tab.canConfirmSent} onClick={onSent}>{copy.manualPromptSent}</PrimaryButton>
+          : null}
       </div>
     </div>
   );
@@ -1750,6 +1755,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setZeroRiskRequireSentConfirmation = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setZeroRiskRequireSentConfirmation(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const setInteractionMode = async (mode: BrowserInteractionMode) => {
     setBusy(true);
     setError(null);
@@ -1809,6 +1825,15 @@ function SettingsSurface({
           mode={snapshot.state.browserInteractionMode}
           onChange={(mode) => void setInteractionMode(mode)}
         />
+        {snapshot.state.browserInteractionMode === "manual" ? (
+          <SettingRow body={copy.zeroRiskSentConfirmationBody} label={copy.zeroRiskSentConfirmation}>
+            <Switch
+              checked={snapshot.state.zeroRiskRequireSentConfirmation}
+              disabled={busy || snapshot.state.coreSetupComplete !== true}
+              onChange={(checked) => void setZeroRiskRequireSentConfirmation(checked)}
+            />
+          </SettingRow>
+        ) : null}
         <SettingRow body={toolAuthorityBody} label={copy.delegatedToolAuthority}>
           <Switch
             checked={displayedToolAuthorityMode === "delegated"}

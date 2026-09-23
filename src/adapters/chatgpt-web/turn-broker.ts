@@ -66,6 +66,7 @@ interface SafeWaiter<T> {
 interface SafeTurnControl {
   state: SafeTurnState;
   surfaceNonce: string;
+  requireSentConfirmation: boolean;
   launcherSent: boolean;
   connectorStarted: boolean;
   finalAnswer?: string;
@@ -142,6 +143,7 @@ interface BrokerRequest {
   handoffId?: string;
   summary?: string;
   surfaceNonce?: string;
+  requireSentConfirmation?: boolean;
   finalAnswer?: string;
   contract?: "native" | "safe";
 }
@@ -160,6 +162,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
+const TURN_BROKER_PROTOCOL_VERSION = 6;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -328,6 +331,7 @@ export interface TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId?: string,
+    options?: { requireSentConfirmation?: boolean },
   ): Promise<string>;
   updateEnvironment(token: string, environment: ChatGptTurnCapability): void | Promise<void>;
   confirmSafeTurnSent(
@@ -460,8 +464,13 @@ export class TurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
-    externalOwner = false,
+    optionsOrExternalOwner: { requireSentConfirmation?: boolean; externalOwner?: boolean } | boolean = {},
   ): Promise<string> {
+    const options = typeof optionsOrExternalOwner === "boolean"
+      ? { externalOwner: optionsOrExternalOwner }
+      : optionsOrExternalOwner;
+    const requireSentConfirmation = options.requireSentConfirmation !== false;
+    const externalOwner = options.externalOwner === true;
     assertSurfaceNonce(surfaceNonce);
     const token = await this.register(environment, ttlMs, traceId, externalOwner, "request");
     const channel = this.channels.get(token);
@@ -469,6 +478,7 @@ export class TurnBroker implements TurnBrokerOwner {
     channel.safe = {
       state: "awaiting_start",
       surfaceNonce,
+      requireSentConfirmation,
       launcherSent: false,
       connectorStarted: false,
       sentWaiters: new Set(),
@@ -814,7 +824,9 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private activateSafeTurn(channel: TurnChannel, safe: SafeTurnControl): void {
-    if (safe.state !== "awaiting_start" || !safe.launcherSent || !safe.connectorStarted) return;
+    if (safe.state !== "awaiting_start"
+      || !safe.connectorStarted
+      || (safe.requireSentConfirmation && !safe.launcherSent)) return;
     safe.state = "running";
     // The setup window may be bounded, but a turn authorized by the user and bound by the
     // Zero Risk connector remains live until completion, cancellation, or runtime shutdown.
@@ -826,7 +838,9 @@ export class TurnBroker implements TurnBrokerOwner {
     const safe = channel.safe;
     if (!safe) return;
     if (safe.state === "awaiting_start") {
-      if (!safe.launcherSent) throw new Error("Zero Risk turn is waiting for the user's Sent confirmation");
+      if (safe.requireSentConfirmation && !safe.launcherSent) {
+        throw new Error("Zero Risk turn is waiting for the user's Sent confirmation");
+      }
       throw new Error("Zero Risk request is not connected yet. Call codex_turn_start with its request_id first");
     }
     if (safe.state !== "running") throw new Error("Zero Risk turn is already terminal");
@@ -1004,7 +1018,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const status = await callTurnBroker<{ protocolVersion: number; owner: string }>(
       this.socketPath, { method: "owner_status" }, 500,
     );
-    if (status?.protocolVersion !== 5 || status.owner !== this.ownerId) {
+    if (status?.protocolVersion !== TURN_BROKER_PROTOCOL_VERSION || status.owner !== this.ownerId) {
       this.failEndpoint(new Error("ChatGPT web turn broker endpoint owner mismatch; a runtime restart is required"));
     }
     this.endpointTransportFailures = 0;
@@ -1349,7 +1363,9 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!request.token) throw new Error("Zero Risk request_id is required");
       if (typeof request.finalAnswer !== "string") throw new Error("Zero Risk turn final_answer is required");
       let channel = this.channels.get(request.token);
-      if (channel?.safe?.state === "awaiting_start" && !channel.safe.launcherSent) {
+      if (channel?.safe?.state === "awaiting_start"
+        && channel.safe.requireSentConfirmation
+        && !channel.safe.launcherSent) {
         await this.waitForSafeSent(request.token, socketSignal);
         this.prune();
         channel = this.channels.get(request.token);
@@ -1370,7 +1386,11 @@ export class TurnBroker implements TurnBrokerOwner {
       return { submitted: true };
     }
     if (request.method === "owner_status") {
-      return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners, owner: this.ownerId };
+      return {
+        protocolVersion: TURN_BROKER_PROTOCOL_VERSION,
+        acceptingExternalOwners: this.acceptingExternalOwners,
+        owner: this.ownerId,
+      };
     }
     if (request.method === "owner_register") {
       const environment = ownerCapability(request.environment);
@@ -1382,6 +1402,10 @@ export class TurnBroker implements TurnBrokerOwner {
     if (request.method === "owner_register_safe") {
       const environment = ownerCapability(request.environment);
       assertSurfaceNonce(request.surfaceNonce);
+      if (request.requireSentConfirmation !== undefined
+        && typeof request.requireSentConfirmation !== "boolean") {
+        throw new Error("Zero Risk Sent confirmation preference is invalid");
+      }
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
@@ -1390,7 +1414,10 @@ export class TurnBroker implements TurnBrokerOwner {
         request.surfaceNonce,
         request.ttlMs,
         request.traceId,
-        true,
+        {
+          requireSentConfirmation: request.requireSentConfirmation !== false,
+          externalOwner: true,
+        },
       ).then(token => ({ token }));
     }
     if (request.method === "owner_update") {
@@ -1476,7 +1503,9 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       if (activeChannel.safe) {
         if (contract !== "safe") throw new Error("Zero Risk request id requires the Zero Risk MCP contract");
-        if (activeChannel.safe.state === "awaiting_start" && !activeChannel.safe.launcherSent) {
+        if (activeChannel.safe.state === "awaiting_start"
+          && activeChannel.safe.requireSentConfirmation
+          && !activeChannel.safe.launcherSent) {
           // ChatGPT can issue its first Harness call in the brief interval between the user sending
           // the copied prompt and confirming Sent in the Launcher. Hold that call behind the local
           // authorization boundary, but still require codex_turn_start before it can run.
@@ -1794,7 +1823,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
         + ` (${error instanceof Error ? error.message : String(error)})`,
       );
     }
-    if (status.protocolVersion !== 5) {
+    if (status.protocolVersion !== TURN_BROKER_PROTOCOL_VERSION) {
       throw new Error(`Unsupported DEV turn-owner protocol version: ${String(status.protocolVersion)}`);
     }
     if (status.acceptingExternalOwners !== true) {
@@ -1820,12 +1849,14 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
+    options: { requireSentConfirmation?: boolean } = {},
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
       method: "owner_register_safe",
       environment,
       surfaceNonce,
+      requireSentConfirmation: options.requireSentConfirmation !== false,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
     });

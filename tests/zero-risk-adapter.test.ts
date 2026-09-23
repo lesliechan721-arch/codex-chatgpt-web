@@ -575,6 +575,53 @@ test("Zero Risk adapter never starts the automatic browser worker and completes 
   }
 });
 
+test("Zero Risk can use connector binding instead of a second Launcher Sent confirmation", async () => {
+  const config = provider("connector-confirmation");
+  config.chatgptWeb!.zeroRiskRequireSentConfirmation = false;
+  const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  let exactBinding: ReturnType<typeof binding> | undefined;
+  const calls: string[] = [];
+  const control: ChatGptZeroRiskManualControl = {
+    async start(_path, activity) {
+      calls.push("start");
+      exactBinding = binding(activity.prompt);
+      queueMicrotask(() => broker.startSafeTurn(exactBinding!.request_id));
+    },
+    async waitSent() {
+      throw new Error("automatic connector confirmation must not wait for Launcher Sent");
+    },
+    waitTerminal: noManualTerminal,
+    async markStarted() {
+      calls.push("started");
+      broker.completeSafeTurn(exactBinding!.request_id, "Connector-confirmed Zero Risk answer");
+    },
+    async end(_path, activity) { calls.push(`end:${activity.status}`); },
+    async cancel() { calls.push("cancel"); },
+  };
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control }).runTurn!(
+      request("turn_safe_connector_confirmation"),
+      { headers: new Headers() },
+      event => events.push(event),
+    );
+    expect(calls).toEqual(["start", "started", "end:completed"]);
+    expect(events.some(event => event.type === "text_delta"
+      && event.phase === "commentary"
+      && event.text.includes("connector will confirm this turn automatically"))).toBeTrue();
+    expect(events.some(event => event.type === "text_delta"
+      && event.phase === "commentary"
+      && event.text.includes("confirm it was sent in the launcher"))).toBeFalse();
+    expect(events.filter((event): event is Extract<AdapterEvent, { type: "text_delta" }> => (
+      event.type === "text_delta" && event.phase === "final_answer"
+    )).map(event => event.text).join(""))
+      .toBe("Connector-confirmed Zero Risk answer");
+  } finally {
+    chatGptTurnSessions.clear();
+    await broker.close();
+  }
+});
+
 test("delegated Zero Risk starts without filesystem environment authority", async () => {
   const config = provider("delegated-envless");
   config.chatgptWeb!.toolAuthorityMode = "delegated";

@@ -187,6 +187,10 @@ class BrowserControlServer {
       if (body.connectorBound !== undefined && typeof body.connectorBound !== "boolean") {
         throw new Error("connectorBound is invalid");
       }
+      if (body.sentConfirmationRequired !== undefined
+        && typeof body.sentConfirmationRequired !== "boolean") {
+        throw new Error("sentConfirmationRequired is invalid");
+      }
       if (body.refreshViewport !== undefined && typeof body.refreshViewport !== "boolean") {
         throw new Error("refreshViewport is invalid");
       }
@@ -197,6 +201,9 @@ class BrowserControlServer {
         if (manualAction === "start") {
           if (host.browserInteractionMode() !== "manual") {
             throw new Error("Zero Risk is not enabled");
+          }
+          if (typeof body.sentConfirmationRequired !== "boolean") {
+            throw new Error("sentConfirmationRequired is required for manual turn start");
           }
           if (typeof body.prompt !== "string" || body.prompt.length < 1) {
             throw new Error("manual prompt is invalid");
@@ -215,6 +222,8 @@ class BrowserControlServer {
             body.conversationKey,
             body.resumePrompt,
             body.compaction === true,
+            preferences.zeroRiskRequireSentConfirmation !== false,
+            body.sentConfirmationRequired,
           );
           this.logger.info("browser.manual_control_started", {
             traceId: body.traceId,
@@ -260,7 +269,7 @@ class BrowserControlServer {
           }
           if (observed.status === "timeout") {
             writeJson(response, 408, {
-              error: "Codex Zero Risk did not start within its allowed time after Sent confirmation",
+              error: "Codex Zero Risk did not receive its required confirmation within the allowed time",
               code: "manual_turn_timed_out",
             });
             return;
@@ -356,10 +365,11 @@ class BrowserControlServer {
       const retainedUnavailable = error?.code === "retained_conversation_unavailable";
       const manualInspectionDisabled = error?.code === "manual_browser_inspection_disabled";
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
+      const manualSentPolicyMismatch = error?.code === "manual_sent_policy_mismatch";
       const manualTimedOut = error?.code === "manual_turn_timed_out";
       writeJson(
         response,
-        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost
+        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch
           ? 409
           : manualTimedOut ? 408 : 400,
         {
@@ -368,6 +378,7 @@ class BrowserControlServer {
         ...(retainedUnavailable ? { code: "retained_conversation_unavailable" } : {}),
         ...(manualInspectionDisabled ? { code: "manual_browser_inspection_disabled" } : {}),
         ...(manualOwnerLost ? { code: "manual_turn_owner_lost" } : {}),
+        ...(manualSentPolicyMismatch ? { code: "manual_sent_policy_mismatch" } : {}),
         ...(manualTimedOut ? { code: "manual_turn_timed_out" } : {}),
         },
       );

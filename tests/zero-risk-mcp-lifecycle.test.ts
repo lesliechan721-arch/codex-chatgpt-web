@@ -43,6 +43,44 @@ function toolResult(value: Record<string, unknown>): BrokerToolResult {
 }
 
 describe("Zero Risk turn broker lifecycle", () => {
+  test("connector-confirmation turns do not wait for a nonexistent Launcher Sent signal", async () => {
+    const socketPath = endpoint("connector-confirmation-claim");
+    const broker = TurnBroker.forSocket(socketPath);
+    try {
+      const requestId = await broker.registerSafe(
+        environment(),
+        nonceA,
+        undefined,
+        "safe-connector-confirmation-claim",
+        { requireSentConfirmation: false },
+      );
+
+      await expect(callTurnBroker(
+        socketPath,
+        { method: "claim", token: requestId, contract: "safe" },
+        250,
+      )).rejects.toThrow("codex_turn_start with its request_id first");
+
+      expect(broker.startSafeTurn(requestId)).toEqual({ started: true, duplicate: false });
+      const claimed = await callTurnBroker<{
+        bindingId: string;
+        activityId: string;
+      }>(socketPath, {
+        method: "claim",
+        token: requestId,
+        contract: "safe",
+      }, 250);
+      expect(claimed.bindingId).toStartWith("binding_");
+      await callTurnBroker(socketPath, {
+        method: "activity_complete",
+        token: requestId,
+        activityId: claimed.activityId,
+      });
+    } finally {
+      await broker.close();
+    }
+  });
+
   test("requires both Launcher Sent and connector start before tools can run", async () => {
     const socketPath = endpoint("strict-lifecycle");
     const broker = TurnBroker.forSocket(socketPath);

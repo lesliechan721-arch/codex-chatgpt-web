@@ -140,7 +140,10 @@ export interface ChatGptZeroRiskManualControl {
     owner: LauncherManualTurnOwner,
     options?: { abortSignal?: AbortSignal; timeoutMs?: number },
   ): Promise<{ status: "cancelled" | "failed" }>;
-  markStarted(descriptorPath: string, owner: LauncherManualTurnOwner): Promise<void>;
+  markStarted(
+    descriptorPath: string,
+    owner: LauncherManualTurnOwner,
+  ): Promise<void>;
   end(descriptorPath: string, activity: LauncherManualTurnEnd): Promise<unknown>;
   cancel(descriptorPath: string, owner: LauncherManualTurnOwner): Promise<void>;
 }
@@ -393,6 +396,11 @@ export function createChatGptWebAdapter(
     proAvailable: provider.chatgptWeb?.proAvailable === true,
   };
   const manualInteraction = provider.chatgptWeb?.browserInteractionMode === "manual";
+  const zeroRiskRequireSentConfirmation = provider.chatgptWeb?.zeroRiskRequireSentConfirmation !== false;
+  if (provider.chatgptWeb?.zeroRiskRequireSentConfirmation !== undefined
+    && typeof provider.chatgptWeb.zeroRiskRequireSentConfirmation !== "boolean") {
+    throw new Error("Zero Risk Sent confirmation preference must be a boolean");
+  }
   const toolAuthorityMode = provider.chatgptWeb?.toolAuthorityMode ?? "verified-environment";
   const freshConversationPerTurn = provider.chatgptWeb?.experimentalFreshConversationPerTurn === true;
   if (provider.chatgptWeb?.experimentalFreshConversationPerTurn !== undefined
@@ -628,7 +636,13 @@ export function createChatGptWebAdapter(
       };
       const runManual = async (): Promise<string> => {
         try {
-          activeToken = await broker.registerSafe(environment, surfaceNonce, undefined, traceId);
+          activeToken = await broker.registerSafe(
+            environment,
+            surfaceNonce,
+            undefined,
+            traceId,
+            { requireSentConfirmation: zeroRiskRequireSentConfirmation },
+          );
           observeCapabilityRetirement(activeToken, externalProgress);
           const compiled = compileChatGptWebPrompt(
             checkpointInput.parsed,
@@ -655,31 +669,38 @@ export function createChatGptWebAdapter(
               });
             }
           }
-          tokenSettled = true;
-          token.resolve(activeToken);
-          if (!parsed._compactionRequest) {
-            trace.push({
-              kind: "commentary",
-              text: "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, send the prompt, then confirm it was sent in the launcher.",
-            });
-          }
           await zeroRiskManualControl.start(retainedLauncherDescriptor, {
             ...owner,
             prompt: compiled.text,
+            sentConfirmationRequired: zeroRiskRequireSentConfirmation,
             ...(resumeCompiled ? { resumePrompt: resumeCompiled.text } : {}),
             ...(conversationKey ? { conversationKey } : {}),
             ...(parsed._compactionRequest ? { compaction: true as const } : {}),
           });
           launcherStarted = true;
-          await zeroRiskManualControl.waitSent(retainedLauncherDescriptor, owner, {
-            abortSignal: browserAbort.signal,
-          });
-          await broker.confirmSafeTurnSent(activeToken, surfaceNonce);
-          submission.phase = "accepted";
-          if (!parsed._compactionRequest) trace.push({
-            kind: "commentary",
-            text: "> **Waiting for ChatGPT**\n>\n> The prompt is marked `Sent`. Waiting for `Codex Zero Risk` to bind this turn through the selected ChatGPT connector.",
-          });
+          // Do not expose the broker request id to the outer harness until Launcher has captured
+          // and accepted the same per-turn Sent policy used by the broker.
+          tokenSettled = true;
+          token.resolve(activeToken);
+          if (!parsed._compactionRequest) {
+            trace.push({
+              kind: "commentary",
+              text: zeroRiskRequireSentConfirmation
+                ? "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, send the prompt, then confirm it was sent in the launcher."
+                : "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, then send the prompt. The connector will confirm this turn automatically.",
+            });
+          }
+          if (zeroRiskRequireSentConfirmation) {
+            await zeroRiskManualControl.waitSent(retainedLauncherDescriptor, owner, {
+              abortSignal: browserAbort.signal,
+            });
+            await broker.confirmSafeTurnSent(activeToken, surfaceNonce);
+            submission.phase = "accepted";
+            if (!parsed._compactionRequest) trace.push({
+              kind: "commentary",
+              text: "> **Waiting for ChatGPT**\n>\n> The prompt is marked `Sent`. Waiting for `Codex Zero Risk` to bind this turn through the selected ChatGPT connector.",
+            });
+          }
           const terminalAbort = new AbortController();
           const abortTerminal = () => terminalAbort.abort();
           browserAbort.signal.addEventListener("abort", abortTerminal, { once: true });
@@ -697,6 +718,7 @@ export function createChatGptWebAdapter(
               broker.waitForSafeStart(activeToken, browserAbort.signal),
               terminalFailure,
             ]);
+            submission.phase = "accepted";
             await zeroRiskManualControl.markStarted(retainedLauncherDescriptor, owner);
             if (!parsed._compactionRequest) trace.push({
               kind: "commentary",
@@ -728,7 +750,13 @@ export function createChatGptWebAdapter(
           // retirement observer also aborts browserAbort, but that self-induced abort must not turn
           // an ordinary launcher/runtime failure into a user cancellation.
           const externallyAborted = browserAbort.signal.aborted;
-          if (activeToken) await Promise.resolve(broker.revoke(activeToken, normalized)).catch(() => {});
+          // Before the Launcher policy handshake is published, this worker owns cleanup. After
+          // publication, the turn session owns the same capability and must observe this browser
+          // failure before revoking it; otherwise cleanup can replace the causal Launcher error
+          // with an "invalid or expired" broker error in the response observer.
+          if (activeToken && !tokenSettled) {
+            await Promise.resolve(broker.revoke(activeToken, normalized)).catch(() => {});
+          }
           try {
             await finishLauncher(externallyAborted ? "aborted" : "failed");
           } catch (controlError) {

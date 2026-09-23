@@ -1334,6 +1334,36 @@ class RuntimeHost {
     return { ...result, mode: current.mode, enabled: enabled === true };
   }
 
+  async setZeroRiskRequireSentConfirmation(enabled) {
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) {
+      throw new Error("Install the Codex integration before changing Zero Risk Sent confirmation");
+    }
+    if (current.config?.browserInteractionMode !== "manual" || current.mode !== "full") {
+      throw new Error("Zero Risk Sent confirmation is available only while the Full Zero Risk harness is active");
+    }
+    const args = [
+      ...(this.launcherProfile === "development" ? ["dev", "setup"] : ["setup"]),
+      "--full",
+      "--browser-host-descriptor",
+      this.browserDescriptorPath,
+      ...this.browserInteractionArgs({ mode: "manual" }),
+      "--acknowledge-unofficial",
+      enabled === true ? "--zero-risk-sent-confirmation" : "--zero-risk-no-sent-confirmation",
+      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Requiring Zero Risk Sent confirmation" : "Disabling Zero Risk Sent confirmation",
+      successMessage: enabled ? "Zero Risk Sent confirmation required" : "Zero Risk Sent confirmation disabled",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = this.launcherProfile === "development"
+      ? await this.runDevSetup("zero-risk-sent-confirmation", args, options)
+      : await this.runSetup("zero-risk-sent-confirmation", args, options);
+    return { ...result, mode: current.mode, enabled: enabled === true };
+  }
+
   async upgradeManagedRuntime() {
     this.assertProductionProfile("Managed Codex runtime upgrade");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
