@@ -3444,7 +3444,7 @@ test("visible DOM trace interleaves statuses and explicit intermediate commentar
   ] as const;
   expect(tracker.observe([...initialBlocks], false, 1_000)).toEqual([]);
   expect(tracker.observe([...initialBlocks], false, 1_100)).toEqual([
-    { kind: "reasoning", text: "Reviewed architecture documentation" },
+    { kind: "reasoning", text: "**Reviewed architecture documentation**" },
     { kind: "commentary", text: "The implementation has a concrete state drift." },
   ]);
   const commentaryBlocks = [
@@ -3456,7 +3456,7 @@ test("visible DOM trace interleaves statuses and explicit intermediate commentar
   ] as const;
   expect(tracker.observe([...commentaryBlocks], false, 1_200)).toEqual([]);
   expect(tracker.observe([...commentaryBlocks], false, 1_300)).toEqual([
-    { kind: "reasoning", text: "Inspecting runtime evidence" },
+    { kind: "reasoning", text: "**Inspecting runtime evidence**" },
     { kind: "commentary", text: "The browser DOM confirms the boundary." },
   ]);
   expect(tracker.observe([
@@ -3468,7 +3468,7 @@ test("visible DOM trace does not duplicate a phase after a transient DOM disappe
   const tracker = new ChatGptVisibleTraceTracker(100);
   expect(tracker.observe([{ kind: "status", text: "Thinking" }], false, 1_000)).toEqual([]);
   expect(tracker.observe([{ kind: "status", text: "Thinking" }], false, 1_100)).toEqual([
-    { kind: "reasoning", text: "Thinking" },
+    { kind: "reasoning", text: "**Thinking**" },
   ]);
   expect(tracker.observe([], false, 1_150)).toEqual([]);
   expect(tracker.observe([{ kind: "status", text: "Thinking" }], false, 1_300)).toEqual([]);
@@ -3492,7 +3492,7 @@ test("visible DOM trace emits a short-lived reasoning label on its first observa
   expect(tracker.observe([
     { kind: "status", text: "Binding Codex turn context" },
   ], false, 1_000)).toEqual([
-    { kind: "reasoning", text: "Binding Codex turn context" },
+    { kind: "reasoning", text: "**Binding Codex turn context**" },
   ]);
 });
 
@@ -3501,7 +3501,7 @@ test("completed-turn evidence flushes a short-lived reasoning label immediately"
   expect(tracker.observe([
     { kind: "status", text: "Reviewing ChatGPT Web Prompt and State Handling" },
   ], true, 1_000)).toEqual([
-    { kind: "reasoning", text: "Reviewing ChatGPT Web Prompt and State Handling" },
+    { kind: "reasoning", text: "**Reviewing ChatGPT Web Prompt and State Handling**" },
   ]);
 });
 
@@ -3537,7 +3537,7 @@ test("visible DOM trace emits one complete commentary paragraph before the next 
     { kind: "commentary", text: "I’m reading the repository’s mandatory architecture" },
   ]);
   expect(tracker.observe([...completed], false, 1_350)).toEqual([
-    { kind: "reasoning", text: "Read context file contents" },
+    { kind: "reasoning", text: "**Read context file contents**" },
   ]);
   expect(tracker.observe([...completed], false, 1_450)).toEqual([]);
 });
@@ -3597,7 +3597,7 @@ test("visible DOM trace keeps a complete action phrase instead of a nested count
   expect(new ChatGptVisibleTraceTracker(0).observe([
     { kind: "status", text: "Searched\n5\nsites" },
   ], false)).toEqual([
-    { kind: "reasoning", text: "Searched 5 sites" },
+    { kind: "reasoning", text: "**Searched 5 sites**" },
   ]);
 });
 
@@ -3614,7 +3614,7 @@ test("visible DOM trace waits out animated Pro fragments and appends genuine gro
     { kind: "status", text: "I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity" },
   ], false, 1_200)).toEqual([{
     kind: "reasoning",
-    text: "I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity",
+    text: "**I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity**",
   }]);
 
   expect(tracker.observe([
@@ -3624,9 +3624,44 @@ test("visible DOM trace waits out animated Pro fragments and appends genuine gro
     { kind: "status", text: "I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity, including validation" },
   ], false, 1_350)).toEqual([{
     kind: "reasoning",
-    text: ", including validation",
+    text: "__, including validation__",
     continuation: true,
   }]);
+
+  expect(Bun.markdown.html(
+    "**I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity**"
+    + "__, including validation__",
+  )).toContain("<strong>, including validation</strong>");
+
+  expect(tracker.observe([
+    { kind: "status", text: "I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity, including validation and tests" },
+  ], false, 1_400)).toEqual([]);
+  expect(tracker.observe([
+    { kind: "status", text: "I’m seeking a concrete stack to automate dump.cs → RVA → Ghidra → rewrite → Unity, including validation and tests" },
+  ], false, 1_500)).toEqual([{
+    kind: "reasoning",
+    text: " **and tests**",
+    continuation: true,
+  }]);
+});
+
+test("visible DOM reasoning bolding preserves Markdown punctuation across continuation deltas", () => {
+  const { createWindow } = require("@mixmark-io/domino") as {
+    createWindow(html: string): { document: Document };
+  };
+  const tracker = new ChatGptVisibleTraceTracker(0);
+  const initial = "Inspect * _ `code` [link](url) <https://example.com> &copy; ~~gone~~ \\ end*";
+  const first = tracker.observe([{ kind: "status", text: initial }], false, 1_000);
+  const second = tracker.observe([{ kind: "status", text: `${initial}_bar` }], false, 1_010);
+
+  expect(first).toHaveLength(1);
+  expect(second).toHaveLength(1);
+  expect(second[0]).toMatchObject({ kind: "reasoning", continuation: true });
+  const rendered = createWindow(Bun.markdown.html([...first, ...second].map(event => event.text).join(""))).document.body;
+  expect(rendered.textContent.trimEnd()).toBe(`${initial}_bar`);
+  expect(Array.from(rendered.querySelectorAll("strong")).map(element => element.textContent).join(""))
+    .toBe(`${initial}_bar`);
+  expect(rendered.querySelector("a, code, em") ?? null).toBeNull();
 });
 
 test("trace parsing excludes the Answer now UI control", () => {

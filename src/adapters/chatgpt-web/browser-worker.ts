@@ -1701,10 +1701,17 @@ const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
   traceBlocks: [],
 });
 
+function escapeMarkdownPlainText(value: string): string {
+  // Trace text comes from innerText, so Markdown punctuation is literal user-visible text here.
+  // Escape only punctuation that can change inline Markdown semantics before adding wrappers.
+  return value.replace(/[\\`*_\[\]()<>~&]/g, "\\$&");
+}
+
 /** Convert the public ChatGPT turn DOM into append-only Codex reasoning summaries. */
 export class ChatGptVisibleTraceTracker {
   private readonly emittedTrace = new Map<string, string>();
   private readonly traceCandidates = new Map<string, { text: string; changedAt: number }>();
+  private readonly reasoningDelimiter = new Map<string, "**" | "__">();
 
   constructor(private readonly traceStabilityMs = 250) {}
 
@@ -1745,9 +1752,30 @@ export class ChatGptVisibleTraceTracker {
       const kind = block.kind === "commentary" ? "commentary" : "reasoning";
 
       if (previous && text.startsWith(previous)) {
-        output.push({ kind, text: text.slice(previous.length), continuation: true });
+        const delta = text.slice(previous.length);
+        if (kind === "reasoning") {
+          // Responses concatenates continuation deltas into one Markdown summary. Alternate the
+          // strong delimiter so adjacent chunks do not collapse into an invalid `****` boundary.
+          const delimiter = this.reasoningDelimiter.get(slot) === "**" ? "__" : "**";
+          this.reasoningDelimiter.set(slot, delimiter);
+          const leading = delta.match(/^\s+/)?.[0] ?? "";
+          const trailing = delta.match(/\s+$/)?.[0] ?? "";
+          const core = delta.slice(leading.length, delta.length - trailing.length);
+          output.push({
+            kind,
+            text: core ? `${leading}${delimiter}${escapeMarkdownPlainText(core)}${delimiter}${trailing}` : delta,
+            continuation: true,
+          });
+        } else {
+          output.push({ kind, text: delta, continuation: true });
+        }
       } else {
-        output.push({ kind, text });
+        if (kind === "reasoning") {
+          this.reasoningDelimiter.set(slot, "**");
+          output.push({ kind, text: `**${escapeMarkdownPlainText(text)}**` });
+        } else {
+          output.push({ kind, text });
+        }
       }
     }
     return output;
