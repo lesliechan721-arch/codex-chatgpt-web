@@ -30,10 +30,11 @@ function isLocalCompaction(body: unknown): boolean {
   }
   if (!isObj(metadata) || metadata.request_kind !== "compaction"
     || !isObj(metadata.compaction) || metadata.compaction.implementation !== "responses") return false;
-  // Native responses/memento compaction uses the same request_kind/implementation metadata but
-  // does not append the local COMPACT_PROMPT control message. Leave any explicit strategy to the
-  // native text-compaction parser below so it can accept memento and reject unknown strategies.
-  if (metadata.compaction.strategy !== undefined) return false;
+  // Local compact.rs uses a standalone turn and appends an unowned user control message. Native
+  // responses/memento pre-turn compaction uses the same strategy metadata, so strategy alone is
+  // not a protocol boundary. Only standalone turns enter the strict local control-tail contract;
+  // other compaction phases fall through to the native text-compaction parser below.
+  if (metadata.compaction.phase !== "standalone_turn") return false;
   const input = Array.isArray(body.input) ? body.input : [];
   const tail = input.at(-1);
   // This prompt is a native control item, not a new human instruction. Metadata alone does not

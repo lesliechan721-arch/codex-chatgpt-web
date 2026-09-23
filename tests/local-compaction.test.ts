@@ -38,6 +38,7 @@ for (const explicit of [true, false]) test(`native local compaction recognizes m
   const parsed = parseRequest(body);
   expect(parsed._compactionRequest).toBe(true);
   expect(parsed._compactionOutput).toBe("message");
+  expect(parsed._compactionResponseFormat).toBeUndefined();
   expect(extractChatGptCompactionSourceRevision(parsed)).toEqual({ content: source.content, itemId: source.id });
   expect(parsed._rawBody).toEqual(body);
 });

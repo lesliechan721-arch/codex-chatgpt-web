@@ -21,7 +21,10 @@ test("native responses/memento compaction returns assistant text, not an encrypt
     tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
     input: [{ type: "message", id: "msg_source_memento", role: "user", content: [{ type: "input_text", text: "Summarize the previous work." }] }],
   };
-  expect(parseRequest(body)._compactionRequest).toBe(true);
+  const parsed = parseRequest(body);
+  expect(parsed._compactionRequest).toBe(true);
+  expect(parsed._compactionOutput).toBeUndefined();
+  expect(parsed._compactionResponseFormat).toBe("message");
   for (const stream of [false, true]) {
     const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
       method: "POST", body: JSON.stringify({ ...body, stream }),

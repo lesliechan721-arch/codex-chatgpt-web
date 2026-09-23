@@ -1,6 +1,6 @@
 export const CHATGPT_WEB_MODEL_PREFIX = "chatgpt-web/";
 export const CHATGPT_WEB_BACKEND_MODEL = "gpt-5.6-sol";
-export const CHATGPT_WEB_LUNA_BACKEND_MODEL = "gpt-6-luna";
+export const CHATGPT_WEB_LUNA_BACKEND_MODEL = "gpt-5.6-luna";
 /** Internal adapter identity for a turn whose ChatGPT model is selected by the user in the launcher. */
 export const CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL = "chatgpt-web-zero-risk";
 /** Internal adapter identity for the explicitly enabled, Pro-sized Zero Risk context profile. */

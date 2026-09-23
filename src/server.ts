@@ -787,7 +787,7 @@ async function threadTitleRequest(
       );
     }
   }
-  const upstreamModel = webModel ? CHATGPT_WEB_LUNA_BACKEND_MODEL : requestedModel;
+  const upstreamModel = webModel ? CODEX_UPSTREAM_LUNA_MODEL : requestedModel;
   return directResponsesRequest(
     request,
     raw,
@@ -799,6 +799,7 @@ async function threadTitleRequest(
 }
 
 const CODEX_AUTO_REVIEW_MODEL = "codex-auto-review";
+const CODEX_UPSTREAM_LUNA_MODEL = "gpt-6-luna";
 
 async function guardianReviewModel(
   request: Request,
@@ -853,7 +854,7 @@ async function guardianReviewModel(
     )),
   );
   if (slugs.has(CODEX_AUTO_REVIEW_MODEL)) return CODEX_AUTO_REVIEW_MODEL;
-  if (slugs.has(CHATGPT_WEB_LUNA_BACKEND_MODEL)) return CHATGPT_WEB_LUNA_BACKEND_MODEL;
+  if (slugs.has(CODEX_UPSTREAM_LUNA_MODEL)) return CODEX_UPSTREAM_LUNA_MODEL;
   return apiAccessError(
     400,
     "model_not_supported",

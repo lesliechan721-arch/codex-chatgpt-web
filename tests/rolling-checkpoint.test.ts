@@ -46,7 +46,7 @@ function request(
   input: Record<string, unknown>[],
 ) {
   return parseRequest({
-    model: "gpt-6-luna",
+    model: "gpt-5.6-luna",
     input,
     stream: true,
     client_metadata: {
@@ -253,11 +253,11 @@ test("Luna checkpoint preserves the server-resolved backend model when the raw b
     message("user", "Continue", nextTurnId),
   ]);
   (next._rawBody as { model: string }).model = "chatgpt-web/luna";
-  next.modelId = "gpt-6-luna";
+  next.modelId = "gpt-5.6-luna";
   next.options.reasoning = "low";
 
   const applied = store.apply(next);
   expect(applied.applied).toBeTrue();
-  expect(applied.parsed.modelId).toBe("gpt-6-luna");
+  expect(applied.parsed.modelId).toBe("gpt-5.6-luna");
   expect(applied.parsed.options.reasoning).toBe("low");
 });

@@ -50,6 +50,8 @@ describe("fixed ChatGPT Web model routes", () => {
       "GPT-5.6 Sol Instant (Web)", "GPT-5.6 Sol (Web)", "GPT-5.6 Pro (Web)", "GPT-6 Pro (Web)",
     ]);
     expect(CHATGPT_WEB_LUNA_MODEL_ROUTE.displayName).toBe("GPT-5.6 Luna (Web)");
+    expect(CHATGPT_WEB_LUNA_BACKEND_MODEL).toBe("gpt-5.6-luna");
+    expect(CHATGPT_WEB_LUNA_MODEL_ROUTE.backendModel).toBe("gpt-5.6-luna");
   });
 
   test("exposes only Plus-eligible routes without the Pro account capability", () => {

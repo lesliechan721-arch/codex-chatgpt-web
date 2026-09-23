@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  CHATGPT_WEB_LUNA_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
 } from "./chatgpt-web-models";
@@ -572,7 +573,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
   const manual = config.browserInteractionMode === "manual";
   const model = manual
     ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
-    : config.solAvailable ? "gpt-5.6-sol" : "gpt-6-luna";
+    : config.solAvailable ? "gpt-5.6-sol" : CHATGPT_WEB_LUNA_BACKEND_MODEL;
   const models = manual
     ? [
       CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
