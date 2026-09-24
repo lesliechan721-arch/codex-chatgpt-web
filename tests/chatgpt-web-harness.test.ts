@@ -29,6 +29,9 @@ import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compac
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
 
+// Each ordinary test call below is a new logical Native operation.
+let nextNativeOperationId = 0;
+
 const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date.now()}`);
 mkdirSync(tempRoot, { recursive: true });
 afterAll(() => rmSync(tempRoot, { recursive: true, force: true }));
@@ -2774,7 +2777,7 @@ describe("ChatGPT outer-native harness v4", () => {
       stderr: "pipe",
     });
     const client = new Client({ name: "codex-chatgpt-web-harness-test", version: "1.0.0" });
-    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: { operation_id: ++nextNativeOperationId, ...args } });
 
     try {
       await client.connect(transport);
@@ -2784,6 +2787,7 @@ describe("ChatGPT outer-native harness v4", () => {
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",
+        "codex_tool_wait",
         "codex_view_image",
         "codex_write_stdin",
       ]);
@@ -2798,7 +2802,7 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("9bb14902149337b52ce8598889497b1aba5a3265f28291df950bb38b5700a421");
+        .toBe("802a745656d0b7dce98a57f6292556db5682b96ce89a327763cd360cc22bb2f1");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -2808,19 +2812,19 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(listed.tools.find(tool => tool.name === "codex_exec")?.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: true,
-        idempotentHint: false,
+        idempotentHint: true,
         openWorldHint: true,
       });
       expect(listed.tools.find(tool => tool.name === "codex_write_stdin")?.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: true,
-        idempotentHint: false,
+        idempotentHint: true,
         openWorldHint: true,
       });
       expect(listed.tools.find(tool => tool.name === "codex_apply_patch")?.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: true,
-        idempotentHint: false,
+        idempotentHint: true,
         openWorldHint: false,
       });
       expect(listed.tools.find(tool => tool.name === "codex_view_image")?.annotations).toMatchObject({
@@ -2838,7 +2842,7 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.annotations).toMatchObject({
         readOnlyHint: false,
         destructiveHint: true,
-        idempotentHint: false,
+        idempotentHint: true,
         openWorldHint: true,
       });
 
@@ -3181,7 +3185,7 @@ describe("ChatGPT outer-native harness v4", () => {
         } }];
         const token = await broker.register(environment, 60_000);
         try {
-          const pending = client.callTool({ name: "codex_exec", arguments: { turn_token: token, cmd: "pwd", ...permissions } });
+          const pending = client.callTool({ name: "codex_exec", arguments: { operation_id: ++nextNativeOperationId, turn_token: token, cmd: "pwd", ...permissions } });
           const [request] = await broker.nextToolBatch(token);
           const expected = name === "exec_command" ? { cmd: "pwd", ...permissions } : { command: "pwd", ...permissions };
           broker.completeTool(token, request!.callId, { content: [{ type: "text", text: "Native approval denied" }], isError: true });
@@ -3196,10 +3200,10 @@ describe("ChatGPT outer-native harness v4", () => {
       } }];
       const token = await broker.register(environment, 60_000);
       try {
-        const refused = await client.callTool({ name: "codex_exec", arguments: { turn_token: token, cmd: "pwd", ...permissions } });
+        const refused = await client.callTool({ name: "codex_exec", arguments: { operation_id: ++nextNativeOperationId, turn_token: token, cmd: "pwd", ...permissions } });
         expect(refused.isError).toBe(true);
         expect(JSON.stringify(refused.content)).toContain("does not support sandbox_permissions");
-        const ordinary = client.callTool({ name: "codex_exec", arguments: { turn_token: token, cmd: "pwd" } });
+        const ordinary = client.callTool({ name: "codex_exec", arguments: { operation_id: ++nextNativeOperationId, turn_token: token, cmd: "pwd" } });
         const batch = await broker.nextToolBatch(token);
         for (const request of batch) broker.completeTool(token, request.callId, toolResult({ output: "fixture", exit_code: 0 }));
         await ordinary;
@@ -3230,7 +3234,7 @@ describe("ChatGPT outer-native harness v4", () => {
       stderr: "pipe",
     });
     const client = new Client({ name: "codex-chatgpt-web-direct-tools-test", version: "1.0.0" });
-    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: { operation_id: ++nextNativeOperationId, ...args } });
 
     try {
       await client.connect(transport);
@@ -3353,11 +3357,11 @@ describe("ChatGPT outer-native harness v4", () => {
       await client.connect(transport);
       const firstCall = client.callTool({
         name: "codex_exec",
-        arguments: { turn_token: firstToken, cmd: "pwd", workdir: firstEnvironment.cwd, yield_time_ms: 1_000 },
+        arguments: { operation_id: ++nextNativeOperationId, turn_token: firstToken, cmd: "pwd", workdir: firstEnvironment.cwd, yield_time_ms: 1_000 },
       });
       const secondCall = client.callTool({
         name: "codex_exec",
-        arguments: { turn_token: secondToken, cmd: "pwd", workdir: secondEnvironment.cwd, yield_time_ms: 2_000 },
+        arguments: { operation_id: ++nextNativeOperationId, turn_token: secondToken, cmd: "pwd", workdir: secondEnvironment.cwd, yield_time_ms: 2_000 },
       });
       const [[firstRequest], [secondRequest]] = await Promise.all([
         broker.nextToolBatch(firstToken),
@@ -3406,7 +3410,7 @@ describe("ChatGPT outer-native harness v4", () => {
       stderr: "pipe",
     });
     const client = new Client({ name: "codex-chatgpt-web-harness-test", version: "1.0.0" });
-    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: { operation_id: ++nextNativeOperationId, ...args } });
 
     try {
       await client.connect(transport);
@@ -3415,7 +3419,7 @@ describe("ChatGPT outer-native harness v4", () => {
         turn_token: "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       });
       expect(invalid.isError).toBe(true);
-      expect(JSON.stringify(invalid.content)).toContain("turn token is invalid, expired, or revoked");
+      expect(invalid.structuredContent).toMatchObject({ code: "codex_tool_operation_retired" });
 
       const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
       const [execRequest] = await Promise.race([
@@ -3438,14 +3442,14 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 30_000);
 
-  test("an explicitly aborted MCP request revokes its turn binding and leaves the stdio server usable", async () => {
+  test("an explicitly aborted MCP query preserves its original operation and leaves the stdio server usable", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-mcp-abort-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
     const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
     environment.tools = [
       { name: "exec_command", description: "Run a Codex command", parameters: { type: "object" } },
     ];
-    const abandonedToken = await broker.register(environment, 3_000);
+    const abandonedToken = await broker.register(environment);
     const replacementToken = await broker.register(environment);
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -3460,31 +3464,27 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(chatGptMcpInvocationTimeout({ ...environment, expiresAt: 1_500 }, 1_000)).toBe(500);
       await client.connect(transport);
       const abort = new AbortController();
+      const abandonedOperationId = ++nextNativeOperationId;
       const abandoned = client.callTool({
         name: "codex_exec",
-        arguments: { turn_token: abandonedToken, cmd: "sleep forever", yield_time_ms: 30_000 },
+        arguments: { operation_id: abandonedOperationId, turn_token: abandonedToken, cmd: "sleep forever", yield_time_ms: 30_000 },
       }, undefined, { signal: abort.signal });
       const [request] = await broker.nextToolBatch(abandonedToken);
       expect(request).toMatchObject({ wireName: "exec_command" });
       abort.abort(new Error("synthetic MCP client cancellation"));
       await expect(abandoned).rejects.toBeDefined();
 
-      const deadline = Date.now() + 5_000;
-      let abandonedError: unknown;
-      do {
-        try {
-          await callTurnBroker(socketPath, { method: "claim", token: abandonedToken });
-        } catch (error) {
-          abandonedError = error;
-          break;
-        }
-        await Bun.sleep(10);
-      } while (Date.now() < deadline);
-      expect(String(abandonedError)).toContain("already finished");
+      broker.completeTool(abandonedToken, request!.callId, toolResult({ original: "recovered after query cancellation" }));
+      const recovered = await client.callTool({
+        name: "codex_tool_wait",
+        arguments: { turn_token: abandonedToken, operation_id: abandonedOperationId },
+      });
+      expect(recovered.structuredContent).toEqual({ original: "recovered after query cancellation" });
+      expect(broker.beginCompletionFence(abandonedToken)).toBeNumber();
 
       const inventory = await client.callTool({
         name: "codex_tool_inventory",
-        arguments: { turn_token: replacementToken, query: "exec_command", include_schema: false },
+        arguments: { operation_id: ++nextNativeOperationId, turn_token: replacementToken, query: "exec_command", include_schema: false },
       });
       expect(inventory.structuredContent).toMatchObject({
         total: 1,
@@ -3498,7 +3498,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   }, 10_000);
 
-  test("a native tool deadline returns an explicit MCP timeout instead of a transport failure", async () => {
+  test("an explicit native capability deadline retires the operation without becoming a bridge polling timeout", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-mcp-timeout-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
     const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
@@ -3525,7 +3525,7 @@ describe("ChatGPT outer-native harness v4", () => {
       replacementToken = activeReplacementToken;
       const timedOut = client.callTool({
         name: "codex_exec",
-        arguments: { turn_token: activeTimedOutToken, cmd: "slow external MCP call" },
+        arguments: { operation_id: ++nextNativeOperationId, turn_token: activeTimedOutToken, cmd: "slow external MCP call" },
       });
       const [request] = await broker.nextToolBatch(activeTimedOutToken);
       expect(request).toMatchObject({ wireName: "exec_command" });
@@ -3537,18 +3537,19 @@ describe("ChatGPT outer-native harness v4", () => {
         value => ({ type: "value" as const, value }),
         error => ({ type: "error" as const, error: error instanceof Error ? error : new Error(String(error)) }),
       );
-      const retirement = broker.waitForRetirement(activeTimedOutToken).then(() => {
+      const retirement = broker.waitForRetirement(activeTimedOutToken).catch(error => {
+        expect(error).toMatchObject({ code: "codex_tool_native_deadline" });
         externalProgress.retire(new Error("MCP invocation retired its turn binding"));
       });
 
       const timeoutResult = await timedOut;
       expect(timeoutResult.isError).toBe(true);
       expect(timeoutResult.structuredContent).toMatchObject({
-        code: "codex_tool_timeout",
-        tool: "exec_command",
+        code: "codex_tool_native_deadline",
+        tool: "codex_exec",
         retryable: false,
       });
-      expect(JSON.stringify(timeoutResult.content)).toContain("did not complete before the MCP transport deadline");
+      expect(JSON.stringify(timeoutResult.content)).toContain("Native turn deadline was reached");
       await retirement;
       expect(externalProgress.snapshot().activeToolCalls).toBe(0);
       expect(chatGptExternalToolCallsAreInFlight(externalProgress.snapshot())).toBeFalse();
@@ -3565,7 +3566,7 @@ describe("ChatGPT outer-native harness v4", () => {
 
       const inventory = await client.callTool({
         name: "codex_tool_inventory",
-        arguments: { turn_token: activeReplacementToken, query: "exec_command", include_schema: false },
+        arguments: { operation_id: ++nextNativeOperationId, turn_token: activeReplacementToken, query: "exec_command", include_schema: false },
       });
       expect(inventory.structuredContent).toMatchObject({
         total: 1,

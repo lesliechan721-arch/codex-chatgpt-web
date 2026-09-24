@@ -1,8 +1,21 @@
+import { NATIVE_WAIT_LEASE_MS } from "./native-tool-wait-protocol";
+import type { NativeWaitingSnapshot } from "./native-tool-operations";
+
+/** This evidence is recorded from an authorized Broker observation, not model-authored text. */
+interface NativeWaitingEvidence {
+  sourceRevision: number;
+  activeOperations: number;
+  unreadResults: number;
+  observedAt: number;
+  expiresAt: number;
+}
+
 export interface ChatGptExternalTurnProgressSnapshot {
   revision: number;
   lastToolBatchRevision: number;
   activeToolCalls: number;
   lastProgressAt?: number;
+  nativeWaiting?: NativeWaitingEvidence;
 }
 
 interface ProgressWaiter {
@@ -88,6 +101,8 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
   private observedToolBatchRevision = 0;
   private activeToolCalls = 0;
   private lastProgressAt?: number;
+  private nativeWaitingRevision = 0;
+  private nativeWaiting?: NativeWaitingEvidence;
   private retirementError?: Error;
   private readonly toolBatchObservationWaiters = new Set<ToolBatchObservationWaiter>();
 
@@ -97,6 +112,7 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
       lastToolBatchRevision: this.lastToolBatchRevision,
       activeToolCalls: this.activeToolCalls,
       ...(this.lastProgressAt !== undefined ? { lastProgressAt: this.lastProgressAt } : {}),
+      ...(this.nativeWaiting ? { nativeWaiting: { ...this.nativeWaiting } } : {}),
     };
   }
 
@@ -108,6 +124,27 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
     this.activeToolCalls += count;
     this.advance(now, "tool_batch");
     return this.lastToolBatchRevision;
+  }
+
+  recordNativeWaiting(snapshot: NativeWaitingSnapshot, now = Date.now()): void {
+    this.assertNotRetired();
+    if (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0
+      || !Number.isSafeInteger(snapshot.activeOperations) || snapshot.activeOperations < 0
+      || !Number.isSafeInteger(snapshot.unreadResults) || snapshot.unreadResults < 0
+      || !Number.isFinite(snapshot.remainingMs) || snapshot.remainingMs < 0 || snapshot.remainingMs > NATIVE_WAIT_LEASE_MS
+      || !Number.isFinite(now)) throw new Error("Invalid Broker Native waiting evidence");
+    if (snapshot.revision <= this.nativeWaitingRevision) return;
+    this.nativeWaitingRevision = snapshot.revision;
+    this.nativeWaiting = {
+      sourceRevision: snapshot.revision,
+      activeOperations: snapshot.activeOperations,
+      unreadResults: snapshot.unreadResults,
+      observedAt: now,
+      expiresAt: now + snapshot.remainingMs,
+    };
+    // Waiting changes transport state only. It must not invent a tool batch or business progress.
+    this.revision += 1;
+    this.notify(this.snapshot());
   }
 
   async acknowledgeToolBatch(revision: number): Promise<void> {
@@ -162,8 +199,11 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
       waiter.reject(error);
     }
     this.toolBatchObservationWaiters.clear();
-    if (this.activeToolCalls === 0) return true;
+    if (this.activeToolCalls === 0 && !this.nativeWaiting) return true;
     this.activeToolCalls = 0;
+    if (this.nativeWaiting) {
+      this.nativeWaiting = { ...this.nativeWaiting, activeOperations: 0, unreadResults: 0, expiresAt: this.nativeWaiting.observedAt };
+    }
     // Retirement is not fresh model progress. Advance the transport revision so the browser mirror
     // drops its completion veto, while preserving the timestamp of the last proven MCP activity.
     this.revision += 1;
@@ -220,7 +260,7 @@ export class ChatGptMirroredTurnProgress extends ChatGptTurnProgressBroadcaster 
   }
 
   snapshot(): ChatGptExternalTurnProgressSnapshot {
-    return { ...this.current };
+    return { ...this.current, ...(this.current.nativeWaiting ? { nativeWaiting: { ...this.current.nativeWaiting } } : {}) };
   }
 
   async acknowledgeToolBatch(revision: number): Promise<void> {
@@ -242,13 +282,18 @@ export class ChatGptMirroredTurnProgress extends ChatGptTurnProgressBroadcaster 
     // recorder only ever moves these forward, so a regression means a corrupt or forged frame
     // rather than an ordering artefact, and accepting it would desynchronise observed liveness.
     if (next.lastToolBatchRevision < this.current.lastToolBatchRevision
+      || (this.current.nativeWaiting !== undefined && next.nativeWaiting === undefined)
+      || (next.nativeWaiting && this.current.nativeWaiting && (
+        next.nativeWaiting.sourceRevision < this.current.nativeWaiting.sourceRevision
+        || (next.nativeWaiting.sourceRevision === this.current.nativeWaiting.sourceRevision
+          && next.nativeWaiting.expiresAt > this.current.nativeWaiting.expiresAt)))
       || (next.lastProgressAt === undefined && this.current.lastProgressAt !== undefined)
       || (next.lastProgressAt !== undefined
         && this.current.lastProgressAt !== undefined
         && next.lastProgressAt < this.current.lastProgressAt)) {
       throw new Error("ChatGPT external progress snapshot regressed against the observed state");
     }
-    this.current = { ...next };
+    this.current = { ...next, ...(next.nativeWaiting ? { nativeWaiting: { ...next.nativeWaiting } } : {}) };
     this.notify(this.snapshot());
     return true;
   }
@@ -266,9 +311,25 @@ export function assertChatGptTurnProgressSnapshot(
     || (value.lastProgressAt !== undefined && !Number.isFinite(value.lastProgressAt))
     // Any recorded activity stamps a timestamp, so a frame claiming progress without one is
     // malformed and would otherwise report liveness the daemon never observed.
-    || (value.revision > 0 && value.lastProgressAt === undefined)) {
+    || (value.revision > 0 && value.lastProgressAt === undefined && value.nativeWaiting === undefined)) {
     throw new Error("ChatGPT external progress snapshot is invalid");
   }
+  const waiting = value.nativeWaiting;
+  if (waiting && (!finiteIndex(waiting.sourceRevision) || waiting.sourceRevision === 0
+    || !finiteIndex(waiting.activeOperations) || !finiteIndex(waiting.unreadResults)
+    || !Number.isFinite(waiting.observedAt) || !Number.isFinite(waiting.expiresAt)
+    || waiting.expiresAt < waiting.observedAt || waiting.expiresAt - waiting.observedAt > NATIVE_WAIT_LEASE_MS)) {
+    throw new Error("ChatGPT Native waiting evidence is invalid");
+  }
+}
+
+export function chatGptNativeWaitingLeaseIsLive(snapshot: ChatGptExternalTurnProgressSnapshot | undefined, now: number): boolean {
+  const waiting = snapshot?.nativeWaiting;
+  return Boolean(waiting && (waiting.activeOperations > 0 || waiting.unreadResults > 0)
+    && Number.isFinite(waiting.observedAt) && Number.isFinite(waiting.expiresAt)
+    && waiting.expiresAt > waiting.observedAt
+    && waiting.expiresAt - waiting.observedAt <= NATIVE_WAIT_LEASE_MS
+    && waiting.observedAt <= now + 5_000 && now < waiting.expiresAt);
 }
 
 export function chatGptExternalProgressIsLive(
@@ -280,7 +341,7 @@ export function chatGptExternalProgressIsLive(
   if (!Number.isFinite(now) || !Number.isFinite(graceMs) || graceMs < 0) {
     throw new Error("ChatGPT external progress liveness inputs are invalid");
   }
-  return snapshot.activeToolCalls > 0
+  return chatGptNativeWaitingLeaseIsLive(snapshot, now) || snapshot.activeToolCalls > 0
     || (snapshot.lastProgressAt !== undefined && now - snapshot.lastProgressAt < graceMs);
 }
 
@@ -288,5 +349,7 @@ export function chatGptExternalProgressIsLive(
 export function chatGptExternalToolCallsAreInFlight(
   snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
 ): boolean {
-  return (snapshot?.activeToolCalls ?? 0) > 0;
+  return (snapshot?.activeToolCalls ?? 0) > 0
+    || (snapshot?.nativeWaiting?.activeOperations ?? 0) > 0
+    || (snapshot?.nativeWaiting?.unreadResults ?? 0) > 0;
 }

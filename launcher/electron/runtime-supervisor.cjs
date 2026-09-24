@@ -11,6 +11,7 @@ const {
   terminateOwnedProcessTree,
 } = require("./process-tree.cjs");
 const { runtimeInvocation } = require("./runtime-command.cjs");
+const { DEV_LONG_WAIT_CONNECTOR_NAME } = require("./connector-identity.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
@@ -1083,7 +1084,12 @@ class RuntimeSupervisor {
   }
 
   async runTunnelConnectCommand(config) {
-    const contract = config.browserInteractionMode === "manual" ? "safe" : "native";
+    const contract = config.browserInteractionMode === "manual"
+      ? "safe"
+      : config.purpose === "dev-harness" && config.devNativeToolLongWaitProbe === true
+        && config.appName === DEV_LONG_WAIT_CONNECTOR_NAME
+        ? "native-long-wait-probe"
+        : "native";
     const invocation = this.runtimeCommand([
       "mcp",
       "--contract",

@@ -136,6 +136,66 @@ test("setup repairs a legacy automatic connector name that collides with Zero Ri
   });
 });
 
+test.each([
+  ["Browser-only", "browser-only", "automatic"],
+  ["Automatic Full", "full", "automatic"],
+  ["Zero Risk Full", "full", "manual"],
+] as const)("setup migrates the legacy Zero Risk identity for %s configs", (_, mode, interactionMode) => {
+  const root = join(tmpdir(), `codex-chatgpt-web-zero-risk-name-migration-${mode}-${interactionMode}-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+
+  const legacy = {
+    ...defaultConfig(mode),
+    appName: interactionMode === "manual" ? "Codex Zero Risk" : "Codex Native2",
+    automaticAppName: "Codex Native2",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: interactionMode,
+    contextWindow: 123_456,
+    useSavedChats: true,
+  };
+  const automaticTunnel = {
+    binaryPath: join(root, "automatic", "tunnel-client"),
+    tunnelId: `tunnel_${"a".repeat(32)}`,
+    runtimeKeyFile: join(root, "automatic", "runtime.key"),
+    profileDir: join(root, "automatic", "profile"),
+    profileName: "automatic-profile",
+    alias: "automatic-alias",
+  };
+  const manualTunnel = {
+    binaryPath: join(root, "manual", "tunnel-client"),
+    tunnelId: `tunnel_${"b".repeat(32)}`,
+    runtimeKeyFile: join(root, "manual", "runtime.key"),
+    profileDir: join(root, "manual", "profile"),
+    profileName: "manual-profile",
+    alias: "manual-alias",
+  };
+  if (mode === "full") {
+    legacy.browserHost = "launcher";
+    legacy.browserHostDescriptorPath = join(root, "launcher-browser.json");
+    legacy.automaticTunnel = automaticTunnel;
+    legacy.manualTunnel = manualTunnel;
+    legacy.tunnel = interactionMode === "manual" ? manualTunnel : automaticTunnel;
+  }
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(legacy)}\n`);
+
+  expect(() => loadConfig()).toThrow('manualAppName must be "Codex Zero Risk2"');
+  const loaded = loadConfigForSetup();
+  expect(loaded.mode).toBe(mode);
+  expect(loaded.browserInteractionMode).toBe(interactionMode);
+  expect(loaded.appName).toBe(interactionMode === "manual" ? ZERO_RISK_CHATGPT_CONNECTOR_NAME : "Codex Native2");
+  expect(loaded.automaticAppName).toBe("Codex Native2");
+  expect(loaded.manualAppName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
+  expect(loaded.contextWindow).toBe(123_456);
+  expect(loaded.useSavedChats).toBe(true);
+  if (mode === "full") {
+    expect(loaded.automaticTunnel).toEqual(automaticTunnel);
+    expect(loaded.manualTunnel).toEqual(manualTunnel);
+    expect(loaded.tunnel).toEqual(interactionMode === "manual" ? manualTunnel : automaticTunnel);
+  }
+});
+
 test("setup explicitly migrates v1 pro-only config to v3 managed browser-only", () => {
   const root = join(tmpdir(), `codex-chatgpt-web-config-migration-${process.pid}-${Date.now()}`);
   roots.push(root);

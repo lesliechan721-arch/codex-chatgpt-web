@@ -10,6 +10,7 @@ interface NativeTurnIdleEntry {
   controller: AbortController;
   timer: ReturnType<typeof setTimeout>;
   progressKeys: Set<string>;
+  lastProgressAt: number;
 }
 
 const DEFAULT_TERMINAL_LIMIT = 1_024;
@@ -36,6 +37,8 @@ export class NativeTurnIdleRegistry {
     private readonly timeoutSec: number,
     private readonly onExpire: (identity: NativeTurnIdleIdentity, reason: Error) => void | Promise<void>,
     private readonly terminalLimit = DEFAULT_TERMINAL_LIMIT,
+    private readonly nativeWaitRemainingMs: (identity: NativeTurnIdleIdentity) => number = () => 0,
+    private readonly clock: () => number = () => performance.now(),
   ) {
     if (!Number.isSafeInteger(timeoutSec) || timeoutSec <= 0) {
       throw new Error("Native turn idle timeout must be a positive integer number of seconds");
@@ -54,11 +57,13 @@ export class NativeTurnIdleRegistry {
     this.ensureUnknownIdentityCapacity();
 
     const controller = new AbortController();
+    const lastProgressAt = this.clock();
     const entry: NativeTurnIdleEntry = {
       identity,
       controller,
-      timer: this.arm(key, identity, controller),
+      timer: this.arm(key, identity, controller, lastProgressAt),
       progressKeys: new Set(),
+      lastProgressAt,
     };
     this.active.set(key, entry);
     return controller.signal;
@@ -86,7 +91,8 @@ export class NativeTurnIdleRegistry {
     const entry = this.active.get(key);
     if (!entry || entry.controller.signal.aborted) return false;
     clearTimeout(entry.timer);
-    entry.timer = this.arm(key, entry.identity, entry.controller);
+    entry.lastProgressAt = this.clock();
+    entry.timer = this.arm(key, entry.identity, entry.controller, entry.lastProgressAt);
     return true;
   }
 
@@ -96,8 +102,21 @@ export class NativeTurnIdleRegistry {
     if (!entry || entry.controller.signal.aborted || entry.progressKeys.has(progressKey)) return false;
     entry.progressKeys.add(progressKey);
     clearTimeout(entry.timer);
-    entry.timer = this.arm(key, entry.identity, entry.controller);
+    entry.lastProgressAt = this.clock();
+    entry.timer = this.arm(key, entry.identity, entry.controller, entry.lastProgressAt);
     return true;
+  }
+
+  /** Re-evaluate termination, without moving the last real business-progress timestamp. */
+  refreshWaiting(): void {
+    for (const [key, entry] of this.active) {
+      clearTimeout(entry.timer);
+      entry.timer = this.arm(key, entry.identity, entry.controller, entry.lastProgressAt);
+    }
+  }
+
+  lastProgressAt(identity: NativeTurnIdleIdentity): number | undefined {
+    return this.active.get(identityKey(identity))?.lastProgressAt;
   }
 
   release(identity: NativeTurnIdleIdentity): boolean {
@@ -149,10 +168,18 @@ export class NativeTurnIdleRegistry {
     key: string,
     identity: NativeTurnIdleIdentity,
     controller: AbortController,
+    lastProgressAt: number,
   ): ReturnType<typeof setTimeout> {
+    const idleRemaining = this.timeoutSec * 1_000 - Math.max(0, this.clock() - lastProgressAt);
+    const waitingRemaining = idleRemaining <= 0 ? this.nativeWaitRemainingMs(identity) : 0;
     const timer = setTimeout(() => {
       const current = this.active.get(key);
       if (!current || current.controller !== controller) return;
+      if (this.clock() - current.lastProgressAt < this.timeoutSec * 1_000
+        || this.nativeWaitRemainingMs(identity) > 0) {
+        current.timer = this.arm(key, identity, controller, current.lastProgressAt);
+        return;
+      }
       const reason = new ChatGptWebAdapterError(
         `Remote Codex turn made no progress for ${this.timeoutSec}s`,
         {
@@ -171,7 +198,7 @@ export class NativeTurnIdleRegistry {
           `[codex-chatgpt-web] remote turn idle-timeout cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       });
-    }, this.timeoutSec * 1_000);
+    }, Math.max(1, idleRemaining > 0 ? idleRemaining : Math.min(120_000, waitingRemaining)));
     timer.unref?.();
     return timer;
   }

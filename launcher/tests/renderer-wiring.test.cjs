@@ -914,8 +914,8 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   let config = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: true };
   const runtimeHost = {
     currentOperation: () => null,
-    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native2",
-    setupConnectorName: () => "Codex Native2", mcpCredentialsConfigured: () => true,
+    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native3",
+    setupConnectorName: () => "Codex Native3", mcpCredentialsConfigured: () => true,
     toolAuthorityControl: mode => ({ effectiveMode: mode ?? "verified-environment", forced: false, source: null }),
     setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
   };

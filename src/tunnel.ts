@@ -4,6 +4,10 @@ import { basename, dirname, join } from "node:path";
 import { unzipSync } from "fflate";
 import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
+import {
+  DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME,
+  DEV_NATIVE_LONG_WAIT_MCP_CONTRACT,
+} from "./native-tool-long-wait-probe";
 import { runCommand, runChecked } from "./process";
 
 export const TUNNEL_VERSION = "0.0.12";
@@ -250,7 +254,12 @@ function tunnelCommandQuoted(value: string): string {
 }
 
 export function mcpCommand(config: AppConfig, platform = process.platform): string {
-  const contract = config.browserInteractionMode === "manual" ? "safe" : "native";
+  const contract = config.browserInteractionMode === "manual"
+    ? "safe"
+    : config.purpose === "dev-harness" && config.devNativeToolLongWaitProbe === true
+      && config.appName === DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME
+      ? DEV_NATIVE_LONG_WAIT_MCP_CONTRACT
+      : "native";
   const command = [
     ...config.runtimeCommand,
     "mcp",

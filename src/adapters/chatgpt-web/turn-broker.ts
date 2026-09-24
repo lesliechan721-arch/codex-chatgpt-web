@@ -4,6 +4,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import Ajv from "ajv";
 import { isWindowsPipeEndpoint } from "../../config";
+import { DEV_NATIVE_LONG_WAIT_TOOL_NAME, DEV_NATIVE_LONG_WAIT_WAIT_MS } from "../../native-tool-long-wait-probe";
 import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import { acquireBrokerSocketLock, brokerSocketLockOwnedBy } from "./turn-broker-lock";
@@ -13,6 +14,8 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnCapability, ChatGptTurnEnvironment } from "./environment";
+import { NativeToolAdmissionError, nativeToolInputSchemas, planNativeTool, type NativeToolEntry } from "./native-tool-contract";
+import { NativeOperationError, NativeToolOperations, NATIVE_WAIT_PROTOCOL_VERSION, type NativeWaitingSnapshot } from "./native-tool-operations";
 
 interface PendingTurnAuthority {
   capability: ChatGptTurnCapability;
@@ -43,6 +46,7 @@ export interface BrokerToolResult {
 
 interface PendingInvocation {
   request: BrokerToolRequest;
+  operationId?: number;
   resolve: (result: BrokerToolResult) => void;
   reject: (error: Error) => void;
 }
@@ -52,6 +56,23 @@ interface ToolWaiter {
   reject: (error: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+}
+
+interface DevLongWaitProbeWaiter {
+  resolve: (result: BrokerToolResult | undefined) => void;
+  reject: (error: Error) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface DevLongWaitProbeOperation {
+  fingerprint: string;
+  callId: string;
+  result?: BrokerToolResult;
+  error?: Error;
+  delivered: boolean;
+  waiters: Set<DevLongWaitProbeWaiter>;
 }
 
 export type SafeTurnState = "awaiting_start" | "running" | "completed" | "revoked";
@@ -97,6 +118,11 @@ interface TurnChannel {
   completionCommitted: boolean;
   completionRevision?: number;
   retirementWaiters: Set<SafeWaiter<void>>;
+  devLongWaitProbeOperations: Map<number, DevLongWaitProbeOperation>;
+  nativeOperations: NativeToolOperations;
+  nativeQueryCount: number;
+  deadlineTimer?: ReturnType<typeof setTimeout>;
+  nativeWaitingObservers: Set<SafeWaiter<NativeWaitingSnapshot>>;
   batchTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -125,7 +151,12 @@ interface BrokerRequest {
     | "safe_start"
     | "safe_complete"
     | "activity_complete"
-    | "submit_compaction_handoff";
+    | "submit_compaction_handoff"
+    | "dev_long_wait_probe_start"
+    | "dev_long_wait_probe_wait"
+    | "native_operation_start"
+    | "native_operation_wait"
+    | "owner_native_waiting";
   token?: string;
   bindingId?: string;
   wireName?: string;
@@ -146,6 +177,12 @@ interface BrokerRequest {
   requireSentConfirmation?: boolean;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  operationId?: number;
+  fingerprint?: string;
+  waitMs?: number;
+  nativeWaitProtocol?: number;
+  entry?: NativeToolEntry;
+  nativeInput?: Record<string, unknown>;
 }
 
 interface BrokerResponse {
@@ -153,6 +190,7 @@ interface BrokerResponse {
   result?: unknown;
   error?: string;
   errorKind?: "admission_rejected";
+  errorCode?: string;
 }
 
 const brokers = new Map<string, TurnBroker>();
@@ -162,7 +200,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 6;
+const TURN_BROKER_PROTOCOL_VERSION = 7;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -325,6 +363,7 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
+  waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot>;
   register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string): Promise<string>;
   registerSafe(
     environment: ChatGptTurnCapability,
@@ -398,6 +437,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private endpointHealthCheck?: Promise<boolean>;
   private endpointTransportFailures = 0;
   private readonly sockets = new Set<Socket>();
+  private readonly nativeWaitingListeners = new Set<() => void>();
   private readonly ownerId = `${process.pid}-${randomBytes(16).toString("hex")}`;
   private readonly listenerPath: string;
   private releaseSocketLock?: () => void;
@@ -452,9 +492,32 @@ export class TurnBroker implements TurnBrokerOwner {
       activityRevision: 0,
       completionCommitted: false,
       retirementWaiters: new Set(),
+      devLongWaitProbeOperations: new Map(),
+      nativeWaitingObservers: new Set(),
+      nativeQueryCount: 0,
+      nativeOperations: new NativeToolOperations(
+        () => {
+          this.resolveSafeWaiters(channel.nativeWaitingObservers, channel.nativeOperations.snapshot());
+          for (const listener of this.nativeWaitingListeners) {
+            try { listener(); } catch { console.warn("[chatgpt-web] Native waiting observer callback failed"); }
+          }
+        },
+        reason => this.revoke(token, reason),
+      ),
     };
     this.channels.set(token, channel);
     this.pending.set(token, channel);
+    const enforceDeadline = (): void => {
+      if (this.channels.get(token) !== channel || channel.authority.expiresAt === undefined) return;
+      const remaining = channel.authority.expiresAt - Date.now();
+      if (remaining <= 0) {
+        this.revoke(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
+        return;
+      }
+      channel.deadlineTimer = setTimeout(enforceDeadline, Math.min(2_147_483_647, remaining));
+      channel.deadlineTimer.unref?.();
+    };
+    enforceDeadline();
     console.info(`[chatgpt-web] broker trace=${traceId} registered tokenHash=${handleFingerprint(token)}`);
     return token;
   }
@@ -591,7 +654,11 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
     if (channel.completionCommitted) return channel.completionRevision;
-    if (channel.activities.size > 0 || channel.invocations.size > 0) return undefined;
+    if (channel.activities.size > 0
+      || channel.invocations.size > 0
+      || channel.nativeQueryCount > 0
+      || channel.nativeOperations.hasOutstanding()
+      || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return undefined;
     return channel.activityRevision;
   }
 
@@ -605,9 +672,13 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.completionCommitted) return channel.completionRevision === revision;
     if (channel.activityRevision !== revision
       || channel.activities.size > 0
-      || channel.invocations.size > 0) return false;
+      || channel.invocations.size > 0
+      || channel.nativeQueryCount > 0
+      || channel.nativeOperations.hasOutstanding()
+      || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return false;
     channel.completionCommitted = true;
     channel.completionRevision = revision;
+    channel.nativeOperations.retire(new NativeOperationError("codex_tool_operation_retired", "The turn completed"));
     console.info(
       `[chatgpt-web] broker trace=${channel.traceId} committed browser completion revision=${revision}`,
     );
@@ -619,6 +690,34 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel = this.channels.get(token);
     if (!channel) return Promise.resolve();
     return this.waitForSafeState(channel.retirementWaiters, signal, "turn retirement wait aborted");
+  }
+
+  waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot> {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new NativeOperationError("codex_tool_operation_retired", "The Native capability is no longer active");
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 0) throw new Error("Invalid Native waiting revision");
+    const snapshot = channel.nativeOperations.snapshot();
+    if (snapshot.revision > afterRevision) return Promise.resolve(snapshot);
+    if (channel.nativeWaitingObservers.size >= 8) throw new Error("Native waiting observer limit reached");
+    return this.waitForSafeState(channel.nativeWaitingObservers, signal, "Native waiting observation aborted");
+  }
+
+  onNativeWaitingChanged(listener: () => void): () => void {
+    this.nativeWaitingListeners.add(listener);
+    return () => { this.nativeWaitingListeners.delete(listener); };
+  }
+
+  nativeWaitLeaseRemaining(identity: { threadId: string; turnId: string }): number {
+    let remaining = 0;
+    for (const channel of this.channels.values()) {
+      const capability = channel.authority.capability;
+      if (!("authorityMode" in capability) || capability.authorityMode !== "delegated"
+        || capability.threadId !== identity.threadId || capability.turnId !== identity.turnId) continue;
+      const snapshot = channel.nativeOperations.snapshot();
+      if (snapshot.activeOperations > 0) remaining = Math.max(remaining, snapshot.remainingMs);
+    }
+    return remaining;
   }
 
   requestCompaction(token: string, queuedResult: BrokerToolResult): number {
@@ -641,7 +740,8 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!invocation) continue;
       channel.invocations.delete(callId);
       channel.compactionDeliveryCount += 1;
-      invocation.resolve(structuredClone(queuedResult));
+      if (invocation.operationId !== undefined) channel.nativeOperations.complete(invocation.operationId, queuedResult, true);
+      else invocation.resolve(structuredClone(queuedResult));
     }
     if (queued.length > 0) {
       console.info(
@@ -713,10 +813,14 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.invocations.size > 0) {
       throw new Error(`Zero Risk turn cannot complete with ${channel.invocations.size} pending Codex tool invocation(s)`);
     }
-    if (channel.activities.size > 0) {
-      throw new Error(`Zero Risk turn cannot complete with ${channel.activities.size} active Codex MCP request(s)`);
+    if (channel.activities.size + channel.nativeQueryCount > 0) {
+      throw new Error(`Zero Risk turn cannot complete with ${channel.activities.size + channel.nativeQueryCount} active Codex MCP request(s)`);
+    }
+    if (channel.nativeOperations.hasOutstanding()) {
+      throw new Error("Zero Risk turn cannot complete before all Native operation results have been delivered");
     }
     safe.state = "completed";
+    channel.nativeOperations.retire(new NativeOperationError("codex_tool_operation_retired", "The Zero Risk turn completed"));
     safe.finalAnswer = finalAnswer;
     this.resolveSafeWaiters(safe.completionWaiters, finalAnswer);
     console.info(`[chatgpt-web] broker trace=${channel.traceId} accepted safe completion`);
@@ -764,11 +868,19 @@ export class TurnBroker implements TurnBrokerOwner {
       pendingTools: channel.invocations.size,
       queuedTools: channel.queuedCallIds.length,
       deliveredTools: channel.deliveredCallIds.size,
-      activeMcpRequests: channel.activities.size,
+      activeMcpRequests: channel.activities.size + channel.nativeQueryCount,
       completionCommitted: channel.completionCommitted,
     })}`);
     this.channels.delete(token);
     this.pending.delete(token);
+    clearTimeout(channel.deadlineTimer);
+    channel.deadlineTimer = undefined;
+    const nativeReason = reason instanceof NativeOperationError ? reason
+      : reason.name === "AbortError"
+        ? new NativeOperationError("codex_tool_cancelled", "The Native turn was explicitly cancelled")
+        : new NativeOperationError("codex_tool_operation_retired", "Codex Native retired the turn binding before its tool work completed");
+    this.rejectSafeWaiters(channel.nativeWaitingObservers, nativeReason);
+    channel.nativeOperations.retire(nativeReason);
     if (channel.bindingId) {
       this.bindings.delete(channel.bindingId);
       this.retire(this.retiredBindings, channel.bindingId, channel.traceId);
@@ -780,7 +892,8 @@ export class TurnBroker implements TurnBrokerOwner {
       this.rejectSafeWaiters(channel.safe.completionWaiters, reason);
     }
     this.retire(this.retiredTokens, token, channel.traceId);
-    this.resolveSafeWaiters(channel.retirementWaiters, undefined);
+    if (reason instanceof NativeOperationError) this.rejectSafeWaiters(channel.retirementWaiters, reason);
+    else this.resolveSafeWaiters(channel.retirementWaiters, undefined);
     this.rejectChannel(channel, reason);
   }
 
@@ -831,6 +944,8 @@ export class TurnBroker implements TurnBrokerOwner {
     // The setup window may be bounded, but a turn authorized by the user and bound by the
     // Zero Risk connector remains live until completion, cancellation, or runtime shutdown.
     delete channel.authority.expiresAt;
+    clearTimeout(channel.deadlineTimer);
+    channel.deadlineTimer = undefined;
     this.resolveSafeWaiters(safe.startWaiters, undefined);
   }
 
@@ -839,13 +954,13 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!safe) return;
     if (safe.state === "awaiting_start") {
       if (safe.requireSentConfirmation && !safe.launcherSent) {
-        throw new Error("Zero Risk turn is waiting for the user's Sent confirmation");
+        throw new NativeOperationError("codex_tool_not_started", "Zero Risk turn is waiting for the user's Sent confirmation");
       }
-      throw new Error("Zero Risk request is not connected yet. Call codex_turn_start with its request_id first");
+      throw new NativeOperationError("codex_tool_not_started", "Zero Risk request is not connected yet. Call codex_turn_start with its request_id first");
     }
-    if (safe.state !== "running") throw new Error("Zero Risk turn is already terminal");
+    if (safe.state !== "running") throw new NativeOperationError("codex_tool_operation_retired", "Zero Risk turn is already terminal");
     if (channel.compactionRequested && !allowCompaction) {
-      throw new Error("Zero Risk turn is awaiting completion for Codex context compaction");
+      throw new NativeOperationError("codex_tool_compaction_pending", "Zero Risk turn is awaiting completion for Codex context compaction");
     }
   }
 
@@ -1327,6 +1442,7 @@ export class TurnBroker implements TurnBrokerOwner {
           id: request!.id,
           error: errorOf(error).message,
           ...(error instanceof TurnBrokerAdmissionError ? { errorKind: "admission_rejected" as const } : {}),
+          ...(error instanceof NativeOperationError ? { errorCode: error.code } : {}),
         }),
       );
     });
@@ -1345,7 +1461,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -1355,6 +1471,13 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error("ChatGPT web turn broker is closed");
     }
     this.prune();
+    if (request.method === "native_operation_start" || request.method === "native_operation_wait") {
+      return this.nativeQuery(request, socketSignal);
+    }
+    if (request.method === "owner_native_waiting") {
+      if (!request.token || request.revision === undefined) throw new Error("Native waiting owner and revision are required");
+      return this.waitForNativeWaiting(request.token, request.revision, socketSignal);
+    }
     if (request.method === "safe_start") {
       if (!request.token) throw new Error("Zero Risk request_id is required");
       return this.startSafeTurn(request.token);
@@ -1388,6 +1511,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (request.method === "owner_status") {
       return {
         protocolVersion: TURN_BROKER_PROTOCOL_VERSION,
+        nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         acceptingExternalOwners: this.acceptingExternalOwners,
         owner: this.ownerId,
       };
@@ -1483,6 +1607,9 @@ export class TurnBroker implements TurnBrokerOwner {
       return { count: this.compactionDeliveryCount(request.token) };
     }
     if (request.method === "claim") {
+      if (request.nativeWaitProtocol !== NATIVE_WAIT_PROTOCOL_VERSION) {
+        throw new NativeOperationError("codex_tool_upgrade_required", "Update the runtime/helper and refresh the current connector: operation_id and codex_tool_wait are required before Native dispatch");
+      }
       const contract = request.contract ?? "native";
       const token = request.token;
       if (typeof token !== "string" || token.length === 0) {
@@ -1496,7 +1623,7 @@ export class TurnBroker implements TurnBrokerOwner {
         + `${activeChannel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
       );
       if (!activeChannel) {
-        throw new Error(retiredTurn !== undefined
+        throw new NativeOperationError("codex_tool_operation_retired", retiredTurn !== undefined
           ? `${contract === "safe" ? "This request_id" : "This turn_token"} was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished.`
           + " This Codex Native action can no longer run."
           : `${contract === "safe" ? "request id" : "turn token"} is invalid, expired, or revoked`);
@@ -1536,13 +1663,13 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: turnSnapshot(activeChannel) };
+        return { bindingId: activeChannel.bindingId, activityId, environment: turnSnapshot(activeChannel), nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: turnSnapshot(activeChannel) };
+      return { bindingId, activityId, environment: turnSnapshot(activeChannel), nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION };
     }
 
     const bindingId = request.bindingId;
@@ -1578,7 +1705,7 @@ export class TurnBroker implements TurnBrokerOwner {
         `[chatgpt-web] broker rejected ${request.method} (binding=${bindingId.slice(0, 17)},`
         + ` retiredTurn=${retiredTurn ?? "unknown"})`,
       );
-      throw new Error(retiredTurn !== undefined
+      throw new NativeOperationError("codex_tool_operation_retired", retiredTurn !== undefined
         ? `${retiredTurnLabel(retiredTurn)} has already finished; this Codex Native action can no longer run.`
         : "internal Codex turn binding is invalid or expired");
     }
@@ -1596,6 +1723,65 @@ export class TurnBroker implements TurnBrokerOwner {
         `[chatgpt-web] broker trace=${binding.channel.traceId} intercepted a post-compaction MCP call`,
       );
       return structuredClone(result);
+    }
+
+    if (request.method === "dev_long_wait_probe_start" || request.method === "dev_long_wait_probe_wait") {
+      const operationId = request.operationId;
+      if (!Number.isSafeInteger(operationId) || operationId! <= 0) {
+        throw new Error("DEV long-wait probe operation_id must be a positive safe integer");
+      }
+      const waitMs = request.waitMs ?? DEV_NATIVE_LONG_WAIT_WAIT_MS;
+      if (!Number.isInteger(waitMs) || waitMs < 1 || waitMs > DEV_NATIVE_LONG_WAIT_WAIT_MS) {
+        throw new Error(`DEV long-wait probe wait must be 1-${DEV_NATIVE_LONG_WAIT_WAIT_MS}ms`);
+      }
+      let operation = binding.channel.devLongWaitProbeOperations.get(operationId!);
+      if (request.method === "dev_long_wait_probe_start") {
+        if (typeof request.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(request.fingerprint)) {
+          throw new Error("DEV long-wait probe fingerprint is invalid");
+        }
+        if (operation) {
+          if (operation.fingerprint !== request.fingerprint) {
+            throw new Error("DEV long-wait probe operation_id is already bound to another request");
+          }
+        } else {
+          const tool = currentTool(binding.channel, DEV_NATIVE_LONG_WAIT_TOOL_NAME);
+          if (!tool || tool.freeform) {
+            throw new TurnBrokerAdmissionError("DEV long-wait probe tool is unavailable in this turn");
+          }
+          const callId = opaqueId("call");
+          const toolRequest: BrokerToolRequest = {
+            callId,
+            wireName: DEV_NATIVE_LONG_WAIT_TOOL_NAME,
+            freeform: false,
+            arguments: { operation_id: operationId },
+          };
+          operation = {
+            fingerprint: request.fingerprint,
+            callId,
+            delivered: false,
+            waiters: new Set(),
+          };
+          binding.channel.devLongWaitProbeOperations.set(operationId!, operation);
+          binding.channel.invocations.set(callId, {
+            request: toolRequest,
+            resolve: result => this.completeDevLongWaitProbe(operation!, result),
+            reject: error => this.failDevLongWaitProbe(operation!, error),
+          });
+          binding.channel.queuedCallIds.push(callId);
+          console.info(
+            `[chatgpt-web] broker trace=${binding.channel.traceId} queued DEV long-wait probe operation=${operationId}`,
+          );
+          this.scheduleToolWaiters(binding.channel);
+        }
+      } else if (!operation) {
+        throw new Error("DEV long-wait probe operation_id is unknown in this turn");
+      }
+      const probeResult = await this.waitForDevLongWaitProbe(operation!, waitMs, socketSignal);
+      if (!probeResult) {
+        return { kind: "pending", operation_id: operationId, next_tool: "codex_tool_wait" };
+      }
+      operation!.delivered = true;
+      return { kind: "result", operation_id: operationId, result: structuredClone(probeResult) };
     }
 
     const wireName = request.wireName?.trim();
@@ -1634,10 +1820,89 @@ export class TurnBroker implements TurnBrokerOwner {
     });
   }
 
+  private async nativeQuery(request: BrokerRequest, socketSignal?: AbortSignal): Promise<unknown> {
+    if (request.nativeWaitProtocol !== NATIVE_WAIT_PROTOCOL_VERSION) {
+      throw new NativeOperationError("codex_tool_upgrade_required", "Refresh the connector and update the runtime/helper to the Native waiting protocol");
+    }
+    const token = request.token;
+    if (typeof token !== "string" || !token) throw new NativeOperationError("codex_tool_operation_unknown", "A Native capability reference is required");
+    const channel = this.channels.get(token);
+    if (!channel || channel.completionCommitted) {
+      throw new NativeOperationError("codex_tool_operation_retired", "The Native capability is invalid, expired, or has already finished");
+    }
+    if (request.contract !== (channel.safe ? "safe" : "native")) {
+      throw new NativeOperationError("codex_tool_operation_unknown", "The operation does not belong to this MCP contract");
+    }
+    if (channel.nativeQueryCount >= 64) throw new NativeOperationError("codex_tool_resource_limit", "The Native query limit was reached; existing operations remain available");
+    // A query owns this count, not an MCP process or a Responses round. Socket cancellation and
+    // every return path release it. No per-query activity tombstones accumulate during long waits.
+    channel.nativeQueryCount += 1;
+    channel.activityRevision += 1;
+    try {
+      if (channel.safe?.state === "awaiting_start" && channel.safe.requireSentConfirmation && !channel.safe.launcherSent) {
+        await this.waitForSafeSent(token, socketSignal);
+      }
+      if (this.channels.get(token) !== channel) throw new NativeOperationError("codex_tool_operation_retired", "The Native capability was retired before admission");
+      this.assertSafeHarnessRunning(channel, true);
+      if (socketSignal?.aborted) throw new DOMException("Native query aborted", "AbortError");
+      this.pending.delete(token);
+      const operationId = request.operationId!;
+      if (request.method === "native_operation_start") {
+        if (!request.entry || !Object.hasOwn(nativeToolInputSchemas, request.entry)
+          || !request.nativeInput || typeof request.nativeInput !== "object" || Array.isArray(request.nativeInput)) {
+          throw new NativeOperationError("codex_tool_admission_rejected", "A valid Native entry and its arguments are required");
+        }
+        const started = channel.nativeOperations.start(operationId, request.entry, request.nativeInput, normalized => {
+          if (channel.compactionRequested) {
+            if (!channel.compactionResult) throw new Error("Compaction control result is unavailable");
+            return { result: structuredClone(channel.compactionResult), control: true };
+          }
+          const plan = planNativeTool(request.entry!, normalized, turnSnapshot(channel), request.contract!);
+          if ("result" in plan) return plan;
+          const wireName = namespacedToolName(plan.tool.namespace, plan.tool.name);
+          try {
+            assertCurrentToolInvocation(plan.tool, { id: request.id, method: "invoke", freeform: plan.tool.freeform === true, ...plan.payload }, wireName);
+          } catch (error) {
+            if (!(error instanceof TurnBrokerAdmissionError)) throw error;
+            // Registry validation details may contain schema/user data; cache only the safe class.
+            throw new NativeToolAdmissionError(`The current Codex tool definition does not accept these arguments for ${wireName}`);
+          }
+          return {
+            request: { callId: opaqueId("call"), wireName, freeform: plan.tool.freeform === true, ...plan.payload },
+            resultContract: plan.resultContract,
+          };
+        });
+        if (started.created && channel.compactionRequested) channel.compactionDeliveryCount += 1;
+        if (started.request) {
+          const toolRequest = started.request;
+          channel.invocations.set(toolRequest.callId, {
+            request: toolRequest, operationId,
+            resolve: result => channel.nativeOperations.complete(operationId, result),
+            reject: error => channel.nativeOperations.retire(error),
+          });
+          channel.queuedCallIds.push(toolRequest.callId);
+          console.info(`[chatgpt-web] broker trace=${channel.traceId} queued operation=${operationId} call=${toolRequest.callId.slice(0, 17)} entry=${request.entry}`);
+          this.scheduleToolWaiters(channel);
+        }
+      }
+      const reply = await channel.nativeOperations.wait(operationId, socketSignal, request.waitMs ?? 30_000);
+      this.prune();
+      if (!this.channels.has(token)) throw new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached");
+      return reply;
+    } finally {
+      channel.nativeQueryCount -= 1;
+      channel.activityRevision += 1;
+    }
+  }
+
   private takeQueued(channel: TurnChannel): BrokerToolRequest[] {
     const ids = channel.queuedCallIds.splice(0);
     for (const id of ids) {
-      if (channel.invocations.has(id)) channel.deliveredCallIds.add(id);
+      const invocation = channel.invocations.get(id);
+      if (invocation) {
+        channel.deliveredCallIds.add(id);
+        if (invocation.operationId !== undefined) channel.nativeOperations.handoff(invocation.operationId);
+      }
     }
     return ids.map(id => channel.invocations.get(id)?.request).filter((request): request is BrokerToolRequest => Boolean(request));
   }
@@ -1659,6 +1924,59 @@ export class TurnBroker implements TurnBrokerOwner {
     }, 15);
   }
 
+  private waitForDevLongWaitProbe(
+    operation: DevLongWaitProbeOperation,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<BrokerToolResult | undefined> {
+    if (operation.result) return Promise.resolve(structuredClone(operation.result));
+    if (operation.error) return Promise.reject(operation.error);
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException("DEV long-wait probe wait aborted", "AbortError"));
+    }
+    return new Promise<BrokerToolResult | undefined>((resolveWait, rejectWait) => {
+      const waiter: DevLongWaitProbeWaiter = {
+        resolve: resolveWait,
+        reject: rejectWait,
+        ...(signal ? { signal } : {}),
+        timer: setTimeout(() => {
+          operation.waiters.delete(waiter);
+          if (signal && waiter.onAbort) signal.removeEventListener("abort", waiter.onAbort);
+          resolveWait(undefined);
+        }, waitMs),
+      };
+      if (signal) {
+        waiter.onAbort = () => {
+          clearTimeout(waiter.timer);
+          operation.waiters.delete(waiter);
+          rejectWait(new DOMException("DEV long-wait probe wait aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+      operation.waiters.add(waiter);
+    });
+  }
+
+  private completeDevLongWaitProbe(operation: DevLongWaitProbeOperation, result: BrokerToolResult): void {
+    operation.result = structuredClone(result);
+    for (const waiter of operation.waiters) {
+      clearTimeout(waiter.timer);
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.resolve(structuredClone(operation.result));
+    }
+    operation.waiters.clear();
+  }
+
+  private failDevLongWaitProbe(operation: DevLongWaitProbeOperation, error: Error): void {
+    operation.error = error;
+    for (const waiter of operation.waiters) {
+      clearTimeout(waiter.timer);
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.reject(error);
+    }
+    operation.waiters.clear();
+  }
+
   private wakeToolWaiters(channel: TurnChannel): void {
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     const batch = this.takeQueued(channel);
@@ -1677,6 +1995,8 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private rejectChannel(channel: TurnChannel, error: Error): void {
+    this.rejectSafeWaiters(channel.nativeWaitingObservers, error);
+    channel.nativeOperations.retire(error);
     if (channel.batchTimer) clearTimeout(channel.batchTimer);
     channel.batchTimer = undefined;
     for (const waiter of channel.waiters) {
@@ -1694,7 +2014,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const now = Date.now();
     for (const [token, channel] of this.channels) {
       if (channel.authority.expiresAt === undefined || channel.authority.expiresAt > now) continue;
-      this.revoke(token);
+      this.revoke(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
     }
   }
 }
@@ -1723,8 +2043,8 @@ export async function callTurnBroker<T>(
   // The wire protocol requires a client-owned activity identity. Most callers never need to see
   // it; the MCP server supplies its own so it can retire an ambiguously delivered claim, while
   // lower-level diagnostics receive an equally client-generated identity here.
-  const wireRequest = request.method === "claim" && request.activityId === undefined
-    ? { ...request, activityId: opaqueId("activity") }
+  const wireRequest = request.method === "claim"
+    ? { ...request, activityId: request.activityId ?? opaqueId("activity"), nativeWaitProtocol: request.nativeWaitProtocol ?? NATIVE_WAIT_PROTOCOL_VERSION }
     : request;
   return new Promise<T>((resolveCall, rejectCall) => {
     const socket = createConnection(socketPath);
@@ -1751,7 +2071,8 @@ export async function callTurnBroker<T>(
       clearTimeout(timer);
       cleanup();
       if (response.error) {
-        rejectCall(response.errorKind === "admission_rejected"
+        rejectCall(response.errorCode ? new NativeOperationError(response.errorCode, response.error)
+          : response.errorKind === "admission_rejected"
           ? new TurnBrokerAdmissionError(response.error)
           : new Error(response.error));
       }
@@ -1812,6 +2133,10 @@ export async function callTurnBroker<T>(
  */
 export class RemoteTurnBroker implements TurnBrokerOwner {
   constructor(readonly socketPath: string) {}
+
+  waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot> {
+    return callTurnBroker(this.socketPath, { method: "owner_native_waiting", token, revision: afterRevision }, null, signal);
+  }
 
   async assertCompatible(): Promise<void> {
     let status: { protocolVersion?: unknown; acceptingExternalOwners?: unknown };

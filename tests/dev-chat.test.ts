@@ -14,6 +14,7 @@ import {
 } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
 import { defaultDevChatModel, DEV_CHAT_TOOLS, DevChatDriver } from "../src/dev-chat/driver";
+import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, DEV_NATIVE_LONG_WAIT_TOOL_NAME } from "../src/native-tool-long-wait-probe";
 import {
   createDevCoherentContextPayload,
   createDevContextFiller,
@@ -291,6 +292,41 @@ test("browser-only DEV driver runs real turns without advertising simulated tool
   }
 });
 
+test("DEV long-wait probe tool requires explicit opt-in even with the current DEV connector name", async () => {
+  const root = scratch("cgw-dev-long-wait-isolation");
+  const run = async (appName: string, expected: boolean) => {
+    const config = {
+      ...defaultConfig("full"),
+      purpose: "dev-harness" as const,
+      appName,
+      automaticAppName: appName,
+      devNativeToolLongWaitProbe: expected,
+    };
+    const factory = (): ProviderAdapter => ({
+      name: "dev-long-wait-isolation-test",
+      async runTurn(parsed, _incoming, emit) {
+        const names = (parsed.context.tools ?? []).map(tool => tool.name);
+        expect(names.includes(DEV_NATIVE_LONG_WAIT_TOOL_NAME)).toBe(expected);
+        emit({ type: "text_delta", text: "done", phase: "final_answer" });
+        emit({
+          type: "done", stopReason: "stop", endTurn: true,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, estimated: true },
+        });
+      },
+    });
+    const driver = new DevChatDriver(config, new DevChatStore(join(root, `chats-${expected}`)), factory, root);
+    try {
+      await driver.send(driver.open(`isolation-${expected}`).state, "Check the DEV tool set.");
+    } finally {
+      await driver.close();
+    }
+  };
+
+  expect(DEV_CHAT_TOOLS.some(tool => tool.name === DEV_NATIVE_LONG_WAIT_TOOL_NAME)).toBe(false);
+  await run("Codex Native3 DEV", false);
+  await run(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, true);
+});
+
 test("DEV chat attaches its broker to the launcher-owned tunnel without a Responses listener", async () => {
   const root = scratch("cgw-dev-transport");
   const occupied = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("normal Codex route") });
@@ -323,7 +359,7 @@ test("DEV chat attaches its broker to the launcher-owned tunnel without a Respon
     });
     expect(transport.config).toBe(config);
     expect(await callTurnBroker(transport.config.brokerSocketPath, { method: "owner_status" }))
-      .toMatchObject({ protocolVersion: 6 });
+      .toMatchObject({ protocolVersion: 7, nativeWaitProtocol: 1 });
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("normal Codex route");
   } finally {
     await transport?.close();

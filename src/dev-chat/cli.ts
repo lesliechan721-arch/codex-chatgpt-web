@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
 import { stdin, stdout } from "node:process";
-import { DEV_CHATGPT_CONNECTOR_NAME, loadConfig } from "../config";
+import { DEV_CHATGPT_CONNECTOR_NAME, DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, loadConfig } from "../config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -37,7 +37,7 @@ Usage:
   codex-chatgpt-web dev launcher
   codex-chatgpt-web dev status [--json]
   codex-chatgpt-web dev setup --browser-only [--automatic-browser-interaction]
-  codex-chatgpt-web dev setup --full --tunnel-id ID --runtime-key-file PATH [--automatic-browser-interaction|--zero-risk-browser-interaction]
+  codex-chatgpt-web dev setup --full --tunnel-id ID --runtime-key-file PATH [--automatic-browser-interaction|--zero-risk-browser-interaction] [--native-tool-long-wait-probe]
   codex-chatgpt-web dev chat NAME [--model MODEL] [MESSAGE]
   codex-chatgpt-web dev list
 
@@ -369,6 +369,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
     }
     const biggerContext = takeFlag(args, "--bigger-context");
     const standardContext = takeFlag(args, "--standard-context");
+    const nativeToolLongWaitProbe = takeFlag(args, "--native-tool-long-wait-probe");
     if (biggerContext && standardContext) {
       throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
     }
@@ -388,6 +389,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
       ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),
       ...(tunnelId ? { tunnelId } : {}),
       ...(runtimeKeyFile ? { runtimeKeyFile } : {}),
+      ...(nativeToolLongWaitProbe ? { devNativeToolLongWaitProbe: true } : {}),
     });
     stdout.write(
       `Isolated DEV profile configured (${result.mode}) at ${result.configPath}.\n`
@@ -411,7 +413,9 @@ export async function runDevCommand(args: string[]): Promise<void> {
     );
   }
   const config = loadConfig();
-  if (config.mode === "full" && config.appName !== DEV_CHATGPT_CONNECTOR_NAME) {
+  if (config.mode === "full"
+    && config.appName !== DEV_CHATGPT_CONNECTOR_NAME
+    && config.appName !== DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME) {
     throw new Error("DEV connector identity is outdated. Refresh the DEV profile in the launcher before starting a named chat");
   }
   const runtimeStateRoot = paths.runtimePath;

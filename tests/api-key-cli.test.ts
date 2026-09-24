@@ -371,7 +371,7 @@ test("CLI refresh-models includes the Zero Risk Pro row after the profile is ena
   const localKey = "cgw_" + "p".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   const config = defaultConfig("full");
-  config.appName = "Codex Zero Risk";
+  config.appName = "Codex Zero Risk2";
   config.browserHost = "launcher";
   config.browserInteractionMode = "manual";
   config.browserHostDescriptorPath = join(home, "launcher-browser.json");

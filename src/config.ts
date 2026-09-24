@@ -11,6 +11,7 @@ import {
 import type { CodexProviderConfig, ToolAuthorityMode } from "./types";
 import { effectiveToolAuthorityMode } from "./server-remote-config";
 import { VERSION } from "./version";
+import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "./native-tool-long-wait-probe";
 
 export type RuntimeMode = "browser-only" | "full";
 export type BrowserHostMode = "managed-chrome" | "launcher";
@@ -18,22 +19,25 @@ export type BrowserInteractionMode = "automatic" | "manual";
 export type SubagentProtocol = "compatibility-v1" | "native";
 
 /**
- * ChatGPT caches a connector's public MCP contract by connector identity. The direct turn-token
- * contract therefore has a new identity instead of mutating the retired connector in place.
+ * ChatGPT caches a connector's public MCP contract by connector identity. Native operation IDs
+ * and the fixed wait tool therefore use new production identities rather than stale tool lists.
  */
-export const CHATGPT_CONNECTOR_NAME = "Codex Native2";
+export const CHATGPT_CONNECTOR_NAME = "Codex Native3";
 export const DEV_CHATGPT_CONNECTOR_NAME = `${CHATGPT_CONNECTOR_NAME} DEV`;
-export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk";
-export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native"] as const;
+export { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME };
+export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk2";
+const LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk";
+export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native", "Codex Native2", "Codex Native2 DEV"] as const;
 
 export function isLegacyChatGptConnectorName(value: string): boolean {
   return (LEGACY_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
 }
 
 export function legacyChatGptConnectorMigrationMessage(legacyName: string): string {
+  const currentName = legacyName.endsWith(" DEV") ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
   return `Legacy ChatGPT connector ${JSON.stringify(legacyName)} was found, but this release requires`
-    + ` a newly created connector named ${JSON.stringify(CHATGPT_CONNECTOR_NAME)}. Create`
-    + ` ${JSON.stringify(CHATGPT_CONNECTOR_NAME)} against the same tunnel with Authentication set to None;`
+    + ` a newly created connector named ${JSON.stringify(currentName)}. Create`
+    + ` ${JSON.stringify(currentName)} against the same tunnel with Authentication set to None;`
     + ` do not rename or refresh ${JSON.stringify(legacyName)}.`;
 }
 
@@ -67,6 +71,7 @@ export interface TunnelConfig {
 export interface AppConfig {
   version: 3;
   purpose?: "dev-harness";
+  devNativeToolLongWaitProbe?: boolean;
   releaseVersion: string;
   mode: RuntimeMode;
   toolAuthorityMode?: ToolAuthorityMode;
@@ -368,6 +373,12 @@ export function loadConfigForSetup(): AppConfig {
     raw.browserHost = "managed-chrome";
   }
   const interactionMode = raw.browserInteractionMode ?? "automatic";
+  if (raw.manualAppName === LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+    raw.manualAppName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
+  }
+  if (interactionMode === "manual" && raw.appName === LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+    raw.appName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
+  }
   const automaticName = raw.automaticAppName
     ?? (interactionMode === "automatic" ? raw.appName : CHATGPT_CONNECTOR_NAME);
   if (automaticName === ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
@@ -383,6 +394,11 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.version !== 3) throw new Error(`Unsupported configuration version in ${path}; rerun setup to migrate it`);
   if (parsed.purpose !== undefined && parsed.purpose !== "dev-harness") {
     throw new Error(`Invalid configuration purpose in ${path}`);
+  }
+  if (parsed.devNativeToolLongWaitProbe !== undefined
+    && (typeof parsed.devNativeToolLongWaitProbe !== "boolean"
+      || parsed.devNativeToolLongWaitProbe && parsed.purpose !== "dev-harness")) {
+    throw new Error(`Invalid DEV Native long-wait probe setting in ${path}`);
   }
   if (typeof parsed.releaseVersion !== "string" || !parsed.releaseVersion.trim()) throw new Error(`Missing releaseVersion in ${path}`);
   if (parsed.mode !== "browser-only" && parsed.mode !== "full") throw new Error(`Invalid runtime mode in ${path}`);

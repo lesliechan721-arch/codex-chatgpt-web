@@ -731,7 +731,7 @@ function registerIpc({ logger, stateStore }) {
       connectorName: runtimeHost.browserConnectorName(),
       connectorNames: {
         automatic: runtimeHost.setupConnectorName(),
-        manual: "Codex Zero Risk",
+        manual: "Codex Zero Risk2",
       },
       toolAuthority: runtimeHost.toolAuthorityControl(state.toolAuthorityMode),
       apiAccessMode: currentApiAccessMode(),

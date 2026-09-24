@@ -73,7 +73,7 @@ Automatic modes offer Luna/Think when the account has no reasoning selector; oth
 | **Full harness (With Automation)** | Automatic | Yes, through MCP |
 | **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, then paste and send the prepared prompt. By default, confirm **Sent** in the launcher after sending. You can disable that second confirmation in Launcher settings or with `--zero-risk-no-sent-confirmation`; in that mode the Sent button is hidden and the connector binding confirms the turn automatically. Use `--zero-risk-sent-confirmation` to enable the default behavior explicitly. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
+Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk2` connector yourself, then paste and send the prepared prompt. By default, confirm **Sent** in the launcher after sending. You can disable that second confirmation in Launcher settings or with `--zero-risk-no-sent-confirmation`; in that mode the Sent button is hidden and the connector binding confirms the turn automatically. Use `--zero-risk-sent-confirmation` to enable the default behavior explicitly. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
 
 <a id="full-harness"></a>
 
@@ -97,8 +97,10 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
    **Connect harness**.
 2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
-   **Codex Native2**, with **Authentication: None** and **Allow all actions**.
-3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
+   **Codex Native3**, with **Authentication: None** and **Allow all actions**.
+3. Run **Verify runtime** to confirm that **Codex Native3** is attached and available.
+
+The Native long-wait protocol uses **Codex Native3** for Automatic mode, **Codex Zero Risk2** for Zero Risk, and **Codex Native3 DEV** for repository development. Leave older production connectors unchanged and create the current named connectors. Refresh an existing DEV probe connector before using it for product development. Confirm that the current tool list includes `codex_tool_wait` and that Native entry schemas include `operation_id`; update the runtime and browser helper together. The connector assigns a new positive integer ID before each logical Native call, reuses that ID for retries and waits, and keeps its counter across reconnects. A pending receipt is not task completion and must not cause the original operation to be executed again.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See

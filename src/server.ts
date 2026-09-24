@@ -1541,8 +1541,9 @@ export function startServer(
       // the still-connected response transport writable long enough to send its terminal timeout.
       const cancellation = beginNativeTurnCancellation(identity, reason, false);
       logNativeTurnCleanup("remote turn idle-timeout", cancellation);
-    });
+    }, undefined, identity => turnBroker?.nativeWaitLeaseRemaining(identity) ?? 0);
   }
+  const stopNativeWaitingObservation = turnBroker?.onNativeWaitingChanged(() => turnIdleLeases?.refreshWaiting());
   const cancelDisconnectedRemoteTurn = (identity: NativeCodexTurnIdentity, reason: unknown): void => {
     if (!turnIdleLeases) return;
     const disconnectReason = reason instanceof Error
@@ -1939,6 +1940,7 @@ export function startServer(
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
+    stopNativeWaitingObservation?.();
     chatGptTurnSessions.clear();
     turnIdleLeases?.clear();
     flushResponseState();

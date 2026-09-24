@@ -227,6 +227,12 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    if (turn.externalProgress && !this.helperFeatures.has("native-tool-wait-v1")) {
+      throw new ChatGptWebAdapterError(
+        "Launcher browser helper does not support Native operation waiting; update the runtime and helper before using the current connector",
+        { status: 503, errorType: "server_error", code: "codex_tool_upgrade_required", retryable: false },
+      );
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));

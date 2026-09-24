@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -31,7 +32,13 @@ test("daemon streams browser lifecycle through the real helper process", async (
         await turn.onMultipartStageAcknowledged?.(index);
       }
       await turn.onSendActivated();
+      const initial = turn.externalProgress.snapshot();
+      if (initial.nativeWaiting?.activeOperations !== 1) throw new Error("Initial Native lease lost in IPC");
+      const changed = turn.externalProgress.waitForChange(initial.revision, turn.abortSignal);
       turn.onSubmitted();
+      const renewed = await changed;
+      if (renewed.nativeWaiting?.sourceRevision !== 2 || renewed.lastProgressAt !== undefined
+        || renewed.lastToolBatchRevision !== 0 || renewed.activeToolCalls !== 0) throw new Error("Waiting IPC fabricated Native progress");
       turn.onReasoningSummary("Reading project");
       turn.onReasoningSummary(" files", true);
       turn.onTextDelta("done");
@@ -71,7 +78,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   const config: ResolvedBrowserConfig = {
-    appName: "Codex Native2",
+    appName: "Codex Native3",
     browserHost: "launcher",
     browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper,
@@ -89,10 +96,13 @@ test("daemon streams browser lifecycle through the real helper process", async (
   let sendActivated = false;
   let submitted = false;
   let released = false;
+  const externalProgress = new ChatGptExternalTurnProgress();
+  externalProgress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
   const client = new LauncherBrowserHelperClient(config);
   try {
     const result = await client.run({
       traceId: "abcdef123456",
+      externalProgress,
       modelId: "gpt-5.6-sol",
       reasoning: "high",
       modelFamily: "5.6",
@@ -107,7 +117,10 @@ test("daemon streams browser lifecycle through the real helper process", async (
       }),
       onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
       onSendActivated: () => { sendActivated = true; },
-      onSubmitted: () => { submitted = true; },
+      onSubmitted: () => {
+        submitted = true;
+        externalProgress.recordNativeWaiting({ revision: 2, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
+      },
       onReasoningSummary: (text, continuation) => reasoning.push({ text, continuation: continuation === true }),
       onTextDelta: text => deltas.push(text),
       captureLunaCheckpoint: true,
@@ -186,7 +199,7 @@ test("accepted compaction retires through the helper as completed without hiding
     surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
   }), { mode: 0o600 });
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
+    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper, browserDiagnosticsPath: join(root, "diagnostics"),
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
     turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
@@ -231,10 +244,49 @@ test("accepted compaction retires through the helper as completed without hiding
   }
 });
 
+test("an older helper rejects Native waiting before turn preparation or IPC dispatch", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome",
+    headed: true, autoApproveToolCalls: false, useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child: unknown;
+    pending: Map<string, unknown>;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, unknown>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  internal.handleLine(child, JSON.stringify({
+    type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence"],
+  }));
+  const sent: unknown[] = [];
+  internal.send = async message => { sent.push(message); };
+  let prepared = false;
+  await expect(client.run({
+    traceId: "native-wait-old-helper", modelId: "gpt-5.6-sol", reasoning: "high",
+    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    externalProgress: new ChatGptExternalTurnProgress(),
+    prepare: async () => {
+      prepared = true;
+      return { text: "inspect", images: [], release() {} };
+    },
+    onTextDelta() {},
+  })).rejects.toMatchObject({
+    status: 503, code: "codex_tool_upgrade_required", retryable: false,
+  });
+  expect(prepared).toBe(false);
+  expect(sent).toEqual([]);
+  expect(internal.pending.size).toBe(0);
+});
+
 test("launcher helper protocol preserves multipart context and the compaction flag", async () => {
   const sent: Record<string, unknown>[] = [];
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native2 DEV",
+    appName: "Codex Native3 DEV",
     browserHost: "launcher",
     browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused-state.json",
@@ -416,7 +468,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
 
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useSavedChats: false,
   });
   const internal = client as unknown as {

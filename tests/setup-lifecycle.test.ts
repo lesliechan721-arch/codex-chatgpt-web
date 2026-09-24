@@ -9,6 +9,7 @@ import * as tunnel from "../src/tunnel";
 import * as tunnelService from "../src/tunnel-service";
 import * as browserHost from "../src/launcher-browser-host";
 import * as browserLogin from "../src/browser-login";
+import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "../src/native-tool-long-wait-probe";
 import { launcherCapabilityProbeRequired, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
 
 const config = {
@@ -91,6 +92,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       await listener.stop(true);
       const result = await (development ? setupDevProfile : setup)({ ...options, port,
         ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
+        ...(development && interaction === "automatic" ? { devNativeToolLongWaitProbe: true } : {}),
         useSavedChats: true,
       });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
@@ -99,6 +101,15 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       expect(result.connectorSetupRequired).toBe(true);
       expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
       expect(saved?.useSavedChats).toBe(true);
+
+      if (development && interaction === "automatic") {
+        expect(saved?.appName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
+        writeFileSync(join(root, "config.json"), "{}");
+        mocks.push(spyOn(configModule, "loadConfigForSetup").mockReturnValue(saved!));
+        await setupDevProfile({ ...options, port });
+        expect(saved?.appName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
+        expect(saved?.automaticAppName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
+      }
 
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));

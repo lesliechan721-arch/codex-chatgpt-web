@@ -133,15 +133,15 @@ Video walkthroughs:
 
 Browser-only mode needs no connector. Full harness mode requires all of the following:
 
-- a newly created connector named exactly **Codex Native2**;
+- a newly created connector named exactly **Codex Native3**;
 - **Developer Mode** enabled in ChatGPT;
 - the exact Tunnel selected with **Authentication: None**;
 - the connector and Tunnel on the same OpenAI account as the ChatGPT workspace;
 - **Allow all actions** under the connector's permissions; and
 - **Connect harness** completed before **Verify runtime**.
 
-Do not rename or refresh an old **Codex Native** connector. ChatGPT caches the public MCP contract by
-connector identity, so create **Codex Native2** as a new connector.
+Do not rename or refresh an old **Codex Native** or **Codex Native2** connector. ChatGPT caches the public MCP contract by
+connector identity, so create **Codex Native3** as a new connector.
 
 After updating, if `codex_exec` still does not expose `sandbox_permissions`, `justification`, and
 `prefix_rule`, recreate the current mode's connector so ChatGPT loads the updated tool schema.
@@ -159,7 +159,7 @@ case: the same Codex task continues, but each turn attaches the connector in a
 fresh ChatGPT conversation. It resends more context and can be slower. In stock v5.0.8, close the
 task's **completed** browser tab before sending the next message; closing a running tab cancels it.
 
-Also try recreating **Codex Native2** as a new connector with the same Tunnel and **Allow all
+Also try recreating **Codex Native3** as a new connector with the same Tunnel and **Allow all
 actions**, then run **Verify runtime**. If tools are already missing in a fresh chat, report that
 separately with a safe log and the browser's actual connector/tool state.
 
@@ -284,7 +284,7 @@ To remove the integration safely:
 1. Open **Settings → Remove Codex integration** and wait for it to restore the previous Codex route.
 2. Fully restart Codex.
 3. Quit the launcher and uninstall the application normally for the platform.
-4. If Full harness was configured and is no longer wanted, separately delete **Codex Native2**, its
+4. If Full harness was configured and is no longer wanted, separately delete **Codex Native3**, its
    Tunnel, and the API key created for that Tunnel from the corresponding account settings.
 
 Deleting the application before step 1 can leave Codex pointed at a local route that no longer

@@ -2,6 +2,8 @@
 
 > Delegated authority 后续调整：server remote deployment 必须使用 delegated tool authority，不依赖 Server 本机 Codex rollout / SQLite 恢复客户端 filesystem authority。tool authority、tool registry lifecycle、rollout replay、compaction source recovery、retained browser fallback，以及这些要求所需的最小 adapter/broker 调整，都以 [`../delegated-tool-authority/spec.md`](../delegated-tool-authority/spec.md) 为当前规范。若这些主题与本文旧表述冲突，以 delegated Spec 为准；本文其余网络、远程桌面、API Key、Launcher ownership、持久化、idle lifecycle 和单用户合同继续有效。
 
+> Native 长等待后续调整：[`../native-tool-long-wait/spec.md`](../native-tool-long-wait/spec.md) v0.7 通过其真实链路证据关口并进入实施基线后，当 Broker 已接受的 Native operation 持有该规格定义的有效 120 秒等待租约时，远程 native turn idle 的**终止动作暂停**。该等待活动不是“真实业务进展”，不得刷新本文定义的 idle last-progress 时间；等待租约失效或 operation 结束后，立即按原 last-progress 时间恢复 idle 判定。除此窄例外外，本文的 600 秒默认值、真实业务进展定义、断连清理、tombstone 和 ownership 回收合同继续有效。当前 6.0.1-1 实现尚未具备该例外。
+
 ## 用户结果与范围
 
 Phase 1 将现有桌面 Launcher 作为长期运行的服务端应用使用。它不是 Launcher 的 Web 化重构。
@@ -108,7 +110,8 @@ Linux x86_64 Server / Docker
 - 已有 HTTP 请求断开语义保留：当 Responses 客户端连接被运行时/反向代理判定关闭时，必须立即向对应请求传播 abort，并释放该请求持有的 browser/compaction/HTTP ownership。
 - 远程部署额外启用 native Codex turn 的“无真实进展” idle timeout。默认值为 **600 秒**，并允许部署配置调整；它不是整个 turn 的最大执行时长。
 - idle lease 按 native `thread_id + turn_id` 计算。首次进入建立 lease；文本/推理增量、产生工具调用、收到工具结果、compaction 实际推进/产出等真实业务进展可以续租。单纯 retry/continuation 请求、Responses/adapter heartbeat、browser helper heartbeat 或 TCP 仍连接都不得续租。
-- 工具调用已经发出但没有工具结果或其它真实进展时，idle 时间继续累计。连续达到 idle timeout 后，即使 heartbeat 和 TCP 仍正常，服务端也必须取消该 turn 的 HTTP、browser、broker/compaction 等仍存活 ownership，并使额度可以回收。
+- 工具调用已经发出但没有工具结果或其它真实进展时，idle 时间继续累计。普通工具等待、heartbeat、TCP 或 continuation 都不能刷新 last-progress 时间。唯一额外例外是 Native 长等待协议中由 Broker 验证的有效 operation 等待租约：它可以暂停 idle 到期后的终止动作，但不改变累计的无进展时间。没有这类有效等待租约时，连续达到 idle timeout 后，即使 heartbeat 和 TCP 仍正常，服务端也必须取消该 turn 的 HTTP、browser、broker/compaction 等仍存活 ownership，并使额度可以回收。
+- Native 等待租约失效、operation 结束或旧 owner 因 fresh/fallback compaction 明确退役后，如果该 turn 没有其他符合条件的 Native 等待 operation，idle 判定必须立即恢复到原 last-progress 时间；若累计无进展已超过阈值，应立即进入同一 terminal timeout/ownership 清理路径，不能从恢复时刻重新给 600 秒。
 - idle timeout 后，同一 `thread_id + turn_id` 视为已终止；后续 retry/continuation 不得重新建立新的 lease 来复活该逻辑 turn。
 - 该 idle timeout 只属于服务端远程部署合同。现有桌面/本地安装不因此获得新的全局 turn 上限。
 - 现有 adapter stall timeout 与 browser helper heartbeat lease 继续保留，但它们解决不同问题：前者处理 adapter 事件流静默，后者处理服务端 helper 消失；二者都不能替代 native turn 的“无真实进展”回收机制。
@@ -223,7 +226,7 @@ browser
 - `Request.signal`/客户端流取消仍是首选的即时清理信号。真实 TCP peer disconnect 必须继续释放 tracked HTTP turn，并将 abort 传播到 ChatGPT Web adapter。
 - 远程部署必须额外提供可配置的 native turn idle timeout，默认 `600s`。该值表示“连续没有真实业务进展”的最长时间，不是 adapter silence timeout、HTTP idle timeout，也不是 wall-clock 总时长。
 - idle lease 的 authority 是 native Codex `thread_id + turn_id`。同 identity 的多个 HTTP 请求加入同一 lease；只有已证明的业务进展可以把 idle 计时重新归零。请求重试、continuation 本身和任何 heartbeat 都不能刷新 lease。
-- 工具等待期间如果没有工具结果或其它真实进展，idle 计时继续运行。idle timeout 到期必须走与现有精确 interrupt/cancel 路径等价的 ownership 清理：至少覆盖 active HTTP Responses/compact、ChatGPT browser session、structured compaction，以及与该 turn 绑定且仍存活的 broker ownership。
+- 工具等待期间如果没有工具结果或其它真实进展，idle 计时继续运行。Broker 已验证的 Native operation 等待租约可以暂停**到期终止动作**，但不能把 wait/retry 记录成业务进展，也不能修改 last-progress 时间。等待租约结束且没有其他符合条件的 Native operation 后，按原 last-progress 时间继续判定；若已经超过阈值，必须立即走与现有精确 interrupt/cancel 路径等价的 ownership 清理：至少覆盖 active HTTP Responses/compact、ChatGPT browser session、structured compaction，以及与该 turn 绑定且仍存活的 broker ownership。
 - 如果客户端连接仍存在，服务端应返回可识别的 terminal timeout/incomplete 结果；如果客户端已经不可达，清理仍必须完成，不能等待响应成功写回。
 - timeout 后必须保留有界的 terminal/tombstone 状态，在同一 authority epoch 内拒绝同 identity 复活；该终止记录必须有容量上限或等价回收策略，不能形成新的长期无界内存 ownership。容量轮换只能在 active lease 为 `0` 的明确 epoch 边界发生，并且当前 epoch 必须可诊断；仍有 active lease 时应返回可识别、可重试的容量错误，不能让所有未知 identity 永久共用一个 aborted signal。正常完成则释放活动 lease。
 
@@ -287,7 +290,7 @@ Phase 1 必须实测 Electron `safeStorage` 在最终容器中的后端：
 
 首次尚未完成 ChatGPT/Launcher setup 时，容器可以处于“桌面可连接但应用未完成配置”的初始化状态。健康检查不得因为用户尚未登录 ChatGPT 而无限重启容器。
 
-Responses 健康检查通过容器内部或宿主机私有路径完成。公开 HTTPS 反向代理不得为了健康检查而暴露 `/healthz`。活动 turn 计数可以继续用于诊断，但 health 本身不能因为存在一个正常运行的长 turn 而失败；600 秒 idle timeout 只在没有真实业务进展时触发。
+Responses 健康检查通过容器内部或宿主机私有路径完成。公开 HTTPS 反向代理不得为了健康检查而暴露 `/healthz`。活动 turn 计数可以继续用于诊断，但 health 本身不能因为存在一个正常运行的长 turn 而失败；600 秒 idle timeout 以真实业务进展时间为基准，且可在有效 Native operation 等待租约存在时按上述窄例外暂停终止动作。
 
 ## 已接受设计依据
 
@@ -337,7 +340,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 9. Full/Automation 模式下由该外部 Codex 完成至少一个 MCP 工具回合，证明 Tunnel/MCP 与 outer Codex 工具调用仍保持现有合同。
 10. 触发 delegated compaction 路径，证明 task/session 隔离和 browser/session ownership 仍然正确：exact source execution 可按 delegated Spec 复用；proof 不足或 identity 不精确匹配时，旧 retained conversation 会先退役，再使用 fresh compaction / fresh browser epoch。验收不得要求 retained epoch 在所有情况下保持不变。
 11. 让外部 Codex 在活动流中正常断开 TCP/HTTP 连接，确认对应 HTTP/browser/compaction ownership 被及时取消，活动 turn 计数回到零。
-12. 将远程 native turn idle timeout 临时配置为一个短测试值：持续发送 adapter/browser helper heartbeat 但不产生真实业务进展，确认同一 `thread_id + turn_id` 仍会超时并被强制清理；随后证明文本/推理增量、工具调用产生、工具结果返回或 compaction 实际进展能够续租。工具调用发出后若一直没有结果，计时不得暂停。测试后恢复部署默认 600 秒。
+12. 将远程 native turn idle timeout 临时配置为一个短测试值并覆盖三种情况：仅持续发送 adapter/browser helper heartbeat、TCP 或 continuation 而没有真实业务进展时，同一 `thread_id + turn_id` 仍会超时并被强制清理；文本/推理增量、工具调用产生、工具结果返回或 compaction 实际进展可以刷新 last-progress；已启动 Native operation 在没有工具结果时，只有 Broker 验证的 120 秒等待租约可以跨过 idle 阈值暂停终止动作，且观测到的 last-progress 不应被 wait/retry 改写。停止合法查询并让等待租约失效后，如果原 idle 时间已经越过阈值，应立即触发同一 timeout/ownership 清理，而不是重新得到一个完整 idle 周期。测试后恢复部署默认 600 秒。
 13. 在宿主机确认 Responses raw port、health、admin、CDP 和 VNC 没有公网监听。Responses/noVNC 端口只允许 reverse proxy 所需的宿主机 loopback 或 private-network 可达范围。
 14. 验证公开 Codex Base URL 为空时，导出配置指向宿主机 `127.0.0.1`；设置 HTTPS Base URL 后，重新导出只改变客户端目标，不自动写外部 Codex 文件。
 
@@ -376,7 +379,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 - Responses API 是新的外部入口。它必须使用 HTTPS + 独立客户端 API Key；API Key 泄漏等价于获得该单用户实例的 `/v1` 调用权限。密钥应作为登录凭据处理并支持轮换。
 - Responses 进程为了被 Docker/私有网络转发，容器内可能不再只监听 loopback。这扩大了容器网络内的可达范围，因此安全边界必须由 Docker publication/private network、反向代理 path allowlist 和 API Key 三层共同约束；不能把“进程不再是 loopback”误解为允许公网直连。
 - daemon `controlToken` 的权限高于客户端 API Key，且 `/admin/*` 不使用客户端 API Key 作为授权边界。`controlToken` 不得出现在远程 Codex 导出、反向代理 header 注入或公网响应中。
-- 600 秒 idle timeout 会终止连续 600 秒没有真实业务进展的远程 turn，包括工具回调永久丢失的情况。合法长 turn 只要持续产生真实进展就不受总时长限制；部署可调整 idle 阈值，但不得通过 heartbeat 冒充业务进展来续租。
+- 600 秒 idle timeout 会终止连续 600 秒没有真实业务进展、且没有有效 Native operation 等待租约保护终止动作的远程 turn，包括工具回调永久丢失或等待消费者已经失联的情况。合法 Native 长等待可凭 Broker 验证的 120 秒等待租约跨过 600 秒，但 wait/retry 不算真实业务进展，租约一旦失效就按原 last-progress 时间立即恢复清理判断；部署可调整 idle 阈值，但不得通过 heartbeat 冒充业务进展来续租。
 - 持久 HOME volume 包含 ChatGPT 浏览器会话和其它敏感应用状态。它必须被视为登录凭据，不得同步到不可信存储、提交到 Git 或作为普通诊断附件上传。
 - 外部 Codex 的文件和命令副作用发生在客户端主机的工作目录，不由服务器容器文件系统隔离。现有 Codex sandbox/approval 仍是该客户端主机上的权限控制边界。
 - 同一容器用户下的其它进程仍属于现有 same-user trust boundary。Phase 1 不尝试防御已取得该用户代码执行能力的恶意进程。
@@ -393,7 +396,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 - noVNC/Responses 的容器内部监听端口、Xvfb display 编号和默认桌面分辨率可由实现者选择，只要不会改变公网 path、认证和端口安全边界。
 - “公开 Codex Base URL”的部署变量名、Responses host-port 变量名和 600 秒 idle timeout 的内部配置字段名由实现者选择；其空值语义、默认值和验收行为必须符合本 Spec。
 - 客户端导出可以通过 Launcher UI、CLI 或两者提供；只要产物可复制到另一台主机、不自动写外部 Codex、且不包含服务端本地路径或 control token。
-- 远程 idle lease 可以实现为独立 turn registry，或复用现有 HTTP/session ownership 数据结构；实现必须按 native turn identity 保持单一 lease，并只在真实业务进展时续租，不能简单给每个 HTTP 请求重新计时。
+- 远程 idle lease 可以实现为独立 turn registry，或复用现有 HTTP/session ownership 数据结构；实现必须按 native turn identity 保持单一 last-progress authority，并只在真实业务进展时刷新它，不能简单给每个 HTTP 请求重新计时。Native 长等待的 120 秒 operation lease 是独立的终止暂停条件；实现可以订阅或查询其状态，但不得把它写回成 remote idle 的业务进展。
 - 部署资产可以放在 `deploy/server/` 或等价清晰目录；确切文件组织不属于公共运行合同。
 - 当前 `src/config.ts` 明确拒绝非 loopback Responses host，现有 API Key export 又固定本机 URL，因此本次需求预计需要最小核心改动。除网络绑定、客户端导出、远程 idle lifecycle，以及 delegated Spec 为 authority、tool registry、rollout replay 和 compaction source recovery 明确要求的最小 adapter/broker 修改外，不应顺带重构 Launcher 或其它无关行为。
 
@@ -426,7 +429,7 @@ Responses 健康检查通过容器内部或宿主机私有路径完成。公开 
 - 服务端不再自动配置 Codex，改为导出并由用户复制/合并客户端配置；
 - 公开 Codex Base URL 由部署配置提供，可以为空；为空时导出宿主机 `127.0.0.1` 地址；
 - 正常 HTTP 断开立即取消；远程部署另设可配置 native turn 无进展 idle timeout，默认 600 秒；
-- idle timeout 只属于服务端远程部署，不改变普通桌面/本地安装默认行为，也不限制有持续真实进展的 turn 总时长；
+- idle timeout 只属于服务端远程部署，不改变普通桌面/本地安装默认行为，也不限制有持续真实进展的 turn 总时长；有效 Native operation 等待租约可暂停其终止动作，但不刷新真实业务进展时间，租约失效后按原时间恢复；
 - 远程正确性不依赖 Interrupt command hook；
 - 持久 HOME volume 只保存服务器应用身份和运行状态，不承担外部 Codex 项目/配置持久化；
 - 远程桌面不增加额外网关认证，继续使用 HTTPS + VNC/noVNC 密码；Responses API 则单独要求客户端 API Key；

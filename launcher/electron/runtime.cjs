@@ -9,6 +9,7 @@ const {
   connectorNameForSetup,
   CURRENT_CONNECTOR_NAME,
   DEV_CONNECTOR_NAME,
+  DEV_LONG_WAIT_CONNECTOR_NAME,
   isLegacyConnectorName,
   requireCurrentRuntimeConnectorName,
   validateConnectorName,
@@ -995,7 +996,12 @@ class RuntimeHost {
   }
 
   setupConnectorName() {
-    return this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
+    if (this.launcherProfile !== "development") return CURRENT_CONNECTOR_NAME;
+    const current = this.runtimeConfigSnapshot();
+    if (current.configured && current.config?.appName === DEV_LONG_WAIT_CONNECTOR_NAME) {
+      return DEV_LONG_WAIT_CONNECTOR_NAME;
+    }
+    return DEV_CONNECTOR_NAME;
   }
 
   cancelActiveTurns() {

@@ -14,6 +14,9 @@ import {
 import { defaultBrokerEndpoint } from "../src/config";
 import type { ChatGptTurnEnvironment } from "../src/adapters/chatgpt-web/environment";
 
+// Each ordinary test call below is a new logical Native operation.
+let nextNativeOperationId = 0;
+
 const testTempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 const root = mkdtempSync(join(testTempRoot, "cgw-zero-risk-mcp-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -314,7 +317,7 @@ describe("Zero Risk turn broker lifecycle", () => {
 });
 
 describe("Zero Risk public MCP ABI", () => {
-  test("keeps the turn token after a stale claim is rejected before admission", async () => {
+  test("keeps the capability after the current registry rejects a stale tool selection", async () => {
     const socketPath = endpoint("stale-admission");
     const broker = TurnBroker.forSocket(socketPath);
     const requestId = await broker.registerSafe({
@@ -334,28 +337,6 @@ describe("Zero Risk public MCP ABI", () => {
       stderr: "pipe",
     });
     const client = new Client({ name: "codex-safe-stale-admission-test", version: "1.0.0" });
-    const internals = broker as unknown as {
-      dispatch: (request: { method?: string }, signal?: AbortSignal) => Promise<unknown>;
-    };
-    const originalDispatch = internals.dispatch.bind(broker);
-    let replacedAfterClaim = false;
-    internals.dispatch = async (request, signal) => {
-      const response = await originalDispatch(request, signal);
-      if (!replacedAfterClaim && request.method === "claim") {
-        replacedAfterClaim = true;
-        broker.updateEnvironment(requestId, {
-          authorityMode: "delegated",
-          threadId: "thread-stale-admission",
-          turnId: "turn-stale-admission",
-          tools: [{
-            name: "tool_b",
-            description: "Current tool",
-            parameters: { type: "object", properties: {} },
-          }],
-        });
-      }
-      return response;
-    };
     try {
       await client.connect(transport);
       broker.confirmSafeTurnSent(requestId, nonceA);
@@ -364,24 +345,29 @@ describe("Zero Risk public MCP ABI", () => {
         arguments: { request_id: requestId },
       });
 
+      // The model selected tool_a from an earlier catalog. Admission must use the current
+      // registry, not a snapshot returned by a separate claim request.
+      broker.updateEnvironment(requestId, {
+        authorityMode: "delegated", threadId: "thread-stale-admission", turnId: "turn-stale-admission",
+        tools: [{ name: "tool_b", description: "Current tool", parameters: { type: "object", properties: {} } }],
+      });
       const rejected = await client.callTool({
         name: "codex_tool_call",
-        arguments: { request_id: requestId, wire_name: "tool_a", arguments: {} },
+        arguments: { operation_id: ++nextNativeOperationId, request_id: requestId, wire_name: "tool_a", arguments: {} },
       });
-      expect(replacedAfterClaim).toBe(true);
       expect(rejected.isError).toBe(true);
-      expect(JSON.stringify(rejected.content)).toContain("does not advertise tool_a");
+      expect(rejected.structuredContent).toMatchObject({ code: "codex_tool_admission_rejected" });
+      expect(broker.beginCompletionFence(requestId)).toBeNumber();
 
       const allowed = client.callTool({
         name: "codex_tool_call",
-        arguments: { request_id: requestId, wire_name: "tool_b", arguments: {} },
+        arguments: { operation_id: ++nextNativeOperationId, request_id: requestId, wire_name: "tool_b", arguments: {} },
       });
       const [request] = await broker.nextToolBatch(requestId);
       expect(request).toMatchObject({ wireName: "tool_b", arguments: {} });
       broker.completeTool(requestId, request!.callId, toolResult({ ok: true }));
       expect((await allowed).structuredContent).toEqual({ ok: true });
     } finally {
-      internals.dispatch = originalDispatch;
       await client.close().catch(() => {});
       broker.revoke(requestId);
       await broker.close();
@@ -419,6 +405,7 @@ describe("Zero Risk public MCP ABI", () => {
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",
+        "codex_tool_wait",
         "codex_turn_complete",
         "codex_turn_start",
         "codex_view_image",
@@ -439,7 +426,7 @@ describe("Zero Risk public MCP ABI", () => {
       expect(broker.confirmSafeTurnSent(requestId, nonceA)).toEqual({ confirmed: true, duplicate: false });
       const beforeStart = await client.callTool({
         name: "codex_tool_inventory",
-        arguments: { request_id: requestId },
+        arguments: { operation_id: ++nextNativeOperationId, request_id: requestId },
       });
       expect(beforeStart.isError).toBe(true);
       expect(JSON.stringify(beforeStart.content))
@@ -455,7 +442,7 @@ describe("Zero Risk public MCP ABI", () => {
       });
       const inventoryAfterStart = client.callTool({
         name: "codex_tool_inventory",
-        arguments: { request_id: requestId },
+        arguments: { operation_id: ++nextNativeOperationId, request_id: requestId },
       });
       const [inventoryRequest] = await broker.nextToolBatch(requestId);
       expect(inventoryRequest).toMatchObject({ wireName: "exec", freeform: true });
@@ -479,7 +466,7 @@ describe("Zero Risk public MCP ABI", () => {
 
       const recursive = await client.callTool({
         name: "codex_tool_call",
-        arguments: {
+        arguments: { operation_id: ++nextNativeOperationId,
           request_id: requestId,
           wire_name: `${ownNamespace}__shadow_tool`,
           arguments: {},
@@ -490,7 +477,7 @@ describe("Zero Risk public MCP ABI", () => {
 
       const recursiveGateway = await client.callTool({
         name: "codex_tool_call",
-        arguments: {
+        arguments: { operation_id: ++nextNativeOperationId,
           request_id: requestId,
           wire_name: "exec",
           input: "await tools.mcp__codex_safe__codex_turn_complete({});",
@@ -501,7 +488,7 @@ describe("Zero Risk public MCP ABI", () => {
 
       const useful = client.callTool({
         name: "codex_tool_call",
-        arguments: {
+        arguments: { operation_id: ++nextNativeOperationId,
           request_id: requestId,
           wire_name: "mcp__useful__useful_tool",
           arguments: { query: "test" },

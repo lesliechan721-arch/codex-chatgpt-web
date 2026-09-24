@@ -45,6 +45,7 @@ import {
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
 import { ChatGptExternalTurnProgress } from "./turn-progress";
+import { NativeOperationError } from "./native-tool-operations";
 import {
   canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
@@ -326,6 +327,11 @@ function replayEvents(events: AdapterEvent[], emit: (event: AdapterEvent) => voi
 function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Error {
   const normalized = error instanceof Error ? error : new Error(String(error));
   if (normalized instanceof ChatGptWebAdapterError) return normalized;
+  if (normalized instanceof NativeOperationError) {
+    return new ChatGptWebAdapterError(normalized.message, {
+      status: 502, errorType: "server_error", code: normalized.code, retryable: false, cause: normalized,
+    });
+  }
   const phase = session.runtime.submission?.phase;
   if (!phase || phase === "prepared") return normalized;
   const ambiguous = phase === "send_activated";
@@ -571,9 +577,11 @@ export function createChatGptWebAdapter(
       return answer;
     });
     const browserAbort = new AbortController();
+    const waitingObservationStop = new AbortController();
     let browserOwnerSettled = false;
     const trackBrowserOwner = (browser: Promise<string>): Promise<string> => browser.finally(() => {
       browserOwnerSettled = true;
+      waitingObservationStop.abort();
     });
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
@@ -584,19 +592,37 @@ export function createChatGptWebAdapter(
     ): void => {
       if (observedCapabilityTokens.has(turnToken)) return;
       observedCapabilityTokens.add(turnToken);
+      const observeSignal = AbortSignal.any([browserAbort.signal, waitingObservationStop.signal]);
+      const observeFailure = (error: unknown): void => {
+        if (observeSignal.aborted || browserOwnerSettled) return;
+        const failure = error instanceof NativeOperationError
+          ? new ChatGptWebAdapterError(error.message, {
+            status: 502, errorType: "server_error", code: error.code, retryable: false, cause: error,
+          })
+          : new ChatGptWebAdapterError("The Native waiting observer is unavailable", {
+            status: 502, errorType: "server_error", code: "codex_tool_infrastructure_failure", retryable: false,
+          });
+        externalProgress.retire(failure);
+        if (!browserAbort.signal.aborted) browserAbort.abort(failure);
+      };
+      // This owner subscription outlives individual Responses requests, so a blocked Native
+      // input call does not prevent authenticated wait activity from reaching the browser.
+      void (async () => {
+        let revision = 0;
+        while (!observeSignal.aborted) {
+          const snapshot = await broker.waitForNativeWaiting(turnToken, revision, observeSignal);
+          if (observeSignal.aborted) return;
+          revision = snapshot.revision;
+          externalProgress.recordNativeWaiting(snapshot);
+        }
+      })().catch(observeFailure);
       void broker.waitForRetirement(turnToken).then(
         () => {
           const retirement = new Error("Codex Native retired the turn binding before its tool work completed");
           externalProgress.retire(retirement);
           if (!browserOwnerSettled && !browserAbort.signal.aborted) browserAbort.abort(retirement);
         },
-        error => {
-          const failure = new Error("ChatGPT could not observe Codex Native turn retirement", {
-            cause: error,
-          });
-          externalProgress.retire(failure);
-          if (!browserAbort.signal.aborted) browserAbort.abort(failure);
-        },
+        observeFailure,
       );
     };
     const submission: NonNullable<ChatGptTurnRuntime["submission"]> = { phase: "prepared" };
@@ -686,8 +712,8 @@ export function createChatGptWebAdapter(
             trace.push({
               kind: "commentary",
               text: zeroRiskRequireSentConfirmation
-                ? "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, send the prompt, then confirm it was sent in the launcher."
-                : "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk` plugin and the model you want, then send the prompt. The connector will confirm this turn automatically.",
+                ? "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk2` plugin and the model you want, send the prompt, then confirm it was sent in the launcher."
+                : "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the `Codex Zero Risk2` plugin and the model you want, then send the prompt. The connector will confirm this turn automatically.",
             });
           }
           if (zeroRiskRequireSentConfirmation) {
@@ -698,7 +724,7 @@ export function createChatGptWebAdapter(
             submission.phase = "accepted";
             if (!parsed._compactionRequest) trace.push({
               kind: "commentary",
-              text: "> **Waiting for ChatGPT**\n>\n> The prompt is marked `Sent`. Waiting for `Codex Zero Risk` to bind this turn through the selected ChatGPT connector.",
+              text: "> **Waiting for ChatGPT**\n>\n> The prompt is marked `Sent`. Waiting for `Codex Zero Risk2` to bind this turn through the selected ChatGPT connector.",
             });
           }
           const terminalAbort = new AbortController();
@@ -722,7 +748,7 @@ export function createChatGptWebAdapter(
             await zeroRiskManualControl.markStarted(retainedLauncherDescriptor, owner);
             if (!parsed._compactionRequest) trace.push({
               kind: "commentary",
-              text: "> **Zero Risk connected**\n>\n> `Codex Zero Risk` is connected. ChatGPT is now working through the native Codex harness; progress remains visible in the launcher.",
+              text: "> **Zero Risk connected**\n>\n> `Codex Zero Risk2` is connected. ChatGPT is now working through the native Codex harness; progress remains visible in the launcher.",
             });
             answer = await Promise.race([
               broker.waitForSafeCompletion(activeToken, browserAbort.signal),

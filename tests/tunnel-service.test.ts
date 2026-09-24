@@ -6,6 +6,7 @@ import { defaultConfig } from "../src/config";
 import { createTunnelConfig, mcpCommand } from "../src/tunnel";
 import { tunnelServiceDefinition } from "../src/tunnel-service";
 import { existingFullSetupCredentials, tunnelWorkerRuntimeChanged } from "../src/setup";
+import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, DEV_NATIVE_LONG_WAIT_MCP_CONTRACT } from "../src/native-tool-long-wait-probe";
 
 const roots: string[] = [];
 
@@ -149,6 +150,13 @@ describe("tunnel launchd ownership", () => {
 
     config.browserInteractionMode = "manual";
     expect(parsePinnedTunnelCommand(mcpCommand(config, "win32"))).toContain("safe");
+
+    config.browserInteractionMode = "automatic";
+    config.purpose = "dev-harness";
+    config.appName = DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
+    expect(parsePinnedTunnelCommand(mcpCommand(config, "win32"))).toContain("native");
+    config.devNativeToolLongWaitProbe = true;
+    expect(parsePinnedTunnelCommand(mcpCommand(config, "win32"))).toContain(DEV_NATIVE_LONG_WAIT_MCP_CONTRACT);
   });
 
 });

@@ -96,6 +96,7 @@ import {
 import {
   chatGptExternalProgressIsLive,
   chatGptExternalToolCallsAreInFlight,
+  chatGptNativeWaitingLeaseIsLive,
 } from "./turn-progress";
 import type {
   ChatGptExternalTurnProgressSnapshot,
@@ -1119,6 +1120,7 @@ export const browserStageTimeouts = {
  */
 export class ChatGptSuspensionClock {
   private suspendedTotalMs = 0;
+  private latestSuspension?: { startedAt: number; endedAt: number };
   private lastTickAt: number;
   private timer: ReturnType<typeof setInterval> | undefined;
 
@@ -1139,12 +1141,19 @@ export class ChatGptSuspensionClock {
   /** Exposed for tests; production ticks come from the interval above. */
   tick(now: number): void {
     const gap = now - this.lastTickAt;
+    if (gap >= this.gapThresholdMs) {
+      this.latestSuspension = { startedAt: this.lastTickAt + this.tickIntervalMs, endedAt: now };
+    }
     this.lastTickAt = now;
     if (gap >= this.gapThresholdMs) this.suspendedTotalMs += gap - this.tickIntervalMs;
   }
 
   suspendedMs(): number {
     return this.suspendedTotalMs;
+  }
+
+  recentSuspension(): { startedAt: number; endedAt: number } | undefined {
+    return this.latestSuspension;
   }
 }
 
@@ -1649,7 +1658,13 @@ export const CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS = 5_000;
 export function chatGptExternalProgressSuppressesDomHealth(
   snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
   now: number,
+  suspension = chatGptSuspensionClock.recentSuspension(),
 ): boolean {
+  if (chatGptNativeWaitingLeaseIsLive(snapshot, now)) return true;
+  // A formerly valid lease gets only a short transport recovery grace after system resume.
+  // The Broker must publish new evidence; an old snapshot cannot keep extending this grace.
+  if (suspension && now >= suspension.endedAt && now - suspension.endedAt < 5_000
+    && chatGptNativeWaitingLeaseIsLive(snapshot, suspension.startedAt)) return true;
   if (!chatGptExternalProgressIsLive(snapshot, now, CHATGPT_RESPONSE_DOM_GRACE_MS)) return false;
   const lastProgressAt = snapshot?.lastProgressAt;
   if (lastProgressAt === undefined) return false;
@@ -3022,6 +3037,9 @@ export class ChatGptBrowserWorker {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       if (observationPage.isClosed()) throw chatGptBrowserTabClosedError();
       let progress = externalProgress?.snapshot();
+      if (chatGptNativeWaitingLeaseIsLive(progress, Date.now())) {
+        responseDeadline = Math.min(deadline ?? Number.POSITIVE_INFINITY, Date.now() + graceMs);
+      }
       if (progress?.lastProgressAt !== undefined) {
         responseDeadline = Math.min(
           deadline ?? Number.POSITIVE_INFINITY,

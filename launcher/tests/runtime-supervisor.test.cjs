@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { packagedRuntimePaths } = require("../electron/runtime-command.cjs");
+const { DEV_LONG_WAIT_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { linuxDesktopEntry, requireAutostartState } = require("../electron/autostart.cjs");
 const {
   createLogger,
@@ -245,7 +246,7 @@ test("DEV runtime supervision ignores launcher version mismatch and starts only 
     releaseVersion: "9.9.9",
     purpose: "dev-harness",
     mode: "full",
-    appName: "Codex Native2 DEV",
+    appName: "Codex Native3 DEV",
     tunnel: {
       binaryPath: path.join(root, "bin", "tunnel-client"),
       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
@@ -425,6 +426,22 @@ test("launcher repairs its runtime before building the tunnel MCP command", asyn
     assert.equal(runtimeRepairs, 1);
     assert.equal(command.includes(serializedRuntime), true);
     assert.equal(command.includes(`${path.sep}versions${path.sep}`), false);
+
+    runtimeRepairs = 0;
+    config.purpose = "dev-harness";
+    config.appName = DEV_LONG_WAIT_CONNECTOR_NAME;
+    config.devNativeToolLongWaitProbe = false;
+    await supervisor.runTunnelConnectCommand(config);
+    const devCommand = connectArgs[connectArgs.indexOf("--mcp-command") + 1];
+    assert.equal(runtimeRepairs, 1);
+    assert.equal(devCommand.includes("native-long-wait-probe"), false);
+
+    runtimeRepairs = 0;
+    config.devNativeToolLongWaitProbe = true;
+    await supervisor.runTunnelConnectCommand(config);
+    const probeCommand = connectArgs[connectArgs.indexOf("--mcp-command") + 1];
+    assert.equal(runtimeRepairs, 1);
+    assert.equal(probeCommand.includes("native-long-wait-probe"), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -2402,7 +2419,7 @@ test("observed CLI fresh-conversation changes retire completed tabs once and def
   const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
   const key = "a".repeat(64);
   const old = { id: "old", traceId: "old-trace", status: "ready", interactionMode: "automatic", conversationKey: key,
-    connectorIdentity: "Codex Native2", connectorBound: true };
+    connectorIdentity: "Codex Native3", connectorBound: true };
   const active = { id: "active", traceId: "active-trace", status: "running", interactionMode: "automatic", conversationKey: key };
   const manual = { id: "manual", status: "ready", interactionMode: "manual", conversationKey: "b".repeat(64) };
   let operation = null, updates = 0;
@@ -2444,7 +2461,7 @@ test("observed CLI fresh-conversation changes retire completed tabs once and def
     assert.deepEqual(removed, [old.id]);
     assert.equal(browserHost.turnTabs.get(active.id), active);
     assert.equal(browserHost.turnTabs.get(manual.id), manual);
-    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native2");
+    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native3");
     assert.equal(lease.reused, false);
     assert.equal(lease.tabId, "new");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

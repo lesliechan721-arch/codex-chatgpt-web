@@ -14,6 +14,11 @@ import {
   resolveChatGptWebContextLimits,
 } from "../chatgpt-web-models";
 import type { AppConfig } from "../config";
+import {
+  DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME,
+  DEV_NATIVE_LONG_WAIT_DELAY_MS,
+  DEV_NATIVE_LONG_WAIT_TOOL_NAME,
+} from "../native-tool-long-wait-probe";
 import { parseRequest } from "../responses/parser";
 import { compactRequest, responseRequest, routeChatGptWebRequest } from "../server";
 import { namespacedToolName, type AdapterEvent, type CodexProviderConfig } from "../types";
@@ -190,12 +195,16 @@ function requestBody(
   input: unknown[],
   stream: boolean,
   localToolsEnabled: boolean,
+  nativeLongWaitProbe: boolean,
 ): Record<string, unknown> {
+  const tools = nativeLongWaitProbe
+    ? [...DEV_CHAT_TOOLS, simulatedFunction(DEV_NATIVE_LONG_WAIT_TOOL_NAME, "native long-wait transport probe")]
+    : DEV_CHAT_TOOLS;
   return {
     model: state.model,
     instructions: localToolsEnabled ? DEV_CHAT_SYSTEM_INSTRUCTIONS : DEV_CHAT_BROWSER_ONLY_INSTRUCTIONS,
     input,
-    tools: localToolsEnabled ? DEV_CHAT_TOOLS : [],
+    tools: localToolsEnabled ? tools : [],
     tool_choice: "auto",
     parallel_tool_calls: true,
     reasoning: { summary: "auto" },
@@ -513,7 +522,15 @@ export class DevChatDriver {
     const usage: DevChatUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     let finalText = "";
     for (let round = 0; round < 64; round += 1) {
-      const body = requestBody(state, this.cwd, turnId, workingInput, false, this.config.mode === "full");
+      const body = requestBody(
+        state,
+        this.cwd,
+        turnId,
+        workingInput,
+        false,
+        this.config.mode === "full",
+        this.config.devNativeToolLongWaitProbe === true && this.config.appName === DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME,
+      );
       const response = await responseRequest(new Request("http://codex-web-gpt.dev/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -554,6 +571,9 @@ export class DevChatDriver {
       totalToolCalls += calls.length;
       for (const call of calls) {
         emit({ type: "tool_call", name: call.name, input: call.input });
+        if (call.name === DEV_NATIVE_LONG_WAIT_TOOL_NAME) {
+          await new Promise(resolveWait => setTimeout(resolveWait, DEV_NATIVE_LONG_WAIT_DELAY_MS));
+        }
         const receipt = simulatedReceipt(state, turnId, call);
         emit({ type: "tool_result", name: call.name, receipt });
         workingInput.push(toolOutput(call, receipt));
@@ -593,6 +613,7 @@ export class DevChatDriver {
       input,
       false,
       this.config.mode === "full",
+      this.config.devNativeToolLongWaitProbe === true && this.config.appName === DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME,
     ));
     const route = routeChatGptWebRequest(parsed, this.config);
     const inputTokens = estimateChatGptWebInputTokens(parsed, {

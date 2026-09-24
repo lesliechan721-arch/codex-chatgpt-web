@@ -44,6 +44,7 @@ import {
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "./native-tool-long-wait-probe";
 import { effectiveToolAuthorityMode, manualCodexConfigurationOnly } from "./server-remote-config";
 
 export interface SetupOptions {
@@ -69,6 +70,7 @@ export interface SetupOptions {
   tunnelId?: string;
   runtimeKeyFile?: string;
   runtimeKeyValue?: string;
+  devNativeToolLongWaitProbe?: boolean;
 }
 
 export interface SetupResult {
@@ -326,7 +328,7 @@ function baseConfig(
       throw new Error("Zero Risk does not support Bigger Context");
     }
     if (config.mode !== "full") {
-      throw new Error("Zero Risk requires --full so Codex Zero Risk can signal start, tools, and completion");
+      throw new Error("Zero Risk requires --full so Codex Zero Risk2 can signal start, tools, and completion");
     }
     if (config.browserHost !== "launcher") {
       throw new Error("Zero Risk requires the Launcher; pass --browser-host-descriptor from the running Launcher");
@@ -695,11 +697,21 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     throw new Error("DEV profile setup requires the isolated launcher browser descriptor");
   }
   const config = baseConfig(existing, options, DEV_LAUNCHER_PROFILE);
+  if (options.devNativeToolLongWaitProbe === true) {
+    if (config.mode !== "full" || config.browserInteractionMode !== "automatic") {
+      throw new Error("DEV Native long-wait probe requires --full with automatic browser interaction");
+    }
+  }
+  const nativeLongWaitProbe = options.devNativeToolLongWaitProbe === true
+    || (config.mode === "full"
+      && config.browserInteractionMode === "automatic"
+      && existing?.devNativeToolLongWaitProbe === true);
   effectiveToolAuthorityMode(config.toolAuthorityMode);
   if (config.browserHost !== "launcher") {
     throw new Error("DEV profile setup requires the desktop launcher browser host");
   }
   config.purpose = DEV_CONFIG_PURPOSE;
+  config.devNativeToolLongWaitProbe = nativeLongWaitProbe;
   if (config.browserInteractionMode === "automatic") {
     const capabilities = await inspectLauncherCapabilities(
       config,
@@ -710,6 +722,10 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     config.solAvailable = capabilities.solAvailable;
     config.extraHighAvailable = capabilities.solAvailable && capabilities.extraHighAvailable;
     config.proAvailable = capabilities.solAvailable && capabilities.proAvailable;
+  }
+  if (nativeLongWaitProbe) {
+    config.appName = DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
+    config.automaticAppName = DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
   }
 
   await configureTunnel(config, existing, options);
