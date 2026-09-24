@@ -949,8 +949,10 @@ function BrowserSurface({
   const copyManualPrompt = async (tabId: string) => {
     try {
       await api!.copyManualPrompt(tabId);
+      return true;
     } catch (cause) {
       setError(messageOf(cause));
+      return false;
     }
   };
   const confirmManualSent = async (tabId: string) => {
@@ -1048,8 +1050,9 @@ function BrowserSurface({
         && ["awaiting-user", "sent"].includes(selectedManualTab.manualState ?? "") ? (
         <ManualTurnGuide
           copy={copy}
+          key={selectedManualTab.id}
           onCancel={() => void closeTab(selectedManualTab.id)}
-          onCopy={() => void copyManualPrompt(selectedManualTab.id)}
+          onCopy={() => copyManualPrompt(selectedManualTab.id)}
           onSent={() => void confirmManualSent(selectedManualTab.id)}
           tab={selectedManualTab}
         />
@@ -1101,21 +1104,43 @@ function ManualTurnGuide({
 }: {
   copy: Copy;
   onCancel: () => void;
-  onCopy: () => void;
+  onCopy: () => Promise<boolean>;
   onSent: () => void;
   tab: BrowserState["tabs"][number];
 }) {
   const [now, setNow] = useState(Date.now());
+  const [cancelPending, setCancelPending] = useState(false);
+  const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (tab.manualState !== "awaiting-user" || !tab.manualDeadlineAt) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
   }, [tab.manualDeadlineAt, tab.manualState]);
+  useEffect(() => {
+    if (!cancelPending) return;
+    const timer = window.setTimeout(() => setCancelPending(false), 3_000);
+    return () => window.clearTimeout(timer);
+  }, [cancelPending]);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
   const deadline = tab.manualDeadlineAt ? Date.parse(tab.manualDeadlineAt) : Number.NaN;
   const seconds = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - now) / 1_000)) : 0;
   const waiting = tab.manualState === "awaiting-user";
   const requireSentConfirmation = tab.manualSentConfirmationRequired !== false;
+  const cancel = () => {
+    if (!cancelPending) {
+      setCancelPending(true);
+      return;
+    }
+    onCancel();
+  };
+  const copyPrompt = async () => {
+    if (await onCopy()) setCopied(true);
+  };
   const status = waiting
     ? `${seconds} ${copy.manualPromptSeconds}`
     : tab.manualState === "sent"
@@ -1135,8 +1160,12 @@ function ManualTurnGuide({
       </div>
       <span className="manual-turn-status">{status}</span>
       <div className="manual-turn-actions">
-        <SecondaryButton onClick={onCancel}>{copy.manualPromptCancel}</SecondaryButton>
-        <SecondaryButton disabled={!tab.canCopyPrompt} onClick={onCopy}>{copy.manualPromptCopy}</SecondaryButton>
+        <SecondaryButton onClick={cancel}>
+          {cancelPending ? copy.manualPromptCancelConfirm : copy.manualPromptCancel}
+        </SecondaryButton>
+        <SecondaryButton disabled={!tab.canCopyPrompt} onClick={() => void copyPrompt()}>
+          {copied ? copy.manualPromptCopied : copy.manualPromptCopy}
+        </SecondaryButton>
         {requireSentConfirmation
           ? <PrimaryButton disabled={!tab.canConfirmSent} onClick={onSent}>{copy.manualPromptSent}</PrimaryButton>
           : null}

@@ -20,6 +20,104 @@ test("embedded ChatGPT is measured only after its animated surface mounts", () =
   assert.match(appSource, /ref=\{browserSlotRef\}/);
 });
 
+test("Zero Risk manual actions confirm cancellation and acknowledge only successful copies", async () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const guideSource = appSource.slice(appSource.indexOf("function ManualTurnGuide("), appSource.indexOf("function SetupSurface("));
+  const transpiled = ts.transpileModule(guideSource, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "element" },
+  }).outputText;
+  const state = [];
+  let cursor = 0;
+  const sandbox = {
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    PrimaryButton: "PrimaryButton",
+    SecondaryButton: "SecondaryButton",
+    useEffect() {},
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in state)) state[index] = typeof initial === "function" ? initial() : initial;
+      return [state[index], value => { state[index] = typeof value === "function" ? value(state[index]) : value; }];
+    },
+  };
+  vm.runInNewContext(`${transpiled}\nrender = ManualTurnGuide;`, sandbox);
+  const render = props => { cursor = 0; return sandbox.render(props); };
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  const buttons = tree => visit(tree).filter(node => node.type === "SecondaryButton");
+  const label = button => button.children[0];
+  const copy = {
+    complete: "Complete", failed: "Failed", manualPromptCancel: "Cancel turn",
+    manualPromptCancelConfirm: "Click again to cancel", manualPromptCopied: "Copied",
+    manualPromptCopy: "Copy prompt", manualPromptInstruction: "Instruction",
+    manualPromptInstructionAutomaticConfirmation: "Automatic instruction", manualPromptRunning: "Running",
+    manualPromptSeconds: "seconds left", manualPromptSent: "Sent", manualPromptTitle: "Title",
+    manualPromptWaiting: "Waiting",
+  };
+  const tab = {
+    id: "manual-a", canConfirmSent: true, canCopyPrompt: true, manualDeadlineAt: null,
+    manualSentConfirmationRequired: true, manualState: "awaiting-user",
+  };
+  let cancellations = 0;
+  let copySucceeds = false;
+  const props = {
+    copy, tab, onCancel: () => { cancellations += 1; }, onCopy: async () => copySucceeds, onSent() {},
+  };
+
+  let tree = render(props);
+  buttons(tree)[0].props.onClick();
+  assert.equal(cancellations, 0);
+  tree = render(props);
+  assert.equal(label(buttons(tree)[0]), copy.manualPromptCancelConfirm);
+  buttons(tree)[0].props.onClick();
+  assert.equal(cancellations, 1);
+
+  buttons(tree)[1].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  tree = render(props);
+  assert.equal(label(buttons(tree)[1]), copy.manualPromptCopy);
+
+  copySucceeds = true;
+  buttons(tree)[1].props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  tree = render(props);
+  assert.equal(label(buttons(tree)[1]), copy.manualPromptCopied);
+});
+
+test("Zero Risk manual guide remounts when the selected task changes", () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const browserSource = appSource.slice(appSource.indexOf("function BrowserSurface("), appSource.indexOf("function ManualTurnGuide("));
+  const transpiled = ts.transpileModule(browserSource, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "element" },
+  }).outputText;
+  const sandbox = {
+    api: {}, BrandMark: "BrandMark", Icon: "Icon", IconButton: "IconButton", ManualTurnGuide: "ManualTurnGuide",
+    PrimaryButton: "PrimaryButton", SecondaryButton: "SecondaryButton", StateDot: "StateDot",
+    browserTabTitleFromTitle: value => value, browserTabTone: () => "idle", formatBrowserAddress: value => value ?? "",
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useEffect() {}, useState: initial => [typeof initial === "function" ? initial() : initial, () => {}],
+  };
+  vm.runInNewContext(`${transpiled}\nrender = BrowserSurface;`, sandbox);
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  const tab = {
+    id: "manual-b", active: true, canConfirmSent: true, canCopyPrompt: true, interactionMode: "manual",
+    loading: false, manualState: "awaiting-user", status: "running", title: "Manual task",
+  };
+  const tree = sandbox.render({
+    browser: { authenticated: true, canGoBack: false, canGoForward: false, loading: false, tabs: [tab], visible: true, zoomFactor: 1 },
+    browserSlotRef() {}, copy: { back: "Back", browserAddress: "Address", browserTabLimit: "Limit",
+      hideBrowser: "Hide", hideTab: "Close", openChatgpt: "Open", reload: "Reload", zoomIn: "Zoom in",
+      zoomOut: "Zoom out", zoomReset: "Reset" }, interactionMode: "manual", operation: null, platform: "darwin", setError() {},
+  });
+  const guide = visit(tree).find(node => node.type === "ManualTurnGuide");
+  assert.ok(guide);
+  assert.equal(guide.props.key, tab.id);
+});
+
 test("the proxy dialog coordinates with the native browser surface", () => {
   assert.match(appSource, /const \[networkProxyOpen, setNetworkProxyOpen\] = useState\(false\)/);
   assert.match(
