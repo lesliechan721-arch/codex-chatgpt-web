@@ -75,6 +75,7 @@ test("descriptor publishes native surface identities without inspecting renderer
 test("mode transitions publish targets before setup inspection and restore them on rollback", async () => {
   const dir = fs.mkdtempSync(require("node:path").join(require("node:os").tmpdir(), "browser-mode-targets-"));
   let savedMode = "manual";
+  const announcementModes = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     surfaceId: "h".repeat(32),
     view: { webContents: { isDestroyed: () => false, getOrCreateDevToolsTargetId: () => "home-target" } },
@@ -83,6 +84,7 @@ test("mode transitions publish targets before setup inspection and restore them 
     profile: "production", cdpPort: 40000, partition: "persist:codex-web-gpt-chatgpt",
     control: {}, helper: {}, descriptorPath: require("node:path").join(dir, "descriptor.json"),
     markOwnedSurface: async () => {},
+    configureAnnouncementDismissal: async enabled => announcementModes.push(enabled),
   });
   const targets = () => JSON.parse(fs.readFileSync(fixture.descriptorPath, "utf8")).surfaceTargets;
   const automaticTargets = { [fixture.surfaceId]: "home-target" };
@@ -113,6 +115,12 @@ test("mode transitions publish targets before setup inspection and restore them 
     savedMode = "manual";
     assert.deepEqual(targets(), {});
     assert.equal(fixture.currentOperation(), null);
+    await assert.rejects(fixture.withInteractionModeChange("automatic", async commit => {
+      await commit();
+      throw new Error("runtime failed after browser commit");
+    }), /runtime failed after browser commit/);
+    assert.deepEqual(targets(), {});
+    assert.deepEqual(announcementModes, [false, true, false, true, false, true, false]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -581,6 +589,44 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
+  const calls = [];
+  let size = [1120, 720];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    primaryRendererReady: false, primaryDeviceEmulationDirty: true,
+    primaryDeviceEmulationViewport: null,
+    bounds: { x: 280, y: 64, width: 840, height: 656 },
+    window: { getContentSize: () => size },
+    view: {
+      setBounds: value => calls.push(["bounds", value]), setVisible: value => calls.push(["visible", value]),
+      webContents: {
+        enableDeviceEmulation: value => calls.push(["emulate", value.viewSize]),
+        disableDeviceEmulation: () => calls.push(["disable"]),
+      },
+    },
+  });
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.some(([event]) => event === "emulate"), false);
+  fixture.primaryRendererReady = true;
+  fixture.presentPrimaryView(false);
+  assert.deepEqual(calls.slice(-3), [["emulate", { width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }], ["visible", true]]);
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 1);
+  fixture.primaryDeviceEmulationDirty = true;
+  fixture.presentPrimaryView(false);
+  size = [1280, 800];
+  fixture.presentPrimaryView(false);
+  assert.deepEqual(fixture.primaryDeviceEmulationViewport, { width: 1280, height: 800 });
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 3);
+  fixture.presentPrimaryView(true);
+  assert.deepEqual(calls.slice(-3), [["bounds", fixture.bounds], ["disable"], ["visible", true]]);
+  assert.equal(fixture.primaryDeviceEmulationViewport, null);
+  fixture.getBrowserInteractionMode = () => "manual";
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 3);
+});
+
 test("turn tabs use the hidden viewport when the launcher window is hidden", () => {
   const events = [];
   const tab = {
@@ -836,6 +882,41 @@ test("launcher authentication requires the Temporary Chat composer and complete 
   const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
   assert.equal(result.authenticated, true);
   assert.equal(result.status, "ready");
+});
+
+test("authentication finds the new composer only in its ChatGPT form", async () => {
+  const vm = require("node:vm");
+  const { createDocument } = require("@mixmark-io/domino");
+  const url = "https://chatgpt.com/?temporary-chat=true";
+  for (const owned of [true, false]) {
+    const document = createDocument(`<form ${owned ? "data-chatgpt-composer" : ""}>
+      <div data-composer-markdown contenteditable="true" role="textbox"></div></form>`);
+    const editor = document.querySelector("[data-composer-markdown]");
+    Object.defineProperties(editor, {
+      isConnected: { value: true },
+      getBoundingClientRect: { value: () => ({ width: 300, height: 60 }) },
+    });
+    const fixture = {
+      state: { authenticated: false }, activeTraceId: null, manualOperation: null,
+      view: { webContents: {
+        isDestroyed: () => false, getURL: () => url,
+        executeJavaScript: script => vm.runInNewContext(script, {
+          location: { href: url },
+          document: { readyState: "complete", querySelectorAll: selector => document.querySelectorAll(selector) },
+          getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+          URL, AbortController, setTimeout, clearTimeout,
+          fetch: async () => ({ ok: true, status: 200, url: "https://chatgpt.com/api/auth/session",
+            headers: { get: () => "application/json" },
+            json: async () => ({ user: { id: "fixture" }, expires: "2099-01-01T00:00:00Z" }),
+          }),
+        }),
+      } },
+      setState(patch) { this.state = { ...this.state, ...patch }; },
+      snapshot() { return { ...this.state }; }, logger: { info() {} },
+    };
+    const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
+    assert.equal(result.authenticated, owned);
+  }
 });
 
 test("session verification distinguishes a missing login from network and invalid-response failures", async () => {
@@ -3326,6 +3407,7 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
     surfaceId: "automatic-primary-surface",
     view: { webContents: {
       executeJavaScript: async script => { scripts.push(script); },
+      isDestroyed: () => false,
     } },
     snapshot: () => ({ activeTabId: "home" }),
   });
@@ -3334,9 +3416,10 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
     await commit();
     return "configured";
   }), "configured");
-  assert.equal(scripts.length, 1);
+  assert.equal(scripts.length, 2);
   assert.match(scripts[0], /__CODEX_WEB_GPT_SURFACE_ID__/);
   assert.match(scripts[0], /automatic-primary-surface/);
+  assert.match(scripts[1], /configureChatGptAnnouncementDismissal/);
 });
 
 test("a failed Automatic ownership proof stays inside the runtime rollback boundary", async () => {
@@ -3401,6 +3484,7 @@ test("Zero Risk fails closed at every primary-surface inspection boundary", asyn
   });
   await assert.rejects(fixture.applyViewportCss(), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.markOwnedSurface(), /disabled in Zero Risk mode/);
+  await assert.rejects(fixture.configureAnnouncementDismissal(true), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.probeAuthentication(), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.inspectSession(true), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.inspectLimitsPlan(), /disabled in Zero Risk mode/);
