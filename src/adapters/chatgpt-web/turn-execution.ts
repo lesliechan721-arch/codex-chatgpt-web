@@ -259,8 +259,19 @@ function activeToolResultMatches(item: Record<string, unknown>, request: BrokerT
 function responseOutputDigest(output: unknown[]): string {
   return canonicalInputDigest(output.map(value => {
     const item = rawRecord(value);
-    if (!item || !("id" in item)) return value;
+    if (!item) return value;
     const { id: _id, ...owned } = item;
+    // Codex does not round-trip completed status or empty output_text annotations.
+    // Normalize only those response defaults; content, phase and tool identity stay exact.
+    if (owned.status === "completed") delete owned.status;
+    if (owned.type === "message" && Array.isArray(owned.content)) {
+      owned.content = owned.content.map(value => {
+        const part = rawRecord(value);
+        if (part?.type !== "output_text" || !Array.isArray(part.annotations) || part.annotations.length !== 0) return value;
+        const { annotations: _annotations, ...text } = part;
+        return text;
+      });
+    }
     return owned;
   }));
 }

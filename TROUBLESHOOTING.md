@@ -158,7 +158,7 @@ Share the exact failed tool result and an **Activity → Export safe log**. An a
 "safety block" without a failed tool result does not establish the cause. **Allow all actions**
 does not override ChatGPT's own safety checks.
 
-After updating, refresh **Codex Native2** in ChatGPT's plugin settings to load its current tool
+After updating, refresh **Codex Native3** in ChatGPT's plugin settings to load its current tool
 descriptions. This updates the compaction tool contract; it does not remove safety restrictions.
 If compaction ends without a submitted summary, the launcher reports that failure and preserves
 the existing task history.

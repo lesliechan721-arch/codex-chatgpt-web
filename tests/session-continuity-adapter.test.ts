@@ -291,6 +291,144 @@ function reverseJsonObjectKeys(value: unknown): unknown {
     .reverse().map(([key, child]) => [key, reverseJsonObjectKeys(child)]));
 }
 
+// Observed with Codex 0.158.0 against an isolated Responses stub: response-only
+// status and output_text annotations are not serialized back into input history.
+function codexRoundtrippedOutput(output: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return output.map(({ status: _status, ...item }) => {
+    if (item.type === "message" && Array.isArray(item.content)) {
+      item.content = item.content.map(({ annotations: _annotations, ...part }) => part);
+    }
+    return item;
+  });
+}
+
+for (const manual of [false, true]) for (const stream of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} ${stream ? "streamed" : "JSON"} accepts Codex-roundtripped tool output without repeating work`, async () => {
+  const f = httpFixture(manual);
+  f.body.stream = stream;
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  f.controls.emitReviewCommentary = true;
+  const readResponse = async (response: Response): Promise<{ output: Array<Record<string, unknown>> }> => {
+    if (!response.headers.get("content-type")?.includes("text/event-stream")) return await response.json();
+    const events = (await response.text()).split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
+    expect(events.some(event => event.type === "response.failed")).toBe(false);
+    const completed = events.find(event => event.type === "response.completed");
+    expect(completed).toBeDefined();
+    return completed.response;
+  };
+  const response = await f.send(f.body);
+  const first = await readResponse(response);
+  const call = first.output.find(item => item.type === "function_call")!;
+  expect(call.status).toBe("completed");
+  const nextBody = { ...f.body, input: [
+    ...f.body.input, ...codexRoundtrippedOutput(first.output),
+    { type: "function_call_output", call_id: call.call_id, output: "Actual accepted result 42." },
+  ] };
+  const next = await f.send(nextBody);
+  expect({ httpStatus: next.status, ...await readResponse(next) }).toMatchObject({ httpStatus: 200, status: "completed" });
+  const replay = await f.send(nextBody);
+  expect({ httpStatus: replay.status, ...await readResponse(replay) }).toMatchObject({ httpStatus: 200, status: "completed" });
+  expect(f.controls.toolResults).toHaveLength(1);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.pages.size).toBe(1);
+});
+
+for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} accepts Codex-roundtripped final output on the next user turn`, async () => {
+  const f = httpFixture(manual);
+  f.controls.emitReviewCommentary = true;
+  const first = await (await f.send(f.body)).json() as { output: Array<Record<string, unknown>> };
+  const next = await f.send({
+    ...f.body, input: [...f.body.input, ...codexRoundtrippedOutput(first.output),
+      { type: "message", role: "user", id: "roundtripped-next", content: "Continue authorized work.",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-roundtripped-next" } },
+    ], client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-roundtripped-next" }) },
+  });
+  expect({ httpStatus: next.status, ...await next.json() }).toMatchObject({ httpStatus: 200, status: "completed" });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.reused).toBe(true);
+  expect(f.submissions[1]!.prompt).not.toContain("Completed response 1.");
+  expect(f.pages.size).toBe(1);
+});
+
+for (const manual of [false, true]) for (const format of ["local", "v1", "v2"] as const) {
+  test(`HTTP ${manual ? "Zero Risk" : "Automatic"} ${format} compaction recognizes Codex-roundtripped owned output`, async () => {
+    const f = httpFixture(manual);
+    f.controls.emitReviewCommentary = true;
+    const first = await (await f.send(f.body)).json() as { output: Array<Record<string, unknown>> };
+    const history = [...f.body.input, ...codexRoundtrippedOutput(first.output)];
+    const body = format === "local" ? {
+      ...f.body, input: [...history, { type: "message", role: "user", content: COMPACT_PROMPT }],
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+        thread_id: f.threadId, turn_id: "turn-first", request_kind: "compaction",
+        compaction: { implementation: "responses", trigger: "manual", phase: "standalone_turn", strategy: "memento" },
+      }) },
+    } : { ...f.body, input: [...history, ...(format === "v2" ? [{ type: "compaction_trigger" }] : [])] };
+    const response = await f.send(body, format === "v1");
+    expect({ httpStatus: response.status, ...await response.json() }).toMatchObject(manual
+      ? { httpStatus: format === "v1" ? 400 : 200, error: { code: "continuity_manual_handoff_required" },
+        ...(format === "v1" ? {} : { status: "failed", retryable: false }) }
+      : { httpStatus: 200 });
+    expect(f.submissions).toHaveLength(manual ? 1 : 2);
+    expect(f.pages.size).toBe(1);
+  });
+}
+
+test("Zero Risk rejected history can be explicitly cancelled before leaving continuity without a restart", async () => {
+  const f = httpFixture(true);
+  f.controls.invokeSourceTools = true;
+  const first = await (await f.send(f.body)).json() as { output: Array<Record<string, unknown>> };
+  const output = codexRoundtrippedOutput(first.output);
+  const call = output.find(item => item.type === "function_call")!;
+  call.arguments = '{"cmd":"unowned"}';
+  const rejected = await f.send({ ...f.body, input: [
+    ...f.body.input, ...output,
+    { type: "function_call_output", call_id: call.call_id, output: "Must not be delivered." },
+  ] });
+  expect(rejected.status).toBe(409);
+  expect((await rejected.json()).error.code).toBe("continuity_source_unproven");
+  expect(f.controls.toolResults).toHaveLength(0);
+  const legacy = f.next(f.request());
+  legacy._conversationPolicy = "recoverable";
+  await expect(f.adapter().preflight!(legacy, { headers: new Headers() }))
+    .rejects.toThrow("Finish or explicitly cancel the current continuity work");
+
+  const cancelled = chatGptTurnSessions.cancelNativeTurn(f.threadId, "turn-first", new Error("Explicit test cancellation"));
+  expect(cancelled.cancelled).toBe(1);
+  await cancelled.settlement;
+  await f.adapter().preflight!(legacy, { headers: new Headers() });
+  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("lost");
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_session_lost" });
+  expect(f.pages.size).toBe(0);
+  expect(f.submissions).toHaveLength(1);
+});
+
+for (const changed of ["call_id", "name", "namespace", "arguments", "text", "phase", "status", "annotations"] as const) {
+  test(`HTTP Codex-roundtripped history still rejects changed owned ${changed}`, async () => {
+    const f = httpFixture();
+    f.controls.invokeSourceTools = true;
+    f.controls.singleSourceTool = true;
+    f.controls.emitReviewCommentary = true;
+    const first = await (await f.send(f.body)).json() as { output: Array<Record<string, unknown>> };
+    const output = codexRoundtrippedOutput(first.output);
+    const call = output.find(item => item.type === "function_call")!;
+    const message = output.find(item => item.type === "message")!;
+    const originalCallId = call.call_id;
+    if (changed === "text" || changed === "annotations") {
+      (message.content as Array<Record<string, unknown>>)[0]![changed] = changed === "text" ? "Unowned text." : [{ type: "unowned_annotation" }];
+    } else if (changed === "phase") message.phase = "final_answer";
+    else call[changed] = changed === "status" ? "in_progress" : "unowned";
+    const response = await f.send({ ...f.body, input: [
+      ...f.body.input, ...output,
+      { type: "function_call_output", call_id: originalCallId, output: "Must not be delivered." },
+    ] });
+    expect({ httpStatus: response.status, ...await response.json() }).toMatchObject({
+      httpStatus: 409, error: { code: "continuity_source_unproven" },
+    });
+    expect(f.controls.toolResults).toHaveLength(0);
+    expect(f.submissions).toHaveLength(1);
+  });
+}
+
 for (const format of ["local", "v1", "v2"] as const) test(`HTTP ${format} compact installs one checkpoint and continues on the same page`, async () => {
   const f = httpFixture();
   const firstResponse = await f.send(f.body);
