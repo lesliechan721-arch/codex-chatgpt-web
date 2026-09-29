@@ -11,7 +11,7 @@ import {
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   requireChatGptWebModelRoute,
-  resolveChatGptWebContextLimits,
+  resolveChatGptWebHistoryLimits,
 } from "../chatgpt-web-models";
 import type { AppConfig } from "../config";
 import {
@@ -622,7 +622,7 @@ export class DevChatDriver {
       extraHighAvailable: this.config.extraHighAvailable === true,
       proAvailable: this.config.proAvailable,
     });
-    const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);
+    const limits = resolveChatGptWebHistoryLimits(route, this.config);
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;
     return {

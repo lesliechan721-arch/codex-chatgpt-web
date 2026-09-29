@@ -17,6 +17,8 @@ import {
 } from "./native-compaction-control";
 import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broker";
 import type { ChatGptBrowserOutcome, ChatGptTurnSession } from "./turn-execution";
+import type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
+import { assertContinuityCompiledInput } from "./continuity-input";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -157,7 +159,7 @@ function abortReason(signal: AbortSignal): Error {
     : new DOMException("ChatGPT compaction handoff aborted", "AbortError");
 }
 
-function withCompactionAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function withCompactionAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortReason(signal));
   return new Promise<T>((resolve, reject) => {
@@ -205,6 +207,12 @@ export async function settleActiveCompactionSource(
       throw abortReason(signal);
     }
     if (!source.isActive() || source.runtime.mode !== "tools") {
+      if (parsed._conversationPolicy === "continuity-first" && !source.isActive()) {
+        const outcome = await source.browserOutcome;
+        if (outcome.type === "error") throw outcome.error;
+        await withCompactionAbort(source.physicalSettlement, signal);
+        return { answer: outcome.answer, compactionInstructionDelivered: false };
+      }
       throw new Error("The active ChatGPT compaction source has no MCP tool boundary");
     }
     const outstanding = source.outstanding();
@@ -256,6 +264,7 @@ export async function settleActiveZeroRiskCompactionSource(
   broker: TurnBrokerOwner,
   signal?: AbortSignal,
   onProgress?: () => void,
+  onAcceptedHandoff?: (summary: string) => void,
 ): Promise<string | undefined> {
   const compactPrompt = compactionPrompt(parsed);
   return source.runExclusive(async () => {
@@ -264,6 +273,12 @@ export async function settleActiveZeroRiskCompactionSource(
       throw abortReason(signal);
     }
     if (!source.isActive() || source.runtime.mode !== "tools" || !source.runtime.manualControl) {
+      if (parsed._conversationPolicy === "continuity-first" && !source.isActive()) {
+        const outcome = await source.browserOutcome;
+        if (outcome.type === "error") throw outcome.error;
+        await withCompactionAbort(source.physicalSettlement, signal);
+        return undefined;
+      }
       throw new Error("The active Zero Risk compaction source has no manual MCP tool boundary");
     }
     const outstanding = source.outstanding();
@@ -296,12 +311,15 @@ export async function settleActiveZeroRiskCompactionSource(
       }
       const browserOutcome = await waitForActiveCompactionBrowserOutcome(source, signal, onProgress);
       if (browserOutcome.type === "error") throw browserOutcome.error;
-      await withCompactionAbort(source.physicalSettlement, signal);
       const instructionDelivered = outstanding.length > 0
         || await broker.compactionDeliveryCount(token) > 0;
-      if (!instructionDelivered) return undefined;
       const summary = browserOutcome.answer.trim();
-      if (!summary) throw new Error("The active Zero Risk response returned an empty compaction summary");
+      if (instructionDelivered) {
+        if (!summary) throw new Error("The active Zero Risk response returned an empty compaction summary");
+        onAcceptedHandoff?.(summary);
+      }
+      await withCompactionAbort(source.physicalSettlement, signal);
+      if (!instructionDelivered) return undefined;
       return summary;
     } catch (error) {
       if (signal?.aborted) source.cancel(abortReason(signal));
@@ -322,6 +340,12 @@ export async function requestRetainedCompactionHandoff(
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   onProgress?: () => void,
+  continuity?: {
+    claim: ContinuityClaim;
+    onLease: (lease: ContinuityLease) => void;
+    onPhysicalSettlement: (settlement: Promise<void>) => void;
+    onAcceptedHandoff: (summary: string) => void;
+  },
 ): Promise<string> {
   const conversationKey = source.conversationKey();
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
@@ -350,11 +374,20 @@ export async function requestRetainedCompactionHandoff(
     }, () => {});
     transaction = await withCompactionAbort(transactionPromise, operationSignal);
     const instruction = structuredCompactionHandoffInstruction(transaction, compactionPrompt(parsed));
+    if (continuity) assertContinuityCompiledInput({ text: instruction, images: [] }, {
+      ...parsed, context: { ...parsed.context, messages: [] },
+    }, capabilities);
     const prepare = async () => ({ text: instruction, images: [], release: () => {} });
     browser = worker.run({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
+      ...(continuity ? {
+        modelFamily: parsed._chatgptModelFamily,
+        continuity: continuity.claim,
+        onContinuityLease: continuity.onLease,
+        retainConversation: true,
+      } : {}),
       // The retained connector exposes only the one-shot control token embedded above. It does
       // not receive an ordinary Codex tool environment for this checkpoint message.
       capabilities: { ...capabilities, localToolsEnabled: false },
@@ -366,6 +399,7 @@ export async function requestRetainedCompactionHandoff(
       abortSignal: browserAbort.signal,
       onTextDelta: () => { onProgress?.(); },
     });
+    continuity?.onPhysicalSettlement(browser.then(() => undefined, () => undefined));
     const browserFailure = browser.then<never>(
       () => new Promise<never>(() => {}),
       error => { throw error; },
@@ -377,6 +411,7 @@ export async function requestRetainedCompactionHandoff(
       ]),
       operationSignal,
     );
+    continuity?.onAcceptedHandoff(summary);
     onProgress?.();
     // The one-shot control submission is the terminal event for this purpose-built response.
     // ChatGPT may render no assistant text after a tool-only response, and therefore no Copy
@@ -414,6 +449,7 @@ interface CachedCompactionRun {
   active: boolean;
   promise: Promise<unknown>;
   settlement: Promise<void>;
+  retainFailedResult?: true;
 }
 
 interface StructuredCompactionInterruption {
@@ -428,6 +464,8 @@ export interface StructuredCompactionOwner {
   /** Exact native Codex owner, when supplied by the current Responses request. */
   nativeThreadId?: string;
   nativeTurnId?: string;
+  /** A strict failure is replay evidence, never permission to generate another summary. */
+  retainFailedResult?: true;
 }
 
 const structuredCompactionRuns = new Map<string, CachedCompactionRun>();
@@ -510,7 +548,7 @@ export function runStructuredCompactionOnce<T = string>(
     if (structuredCompactionOwners.get(owner.ownerKey) === ownerSettlement) {
       structuredCompactionOwners.delete(owner.ownerKey);
     }
-    if (failed && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
+    if (failed && !run.retainFailedResult && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
   });
   const run: CachedCompactionRun = {
     createdAt: Date.now(),
@@ -522,6 +560,7 @@ export function runStructuredCompactionOnce<T = string>(
     active: true,
     promise,
     settlement: ownerSettlement,
+    ...(owner.retainFailedResult ? { retainFailedResult: true } : {}),
   };
   structuredCompactionRuns.set(key, run);
   structuredCompactionOwners.set(owner.ownerKey, ownerSettlement);

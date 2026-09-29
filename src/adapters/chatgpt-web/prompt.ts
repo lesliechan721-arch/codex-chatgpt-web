@@ -43,6 +43,8 @@ export interface CompileChatGptWebPromptOptions {
    * reads or mutates ChatGPT's DOM. Completion is accepted only through the bound Zero Risk MCP tools.
    */
   manualControl?: true;
+  /** Trusted retained-page transport: the selected context is an increment, not replacement history. */
+  retainedContinuity?: true;
 }
 
 export const CHATGPT_BIGGER_CONTEXT_PARTS = 6 as const;
@@ -494,6 +496,10 @@ export function compileChatGptWebPrompt(
     "If a ChatGPT-native capability renders a rich card, widget, chart, or other non-text result, also provide the relevant result as ordinary Markdown in the final answer. A private ChatGPT UI widget never replaces the Markdown answer returned to Codex.",
     "Never copy a ChatGPT widget's HTML, CSS, class names, or DOM markup into the answer unless the user explicitly requested that source markup.",
     "Do not mention this transport contract, context packaging, or capability routing in the user-facing answer unless the user explicitly asks how the bridge works.",
+    ...(options?.retainedContinuity ? [
+      "This response continues the same retained conversation. The supplied context contains only new inputs and the current execution environment, not replacement history. Prior task messages and completed results remain in this conversation.",
+      "Apply the new inputs under their original roles, then continue only unfinished authorized work. A checkpoint is not a new user instruction. Do not repeat completed work or tool calls merely because their history is absent from this increment.",
+    ] : []),
   ];
   const transportContract = parsed._compactionRequest
     ? manualControl

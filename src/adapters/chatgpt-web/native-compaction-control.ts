@@ -70,8 +70,11 @@ export function structuredCompactionHandoffInstruction(
 ): string {
   return [
     "Automatic Codex context compaction has started. Stop ordinary task work and do not call any more work tools.",
+    "This is a new bridge control request. The previous task is now context to summarize; its tool limits and final-answer format do not govern this checkpoint submission.",
+    "The required local action is to store a checkpoint in the Codex harness through the attached codex_tool_call tool. Printing a summary in chat does not store it and cannot complete this request.",
     compactPrompt,
     ...compactionControlBinding(transaction),
+    "Use only the control token above for this request. Omit operation_id: this reserved control call is not an ordinary Native operation. Do not include tokens or handoff IDs in the summary or chat text.",
     "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
     "The outer bridge accepts compaction only after the structured checkpoint is valid and its owned browser turn has physically settled.",
   ].join("\n");

@@ -18,6 +18,13 @@ export const DEV_CHAT_MODELS = [
   "chatgpt-web/high",
   "chatgpt-web/extra-high",
   "chatgpt-web/pro",
+  // Parsing/persistence does not bypass trusted route release and mode admission checks.
+  "chatgpt-web-continuity/gpt-5.6-sol-instant",
+  "chatgpt-web-continuity/gpt-5.6-sol",
+  "chatgpt-web-continuity/gpt-5.6-pro",
+  "chatgpt-web-continuity/gpt-6-pro",
+  "chatgpt-web-continuity/zero-risk",
+  "chatgpt-web-continuity/zero-risk-pro",
 ] as const;
 
 export type DevChatModel = typeof DEV_CHAT_MODELS[number];

@@ -21,6 +21,7 @@ import {
   waitForLauncherManualSent,
   waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
+import { CONTINUITY_FEATURE } from "../src/adapters/chatgpt-web/continuity-contract";
 import type { Browser, BrowserContext, Page } from "playwright-core";
 
 const roots: string[] = [];
@@ -53,12 +54,14 @@ function descriptorFile(
   controlEndpoint = "http://127.0.0.1:39111",
   profile: "production" | "development" = "production",
   endpoint = "http://127.0.0.1:39110",
+  features?: string[],
 ): string {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-descriptor-"));
   roots.push(root);
   const path = join(root, "launcher-browser.json");
   writeFileSync(path, `${JSON.stringify({
     version: 3,
+    ...(features ? { features } : {}),
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
@@ -81,6 +84,57 @@ function descriptorFile(
   })}\n`, { mode: 0o600 });
   return path;
 }
+
+test("automatic initial continuity start reconciles one lost acknowledgement with the exact claim", async () => {
+  let attempts = 0;
+  const owner = "a".repeat(64);
+  const traceId = "automatic_reconcile";
+  const lease = { owner, leaseId: "b".repeat(32), traceId };
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* drain */ }
+    attempts += 1;
+    if (attempts === 1) {
+      response.destroy();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: true,
+      surfaceId: "s".repeat(32),
+      reused: true,
+      connectorBound: false,
+      continuity: lease,
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(
+      `http://127.0.0.1:${address.port}`,
+      "production",
+      "http://127.0.0.1:39110",
+      [CONTINUITY_FEATURE],
+    );
+    await expect(notifyLauncherTurn(path, {
+      phase: "start",
+      traceId,
+      helperPid: process.pid,
+      conversationKey: "c".repeat(64),
+      continuity: { owner },
+    }, 500)).resolves.toMatchObject({
+      surfaceId: "s".repeat(32),
+      reused: true,
+      continuity: lease,
+    });
+    expect(attempts).toBe(2);
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  }
+});
 
 test("launcher descriptor is owner-only, loopback-only, and process-bound", () => {
   const path = descriptorFile();

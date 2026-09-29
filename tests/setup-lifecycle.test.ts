@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as configModule from "../src/config";
@@ -11,6 +11,7 @@ import * as browserHost from "../src/launcher-browser-host";
 import * as browserLogin from "../src/browser-login";
 import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "../src/native-tool-long-wait-probe";
 import { launcherCapabilityProbeRequired, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
+import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 
 const config = {
   mode: "browser-only" as const,
@@ -101,6 +102,13 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       expect(result.connectorSetupRequired).toBe(true);
       expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
       expect(saved?.useSavedChats).toBe(true);
+      const continuityPath = join(root, "runtime", "session-continuity");
+      const continuity = new ContinuityRegistrationStore(continuityPath);
+      const thread = "1".repeat(64);
+      const owner = "2".repeat(64);
+      expect(continuity.get(thread)).toBeUndefined();
+      continuity.claim(thread, "3".repeat(64), owner);
+      continuity.finish(thread, owner, "lost");
 
       if (development && interaction === "automatic") {
         expect(saved?.appName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
@@ -114,6 +122,12 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));
       await expect((development ? setupDevProfile : setup)({ ...options, port })).rejects.toThrow("config commit failed");
+      expect(calls).toEqual([]);
+      expect(continuity.get(thread)?.state).toBe("lost");
+      const registryFile = join(continuityPath, "threads.json");
+      writeFileSync(registryFile, "broken registration");
+      await expect((development ? setupDevProfile : setup)({ ...options, port })).rejects.toThrow("was not reset");
+      expect(readFileSync(registryFile, "utf8")).toBe("broken registration");
       expect(calls).toEqual([]);
     } finally {
       for (const mock of mocks.reverse()) mock.mockRestore();

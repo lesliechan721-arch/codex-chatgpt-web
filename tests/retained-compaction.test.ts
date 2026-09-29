@@ -34,6 +34,7 @@ import {
   ChatGptTurnSessions,
   chatGptCompactionSourceExecutionKey,
   chatGptTurnExecutionKey,
+  chatGptTurnRoundKey,
   chatGptTurnSessions,
 } from "../src/adapters/chatgpt-web/turn-execution";
 import {
@@ -144,6 +145,27 @@ test("one browser conversation spans native turns and rotates only at compaction
     content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\ncheckpoint` }],
   });
   expect(chatGptConversationKey(v1Compact, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+});
+
+test("continuity retains its physical key but partitions execution and round replay by verified revision", () => {
+  const first = request();
+  first._conversationPolicy = "continuity-first";
+  first._continuityHistoryRevision = 0;
+  const next = structuredClone(first);
+  next._continuityHistoryRevision = 1;
+  (next._rawBody as { input: unknown[] }).input.unshift({
+    type: "message", role: "user", content: `${SUMMARY_PREFIX}\naccepted checkpoint`,
+  });
+  expect(chatGptConversationKey(next, "provider")).toBe(chatGptConversationKey(first, "provider"));
+  expect(chatGptTurnExecutionKey(next)).not.toBe(chatGptTurnExecutionKey(first));
+  const sameInput = { ...first, _continuityHistoryRevision: 1 };
+  expect(chatGptTurnRoundKey(sameInput)).not.toBe(chatGptTurnRoundKey(first));
+  expect(chatGptTurnExecutionKey({ ...first, _chatgptModelFamily: "6" }))
+    .not.toBe(chatGptTurnExecutionKey({ ...first, _chatgptModelFamily: "5.6" }));
+  expect(chatGptConversationKey({ ...first, _conversationPolicy: "recoverable" }, "provider"))
+    .not.toBe(chatGptConversationKey(first, "provider"));
+  expect(() => chatGptTurnExecutionKey({ ...first, _continuityHistoryRevision: undefined })).toThrow();
+  expect(() => chatGptTurnRoundKey({ ...first, _continuityHistoryRevision: -1 })).toThrow();
 });
 
 test("compaction capability is one-shot and structurally bound to its handoff id", async () => {

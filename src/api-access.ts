@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { upstreamModelAllowed, type UpstreamProviderRuntime } from "./upstream-provider";
+import { isChatGptWebModelSlug } from "./chatgpt-web-models";
 
 /** HTTP access is orthogonal to browser-only/full and automatic/manual execution. */
 export type ApiAccessPolicy =
@@ -99,9 +100,9 @@ export function requireWebModelInApiKeyMode(
   if (policy.mode !== "api-key") return undefined;
   // Exact account/mode eligibility remains owned by requireChatGptWebModelRoute. This guard
   // closes the native passthrough branch before parsing can start any adapter or continuation.
-  if (typeof model === "string" && model.startsWith("chatgpt-web/")) return undefined;
+  if (typeof model === "string" && isChatGptWebModelSlug(model)) return undefined;
   if (upstream?.available && upstream.config && upstreamModelAllowed(model, upstream.config)) return undefined;
-  return apiAccessError(400, "model_not_supported", "API key mode requires a chatgpt-web/* model or a model allowed by the configured upstream provider");
+  return apiAccessError(400, "model_not_supported", "API key mode requires a chatgpt-web/* or chatgpt-web-continuity/* model, or a model allowed by the configured upstream provider");
 }
 
 /** Client authentication must not reach the browser, connector, traces or any upstream. */

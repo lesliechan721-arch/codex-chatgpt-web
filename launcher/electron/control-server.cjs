@@ -1,6 +1,7 @@
 const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
+const { inspectContinuityConversation, validateContinuityClaim } = require("./continuity-lease.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
@@ -100,6 +101,8 @@ class BrowserControlServer {
       || request.url === "/v1/turn/usage"
       || request.url === "/v1/turn/end";
     const isTurnRelease = request.url === "/v1/turn/release";
+    const isContinuityInspect = request.url === "/v1/turn/continuity";
+    const isContinuityCapacity = request.url === "/v1/turn/continuity-capacity";
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isProxyResolution = request.url === "/v1/network/resolve-proxy";
     const manualAction = new Map([
@@ -110,7 +113,7 @@ class BrowserControlServer {
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
     ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isSessionInspect && !isProxyResolution && !manualAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isContinuityInspect && !isContinuityCapacity && !isSessionInspect && !isProxyResolution && !manualAction)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
@@ -135,6 +138,10 @@ class BrowserControlServer {
       const preferences = this.getPreferences();
       const host = this.getBrowserHost();
       if (!host) throw new Error("browser host is not ready");
+      if (isContinuityCapacity) {
+        writeJson(response, 200, { ok: true, available: host.hasContinuityCapacity() });
+        return;
+      }
       if (isSessionInspect) {
         if (host.browserInteractionMode() === "manual") {
           const error = new Error(
@@ -147,11 +154,16 @@ class BrowserControlServer {
         writeJson(response, 200, result);
         return;
       }
-      if (isTurnRelease) {
+      if (isTurnRelease || isContinuityInspect) {
         if (typeof body?.conversationKey !== "string" || !/^[a-f0-9]{64}$/.test(body.conversationKey)) {
           throw new Error("conversationKey is invalid");
         }
-        const released = releaseRetainedConversation(host, body.conversationKey);
+        if (isContinuityInspect) {
+          const result = inspectContinuityConversation(host, body.conversationKey, body.expected);
+          writeJson(response, 200, { ok: true, ...result });
+          return;
+        }
+        const released = releaseRetainedConversation(host, body.conversationKey, body.expected);
         this.logger.info("browser.retained_conversation_released", { released });
         writeJson(response, 200, { ok: true, released });
         return;
@@ -180,6 +192,10 @@ class BrowserControlServer {
       }
       if (body.connectorIdentity !== undefined && body.conversationKey === undefined) {
         throw new Error("connectorIdentity requires conversationKey");
+      }
+      validateContinuityClaim(body.continuity);
+      if (body.continuity !== undefined && body.conversationKey === undefined) {
+        throw new Error("continuity requires conversationKey");
       }
       if (body.retain !== undefined && typeof body.retain !== "boolean") {
         throw new Error("retain is invalid");
@@ -224,6 +240,8 @@ class BrowserControlServer {
             body.compaction === true,
             preferences.zeroRiskRequireSentConfirmation !== false,
             body.sentConfirmationRequired,
+            ...(body.continuity || body.requireRetainedConversation
+              ? [body.continuity, body.requireRetainedConversation === true] : []),
           );
           this.logger.info("browser.manual_control_started", {
             traceId: body.traceId,
@@ -331,6 +349,7 @@ class BrowserControlServer {
             body.connectorIdentity,
             body.requireRetainedConversation === true,
             acquisition.signal,
+            ...(body.continuity ? [body.continuity] : []),
           );
         } finally {
           response.off("close", onClose);
@@ -367,9 +386,11 @@ class BrowserControlServer {
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
       const manualSentPolicyMismatch = error?.code === "manual_sent_policy_mismatch";
       const manualTimedOut = error?.code === "manual_turn_timed_out";
+      const continuityCode = ["continuity_session_lost", "continuity_source_unproven", "continuity_resource_capacity"].includes(error?.code)
+        ? error.code : undefined;
       writeJson(
         response,
-        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch
+        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
           ? 409
           : manualTimedOut ? 408 : 400,
         {
@@ -380,6 +401,7 @@ class BrowserControlServer {
         ...(manualOwnerLost ? { code: "manual_turn_owner_lost" } : {}),
         ...(manualSentPolicyMismatch ? { code: "manual_sent_policy_mismatch" } : {}),
         ...(manualTimedOut ? { code: "manual_turn_timed_out" } : {}),
+        ...(continuityCode ? { code: continuityCode } : {}),
         },
       );
     }

@@ -392,6 +392,8 @@ test("CLI refresh-models includes the Zero Risk Pro row after the profile is ena
   assert.deepEqual(catalog.models.map((model: { slug: string }) => model.slug), [
     "chatgpt-web/zero-risk",
     "chatgpt-web/zero-risk-pro",
+    "chatgpt-web-continuity/zero-risk",
+    "chatgpt-web-continuity/zero-risk-pro",
   ]);
 }));
 

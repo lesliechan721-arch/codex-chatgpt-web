@@ -116,6 +116,8 @@ external browser.
 
 ### Cross-turn data leakage
 
+The following recovery behavior applies to the published `chatgpt-web/` models.
+
 Browser turns use at most five independent task-bound tabs in one private login partition. Every
 outer Codex task owns an exact launcher surface lease and retains its Temporary Chat only across
 sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
@@ -130,6 +132,22 @@ In delegated mode, retained compaction source proof comes only from the request-
 source message ID, source content, current native thread, model, and reasoning identity. Rollout aliases
 and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof retires the
 retained conversation before a fresh compaction starts from the full request history.
+
+The `chatgpt-web-continuity/` policy never uses that fresh fallback. Its physical
+conversation key is stable, while execution authority is isolated by trusted scope, revision,
+and exact owner/lease/head. A summary or response-cache hit cannot establish a new owner. After
+loss, restart, or mode exit, a durable first-use record prevents the same native thread from
+silently creating another page. That record stores only irreversible indexes and minimal owner
+state, not content or credentials, and is capped at 10,000 threads / 4 MiB without automatic
+expiry or repair. Checkpoint evidence is capped at 256 entries, 2 MiB each and 24 MiB total.
+
+Continuity's 24-hour ready-page retention is not a capability extension. Native operation
+identity, real tool results, queued/delivered boundaries, completion barriers, cancellation,
+helper liveness and remote idle keep their existing contracts. Healthy continuity pages are not
+capacity-eviction candidates. Zero Risk cannot generate a second checkpoint prompt after its
+active control path has ended. The separate
+[release validation matrix](release-validation.md#session-continuity-validation) records validation
+coverage; it is not an additional runtime alias gate.
 
 ## Network exposure
 

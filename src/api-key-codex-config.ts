@@ -2,6 +2,7 @@ import { apiKeyPolicy } from "./api-access";
 import type { AppConfig } from "./config";
 import { installCompatibilityV1Features } from "./codex-integration-document";
 import { codexInterruptHookCommand } from "./codex-interrupt-hook";
+import { isChatGptWebModelSlug } from "./chatgpt-web-models";
 
 /** Render only. Neither the caller's config.toml nor auth.json is ever written here. */
 export function renderApiKeyCodexConfig(options: {
@@ -18,7 +19,7 @@ export function renderApiKeyCodexConfig(options: {
   if (!Number.isSafeInteger(options.port) || options.port < 1 || options.port > 65535) {
     throw new Error("Invalid local API port");
   }
-  if (!options.model.startsWith("chatgpt-web/")) throw new Error("A ChatGPT Web model is required");
+  if (!isChatGptWebModelSlug(options.model)) throw new Error("A ChatGPT Web model is required");
   apiKeyPolicy(options.apiKey);
   const quote = (value: string) => JSON.stringify(value);
   const baseUrl = options.baseUrl?.trim() || `http://127.0.0.1:${options.port}/v1`;

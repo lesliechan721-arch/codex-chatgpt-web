@@ -505,6 +505,49 @@ function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnI
   return recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
 }
 
+/** First entry requires a real current instruction, not a recovered checkpoint or tool continuation. */
+export function hasInitialChatGptTurnInstruction(parsed: CodexParsedRequest): boolean {
+  if (parsed._compactionRequest) return false;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const metadata = clientTurnMetadata(parsed);
+  if (!identity.threadId || !identity.turnId) return false;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = record(input[index]);
+    if (!item) continue;
+    const revision = userRevision(item, identity.turnId, metadata);
+    if (revision) return revision.turnId === undefined || revision.turnId === identity.turnId;
+    // Already-started work is not a fresh ordinary instruction merely because its older user
+    // message is still in the request. Context/environment updates do not cross this boundary.
+    if (item.role === "assistant" || (typeof item.type === "string"
+      && ["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "tool_search_call", "tool_search_output"].includes(item.type))) return false;
+  }
+  return false;
+}
+
+/** Reintroduce only the current operational envelope, never historical task messages. */
+export function continuityCurrentEnvironmentInput(parsed: CodexParsedRequest): unknown[] {
+  return currentChatGptEnvironmentParts(parsed).map(part => ({
+    ...part.item,
+    content: [{ type: "input_text", text: part.text }],
+    internal_chat_message_metadata_passthrough: {
+      ...record(part.item.internal_chat_message_metadata_passthrough),
+      content_item_kinds: ["environments.environment_context"],
+    },
+  }));
+}
+
+/** A retained source copied by the checkpoint codec is not a new instruction to execute. */
+export function isRetainedCompactionSourceInstruction(parsed: CodexParsedRequest, value: unknown): boolean {
+  const identity = extractChatGptTurnIdentity(parsed);
+  const revision = userRevision(value, identity.turnId, clientTurnMetadata(parsed));
+  const accepted = recoverCompactionInstruction(parsed, identity);
+  return Boolean(revision && accepted
+    && (!revision.itemId || !accepted.source.itemId || revision.itemId === accepted.source.itemId)
+    && isAcceptedCompactionContinuation(parsed, identity, revision));
+}
+
 function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record<string, unknown>): ChatGptTurnUserRevision | undefined {
   const item = record(value);
   if (!isNativeInstruction(item, metadata)) return undefined;

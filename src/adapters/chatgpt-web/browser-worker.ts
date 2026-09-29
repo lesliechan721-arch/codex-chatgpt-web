@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
@@ -162,6 +162,7 @@ const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "data-turn-id",
   "data-turn-id-container",
   "data-turn-key",
+  "data-chatgpt-search-message-ids",
   "data-conversation-role",
   "data-user-message-bubble",
   "data-markdown-text-style",
@@ -1267,6 +1268,8 @@ export interface BrowserTurn {
   retainConversation?: boolean;
   requireRetainedConversation?: boolean;
   conversationKey?: string;
+  continuity?: import("./continuity-contract").ContinuityClaim;
+  onContinuityLease?: (lease: import("./continuity-contract").ContinuityLease) => void;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
@@ -1319,6 +1322,7 @@ interface ChatGptAssistantTurnBinding {
   identity: string;
   locator: Locator;
   acceptedTurnIdentities: readonly string[];
+  messageIds?: readonly string[];
 }
 
 interface ChatGptSubmissionDomState {
@@ -1328,7 +1332,42 @@ interface ChatGptSubmissionDomState {
   turnIdentities: string[];
   userIdentities: string[];
   responseIdentities: string[];
+  responseMessageIds?: Record<string, string[]>;
 }
+
+export function chatGptTurnBindingDiagnostic(
+  event: "accepted" | "detached" | "rebound" | "missing",
+  baseline: Pick<ChatGptSubmissionBaseline, "initialTurnIdentities">,
+  binding: ChatGptAssistantTurnBinding | undefined,
+  state: ChatGptSubmissionDomState,
+) {
+  const identity = (value: string) => {
+    const group = /^group:(user|assistant):/.exec(value);
+    return {
+      kind: group ? `group:${group[1]}` : "legacy",
+      fingerprint: createHash("sha256").update(value).digest("hex"),
+      ...(group ? { groupFingerprint: createHash("sha256").update(value.slice(group[0].length)).digest("hex") } : {}),
+    };
+  };
+  const identities = (values: readonly string[]) => ({
+    count: values.length,
+    // Keep recent identities and explicit counts without growing diagnostics with the conversation.
+    entries: values.slice(-64).map(identity),
+  });
+  const accepted = new Set(binding?.acceptedTurnIdentities ?? []);
+  return {
+    event,
+    bound: binding ? identity(binding.identity) : null,
+    initial: identities(baseline.initialTurnIdentities),
+    accepted: identities(binding?.acceptedTurnIdentities ?? []),
+    current: identities(state.turnIdentities),
+    users: identities(state.userIdentities),
+    responses: identities(state.responseIdentities),
+    unexpectedUsers: identities(state.userIdentities.filter(value => !accepted.has(value))),
+  };
+}
+
+type ChatGptBindingObserver = (diagnostic: ReturnType<typeof chatGptTurnBindingDiagnostic>) => void;
 
 interface ChatGptSubmissionDomCache {
   key?: string;
@@ -1876,6 +1915,12 @@ class ChatGptBrowserDiagnostics {
   private readonly directory: string;
   private sequence = 0;
   private initialized = false;
+  private readonly bindingObservations: object[] = [];
+
+  recordBinding(diagnostic: ReturnType<typeof chatGptTurnBindingDiagnostic>): void {
+    if (this.bindingObservations.length === 16) this.bindingObservations.splice(1, 1);
+    this.bindingObservations.push({ at: new Date().toISOString(), ...diagnostic });
+  }
 
   constructor(
     private readonly traceId: string,
@@ -2064,6 +2109,7 @@ class ChatGptBrowserDiagnostics {
         capturedAt,
         traceId: this.traceId,
         checkpoint,
+        ...(this.bindingObservations.length > 0 ? { bindingObservations: this.bindingObservations } : {}),
         ...(error !== undefined ? {
           error: redactChatGptUiDiagnostic(error instanceof Error ? error.message : String(error)),
         } : {}),
@@ -2315,6 +2361,13 @@ export class ChatGptBrowserWorker {
       if (this.activeRuns.get(turn.traceId) === run) this.activeRuns.delete(turn.traceId);
     }).catch(() => {});
     return run;
+  }
+
+  /** Protocol handshake only: no browser page, renderer inspection or prompt submission. */
+  async assertContinuityCompatible(): Promise<void> {
+    if (this.config.browserHost !== "launcher") throw new Error("Continuity requires Launcher");
+    this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
+    await this.launcherHelper.assertContinuityCompatible();
   }
 
   verifyConnector(traceId = `verify_${randomUUID().replaceAll("-", "")}`): Promise<string> {
@@ -2955,6 +3008,7 @@ export class ChatGptBrowserWorker {
       }
       const groups = [...document.querySelectorAll("[data-turn-key]")];
       const groupKeys = identities(groups, "data-turn-key");
+      const responseMessageIds: Record<string, string[]> = {};
       groups.forEach((group, index) => {
         const user = `group:user:${groupKeys[index]}`;
         const assistant = `group:assistant:${groupKeys[index]}`;
@@ -2962,7 +3016,13 @@ export class ChatGptBrowserWorker {
         // contents. Remounting an old answer must never acknowledge a new submission.
         turnIdentities.push(user, assistant);
         if (group.querySelector("[data-user-message-bubble]")) userIdentities.push(user);
-        if (group.querySelector('[data-conversation-role="assistant"]')) responseIdentities.push(assistant);
+        const answers = [...group.querySelectorAll('[data-conversation-role="assistant"]')];
+        if (answers.length) {
+          responseIdentities.push(assistant);
+          responseMessageIds[assistant] = [...new Set(answers.flatMap(answer =>
+            (answer.closest("[data-chatgpt-search-message-ids]")
+              ?.getAttribute("data-chatgpt-search-message-ids") ?? "").split(/\s+/).filter(Boolean)))];
+        }
       });
       return {
         key: observerKey,
@@ -2973,6 +3033,7 @@ export class ChatGptBrowserWorker {
           turnIdentities,
           userIdentities,
           responseIdentities,
+          responseMessageIds,
         },
       };
     }, {
@@ -3045,6 +3106,7 @@ export class ChatGptBrowserWorker {
     graceMs: number = CHATGPT_RESPONSE_DOM_GRACE_MS,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    observeBinding?: ChatGptBindingObserver,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3128,11 +3190,16 @@ export class ChatGptBrowserWorker {
         completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
-      if (identity) return {
-        identity,
-        locator: observationPage.locator(chatGptAssistantTurnSelector(identity)),
-        acceptedTurnIdentities: state.turnIdentities,
-      };
+      if (identity) {
+        const binding = {
+          identity,
+          locator: observationPage.locator(chatGptAssistantTurnSelector(identity)),
+          acceptedTurnIdentities: state.turnIdentities,
+          messageIds: state.responseMessageIds?.[identity] ?? [],
+        };
+        observeBinding?.(chatGptTurnBindingDiagnostic("accepted", observationBaseline, binding, state));
+        return binding;
+      }
       // The power UI can expose Stop for a long reasoning phase before mounting any assistant
       // node. Fresh generation evidence extends only DOM grace, never the caller's deadline.
       if (state.visibleStopButtonCount > 0) {
@@ -3142,6 +3209,7 @@ export class ChatGptBrowserWorker {
       // observation can prove it is still missing; the explicit turn deadline remains above.
       if (Date.now() >= responseDeadline
         && !chatGptExternalProgressSuppressesDomHealth(progress, Date.now())) {
+        observeBinding?.(chatGptTurnBindingDiagnostic("missing", observationBaseline, undefined, state));
         throw new Error("ChatGPT accepted the message but did not expose its assistant turn in the DOM");
       }
       await this.waitForTurnDomOrExternalProgress(
@@ -3158,6 +3226,7 @@ export class ChatGptBrowserWorker {
     baseline: ChatGptSubmissionBaseline,
     binding: ChatGptAssistantTurnBinding,
     signal?: AbortSignal,
+    observeBinding?: ChatGptBindingObserver,
   ): Promise<ChatGptAssistantTurnBinding> {
     const boundCount = await withChatGptBrowserObservationTimeout(
       withBrowserTurnAbort(binding.locator.count(), signal),
@@ -3167,21 +3236,30 @@ export class ChatGptBrowserWorker {
       throw new Error(`ChatGPT exposed ${boundCount} DOM nodes for the bound assistant turn`);
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
+    observeBinding?.(chatGptTurnBindingDiagnostic("detached", baseline, binding, state));
     const acceptedTurns = new Set(binding.acceptedTurnIdentities);
-    if (state.userIdentities.some(identity => !acceptedTurns.has(identity))) {
-      throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
-    }
     const identity = chatGptReboundTurnIdentity(
       baseline.initialTurnIdentities,
       binding.identity,
       state.responseIdentities,
     );
+    // The power renderer can replace fallback-turn-N with the user message ID. Only
+    // an unchanged assistant message ID proves that this is the same response group.
+    const sameMessage = identity?.startsWith("group:assistant:")
+      && binding.messageIds?.some(id => state.responseMessageIds?.[identity]?.includes(id));
+    const reboundUser = sameMessage ? identity?.replace("group:assistant:", "group:user:") : undefined;
+    if (state.userIdentities.some(user => !acceptedTurns.has(user) && user !== reboundUser)) {
+      throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+    }
     if (!identity || identity === binding.identity) return binding;
-    return {
+    const rebound = {
       identity,
       locator: page.locator(chatGptAssistantTurnSelector(identity)),
       acceptedTurnIdentities: state.turnIdentities,
+      messageIds: state.responseMessageIds?.[identity] ?? [],
     };
+    observeBinding?.(chatGptTurnBindingDiagnostic("rebound", baseline, rebound, state));
+    return rebound;
   }
 
   private async attachedPromptText(page: Page, abortSignal?: AbortSignal): Promise<string> {
@@ -3546,7 +3624,13 @@ export class ChatGptBrowserWorker {
     throwIfPromptAttachmentAborted(abortSignal);
     await throwIfChatGptRateLimitDialog(page);
     throwIfPromptAttachmentAborted(abortSignal);
-    const connectorMode = chatGptConnectorAttachmentMode(localTools, reuseConnector);
+    let connectorMode = chatGptConnectorAttachmentMode(localTools, reuseConnector);
+    // A retained page proves conversation ownership, but ChatGPT can clear the
+    // message's connector pill after sending. Re-establish that message selection.
+    if (connectorMode === "retained"
+      && !await this.connectorIsSelected(await this.activeComposer(page, 30_000, abortSignal), abortSignal)) {
+      connectorMode = "mention";
+    }
     let composerMutationStarted = false;
     try {
       if (connectorMode !== "mention") {
@@ -4556,6 +4640,7 @@ export class ChatGptBrowserWorker {
         ? { connectorIdentity: this.config.appName }
         : {}),
       ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
+      ...(turn.continuity ? { continuity: turn.continuity } : {}),
     }, undefined, turn.abortSignal).catch(error => {
       if (error instanceof LauncherBrowserTurnCancelledError) throw chatGptBrowserTabClosedError();
       if (error instanceof LauncherRetainedConversationUnavailableError) {
@@ -4591,6 +4676,10 @@ export class ChatGptBrowserWorker {
     };
     try {
       if (!surfaceId) throw new Error("Launcher did not lease a browser tab for the ChatGPT turn");
+      if (turn.continuity) {
+        if (!lease.continuity) throw new Error("Launcher omitted the required continuity lease");
+        turn.onContinuityLease?.(lease.continuity);
+      }
       if (turn.requireRetainedConversation && !reused) {
         throw chatGptRetainedConversationUnavailableError();
       }
@@ -4661,7 +4750,11 @@ export class ChatGptBrowserWorker {
     const requestedMode = resolveChatGptWebModelMode(turn.modelId, turn.reasoning, browserCapabilities);
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
-    const prepared = await prepare();
+    const sourcePrompt = await prepare();
+    const prepared = turn.nativeConnector ? {
+      ...sourcePrompt,
+      text: `${sourcePrompt.text}\nUse codex_tool_call from the selected app ${JSON.stringify(this.config.appName)}. Do not use another Codex app or connector: it owns a different harness and cannot accept this token.`,
+    } : sourcePrompt;
     const diagnostics = new ChatGptBrowserDiagnostics(
       turn.traceId,
       this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
@@ -5169,6 +5262,7 @@ export class ChatGptBrowserWorker {
             return recovered;
           }
           : undefined,
+        diagnostic => diagnostics.recordBinding(diagnostic),
       );
       await diagnostics.capture(page, "send-accepted");
 
@@ -5252,6 +5346,7 @@ export class ChatGptBrowserWorker {
                 submissionBaseline,
                 responseTurn,
                 turn.abortSignal,
+                diagnostic => diagnostics.recordBinding(diagnostic),
               ),
             );
             if (rebound.identity !== responseTurn.identity) {

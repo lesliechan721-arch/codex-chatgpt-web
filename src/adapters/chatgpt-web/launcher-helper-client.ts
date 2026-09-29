@@ -6,6 +6,8 @@ import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../lau
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
+import { CONTINUITY_FEATURE, isContinuityLease, type ContinuityLease } from "./continuity-contract";
+import { continuityError } from "./continuity-errors";
 import {
   parseChatGptLunaCheckpoint,
   type ChatGptLunaCheckpoint,
@@ -31,6 +33,7 @@ type HelperMessage =
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
+  | { type: "event"; id: string; event: "continuity_lease"; lease: ContinuityLease }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
   | { type: "result"; id: string; text: string }
   | {
@@ -63,6 +66,10 @@ function parseHelperMessage(line: string): HelperMessage {
   }
   if (message.type === "event") {
     const event = message.event;
+    if (event === "continuity_lease") {
+      if (!isContinuityLease(message.lease)) throw new Error("Launcher browser helper returned an invalid continuity lease");
+      return { type: "event", id: message.id, event, lease: message.lease };
+    }
     if (event === "multipart_stage_acknowledged") {
       if (!Number.isSafeInteger(message.stageIndex) || (message.stageIndex as number) <= 0) {
         throw new Error("Launcher browser helper multipart stage index is invalid");
@@ -211,6 +218,7 @@ export class LauncherBrowserHelperClient {
   async run(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     await this.ensureChild();
+    if (turn.continuity) await this.assertContinuityCompatible();
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
       throw new Error(
@@ -296,6 +304,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.retainConversation ? { retainConversation: true } : {}),
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
             ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
+            ...(turn.continuity ? { continuity: turn.continuity } : {}),
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
@@ -322,6 +331,13 @@ export class LauncherBrowserHelperClient {
     if (!child) return;
     await this.sendTo(child, { type: "shutdown" }).catch(() => {});
     await this.terminateChild(child, 2_000);
+  }
+
+  async assertContinuityCompatible(): Promise<void> {
+    await this.ensureChild();
+    if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")) {
+      throw continuityError("continuity_configuration_conflict", "Update the runtime and browser helper before starting this mode.");
+    }
   }
 
   private async ensureChild(): Promise<void> {
@@ -516,6 +532,18 @@ export class LauncherBrowserHelperClient {
             error instanceof Error ? error : new Error(String(error)),
             pending,
           ));
+      }
+      else if (message.event === "continuity_lease") {
+        try {
+          const claim = pending.turn.continuity;
+          if (!claim || message.lease.owner !== claim.owner || message.lease.traceId !== pending.turn.traceId
+            || (claim.expected && message.lease.leaseId !== claim.expected.leaseId)) {
+            throw continuityError("continuity_session_lost");
+          }
+          pending.turn.onContinuityLease?.(message.lease);
+        } catch (error) {
+          this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending);
+        }
       }
       else if (message.event === "prepared_selected") {
         const prepare = message.reused ? pending.turn.prepareResume : pending.turn.prepare;

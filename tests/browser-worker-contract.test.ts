@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptTurnBindingDiagnostic, ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -171,6 +171,47 @@ test("assistant tracking rebinds only one proven replacement after React detache
   )).toThrow("2 new conversation turns");
 });
 
+test("binding diagnostics distinguish role and group changes without persisting raw identities", () => {
+  const identities = ["group:user:private-group", "group:assistant:private-group", "private-legacy"];
+  const diagnostic = chatGptTurnBindingDiagnostic("accepted", { initialTurnIdentities: [] }, {
+    identity: identities[1]!, locator: {} as never, acceptedTurnIdentities: identities,
+  }, {
+    userTurnCount: 1, assistantTurnCount: 1, visibleStopButtonCount: 0,
+    turnIdentities: identities, userIdentities: [identities[0]!], responseIdentities: [identities[1]!],
+  });
+  expect(JSON.stringify(diagnostic)).not.toContain("private");
+  expect(diagnostic.users.entries[0]!.groupFingerprint).toBe(diagnostic.bound!.groupFingerprint);
+  expect(diagnostic.users.entries[0]!.fingerprint).not.toBe(diagnostic.bound!.fingerprint);
+  expect(diagnostic.accepted.entries[2]!.kind).toBe("legacy");
+  expect(diagnostic.unexpectedUsers.count).toBe(0);
+});
+
+test("detached binding records rejected user identities before failing and preserves proven rebinds", async () => {
+  const observations: ReturnType<typeof chatGptTurnBindingDiagnostic>[] = [];
+  const baseline = { initialTurnIdentities: [], domCache: {} };
+  const binding = {
+    identity: "old-answer", locator: { count: async () => 0 }, acceptedTurnIdentities: ["accepted-user", "old-answer"],
+  };
+  const state = {
+    userTurnCount: 1, assistantTurnCount: 1, visibleStopButtonCount: 0,
+    turnIdentities: ["new-user", "new-answer"], userIdentities: ["new-user"], responseIdentities: ["new-answer"],
+  };
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    submissionDomState: async () => state,
+  });
+  const observe = (value: ReturnType<typeof chatGptTurnBindingDiagnostic>) => observations.push(value);
+  await expect(worker.reconcileAssistantTurnBinding({}, baseline, binding, undefined, observe))
+    .rejects.toThrow("another user turn");
+  expect(observations.map(value => value.event)).toEqual(["detached"]);
+  expect(observations[0]!.unexpectedUsers.count).toBe(1);
+  expect(JSON.stringify(observations)).not.toContain("new-user");
+  state.userIdentities = ["accepted-user"];
+  state.turnIdentities = ["accepted-user", "new-answer"];
+  const rebound = await worker.reconcileAssistantTurnBinding({ locator: () => ({}) }, baseline, binding, undefined, observe);
+  expect(rebound.identity).toBe("new-answer");
+  expect(observations.map(value => value.event)).toEqual(["detached", "detached", "rebound"]);
+});
+
 test("power turn identity separates roles and keeps virtualized groups in the submission baseline", async () => {
   const { createWindow } = require("@mixmark-io/domino");
   const window = createWindow('<div data-turn-id-container="legacy"><section data-testid="conversation-turn-0" data-turn="assistant" data-turn-id="legacy"></section></div><div data-turn-key="history"></div><div data-turn-key="previous"><div data-user-message-bubble></div><h4 data-conversation-role="assistant"></h4><div data-turn-id-container="search-only"><section data-testid="conversation-turn-search" data-turn="assistant"><div data-message-author-role="assistant"></div></section></div></div>');
@@ -208,9 +249,11 @@ test("power turn identity separates roles and keeps virtualized groups in the su
   observers.forEach(notify => notify());
   expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
   expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBeUndefined();
-  next.innerHTML += '<h4 data-conversation-role="assistant"></h4>';
+  next.innerHTML += '<div data-chatgpt-search-message-ids="stable-answer stable-answer"><h4 data-conversation-role="assistant"></h4></div>';
   observers.forEach(notify => notify());
   expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBe("group:assistant:next");
+  expect(Array.from((await worker.submissionDomState(page)).responseMessageIds["group:assistant:next"]))
+    .toEqual(["stable-answer"]);
   window.document.body.appendChild(next.cloneNode(true));
   observers.forEach(notify => notify());
   await expect(worker.submissionDomState(page)).rejects.toThrow("duplicate conversation turn identities");
@@ -218,6 +261,34 @@ test("power turn identity separates roles and keeps virtualized groups in the su
   next.setAttribute("data-turn-key", "");
   observers.forEach(notify => notify());
   await expect(worker.submissionDomState(page)).rejects.toThrow("no stable data-turn-key");
+});
+
+test("a changed power group can rebind only with the same assistant message and no unrelated new user", async () => {
+  const baseline = { initialTurnIdentities: [], domCache: {} };
+  const binding = {
+    identity: "group:assistant:fallback-turn-0", locator: { count: async () => 0 },
+    acceptedTurnIdentities: ["group:user:fallback-turn-0", "group:assistant:fallback-turn-0"],
+    messageIds: ["stable-answer"],
+  };
+  for (const scenario of ["same-message", "different-message", "no-message-id", "extra-user"]) {
+    const state = {
+      userTurnCount: 1, assistantTurnCount: 1, visibleStopButtonCount: 0,
+      turnIdentities: ["group:user:resolved", "group:assistant:resolved"],
+      userIdentities: ["group:user:resolved", ...(scenario === "extra-user" ? ["group:user:unrelated"] : [])],
+      responseIdentities: ["group:assistant:resolved"],
+      responseMessageIds: { "group:assistant:resolved": scenario === "no-message-id" ? []
+        : [scenario === "different-message" ? "different-answer" : "stable-answer"] },
+    };
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), { submissionDomState: async () => state });
+    const result = worker.reconcileAssistantTurnBinding({ locator: () => ({}) }, baseline, binding);
+    if (scenario === "same-message") {
+      const rebound = await result;
+      expect(rebound.identity).toBe("group:assistant:resolved");
+      expect(rebound.messageIds).toEqual(["stable-answer"]);
+    } else {
+      await expect(result).rejects.toThrow("another user turn");
+    }
+  }
 });
 
 test("response caching rechecks CSS visibility without requiring a DOM mutation", async () => {
@@ -2342,11 +2413,46 @@ test("retained tool turns insert into the connector-bound composer without selec
   };
   await attachPrompt.call({
     activeComposer: async () => composer,
+    connectorIsSelected: async () => true,
     selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
     insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
   }, dialogPage("").page, "retained context", true, undefined, undefined, false, undefined, true);
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
+});
+
+test("retained tool turns restore a missing message connector before inserting the prompt", async () => {
+  const attach = (ChatGptBrowserWorker.prototype as any).attachPrompt;
+  for (const unavailable of [false, true]) {
+    const calls: string[] = [];
+    const composer = {
+      focus: async () => { calls.push("focus"); },
+      press: async () => {},
+    };
+    const worker = {
+      activeComposer: async () => composer,
+      connectorIsSelected: async () => false,
+      selectConnector: async () => {
+        calls.push("select");
+        if (unavailable) throw new Error("connector unavailable");
+        return composer;
+      },
+      insertPromptText: async (_page: unknown, text: string) => {
+        expect(text.trim()).toBe("checkpoint request");
+        calls.push("insert");
+      },
+      assertPromptAttached: async () => { calls.push("assert"); },
+    };
+    const attached = attach.call(worker, dialogPage("").page, "checkpoint request", true,
+      undefined, undefined, false, undefined, true);
+    if (unavailable) {
+      await expect(attached).rejects.toThrow("connector unavailable");
+      expect(calls).toEqual(["select"]);
+    } else {
+      await attached;
+      expect(calls).toEqual(["select", "focus", "insert", "assert"]);
+    }
+  }
 });
 
 test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
@@ -2538,6 +2644,7 @@ test("Think attachment runs after fresh connector selection and rechecks retaine
     const submitted: boolean[] = [];
     const worker = {
       activeComposer: async () => ui.composer,
+      connectorIsSelected: async () => retained,
       selectConnector: async () => { connectorSelections += 1; ui.state.connectors = ["Codex Native3"]; return ui.composer; },
       insertPromptText: async () => { submitted.push(ui.state.pressed); },
       assertPromptAttached: async () => {}, clearChatGptComposerState: async () => { ui.state.draft = ""; ui.state.connectors = []; },

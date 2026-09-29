@@ -3154,7 +3154,8 @@ test("manual navigation preserves initial setup but retires a completed page's c
 });
 
 test("navigation cannot silently continue a resumed manual turn with only its delta", async () => {
-  for (const state of ["awaiting-user", "sent", "running"]) {
+  for (const [state, inPlace] of ["awaiting-user", "sent", "running"].flatMap(state =>
+    [false, true].map(inPlace => [state, inPlace]))) {
     const { fixture } = manualTurnFixture();
     const key = "a".repeat(64);
     const first = fixture.beginManualTurn("manual_initial", process.pid, "original context", key);
@@ -3177,8 +3178,8 @@ test("navigation cannot silently continue a resumed manual turn with only its de
       assert.equal(tab.conversationKey, key);
     }
     const terminal = fixture.waitManualTerminal("manual_next", process.pid, 1_000);
-    // Even reloading the same URL replaces the document; it is not a history-state update.
-    contents.emit("did-start-navigation", {}, tab.url, false, true);
+    // Both a reload and a different conversation in the same document invalidate resumed context.
+    contents.emit("did-start-navigation", {}, inPlace ? "https://chatgpt.com/c/another" : tab.url, inPlace, true);
     assert.equal(tab.status, "error");
     assert.equal((await terminal).status, "failed");
     assert.match(tab.message, /full context/);
@@ -3191,20 +3192,87 @@ test("navigation cannot silently continue a resumed manual turn with only its de
   }
 });
 
-test("navigation after the first manual submission prevents retaining the changed page", () => {
+test("first manual submission retains same-document conversation creation until MCP starts", () => {
   const { fixture } = manualTurnFixture();
   const first = fixture.beginManualTurn("manual_initial", process.pid, "original context", "a".repeat(64));
   const tab = fixture.turnTabs.get(first.tabId);
   const contents = new EventEmitter();
   contents.setWindowOpenHandler = () => {};
   tab.view = { webContents: contents };
+  tab.url = "https://chatgpt.com/?temporary-chat=true";
   fixture.bindManualTurnContents(tab);
+  contents.emit("did-navigate-in-page", {}, "https://chatgpt.com/c/provisional-chat", true);
   fixture.confirmManualSent(tab.id);
+  contents.emit("did-start-navigation", {}, "https://chatgpt.com/c/created-chat", true, true);
   contents.emit("did-navigate-in-page", {}, "https://chatgpt.com/c/created-chat", true);
   fixture.markManualTurnStarted("manual_initial", process.pid);
   fixture.endManualTurn("manual_initial", process.pid, "completed", true);
-  assert.equal(fixture.turnTabs.has(tab.id), false);
+  assert.equal(fixture.turnTabs.has(tab.id), true);
   assert.equal(fixture.manualCompletionSignals.has("manual_initial"), true);
+  const next = fixture.beginManualTurn("manual_next", process.pid, "full context", "a".repeat(64), "delta");
+  assert.equal(next.reused, true);
+  assert.equal(next.tabId, first.tabId);
+  fixture.cancelManualTurn("manual_next", process.pid);
+});
+
+test("first manual submission still loses retention on reload, unsupported routes, or navigation after MCP starts", () => {
+  for (const [from, to, inPlace, started] of [
+    ["https://chatgpt.com/c/initial", "https://chatgpt.com/c/initial", false, false],
+    ["https://chatgpt.com/", "https://chatgpt.com/c/created", false, false],
+    ["https://chatgpt.com/c/initial", "https://example.com/c/created", true, false],
+    ["https://chatgpt.com/c/initial", "https://chatgpt.com/", true, false],
+    ["https://chatgpt.com/auth", "https://chatgpt.com/c/created", true, false],
+    ["https://chatgpt.com/c/initial", "https://chatgpt.com/c/another", true, true],
+  ]) {
+    const { fixture } = manualTurnFixture();
+    const first = fixture.beginManualTurn("manual_initial", process.pid, "full context", "a".repeat(64));
+    const tab = fixture.turnTabs.get(first.tabId);
+    const contents = new EventEmitter();
+    contents.setWindowOpenHandler = () => {};
+    tab.view = { webContents: contents };
+    tab.url = from;
+    fixture.bindManualTurnContents(tab);
+    fixture.confirmManualSent(tab.id);
+    if (started) fixture.markManualTurnStarted("manual_initial", process.pid);
+    contents.emit("did-start-navigation", {}, to, inPlace, true);
+    assert.equal(tab.conversationKey, undefined, `${from} -> ${to}, started=${started}`);
+    fixture.endManualTurn("manual_initial", process.pid, "completed", true);
+    assert.equal(fixture.turnTabs.has(tab.id), false);
+  }
+});
+
+test("manual navigation diagnostics preserve Sent ordering and redact URLs", () => {
+  for (const sentFirst of [false, true]) {
+    const { fixture } = manualTurnFixture();
+    const records = [];
+    fixture.logger.info = (event, fields) => records.push({ event, ...fields });
+    const lease = fixture.beginManualTurn("manual_diagnostic", process.pid, "private prompt", "a".repeat(64));
+    const tab = fixture.turnTabs.get(lease.tabId);
+    const contents = new EventEmitter();
+    contents.setWindowOpenHandler = () => {};
+    tab.view = { webContents: contents };
+    tab.url = "https://chatgpt.com/?temporary-chat=true";
+    fixture.bindManualTurnContents(tab);
+    if (sentFirst) fixture.confirmManualSent(tab.id);
+    const target = "https://chatgpt.com/c/private-conversation?secret=private-token#private-fragment";
+    contents.emit("did-start-navigation", {}, target, true, true);
+    contents.emit("did-navigate-in-page", {}, target, true);
+    const navigation = records.filter(record => record.navigationEvent);
+    assert.equal(navigation.length, 2);
+    assert.equal(navigation[0].decision, sentFirst ? "initial-conversation" : "initial-setup");
+    assert.equal(navigation[0].manualState, sentFirst ? "sent" : "awaiting-user");
+    assert.equal(navigation[0].sameDocument, true);
+    assert.equal(navigation[0].mainFrame, true);
+    assert.equal(navigation[0].from.category, "temporary-home");
+    assert.equal(navigation[0].to.category, "conversation");
+    assert.equal(navigation[0].to.fingerprint, navigation[1].from.fingerprint);
+    assert.equal(navigation[0].hadConversationKey, true);
+    assert.equal(Boolean(tab.conversationKey), true);
+    if (sentFirst) assert.ok(navigation[0].sinceSentMs >= 0);
+    else assert.equal(navigation[0].sinceSentMs, null);
+    assert.doesNotMatch(JSON.stringify(navigation), /private|https:|temporary-chat/);
+    fixture.cancelManualTurn("manual_diagnostic", process.pid);
+  }
 });
 
 test("manual start rejects a different prompt after Sent instead of replaying a trace", () => {

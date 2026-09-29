@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { AdapterEvent, CodexParsedRequest } from "../../types";
+import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "../../types";
+import { canonicalJson } from "./canonical-json";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
@@ -9,6 +10,9 @@ import {
   extractChatGptTurnUserRevision,
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
+import { continuityError } from "./continuity-errors";
+import { retainContinuityOrdinaryReplayTombstone, type ContinuityBinding } from "./continuity-binding";
+import { CONTINUITY_IDLE_TTL_MS } from "./continuity-contract";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
 
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -162,6 +166,8 @@ interface ChatGptTurnRuntimeBase {
   trace: ChatGptTraceFeed;
   text: ChatGptTextFeed;
   usageInput?: CodexParsedRequest;
+  /** The live binding owns the ready-page clock; replay and queries never renew it. */
+  continuityBinding?: ContinuityBinding;
   conversationKey?: string;
   releaseRetainedConversation?: () => Promise<void>;
   /** Idempotently retire the turn-bound MCP capability after browser and observer settlement. */
@@ -181,9 +187,16 @@ export type ChatGptTurnRuntime =
   | (ChatGptTurnRuntimeBase & { mode: "read-only" });
 
 function executionKey(parsed: CodexParsedRequest, payload: unknown): string {
-  return createHash("sha256").update(JSON.stringify({
+  const continuity = parsed._conversationPolicy === "continuity-first";
+  if (continuity && (!Number.isSafeInteger(parsed._continuityHistoryRevision)
+    || parsed._continuityHistoryRevision! < 0)) throw continuityError("continuity_source_unproven");
+  return createHash("sha256").update(canonicalJson({
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
+    ...(continuity ? {
+      policy: "continuity-first", historyRevision: parsed._continuityHistoryRevision,
+      modelFamily: parsed._chatgptModelFamily,
+    } : {}),
     payload,
   })).digest("hex");
 }
@@ -204,6 +217,52 @@ function canonicalMessageId(parsed: CodexParsedRequest, itemId: string | undefin
   if (!itemId) return undefined;
   const alias = parsed._chatGptMessageIdAliases?.[itemId];
   return typeof alias === "string" && alias.length > 0 ? alias : itemId;
+}
+
+function canonicalInputDigest(input: unknown[]): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+}
+
+function rawRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function activeToolCallMatches(item: Record<string, unknown>, request: BrokerToolRequest): boolean {
+  if (item.call_id !== request.callId) return false;
+  if (item.type === "tool_search_call") {
+    if (request.freeform || request.wireName !== "tool_search") return false;
+    return canonicalJson(item.arguments ?? {}) === canonicalJson(request.arguments ?? {});
+  }
+  const name = typeof item.name === "string" ? item.name : undefined;
+  const namespace = typeof item.namespace === "string" ? item.namespace : undefined;
+  if (!name || namespacedToolName(namespace, name) !== request.wireName) return false;
+  if (request.freeform) {
+    return item.type === "custom_tool_call" && (item.input ?? "") === (request.input ?? "");
+  }
+  if (item.type !== "function_call") return false;
+  let args: unknown = item.arguments ?? {};
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); }
+    catch { return false; }
+  }
+  return canonicalJson(args) === canonicalJson(request.arguments ?? {});
+}
+
+function activeToolResultMatches(item: Record<string, unknown>, request: BrokerToolRequest): boolean {
+  if (item.call_id !== request.callId) return false;
+  if (request.wireName === "tool_search") return item.type === "tool_search_output";
+  return item.type === (request.freeform ? "custom_tool_call_output" : "function_call_output");
+}
+
+function responseOutputDigest(output: unknown[]): string {
+  return canonicalInputDigest(output.map(value => {
+    const item = rawRecord(value);
+    if (!item || !("id" in item)) return value;
+    const { id: _id, ...owned } = item;
+    return owned;
+  }));
 }
 
 export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
@@ -326,6 +385,11 @@ export class ChatGptTurnSession {
   private settledBrowserOutcome?: ChatGptBrowserOutcome;
   private settledPhysical = false;
   private attachedConversationKey: string | undefined;
+  private canonicalInputValue?: unknown[];
+  private readonly canonicalInputDigests = new Set<string>();
+  private readonly canonicalInputGenerationByDigest = new Map<string, number>();
+  private canonicalInputGeneration = 0;
+  private readonly responseOutputByGeneration = new Map<number, { length: number; digest: string }>();
   private tail: Promise<void> = Promise.resolve();
   private capabilityRetirementScheduled = false;
   private readonly rounds = new Map<string, {
@@ -356,6 +420,7 @@ export class ChatGptTurnSession {
       .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
       .then(outcome => {
       this.settledBrowserOutcome = outcome;
+      if (runtime.continuityBinding) this.lastTouchedAt = runtime.continuityBinding.lastUsedAt;
       const error = outcome.type === "error" && outcome.error instanceof ChatGptWebAdapterError
         ? outcome.error : undefined;
       console.info(`[chatgpt-web] browser_settled ${JSON.stringify({
@@ -378,7 +443,7 @@ export class ChatGptTurnSession {
   }
 
   touch(): void {
-    this.lastTouchedAt = Date.now();
+    if (!this.runtime.continuityBinding) this.lastTouchedAt = Date.now();
   }
 
   lastUsedAt(): number {
@@ -391,6 +456,143 @@ export class ChatGptTurnSession {
 
   settledOutcome(): ChatGptBrowserOutcome | undefined {
     return this.settledBrowserOutcome;
+  }
+
+  acceptCanonicalInput(parsed: CodexParsedRequest): void {
+    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+    if (!Array.isArray(input)) throw continuityError("continuity_source_unproven");
+    if (!this.canonicalInputValue) {
+      this.canonicalInputValue = structuredClone(input);
+      const digest = canonicalInputDigest(input);
+      this.canonicalInputDigests.add(digest);
+      this.canonicalInputGeneration += 1;
+      this.canonicalInputGenerationByDigest.set(digest, this.canonicalInputGeneration);
+      return;
+    }
+    const digest = canonicalInputDigest(input);
+    if (this.runtime.continuityBinding?.state === "compacting"
+      && digest !== canonicalInputDigest(this.canonicalInputValue)) {
+      throw continuityError("continuity_source_unproven", "Compaction owns the canonical input boundary.");
+    }
+    if (this.canonicalInputDigests.has(digest)) return;
+    this.assertCanonicalExtension(input);
+    this.canonicalInputValue = structuredClone(input);
+    this.canonicalInputDigests.add(digest);
+    this.canonicalInputGeneration += 1;
+    this.canonicalInputGenerationByDigest.set(digest, this.canonicalInputGeneration);
+  }
+
+  assertCanonicalReplayInput(parsed: CodexParsedRequest): void {
+    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+    if (!Array.isArray(input) || !this.canonicalInputValue) throw continuityError("continuity_source_unproven");
+    if (this.canonicalInputDigests.has(canonicalInputDigest(input))) return;
+    this.assertCanonicalExtension(input);
+  }
+
+  assertCompactionSourceHistory(input: unknown[], expectedGeneration?: number): number {
+    if (!this.canonicalInputValue) throw continuityError("continuity_source_unproven");
+    if (expectedGeneration !== undefined && expectedGeneration !== this.canonicalInputGeneration) {
+      throw continuityError("continuity_source_unproven", "The compaction source history changed after preflight.");
+    }
+    if (canonicalInputDigest(input) !== canonicalInputDigest(this.canonicalInputValue)) {
+      this.assertCanonicalExtension(input);
+    }
+    return this.canonicalInputGeneration;
+  }
+
+  canonicalInputGenerationFor(input: unknown[]): number | undefined {
+    return this.canonicalInputGenerationByDigest.get(canonicalInputDigest(input));
+  }
+
+  recordResponseOutput(output: unknown[], generation = this.canonicalInputGeneration): void {
+    const proof = { length: output.length, digest: responseOutputDigest(output) };
+    const existing = this.responseOutputByGeneration.get(generation);
+    if (existing && (existing.length !== proof.length || existing.digest !== proof.digest)) {
+      throw continuityError("continuity_source_unproven", "A replay changed the owned response output.");
+    }
+    this.responseOutputByGeneration.set(generation, proof);
+  }
+
+  recordedResponseOutputLength(input: unknown[], offset: number, required = true): number | undefined {
+    const proof = this.responseOutputByGeneration.get(this.canonicalInputGeneration);
+    if (!proof) return undefined;
+    const output = input.slice(offset, offset + proof.length);
+    if (output.length !== proof.length || responseOutputDigest(output) !== proof.digest) {
+      if (!required) return undefined;
+      throw continuityError("continuity_source_unproven", "The retained history does not contain the exact owned response output.");
+    }
+    return proof.length;
+  }
+
+  canonicalInput(): unknown[] | undefined {
+    return this.canonicalInputValue ? structuredClone(this.canonicalInputValue) : undefined;
+  }
+
+  private assertCanonicalExtension(input: unknown[]): void {
+    const canonical = this.canonicalInputValue;
+    if (!canonical) {
+      throw continuityError("continuity_source_unproven", "A replay cannot replace the owned canonical input.");
+    }
+    const outstanding = this.outstanding();
+    if (!canonical.every((item, index) => canonicalInputDigest([item]) === canonicalInputDigest([input[index]]))) {
+      throw continuityError("continuity_source_unproven", "The active input is not owned by the current execution.");
+    }
+    const recordedOutputLength = this.recordedResponseOutputLength(input, canonical.length);
+    if (recordedOutputLength !== undefined) {
+      const resultsInput = input.slice(canonical.length + recordedOutputLength);
+      if (!this.isActive()) {
+        if (outstanding.length > 0 || resultsInput.length > 0) {
+          throw continuityError("continuity_source_unproven", "The settled response history contains an unowned execution record.");
+        }
+        return;
+      }
+      if (resultsInput.length !== outstanding.length) {
+        throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
+      }
+      const expected = new Map(outstanding.map(request => [request.callId, request]));
+      const results = new Set<string>();
+      for (const value of resultsInput) {
+        const item = rawRecord(value);
+        const callId = typeof item?.call_id === "string" ? item.call_id : undefined;
+        const request = callId ? expected.get(callId) : undefined;
+        if (!item || !callId || !request || !activeToolResultMatches(item, request) || results.has(callId)) {
+          throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
+        }
+        results.add(callId);
+      }
+      if (results.size !== outstanding.length) {
+        throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
+      }
+      return;
+    }
+    if (!this.isActive() || input.length !== canonical.length + outstanding.length * 2) {
+      throw continuityError("continuity_source_unproven", "A replay cannot replace the owned canonical input.");
+    }
+    const expected = new Map(outstanding.map(request => [request.callId, request]));
+    const calls = new Set<string>();
+    const results = new Set<string>();
+    for (const value of input.slice(canonical.length)) {
+      const item = rawRecord(value);
+      const callId = typeof item?.call_id === "string" ? item.call_id : undefined;
+      const request = callId ? expected.get(callId) : undefined;
+      if (!item || !callId || !request) {
+        throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
+      }
+      if (activeToolCallMatches(item, request)) {
+        if (calls.has(callId)) throw continuityError("continuity_source_unproven");
+        calls.add(callId);
+        continue;
+      }
+      if (activeToolResultMatches(item, request)) {
+        if (results.has(callId)) throw continuityError("continuity_source_unproven");
+        results.add(callId);
+        continue;
+      }
+      throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
+    }
+    if (calls.size !== outstanding.length || results.size !== outstanding.length) {
+      throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
+    }
   }
 
   conversationKey(): string | undefined {
@@ -645,10 +847,101 @@ export class ChatGptTurnSessions {
     return session;
   }
 
+  recordResponseOutput(nativeThreadId: string, nativeTurnId: string, input: unknown[], output: unknown[]): void {
+    const matches = [...this.entries.values()].flatMap(session => {
+      if (session.nativeThreadId !== nativeThreadId || session.nativeTurnId !== nativeTurnId) return [];
+      const generation = session.canonicalInputGenerationFor(input);
+      return generation === undefined ? [] : [{ session, generation }];
+    });
+    if (matches.length !== 1) {
+      throw continuityError("continuity_source_unproven", "The completed response no longer has one exact execution owner.");
+    }
+    matches[0]!.session.recordResponseOutput(output, matches[0]!.generation);
+  }
+
+  /** Drop only a proved pre-mutation first-creation failure. The durable creation claim remains live. */
+  discardRetryableContinuityCreation(
+    key: string,
+    session: ChatGptTurnSession,
+    binding: ContinuityBinding,
+  ): boolean {
+    if (this.entries.get(key) !== session || session.runtime.continuityBinding !== binding
+      || binding.state !== "creating" || binding.initialExecutionKey !== key
+      || binding.executionKey !== key || binding.lease || session.runtime.submission?.phase !== "prepared"
+      || session.settledOutcome()?.type !== "error") return false;
+    this.entries.delete(key);
+    this.forgetConversationHead(session);
+    return true;
+  }
+
   findConversationHead(conversationKey: string): ChatGptTurnSession | undefined {
     const session = this.conversationHeads.get(conversationKey);
     session?.touch();
     return session;
+  }
+
+  /** Continuity cannot adopt an in-flight owner from another route/provider namespace. */
+  assertContinuityThreadAvailable(nativeThreadId: string, executionKey: string): void {
+    this.prune();
+    for (const [key, session] of this.entries) {
+      if (key !== executionKey && session.nativeThreadId === nativeThreadId
+        && (!session.isPhysicallySettled() || session.outstanding().length > 0)) {
+        throw continuityError("continuity_source_unproven", "Finish or explicitly cancel the existing native-thread owner before changing modes.");
+      }
+    }
+    if (!this.entries.has(executionKey)) {
+      if ([...this.entries.values()].filter(session => session.isActive()).length >= MAX_CHATGPT_BROWSER_TABS) {
+        throw continuityError("continuity_resource_capacity", "Finish or close an existing browser turn before starting another.");
+      }
+      while (this.entries.size >= this.maxEntries) {
+        const historical = [...this.entries].filter(([key, session]) => session.runtime.continuityBinding
+          && !session.isActive() && session.isPhysicallySettled() && session.outstanding().length === 0
+          && !this.protectedContinuityBinding(key, session))
+          .sort(([, left], [, right]) => left.lastUsedAt() - right.lastUsedAt());
+        if (historical.length === 0) throw continuityError("continuity_resource_capacity");
+        let reclaimed = false;
+        let blockedByReplayCapacity: ChatGptWebAdapterError | undefined;
+        for (const [historicalKey, historicalSession] of historical) {
+          try {
+            this.retainContinuityReplayIdentity(historicalKey, historicalSession);
+          } catch (error) {
+            if (error instanceof ChatGptWebAdapterError && error.code === "continuity_resource_capacity") {
+              blockedByReplayCapacity ??= error;
+              continue;
+            }
+            throw error;
+          }
+          // This is replay-cache reclamation, not task cancellation. Its former physical page
+          // may already belong to another execution or to a committed checkpoint.
+          this.entries.delete(historicalKey);
+          this.forgetConversationHead(historicalSession);
+          reclaimed = true;
+          break;
+        }
+        if (!reclaimed) throw blockedByReplayCapacity ?? continuityError("continuity_resource_capacity");
+      }
+    }
+  }
+
+  /** Selecting a different route cannot take over work that still has a live writer. */
+  assertContinuityCanLeave(binding: ContinuityBinding): void {
+    if (["running", "compacting"].includes(binding.state)
+      || [...this.entries.values()].some(session => session.runtime.continuityBinding === binding
+        && (session.isActive() || !session.isPhysicallySettled() || session.outstanding().length > 0))) {
+      throw continuityError("continuity_source_unproven", "Finish or explicitly cancel the current continuity work before selecting another route.");
+    }
+  }
+
+  /** Mode exit removes write ownership but preserves accepted ordinary answers and journals. */
+  async detachContinuityBinding(binding: ContinuityBinding): Promise<void> {
+    this.assertContinuityCanLeave(binding);
+    const sessions = [...this.entries.values()].filter(session => session.runtime.continuityBinding === binding);
+    for (const session of sessions) {
+      this.forgetConversationHead(session);
+      const key = session.conversationKey();
+      if (key) session.detachConversation(key);
+    }
+    await Promise.all(sessions.map(session => session.runtime.retireCapability?.()));
   }
 
   /** Wait for a retained conversation epoch that has been detached but not physically released. */
@@ -659,6 +952,27 @@ export class ChatGptTurnSessions {
 
   async retireConversationAndWait(conversationKey: string): Promise<number> {
     return this.closeConversationAndWait(conversationKey);
+  }
+
+  /** Retire only the settled execution after a same-page handoff. Never release its surface. */
+  async retireContinuityExecution(
+    executionKey: string,
+    source: ChatGptTurnSession,
+    conversationKey: string,
+    preserveFinalResponse: boolean,
+  ): Promise<void> {
+    if (this.entries.get(executionKey) !== source || this.conversationHeads.get(conversationKey) !== source
+      || source.conversationKey() !== conversationKey || !source.isPhysicallySettled()
+      || source.settledOutcome()?.type !== "final" || source.outstanding().length > 0) {
+      throw continuityError("continuity_source_unproven");
+    }
+    await source.runtime.retireCapability?.();
+    if (this.entries.get(executionKey) !== source || this.conversationHeads.get(conversationKey) !== source) {
+      throw continuityError("continuity_source_unproven");
+    }
+    this.forgetConversationHead(source);
+    source.detachConversation(conversationKey);
+    if (!preserveFinalResponse) source.supersededError = continuityError("continuity_source_unproven", "This execution ended at a checkpoint; its summary is not an ordinary answer.");
   }
 
   /**
@@ -848,13 +1162,46 @@ export class ChatGptTurnSessions {
   }
 
   private prune(): void {
-    const cutoff = Date.now() - this.ttlMs;
+    const now = Date.now();
     for (const [key, session] of this.entries) {
-      if (session.isActive() || session.lastUsedAt() >= cutoff) continue;
-      session.cancel();
+      const binding = this.protectedContinuityBinding(key, session);
+      if (session.isActive() || (session.runtime.continuityBinding
+        && (!session.isPhysicallySettled() || session.outstanding().length > 0))) continue;
+      if (binding && binding.state !== "ready") continue;
+      const idleSince = binding?.lastUsedAt ?? session.lastUsedAt();
+      const ttl = binding ? CONTINUITY_IDLE_TTL_MS : this.ttlMs;
+      if (binding ? now - idleSince < ttl : now - idleSince <= ttl) continue;
+      if (!session.runtime.continuityBinding || binding) session.cancel();
+      if (!binding) {
+        try {
+          this.retainContinuityReplayIdentity(key, session);
+        } catch (error) {
+          if (error instanceof ChatGptWebAdapterError && error.code === "continuity_resource_capacity") continue;
+          throw error;
+        }
+      }
       this.entries.delete(key);
       this.forgetConversationHead(session);
     }
+  }
+
+  private retainContinuityReplayIdentity(key: string, session: ChatGptTurnSession): void {
+    const binding = session.runtime.continuityBinding;
+    const input = session.runtime.usageInput;
+    if (!binding || input?._compactionRequest === true || binding.state === "lost" || binding.state === "ended") return;
+    retainContinuityOrdinaryReplayTombstone(binding, key, input?._continuityHistoryRevision as number);
+  }
+
+  private protectedContinuityBinding(key: string, session: ChatGptTurnSession): ContinuityBinding | undefined {
+    const binding = session.runtime.continuityBinding;
+    if (!binding || binding.state === "lost" || binding.state === "ended") return undefined;
+    const conversationKey = session.conversationKey();
+    if (conversationKey && this.conversationHeads.get(conversationKey) === session) return binding;
+    if (binding.executionKey === undefined && [...binding.checkpoints.values()].some(checkpoint => (
+      checkpoint.revision === binding.revision && checkpoint.preserveFinalResponse
+      && checkpoint.sourceExecutionKey === key
+    ))) return binding;
+    return undefined;
   }
 
   private forgetConversationHead(session: ChatGptTurnSession): void {

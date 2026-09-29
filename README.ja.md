@@ -184,6 +184,8 @@ bun run app:package
 
 `dev:launcher` は `~/.codex-chatgpt-web-dev` 内の独立したプロファイルとアカウントを使います。`dev:chat` は実際のブラウザーとコンパクション処理を使い、ツールの結果は明示的にシミュレーションします。通常の Codex のルートは変更しません。設定とコマンドは [DEV chat ハーネス](docs/dev-chat.md)を参照してください。
 
+[セッション継続性優先](docs/session-continuity.md)は、コンパクション後も同じ会話を維持し、元のページを失った場合は再構築せず停止します。互換性のある Full Native + Launcher 構成では、オプトインの `chatgpt-web-continuity/` エイリアスを利用できます。Fresh Conversation Per Turn と Bigger Context は引き続き非互換です。Codex の履歴上限を増やしても、ChatGPT の単一入力上限や既存モデルは変わりません。
+
 </details>
 
 ## Star の履歴

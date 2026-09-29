@@ -168,6 +168,15 @@ test("new DEV chats default to the cheapest account-supported browser model", ()
   })).toBe("chatgpt-web/zero-risk");
 });
 
+test("DEV persistence preserves full continuity slugs without changing the default model", () => {
+  const root = scratch("cgw-dev-continuity-model");
+  const store = new DevChatStore(join(root, "chats"));
+  const { state } = store.loadOrCreate("continuity", "chatgpt-web-continuity/gpt-5.6-sol", root);
+  store.save(state);
+  expect(store.load("continuity")?.model).toBe("chatgpt-web-continuity/gpt-5.6-sol");
+  expect(defaultDevChatModel(defaultConfig("full"))).not.toContain("continuity");
+});
+
 test("Zero Risk DEV chats open only the generic route", () => {
   const root = scratch("cgw-dev-safe-model");
   const config = {

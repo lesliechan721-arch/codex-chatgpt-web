@@ -4,8 +4,8 @@ import {
   availableChatGptWebModelRoutes,
   chatGptWebRouteEfforts,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
-  CHATGPT_WEB_MODEL_PREFIX,
-  resolveChatGptWebContextLimits,
+  isChatGptWebModelSlug,
+  resolveChatGptWebHistoryLimits,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
 
@@ -47,6 +47,13 @@ function routedModelPriority(
   config: AppConfig,
 ): number | undefined {
   const priority = modelPriority(template);
+  if (priority !== undefined && route.conversationPolicy === "continuity-first") {
+    if (priority > Number.MAX_SAFE_INTEGER - 2) {
+      throw new Error("Native Codex model template priority cannot reserve the existing Web model order");
+    }
+    // New opt-in identities follow both ordinary reasoning routes and the V1 instant entry.
+    return priority + 2;
+  }
   if (priority === undefined
     || config.subagentProtocol !== "compatibility-v1"
     || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant"].includes(route.slug)) return priority;
@@ -61,7 +68,7 @@ function nativeTemplateCandidate(value: unknown, requireTools: boolean): value i
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const model = value as JsonObject;
   const modelSlug = slug(model);
-  if (!modelSlug || modelSlug.startsWith(CHATGPT_WEB_MODEL_PREFIX)) return false;
+  if (!modelSlug || isChatGptWebModelSlug(modelSlug)) return false;
   // This route forwards ChatGPT authentication. Codex's own model manager keeps every list-visible
   // model in ChatGPT mode even when `supported_in_api` is false; that flag gates API-key mode, not
   // whether the backend row is a valid catalog template. The routed Web row overrides the flag to
@@ -101,15 +108,15 @@ export function buildChatGptWebModel(
 ): JsonObject {
   const template = object(templateValue, "native Codex model template");
   const templateSlug = slug(template);
-  if (!templateSlug || templateSlug.startsWith(CHATGPT_WEB_MODEL_PREFIX)) {
+  if (!templateSlug || isChatGptWebModelSlug(templateSlug)) {
     throw new Error("ChatGPT Web model template must be a native Codex model");
   }
-  const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
+  const limits = resolveChatGptWebHistoryLimits(route, config);
   const efforts = chatGptWebRouteEfforts(route, config);
   for (const effort of efforts) {
     const adapterEffort = route.supportedCodexEfforts ? effort : route.adapterEffort;
     if (adapterEffort === "ultra") throw new Error("Ultra is not a browser effort");
-    const candidate = resolveChatGptWebContextLimits(route.backendModel, adapterEffort, config);
+    const candidate = resolveChatGptWebHistoryLimits({ ...route, adapterEffort }, config);
     if (JSON.stringify(candidate) !== JSON.stringify(limits)) {
       throw new Error(`Cannot group different context budgets under ${route.slug}`);
     }
@@ -172,7 +179,10 @@ export function augmentNativeModelCatalog(
     throw new Error("Native Codex models response is missing a models array");
   }
   const nativeModels = structuredClone(
-    catalog.models.filter(model => !slug(model)?.startsWith(CHATGPT_WEB_MODEL_PREFIX)),
+    catalog.models.filter(model => {
+      const modelSlug = slug(model);
+      return !modelSlug || !isChatGptWebModelSlug(modelSlug);
+    }),
   );
   if (config.subagentProtocol === "compatibility-v1") {
     for (const candidate of nativeModels) {

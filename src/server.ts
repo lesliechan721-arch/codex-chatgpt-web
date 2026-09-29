@@ -18,6 +18,7 @@ import {
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
+import { cancelAbandonedContinuityCreation, leaveContinuityMode } from "./adapters/chatgpt-web/continuity-lifecycle";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
@@ -448,6 +449,7 @@ export interface ResponseRequestOptions {
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
   const route = requireChatGptWebModelRoute(parsed.modelId, config, parsed.options.reasoning);
+  parsed._conversationPolicy = route.conversationPolicy ?? "recoverable";
   if (route.interactionMode === "automatic" && route.modelFamily) parsed._chatgptModelFamily = route.modelFamily;
   else delete parsed._chatgptModelFamily;
   parsed.modelId = route.backendModel;
@@ -986,6 +988,8 @@ export async function responseRequest(
       ? new Request(nativeRequest, { signal: AbortSignal.any([req.signal, turnIdleSignal]) })
       : nativeRequest;
     try {
+      req.signal.throwIfAborted();
+      await leaveContinuityMode(providerConfig(config).chatgptWeb?.continuityStateDirectory, boundTurnIdentity?.threadId);
       let upstream: Response;
       if (accessPolicy.mode === "api-key") {
         upstream = await forwardUpstreamProviderRequest(
@@ -1068,8 +1072,18 @@ export async function responseRequest(
   const compactionItem = compaction
     && parsed._compactionOutput !== "message"
     && parsed._compactionResponseFormat !== "message";
+  let traceId: string | undefined;
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
+      if (parsed._conversationPolicy === "continuity-first" && traceId
+        && response.status === "completed" && Array.isArray(response.output)) {
+        const identity = extractChatGptTurnIdentity(parsed);
+        const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+        if (!identity.threadId || !identity.turnId || !Array.isArray(input)) {
+          throw new Error("The completed ChatGPT response lost its native continuity identity");
+        }
+        chatGptTurnSessions.recordResponseOutput(identity.threadId, identity.turnId, input, response.output);
+      }
       if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
       return;
     }
@@ -1118,9 +1132,10 @@ export async function responseRequest(
   }
 
   const provider = providerConfig(config);
-  let traceId: string | undefined;
   try {
-    traceId = chatGptWebTraceId(provider, parsed);
+    // Continuity resolves its history revision during preflight. An unverified caller value
+    // must never participate in trace, cancellation, or replay identity.
+    if (parsed._conversationPolicy !== "continuity-first") traceId = chatGptWebTraceId(provider, parsed);
   } catch (error) {
     // A cancelled browser session can only exist after the adapter accepted canonical native
     // turn identity and user-revision metadata. Requests without that identity have no matching
@@ -1198,6 +1213,7 @@ export async function responseRequest(
   if (adapter.preflight) {
     try {
       await adapter.preflight(parsed, incoming);
+      if (parsed._conversationPolicy === "continuity-first") traceId = chatGptWebTraceId(provider, parsed);
     } catch (error) {
       const event = adapterErrorEvent(error);
       options.onAdapterEvent?.(event, { compaction });
@@ -1212,6 +1228,15 @@ export async function responseRequest(
     }
   }
   try {
+    if (parsed._conversationPolicy !== "continuity-first") {
+      incoming.abortSignal.throwIfAborted();
+      await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, webTurnIdentity?.threadId);
+    } else if (traceId) {
+      const interrupted = chatGptTurnSessions.cancelledError(traceId);
+      if (interrupted) return Response.json({ error: {
+        type: "client_closed_request", code: "client_cancelled", message: interrupted.message,
+      } }, { status: 400 });
+    }
     if (webTurnIdentity && options.onTurnAdmission) {
       bindTurnIdentity(webTurnIdentity, true);
       if (turnIdleSignal) forwardAbort(turnIdleSignal);
@@ -1352,6 +1377,9 @@ export async function compactRequest(
       ? new Request(nativeRequest, { signal: AbortSignal.any([req.signal, turnIdleSignal]) })
       : nativeRequest;
     try {
+      req.signal.throwIfAborted();
+      await leaveContinuityMode(providerConfig(config).chatgptWeb?.continuityStateDirectory,
+        extractCodexTurnIdentityFromBody(raw).threadId);
       let upstream: Response;
       if (accessPolicy.mode === "api-key") {
         upstream = await forwardUpstreamProviderRequest(
@@ -1503,6 +1531,11 @@ export function startServer(
       identity.threadId,
       identity.turnId,
       reason,
+    );
+    cancelAbandonedContinuityCreation(
+      providerConfig(config).chatgptWeb?.continuityStateDirectory,
+      identity.threadId,
+      identity.turnId,
     );
     const compactionCancellation = cancelStructuredCompactionNativeTurn(
       identity.threadId,

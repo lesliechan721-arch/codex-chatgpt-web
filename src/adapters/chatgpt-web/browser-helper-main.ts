@@ -7,6 +7,7 @@ import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adap
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
+import { CONTINUITY_FEATURE, isContinuityClaim, type ContinuityClaim } from "./continuity-contract";
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
@@ -33,6 +34,7 @@ interface RunMessage {
     retainConversation?: boolean;
     requireRetainedConversation?: boolean;
     conversationKey?: string;
+    continuity?: ContinuityClaim;
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
@@ -177,6 +179,9 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.conversationKey !== undefined && !/^[a-f0-9]{64}$/.test(message.turn.conversationKey)) {
     throw new Error("Browser helper conversation key is invalid");
   }
+  if (message.turn.continuity !== undefined && !isContinuityClaim(message.turn.continuity)) {
+    throw new Error("Browser helper continuity claim is invalid");
+  }
   if (message.turn.compaction !== undefined && typeof message.turn.compaction !== "boolean") {
     throw new Error("Browser helper compaction flag is invalid");
   }
@@ -228,6 +233,14 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),
     ...(message.turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
+    ...(message.turn.continuity ? {
+      continuity: message.turn.continuity,
+      onContinuityLease: lease => {
+        if (!writeProtocol({ type: "event", id: message.id, event: "continuity_lease", lease })) {
+          throw new Error("Browser helper could not return the continuity lease");
+        }
+      },
+    } : {}),
     abortSignal: abortController.signal,
     ...(message.turn.compaction ? { compaction: true } : {}),
     ...(progress ? {
@@ -535,4 +548,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "multipart-stage-ack", "skill-attachments"] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE] });

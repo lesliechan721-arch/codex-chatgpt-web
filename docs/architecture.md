@@ -91,6 +91,9 @@ and development connectors installed without renaming, refreshing, or deleting e
 
 ## Browser lifecycle
 
+The following describes the recoverable `chatgpt-web/` policy. The continuity policy is described
+separately below.
+
 The desktop launcher owns one persistent Electron partition and up to five task-bound browser
 tabs. Each task/model/effort/compaction epoch owns one exact `WebContentsView` lease; sequential
 native messages reuse that surface, while each message receives a fresh turn-bound MCP token and
@@ -189,6 +192,34 @@ by Codex. A prompt-level checkpoint marker is translated into a visible Codex tr
 every later tool action in the same turn continues to present the current turn capability. Visible
 ChatGPT status rows become reasoning summaries, while stable prose between rows becomes native
 Codex commentary.
+
+### Continuity policy
+
+`chatgpt-web-continuity/` is a separate, opt-in namespace. Only trusted routing selects the policy.
+Full Native tools, Launcher, supported
+account/model/effort controls, and compatible helper features are required. Fresh Conversation
+Per Turn and Bigger Context are rejected. No additional internal release-verification flag is
+required to expose these models.
+
+The physical conversation key does not change at compaction. Execution keys and response rounds
+include a trusted scope and a separate history revision. Before first-page creation, the actual
+ordinary input passes environment, identity, version, input, and capacity checks, then a durable
+content-free registry records the thread's one creation right. A missing live owner, changed
+scope, or damaged registration is not an empty thread and cannot trigger a fresh-page fallback.
+
+The compaction driver accepts the exact source's handoff, waits for physical settlement, retires
+old execution authority, and commits one checkpoint/revision while retaining the page. Accepted
+but uncommitted evidence remains bounded evidence, not continuation authority. Completed ordinary
+answers remain separate from control summaries. Zero Risk uses only an active response's real
+MCP control delivery; a response that already ended requires manual handoff without a new prompt.
+
+The 1,000,000/900,000-token catalog values govern canonical Codex history. Actual browser prompts
+still use the original transport checks. Healthy ready pages and their current logical heads
+use a 24-hour successful-work clock; queries and replay do not renew it. Five protected pages
+block a sixth allocation. Durable registration, checkpoint evidence, response caches, tool
+capabilities, and physical pages have separate limits and lifetimes; retained pages do not extend
+tool authority or authorize recovery across a restart. See [the policy guide](session-continuity.md)
+for limits, failure handling, and release status.
 
 ## Local ChatGPT Limits
 

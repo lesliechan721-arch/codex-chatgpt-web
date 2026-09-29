@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,7 +7,8 @@ import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
+import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions, type ChatGptTurnRuntime } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
@@ -2969,6 +2970,77 @@ test("lifecycle drain and cancellation include browser turns owned by the extern
     await server.stop(true);
     await closeTurnBrokers();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("health and drain/resume stay available when continuity replay tombstones are full", async () => {
+  let now = 1_000;
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const cancelled: string[] = [];
+  const binding: ContinuityBinding = {
+    thread: "thread",
+    scope: "scope",
+    owner: "owner",
+    initialExecutionKey: "old",
+    state: "ready",
+    revision: 0,
+    lastUsedAt: now,
+    executionKey: "current",
+    revisionDigests: new Map(),
+    revisions: new Map(),
+    checkpoints: new Map(),
+    ordinaryReplayTombstones: new Map(),
+  };
+  const runtime = (key: string): ChatGptTurnRuntime => ({
+    mode: "read-only",
+    browser: Promise.resolve(`answer-${key}`),
+    physicalSettlement: Promise.resolve(),
+    text: new ChatGptTextFeed(),
+    trace: new ChatGptTraceFeed(),
+    conversationKey: "continuity-page",
+    continuityBinding: binding,
+    usageInput: { _continuityHistoryRevision: 0 } as ChatGptTurnRuntime["usageInput"],
+    cancel: () => { cancelled.push(key); },
+  });
+
+  chatGptTurnSessions.clear();
+  let server: ReturnType<typeof startServer> | undefined;
+  try {
+    const old = chatGptTurnSessions.getOrCreate("old", () => runtime("old"));
+    await old.browserOutcome;
+    await old.physicalSettlement;
+    const head = chatGptTurnSessions.getOrCreate("current", () => runtime("current"));
+    await head.browserOutcome;
+    await head.physicalSettlement;
+    for (let index = 0; index < 256; index += 1) {
+      binding.ordinaryReplayTombstones.set(`retained-${index}`, 0);
+    }
+
+    now += 31 * 60_000;
+    server = startServer(config);
+    const endpoint = `http://127.0.0.1:${server.port}`;
+    const authorization = { authorization: `Bearer ${config.controlToken}` };
+
+    const health = await fetch(`${endpoint}/healthz`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ status: "ok", active_browser_turns: 0 });
+
+    const drain = await fetch(`${endpoint}/admin/drain`, { method: "POST", headers: authorization });
+    expect(drain.status).toBe(200);
+    expect(await drain.json()).toMatchObject({ status: "ok", accepting_turns: false, active_browser_turns: 0 });
+
+    const resume = await fetch(`${endpoint}/admin/resume`, { method: "POST", headers: authorization });
+    expect(resume.status).toBe(200);
+    expect(await resume.json()).toMatchObject({ status: "ok", accepting_turns: true, active_browser_turns: 0 });
+
+    expect(chatGptTurnSessions.find("old")).toBe(old);
+    expect(chatGptTurnSessions.findConversationHead("continuity-page")).toBe(head);
+    expect(cancelled).toEqual([]);
+  } finally {
+    await server?.stop(true);
+    chatGptTurnSessions.clear();
+    clock.mockRestore();
   }
 });
 

@@ -33,6 +33,38 @@ Record the release version, operating-system version, install path (`clean` or `
 plan, Codex version, result of each check, and a redacted Activity log for every failure. Never
 capture cookies, tunnel IDs, API keys, bearer tokens, or prompt contents.
 
+## Session continuity validation
+
+`chatgpt-web-continuity/` has additional validation because it deliberately keeps one exact
+ChatGPT conversation across ordinary turns and compaction. These checks record release coverage;
+they are not an additional runtime feature flag or alias gate.
+
+For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, record:
+
+1. First-use creation, a normal continuation, and a compaction continuation all keep the exact
+   expected native thread, history revision, Launcher surface, and continuity lease. A lost page,
+   changed scope, restart, or explicit mode exit must stop instead of creating a replacement page.
+2. Automatic completed-response and active-response compaction each commit one structured
+   checkpoint and continue on the same page with new tool authority. Zero Risk active compaction
+   uses the delivered control path; a response that ended before control delivery preserves its
+   ordinary result and requires manual handoff without a second automatic prompt.
+3. The published 1,000,000-token history window and 900,000-token automatic-compaction target do
+   not increase the existing single-browser-input limits. Test a large canonical history with a
+   short valid increment and a first input that exceeds the original browser boundary.
+4. Five healthy continuity pages remain protected from capacity eviction. Measure representative
+   real-page memory plus checkpoint/replay storage under sustained use, and verify that additional
+   work fails before creating a page when no safe capacity remains.
+5. A ready page expires only after 24 hours without successful continuity work. Health checks,
+   replay, inspection, and heartbeats must not renew that clock. Exercise the real 24-hour boundary
+   rather than replacing it only with a mocked clock.
+6. Remote/delegated operation keeps the existing native operation identity, queued/delivered tool
+   boundaries, cancellation, helper liveness, and remote-idle behavior. A retained page never
+   extends a tool capability or authorizes a replay after its exact owner is lost.
+
+Keep the component and synthetic evidence with the implementation record, but distinguish it from
+real authenticated ChatGPT results. Any unexecuted platform, 24-hour, resource-load, or remote-idle
+combination must remain visible in the release record instead of being described as validated.
+
 ## Windows 11 gate
 
 Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account:

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { CHATGPT_WEB_MODEL_ROUTES, availableChatGptWebModelRoutes, chatGptWebRouteEfforts } from "../src/chatgpt-web-models";
+import { CHATGPT_WEB_MODEL_ROUTES, availableChatGptWebModelRoutes, chatGptWebRouteEfforts, isChatGptWebModelSlug } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
 import { normalizeUpstreamModelCatalog } from "../src/upstream-model-catalog";
@@ -109,7 +109,7 @@ try {
       priority?: number;
     }>;
   };
-  const web = catalog.models?.filter(model => model.slug?.startsWith("chatgpt-web/")) ?? [];
+  const web = catalog.models?.filter(model => model.slug && isChatGptWebModelSlug(model.slug)) ?? [];
   const expected = availableChatGptWebModelRoutes(config, true).map(route => ({
     slug: route.slug, visibility: route.legacy ? "hide" : "list", effort: chatGptWebRouteEfforts(route, config).join(","),
   }));
@@ -142,7 +142,7 @@ try {
     .map(model => model.slug);
   const nativeSpawnLeader = (augmented.models as Array<Record<string, unknown>>)
     .filter(model => typeof model.slug === "string"
-      && !model.slug.startsWith("chatgpt-web/")
+      && !isChatGptWebModelSlug(model.slug)
       && model.supported_in_api === true
       && model.visibility === "list")
     .toSorted((left, right) => (typeof left.priority === "number" ? left.priority : Number.MAX_SAFE_INTEGER)

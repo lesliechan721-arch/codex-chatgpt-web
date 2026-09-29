@@ -62,7 +62,8 @@ function clone(value) {
 
 function normalizeModelId(value) {
   if (typeof value !== "string" || !value || value.length > 256 || value.trim() !== value
-    || /[\u0000-\u001f\u007f]/.test(value) || value.startsWith("chatgpt-web/")) {
+    || /[\u0000-\u001f\u007f]/.test(value)
+    || value.startsWith("chatgpt-web/") || value.startsWith("chatgpt-web-continuity/")) {
     throw new Error("Invalid upstream model ID");
   }
   return value;

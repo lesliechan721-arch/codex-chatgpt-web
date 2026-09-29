@@ -3,6 +3,10 @@ import { resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { expandUserPath } from "./config";
 import { processRunning } from "./process";
+import {
+  CONTINUITY_FEATURE, isContinuityLease, type ContinuityClaim, type ContinuityLease,
+} from "./adapters/chatgpt-web/continuity-contract";
+import { continuityError } from "./adapters/chatgpt-web/continuity-errors";
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
 export const LAUNCHER_BROWSER_IDLE_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Cmeta%20charset%3D%22utf-8%22%3E%3Ctitle%3ECodex%20Web%20GPT%3C%2Ftitle%3E%3C%2Fhead%3E%3Cbody%3E%3C%2Fbody%3E%3C%2Fhtml%3E#codex-web-gpt-browser-host";
@@ -38,6 +42,7 @@ export class LauncherManualTurnFailedError extends Error {
 
 export interface LauncherBrowserHostDescriptor {
   version: 3;
+  features?: string[];
   kind: typeof LAUNCHER_BROWSER_HOST_KIND;
   profile: LauncherBrowserHostProfile;
   pid: number;
@@ -133,8 +138,13 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (typeof descriptor.createdAt !== "string" || Number.isNaN(Date.parse(descriptor.createdAt))) {
     throw new Error("Launcher browser descriptor has an invalid creation time");
   }
+  if (descriptor.features !== undefined && (!Array.isArray(descriptor.features)
+    || descriptor.features.some(feature => typeof feature !== "string"))) {
+    throw new Error("Launcher browser descriptor has invalid features");
+  }
   return {
     version: 3,
+    ...(descriptor.features ? { features: descriptor.features } : {}),
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile: descriptor.profile,
     pid: descriptor.pid!,
@@ -376,6 +386,7 @@ export type LauncherTurnActivity =
       conversationKey?: string;
       connectorIdentity?: string;
       requireRetainedConversation?: boolean;
+      continuity?: ContinuityClaim;
     }
   | {
       phase: "heartbeat";
@@ -412,12 +423,15 @@ export interface LauncherManualTurnStart extends LauncherManualTurnOwner {
   /** Used only when the exact retained ChatGPT conversation already owns the accumulated history. */
   resumePrompt?: string;
   conversationKey?: string;
+  requireRetainedConversation?: boolean;
+  continuity?: ContinuityClaim;
   /** Gives a manual context handoff enough time without widening ordinary Zero Risk turns. */
   compaction?: true;
 }
 
 export interface LauncherManualTurnLease {
   tabId: string;
+  continuity?: ContinuityLease;
   reused: boolean;
   deadlineAt: string | null;
   state: "awaiting-user" | "sent" | "running" | "completed";
@@ -516,6 +530,8 @@ function throwManualControlError(response: Response, body: Record<string, unknow
   const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
   if (body.code === "turn_cancelled") throw new LauncherBrowserTurnCancelledError(message);
   if (body.code === "manual_turn_timed_out") throw new LauncherManualTurnTimedOutError(message);
+  if (body.code === "continuity_session_lost" || body.code === "continuity_source_unproven"
+    || body.code === "continuity_resource_capacity") throw continuityError(body.code);
   throw new LauncherManualTurnFailedError(message);
 }
 
@@ -525,12 +541,13 @@ export async function startLauncherManualTurn(
   timeoutMs = LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS,
 ): Promise<LauncherManualTurnLease> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  if (activity.continuity) assertLauncherContinuityFeature(descriptor);
   const { response, body } = await reconcileLauncherManualMutation(
     descriptor,
     "start",
     activity,
     timeoutMs,
-    isLauncherManualTurnLease,
+    body => isLauncherManualTurnLease(body) && (!activity.continuity || validContinuityAcknowledgement(body.continuity, activity.continuity, activity.traceId)),
     "Launcher returned an invalid manual turn lease",
     async () => {
       try {
@@ -557,6 +574,7 @@ export async function startLauncherManualTurn(
   }
   return {
     tabId: body.tabId as string,
+    ...(activity.continuity ? { continuity: body.continuity as ContinuityLease } : {}),
     reused: body.reused as boolean,
     deadlineAt: body.deadlineAt as string | null,
     state: body.state as LauncherManualTurnLease["state"],
@@ -675,75 +693,94 @@ export async function notifyLauncherTurn(
   connectorBound?: boolean;
   cancelledByUser?: boolean;
   trackUsage?: boolean;
+  continuity?: ContinuityLease;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${descriptor.control.endpoint}/v1/turn/${activity.phase}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${descriptor.control.token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(activity),
-      signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
-    });
-    if (!response.ok) {
+  if (activity.phase === "start" && activity.continuity) assertLauncherContinuityFeature(descriptor);
+  const reconcileInitialStart = activity.phase === "start" && Boolean(activity.continuity && !activity.continuity.expected);
+  for (let attempt = 0; attempt < (reconcileInitialStart ? 2 : 1); attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let deterministicResponse = false;
+    try {
+      const response = await fetch(`${descriptor.control.endpoint}/v1/turn/${activity.phase}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${descriptor.control.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(activity),
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
+      });
+      if (!response.ok) {
+        deterministicResponse = true;
+        const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+        if (body.code === "continuity_session_lost" || body.code === "continuity_source_unproven"
+          || body.code === "continuity_resource_capacity") throw continuityError(body.code);
+        if (response.status === 409 && body.code === "turn_cancelled") {
+          throw new LauncherBrowserTurnCancelledError(
+            typeof body.error === "string" ? body.error : `Browser turn ${activity.traceId} was cancelled by the user`,
+          );
+        }
+        if (response.status === 409 && body.code === "retained_conversation_unavailable") {
+          throw new LauncherRetainedConversationUnavailableError(
+            typeof body.error === "string" ? body.error : "The retained ChatGPT conversation is no longer available",
+          );
+        }
+        const detail = typeof body.error === "string" ? body.error : "";
+        throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+      }
       const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-      if (response.status === 409 && body.code === "turn_cancelled") {
-        throw new LauncherBrowserTurnCancelledError(
-          typeof body.error === "string" ? body.error : `Browser turn ${activity.traceId} was cancelled by the user`,
-        );
+      if (activity.phase === "start") {
+        if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
+          throw new Error("Launcher browser control channel returned an invalid turn surface id");
+        }
+        if (typeof body.reused !== "boolean") {
+          throw new Error("Launcher browser control channel returned an invalid reuse state");
+        }
+        if (typeof body.connectorBound !== "boolean") {
+          throw new Error("Launcher browser control channel returned an invalid connector state");
+        }
+        if (activity.continuity && !validContinuityAcknowledgement(body.continuity, activity.continuity, activity.traceId)) {
+          throw continuityError("continuity_session_lost");
+        }
+        return {
+          surfaceId: body.surfaceId,
+          reused: body.reused,
+          connectorBound: body.connectorBound,
+          trackUsage: body.trackUsage === true,
+          ...(activity.continuity ? { continuity: body.continuity as ContinuityLease } : {}),
+        };
       }
-      if (response.status === 409 && body.code === "retained_conversation_unavailable") {
-        throw new LauncherRetainedConversationUnavailableError(
-          typeof body.error === "string" ? body.error : "The retained ChatGPT conversation is no longer available",
-        );
+      if (activity.phase === "end") {
+        if (typeof body.cancelledByUser !== "boolean") {
+          throw new Error("Launcher browser control channel returned an invalid turn release result");
+        }
+        return { cancelledByUser: body.cancelledByUser };
       }
-      const detail = typeof body.error === "string" ? body.error : "";
-      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+      return {};
+    } catch (error) {
+      if (signal?.aborted) throw new DOMException("Launcher browser acquisition cancelled", "AbortError");
+      const normalized = controller.signal.aborted
+        ? new Error(`Launcher browser control ${activity.phase} timed out after ${timeoutMs}ms`)
+        : error;
+      if (reconcileInitialStart && attempt === 0 && !deterministicResponse) continue;
+      if (normalized instanceof LauncherBrowserTurnCancelledError
+        || normalized instanceof LauncherRetainedConversationUnavailableError
+        || (normalized instanceof Error && "code" in normalized && String(normalized.code).startsWith("continuity_"))) throw normalized;
+      throw new Error(`Launcher browser control channel failed: ${normalized instanceof Error ? normalized.message : String(normalized)}`);
+    } finally {
+      clearTimeout(timer);
     }
-    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (activity.phase === "start") {
-      if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
-        throw new Error("Launcher browser control channel returned an invalid turn surface id");
-      }
-      if (typeof body.reused !== "boolean") {
-        throw new Error("Launcher browser control channel returned an invalid reuse state");
-      }
-      if (typeof body.connectorBound !== "boolean") {
-        throw new Error("Launcher browser control channel returned an invalid connector state");
-      }
-      return {
-        surfaceId: body.surfaceId,
-        reused: body.reused,
-        connectorBound: body.connectorBound,
-        trackUsage: body.trackUsage === true,
-      };
-    }
-    if (activity.phase === "end") {
-      if (typeof body.cancelledByUser !== "boolean") {
-        throw new Error("Launcher browser control channel returned an invalid turn release result");
-      }
-      return { cancelledByUser: body.cancelledByUser };
-    }
-    return {};
-  } catch (error) {
-    if (signal?.aborted) throw new DOMException("Launcher browser acquisition cancelled", "AbortError");
-    if (controller.signal.aborted) throw new Error(`Launcher browser control ${activity.phase} timed out after ${timeoutMs}ms`);
-    if (error instanceof LauncherBrowserTurnCancelledError
-      || error instanceof LauncherRetainedConversationUnavailableError) throw error;
-    throw new Error(`Launcher browser control channel failed: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    clearTimeout(timer);
   }
+  throw new Error("Launcher browser control start reconciliation failed");
 }
 
 export async function releaseLauncherRetainedConversation(
   descriptorPath: string,
   conversationKey: string,
   timeoutMs = LAUNCHER_TURN_END_TIMEOUT_MS,
+  expected?: ContinuityLease,
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(conversationKey)) {
     throw new Error("Launcher retained conversation key is invalid");
@@ -758,7 +795,7 @@ export async function releaseLauncherRetainedConversation(
         authorization: `Bearer ${descriptor.control.token}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify({ conversationKey }),
+      body: JSON.stringify({ conversationKey, ...(expected ? { expected } : {}) }),
       signal: controller.signal,
     });
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
@@ -771,5 +808,64 @@ export async function releaseLauncherRetainedConversation(
     throw new Error(`Launcher retained conversation release failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+export function assertLauncherContinuityFeature(descriptor: LauncherBrowserHostDescriptor): void {
+  if (!descriptor.features?.includes(CONTINUITY_FEATURE)) {
+    throw continuityError("continuity_configuration_conflict", "Update and restart Launcher before starting this mode.");
+  }
+}
+
+function validContinuityAcknowledgement(value: unknown, claim: ContinuityClaim, traceId: string): value is ContinuityLease {
+  return isContinuityLease(value) && value.owner === claim.owner && value.traceId === traceId
+    && (!claim.expected || value.leaseId === claim.expected.leaseId);
+}
+
+/** Reject known capacity exhaustion before consuming a new thread's creation registration. */
+export async function assertLauncherContinuityCapacity(descriptorPath: string): Promise<void> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  assertLauncherContinuityFeature(descriptor);
+  let available: boolean;
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-capacity`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+    });
+    const body = await response.json() as Record<string, unknown>;
+    if (!response.ok || body.ok !== true || typeof body.available !== "boolean") throw new Error("Invalid capacity acknowledgement");
+    available = body.available;
+  } catch {
+    throw continuityError("continuity_configuration_conflict", "Launcher cannot confirm the continuity capacity contract. Update or restore the local control connection before starting this mode.");
+  }
+  if (!available) throw continuityError("continuity_resource_capacity", "Close an existing browser page before starting another task.");
+}
+
+/** Reads only Launcher's lease table. It neither inspects the website nor refreshes idle time. */
+export async function inspectLauncherContinuityConversation(
+  descriptorPath: string,
+  conversationKey: string,
+  expected: ContinuityLease,
+): Promise<{ continuity: ContinuityLease; state: "ready" | "running" }> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  assertLauncherContinuityFeature(descriptor);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ conversationKey, expected }),
+      signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+    });
+    const body = await response.json() as Record<string, unknown>;
+    if (!response.ok || body.ok !== true || !isContinuityLease(body.continuity)
+      || body.continuity.owner !== expected.owner || body.continuity.leaseId !== expected.leaseId
+      || body.continuity.traceId !== expected.traceId || !["ready", "running"].includes(String(body.state))) {
+      throw continuityError("continuity_session_lost");
+    }
+    return { continuity: body.continuity, state: body.state as "ready" | "running" };
+  } catch {
+    throw continuityError("continuity_session_lost");
   }
 }

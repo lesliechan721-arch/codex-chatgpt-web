@@ -39,7 +39,9 @@ export function chatGptConversationKey(
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
     ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
-    compaction: compactionEpoch(raw?.input),
+    ...(parsed._conversationPolicy === "continuity-first"
+      ? { policy: "continuity-first" }
+      : { compaction: compactionEpoch(raw?.input) }),
   })).digest("hex");
 }
 

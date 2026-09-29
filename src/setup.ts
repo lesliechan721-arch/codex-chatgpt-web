@@ -3,7 +3,8 @@ import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { ContinuityRegistrationStore } from "./adapters/chatgpt-web/continuity-registration";
 import type { AppConfig, BrowserInteractionMode, RuntimeMode, SubagentProtocol } from "./config";
 import type { ToolAuthorityMode } from "./types";
 import {
@@ -614,6 +615,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (changedWhileLoaded && !preliminaryChange && existing) await assertServiceIdle(existing);
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
+  if (config.mode === "full" && config.browserHost === "launcher") {
+    new ContinuityRegistrationStore(join(dirname(getConfigPath()), "runtime", "session-continuity")).initialize();
+  }
+
   if (!launcherOwned) {
     saveConfig(config);
     installService(config);
@@ -731,6 +736,9 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
   await configureTunnel(config, existing, options);
   // DEV uses the same supervisor-owned startup after this configuration is committed.
   const tunnelReady = config.mode === "full" ? false : null;
+  if (config.mode === "full") {
+    new ContinuityRegistrationStore(join(dirname(getConfigPath()), "runtime", "session-continuity")).initialize();
+  }
   saveConfig(config);
   return {
     mode: config.mode,

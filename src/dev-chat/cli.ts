@@ -30,6 +30,7 @@ import {
   resolveDevProfilePaths,
 } from "./profile";
 import { DEV_CONFIG_PURPOSE, DEV_LAUNCHER_PROFILE } from "./constants";
+import { isChatGptWebModelSlug } from "../chatgpt-web-models";
 
 const DEV_HELP = `Codex Web GPT DEV chat
 
@@ -94,7 +95,7 @@ function compactJson(value: unknown, limit = 2_000): string {
 function modelFromCli(value: string | undefined): DevChatModel | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase();
-  const slug = normalized.startsWith("chatgpt-web/") ? normalized : `chatgpt-web/${normalized}`;
+  const slug = isChatGptWebModelSlug(normalized) ? normalized : `chatgpt-web/${normalized}`;
   if (!(DEV_CHAT_MODELS as readonly string[]).includes(slug)) {
     throw new Error(`Unknown DEV model ${JSON.stringify(value)}; choose ${DEV_CHAT_MODELS.map(model => model.replace("chatgpt-web/", "")).join(", ")}`);
   }

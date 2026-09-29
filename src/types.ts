@@ -7,6 +7,12 @@ export interface CodexParsedRequest {
   _rawBody?: unknown;
   /** Set only by the trusted Web route, never parsed from caller-supplied model metadata. */
   _chatgptModelFamily?: "5.6" | "6";
+  /** Internal trusted-route policy. Never parsed from request metadata or summary text. */
+  _conversationPolicy?: "recoverable" | "continuity-first";
+  /** Resolved only from the live continuity binding, never from request metadata. */
+  _continuityHistoryRevision?: number;
+  /** Provider/model scope bound by the Adapter before resolving local checkpoint evidence. */
+  _continuityScope?: string;
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**
@@ -301,6 +307,7 @@ export interface CodexProviderConfig {
     threadEnvironmentStatePath?: string;
     /** Persisted exact-parent rolling checkpoints used only by Free/Luna turns. */
     lunaCheckpointStatePath?: string;
+    continuityStateDirectory?: string;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
     /**

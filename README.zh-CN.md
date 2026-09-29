@@ -181,6 +181,8 @@ bun run app:package
 
 `dev:launcher` 在 `~/.codex-chatgpt-web-dev` 下使用独立配置和账户。`dev:chat` 使用真实浏览器与压缩流程，并提供明确的模拟工具结果，不改变正常 Codex 路由。设置和命令请参阅 [DEV chat harness](docs/dev-chat.md)。
 
+[会话连续性优先](docs/session-continuity.md)在压缩后保留同一会话；原页面丢失时明确停止，不自动重建。兼容的 Full Native + Launcher 环境会提供可选的 `chatgpt-web-continuity/` 别名；Fresh Conversation Per Turn 和 Bigger Context 仍不兼容。更大的 Codex 历史预算不提高 ChatGPT 单次输入上限，也不改变现有模型。
+
 </details>
 
 ## Star History
