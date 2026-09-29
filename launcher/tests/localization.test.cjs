@@ -182,3 +182,18 @@ test("all locales translate known doctor messages without changing literal diagn
   assert.equal(copyFor("ko").install, "모델 설치");
   assert.equal(copyFor("zh-TW").install, "安裝模型");
 });
+
+
+test("plugin setup and Zero Risk instructions show configured names in every language", () => {
+  const { copyFor } = loadI18nModule();
+  const names = { automatic: "Codex Work", manual: "Codex Manual" };
+  for (const language of Object.keys(languages)) {
+    const copy = copyFor(language, names);
+    for (const key of ["manualMcpStepThreeBody", "manualConnectorNotice", "manualPromptInstruction", "manualPromptWaiting"]) {
+      assert.ok(copy[key].includes(names.manual), `${language}: ${key}`);
+    }
+    assert.ok(copy.connectorMigrationNotice.includes(names.automatic));
+    assert.ok(copy.pluginNameWarning.length > 0);
+    assert.equal(copyFor(language).manualPromptInstruction.includes("Codex Manual"), false);
+  }
+});

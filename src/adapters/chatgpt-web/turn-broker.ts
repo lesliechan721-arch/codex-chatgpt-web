@@ -2111,14 +2111,19 @@ export async function callTurnBroker<T>(
         finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
         return;
       }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+        || ("result" in parsed) === ("error" in parsed)
+        || ("error" in parsed && (typeof parsed.error !== "string" || !parsed.error))) {
+        finishError(new Error("ChatGPT web turn broker returned an invalid response frame"));
+        return;
+      }
       if (parsed.id !== id) {
         finishError(new Error("ChatGPT web turn broker response id mismatch"));
         return;
       }
       response = parsed;
       if (settleOnResponseFrame) {
-        // A long-poll keeps its request half open while the server waits. Its complete response
-        // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
+        // Long-polls finish on the full frame; their peer can otherwise keep both halves open.
         finishResponse();
         socket.destroy();
       }

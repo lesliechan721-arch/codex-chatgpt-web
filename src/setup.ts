@@ -49,6 +49,7 @@ import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "./native-tool-long-wait-pro
 import { effectiveToolAuthorityMode, manualCodexConfigurationOnly } from "./server-remote-config";
 
 export interface SetupOptions {
+  connectorNameSuffix?: string;
   mode: RuntimeMode;
   browserInteractionMode?: BrowserInteractionMode;
   toolAuthorityMode?: ToolAuthorityMode;
@@ -272,6 +273,8 @@ function baseConfig(
   Object.assign(config, resolveInteractionConnectorIdentities(
     config.browserInteractionMode,
     profile,
+    existing,
+    options.connectorNameSuffix,
   ));
   if (options.subagentProtocol) config.subagentProtocol = options.subagentProtocol;
   config.releaseVersion = VERSION;

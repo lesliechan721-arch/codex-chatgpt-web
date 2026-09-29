@@ -12,6 +12,7 @@ const {
 } = require("./process-tree.cjs");
 const { runtimeInvocation } = require("./runtime-command.cjs");
 const { DEV_LONG_WAIT_CONNECTOR_NAME } = require("./connector-identity.cjs");
+const { windowsTrustEnvironment } = require("./windows-trust.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
@@ -523,7 +524,7 @@ class RuntimeSupervisor {
     const child = spawn(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       detached: DETACH_OWNED_CHILD,
-      env: environment,
+      env: windowsTrustEnvironment(environment, this.platform),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

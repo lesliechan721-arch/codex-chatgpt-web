@@ -80,14 +80,23 @@ probe. The DEV launcher supervisor owns only the isolated MCP tunnel. Browser di
 state, thread authority, checkpoints, and named chat state live
 under `~/.codex-chatgpt-web-dev` by default.
 
-The ChatGPT connector name is also the public MCP ABI identity. The direct turn-token contract uses
-`Codex Native3`; the retired `Codex Native` and `Codex Native2` identities are never selected or refreshed in place. Setup
-migrates known legacy local configuration to the new name, clears prior verification state, and
+The ChatGPT connector name is also the public MCP ABI identity. The direct turn-token contract defaults
+to `Codex Native3`; Settings can change the part after `Codex ` for the selected mode. The retired
+`Codex Native`, `Codex Native2`, and `Codex Native2 DEV` identities are never selected or refreshed in
+place. Setup migrates known legacy local configuration to the current identity, clears prior verification state, and
 requires the user to create the new connector. Browser verification accepts the exact new identity,
 reports a specific migration error when only the legacy identity is visible, and never falls back to
 the legacy connector. Future public schema changes require another explicit connector identity.
 Repository DEV mode uses `Codex Native3 DEV` so the same ChatGPT account can keep both production
 and development connectors installed without renaming, refreshing, or deleting either one.
+
+Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native3`
+by default in Automatic, `Zero Risk2` in manual mode, and `Native3 DEV` in Automatic DEV. Mode names
+are stored independently and must differ. Setup preserves them across upgrades and mode changes.
+A name change uses the existing setup transaction, rejects active work, and clears MCP verification
+only after success. The user must create a new plugin with that exact name. Renaming a display
+label does not itself replace a remote connector's cached schema; retired connector identities cannot
+be selected as new names and legacy connectors are still never reused.
 
 ## Browser lifecycle
 
@@ -136,7 +145,8 @@ captured policy does not change if the global setting changes while the turn is 
 
 With Sent confirmation enabled, an ordinary manual handoff allows one minute to paste, select the
 visible ChatGPT model, effort, and Zero Risk connector, send, and confirm Sent; a manual compaction
-handoff allows two minutes. Sent ends that confirmation deadline. With Sent confirmation disabled,
+handoff allows two minutes. Copying the prompt again restarts this confirmation timer, and the prompt
+remains available to copy until the plugin starts. Sent ends that confirmation deadline. With Sent confirmation disabled,
 the Launcher does not show the Sent button and instead allows up to five minutes for the first MCP
 connector bind, which confirms the turn automatically. After either confirmation path succeeds, the
 live turn remains subject to explicit cancellation and runtime-owner cleanup.

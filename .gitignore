@@ -20,3 +20,4 @@ notes.md
 .worktrees/
 .idea/
 /.dev-workflows/
+/.agents/skills/github-pairing/

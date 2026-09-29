@@ -663,6 +663,16 @@ test("Luna turns without a retained conversation never send connector identity a
   expect(runExclusive.slice(connectorIdentity - 260, connectorIdentity)).toContain("turn.nativeConnector");
 });
 
+test("chat preparation preserves page-read and composer errors instead of reporting an expired login", async () => {
+  const prepare = (ChatGptBrowserWorker.prototype as unknown as {
+    prepareChatSurface(page: unknown): Promise<unknown>;
+  }).prepareChatSurface;
+  for (const error of [new ChatGptBrowserObservationTimeoutError(5_000), new Error("ChatGPT composer is unavailable")]) {
+    const page = { url: () => "https://chatgpt.com/?temporary-chat=true" };
+    await expect(prepare.call({ activeComposer: async () => { throw error; } }, page)).rejects.toBe(error);
+  }
+});
+
 test("a stalled DOM observation fails within its probe budget", async () => {
   expect(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS).toBe(5_000);
   expect(MAX_CHATGPT_BROWSER_PAGE_REBINDS).toBe(2);
@@ -1595,6 +1605,7 @@ test("repeated connector verification reuses its selected pill before clearing t
     config: { appName: "Codex Native3 DEV" },
     activeComposer: async () => selectedComposer,
     connectorIsSelected: async () => true,
+    attachedPromptText: async () => "",
   }, page, async checkpoint => { checkpoints.push(checkpoint); })).resolves.toBe(selectedComposer);
 
   expect(fillCalls).toBe(0);
@@ -3607,6 +3618,11 @@ test("browser diagnostic state drops every rendered text field before persistenc
   const diagnostic = sanitizeChatGptBrowserDiagnosticState({
     url: "https://chatgpt.com/c/private-conversation-id",
     title: "private conversation title",
+    documentComplete: false,
+    composer: { unrecognizedEditors: [{
+      tag: "textarea", role: null, attributes: { placeholder: true, id: false },
+      inForm: false, focused: true, value: "private draft", placeholder: "private hint",
+    }] },
     location: { origin: "https://chatgpt.com", pathSegments: 2, temporaryChat: false },
     connectorRows: [{
       tag: "a",
@@ -3620,6 +3636,10 @@ test("browser diagnostic state drops every rendered text field before persistenc
   const encoded = JSON.stringify(diagnostic);
   expect(encoded).not.toContain("private");
   expect(diagnostic).toEqual({
+    documentComplete: false,
+    composer: { unrecognizedEditors: [{
+      tag: "textarea", role: null, attributes: { placeholder: true, id: false }, inForm: false, focused: true,
+    }] },
     location: { origin: "https://chatgpt.com", pathSegments: 2, temporaryChat: false },
     connectorRows: [{ tag: "a", role: "button", textChars: 28 }],
     overlays: [{ role: "status", textChars: 18 }],
@@ -3899,7 +3919,7 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   const missing = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };
@@ -3925,6 +3945,17 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("DOM may have changed");
+});
+
+test("visible generation suspends DOM health and restarts its grace when Stop disappears", () => {
+  const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
+  const absent = { responsePresent: false, running: false, currentText: "", completionActionVisible: false };
+  expect(tracker.update(absent, 0)).toBeUndefined();
+  expect(tracker.update({ ...absent, running: true }, 500)).toBeUndefined();
+  expect(tracker.update({ ...absent, running: true }, 60_000)).toBeUndefined();
+  expect(tracker.update(absent, 61_000)).toBeUndefined();
+  expect(tracker.update(absent, 61_999)).toBeUndefined();
+  expect(tracker.update(absent, 62_000)).toContain("did not create a response DOM");
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {
@@ -3971,7 +4002,7 @@ test("suspending DOM health for proven MCP progress restarts the missing-respons
   const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };
@@ -3996,7 +4027,7 @@ test("clearing the missing-response window preserves whether a response was ever
     currentText: "partial",
     completionActionVisible: false,
   };
-  const absent = { ...present, responsePresent: false, currentText: "" };
+  const absent = { ...present, responsePresent: false, running: false, currentText: "" };
 
   expect(tracker.update(present, 1_000)).toBeUndefined();
   expect(tracker.update(absent, 1_500)).toBeUndefined();
@@ -4067,7 +4098,7 @@ test("live external progress still records that a response DOM was observed", ()
   const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };

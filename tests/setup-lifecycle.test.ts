@@ -66,6 +66,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
     const calls: string[] = [];
     let saved: configModule.AppConfig | undefined;
     const mocks = [
+      spyOn(configModule, "getConfigDir").mockReturnValue(root),
       spyOn(configModule, "getConfigPath").mockReturnValue(join(root, "config.json")),
       spyOn(configModule, "saveConfig").mockImplementation(value => { saved = value; calls.push("save"); }),
       spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {}),
@@ -95,6 +96,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
         ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
         ...(development && interaction === "automatic" ? { devNativeToolLongWaitProbe: true } : {}),
         useSavedChats: true,
+        connectorNameSuffix: "Work",
       });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
       expect(saved?.tunnel?.alias).toBe(`codex-chatgpt-web${development ? "-dev" : ""}${interaction === "manual" ? "-zero-risk" : ""}`);
@@ -112,12 +114,25 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
 
       if (development && interaction === "automatic") {
         expect(saved?.appName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
-        writeFileSync(join(root, "config.json"), "{}");
-        mocks.push(spyOn(configModule, "loadConfigForSetup").mockReturnValue(saved!));
-        await setupDevProfile({ ...options, port });
-        expect(saved?.appName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
         expect(saved?.automaticAppName).toBe(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME);
+      } else {
+        expect(saved?.appName).toBe("Codex Work");
       }
+      expect(interaction === "manual" ? saved?.automaticAppName : saved?.manualAppName)
+        .toBe(interaction === "automatic"
+          ? configModule.ZERO_RISK_CHATGPT_CONNECTOR_NAME
+          : development ? configModule.DEV_CHATGPT_CONNECTOR_NAME : configModule.CHATGPT_CONNECTOR_NAME);
+      // Unrelated setup and mode changes retain the suffix; clearing it is explicit.
+      const initial = structuredClone(saved!);
+      mocks.push(spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(initial)));
+      writeFileSync(join(root, "config.json"), JSON.stringify(initial));
+      await (development ? setupDevProfile : setup)({ ...options, port });
+      expect(saved?.appName).toBe(initial.appName);
+      await expect((development ? setupDevProfile : setup)({
+        ...options,
+        port,
+        connectorNameSuffix: interaction === "manual" ? "Zero Risk" : development ? "Native2 DEV" : "Native2",
+      })).rejects.toThrow("retired");
 
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));

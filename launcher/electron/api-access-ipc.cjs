@@ -1,7 +1,13 @@
 const { ERROR_CODES } = require("./api-access-settings.cjs");
 
 /** Explicit per-method IPC; never expose ipcRenderer or general file/command/clipboard access. */
-function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigationAllowed }) {
+function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigationAllowed, beforeMutation }) {
+  const mutatingChannels = new Set([
+    "launcher:api-access-generate",
+    "launcher:api-access-apply",
+    "launcher:api-access-upstream-save",
+    "launcher:api-access-upstream-delete",
+  ]);
   const methods = {
     "launcher:api-access-status": () => controller.status(),
     "launcher:api-access-reveal": () => controller.reveal(),
@@ -32,7 +38,10 @@ function registerApiAccessIpc({ ipcMain, controller, getWindow, rendererNavigati
         "launcher:api-access-upstream-models",
       ].includes(channel) ? 1 : 0;
       if (args.length !== arity) return { ok: false, code: "invalid-input" };
-      try { return { ok: true, value: await method(...args) }; }
+      try {
+        if (mutatingChannels.has(channel)) await beforeMutation?.();
+        return { ok: true, value: await method(...args) };
+      }
       catch (error) {
         // Do not send/log arbitrary errors from file IO or runtime helpers: they may contain secrets.
         return { ok: false, code: ERROR_CODES.has(error?.code) ? error.code : "unavailable" };

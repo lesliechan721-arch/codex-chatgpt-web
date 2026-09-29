@@ -172,6 +172,7 @@ export interface LauncherApi extends ApiAccessApi {
     replace?: boolean;
     interactionMode?: BrowserInteractionMode;
   }): Promise<{ ok: boolean; stdout: string }>;
+  setConnectorNameSuffix(suffix: string): Promise<LauncherState>;
   setMcpStep(step: number): Promise<LauncherState>;
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
   setBiggerContext(enabled: boolean): Promise<LauncherState>;
@@ -198,6 +199,7 @@ export interface LauncherApi extends ApiAccessApi {
   windowState(): Promise<{ fullScreen: boolean; maximized: boolean }>;
   windowControl(action: "close" | "minimize" | "zoom"): void;
   onWindowStateChanged(listener: (state: { fullScreen: boolean; maximized: boolean }) => void): () => void;
+  onConnectorNamesChanged(listener: (names: Pick<LauncherSnapshot, "connectorName" | "connectorNames">) => void): () => void;
   onStateChanged(listener: (state: LauncherState) => void): () => void;
   onBrowserState(listener: (state: BrowserState) => void): () => void;
   onOperation(listener: (state: OperationState) => void): () => void;

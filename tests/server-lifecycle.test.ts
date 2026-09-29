@@ -1715,6 +1715,8 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
   process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
   const root = mkdtempSync(join(tmpdir(), "cgw-remote-replay-idle-"));
+  const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
   const config = {
     ...defaultConfig("full"),
     port: 0,
@@ -1835,6 +1837,8 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
     await server.stop(true);
     await closeTurnBrokers();
     rmSync(root, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+    else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
     if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
     else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
   }
@@ -2765,6 +2769,7 @@ test.each(["alpha/search", "images/generations"])("authenticated lifecycle contr
   const config = { ...defaultConfig("browser-only"), port: 0 };
   let upstreamAbortObserved = false;
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: request => new Promise<Response>((_resolve, reject) => {
       request.signal.addEventListener("abort", () => {
         upstreamAbortObserved = true;
@@ -3046,7 +3051,7 @@ test("health and drain/resume stay available when continuity replay tombstones a
 
 test("a drained runtime rejects new model-catalog work before shutdown", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
-  const server = startServer(config);
+  const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
   const endpoint = `http://127.0.0.1:${server.port}`;
   const authorization = { authorization: `Bearer ${config.controlToken}` };
   try {
@@ -3078,6 +3083,7 @@ test("a drained runtime rejects new model-catalog work before shutdown", async (
 test("health proves that Codex received a successful augmented model catalog", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async () => Response.json({
       models: [{
         slug: "gpt-5.6-sol",
@@ -3113,6 +3119,7 @@ test("server exposes authenticated standalone Web Search on the routed v1 base U
   const config = { ...defaultConfig("browser-only"), port: 0 };
   let upstreamRequest: Request | undefined;
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async request => {
       upstreamRequest = request;
       return Response.json({ results: ["native-search-result"] });
@@ -3158,6 +3165,7 @@ test("standalone native image generation and edits preserve their upstream proto
     },
   });
   const server = startServer(config, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async request => {
       requests.push(request);
       const path = new URL(request.url).pathname;
@@ -3268,6 +3276,7 @@ test("authenticated shutdown requires a verified idle drain", async () => {
 test("model catalog health distinguishes no request, transport failure, upstream denial, and recovery without secrets", async () => {
   let outcome: "transport" | "denied" | "invalid" | "ready" = "transport";
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async () => {
       if (outcome === "transport") throw Object.assign(new Error("private proxy credentials and host"), { code: "UnsupportedProxyProtocol" });
       if (outcome === "denied") return new Response("private upstream account detail", { status: 403 });

@@ -311,6 +311,8 @@ async function setupCommand(args: string[]): Promise<void> {
     }
     options.toolAuthorityMode = toolAuthorityMode;
   }
+  const connectorNameSuffix = takeOption(args, "--connector-name-suffix");
+  if (connectorNameSuffix !== undefined) options.connectorNameSuffix = connectorNameSuffix;
   const subagentProtocol = takeOption(args, "--subagent-protocol");
   if (subagentProtocol !== undefined) {
     if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
