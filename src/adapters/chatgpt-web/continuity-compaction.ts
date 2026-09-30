@@ -4,14 +4,13 @@ import { inspectLauncherContinuityConversation, releaseLauncherRetainedConversat
 import type { CodexParsedRequest } from "../../types";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptBrowserWorker } from "./browser-worker";
-import { rememberCompactionContinuation, reserveCompactionContinuation } from "./compaction-continuation";
 import {
   canonicalizeCompactionHandoff, existingStructuredCompactionRun, MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   requestRetainedCompactionHandoff, runStructuredCompactionOnce,
   retainStructuredCompactionFailure,
   settleActiveCompactionSource, settleActiveZeroRiskCompactionSource, withCompactionAbort,
 } from "./compaction-handoff";
-import type { ContinuityClaim, ContinuityToolResultReplayEvidence } from "./continuity-binding";
+import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
 import { continuityToolRegistry } from "./continuity-tools";
 import type { PreparedContinuityRequest } from "./continuity-request";
@@ -111,9 +110,9 @@ export function runContinuityCompaction(
     const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (!manual && !(broker instanceof TurnBroker)) throw continuityError("continuity_configuration_conflict");
     const sourceRevision = extractChatGptCompactionSourceRevision(parsed);
+    if (sourceRevision.itemId) sourceRevision.itemId = parsed._chatGptMessageIdAliases?.[sourceRevision.itemId] ?? sourceRevision.itemId;
     const sourceInstructionReplay = source.continuitySourceInstructionReplayEvidence();
     let sourceResultReplay: ContinuityToolResultReplayEvidence | undefined;
-    const releaseReservation = reserveCompactionContinuation(parsed, identity);
     let begun = false;
     let noControlDelivered = false;
     const timeoutMs = Math.min(configuredTimeout ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
@@ -146,7 +145,8 @@ export function runContinuityCompaction(
         // The checkpoint budget retains one exact source plus bounded local result comparison data.
         const sourceEvidenceBytes = Buffer.byteLength(JSON.stringify(sourceRevision))
           + Buffer.byteLength(JSON.stringify(resultReplay))
-          + Buffer.byteLength(JSON.stringify(sourceInstructionReplay)) + 512;
+          + Buffer.byteLength(JSON.stringify(sourceInstructionReplay))
+          + Buffer.byteLength(JSON.stringify(identity.turnId)) + 128 + 512;
         const accepted = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
         if (source.continuityToolSearchResults(parsed).length > 0) {
           binding.discoveredTools = continuityToolRegistry(parsed, binding, source).discoveredTools;
@@ -227,10 +227,11 @@ export function runContinuityCompaction(
         preserveFinalResponse,
         sourceResultReplay,
         sourceInstructionReplay,
+        sourceRevision,
+        [...new Set([sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]
+          .map(revision => continuitySourceRepresentationDigest(parsed, revision)))],
+        identity.turnId,
       );
-      // Capacity was reserved before the first control instruction. Only a real committed
-      // handoff enters the instruction-recovery table; summary text alone is never authority.
-      rememberCompactionContinuation(parsed, identity, [sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)], summary);
       return summary;
     } catch (error) {
       if (!begun || noControlDelivered) throw error;
@@ -250,7 +251,6 @@ export function runContinuityCompaction(
       throw continuityError("continuity_source_unproven", "The handoff did not commit; already accepted results were not re-executed.");
     } finally {
       clearTimeout(timeout);
-      releaseReservation();
     }
   });
 }

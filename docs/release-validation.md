@@ -76,20 +76,19 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
    response history forms, local/v1/v2 codec coverage, ordinary → tool result → compact → continue,
    and lost-response retries. Synthetic metadata variants are not real-client certification.
 
-Minimal-validation coverage on 2026-09-30: the tenth repair round has 14 passing new
-regressions. Checkpoint-only continuation ignores completed user history before the checkpoint;
-the retained source itself remains protected on first transition and cached retries. Original and
-v1 producer source representations are captured at commit, so cached HTTP compaction replay
-adds no source evidence. Both modes cover 600 cached reads across local/v1/v2 codecs, current
-source payload conflicts, current constraints, anonymous new instructions, and preserved ordinary
-final output. Related targeted validation has 71 passes. Integration validation across 17 files
-totals 844 passes, one Windows-only skip, and no failures; typecheck and diff checks pass.
-Both new independent full reviews are complete, and the two prior findings are closed. Two new
-P2 findings remain: same-turn sources with identical summaries select the first source and reject
-the second continuation, and an active execution replays a cached ordinary round before updating
-its current tool registry. The current scope has not passed review. The
-[design attachment](dev/session-continuity/minimal-validation.md) records the current status. The real Codex/ChatGPT path in item 9, real 24-hour retention,
-sustained page-memory load, and remote deployment validation remain unexecuted for this change.
+Current-work validation on 2026-09-30 uses
+[the third-version contract](dev/session-continuity/current-work-validation.md). Source recovery now
+uses the selected bounded checkpoint commit, and active ordinary replay updates its current tool
+registry before returning. Current input preserves the real client's persistent instruction prefixes;
+an explicitly owned new turn need not replay its completed predecessor. The
+[implementation record](dev/session-continuity/current-work-build.md) contains current test and
+independent-review results; prior tenth-round totals apply only to the earlier baseline.
+[Protocol evidence](dev/session-continuity/current-work-protocol-evidence.md) records 34 real Codex
+POSTs against a fake page, including a harmless Native command, retry, steering, local/v2 compact,
+and active/completed checkpoint-only requests. V1, JSON, and previous-response history are not
+covered by these real captures. Zero Risk samples cover the model protocol only. Authenticated
+ChatGPT pages, real 24-hour retention, sustained page-memory load, and remote deployment validation
+remain unexecuted for this change.
 
 Keep the component and synthetic evidence with the implementation record, but distinguish it from
 real authenticated ChatGPT results. Any unexecuted platform, 24-hour, resource-load, or remote-idle

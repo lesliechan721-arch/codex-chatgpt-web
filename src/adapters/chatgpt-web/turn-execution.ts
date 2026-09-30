@@ -300,6 +300,10 @@ export function chatGptContinuityInstructionPayloadDigest(
   allowRetainedSourceFallback = false,
 ): string {
   const contents = continuityInstructionPayloadContents(parsed, previous, allowRetainedSourceFallback);
+  return continuityInstructionPayloadDigestForContents(parsed, contents);
+}
+
+function continuityInstructionPayloadDigestForContents(parsed: CodexParsedRequest, contents: unknown[]): string {
   const { reasoning: _reasoning, promptCacheKey: _promptCacheKey, ...options } = parsed.options;
   const raw = rawRecord(parsed._rawBody);
   const instructions = typeof raw?.instructions === "string" && raw.instructions.length > 0
@@ -707,16 +711,13 @@ export class ChatGptTurnSession {
     const acceptedAllowRetainedSourceFallback = this.acceptedInstructionPayloadDigest === undefined
       ? allowRetainedSourceFallback
       : this.acceptedInstructionAllowsRetainedSourceFallback;
-    const payload = chatGptContinuityInstructionPayloadDigest(
+    const contents = continuityInstructionPayloadContents(
       parsed,
       acceptedPrevious,
       acceptedAllowRetainedSourceFallback,
     );
-    const content = continuityInstructionContentDigest(
-      parsed,
-      acceptedPrevious,
-      acceptedAllowRetainedSourceFallback,
-    );
+    const payload = continuityInstructionPayloadDigestForContents(parsed, contents);
+    const content = createHash("sha256").update(canonicalJson(contents)).digest("hex");
     if (this.acceptedInstructionIdentity !== undefined && this.acceptedInstructionIdentity !== instructionIdentity) {
       throw continuityError("continuity_source_unproven");
     }
@@ -987,6 +988,10 @@ export class ChatGptTurnSession {
     return this.outstandingById.has(callId);
   }
 
+  hasContinuityToolCall(callId: string): boolean {
+    return this.toolBatchByCallId.has(callId);
+  }
+
   markResultDelivered(callId: string): void {
     if (!this.outstandingById.delete(callId)) throw new Error(`ChatGPT bridge tool result does not match an outstanding call: ${callId}`);
     const batch = this.toolBatchByCallId.get(callId);
@@ -1211,6 +1216,13 @@ export class ChatGptTurnSessions {
     const session = this.entries.get(key);
     session?.touch();
     return session;
+  }
+
+  continuityToolCallRevision(binding: ContinuityBinding, callId: string): number | undefined {
+    const sources = [...this.entries.values()].filter(session => session.runtime.continuityBinding === binding
+      && session.hasContinuityToolCall(callId));
+    if (sources.length > 1) throw continuityError("continuity_source_unproven");
+    return sources[0]?.runtime.usageInput?._continuityHistoryRevision;
   }
 
   /** Drop only a proved pre-mutation first-creation failure. The durable creation claim remains live. */

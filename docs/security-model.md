@@ -152,6 +152,13 @@ Repeated summaries and unclear instruction ownership stop when local records can
 work item. Retry comparison records are bounded with their journals or checkpoints; first-input
 capture is released when creation succeeds or the binding becomes terminal.
 
+Continuity source recovery reads one selected committed checkpoint relation. Identical summaries
+cannot merge different source identities or extend the accepted source representations on replay.
+The request's persistent native instruction prefix remains current payload even when its metadata
+records an earlier creation turn; this prompt selection grants no filesystem or tool authority.
+Active ordinary replay updates the current tool registry only after payload and owner validation
+under the execution lock. Earlier execution replay cannot update a later owner's registry.
+
 Continuity's 24-hour ready-page retention is not a capability extension. Native operation
 identity, real tool results, queued/delivered boundaries, completion barriers, cancellation,
 helper liveness and remote idle keep their existing contracts. Healthy continuity pages are not

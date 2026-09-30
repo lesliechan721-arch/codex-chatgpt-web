@@ -503,14 +503,52 @@ export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unkn
 }
 
 function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
+  return requestCarriedChatGptInstructionRevision(parsed, expectedTurnId)
+    ?? recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
+}
+
+interface ContinuityInstructionSelection {
+  input: unknown[];
+  scope?: string;
+  compaction?: boolean;
+  carried: Map<string | undefined, number>;
+  index?: number;
+  inputs: Map<string, number[]>;
+}
+
+// Request-local positions share identity and grouping decisions without copying source records.
+const continuityInstructionSelections = new WeakMap<CodexParsedRequest, ContinuityInstructionSelection>();
+
+function continuityInstructionSelection(parsed: CodexParsedRequest, input: unknown[]): ContinuityInstructionSelection | undefined {
+  if (parsed._conversationPolicy !== "continuity-first") return undefined;
+  const cached = continuityInstructionSelections.get(parsed);
+  if (cached && cached.input === input && cached.scope === parsed._continuityScope
+    && cached.compaction === parsed._compactionRequest) return cached;
+  const selection = { input, scope: parsed._continuityScope, compaction: parsed._compactionRequest,
+    carried: new Map<string | undefined, number>(), inputs: new Map<string, number[]>() };
+  continuityInstructionSelections.set(parsed, selection);
+  return selection;
+}
+
+/** Read request-carried identity without invoking checkpoint recovery. */
+export function requestCarriedChatGptInstructionRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
+  const selection = continuityInstructionSelection(parsed, input);
+  if (selection?.carried.has(expectedTurnId)) {
+    const index = selection.carried.get(expectedTurnId)!;
+    return index >= 0 ? userRevision(input[index], expectedTurnId, metadata, true) : undefined;
+  }
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const revision = userRevision(input[index], expectedTurnId, metadata, parsed._conversationPolicy === "continuity-first");
-    if (revision) return revision;
+    if (revision) {
+      selection?.carried.set(expectedTurnId, index);
+      return revision;
+    }
   }
-  return recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
+  selection?.carried.set(expectedTurnId, -1);
+  return undefined;
 }
 
 /** Index of the latest native instruction that is physically present in this request. */
@@ -525,6 +563,12 @@ export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): numb
   const metadata = clientTurnMetadata(parsed);
   const checkpoint = parsed._conversationPolicy === "continuity-first" && !parsed._compactionRequest
     ? recoverCompactionInstruction(parsed, identity) : undefined;
+  const selection = continuityInstructionSelection(parsed, input);
+  if (selection?.index !== undefined) return selection.index;
+  const remember = (index: number): number => {
+    if (selection) selection.index = index;
+    return index;
+  };
   let retainedSourceIndex = -1;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     if (checkpoint && index <= checkpoint.summaryIndex) {
@@ -547,9 +591,9 @@ export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): numb
     if (!revision) continue;
     if (isRetainedCompactionSourceInstruction(parsed, input[index])) {
       if (retainedSourceIndex < 0) retainedSourceIndex = index;
-    } else if (revision.turnId === undefined || revision.turnId === identity.turnId) return index;
+    } else if (revision.turnId === undefined || revision.turnId === identity.turnId) return remember(index);
   }
-  return retainedSourceIndex;
+  return remember(retainedSourceIndex);
 }
 
 /** Use the same native instruction for work identity and incremental input selection. */
@@ -588,6 +632,15 @@ export function continuityCurrentInstructionInput(
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const index = chatGptCurrentInstructionIndex(parsed);
+  const selection = continuityInstructionSelection(parsed, input);
+  const selectionKey = JSON.stringify([previous?.instructionIdentity ?? null, previous?.nativeTurnId ?? null,
+    previous?.trustedLowerBound ?? null, includeRetainedSource]);
+  const cached = selection?.inputs.get(selectionKey);
+  if (cached) return cached.map(candidate => structuredClone(input[candidate]));
+  const remember = (indices: number[]): unknown[] => {
+    selection?.inputs.set(selectionKey, indices);
+    return indices.map(candidate => structuredClone(input[candidate]));
+  };
   const retainCurrentSource = includeRetainedSource && isRetainedCompactionSourceInstruction(parsed, input[index]);
   const identity = extractChatGptTurnIdentity(parsed);
   if (parsed._compactionRequest) {
@@ -596,12 +649,39 @@ export function continuityCurrentInstructionInput(
   }
   const metadata = clientTurnMetadata(parsed);
   const prior = previous;
+  const currentTurnOwned = userRevision(input[index], identity.turnId, metadata)?.turnId === identity.turnId;
+  // Codex reuses the instruction prefix of each execution-history window across turns.
+  // Its turn_id records creation, while native content kinds identify persistent groups.
+  const requestPrefix = new Set<number>();
+  const prefixKinds = new Set(["model.base_instructions", "generic.developer_instructions",
+    "host_skills.instructions", "permissions.instructions", "collaboration_mode.instructions",
+    "plugins.instructions", "plugins.usage_instructions", "apps.instructions",
+    "multi_agent.mode_instructions", "multi_agent.role_instructions", "multi_agent.usage_hint",
+    "skills.catalog", "skills.instructions", "cloud_skills.instructions", "memories.instructions",
+    "plugins.recommendations", "environments.instructions", "persistent_mode.instructions",
+    "token_budget.context_window", "token_budget.context_window_guidance", "tools.deferred_namespaces",
+    "git_attribution.instructions", "managed_config.developer_instructions", "model_switch.instructions",
+    "agents_md.instructions", "environments.environment_context"]);
   const checkpointIndex = prior?.trustedLowerBound;
+  const prefixStarts = [0, ...(checkpointIndex !== undefined && checkpointIndex >= 0 ? [checkpointIndex + 1] : [])];
+  for (const start of prefixStarts) {
+    for (let candidate = start; candidate < input.length; candidate += 1) {
+      const item = record(input[candidate]);
+      if (item?.type === "additional_tools") continue;
+      const envelope = inputItemType(item) === "message" && (item?.role === "system" || item?.role === "developer");
+      const grouped = hasEnvironmentContextFragment(item) && Array.isArray(item.content);
+      if (!envelope && !grouped) break;
+      const kinds = messageContentKinds(item!);
+      // A workspace without AGENTS still has a pure environment item in this prefix.
+      if (itemTurnId(item) === undefined || itemTurnId(item) === identity.turnId
+        || (kinds && kinds.length > 0 && kinds.every(kind => prefixKinds.has(kind)))) requestPrefix.add(candidate);
+    }
+  }
   let lowerBound = checkpointIndex !== undefined && Number.isInteger(checkpointIndex)
     && checkpointIndex >= 0 && checkpointIndex < input.length
     ? checkpointIndex
     : -1;
-  if (index < 0 && lowerBound < 0) return [];
+  if (index < 0 && lowerBound < 0) return remember([]);
   let predecessorDefinesBoundary = false;
   if (prior?.instructionIdentity && index > lowerBound) {
     const priorInstructionIdentity = prior.instructionIdentity;
@@ -623,7 +703,8 @@ export function continuityCurrentInstructionInput(
         break;
       }
     }
-    if (lowerBound < 0) {
+    if (lowerBound < 0 && !(currentTurnOwned && prior.nativeTurnId !== undefined
+      && prior.nativeTurnId !== identity.turnId)) {
       throw continuityError("continuity_source_unproven", "The accepted predecessor instruction cannot be located in the current request.");
     }
   }
@@ -638,10 +719,16 @@ export function continuityCurrentInstructionInput(
       executionOutputIndex = candidate;
     }
   }
-  const currentTurnOwned = userRevision(input[index], identity.turnId, metadata)?.turnId === identity.turnId;
   const currentEnvironmentItems = new Set(currentChatGptEnvironmentParts(parsed).map(part => part.item));
+  // API-key Codex omits per-item provenance. Its rebuilt window has a complete native
+  // preamble followed by one instruction; additional unowned history remains ambiguous.
+  const unownedWindowInstruction = checkpointIndex !== undefined && checkpointIndex >= 0 && index > checkpointIndex
+    && prior?.nativeTurnId !== undefined && prior.nativeTurnId !== identity.turnId
+    && userRevision(input[index], identity.turnId, metadata)?.turnId === undefined
+    && [...requestPrefix].some(candidate => candidate > checkpointIndex && hasEnvironmentContextFragment(record(input[candidate])))
+    && input.slice(checkpointIndex + 1, index).every((_, offset) => requestPrefix.has(checkpointIndex + 1 + offset));
   let trailingOutput = false;
-  const selected: unknown[] = [];
+  const selected: number[] = [];
   for (let candidate = 0; candidate < input.length; candidate += 1) {
     const item = input[candidate];
     const message = record(item);
@@ -652,7 +739,9 @@ export function continuityCurrentInstructionInput(
       && (chatGptInstructionContent(message) as unknown[]).length > 0);
     const supplemental = envelope || grouped;
     const nativeTurnId = revision?.turnId ?? itemTurnId(item);
-    if (candidate <= lowerBound && !(supplemental && nativeTurnId === identity.turnId)) continue;
+    const requestWide = requestPrefix.has(candidate);
+    if (candidate <= lowerBound && !requestWide && !(nativeTurnId === identity.turnId
+      && (supplemental || (currentTurnOwned && prior?.nativeTurnId !== identity.turnId)))) continue;
     if (!revision && itemTurnId(item) === undefined && isNativeInstruction(message, metadata)
       && (!parsed._compactionRequest || candidate <= index)) {
       if (!prior && candidate < executionOutputIndex) continue;
@@ -663,12 +752,12 @@ export function continuityCurrentInstructionInput(
         "custom_tool_call_output", "tool_search_call", "tool_search_output", "compaction"].includes(String(message.type)))) {
       trailingOutput = true;
     }
-    if ((!revision && !supplemental) || (!retainCurrentSource && isRetainedCompactionSourceInstruction(parsed, item))) continue;
-    if (nativeTurnId !== undefined && nativeTurnId !== identity.turnId) continue;
+    if ((!revision && !supplemental && !requestWide) || (!retainCurrentSource && isRetainedCompactionSourceInstruction(parsed, item))) continue;
+    if (nativeTurnId !== undefined && nativeTurnId !== identity.turnId && !requestWide) continue;
     if (envelope && candidate > index && nativeTurnId === undefined && trailingOutput) {
       throw continuityError("continuity_source_unproven", "A trailing instruction without native turn ownership follows execution output.");
     }
-    if (nativeTurnId === undefined && candidate < executionOutputIndex) {
+    if (nativeTurnId === undefined && candidate < executionOutputIndex && !requestWide) {
       if (prior) {
         throw continuityError("continuity_source_unproven", "An instruction without native turn ownership cannot be distinguished from completed work.");
       }
@@ -677,7 +766,8 @@ export function continuityCurrentInstructionInput(
       continue;
     }
     // A predecessor before a moved checkpoint does not prove ownership of its later items.
-    if (prior?.instructionIdentity && !predecessorDefinesBoundary
+    if (prior?.instructionIdentity && !predecessorDefinesBoundary && !requestWide
+      && !(unownedWindowInstruction && candidate === index)
       && !(supplemental && (nativeTurnId === identity.turnId || candidate > index))
       && !(supplemental && nativeTurnId === undefined && currentTurnOwned && prior.nativeTurnId !== identity.turnId)
       && (nativeTurnId !== identity.turnId || prior.nativeTurnId === identity.turnId)) {
@@ -686,9 +776,9 @@ export function continuityCurrentInstructionInput(
         "The checkpoint boundary cannot distinguish this instruction from completed history.",
       );
     }
-    selected.push(structuredClone(item));
+    selected.push(candidate);
   }
-  return selected;
+  return remember(selected);
 }
 
 /** First entry requires a real current instruction, not a recovered checkpoint or tool continuation. */

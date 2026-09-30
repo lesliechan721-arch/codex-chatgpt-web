@@ -238,10 +238,16 @@ reconnect replays its original journal; a result retry selects its original loca
 and batch comparison records share the 512-round bound, with the initial ordinary journal
 protected while its execution is retained. Reclaimed results cannot start new work.
 
-Continuation input uses the accepted predecessor or committed checkpoint and current native
-instruction ownership. Ambiguous unowned instructions mixed with completed output are rejected
-before submission. A repeated summary is only a revision candidate; local work and transaction
-records must resolve it uniquely. Historical edits are not sent back to the retained page.
+Continuation input uses current native instruction ownership and the committed checkpoint relation.
+An explicitly owned new turn can omit its completed predecessor. The native instruction prefix of
+the current execution-history window remains part of the current payload, including developer and
+grouped AGENTS instructions whose turn metadata records their earlier creation. Unowned instructions
+mixed with completed output remain ambiguous and are rejected before submission. Full source data
+and codec comparison data live in the bounded checkpoint commit; continuity does not recover a source
+from the ordinary mode's continuation cache. Each request reuses its selected commit, and the start
+boundary checks ownership again before consuming its transition once. Historical edits are not sent
+back to the retained page. Active ordinary reconnects publish the current tool registry under the
+execution lock before replaying their journal; historical execution replay cannot update a later owner.
 
 ## Local ChatGPT Limits
 

@@ -10,7 +10,7 @@ import { parseRequest } from "../../responses/parser";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import {
   continuityBindingsFor, continuityCheckpoint, continuityDigest,
-  type ContinuityBinding, type ContinuityBindings,
+  selectContinuityCheckpoint, type ContinuityCheckpointCommit, type ContinuityCheckpointSelection, type ContinuityBinding, type ContinuityBindings,
 } from "./continuity-binding";
 import { isContinuityLease, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
@@ -48,6 +48,7 @@ export interface PreparedContinuityRequest {
   allowRetainedSourceInstructionPayload?: boolean;
   finalReplaySource?: ChatGptTurnSession;
   verifiedSourceGeneration?: number;
+  checkpointTransition?: ContinuityCheckpointSelection;
 }
 
 function sameLease(left: ContinuityLease | undefined, right: ContinuityLease | undefined): boolean {
@@ -118,7 +119,7 @@ function assertNoUnownedTerminalResults(parsed: CodexParsedRequest, checkpointIn
 function checkpointResumeInput(
   parsed: CodexParsedRequest,
   binding: ContinuityBinding,
-  revision: number,
+  checkpoint: ContinuityCheckpointCommit | undefined,
   proof: ReturnType<typeof continuityCheckpoint>,
 ): {
   input: CodexParsedRequest;
@@ -126,7 +127,6 @@ function checkpointResumeInput(
   allowRetainedSourceInstructionPayload: boolean;
   finalReplaySource?: ChatGptTurnSession;
 } {
-  const checkpoint = [...binding.checkpoints.values()].find(value => value.revision === revision);
   if (!checkpoint?.sourceInstructionReplay || proof.index < 0) throw continuityError("continuity_source_unproven");
   const instructionPrevious = {
     instructionIdentity: checkpoint.sourceInstructionReplay.instructionIdentity,
@@ -192,6 +192,7 @@ export async function prepareContinuityRequest(
   bindContinuityRequestScope(parsed, namespace);
   const scope = parsed._continuityScope!;
   let binding = bindings.lookup(thread, scope);
+  const checkpointSelection = selectContinuityCheckpoint(parsed, identity);
   const checkpointProof = continuityCheckpoint(parsed);
   const checkpoint = checkpointProof.digest;
   const revisionCandidates = binding ? bindings.revisionsFor(binding, checkpoint) : [0];
@@ -208,12 +209,9 @@ export async function prepareContinuityRequest(
     const reclaimed = parsed._compactionRequest ? [] : keyedCandidates.filter(candidate => (
       binding!.ordinaryReplayTombstones.get(candidate.executionKey)?.revision === candidate.revision
     ));
-    const transitionTargets = parsed._compactionRequest || checkpointProof.index < 0 ? [] : keyedCandidates.filter(candidate => {
-      const checkpointCommit = [...binding!.checkpoints.values()].find(value => value.revision === candidate.revision);
-      if (!checkpointCommit) return false;
-      return keyedCandidates.some(source => source.revision === checkpointCommit.sourceRevision
-        && source.executionKey === checkpointCommit.sourceExecutionKey);
-    });
+    const transitionTargets = parsed._compactionRequest || !checkpointSelection ? [] : keyedCandidates.filter(candidate => (
+      candidate.revision === checkpointSelection.checkpoint.revision
+    ));
     const checkpointOnly = checkpointProof.index >= 0
       && !hasNativeChatGptInstruction(parsed, continuityCurrentInstructionInput(parsed, { trustedLowerBound: checkpointProof.index }));
     const resultRounds = parsed._compactionRequest ? [] : keyedCandidates.filter(candidate => {
@@ -241,8 +239,10 @@ export async function prepareContinuityRequest(
     }
   }
   const { revision, executionKey } = selected;
-  const sourceReplay = checkpointProof.index >= 0
-    ? [...binding?.checkpoints.values() ?? []].find(value => value.revision === revision)?.sourceInstructionReplay : undefined;
+  const selectedCheckpoint = checkpointProof.index >= 0
+    ? checkpointSelection?.checkpoint.revision === revision ? checkpointSelection.checkpoint
+      : [...binding?.checkpoints.values() ?? []].find(value => value.revision === revision) : undefined;
+  const sourceReplay = selectedCheckpoint?.sourceInstructionReplay;
   // The retained source remains protected even before the checkpoint and on cached retries.
   if (!parsed._compactionRequest && sourceReplay && continuityInstructionIdentity(parsed) === sourceReplay.instructionIdentity) {
     for (const value of (parsed._rawBody as { input: unknown[] }).input) {
@@ -354,6 +354,7 @@ export async function prepareContinuityRequest(
   let instructionPrevious: ChatGptContinuityInstructionPrevious | undefined;
   let allowRetainedSourceInstructionPayload = false;
   let finalReplaySource: ChatGptTurnSession | undefined;
+  let checkpointTransition: ContinuityCheckpointSelection | undefined;
   if (!parsed._compactionRequest && !existing) {
     assertNoUnownedTerminalResults(parsed, checkpointProof.index);
     chatGptTurnSessions.assertContinuityThreadAvailable(identity.threadId, executionKey);
@@ -365,9 +366,15 @@ export async function prepareContinuityRequest(
       ({ input, instructionPrevious, allowRetainedSourceInstructionPayload, finalReplaySource } = checkpointResumeInput(
         parsed,
         binding!,
-        revision,
+        selectedCheckpoint,
         checkpointProof,
       ));
+      if (allowRetainedSourceInstructionPayload) {
+        if (!checkpointSelection || checkpointSelection.checkpoint.revision !== revision) {
+          throw continuityError("continuity_source_unproven", "The request has no exact committed checkpoint transition.");
+        }
+        checkpointTransition = checkpointSelection;
+      }
     } else if (expected) {
       ({ input, instructionPrevious } = ordinaryResumeInput(parsed, binding!, conversationKey, checkpointProof));
     } else if (binding?.state === "creating" && binding.initialExecutionKey === executionKey
@@ -403,6 +410,7 @@ export async function prepareContinuityRequest(
     bindings, binding, descriptor, conversationKey, executionKey, nativeThreadId: identity.threadId,
     revision, sourceExecutionKey, expected, input, instructionPrevious,
     allowRetainedSourceInstructionPayload, finalReplaySource, verifiedSourceGeneration,
+    checkpointTransition,
   };
 }
 
@@ -415,7 +423,16 @@ export function beginContinuityResponse(prepared: PreparedContinuityRequest): Co
     throw continuityError("continuity_source_unproven");
   }
   chatGptTurnSessions.assertContinuityThreadAvailable(prepared.nativeThreadId, prepared.executionKey);
-  return bindings.beginResponse(binding, prepared.executionKey);
+  const transition = prepared.checkpointTransition;
+  if (transition && (transition.binding !== binding || binding.checkpoints.get(transition.key) !== transition.checkpoint
+    || transition.checkpoint.revision !== prepared.revision
+    || (transition.checkpoint.continuationExecutionKey !== undefined
+      && transition.checkpoint.continuationExecutionKey !== prepared.executionKey))) {
+    throw continuityError("continuity_source_unproven", "The checkpoint transition was already consumed by another execution.");
+  }
+  const claim = bindings.beginResponse(binding, prepared.executionKey);
+  if (transition) transition.checkpoint.continuationExecutionKey = prepared.executionKey;
+  return claim;
 }
 
 export function acceptContinuityResponseLease(prepared: PreparedContinuityRequest, traceId: string, value: unknown): ContinuityLease {

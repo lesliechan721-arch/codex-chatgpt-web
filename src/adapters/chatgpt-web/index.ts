@@ -1558,6 +1558,46 @@ export function createChatGptWebAdapter(
               && session.continuityRoundKey(parsed) !== roundKey) {
               throw continuityError("continuity_source_unproven", "The local work identity changed while this request was waiting for the execution lock.");
             }
+            let turnToken: string | undefined;
+            const updateTurnEnvironment = async (): Promise<string> => {
+              if (session.runtime.mode !== "tools") throw new Error("Read-only ChatGPT Web runtime cannot update tool authority");
+              const token = await withAbort(session.runtime.token, incoming.abortSignal);
+              if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
+              const prepared = preparedContinuity.get(parsed);
+              const binding = prepared?.binding;
+              if (binding) {
+                if (!session.isActive()) return token;
+                if (prepared.bindings.lookup(binding.thread, binding.scope) !== binding
+                  || binding.executionKey !== executionKey || binding.revision !== prepared.revision
+                  || chatGptTurnSessions.findConversationHead(prepared.conversationKey) !== session
+                  || session.supersededError) {
+                  throw continuityError("continuity_source_unproven", "This execution no longer owns the current page environment.");
+                }
+                session.assertCanonicalReplayInput(parsed);
+              }
+              const registry = binding ? continuityToolRegistry(parsed, binding, session) : undefined;
+              if (registry) {
+                parsed.context.tools = registry.tools;
+                environment = { ...environment, tools: registry.tools };
+              }
+              await broker.updateEnvironment(token, environment);
+              // Owner IPC can finish after this browser settles and another execution takes the
+              // page. Its old response may replay, but cannot publish into the new owner's registry.
+              if (binding && registry && binding.state !== "lost" && binding.state !== "ended"
+                && prepared.bindings.observed(binding.thread) === binding
+                && binding.executionKey === executionKey && binding.revision === prepared.revision
+                && chatGptTurnSessions.findConversationHead(prepared.conversationKey) === session
+                && !session.supersededError) {
+                binding.discoveredTools = registry.discoveredTools;
+              }
+              return token;
+            };
+            // An active ordinary reconnect publishes its current registry before returning its
+            // journal. Historical executions remain read-only and keep their original response.
+            if (parsed._conversationPolicy === "continuity-first" && session.isActive()
+              && session.runtime.mode === "tools") {
+              turnToken = await updateTurnEnvironment();
+            }
             continuityAdmissionPending = false;
             const replay = session.roundEvents(roundKey);
             replayEvents(replay, emit);
@@ -1614,20 +1654,16 @@ export function createChatGptWebAdapter(
               return;
             }
 
-            let turnToken: string | undefined;
             if (session.runtime.mode === "tools") {
-              turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
-              if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
-              const binding = preparedContinuity.get(parsed)?.binding;
-              const registry = binding ? continuityToolRegistry(parsed, binding, session) : undefined;
-              if (registry) {
-                parsed.context.tools = registry.tools;
-                environment = { ...environment, tools: registry.tools };
+              if (!turnToken) {
+                turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
+                if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
+                await broker.updateEnvironment(turnToken, environment);
               }
-              await broker.updateEnvironment(turnToken, environment);
-              if (binding && registry) binding.discoveredTools = registry.discoveredTools;
+              const updatedOutcome = session.settledOutcome();
+              if (updatedOutcome?.type === "error") throw updatedOutcome.error;
 
-              const outstanding = session.outstanding();
+              const outstanding = session.isActive() ? session.outstanding() : [];
               if (outstanding.length > 0) {
                 const results = parsed._conversationPolicy === "continuity-first"
                   ? session.acceptContinuityToolResults(parsed)
@@ -1678,7 +1714,7 @@ export function createChatGptWebAdapter(
               const externalProgress = session.runtime.mode === "tools"
                 ? session.runtime.externalProgress
                 : undefined;
-              const armNextTools = () => turnToken
+              const armNextTools = () => turnToken && session.isActive()
                 ? broker.nextToolBatch(turnToken, toolWaitAbort.signal).then(async requests => {
                   if (!externalProgress) {
                     throw new Error("ChatGPT broker returned tools for a read-only browser turn");

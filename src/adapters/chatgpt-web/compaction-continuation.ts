@@ -3,14 +3,12 @@ import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFI
 import type { CodexParsedRequest } from "../../types";
 import type { ChatGptTurnIdentity, ChatGptTurnUserRevision } from "./environment";
 import { continuityError } from "./continuity-errors";
-import { canonicalJson } from "./canonical-json";
+import { continuitySourceRepresentationDigest, selectContinuityCheckpoint } from "./continuity-binding";
 
 interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
   source: ChatGptTurnUserRevision;
-  protectedScope?: string;
-  threadHash?: string;
 }
 
 // Evidence of a checkpoint actually returned by this daemon, not authority inferred from text
@@ -21,28 +19,22 @@ const reservations = new Set<string>();
 
 function scope(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): string | undefined {
   if (!identity.threadId || !identity.turnId) return undefined;
-  const base = [identity.threadId, identity.turnId, parsed.modelId, parsed.options.reasoning];
-  if (parsed._conversationPolicy !== "continuity-first") return JSON.stringify(base);
-  if (!parsed._continuityScope) return undefined;
-  return digest([...base, "continuity-first", parsed._chatgptModelFamily, parsed._continuityScope]);
+  if (parsed._conversationPolicy === "continuity-first") return undefined;
+  return JSON.stringify([identity.threadId, identity.turnId, parsed.modelId, parsed.options.reasoning]);
 }
 
 function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function sourceDigest(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
-  return parsed._conversationPolicy === "continuity-first"
-    ? createHash("sha256").update(canonicalJson([source.turnId,
-      source.itemId ? parsed._chatGptMessageIdAliases?.[source.itemId] ?? source.itemId : null,
-      source.content, source.instructionEnvelope ?? { role: "user" }])).digest("hex")
-    : digest([source.turnId, source.content]);
+function sourceDigest(source: ChatGptTurnUserRevision): string {
+  return digest([source.turnId, source.content]);
 }
 
 function makeCheckpointRoom(key: string): void {
   if (checkpoints.has(key) || reservations.has(key)) return;
   while (new Set([...checkpoints.keys(), ...reservations]).size >= MAX_CHECKPOINTS) {
-    const evictable = [...checkpoints].find(([candidate, checkpoint]) => !checkpoint.protectedScope && !reservations.has(candidate));
+    const evictable = [...checkpoints].find(([candidate]) => !reservations.has(candidate));
     if (!evictable) throw continuityError("continuity_resource_capacity", "The checkpoint evidence registry is full.");
     checkpoints.delete(evictable[0]);
   }
@@ -57,12 +49,6 @@ export function reserveCompactionContinuation(parsed: CodexParsedRequest, identi
   return () => { reservations.delete(key); };
 }
 
-export function releaseContinuityContinuationEvidence(protectedScope: string, threadHash: string): void {
-  for (const [key, checkpoint] of checkpoints) {
-    if (checkpoint.protectedScope === protectedScope && checkpoint.threadHash === threadHash) checkpoints.delete(key);
-  }
-}
-
 export function rememberCompactionContinuation(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
@@ -74,18 +60,12 @@ export function rememberCompactionContinuation(
   makeCheckpointRoom(key);
   const prior = checkpoints.get(key);
   const acceptedSource = structuredClone(sources[0]);
-  if (parsed._conversationPolicy === "continuity-first" && acceptedSource.itemId) {
-    acceptedSource.itemId = parsed._chatGptMessageIdAliases?.[acceptedSource.itemId] ?? acceptedSource.itemId;
-  }
   const sourceHashes = prior?.summaryHash === digest(summary) ? new Set(prior.sourceHashes) : new Set<string>();
-  for (const source of sources) sourceHashes.add(sourceDigest(parsed, source));
+  for (const source of sources) sourceHashes.add(sourceDigest(source));
   checkpoints.delete(key);
   checkpoints.set(key, {
     summaryHash: digest(summary), sourceHashes,
     source: prior?.summaryHash === digest(summary) ? prior.source : acceptedSource,
-    ...(parsed._conversationPolicy === "continuity-first" ? {
-      protectedScope: parsed._continuityScope, threadHash: digest(identity.threadId),
-    } : {}),
   });
 }
 
@@ -94,7 +74,11 @@ export function isAcceptedCompactionContinuation(
   identity: ChatGptTurnIdentity,
   source: ChatGptTurnUserRevision,
 ): boolean {
-  return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(parsed, source)) === true;
+  if (parsed._conversationPolicy === "continuity-first") {
+    return selectContinuityCheckpoint(parsed, identity)?.checkpoint.sourceRepresentationDigests
+      ?.includes(continuitySourceRepresentationDigest(parsed, source)) === true;
+  }
+  return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(source)) === true;
 }
 
 /** Native compaction may retain only its summary; recover the task solely from our completed handoff. */
@@ -102,6 +86,11 @@ export function recoverCompactionInstruction(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
 ): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
+  if (parsed._conversationPolicy === "continuity-first") {
+    const selected = selectContinuityCheckpoint(parsed, identity);
+    return selected?.checkpoint.sourceInstruction
+      ? { source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex } : undefined;
+  }
   const accepted = acceptedCheckpoint(parsed, identity);
   return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;
 }
@@ -139,9 +128,7 @@ function acceptsSummary(key: string, checkpoint: CompletedCheckpoint, summary: s
   if (digest(summary) !== checkpoint.summaryHash) return false;
   // A long-running continuation does not become invalid merely because time passed. Keep the
   // bounded registry ordered by actual use instead of expiring a still-active native turn.
-  if (!checkpoint.protectedScope) {
-    checkpoints.delete(key);
-    checkpoints.set(key, checkpoint);
-  }
+  checkpoints.delete(key);
+  checkpoints.set(key, checkpoint);
   return true;
 }

@@ -19,6 +19,7 @@ import {
   withCompactionAbort,
 } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { CompactionTransactionStore } from "../src/adapters/chatgpt-web/compaction-transaction";
+import { rememberCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
 import {
   chatGptConversationKey,
   retainedConversationResumeRequest,
@@ -27,7 +28,8 @@ import {
   chatGptWebExecutionNamespace,
   createChatGptWebAdapter,
 } from "../src/adapters/chatgpt-web/index";
-import { SUMMARY_PREFIX } from "../src/responses/compaction";
+import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
+import { extractChatGptTurnIdentity, extractChatGptCompactionSourceRevision } from "../src/adapters/chatgpt-web/environment";
 import {
   ChatGptTextFeed,
   ChatGptTraceFeed,
@@ -146,6 +148,22 @@ test("one browser conversation spans native turns and rotates only at compaction
     content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\ncheckpoint` }],
   });
   expect(chatGptConversationKey(v1Compact, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+});
+
+test("ordinary checkpoint recovery remains isolated from continuity commit authority", () => {
+  const compact = request(true);
+  const identity = extractChatGptTurnIdentity(compact);
+  const source = extractChatGptCompactionSourceRevision(compact);
+  const summary = "Ordinary retained source checkpoint.";
+  rememberCompactionContinuation(compact, identity, [source], summary);
+  const continued = { ...compact, _compactionRequest: false, _rawBody: {
+    ...compact._rawBody as object, input: [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary) }],
+  } };
+  expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
+  const continuity = { ...continued, _conversationPolicy: "continuity-first" as const, _continuityScope: "uncommitted-continuity-scope" };
+  rememberCompactionContinuation({ ...compact, ...continuity, _compactionRequest: true }, identity, [source], summary);
+  expect(recoverCompactionInstruction(continuity, identity)).toBeUndefined();
+  expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
 });
 
 test("continuity retains its physical key but partitions execution and round replay by verified revision", () => {

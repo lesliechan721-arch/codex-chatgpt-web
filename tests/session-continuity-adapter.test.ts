@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { cancelStructuredCompactionNativeTurn, existingStructuredCompactionRun } from "../src/adapters/chatgpt-web/compaction-handoff";
-import { isAcceptedCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CONTINUITY_FEATURE, type ContinuityClaim, type ContinuityLease } from "../src/adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
@@ -14,6 +14,7 @@ import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continu
 import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "../src/adapters/chatgpt-web/index";
 import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
+import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
@@ -93,7 +94,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     failHandoffSettlement: false,
     endFailure: false, deferCompletion: false, safeToken: "", started: false,
     handoffSummary: "Verified checkpoint.", invokeSourceTools: false, singleSourceTool: false, parallelSourceTools: false,
-    pauseAfterToolResults: false, repeatManualSourceTool: false,
+    pauseAfterToolResults: false, repeatManualSourceTool: false, nativeSourceTools: false,
     sourceToken: "", toolResults: [] as BrokerToolResult[], modelTask: undefined as Promise<void> | undefined,
     releaseDeferredCompletion: undefined as (() => void) | undefined,
     releaseAfterToolResults: undefined as (() => void) | undefined,
@@ -102,11 +103,23 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     controls.sourceToken = token;
     const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
       provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
-    const invoke = () => callTurnBroker<BrokerToolResult>(provider.chatgptWeb!.brokerSocketPath!, {
-      method: "invoke", bindingId: claim.bindingId, wireName: controls.reviewWireName, freeform: false,
-      registryGeneration: claim.environment.registryGeneration,
-      arguments: { cmd: "fixture-command-not-executed-by-this-test" },
-    }, null);
+    let operationId = 0;
+    const invoke = async (): Promise<BrokerToolResult> => {
+      if (controls.nativeSourceTools) {
+        const reply = await callTurnBroker<NativeOperationReply>(provider.chatgptWeb!.brokerSocketPath!, {
+          method: "native_operation_start", token, contract: manual ? "safe" : "native", nativeWaitProtocol: 1,
+          operationId: ++operationId, entry: "codex_exec",
+          nativeInput: { cmd: "fixture-command-not-executed-by-this-test" },
+        }, null);
+        if (reply.kind !== "result") throw new Error("Fixture operation did not receive its Native result");
+        return reply.result;
+      }
+      return callTurnBroker<BrokerToolResult>(provider.chatgptWeb!.brokerSocketPath!, {
+        method: "invoke", bindingId: claim.bindingId, wireName: controls.reviewWireName, freeform: false,
+        registryGeneration: claim.environment.registryGeneration,
+        arguments: { cmd: "fixture-command-not-executed-by-this-test" },
+      }, null);
+    };
     if (!manual && controls.parallelSourceTools && !controls.singleSourceTool) {
       controls.toolResults.push(...await Promise.all([invoke(), invoke()]));
     } else {
@@ -274,6 +287,358 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   };
   return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker };
 }
+
+for (const manual of [false, true]) for (const replacement of ["empty", "removed"] as const) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} cached ordinary round applies ${replacement} tools before Native admission`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  f.controls.nativeSourceTools = true;
+  const first = f.request();
+  const initial = await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  const binding = source.runtime.continuityBinding!;
+  const generation = source.continuityGenerationValue();
+  const lastUsedAt = binding.lastUsedAt;
+  const lease = structuredClone(binding.lease);
+  const raw = structuredClone(first._rawBody) as { input: unknown[]; tools: unknown[] };
+  raw.tools = replacement === "empty" ? [] : [{ type: "function", name: "remaining_fixture_tool",
+    parameters: { type: "object", properties: {} } }];
+  const replay = parseRequest(raw);
+  replay._conversationPolicy = "continuity-first";
+  expect(await f.run(replay)).toEqual(initial);
+  expect(source.continuityGenerationValue()).toBe(generation);
+  expect(binding.lastUsedAt).toBe(lastUsedAt);
+  expect(binding.lease).toEqual(lease);
+  expect(f.submissions).toHaveLength(1);
+  const start = (operationId: number, cmd = "fixture-command-not-executed-by-this-test") => callTurnBroker<NativeOperationReply>(
+    f.provider.chatgptWeb!.brokerSocketPath!, {
+      method: "native_operation_start", token: f.controls.sourceToken, contract: manual ? "safe" : "native",
+      nativeWaitProtocol: 1, operationId, entry: "codex_exec", nativeInput: { cmd }, waitMs: 1,
+    });
+  expect(await start(2)).toMatchObject({ kind: "result", result: {
+    isError: true, structuredContent: { code: "codex_tool_admission_rejected" },
+  } });
+  expect(await start(1)).toEqual({ kind: "pending", operation_id: 1 });
+  await expect(start(1, "changed-start-description")).rejects.toMatchObject({ code: "codex_tool_operation_conflict" });
+  expect(source.outstanding().map(request => request.callId)).toEqual([call.callId]);
+  const delivery = spyOn(f.broker, "completeTool");
+  try {
+    const result = parseRequest({ ...raw, input: [...raw.input,
+      { type: "function_call_output", call_id: call.callId, output: "Original admitted operation result." }] });
+    result._conversationPolicy = "continuity-first";
+    expect((await f.run(result)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    await f.run(result);
+    expect(delivery).toHaveBeenCalledTimes(1);
+    expect(f.controls.toolResults).toHaveLength(1);
+    expect(f.controls.toolResults[0]?.content).toEqual([{ type: "text", text: "Original admitted operation result." }]);
+    expect(f.submissions).toHaveLength(1);
+  } finally { delivery.mockRestore(); }
+});
+
+for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} rejected current payload leaves the active registry unchanged`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  const update = spyOn(f.broker, "updateEnvironment");
+  try {
+    const raw = structuredClone(first._rawBody) as { input: Array<Record<string, unknown>>; tools: unknown[] };
+    raw.input[0]!.content = "Conflicting current instruction.";
+    raw.tools = [];
+    const rejected = parseRequest(raw);
+    rejected._conversationPolicy = "continuity-first";
+    await expect(f.run(rejected)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(update).not.toHaveBeenCalled();
+    const claim = await callTurnBroker<{ activityId?: string; environment: { tools: Array<{ name: string }> } }>(
+      f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token: f.controls.sourceToken, ...(manual ? { contract: "safe" } : {}) });
+    expect(claim.environment.tools.map(tool => tool.name)).toEqual(["exec_command"]);
+    if (claim.activityId) await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+      method: "activity_complete", token: f.controls.sourceToken, activityId: claim.activityId,
+    });
+    const result = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+      { type: "function_call_output", call_id: call.callId, output: "Accepted original result." }]);
+    expect((await f.run(result)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(f.controls.toolResults).toHaveLength(1);
+  } finally { update.mockRestore(); }
+});
+
+for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} generating reconnect applies its tools without advancing work`, async () => {
+  const f = fixture(manual);
+  f.controls.deferCompletion = true;
+  const first = f.request();
+  const adapter = f.adapter();
+  const abort = new AbortController();
+  await adapter.preflight!(first, { headers: new Headers() });
+  const detached = adapter.runTurn!(first, { headers: new Headers(), abortSignal: abort.signal }, () => {}).catch(error => error);
+  while (!f.controls.started) await Bun.sleep(1);
+  abort.abort();
+  expect(await detached).toMatchObject({ name: "AbortError" });
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const generation = source.continuityGenerationValue();
+  const lastUsedAt = source.runtime.continuityBinding!.lastUsedAt;
+  const raw = { ...first._rawBody as object, tools: [] };
+  const retry = parseRequest(raw);
+  retry._conversationPolicy = "continuity-first";
+  await adapter.preflight!(retry, { headers: new Headers() });
+  const update = spyOn(f.broker, "updateEnvironment");
+  try {
+    const pending = adapter.runTurn!(retry, { headers: new Headers() }, () => {});
+    while (update.mock.calls.length === 0) await Bun.sleep(1);
+    const token = manual ? f.controls.safeToken : f.submissions[0]!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+    expect(await callTurnBroker<NativeOperationReply>(f.provider.chatgptWeb!.brokerSocketPath!, {
+      method: "native_operation_start", token, contract: manual ? "safe" : "native", nativeWaitProtocol: 1,
+      operationId: 1, entry: "codex_exec", nativeInput: { cmd: "not-executed" }, waitMs: 1,
+    })).toMatchObject({ kind: "result", result: { isError: true, structuredContent: { code: "codex_tool_admission_rejected" } } });
+    expect(source.continuityGenerationValue()).toBe(generation);
+    expect(source.runtime.continuityBinding!.lastUsedAt).toBe(lastUsedAt);
+    expect(source.outstanding()).toEqual([]);
+    if (manual) f.broker.completeSafeTurn(token, "Completed response 1.");
+    else f.controls.releaseDeferredCompletion!();
+    await pending;
+    expect(f.submissions).toHaveLength(1);
+  } finally { update.mockRestore(); }
+});
+
+for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} old execution cannot replace the later owner's tools`, async () => {
+  const f = fixture(manual);
+  const first = f.request();
+  const oldEvents = await f.run(first);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const next = f.next(first);
+  await f.run(next);
+  const current = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(next)}`)!;
+  const call = current.outstanding()[0]!;
+  const binding = current.runtime.continuityBinding!;
+  const owner = binding.executionKey;
+  const generation = current.continuityGenerationValue();
+  const lastUsedAt = binding.lastUsedAt;
+  const update = spyOn(f.broker, "updateEnvironment");
+  try {
+    const replay = parseRequest({ ...first._rawBody as object, tools: [] });
+    replay._conversationPolicy = "continuity-first";
+    expect(await f.run(replay)).toEqual(oldEvents);
+    expect(update).not.toHaveBeenCalled();
+    expect(binding.executionKey).toBe(owner);
+    expect(current.continuityGenerationValue()).toBe(generation);
+    expect(binding.lastUsedAt).toBe(lastUsedAt);
+    const claim = await callTurnBroker<{ activityId?: string; environment: { tools: Array<{ name: string }> } }>(
+      f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token: f.controls.sourceToken, ...(manual ? { contract: "safe" } : {}) });
+    expect(claim.environment.tools.map(tool => tool.name)).toEqual(["exec_command"]);
+    if (claim.activityId) await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+      method: "activity_complete", token: f.controls.sourceToken, activityId: claim.activityId,
+    });
+    const result = f.request("", "turn-next", [...(next._rawBody as { input: unknown[] }).input,
+      { type: "function_call_output", call_id: call.callId, output: "Later owner's result." }]);
+    expect((await f.run(result)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(f.controls.toolResults).toHaveLength(1);
+    expect(f.submissions).toHaveLength(2);
+  } finally { update.mockRestore(); }
+});
+
+test("registry replay: a delayed old update cannot replace the new owner's discovery", async () => {
+  const f = fixture(true);
+  f.controls.deferCompletion = true;
+  const tools = [{ type: "tool_search", parameters: { type: "object" } }];
+  const first = parseRequest({ ...f.request()._rawBody as object, tools });
+  first._conversationPolicy = "continuity-first";
+  let release!: () => void;
+  let entered!: () => void;
+  const applied = new Promise<void>(resolve => { entered = resolve; });
+  const originalUpdate = f.broker.updateEnvironment.bind(f.broker);
+  let paused = false;
+  // DEV owner IPC can apply the update before its response reaches the Adapter.
+  const update = spyOn(f.broker, "updateEnvironment").mockImplementation(async (token, environment) => {
+    originalUpdate(token, environment);
+    if (!paused) {
+      paused = true;
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+    }
+  });
+  let oldRun: Promise<AdapterEvent[]> | undefined;
+  try {
+    oldRun = f.run(first);
+    await applied;
+    while (!f.controls.started) await Bun.sleep(1);
+    const oldSource = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+    f.broker.completeSafeTurn(f.controls.safeToken, "Old ordinary answer.");
+    await oldSource.browserOutcome;
+    await oldSource.physicalSettlement;
+    const binding = oldSource.runtime.continuityBinding!;
+    f.controls.deferCompletion = false;
+    f.controls.invokeSourceTools = true;
+    f.controls.singleSourceTool = true;
+    f.controls.reviewWireName = "tool_search";
+    const current = parseRequest({ ...f.next(first)._rawBody as object, tools });
+    current._conversationPolicy = "continuity-first";
+    expect((await f.run(current)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+    const currentSource = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(current)}`)!;
+    const call = currentSource.outstanding()[0]!;
+    const discovered = { type: "function", name: "new_owner_discovered", parameters: { type: "object", properties: {} } };
+    const terminal = parseRequest({ ...current._rawBody as object, input: [...(current._rawBody as { input: unknown[] }).input,
+      { type: "tool_search_output", call_id: call.callId, status: "completed", tools: [discovered] }] });
+    terminal._conversationPolicy = "continuity-first";
+    expect((await f.run(terminal)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(binding.discoveredTools?.map(tool => tool.name)).toEqual(["new_owner_discovered"]);
+    const newOwnerKey = binding.executionKey;
+    const generation = currentSource.continuityGenerationValue();
+    const lastUsedAt = binding.lastUsedAt;
+    const lease = structuredClone(binding.lease);
+    release();
+    const oldEvents = await oldRun;
+    expect(oldEvents).toContainEqual({ type: "text_delta", text: "Old ordinary answer.", phase: "final_answer" });
+    expect(oldEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(binding.executionKey).toBe(newOwnerKey);
+    expect(binding.discoveredTools?.map(tool => tool.name)).toEqual(["new_owner_discovered"]);
+    expect(currentSource.continuityGenerationValue()).toBe(generation);
+    expect(binding.lastUsedAt).toBe(lastUsedAt);
+    expect(binding.lease).toEqual(lease);
+    expect(f.controls.toolResults).toHaveLength(1);
+    expect(f.submissions).toHaveLength(2);
+  } finally {
+    release?.();
+    await oldRun?.catch(() => {});
+    update.mockRestore();
+  }
+});
+
+for (const [kind, layout] of [
+  ["plugins.instructions", "merged"], ["plugins.usage_instructions", "merged"], ["apps.instructions", "merged"],
+  ["multi_agent.mode_instructions", "standalone"], ["multi_agent.role_instructions", "standalone"],
+  ["multi_agent.usage_hint", "standalone"], ["token_budget.context_window", "standalone"],
+  ["managed_config.developer_instructions", "standalone"],
+  ["skills.catalog", "merged"], ["skills.instructions", "merged"], ["cloud_skills.instructions", "merged"],
+  ["memories.instructions", "merged"], ["plugins.recommendations", "merged"], ["environments.instructions", "merged"],
+  ["persistent_mode.instructions", "merged"], ["token_budget.context_window_guidance", "merged"],
+  ["tools.deferred_namespaces", "merged"], ["git_attribution.instructions", "merged"], ["model_switch.instructions", "merged"],
+] as const) test(`native prefix: ${kind} survives a new turn and rejects a conflicting retry`, async () => {
+  const f = fixture();
+  const generic = { type: "input_text", text: "Generic native developer instructions." };
+  const target = { type: "input_text", text: `Current ${kind} instructions.` };
+  const targetFirst = kind === "model_switch.instructions";
+  const parts = targetFirst ? [target, generic] : [generic, target];
+  const prefix = { type: "message", role: "developer", id: "native-prefix",
+    content: layout === "merged" ? parts : [target],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first", content_item_kinds: layout === "merged"
+      ? (targetFirst ? [kind, "generic.developer_instructions"] : ["generic.developer_instructions", kind]) : [kind] } };
+  // Source-backed synthetic variants of the rust-v0.159.2 initial developer layout.
+  const prefixes = layout === "standalone" ? [{ ...prefix, id: "native-generic-prefix", content: [generic],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first", content_item_kinds: ["generic.developer_instructions"] } }, prefix] : [prefix];
+  const first = f.request("", "turn-first", [...prefixes, ...(f.request()._rawBody as { input: unknown[] }).input]);
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const next = f.next(first);
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const prompt = f.submissions.at(-1)!.prompt;
+  for (const part of parts) expect(prompt).toContain(part.text);
+  expect(prompt.indexOf(parts[0]!.text)).toBeLessThan(prompt.indexOf(parts[1]!.text));
+  const raw = structuredClone(next._rawBody) as { input: Array<Record<string, unknown>> };
+  const content = raw.input[layout === "standalone" ? 1 : 0]!.content as Array<{ type: string; text: string }>;
+  content[layout === "merged" && !targetFirst ? 1 : 0]!.text = `Changed ${kind} instructions.`;
+  const retry = parseRequest(raw);
+  retry._conversationPolicy = "continuity-first";
+  const update = spyOn(f.broker, "updateEnvironment");
+  try {
+    await expect(f.run(retry)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(update).not.toHaveBeenCalled();
+  } finally { update.mockRestore(); }
+  expect(f.submissions).toHaveLength(2);
+});
+
+test("verified pure environment: a derived no-AGENTS checkpoint continuation stays on the same page", async () => {
+  const codexHome = mkdtempSync("/tmp/cgw-cont-pure-env-home-");
+  cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
+  const f = fixture(false, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410741" });
+  f.provider.chatgptWeb!.toolAuthorityMode = "verified-environment";
+  // Source-backed no-AGENTS variant of the API-key capture, with a synthetic canonical rollout.
+  // The original verified resolver runs unchanged; the page is the existing controlled fixture.
+  const capture = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/session-continuity/current-work-protocol-api-key.json"), "utf8")) as {
+    captured: Array<{ label: string; body: { input: Array<Record<string, any>>; client_metadata: Record<string, string>; [key: string]: unknown } }>;
+  };
+  const sourceTurn = "019cbcc7-31b2-7028-a632-7f8118410742";
+  const compactTurn = "019cbcc7-31b2-7028-a632-7f8118410743";
+  const continuedTurn = "019cbcc7-31b2-7028-a632-7f8118410744";
+  const sourceBody = structuredClone(capture.captured.find(record => record.label === "new-turn")!.body);
+  sourceBody.input = sourceBody.input.filter(item => item.role === "developer" || item.id === "item_4" || item.id === "item_12");
+  const continuedBody = structuredClone(capture.captured.find(record => record.label === "continue")!.body);
+  for (const body of [sourceBody, continuedBody]) for (const item of body.input) {
+    if (Array.isArray(item.content)) {
+      item.content = item.content.filter((part: { text?: string }) => !part.text?.startsWith("# AGENTS.md instructions"));
+    }
+  }
+  expect(JSON.stringify([sourceBody.input, continuedBody.input])).not.toContain("AGENTS_MARKER");
+  const sourceItem = sourceBody.input.find(item => item.id === "item_12")!;
+  const sessionDirectory = join(codexHome, "sessions", "2026", "09", "30");
+  mkdirSync(sessionDirectory, { recursive: true });
+  writeFileSync(join(sessionDirectory, `rollout-2026-09-30T09-00-00-${f.threadId}.jsonl`), [
+    { type: "session_meta", payload: { id: f.threadId, source: "vscode" } },
+    { type: "turn_context", payload: { turn_id: sourceTurn, cwd: "/tmp/cgw-protocol-fixture/workspace",
+      workspace_roots: ["/tmp/cgw-protocol-fixture/workspace"], approval_policy: "never", sandbox_policy: { type: "read-only" },
+      permission_profile: { type: "managed", network: "restricted", file_system: { type: "restricted",
+        entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] } } } },
+    { type: "response_item", payload: { ...sourceItem, internal_chat_message_metadata_passthrough: { turn_id: sourceTurn } } },
+  ].map(item => JSON.stringify(item)).join("\n") + "\n");
+  const metadata = JSON.parse(sourceBody.client_metadata["x-codex-turn-metadata"]!);
+  const options = { model: "gpt-5.6-sol", reasoning: { effort: "low" }, stream: false };
+  const first = parseRequest({ ...sourceBody, ...options, client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+    ...metadata, thread_id: f.threadId, turn_id: sourceTurn, request_kind: "turn",
+  }) } });
+  first._conversationPolicy = "continuity-first";
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const binding = source.runtime.continuityBinding!;
+  const physicalKey = f.submissions[0]!.key;
+  const leaseId = binding.lease!.leaseId;
+  const compact = parseRequest({ ...sourceBody, ...options, input: [...sourceBody.input,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Completed response 1." }] },
+    { type: "message", role: "user", content: COMPACT_PROMPT }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...metadata, thread_id: f.threadId, turn_id: compactTurn,
+      request_kind: "compaction", compaction: { implementation: "responses", strategy: "memento", phase: "standalone_turn" } }) },
+  });
+  compact._conversationPolicy = "continuity-first";
+  compact._compactionRequest = true;
+  compact._compactionOutput = "message";
+  await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolveWithRolloutPublicationRetry(compact);
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing verified compaction summary");
+  expect(compact._chatGptCompactionSourceTurnId).toBe(sourceTurn);
+  expect(binding.checkpoints.size).toBe(1);
+  expect(binding.revision).toBe(1);
+  expect(f.submissions).toHaveLength(2);
+  continuedBody.input.find(item => item.id === "item_18")!.content = [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary.text}` }];
+  const continued = parseRequest({ ...continuedBody, ...options, client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+    ...JSON.parse(continuedBody.client_metadata["x-codex-turn-metadata"]!), thread_id: f.threadId, turn_id: continuedTurn, request_kind: "turn",
+  }) } });
+  continued._conversationPolicy = "continuity-first";
+  const accepted = await f.run(continued);
+  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(3);
+  expect(f.submissions[2]).toMatchObject({ key: physicalKey, reused: true });
+  expect(binding.lease!.leaseId).toBe(leaseId);
+  const prompt = f.submissions[2]!.prompt;
+  for (const marker of ["SYSTEM_MARKER", "DEVELOPER_MARKER", "CONTINUE_MARKER"]) expect(prompt).toContain(marker);
+  for (const marker of ["ORDINARY_MARKER", "NEW_TURN_MARKER", "AGENTS_MARKER"]) expect(prompt).not.toContain(marker);
+  expect(await f.run(structuredClone(continued))).toEqual(accepted);
+  expect(f.submissions).toHaveLength(3);
+  const conflictingRaw = structuredClone(continued._rawBody) as { input: Array<Record<string, any>> };
+  conflictingRaw.input.find(item => item.id === "item_21")!.content[0].text = "Changed current continuation payload.";
+  const conflicting = parseRequest(conflictingRaw);
+  conflicting._conversationPolicy = "continuity-first";
+  const update = spyOn(f.broker, "updateEnvironment");
+  try {
+    await expect(f.run(conflicting)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(update).not.toHaveBeenCalled();
+  } finally { update.mockRestore(); }
+  expect(f.submissions).toHaveLength(3);
+  expect(f.pages.size).toBe(1);
+  expect(binding.revision).toBe(1);
+  expect(binding.checkpoints.size).toBe(1);
+});
 
 function httpFixture(manual = false) {
   const f = fixture(manual);
@@ -2934,6 +3299,145 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(continued._continuityHistoryRevision).toBe(2);
 });
 
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} same-turn identical source text and summary select the explicitly retained source`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const compactActive = async (ordinary: CodexParsedRequest) => {
+    const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(ordinary)}`)!;
+    const call = source.outstanding()[0]!;
+    const compact = f.request("", "turn-first", [
+      ...(ordinary._rawBody as { input: unknown[] }).input,
+      { type: "function_call_output", call_id: call.callId, output: "Accepted exact source result." },
+    ]);
+    compact._compactionRequest = true;
+    const events = await f.run(compact);
+    const summary = events.find(event => event.type === "text_delta");
+    if (summary?.type !== "text_delta") throw new Error("Missing committed checkpoint");
+    return { compact, summary: summary.text };
+  };
+  const a = f.request();
+  await f.run(a);
+  const first = await compactActive(a);
+  const bItem = { type: "message", role: "user", id: "same-turn-source-b", content: "First continuity instruction.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  const b = f.request("", "turn-first", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(first.summary) },
+    ...(a._rawBody as { input: unknown[] }).input, bItem,
+  ]);
+  await f.run(b);
+  const second = await compactActive(b);
+  expect(second.summary).toBe(first.summary);
+  f.controls.invokeSourceTools = false;
+  const continued = f.request("", "turn-first", [bItem,
+    { type: "compaction", encrypted_content: encodeCompactionSummary(second.summary) },
+  ]);
+  bindContinuityRequestScope(continued, chatGptWebExecutionNamespace(f.provider));
+  expect(recoverCompactionInstruction(continued, extractChatGptTurnIdentity(continued))?.source.itemId).toBe(bItem.id);
+  const before = f.submissions.length;
+  const [accepted, concurrentRetry] = await Promise.all([f.run(continued), f.run(structuredClone(continued))]);
+  expect(concurrentRetry).toEqual(accepted);
+  expect(continued._continuityHistoryRevision).toBe(2);
+  expect(await f.run(structuredClone(continued))).toEqual(accepted);
+  expect(f.submissions).toHaveLength(before + 1);
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  expect(binding.checkpoints.size).toBe(2);
+  expect([...binding.checkpoints.values()].find(checkpoint => checkpoint.revision === 2)?.continuationExecutionKey)
+    .toBe(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(continued)}`);
+  expect(await f.run(structuredClone(first.compact))).toEqual(await f.run(first.compact));
+  const stale = f.request("", "turn-first", [
+    ...(a._rawBody as { input: unknown[] }).input,
+    { type: "compaction", encrypted_content: encodeCompactionSummary(first.summary) },
+  ]);
+  await expect(f.run(stale)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const ambiguous = f.request("", "turn-first", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(first.summary) },
+  ]);
+  await expect(f.run(ambiguous)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(before + 1);
+  const next = f.request("", "turn-first", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(second.summary) }, bItem,
+    { type: "message", role: "user", id: "same-turn-current-c", content: "Distinct work after both checkpoints.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } },
+  ]);
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(next._continuityHistoryRevision).toBe(2);
+  expect(f.submissions).toHaveLength(before + 2);
+});
+
+test("real Codex captured active and completed checkpoint-only requests reuse product commits with a fake page", async () => {
+  // This replays real client request structure. Launcher, ChatGPT, and Native execution use the fixture.
+  const captured = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/session-continuity/current-work-protocol-active.json"), "utf8")) as {
+    captured: Array<{ label: string; replay?: boolean; body: { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+      response: { output: Array<{ type: string; encrypted_content?: string }> } }>;
+  };
+  const f = fixture();
+  const checkpointContents = new Map<string, string>();
+  const load = (record: typeof captured.captured[number]) => {
+    const body = structuredClone(record.body);
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, thread_id: f.threadId });
+    for (const item of body.input) if (typeof item.encrypted_content === "string" && checkpointContents.has(item.encrypted_content)) {
+      item.encrypted_content = checkpointContents.get(item.encrypted_content)!;
+    }
+    const parsed = parseRequest({ ...body, model: "gpt-5.6-sol", stream: false });
+    parsed._conversationPolicy = "continuity-first";
+    return parsed;
+  };
+  const ordinary = captured.captured.find(record => record.label === "ordinary" && !record.replay)!;
+  const activeCompact = captured.captured.find(record => record.label === "active-compact")!;
+  const activeContinuation = captured.captured.find(record => record.label === "ordinary"
+    && record.body.input.some(item => item.type === "compaction"))!;
+  f.controls.invokeSourceTools = true;
+  const first = load(ordinary);
+  const initial = await f.run(first);
+  expect(initial.at(-1)).toMatchObject({ type: "done", endTurn: false });
+  expect(await f.run(load(ordinary))).toEqual(initial);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const compact = load(activeCompact);
+  const raw = compact._rawBody as { input: Array<Record<string, unknown>> };
+  const callId = source.outstanding()[0]!.callId;
+  for (const item of raw.input) if (item.call_id) item.call_id = callId;
+  // Reparse after mapping the fake capture's call ID to the local product Broker call.
+  const localCompact = parseRequest({ ...compact._rawBody as object, model: compact.modelId });
+  localCompact._conversationPolicy = "continuity-first";
+  f.controls.handoffSummary = decodeCompactionSummary(activeCompact.response.output[0]!.encrypted_content!)!;
+  const activeSummary = await f.run(localCompact);
+  expect(activeSummary.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const activeSummaryText = activeSummary.find(event => event.type === "text_delta");
+  if (activeSummaryText?.type !== "text_delta") throw new Error("Missing product checkpoint");
+  // The product adds its existing latest-user codec appendix; use that committed encoding.
+  checkpointContents.set(activeCompact.response.output[0]!.encrypted_content!, encodeCompactionSummary(activeSummaryText.text));
+  f.controls.invokeSourceTools = false;
+  const continued = load(activeContinuation);
+  const activeResult = await f.run(continued);
+  expect(activeResult.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(await f.run(load(activeContinuation))).toEqual(activeResult);
+  expect(f.submissions.at(-1)!.prompt).toContain("SYSTEM_MARKER");
+  expect(f.submissions.at(-1)!.prompt).toContain("DEVELOPER_MARKER");
+  expect(f.submissions.at(-1)!.prompt).toContain("# AGENTS.md instructions");
+  expect(f.submissions.at(-1)!.prompt).not.toContain("ORDINARY_MARKER");
+  const next = load(captured.captured.find(record => record.label === "new-turn")!);
+  const nextResult = await f.run(next);
+  const completedCompact = captured.captured.find(record => record.label === "compact")!;
+  f.controls.handoffSummary = decodeCompactionSummary(completedCompact.response.output[0]!.encrypted_content!)!;
+  const completedSummary = await f.run(load(completedCompact));
+  expect(completedSummary.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const completedSummaryText = completedSummary.find(event => event.type === "text_delta");
+  if (completedSummaryText?.type !== "text_delta") throw new Error("Missing completed product checkpoint");
+  checkpointContents.set(completedCompact.response.output[0]!.encrypted_content!, encodeCompactionSummary(completedSummaryText.text));
+  const before = f.submissions.length;
+  const checkpointOnly = captured.captured.find(record => record.label === "checkpoint-only")!;
+  const finalReplay = await f.run(load(checkpointOnly));
+  expect(finalReplay.filter(event => event.type === "text_delta")).toEqual(nextResult.filter(event => event.type === "text_delta"));
+  expect(await f.run(load(checkpointOnly))).toEqual(finalReplay);
+  expect(f.submissions).toHaveLength(before);
+  expect(f.controls.toolResults).toHaveLength(2);
+  expect(f.pages.size).toBe(1);
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  expect(binding.revision).toBe(2);
+  expect(binding.checkpoints.size).toBe(2);
+});
+
 test("Automatic repeated-summary continuation replays the old result round for the same native instruction", async () => {
   const f = fixture();
   f.controls.invokeSourceTools = true;
@@ -3155,7 +3659,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   }
 });
 
-for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} missing instruction predecessor returns a continuity conflict`, async () => {
+// V3 uses explicit new-turn ownership; locating completed predecessors is no longer required.
+for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} owned new-turn input continues without its completed predecessor`, async () => {
   const f = httpFixture(manual);
   expect((await f.send(f.body)).status).toBe(200);
   const response = await f.send({
@@ -3164,9 +3669,17 @@ for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automat
       internal_chat_message_metadata_passthrough: { turn_id: "turn-next" } }],
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-next" }) },
   });
-  expect(response.status).toBe(409);
-  expect(await response.json()).toMatchObject({ error: { code: "continuity_source_unproven" } });
-  expect(f.submissions).toHaveLength(1);
+  expect(response.status).toBe(200);
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions.at(-1)!.prompt).toContain("New instruction with missing predecessor.");
+  const unowned = await f.send({
+    ...f.body,
+    input: [{ type: "message", role: "user", id: "unowned-next", content: "Unowned new instruction." }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-unowned" }) },
+  });
+  expect(unowned.status).toBe(409);
+  expect(await unowned.json()).toMatchObject({ error: { code: "continuity_source_unproven" } });
+  expect(f.submissions).toHaveLength(2);
   expect((await f.send(f.body)).status).toBe(200);
 });
 

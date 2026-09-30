@@ -548,7 +548,9 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("closing a browser trace terminates the active adapter turn and blocks tab resurrection", async () => {
+  for (const delayedUpdate of [false, true]) test(delayedUpdate
+    ? "closing a browser trace terminates while the environment update is pending and blocks tab resurrection"
+    : "closing a browser trace terminates the active adapter turn and blocks tab resurrection", async () => {
     const socketPath = brokerTestEndpoint(`cgw-close-trace-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -557,6 +559,17 @@ describe("ChatGPT outer-native harness v4", () => {
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
+    const broker = TurnBroker.forSocket(socketPath);
+    let updateStarted!: () => void;
+    const updating = new Promise<void>(resolve => { updateStarted = resolve; });
+    let resumeUpdate!: () => void;
+    const updateReleased = new Promise<void>(resolve => { resumeUpdate = resolve; });
+    const originalUpdate = broker.updateEnvironment.bind(broker);
+    const update = delayedUpdate ? spyOn(broker, "updateEnvironment").mockImplementation(async (token, environment) => {
+      originalUpdate(token, environment);
+      updateStarted();
+      await updateReleased;
+    }) : undefined;
     let browserStarts = 0;
     let started!: () => void;
     const browserStarted = new Promise<void>(resolveStarted => { started = resolveStarted; });
@@ -583,7 +596,9 @@ describe("ChatGPT outer-native harness v4", () => {
     try {
       const running = adapter.runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
       await browserStarted;
+      if (delayedUpdate) await updating;
       expect(await chatGptTurnSessions.cancelTrace(traceId)).toBe(1);
+      resumeUpdate();
       await running;
       expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "client_cancelled", retryable: false });
       expect(browserStarts).toBe(1);
@@ -593,6 +608,8 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(replayEvents.at(-1)).toMatchObject({ type: "error", code: "client_cancelled", retryable: false });
       expect(browserStarts).toBe(1);
     } finally {
+      resumeUpdate();
+      update?.mockRestore();
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
       await TurnBroker.forSocket(socketPath).close();

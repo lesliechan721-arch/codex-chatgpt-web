@@ -39,10 +39,15 @@ cannot distinguish the requested work or a new increment from completed history,
 returns `continuity_source_unproven` before submitting it. It does not select the latest revision
 or repeat work to resolve that ambiguity.
 
-The minimal-validation implementation has local automated coverage. Its current independent
-review status is recorded in the [design attachment](dev/session-continuity/minimal-validation.md).
-The real Codex → ChatGPT ordinary/tool-result/compact/continue path and lost-response retries
-remain unverified for this change; local fixtures do not certify that path.
+An explicitly owned new turn can continue without replaying its completed predecessor. The
+current native instruction prefix, including applicable developer and grouped AGENTS instructions,
+remains part of the current payload. An active ordinary retry updates the current advertised tools
+before replaying its response; a removed tool cannot start a new operation.
+
+The [third-version implementation record](dev/session-continuity/current-work-build.md) tracks local
+validation and independent review. [Real Codex protocol samples](dev/session-continuity/current-work-protocol-evidence.md)
+cover a harmless Native command, compaction, continuation and lost-response retries against a fake
+page. The authenticated ChatGPT page path remains unverified for this change.
 
 Zero Risk remains manual. An active response can return a checkpoint only through its existing
 MCP control path. When that response finishes before the control instruction is delivered, the
