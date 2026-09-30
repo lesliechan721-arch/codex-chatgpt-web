@@ -3019,7 +3019,7 @@ test("health and drain/resume stay available when continuity replay tombstones a
     await head.browserOutcome;
     await head.physicalSettlement;
     for (let index = 0; index < 256; index += 1) {
-      binding.ordinaryReplayTombstones.set(`retained-${index}`, 0);
+      binding.ordinaryReplayTombstones.set(`retained-${index}`, { revision: 0 });
     }
 
     now += 31 * 60_000;

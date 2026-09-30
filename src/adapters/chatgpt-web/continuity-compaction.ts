@@ -8,15 +8,20 @@ import { rememberCompactionContinuation, reserveCompactionContinuation } from ".
 import {
   canonicalizeCompactionHandoff, existingStructuredCompactionRun, MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   requestRetainedCompactionHandoff, runStructuredCompactionOnce,
+  retainStructuredCompactionFailure,
   settleActiveCompactionSource, settleActiveZeroRiskCompactionSource, withCompactionAbort,
 } from "./compaction-handoff";
+import type { ContinuityClaim, ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
-import { continuityCheckpointHistoryPositions } from "./continuity-binding";
+import { continuityToolRegistry } from "./continuity-tools";
 import type { PreparedContinuityRequest } from "./continuity-request";
-import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "./environment";
+import { extractChatGptCompactionSourceRevision, extractChatGptCompactV1SourceRevision, extractChatGptTurnIdentity } from "./environment";
 import type { ChatGptWebCapabilities } from "./model";
 import { TurnBroker, type TurnBrokerOwner } from "./turn-broker";
-import { chatGptThreadOwnershipKey, chatGptTurnSessions } from "./turn-execution";
+import {
+  assertContinuitySourceInstructionReplay, assertContinuityToolResultReplayEvidence, chatGptContinuityCompactionRequestDigest,
+  chatGptThreadOwnershipKey, chatGptTurnSessions,
+} from "./turn-execution";
 
 async function readyPage(prepared: PreparedContinuityRequest, allowRunning = false): Promise<void> {
   const { binding } = prepared;
@@ -54,21 +59,48 @@ export function runContinuityCompaction(
   onProgress?: () => void,
 ): Promise<string> {
   const { binding, bindings, executionKey } = prepared;
-  const cached = existingStructuredCompactionRun<string>(executionKey);
-  if (binding.checkpoints.has(executionKey)) {
-    bindings.assertCompactionReplay(binding, executionKey, prepared.revision);
-    if (!cached) throw continuityError("continuity_source_unproven", "The committed result is no longer in the bounded replay cache.");
-    return cached;
-  }
-  if (cached) return cached;
+  const checkpoint = binding.checkpoints.get(executionKey);
+  const replaySourceKey = checkpoint?.sourceExecutionKey ?? prepared.sourceExecutionKey;
+  const replaySource = replaySourceKey ? chatGptTurnSessions.find(replaySourceKey) : undefined;
+  if (checkpoint?.sourceResultReplay) assertContinuityToolResultReplayEvidence(parsed, checkpoint.sourceResultReplay);
+  const resultEvidence = checkpoint?.sourceResultReplay ?? replaySource?.continuityToolResultReplayEvidence(parsed);
+  if (!resultEvidence) throw continuityError("continuity_source_unproven");
+  const requestDigest = chatGptContinuityCompactionRequestDigest(parsed, resultEvidence);
   const identity = extractChatGptTurnIdentity(parsed);
   const handoffTraceId = createHash("sha256").update(`${executionKey}:continuity-handoff`).digest("hex").slice(0, 12);
-  return runStructuredCompactionOnce(executionKey, {
+  const owner = {
     ownerKey: `${namespace}:${chatGptThreadOwnershipKey(parsed)}`,
     traceIds: [createHash("sha256").update(executionKey).digest("hex").slice(0, 12), handoffTraceId],
     nativeThreadId: identity.threadId, nativeTurnId: identity.turnId,
-    retainFailedResult: true,
-  }, async (operatorSignal, retainOwnershipUntil) => {
+    requestDigest,
+  };
+  const cached = existingStructuredCompactionRun<string>(executionKey, requestDigest);
+  if (cached) {
+    const assertCommittedPayload = (): void => {
+      const committed = binding.checkpoints.get(executionKey);
+      if (!committed?.sourceResultReplay || !committed.sourceInstructionReplay) {
+        throw continuityError("continuity_source_unproven", "The retained compaction replay has no local payload comparison evidence.");
+      }
+      assertContinuitySourceInstructionReplay(parsed, committed.sourceInstructionReplay);
+      assertContinuityToolResultReplayEvidence(parsed, committed.sourceResultReplay);
+    };
+    if (checkpoint) {
+      bindings.assertCompactionReplay(binding, executionKey, prepared.revision);
+      assertCommittedPayload();
+    } else {
+      replaySource?.assertContinuitySourceInstruction(parsed);
+      replaySource?.assertContinuityToolResultReplay(parsed);
+    }
+    existingStructuredCompactionRun<string>(executionKey, requestDigest, owner);
+    // A concurrent retry can arrive before the first result batch is accepted under the
+    // source lock. Recheck against its committed evidence before returning the shared summary.
+    return cached.then(summary => { assertCommittedPayload(); return summary; });
+  }
+  if (checkpoint) {
+    bindings.assertCompactionReplay(binding, executionKey, prepared.revision);
+    throw continuityError("continuity_source_unproven", "The committed result is no longer in the bounded replay cache.");
+  }
+  return runStructuredCompactionOnce(executionKey, owner, async (operatorSignal, retainOwnershipUntil) => {
     const sourceExecutionKey = prepared.sourceExecutionKey;
     const source = sourceExecutionKey ? chatGptTurnSessions.find(sourceExecutionKey) : undefined;
     if (!source || !sourceExecutionKey || binding.executionKey !== sourceExecutionKey
@@ -79,8 +111,8 @@ export function runContinuityCompaction(
     const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (!manual && !(broker instanceof TurnBroker)) throw continuityError("continuity_configuration_conflict");
     const sourceRevision = extractChatGptCompactionSourceRevision(parsed);
-    // The recovery table retains one exact source plus bounded hashes and owner metadata.
-    const sourceEvidenceBytes = Buffer.byteLength(JSON.stringify(sourceRevision)) + 512;
+    const sourceInstructionReplay = source.continuitySourceInstructionReplayEvidence();
+    let sourceResultReplay: ContinuityToolResultReplayEvidence | undefined;
     const releaseReservation = reserveCompactionContinuation(parsed, identity);
     let begun = false;
     let noControlDelivered = false;
@@ -100,27 +132,45 @@ export function runContinuityCompaction(
       bindings.acceptCompactionHandoff(binding, executionKey, sourceExecutionKey, canonicalizeCompactionHandoff(parsed, raw));
       reportProgress();
     };
-    retainOwnershipUntil(source.physicalSettlement);
     try {
       if (signal.aborted) throw signal.reason;
-      const claim = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
-      begun = true;
-      try {
-        if (!prepared.verifiedSourceHistory || prepared.verifiedSourceGeneration === undefined) {
+      let claim: ContinuityClaim | undefined;
+      const begin = (): ContinuityClaim => {
+        signal.throwIfAborted();
+        if (prepared.verifiedSourceGeneration === undefined) {
           throw continuityError("continuity_source_unproven");
         }
-        source.assertCompactionSourceHistory(prepared.verifiedSourceHistory, prepared.verifiedSourceGeneration);
-      } catch (error) {
-        bindings.abandonUndeliveredCompaction(binding, executionKey, sourceExecutionKey);
-        begun = false;
-        throw error;
-      }
+        source.assertContinuityCompactionResultBatch(parsed);
+        const resultReplay = source.continuityToolResultReplayEvidence(parsed);
+        source.assertContinuityGeneration(prepared.verifiedSourceGeneration);
+        // The checkpoint budget retains one exact source plus bounded local result comparison data.
+        const sourceEvidenceBytes = Buffer.byteLength(JSON.stringify(sourceRevision))
+          + Buffer.byteLength(JSON.stringify(resultReplay))
+          + Buffer.byteLength(JSON.stringify(sourceInstructionReplay)) + 512;
+        const accepted = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
+        if (source.continuityToolSearchResults(parsed).length > 0) {
+          binding.discoveredTools = continuityToolRegistry(parsed, binding, source).discoveredTools;
+        }
+        sourceResultReplay = resultReplay;
+        begun = true;
+        claim = accepted;
+        retainStructuredCompactionFailure(executionKey);
+        retainOwnershipUntil(source.physicalSettlement);
+        return accepted;
+      };
       let preserveFinalResponse = !source.isActive();
       let rawSummary: string | undefined;
       if (manual) {
         if (source.isActive()) {
-          rawSummary = await withCompactionAbort(settleActiveZeroRiskCompactionSource(parsed, source, broker, signal, reportProgress, acceptHandoff), signal);
+          rawSummary = await source.runExclusive(async () => {
+            begin();
+            return withCompactionAbort(
+              settleActiveZeroRiskCompactionSource(parsed, source, broker, signal, reportProgress, acceptHandoff, true),
+              signal,
+            );
+          });
         } else {
+          await source.runExclusive(async () => { begin(); });
           const outcome = await source.browserOutcome;
           if (outcome.type === "error") throw outcome.error;
           await withCompactionAbort(source.physicalSettlement, signal);
@@ -133,14 +183,22 @@ export function runContinuityCompaction(
         }
       } else {
         if (source.isActive() && source.runtime.mode === "tools") {
-          const settled = await withCompactionAbort(settleActiveCompactionSource(parsed, source, broker as TurnBroker, signal, reportProgress), signal);
+          const settled = await source.runExclusive(async () => {
+            begin();
+            return withCompactionAbort(
+              settleActiveCompactionSource(parsed, source, broker as TurnBroker, signal, reportProgress, true),
+              signal,
+            );
+          });
           preserveFinalResponse = !settled.compactionInstructionDelivered;
         } else {
+          await source.runExclusive(async () => { begin(); });
           const outcome = await source.browserOutcome;
           if (outcome.type === "error") throw outcome.error;
           await withCompactionAbort(source.physicalSettlement, signal);
           preserveFinalResponse = true;
         }
+        if (!claim) throw continuityError("continuity_source_unproven");
         rawSummary = await requestRetainedCompactionHandoff(worker, parsed, source, broker as TurnBroker,
           capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
             claim,
@@ -160,17 +218,19 @@ export function runContinuityCompaction(
       await readyPage(prepared);
       await chatGptTurnSessions.retireContinuityExecution(sourceExecutionKey, source, prepared.conversationKey, preserveFinalResponse);
       if (signal.aborted) throw signal.reason;
+      if (!sourceResultReplay) throw continuityError("continuity_source_unproven");
       bindings.commitCompaction(
         binding,
         executionKey,
         sourceExecutionKey,
         summary,
         preserveFinalResponse,
-        continuityCheckpointHistoryPositions(prepared.verifiedSourceHistory, summary),
+        sourceResultReplay,
+        sourceInstructionReplay,
       );
       // Capacity was reserved before the first control instruction. Only a real committed
       // handoff enters the instruction-recovery table; summary text alone is never authority.
-      rememberCompactionContinuation(parsed, identity, [sourceRevision], summary);
+      rememberCompactionContinuation(parsed, identity, [sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)], summary);
       return summary;
     } catch (error) {
       if (!begun || noControlDelivered) throw error;

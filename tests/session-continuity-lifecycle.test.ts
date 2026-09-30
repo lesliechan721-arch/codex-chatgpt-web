@@ -78,7 +78,7 @@ test("capacity reclaims historical continuity replay without cancelling the curr
   const head = await f.start("current", "page", binding);
   expect(() => f.sessions.assertContinuityThreadAvailable("native-thread", "next")).not.toThrow();
   expect(f.sessions.find("old")).toBeUndefined();
-  expect(binding.ordinaryReplayTombstones.get("old")).toBe(0);
+  expect(binding.ordinaryReplayTombstones.get("old")).toMatchObject({ revision: 0 });
   expect(f.sessions.findConversationHead("page")).toBe(head);
   expect(f.cancelled).toEqual([]);
 });
@@ -98,7 +98,7 @@ test("TTL reclaims historical continuity replay only after retaining its ordinar
     f.sessions.activeCount();
 
     expect(f.sessions.find("old")).toBeUndefined();
-    expect(binding.ordinaryReplayTombstones.get("old")).toBe(0);
+    expect(binding.ordinaryReplayTombstones.get("old")).toMatchObject({ revision: 0 });
     expect(f.sessions.findConversationHead("page")).toBe(head);
     expect(f.cancelled).toEqual([]);
   } finally { clock.mockRestore(); }
@@ -116,7 +116,7 @@ test("TTL observation keeps historical continuity replay and continues pruning w
     const head = await f.start("current", "page", binding);
     await f.start("legacy", "legacy-page");
     for (let index = 0; index < 256; index += 1) {
-      binding.ordinaryReplayTombstones.set(`retained-${index}`, 0);
+      binding.ordinaryReplayTombstones.set(`retained-${index}`, { revision: 0 });
     }
 
     now += 31 * 60_000;
@@ -140,7 +140,7 @@ test("continuity admission still fails when full replay identity storage prevent
     f.bindings.responseReady(binding, "current");
     const head = await f.start("current", "page", binding);
     for (let index = 0; index < 256; index += 1) {
-      binding.ordinaryReplayTombstones.set(`retained-${index}`, 0);
+      binding.ordinaryReplayTombstones.set(`retained-${index}`, { revision: 0 });
     }
 
     now += 31 * 60_000;
@@ -168,9 +168,9 @@ test("continuity admission skips a replay-capacity-blocked history entry when an
     f.bindings.beginResponse(binding, "current");
     f.bindings.responseReady(binding, "current");
     const head = await f.start("current", "page", binding);
-    binding.ordinaryReplayTombstones.set("reclaimable", 0);
+    binding.ordinaryReplayTombstones.set("reclaimable", { revision: 0 });
     for (let index = 0; index < 255; index += 1) {
-      binding.ordinaryReplayTombstones.set(`retained-${index}`, 0);
+      binding.ordinaryReplayTombstones.set(`retained-${index}`, { revision: 0 });
     }
 
     expect(() => f.sessions.assertContinuityThreadAvailable("another-thread", "next")).not.toThrow();

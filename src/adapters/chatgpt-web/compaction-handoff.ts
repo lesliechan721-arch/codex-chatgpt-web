@@ -19,6 +19,7 @@ import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broke
 import type { ChatGptBrowserOutcome, ChatGptTurnSession } from "./turn-execution";
 import type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 import { assertContinuityCompiledInput } from "./continuity-input";
+import { continuityError } from "./continuity-errors";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -161,7 +162,10 @@ function abortReason(signal: AbortSignal): Error {
 
 export function withCompactionAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortReason(signal));
+  if (signal.aborted) {
+    void promise.catch(() => {});
+    return Promise.reject(abortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(abortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
@@ -200,8 +204,9 @@ export async function settleActiveCompactionSource(
   broker: TurnBroker,
   signal?: AbortSignal,
   onProgress?: () => void,
+  alreadyExclusive = false,
 ): Promise<{ answer: string; compactionInstructionDelivered: boolean }> {
-  return source.runExclusive(async () => {
+  const settle = async (): Promise<{ answer: string; compactionInstructionDelivered: boolean }> => {
     if (signal?.aborted) {
       source.cancel(abortReason(signal));
       throw abortReason(signal);
@@ -216,7 +221,9 @@ export async function settleActiveCompactionSource(
       throw new Error("The active ChatGPT compaction source has no MCP tool boundary");
     }
     const outstanding = source.outstanding();
-    const results = currentToolResults(parsed, source);
+    const results = parsed._conversationPolicy === "continuity-first"
+      ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
+      : currentToolResults(parsed, source);
     if (results.size !== outstanding.length) {
       throw new Error(
         `Codex supplied ${results.size} of ${outstanding.length} required tool results for compaction`,
@@ -255,7 +262,8 @@ export async function settleActiveCompactionSource(
     } finally {
       if (token) await broker.revoke(token);
     }
-  });
+  };
+  return alreadyExclusive ? settle() : source.runExclusive(settle);
 }
 
 export async function settleActiveZeroRiskCompactionSource(
@@ -265,9 +273,10 @@ export async function settleActiveZeroRiskCompactionSource(
   signal?: AbortSignal,
   onProgress?: () => void,
   onAcceptedHandoff?: (summary: string) => void,
+  alreadyExclusive = false,
 ): Promise<string | undefined> {
   const compactPrompt = compactionPrompt(parsed);
-  return source.runExclusive(async () => {
+  const settle = async (): Promise<string | undefined> => {
     if (signal?.aborted) {
       source.cancel(abortReason(signal));
       throw abortReason(signal);
@@ -282,7 +291,9 @@ export async function settleActiveZeroRiskCompactionSource(
       throw new Error("The active Zero Risk compaction source has no manual MCP tool boundary");
     }
     const outstanding = source.outstanding();
-    const results = currentToolResults(parsed, source);
+    const results = parsed._conversationPolicy === "continuity-first"
+      ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
+      : currentToolResults(parsed, source);
     if (results.size !== outstanding.length) {
       throw new Error(
         `Codex supplied ${results.size} of ${outstanding.length} required tool results for Zero Risk compaction`,
@@ -327,7 +338,8 @@ export async function settleActiveZeroRiskCompactionSource(
     } finally {
       if (token) await broker.revoke(token);
     }
-  });
+  };
+  return alreadyExclusive ? settle() : source.runExclusive(settle);
 }
 
 export async function requestRetainedCompactionHandoff(
@@ -447,9 +459,9 @@ export async function requestRetainedCompactionHandoff(
 interface CachedCompactionRun {
   createdAt: number;
   ownerKey: string;
-  traceIds: ReadonlySet<string>;
-  nativeThreadId?: string;
-  nativeTurnId?: string;
+  traceIds: Set<string>;
+  nativeTurnIdentities: Set<string>;
+  requestDigest?: string;
   abort: AbortController;
   active: boolean;
   promise: Promise<unknown>;
@@ -469,6 +481,8 @@ export interface StructuredCompactionOwner {
   /** Exact native Codex owner, when supplied by the current Responses request. */
   nativeThreadId?: string;
   nativeTurnId?: string;
+  /** Optional exact semantic payload guard for callers whose work key intentionally omits content. */
+  requestDigest?: string;
   /** A strict failure is replay evidence, never permission to generate another summary. */
   retainFailedResult?: true;
 }
@@ -477,6 +491,7 @@ const structuredCompactionRuns = new Map<string, CachedCompactionRun>();
 const structuredCompactionOwners = new Map<string, Promise<void>>();
 const structuredCompactionInterruptions = new Map<string, StructuredCompactionInterruption>();
 const STRUCTURED_COMPACTION_RUN_TTL_MS = 30 * 60_000;
+const MAX_STRUCTURED_COMPACTION_IDENTITIES = 256;
 
 function nativeTurnIdentityKey(threadId: string, turnId: string): string {
   if (!threadId.trim() || !turnId.trim()) {
@@ -505,6 +520,28 @@ function structuredCompactionInterruption(owner: StructuredCompactionOwner): Err
   )?.reason;
 }
 
+function registerStructuredCompactionOwner(
+  run: Pick<CachedCompactionRun, "ownerKey" | "traceIds" | "nativeTurnIdentities" | "active">,
+  owner: StructuredCompactionOwner,
+): void {
+  if (run.ownerKey !== owner.ownerKey) throw continuityError("continuity_source_unproven");
+  if (!run.active) return;
+  const nativeIdentity = owner.nativeThreadId === undefined && owner.nativeTurnId === undefined
+    ? undefined : nativeTurnIdentityKey(owner.nativeThreadId ?? "", owner.nativeTurnId ?? "");
+  if (run.active && nativeIdentity && !run.nativeTurnIdentities.has(nativeIdentity)) {
+    const interrupted = structuredCompactionInterruption(owner);
+    if (interrupted) throw interrupted;
+  }
+  const traces = new Set(owner.traceIds.filter(traceId => !run.traceIds.has(traceId)));
+  const identityCount = run.traceIds.size + run.nativeTurnIdentities.size + traces.size
+    + (nativeIdentity && !run.nativeTurnIdentities.has(nativeIdentity) ? 1 : 0);
+  if (identityCount > MAX_STRUCTURED_COMPACTION_IDENTITIES) {
+    throw continuityError("continuity_resource_capacity", "The shared compaction cancellation identity registry is full.");
+  }
+  for (const traceId of traces) run.traceIds.add(traceId);
+  if (nativeIdentity) run.nativeTurnIdentities.add(nativeIdentity);
+}
+
 function pruneStructuredCompactionInterruptions(now = Date.now()): void {
   const cutoff = now - STRUCTURED_COMPACTION_RUN_TTL_MS;
   for (const [identity, interruption] of structuredCompactionInterruptions) {
@@ -522,9 +559,24 @@ function pruneStructuredCompactionRuns(): void {
 }
 
 /** Return the canonical result of an exact compact request, even after its source was retired. */
-export function existingStructuredCompactionRun<T = string>(key: string): Promise<T> | undefined {
+export function existingStructuredCompactionRun<T = string>(
+  key: string,
+  requestDigest?: string,
+  owner?: StructuredCompactionOwner,
+): Promise<T> | undefined {
   pruneStructuredCompactionRuns();
-  return structuredCompactionRuns.get(key)?.promise as Promise<T> | undefined;
+  const run = structuredCompactionRuns.get(key);
+  if (run && requestDigest !== undefined && run.requestDigest !== requestDigest) {
+    throw continuityError("continuity_source_unproven", "The compaction request payload conflicts with the retained transaction.");
+  }
+  if (run && owner) registerStructuredCompactionOwner(run, owner);
+  return run?.promise as Promise<T> | undefined;
+}
+
+/** Preserve a failed run only after the caller crossed its irreversible control boundary. */
+export function retainStructuredCompactionFailure(key: string): void {
+  const run = structuredCompactionRuns.get(key);
+  if (run) run.retainFailedResult = true;
 }
 
 export function runStructuredCompactionOnce<T = string>(
@@ -534,9 +586,23 @@ export function runStructuredCompactionOnce<T = string>(
 ): Promise<T> {
   pruneStructuredCompactionRuns();
   const existing = structuredCompactionRuns.get(key);
-  if (existing) return existing.promise as Promise<T>;
+  if (existing) {
+    if (owner.requestDigest !== undefined && existing.requestDigest !== owner.requestDigest) {
+      return Promise.reject(continuityError(
+        "continuity_source_unproven",
+        "The compaction request payload conflicts with the retained transaction.",
+      ));
+    }
+    try { registerStructuredCompactionOwner(existing, owner); }
+    catch (error) { return Promise.reject(error); }
+    return existing.promise as Promise<T>;
+  }
   const interrupted = structuredCompactionInterruption(owner);
   if (interrupted) return Promise.reject(interrupted);
+  const registrations = {
+    ownerKey: owner.ownerKey, traceIds: new Set<string>(), nativeTurnIdentities: new Set<string>(), active: true,
+  };
+  registerStructuredCompactionOwner(registrations, owner);
   const abort = new AbortController();
   const previousOwner = structuredCompactionOwners.get(owner.ownerKey);
   const physicalSettlements: Promise<void>[] = previousOwner ? [previousOwner] : [];
@@ -557,12 +623,9 @@ export function runStructuredCompactionOnce<T = string>(
   });
   const run: CachedCompactionRun = {
     createdAt: Date.now(),
-    ownerKey: owner.ownerKey,
-    traceIds: new Set(owner.traceIds),
-    ...(owner.nativeThreadId ? { nativeThreadId: owner.nativeThreadId } : {}),
-    ...(owner.nativeTurnId ? { nativeTurnId: owner.nativeTurnId } : {}),
+    ...registrations,
+    ...(owner.requestDigest ? { requestDigest: owner.requestDigest } : {}),
     abort,
-    active: true,
     promise,
     settlement: ownerSettlement,
     ...(owner.retainFailedResult ? { retainFailedResult: true } : {}),
@@ -595,8 +658,7 @@ export function cancelStructuredCompactionNativeTurn(
   rememberStructuredCompactionInterruption(threadId, turnId, reason);
   const runs = [...structuredCompactionRuns.values()].filter(run => (
     run.active
-    && run.nativeThreadId === threadId
-    && run.nativeTurnId === turnId
+    && run.nativeTurnIdentities.has(nativeTurnIdentityKey(threadId, turnId))
   ));
   for (const run of runs) {
     if (!run.abort.signal.aborted) run.abort.abort(reason);

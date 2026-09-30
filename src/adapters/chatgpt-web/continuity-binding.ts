@@ -1,13 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import {
-  buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages, SUMMARY_PREFIX,
-} from "../../responses/compaction";
-import type { CodexParsedRequest } from "../../types";
+import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
+import type { CodexParsedRequest, CodexTool } from "../../types";
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
 import { ContinuityRegistrationStore } from "./continuity-registration";
 import { CONTINUITY_IDLE_TTL_MS, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
 import { releaseContinuityContinuationEvidence } from "./compaction-continuation";
+import type { ContinuitySourceInstructionReplayEvidence } from "./turn-execution";
 export { CONTINUITY_IDLE_TTL_MS, CONTINUITY_FEATURE } from "./continuity-contract";
 export type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 
@@ -27,15 +26,20 @@ export interface ContinuityHandoffEvidence {
   summary: string;
 }
 
+export interface ContinuityToolResultReplayEvidence {
+  earlierCallIds?: string[];
+  results: Array<{
+    callId: string;
+    type: string;
+    digest: string;
+  }>;
+}
+
 export interface ContinuityCheckpointCommit extends Omit<ContinuityHandoffEvidence, "key"> {
   revision: number;
   preserveFinalResponse: boolean;
-  historyPositions?: ContinuityHistoryPosition[];
-}
-
-export interface ContinuityHistoryPosition {
-  length: number;
-  digest: string;
+  sourceResultReplay?: ContinuityToolResultReplayEvidence;
+  sourceInstructionReplay?: ContinuitySourceInstructionReplayEvidence;
 }
 
 export interface ContinuityBinding {
@@ -44,6 +48,11 @@ export interface ContinuityBinding {
   readonly owner: string;
   readonly initialExecutionKey: string;
   readonly initialNativeTurnId?: string;
+  /** First request accepted after initial preflight. Retained only while creation is retryable. */
+  initialAcceptedInput?: CodexParsedRequest;
+  initialInstructionPayloadDigest?: string;
+  /** Current locally approved discovery only; released with this live binding. */
+  discoveredTools?: CodexTool[];
   state: "creating" | "running" | "ready" | "compacting" | "lost" | "ended";
   revision: number;
   lastUsedAt: number;
@@ -60,14 +69,20 @@ export interface ContinuityBinding {
   readonly revisionDigests: Map<number, string>;
   readonly revisions: Map<string, number>;
   readonly checkpoints: Map<string, ContinuityCheckpointCommit>;
-  /** Capacity-reclaimed ordinary executions keep only identity and accepted revision. */
-  readonly ordinaryReplayTombstones: Map<string, number>;
+  /** Capacity-reclaimed ordinary executions keep bounded replay and consumed-instruction identity. */
+  readonly ordinaryReplayTombstones: Map<string, {
+    revision: number;
+    instructionIdentity?: string;
+    nativeTurnId?: string;
+  }>;
 }
 
 export function retainContinuityOrdinaryReplayTombstone(
   binding: ContinuityBinding,
   executionKey: string,
   revision: number,
+  instructionIdentity?: string,
+  nativeTurnId?: string,
 ): void {
   if (binding.state === "lost" || binding.state === "ended") return;
   if (!Number.isSafeInteger(revision) || revision < 0 || revision > binding.revision) {
@@ -75,7 +90,21 @@ export function retainContinuityOrdinaryReplayTombstone(
   }
   const existing = binding.ordinaryReplayTombstones.get(executionKey);
   if (existing !== undefined) {
-    if (existing !== revision) throw continuityError("continuity_source_unproven");
+    if (existing.revision !== revision
+      || (existing.instructionIdentity !== undefined && instructionIdentity !== undefined
+        && existing.instructionIdentity !== instructionIdentity)
+      || (existing.nativeTurnId !== undefined && nativeTurnId !== undefined
+        && existing.nativeTurnId !== nativeTurnId)) throw continuityError("continuity_source_unproven");
+    if ((instructionIdentity !== undefined && existing.instructionIdentity === undefined)
+      || (nativeTurnId !== undefined && existing.nativeTurnId === undefined)) {
+      binding.ordinaryReplayTombstones.set(executionKey, {
+        revision,
+        ...(instructionIdentity ?? existing.instructionIdentity
+          ? { instructionIdentity: instructionIdentity ?? existing.instructionIdentity }
+          : {}),
+        ...(nativeTurnId ?? existing.nativeTurnId ? { nativeTurnId: nativeTurnId ?? existing.nativeTurnId } : {}),
+      });
+    }
     return;
   }
   if (binding.ordinaryReplayTombstones.size >= MAX_ORDINARY_REPLAY_TOMBSTONES) {
@@ -84,7 +113,11 @@ export function retainContinuityOrdinaryReplayTombstone(
       "The bounded ordinary replay tombstone registry is full; refusing to forget stale revision identity.",
     );
   }
-  binding.ordinaryReplayTombstones.set(executionKey, revision);
+  binding.ordinaryReplayTombstones.set(executionKey, {
+    revision,
+    ...(instructionIdentity ? { instructionIdentity } : {}),
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+  });
 }
 
 export function continuityDigest(value: unknown): string {
@@ -148,21 +181,6 @@ export function continuityCompactionSourceHistory(parsed: CodexParsedRequest): u
     break;
   }
   return source;
-}
-
-/** Exact canonical locations where the committed checkpoint may replace or extend its source. */
-export function continuityCheckpointHistoryPositions(
-  source: unknown[],
-  summary: string,
-): ContinuityHistoryPosition[] {
-  const v1 = buildCompactV1Output(extractCompactUserMessages(source), summary).slice(0, -1);
-  const candidates = [source, [], v1];
-  const positions = new Map<string, ContinuityHistoryPosition>();
-  for (const candidate of candidates) {
-    const position = { length: candidate.length, digest: continuityDigest(candidate) };
-    positions.set(`${position.length}:${position.digest}`, position);
-  }
-  return [...positions.values()];
 }
 
 /** Live ownership is deliberately separate from durable, content-free registration. */
@@ -259,7 +277,11 @@ export class ContinuityBindings {
       throw continuityError("continuity_session_lost");
     }
     binding.lease = { ...lease };
-    if (binding.state === "creating") binding.state = "running";
+    if (binding.state === "creating") {
+      binding.state = "running";
+      delete binding.initialAcceptedInput;
+      delete binding.initialInstructionPayloadDigest;
+    }
   }
 
   responseReady(binding: ContinuityBinding, executionKey: string, successfulWork = true): void {
@@ -319,7 +341,8 @@ export class ContinuityBindings {
     sourceExecutionKey: string,
     summary: string,
     preserveFinalResponse = false,
-    historyPositions: readonly ContinuityHistoryPosition[] = [],
+    sourceResultReplay?: ContinuityToolResultReplayEvidence,
+    sourceInstructionReplay?: ContinuitySourceInstructionReplayEvidence,
   ): void {
     this.acceptCompactionHandoff(binding, key, sourceExecutionKey, summary);
     const checkpoint = continuityDigest(summary);
@@ -331,7 +354,8 @@ export class ContinuityBindings {
     binding.checkpoints.set(key, {
       sourceRevision, revision: binding.revision, sourceExecutionKey, bytes: accepted.bytes, summary: accepted.summary,
       lease: { ...accepted.lease }, preserveFinalResponse,
-      ...(historyPositions.length > 0 ? { historyPositions: historyPositions.map(position => ({ ...position })) } : {}),
+      ...(sourceResultReplay ? { sourceResultReplay: structuredClone(sourceResultReplay) } : {}),
+      ...(sourceInstructionReplay ? { sourceInstructionReplay: structuredClone(sourceInstructionReplay) } : {}),
     });
     this.checkpointBytes += accepted.bytes - MAX_CHECKPOINT_BYTES;
     binding.compactionKey = undefined;
@@ -389,6 +413,9 @@ export class ContinuityBindings {
   }
 
   private retireCheckpointAuthority(binding: ContinuityBinding): void {
+    delete binding.initialAcceptedInput;
+    delete binding.initialInstructionPayloadDigest;
+    delete binding.discoveredTools;
     releaseContinuityContinuationEvidence(binding.scope, binding.thread);
     binding.evidenceExpiresAt = this.now() + TERMINAL_EVIDENCE_TTL_MS;
     if (binding.compactionKey) {

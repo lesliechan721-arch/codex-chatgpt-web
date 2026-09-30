@@ -27,6 +27,23 @@ the old execution's authority, and commits one new history revision. The page re
 retry can replay an available committed result; it cannot generate a second summary. A summary
 alone never authorizes work, and a control summary does not replace an accepted ordinary answer.
 
+The bridge checks current work against local thread, owner, lease, instruction, tool-batch, and
+revision records. It does not require completed history to match an earlier copy item by item.
+Changes to old text or display metadata do not update the retained ChatGPT page. Send a new
+instruction to correct the task, or use a new thread to rewrite its history. Old tool records
+cannot authorize a tool or supply a result for an outstanding call.
+
+Current instruction identity and payload, result call IDs and types, and compaction source proof
+still have to match. Identical summaries can belong to different revisions. If local records
+cannot distinguish the requested work or a new increment from completed history, the bridge
+returns `continuity_source_unproven` before submitting it. It does not select the latest revision
+or repeat work to resolve that ambiguity.
+
+The minimal-validation implementation has local automated coverage. Its current independent
+review status is recorded in the [design attachment](dev/session-continuity/minimal-validation.md).
+The real Codex → ChatGPT ordinary/tool-result/compact/continue path and lost-response retries
+remain unverified for this change; local fixtures do not certify that path.
+
 Zero Risk remains manual. An active response can return a checkpoint only through its existing
 MCP control path. When that response finishes before the control instruction is delivered, the
 bridge returns `continuity_manual_handoff_required`. It preserves the accepted answer and real

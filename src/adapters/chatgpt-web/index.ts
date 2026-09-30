@@ -47,6 +47,7 @@ import {
 import { ChatGptExternalTurnProgress } from "./turn-progress";
 import { NativeOperationError } from "./native-tool-operations";
 import { continuityError } from "./continuity-errors";
+import { continuityToolRegistry } from "./continuity-tools";
 import { leaveContinuityMode } from "./continuity-lifecycle";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import { assertContinuityCompactionResult, runContinuityCompaction } from "./continuity-compaction";
@@ -1106,6 +1107,9 @@ export function createChatGptWebAdapter(
         if (parsed._conversationPolicy === "continuity-first" && !preparedContinuity.has(parsed)) {
           preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal));
         }
+        if (parsed._conversationPolicy === "continuity-first" && environment) {
+          environment = { ...environment, tools: parsed.context.tools ?? [] };
+        }
         if (parsed._conversationPolicy !== "continuity-first") {
           incoming.abortSignal?.throwIfAborted();
           await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, extractChatGptTurnIdentity(parsed).threadId);
@@ -1488,12 +1492,18 @@ export function createChatGptWebAdapter(
           chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
         }
         const traceId = chatGptWebTraceId(provider, parsed);
+        const retainedContinuitySession = parsed._conversationPolicy === "continuity-first"
+          ? chatGptTurnSessions.find(executionKey)
+          : undefined;
+        const continuityReplay = retainedContinuitySession
+          && retainedContinuitySession.roundCompleted(retainedContinuitySession.continuityRoundKey(parsed))
+          ? retainedContinuitySession : undefined;
         if (parsed._conversationPolicy === "continuity-first") {
           incoming.abortSignal?.throwIfAborted();
-          chatGptTurnSessions.assertContinuityThreadAvailable(nativeIdentity.threadId!, executionKey);
+          if (!continuityReplay) chatGptTurnSessions.assertContinuityThreadAvailable(nativeIdentity.threadId!, executionKey);
         }
         const session = parsed._conversationPolicy === "continuity-first"
-          ? chatGptTurnSessions.getOrCreate(
+          ? continuityReplay ?? chatGptTurnSessions.getOrCreate(
             executionKey,
             () => startRuntime(parsed, environment, traceId, turnCapabilities),
             traceId, ownerKey, nativeTurnId, nativeIdentity.threadId, chatGptInstructionLineage(parsed).current,
@@ -1508,8 +1518,17 @@ export function createChatGptWebAdapter(
           nativeIdentity.threadId,
           chatGptInstructionLineage(parsed),
         );
-        if (parsed._conversationPolicy === "continuity-first") session.acceptCanonicalInput(parsed);
-        const roundKey = chatGptTurnRoundKey(parsed);
+        if (parsed._conversationPolicy === "continuity-first") {
+          const prepared = preparedContinuity.get(parsed);
+          session.acceptCanonicalInput(
+            parsed,
+            prepared?.instructionPrevious,
+            prepared?.allowRetainedSourceInstructionPayload,
+          );
+        }
+        const roundKey = parsed._conversationPolicy === "continuity-first"
+          ? session.continuityRoundKey(parsed)
+          : chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
           // Journal the complete synchronous event batch before touching the HTTP observer. If the
           // observer disconnects midway through emission, an exact reconnect can replay the entire
@@ -1532,8 +1551,14 @@ export function createChatGptWebAdapter(
           session.setFinalEvents(finalReplaySource.eventsForFinalReplay());
           session.setFinalReasoning(finalReplaySource.reasoningForFinalReplay());
         }
+        let continuityAdmissionPending = parsed._conversationPolicy === "continuity-first";
         try {
           await session.runExclusive(async () => {
+            if (parsed._conversationPolicy === "continuity-first"
+              && session.continuityRoundKey(parsed) !== roundKey) {
+              throw continuityError("continuity_source_unproven", "The local work identity changed while this request was waiting for the execution lock.");
+            }
+            continuityAdmissionPending = false;
             const replay = session.roundEvents(roundKey);
             replayEvents(replay, emit);
             if (session.roundCompleted(roundKey)) {
@@ -1593,11 +1618,20 @@ export function createChatGptWebAdapter(
             if (session.runtime.mode === "tools") {
               turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
               if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
+              const binding = preparedContinuity.get(parsed)?.binding;
+              const registry = binding ? continuityToolRegistry(parsed, binding, session) : undefined;
+              if (registry) {
+                parsed.context.tools = registry.tools;
+                environment = { ...environment, tools: registry.tools };
+              }
               await broker.updateEnvironment(turnToken, environment);
+              if (binding && registry) binding.discoveredTools = registry.discoveredTools;
 
               const outstanding = session.outstanding();
               if (outstanding.length > 0) {
-                const results = currentToolResults(parsed, session);
+                const results = parsed._conversationPolicy === "continuity-first"
+                  ? session.acceptContinuityToolResults(parsed)
+                  : currentToolResults(parsed, session);
                 if (results.length === 0) {
                   const reasoning = session.reasoningForOutstandingReplay();
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
@@ -1760,6 +1794,8 @@ export function createChatGptWebAdapter(
             }
           });
         } catch (error) {
+          if (continuityAdmissionPending && error instanceof ChatGptWebAdapterError
+            && error.code === "continuity_source_unproven") throw error;
           if (incoming.abortSignal?.aborted && error instanceof DOMException && error.name === "AbortError") {
             if (session.runtime.manualControl && parsed._conversationPolicy !== "continuity-first") {
               // Zero Risk is user-driven and has no DOM observer that can distinguish continued

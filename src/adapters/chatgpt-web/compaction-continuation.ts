@@ -3,6 +3,7 @@ import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFI
 import type { CodexParsedRequest } from "../../types";
 import type { ChatGptTurnIdentity, ChatGptTurnUserRevision } from "./environment";
 import { continuityError } from "./continuity-errors";
+import { canonicalJson } from "./canonical-json";
 
 interface CompletedCheckpoint {
   summaryHash: string;
@@ -30,8 +31,12 @@ function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
-function sourceDigest(source: ChatGptTurnUserRevision): string {
-  return digest([source.turnId, source.content]);
+function sourceDigest(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
+  return parsed._conversationPolicy === "continuity-first"
+    ? createHash("sha256").update(canonicalJson([source.turnId,
+      source.itemId ? parsed._chatGptMessageIdAliases?.[source.itemId] ?? source.itemId : null,
+      source.content, source.instructionEnvelope ?? { role: "user" }])).digest("hex")
+    : digest([source.turnId, source.content]);
 }
 
 function makeCheckpointRoom(key: string): void {
@@ -68,12 +73,16 @@ export function rememberCompactionContinuation(
   if (!key || !parsed._compactionRequest || !summary || !sources[0]) return;
   makeCheckpointRoom(key);
   const prior = checkpoints.get(key);
+  const acceptedSource = structuredClone(sources[0]);
+  if (parsed._conversationPolicy === "continuity-first" && acceptedSource.itemId) {
+    acceptedSource.itemId = parsed._chatGptMessageIdAliases?.[acceptedSource.itemId] ?? acceptedSource.itemId;
+  }
   const sourceHashes = prior?.summaryHash === digest(summary) ? new Set(prior.sourceHashes) : new Set<string>();
-  for (const source of sources) sourceHashes.add(sourceDigest(source));
+  for (const source of sources) sourceHashes.add(sourceDigest(parsed, source));
   checkpoints.delete(key);
   checkpoints.set(key, {
     summaryHash: digest(summary), sourceHashes,
-    source: prior?.summaryHash === digest(summary) ? prior.source : structuredClone(sources[0]),
+    source: prior?.summaryHash === digest(summary) ? prior.source : acceptedSource,
     ...(parsed._conversationPolicy === "continuity-first" ? {
       protectedScope: parsed._continuityScope, threadHash: digest(identity.threadId),
     } : {}),
@@ -85,7 +94,7 @@ export function isAcceptedCompactionContinuation(
   identity: ChatGptTurnIdentity,
   source: ChatGptTurnUserRevision,
 ): boolean {
-  return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(source)) === true;
+  return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(parsed, source)) === true;
 }
 
 /** Native compaction may retain only its summary; recover the task solely from our completed handoff. */

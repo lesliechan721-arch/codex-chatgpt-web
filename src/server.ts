@@ -14,6 +14,7 @@ import {
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
+  extractChatGptCompactV1SourceRevision,
   isCodexGuardianReviewRequestFromBody,
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
@@ -1086,19 +1087,11 @@ export async function responseRequest(
   let traceId: string | undefined;
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
-      if (parsed._conversationPolicy === "continuity-first" && traceId
-        && response.status === "completed" && Array.isArray(response.output)) {
-        const identity = extractChatGptTurnIdentity(parsed);
-        const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
-        if (!identity.threadId || !identity.turnId || !Array.isArray(input)) {
-          throw new Error("The completed ChatGPT response lost its native continuity identity");
-        }
-        chatGptTurnSessions.recordResponseOutput(identity.threadId, identity.turnId, input, response.output);
-      }
       if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
       return;
     }
-    if (response.status !== "completed") return;
+    // Continuity records both producer representations at commit; cached HTTP reads add none.
+    if (parsed._conversationPolicy === "continuity-first" || response.status !== "completed") return;
     const identity = extractChatGptTurnIdentity(parsed);
     if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
     const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
@@ -1112,15 +1105,9 @@ export async function responseRequest(
          : null);
     if (!summary) return;
     const source = extractChatGptCompactionSourceRevision(parsed);
-    const body = parsed._rawBody as { input?: unknown[] };
     // v1 installs the bounded user-message output, whereas v2 retains the original source.
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
-    const v1Source = extractChatGptCompactionSourceRevision({
-      ...parsed,
-      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(
-        parsed._compactionOutput === "message" ? body.input?.slice(0, -1) : body.input,
-      ), summary) },
-    });
+    const v1Source = extractChatGptCompactV1SourceRevision(parsed, summary);
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
