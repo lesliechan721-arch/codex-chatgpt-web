@@ -16,8 +16,10 @@ import {
   runStructuredCompactionOnce,
   settleActiveCompactionSource,
   settleActiveZeroRiskCompactionSource,
+  withCompactionAbort,
 } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { CompactionTransactionStore } from "../src/adapters/chatgpt-web/compaction-transaction";
+import { rememberCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
 import {
   chatGptConversationKey,
   retainedConversationResumeRequest,
@@ -26,7 +28,8 @@ import {
   chatGptWebExecutionNamespace,
   createChatGptWebAdapter,
 } from "../src/adapters/chatgpt-web/index";
-import { SUMMARY_PREFIX } from "../src/responses/compaction";
+import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
+import { extractChatGptTurnIdentity, extractChatGptCompactionSourceRevision } from "../src/adapters/chatgpt-web/environment";
 import {
   ChatGptTextFeed,
   ChatGptTraceFeed,
@@ -145,6 +148,22 @@ test("one browser conversation spans native turns and rotates only at compaction
     content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\ncheckpoint` }],
   });
   expect(chatGptConversationKey(v1Compact, "provider")).not.toBe(chatGptConversationKey(before, "provider"));
+});
+
+test("ordinary checkpoint recovery remains isolated from continuity commit authority", () => {
+  const compact = request(true);
+  const identity = extractChatGptTurnIdentity(compact);
+  const source = extractChatGptCompactionSourceRevision(compact);
+  const summary = "Ordinary retained source checkpoint.";
+  rememberCompactionContinuation(compact, identity, [source], summary);
+  const continued = { ...compact, _compactionRequest: false, _rawBody: {
+    ...compact._rawBody as object, input: [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary) }],
+  } };
+  expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
+  const continuity = { ...continued, _conversationPolicy: "continuity-first" as const, _continuityScope: "uncommitted-continuity-scope" };
+  rememberCompactionContinuation({ ...compact, ...continuity, _compactionRequest: true }, identity, [source], summary);
+  expect(recoverCompactionInstruction(continuity, identity)).toBeUndefined();
+  expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
 });
 
 test("continuity retains its physical key but partitions execution and round replay by verified revision", () => {
@@ -548,6 +567,137 @@ test("operator cancellation aborts the shared structured compaction owner", asyn
   await expect(run).rejects.toThrow("operator cancelled");
   expect(aborted).toBeTrue();
   expect(existingStructuredCompactionRun(key)).toBeUndefined();
+});
+
+for (const registration of ["run", "cache"] as const) for (const target of ["native", "trace"] as const) {
+  test(`shared compaction ${registration} retry registers its ${target} cancellation identity`, async () => {
+    const key = `shared-cancel-${registration}-${target}-${Date.now()}-${Math.random()}`;
+    const owner = {
+      ownerKey: `owner-${key}`, traceIds: [`trace-original-${key}`],
+      nativeThreadId: `thread-${key}`, nativeTurnId: `turn-original-${key}`, requestDigest: "same-control",
+    };
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const run = runStructuredCompactionOnce(key, owner, signal => new Promise<string>((_resolve, reject) => {
+      started();
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    const outcome = run.catch(error => error);
+    await ready;
+    const retryOwner = { ...owner, traceIds: [`trace-retry-${key}`], nativeTurnId: `turn-retry-${key}` };
+    const retry = registration === "run"
+      ? runStructuredCompactionOnce(key, retryOwner, async () => "must not start")
+      : existingStructuredCompactionRun(key, retryOwner.requestDigest, retryOwner);
+    expect(retry).toBe(run);
+    const reason = new DOMException("Cancel shared retry", "AbortError");
+    const cancelled = target === "native" ? (() => {
+      const cancellation = cancelStructuredCompactionNativeTurn(owner.nativeThreadId, retryOwner.nativeTurnId, reason);
+      return cancellation.settlement.then(() => cancellation.cancelled);
+    })() : cancelStructuredCompactionTrace(retryOwner.traceIds[0]!, reason);
+    expect(await cancelled).toBe(1);
+    expect(await outcome).toBe(reason);
+  });
+}
+
+test("shared compaction rejects an already-interrupted retry identity without cancelling its owner", async () => {
+  const key = `shared-interrupted-retry-${Date.now()}-${Math.random()}`;
+  const owner = {
+    ownerKey: `owner-${key}`, traceIds: [`trace-${key}`],
+    nativeThreadId: `thread-${key}`, nativeTurnId: `turn-original-${key}`, requestDigest: "same-control",
+  };
+  let finish!: () => void;
+  const run = runStructuredCompactionOnce(key, owner, () => new Promise<string>(resolve => {
+    finish = () => resolve("original checkpoint");
+  }));
+  await Bun.sleep(0);
+  const retryOwner = { ...owner, nativeTurnId: `turn-interrupted-${key}` };
+  const reason = new Error("Retry was interrupted before registration");
+  const cancellation = cancelStructuredCompactionNativeTurn(owner.nativeThreadId, retryOwner.nativeTurnId, reason);
+  await cancellation.settlement;
+  await expect(runStructuredCompactionOnce(key, retryOwner, async () => "must not start")).rejects.toBe(reason);
+  expect(() => existingStructuredCompactionRun(key, owner.requestDigest, retryOwner)).toThrow(reason.message);
+  finish();
+  await expect(run).resolves.toBe("original checkpoint");
+});
+
+test("shared compaction cancellation identities are bounded without discarding accepted identities", async () => {
+  const key = `shared-identity-capacity-${Date.now()}-${Math.random()}`;
+  const owner = {
+    ownerKey: `owner-${key}`, traceIds: [`trace-${key}`],
+    nativeThreadId: `thread-${key}`, nativeTurnId: `turn-original-${key}`, requestDigest: "same-control",
+  };
+  const run = runStructuredCompactionOnce(key, owner, signal => new Promise<string>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }));
+  const outcome = run.catch(error => error);
+  await Bun.sleep(0);
+  const retryOwner = { ...owner, nativeTurnId: `turn-retry-${key}` };
+  expect(existingStructuredCompactionRun(key, owner.requestDigest, retryOwner)).toBe(run);
+  expect(() => existingStructuredCompactionRun(key, owner.requestDigest, {
+    ...owner, nativeTurnId: `turn-overflow-${key}`, traceIds: Array.from({ length: 256 }, (_, index) => `trace-extra-${key}-${index}`),
+  })).toThrow("cancellation identity registry is full");
+  const reason = new Error("Cancel an accepted identity after capacity rejection");
+  const cancellation = cancelStructuredCompactionNativeTurn(owner.nativeThreadId, retryOwner.nativeTurnId, reason);
+  await cancellation.settlement;
+  expect(cancellation.cancelled).toBe(1);
+  expect(await outcome).toBe(reason);
+});
+
+test("completed compaction observers do not consume cancellation identity capacity", async () => {
+  const key = `completed-identity-capacity-${Date.now()}-${Math.random()}`;
+  const owner = {
+    ownerKey: `owner-${key}`, traceIds: [`trace-${key}`],
+    nativeThreadId: `thread-${key}`, nativeTurnId: `turn-original-${key}`, requestDigest: "same-control",
+  };
+  let finish!: () => void;
+  let starts = 0;
+  const run = runStructuredCompactionOnce(key, owner, () => new Promise<string>(resolve => {
+    starts++;
+    finish = () => resolve("original checkpoint");
+  }));
+  await Bun.sleep(0);
+  expect(existingStructuredCompactionRun(key, owner.requestDigest, {
+    ...owner, traceIds: [...owner.traceIds, ...Array.from({ length: 254 }, (_, index) => `trace-fill-${key}-${index}`)],
+  })).toBe(run);
+  expect(() => existingStructuredCompactionRun(key, owner.requestDigest, {
+    ...owner, nativeTurnId: `turn-active-overflow-${key}`,
+  })).toThrow("cancellation identity registry is full");
+  finish();
+  await expect(run).resolves.toBe("original checkpoint");
+  await cancelStructuredCompactionNativeTurn(owner.nativeThreadId, owner.nativeTurnId, new Error("Confirm physical settlement")).settlement;
+  for (let index = 0; index < 300; index++) {
+    const observer = { ...owner, traceIds: [`trace-observer-${key}-${index}`], nativeTurnId: `turn-observer-${key}-${index}` };
+    expect(existingStructuredCompactionRun(key, owner.requestDigest, observer)).toBe(run);
+    expect(runStructuredCompactionOnce(key, observer, async () => { starts++; return "must not start"; })).toBe(run);
+  }
+  expect(() => existingStructuredCompactionRun(key, "different-control", owner)).toThrow("payload conflicts");
+  expect(() => existingStructuredCompactionRun(key, owner.requestDigest, { ...owner, ownerKey: "foreign-owner" }))
+    .toThrow("cannot be proved");
+  expect(starts).toBe(1);
+});
+
+test("conflicting shared compaction payloads do not register cancellation identities", async () => {
+  const key = `shared-conflicting-identity-${Date.now()}-${Math.random()}`;
+  const owner = {
+    ownerKey: `owner-${key}`, traceIds: [`trace-${key}`],
+    nativeThreadId: `thread-${key}`, nativeTurnId: `turn-original-${key}`, requestDigest: "accepted-control",
+  };
+  const run = runStructuredCompactionOnce(key, owner, signal => new Promise<string>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }));
+  const outcome = run.catch(error => error);
+  await Bun.sleep(0);
+  const retryOwner = { ...owner, nativeTurnId: `turn-conflict-${key}`, requestDigest: "conflicting-control" };
+  expect(() => existingStructuredCompactionRun(key, retryOwner.requestDigest, retryOwner)).toThrow("payload conflicts");
+  await expect(runStructuredCompactionOnce(key, retryOwner, async () => "must not start"))
+    .rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const rejectedCancellation = cancelStructuredCompactionNativeTurn(owner.nativeThreadId, retryOwner.nativeTurnId, new Error("Rejected retry"));
+  await rejectedCancellation.settlement;
+  expect(rejectedCancellation.cancelled).toBe(0);
+  const reason = new Error("Cleanup accepted owner");
+  const cleanup = cancelStructuredCompactionNativeTurn(owner.nativeThreadId, owner.nativeTurnId, reason);
+  await cleanup.settlement;
+  expect(await outcome).toBe(reason);
 });
 
 test("native interruption before registration prevents the detached compaction from starting", async () => {
@@ -1894,4 +2044,12 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("pre-aborted compaction wait observes an already rejected source promise", async () => {
+  const controller = new AbortController();
+  const reason = new DOMException("Compaction was cancelled before waiting", "AbortError");
+  controller.abort(reason);
+  await expect(withCompactionAbort(Promise.reject(new Error("Source stopped")), controller.signal)).rejects.toBe(reason);
+  await Bun.sleep(0);
 });

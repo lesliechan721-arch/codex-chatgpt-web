@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,14 @@ import {
   MAX_CONTINUITY_REGISTRATIONS,
   MAX_CONTINUITY_REGISTRATION_BYTES,
 } from "../src/adapters/chatgpt-web/continuity-registration";
-import { ContinuityBindings, CONTINUITY_IDLE_TTL_MS, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
+import {
+  ContinuityBindings, CONTINUITY_IDLE_TTL_MS, continuityBindingsFor, continuityDigest,
+  continuitySourceRepresentationDigest, selectContinuityCheckpoint,
+} from "../src/adapters/chatgpt-web/continuity-binding";
+import { parseRequest } from "../src/responses/parser";
+import { encodeCompactionSummary } from "../src/responses/compaction";
+import { continuityCurrentInstructionInput, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, chatGptContinuityInstructionPayloadDigest, continuityInstructionIdentity } from "../src/adapters/chatgpt-web/turn-execution";
 
 const roots: string[] = [];
 const thread = "1".repeat(64);
@@ -19,6 +26,98 @@ function fixture() {
   return { path, store: new ContinuityRegistrationStore(path) };
 }
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
+
+for (const recovery of ["no-checkpoint", "no-match", "distinct-instruction"] as const) test(`request identification stays linear with ${recovery}`, () => {
+  const capture = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/session-continuity/current-work-protocol.json"), "utf8"));
+  const ordinary = capture.captured.find((entry: { label: string; replay?: boolean }) => entry.label === "ordinary" && !entry.replay);
+  const measurements = [100, 200, 400].map(pairs => {
+    const { path, store } = fixture();
+    store.initialize();
+    const bindings = continuityBindingsFor(path);
+    const body = structuredClone(ordinary.body);
+    const current = body.input.pop();
+    const parsedIdentity = extractChatGptTurnIdentity(parseRequest(body));
+    const identity = { ...parsedIdentity, threadId: `linear-identification-${path}` };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ thread_id: identity.threadId, turn_id: identity.turnId });
+    for (let index = 0; index < pairs; index += 1) body.input.push(
+      { type: "message", role: "user", id: `old-${index}`, content: `Completed instruction ${index}`,
+        internal_chat_message_metadata_passthrough: { turn_id: `completed-${index}` } },
+      { type: "message", role: "assistant", content: `Completed answer ${index}` },
+    );
+    const source = { itemId: "checkpoint-source", turnId: "checkpoint-source-turn", content: "Committed source.",
+      instructionEnvelope: { role: "user" } };
+    const summary = "Committed source checkpoint.";
+    if (recovery !== "no-checkpoint") body.input.push({ type: "compaction",
+      encrypted_content: encodeCompactionSummary(recovery === "no-match" ? "Unrelated checkpoint." : summary) });
+    body.input.push(current);
+    const parsed = parseRequest({ ...body, model: "gpt-5.6-sol" });
+    parsed._conversationPolicy = "continuity-first";
+    parsed._continuityScope = scope;
+    parsed._continuityHistoryRevision = 0;
+    const binding = bindings.create(continuityDigest(identity.threadId), scope, "source-execution", continuityDigest(null));
+    if (recovery !== "no-checkpoint") {
+      bindings.acceptLease(binding, { owner: bindings.owner, leaseId: "1".repeat(32), traceId: "2".repeat(12) });
+      bindings.responseReady(binding, "source-execution");
+      bindings.beginCompaction(binding, "compact-execution", "source-execution", 1024);
+      bindings.commitCompaction(binding, "compact-execution", "source-execution", summary, false, undefined, undefined,
+        source, [continuitySourceRepresentationDigest(parsed, source)], identity.turnId);
+    }
+    let reads = 0;
+    const input = (parsed._rawBody as { input: unknown[] }).input;
+    input.forEach((item, index) => Object.defineProperty(input, index, {
+      configurable: true, enumerable: true, get: () => { reads += 1; return item; },
+    }));
+    const registrations = spyOn(bindings.registrations, "get");
+    try {
+      const session = new ChatGptTurnSession({ mode: "read-only", browser: new Promise<string>(() => {}),
+        physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), cancel() {} });
+      const selected = continuityCurrentInstructionInput(parsed);
+      session.acceptCanonicalInput(parsed);
+      session.assertCanonicalReplayInput(parsed);
+      expect(continuityInstructionIdentity(parsed)).toBe(current.id);
+      expect(chatGptContinuityInstructionPayloadDigest(parsed)).toBeDefined();
+      expect(JSON.stringify(selected)).toContain("DEVELOPER_MARKER");
+      expect(JSON.stringify(selected)).toContain("ORDINARY_MARKER");
+      expect(JSON.stringify(selected)).not.toContain("Completed instruction");
+      expect(selectContinuityCheckpoint(parsed, identity)).toBeUndefined();
+      expect(registrations.mock.calls.length).toBeLessThanOrEqual(4);
+      expect(reads).toBeLessThan(input.length * 30);
+      return { size: input.length, reads };
+    } finally { registrations.mockRestore(); }
+  });
+  for (let index = 1; index < measurements.length; index += 1) {
+    expect(measurements[index]!.reads / measurements[index - 1]!.reads).toBeLessThan(2.3);
+  }
+});
+
+test("request checkpoint selection cannot revive a reclaimed authoritative source record", () => {
+  const { path, store } = fixture();
+  store.initialize();
+  const bindings = continuityBindingsFor(path);
+  const identity = { threadId: `record-reclamation-${path}`, turnId: "source-turn" };
+  const source = { itemId: "source-item", turnId: identity.turnId, content: "Full accepted source instruction.",
+    instructionEnvelope: { role: "user" } };
+  const summary = "Committed source checkpoint.";
+  const parsed = parseRequest({ model: "gpt-5.6-sol", input: [
+    { type: "message", role: "user", id: source.itemId, content: source.content,
+      internal_chat_message_metadata_passthrough: { turn_id: identity.turnId } },
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+  ] });
+  parsed._conversationPolicy = "continuity-first";
+  parsed._continuityScope = scope;
+  const binding = bindings.create(continuityDigest(identity.threadId), scope, "source-execution", continuityDigest(null));
+  bindings.acceptLease(binding, { owner: bindings.owner, leaseId: "1".repeat(32), traceId: "2".repeat(12) });
+  bindings.responseReady(binding, "source-execution");
+  bindings.beginCompaction(binding, "compact-execution", "source-execution", Buffer.byteLength(JSON.stringify(source)) + 512);
+  bindings.commitCompaction(binding, "compact-execution", "source-execution", summary, false, undefined, undefined,
+    source, [continuitySourceRepresentationDigest(parsed, source)], identity.turnId);
+  const selected = selectContinuityCheckpoint(parsed, identity)!;
+  expect(selected.checkpoint.sourceInstruction).toEqual(source);
+  expect(selected.checkpoint).toBe(binding.checkpoints.get("compact-execution")!);
+  binding.checkpoints.delete("compact-execution");
+  expect(() => selectContinuityCheckpoint(parsed, identity)).toThrow("no longer retained");
+  expect(selectContinuityCheckpoint(structuredClone(parsed), identity)).toBeUndefined();
+});
 
 test("registration requires controlled initialization and contains no task content", () => {
   const { path, store } = fixture();

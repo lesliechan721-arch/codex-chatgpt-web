@@ -10,6 +10,7 @@ import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adap
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
+import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptDelegatedTurnCapability, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
@@ -19,7 +20,7 @@ import {
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
-import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptDelegatedCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptDelegatedCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
@@ -547,7 +548,9 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("closing a browser trace terminates the active adapter turn and blocks tab resurrection", async () => {
+  for (const delayedUpdate of [false, true]) test(delayedUpdate
+    ? "closing a browser trace terminates while the environment update is pending and blocks tab resurrection"
+    : "closing a browser trace terminates the active adapter turn and blocks tab resurrection", async () => {
     const socketPath = brokerTestEndpoint(`cgw-close-trace-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -556,6 +559,17 @@ describe("ChatGPT outer-native harness v4", () => {
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
+    const broker = TurnBroker.forSocket(socketPath);
+    let updateStarted!: () => void;
+    const updating = new Promise<void>(resolve => { updateStarted = resolve; });
+    let resumeUpdate!: () => void;
+    const updateReleased = new Promise<void>(resolve => { resumeUpdate = resolve; });
+    const originalUpdate = broker.updateEnvironment.bind(broker);
+    const update = delayedUpdate ? spyOn(broker, "updateEnvironment").mockImplementation(async (token, environment) => {
+      originalUpdate(token, environment);
+      updateStarted();
+      await updateReleased;
+    }) : undefined;
     let browserStarts = 0;
     let started!: () => void;
     const browserStarted = new Promise<void>(resolveStarted => { started = resolveStarted; });
@@ -582,7 +596,9 @@ describe("ChatGPT outer-native harness v4", () => {
     try {
       const running = adapter.runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
       await browserStarted;
+      if (delayedUpdate) await updating;
       expect(await chatGptTurnSessions.cancelTrace(traceId)).toBe(1);
+      resumeUpdate();
       await running;
       expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "client_cancelled", retryable: false });
       expect(browserStarts).toBe(1);
@@ -592,6 +608,8 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(replayEvents.at(-1)).toMatchObject({ type: "error", code: "client_cancelled", retryable: false });
       expect(browserStarts).toBe(1);
     } finally {
+      resumeUpdate();
+      update?.mockRestore();
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
       await TurnBroker.forSocket(socketPath).close();
@@ -988,6 +1006,79 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(starts).toBe(1);
     first.setOutstanding([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
     expect(second.outstanding()).toEqual([{ callId: "call_1", wireName: "exec_command", freeform: false, arguments: { cmd: "pwd" } }]);
+  });
+
+  test("continuity tool-batch indexes are reclaimed with the 512-round journal while the current batch stays usable", () => {
+    const session = new ChatGptTurnSession({
+      mode: "tools",
+      token: new Promise<string>(() => {}),
+      externalProgress: new ChatGptExternalTurnProgress(),
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      continuityBinding: { lastUsedAt: Date.now() } as ContinuityBinding,
+      cancel: () => {},
+    });
+    const internals = session as unknown as {
+      rounds: Map<string, unknown>;
+      toolBatches: Map<number, unknown>;
+      toolBatchByCallId: Map<string, unknown>;
+    };
+
+    for (let index = 1; index <= 513; index += 1) {
+      const callId = `continuity-call-${index}`;
+      session.setOutstanding([{ callId, wireName: "exec_command", freeform: false }]);
+      session.markResultDelivered(callId);
+      session.completeRound(`tool-batch:${index}`);
+    }
+
+    expect(internals.rounds.size).toBe(512);
+    expect(internals.toolBatches.size).toBe(512);
+    expect(internals.toolBatchByCallId.has("continuity-call-1")).toBeFalse();
+    expect(internals.toolBatchByCallId.has("continuity-call-2")).toBeTrue();
+
+    session.setOutstanding([{ callId: "continuity-current", wireName: "exec_command", freeform: false }]);
+    session.completeRound("continuity-overflow");
+    expect(internals.toolBatchByCallId.has("continuity-current")).toBeTrue();
+    session.markResultDelivered("continuity-current");
+    expect(session.outstanding()).toHaveLength(0);
+  });
+
+  test("non-continuity rounds do not retain tool-batch indexes past the 512-round journal", () => {
+    const session = new ChatGptTurnSession({
+      mode: "tools",
+      token: new Promise<string>(() => {}),
+      externalProgress: new ChatGptExternalTurnProgress(),
+      browser: new Promise<string>(() => {}),
+      physicalSettlement: new Promise<void>(() => {}),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: () => {},
+    });
+    const internals = session as unknown as {
+      rounds: Map<string, unknown>;
+      toolBatches: Map<number, unknown>;
+      toolBatchByCallId: Map<string, unknown>;
+    };
+
+    for (let index = 1; index <= 513; index += 1) {
+      const callId = `legacy-call-${index}`;
+      session.setOutstanding([{ callId, wireName: "exec_command", freeform: false }]);
+      session.markResultDelivered(callId);
+      session.completeRound(`legacy-result-round-${index}`);
+    }
+
+    expect(internals.rounds.size).toBe(512);
+    expect(internals.toolBatches.size).toBe(0);
+    expect(internals.toolBatchByCallId.size).toBe(0);
+
+    session.setOutstanding([{ callId: "legacy-current", wireName: "exec_command", freeform: false }]);
+    session.completeRound("legacy-overflow");
+    expect(session.outstanding()).toHaveLength(1);
+    expect(internals.toolBatchByCallId.size).toBe(0);
+    session.markResultDelivered("legacy-current");
+    expect(session.outstanding()).toHaveLength(0);
   });
 
   test("waits for completed browser cleanup before starting the next canonical instruction", async () => {

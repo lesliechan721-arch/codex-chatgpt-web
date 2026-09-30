@@ -142,6 +142,23 @@ silently creating another page. That record stores only irreversible indexes and
 state, not content or credentials, and is capped at 10,000 threads / 4 MiB without automatic
 expiry or repair. Checkpoint evidence is capped at 256 entries, 2 MiB each and 24 MiB total.
 
+Within the existing authenticated Codex boundary, continuity trusts the client's current native
+task identity. It does not authenticate completed history against a full saved copy. This permits
+old text and metadata changes, but those changes do not update the retained page and may hide
+external execution that the bridge did not observe. Current instruction payload, delegated
+source proof, local outstanding call IDs/types, accepted result payload, capability, lease, and
+revision conflicts still fail. Historical tool echoes cannot create calls or deliver new results.
+Repeated summaries and unclear instruction ownership stop when local records cannot select one
+work item. Retry comparison records are bounded with their journals or checkpoints; first-input
+capture is released when creation succeeds or the binding becomes terminal.
+
+Continuity source recovery reads one selected committed checkpoint relation. Identical summaries
+cannot merge different source identities or extend the accepted source representations on replay.
+The request's persistent native instruction prefix remains current payload even when its metadata
+records an earlier creation turn; this prompt selection grants no filesystem or tool authority.
+Active ordinary replay updates the current tool registry only after payload and owner validation
+under the execution lock. Earlier execution replay cannot update a later owner's registry.
+
 Continuity's 24-hour ready-page retention is not a capability extension. Native operation
 identity, real tool results, queued/delivered boundaries, completion barriers, cancellation,
 helper liveness and remote idle keep their existing contracts. Healthy continuity pages are not

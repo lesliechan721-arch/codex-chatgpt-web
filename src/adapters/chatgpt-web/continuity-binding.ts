@@ -1,13 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import {
-  buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages, SUMMARY_PREFIX,
-} from "../../responses/compaction";
-import type { CodexParsedRequest } from "../../types";
+import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
+import type { CodexParsedRequest, CodexTool } from "../../types";
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
 import { ContinuityRegistrationStore } from "./continuity-registration";
 import { CONTINUITY_IDLE_TTL_MS, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
-import { releaseContinuityContinuationEvidence } from "./compaction-continuation";
+import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
+import { chatGptTurnSessions, type ContinuitySourceInstructionReplayEvidence } from "./turn-execution";
 export { CONTINUITY_IDLE_TTL_MS, CONTINUITY_FEATURE } from "./continuity-contract";
 export type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 
@@ -27,15 +26,117 @@ export interface ContinuityHandoffEvidence {
   summary: string;
 }
 
+export interface ContinuityToolResultReplayEvidence {
+  earlierCallIds?: string[];
+  results: Array<{
+    callId: string;
+    type: string;
+    digest: string;
+  }>;
+}
+
 export interface ContinuityCheckpointCommit extends Omit<ContinuityHandoffEvidence, "key"> {
   revision: number;
   preserveFinalResponse: boolean;
-  historyPositions?: ContinuityHistoryPosition[];
+  sourceResultReplay?: ContinuityToolResultReplayEvidence;
+  sourceInstructionReplay?: ContinuitySourceInstructionReplayEvidence;
+  sourceInstruction?: ChatGptTurnUserRevision;
+  sourceRepresentationDigests?: readonly string[];
+  continuationNativeTurnId?: string;
+  continuationExecutionKey?: string;
 }
 
-export interface ContinuityHistoryPosition {
-  length: number;
-  digest: string;
+export interface ContinuityCheckpointSelection {
+  binding: ContinuityBinding;
+  key: string;
+  checkpoint: ContinuityCheckpointCommit;
+  summaryIndex: number;
+}
+
+// A request keeps only a pointer to its authoritative commit, never a second source copy.
+const checkpointSelections = new WeakMap<CodexParsedRequest, {
+  input: unknown[] | undefined;
+  scope: string;
+  threadId: string;
+  turnId?: string;
+  selection?: Omit<ContinuityCheckpointSelection, "checkpoint"> & {
+    checkpoint: WeakRef<ContinuityCheckpointCommit>;
+  };
+}>();
+
+export function continuitySourceRepresentationDigest(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
+  return continuityDigest([source.turnId,
+    source.itemId ? parsed._chatGptMessageIdAliases?.[source.itemId] ?? source.itemId : null,
+    source.content, source.instructionEnvelope ?? { role: "user" }]);
+}
+
+/** Summary content filters committed relations; request-carried identity selects the source. */
+export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): ContinuityCheckpointSelection | undefined {
+  if (parsed._conversationPolicy !== "continuity-first" || !parsed._continuityScope || !identity.threadId) return undefined;
+  const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+  const cached = checkpointSelections.get(parsed);
+  if (cached && cached.input === input && cached.scope === parsed._continuityScope
+    && cached.threadId === identity.threadId && cached.turnId === identity.turnId) {
+    const selected = cached.selection;
+    if (!selected) return undefined;
+    const checkpoint = selected.checkpoint.deref();
+    if (selected.binding.state === "lost" || selected.binding.state === "ended") throw continuityError("continuity_session_lost");
+    if (!checkpoint || selected.binding.checkpoints.get(selected.key) !== checkpoint) {
+      throw continuityError("continuity_source_unproven", "The selected checkpoint relation is no longer retained.");
+    }
+    return { ...selected, checkpoint };
+  }
+  const remember = (selection?: ContinuityCheckpointSelection): ContinuityCheckpointSelection | undefined => {
+    checkpointSelections.set(parsed, {
+      input, scope: parsed._continuityScope!, threadId: identity.threadId!, turnId: identity.turnId,
+      ...(selection ? { selection: { ...selection, checkpoint: new WeakRef(selection.checkpoint) } } : {}),
+    });
+    return selection;
+  };
+  const thread = continuityDigest(identity.threadId);
+  let binding: ContinuityBinding | undefined;
+  for (const registry of registries.values()) {
+    const observed = registry.observed(thread);
+    if (observed?.scope === parsed._continuityScope) {
+      binding = registry.lookup(thread, parsed._continuityScope);
+      break;
+    }
+  }
+  if (!binding || !Array.isArray(input)) return remember();
+  const summaries = new Map<string, number>();
+  for (let index = 0; index < input.length; index += 1) {
+    const summary = checkpointSummary(input[index]);
+    if (summary === null) throw continuityError("continuity_source_unproven");
+    if (summary !== undefined) summaries.set(continuityDigest(summary), index);
+  }
+  const candidates = [...binding.checkpoints].flatMap(([key, checkpoint]) => {
+    const summaryIndex = summaries.get(continuityDigest(checkpoint.summary));
+    return summaryIndex === undefined || !checkpoint.sourceInstruction ? [] : [{ binding: binding!, key, checkpoint, summaryIndex }];
+  });
+  if (candidates.length === 0) return remember();
+  const carried = requestCarriedChatGptInstructionRevision(parsed, identity.turnId);
+  const carriedId = carried?.itemId ? parsed._chatGptMessageIdAliases?.[carried.itemId] ?? carried.itemId : undefined;
+  const explicit = carried ? candidates.filter(({ checkpoint }) => (
+    carriedId !== undefined && carriedId === checkpoint.sourceInstructionReplay?.instructionIdentity
+      && (carried.turnId === undefined || carried.turnId === checkpoint.sourceInstruction!.turnId)
+  ) || checkpoint.sourceRepresentationDigests?.includes(continuitySourceRepresentationDigest(parsed, carried))) : [];
+  // A distinct current instruction has its own work identity. It does not need to recover
+  // one of the summary's source instructions; ordinary admission still checks local records.
+  if (explicit.length === 0 && carriedId && carried?.turnId === identity.turnId) return remember();
+  let matching = explicit.length > 0 ? explicit : candidates.filter(({ checkpoint }) => (
+    checkpoint.continuationNativeTurnId === identity.turnId
+  ));
+  if (matching.length > 1) {
+    const terminal = input.findLast(value => value && typeof value === "object"
+      && ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(String((value as Record<string, unknown>).type))) as Record<string, unknown> | undefined;
+    const resultRevision = typeof terminal?.call_id === "string"
+      ? chatGptTurnSessions.continuityToolCallRevision(binding, terminal.call_id) : undefined;
+    if (resultRevision !== undefined) matching = matching.filter(({ checkpoint }) => checkpoint.revision === resultRevision);
+  }
+  if (matching.length > 1) {
+    throw continuityError("continuity_source_unproven", "The request cannot distinguish its committed checkpoint source.");
+  }
+  return remember(matching[0]);
 }
 
 export interface ContinuityBinding {
@@ -44,6 +145,11 @@ export interface ContinuityBinding {
   readonly owner: string;
   readonly initialExecutionKey: string;
   readonly initialNativeTurnId?: string;
+  /** First request accepted after initial preflight. Retained only while creation is retryable. */
+  initialAcceptedInput?: CodexParsedRequest;
+  initialInstructionPayloadDigest?: string;
+  /** Current locally approved discovery only; released with this live binding. */
+  discoveredTools?: CodexTool[];
   state: "creating" | "running" | "ready" | "compacting" | "lost" | "ended";
   revision: number;
   lastUsedAt: number;
@@ -60,14 +166,20 @@ export interface ContinuityBinding {
   readonly revisionDigests: Map<number, string>;
   readonly revisions: Map<string, number>;
   readonly checkpoints: Map<string, ContinuityCheckpointCommit>;
-  /** Capacity-reclaimed ordinary executions keep only identity and accepted revision. */
-  readonly ordinaryReplayTombstones: Map<string, number>;
+  /** Capacity-reclaimed ordinary executions keep bounded replay and consumed-instruction identity. */
+  readonly ordinaryReplayTombstones: Map<string, {
+    revision: number;
+    instructionIdentity?: string;
+    nativeTurnId?: string;
+  }>;
 }
 
 export function retainContinuityOrdinaryReplayTombstone(
   binding: ContinuityBinding,
   executionKey: string,
   revision: number,
+  instructionIdentity?: string,
+  nativeTurnId?: string,
 ): void {
   if (binding.state === "lost" || binding.state === "ended") return;
   if (!Number.isSafeInteger(revision) || revision < 0 || revision > binding.revision) {
@@ -75,7 +187,21 @@ export function retainContinuityOrdinaryReplayTombstone(
   }
   const existing = binding.ordinaryReplayTombstones.get(executionKey);
   if (existing !== undefined) {
-    if (existing !== revision) throw continuityError("continuity_source_unproven");
+    if (existing.revision !== revision
+      || (existing.instructionIdentity !== undefined && instructionIdentity !== undefined
+        && existing.instructionIdentity !== instructionIdentity)
+      || (existing.nativeTurnId !== undefined && nativeTurnId !== undefined
+        && existing.nativeTurnId !== nativeTurnId)) throw continuityError("continuity_source_unproven");
+    if ((instructionIdentity !== undefined && existing.instructionIdentity === undefined)
+      || (nativeTurnId !== undefined && existing.nativeTurnId === undefined)) {
+      binding.ordinaryReplayTombstones.set(executionKey, {
+        revision,
+        ...(instructionIdentity ?? existing.instructionIdentity
+          ? { instructionIdentity: instructionIdentity ?? existing.instructionIdentity }
+          : {}),
+        ...(nativeTurnId ?? existing.nativeTurnId ? { nativeTurnId: nativeTurnId ?? existing.nativeTurnId } : {}),
+      });
+    }
     return;
   }
   if (binding.ordinaryReplayTombstones.size >= MAX_ORDINARY_REPLAY_TOMBSTONES) {
@@ -84,7 +210,11 @@ export function retainContinuityOrdinaryReplayTombstone(
       "The bounded ordinary replay tombstone registry is full; refusing to forget stale revision identity.",
     );
   }
-  binding.ordinaryReplayTombstones.set(executionKey, revision);
+  binding.ordinaryReplayTombstones.set(executionKey, {
+    revision,
+    ...(instructionIdentity ? { instructionIdentity } : {}),
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+  });
 }
 
 export function continuityDigest(value: unknown): string {
@@ -148,21 +278,6 @@ export function continuityCompactionSourceHistory(parsed: CodexParsedRequest): u
     break;
   }
   return source;
-}
-
-/** Exact canonical locations where the committed checkpoint may replace or extend its source. */
-export function continuityCheckpointHistoryPositions(
-  source: unknown[],
-  summary: string,
-): ContinuityHistoryPosition[] {
-  const v1 = buildCompactV1Output(extractCompactUserMessages(source), summary).slice(0, -1);
-  const candidates = [source, [], v1];
-  const positions = new Map<string, ContinuityHistoryPosition>();
-  for (const candidate of candidates) {
-    const position = { length: candidate.length, digest: continuityDigest(candidate) };
-    positions.set(`${position.length}:${position.digest}`, position);
-  }
-  return [...positions.values()];
 }
 
 /** Live ownership is deliberately separate from durable, content-free registration. */
@@ -259,7 +374,11 @@ export class ContinuityBindings {
       throw continuityError("continuity_session_lost");
     }
     binding.lease = { ...lease };
-    if (binding.state === "creating") binding.state = "running";
+    if (binding.state === "creating") {
+      binding.state = "running";
+      delete binding.initialAcceptedInput;
+      delete binding.initialInstructionPayloadDigest;
+    }
   }
 
   responseReady(binding: ContinuityBinding, executionKey: string, successfulWork = true): void {
@@ -319,7 +438,11 @@ export class ContinuityBindings {
     sourceExecutionKey: string,
     summary: string,
     preserveFinalResponse = false,
-    historyPositions: readonly ContinuityHistoryPosition[] = [],
+    sourceResultReplay?: ContinuityToolResultReplayEvidence,
+    sourceInstructionReplay?: ContinuitySourceInstructionReplayEvidence,
+    sourceInstruction?: ChatGptTurnUserRevision,
+    sourceRepresentationDigests?: readonly string[],
+    continuationNativeTurnId?: string,
   ): void {
     this.acceptCompactionHandoff(binding, key, sourceExecutionKey, summary);
     const checkpoint = continuityDigest(summary);
@@ -331,7 +454,10 @@ export class ContinuityBindings {
     binding.checkpoints.set(key, {
       sourceRevision, revision: binding.revision, sourceExecutionKey, bytes: accepted.bytes, summary: accepted.summary,
       lease: { ...accepted.lease }, preserveFinalResponse,
-      ...(historyPositions.length > 0 ? { historyPositions: historyPositions.map(position => ({ ...position })) } : {}),
+      ...(sourceResultReplay ? { sourceResultReplay: structuredClone(sourceResultReplay) } : {}),
+      ...(sourceInstructionReplay ? { sourceInstructionReplay: structuredClone(sourceInstructionReplay) } : {}),
+      ...(sourceInstruction ? { sourceInstruction: structuredClone(sourceInstruction),
+        sourceRepresentationDigests: [...sourceRepresentationDigests ?? []], continuationNativeTurnId } : {}),
     });
     this.checkpointBytes += accepted.bytes - MAX_CHECKPOINT_BYTES;
     binding.compactionKey = undefined;
@@ -389,7 +515,9 @@ export class ContinuityBindings {
   }
 
   private retireCheckpointAuthority(binding: ContinuityBinding): void {
-    releaseContinuityContinuationEvidence(binding.scope, binding.thread);
+    delete binding.initialAcceptedInput;
+    delete binding.initialInstructionPayloadDigest;
+    delete binding.discoveredTools;
     binding.evidenceExpiresAt = this.now() + TERMINAL_EVIDENCE_TTL_MS;
     if (binding.compactionKey) {
       if (binding.acceptedHandoff) this.checkpointBytes += binding.acceptedHandoff.bytes - MAX_CHECKPOINT_BYTES;

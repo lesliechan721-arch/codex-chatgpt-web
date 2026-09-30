@@ -27,6 +27,28 @@ the old execution's authority, and commits one new history revision. The page re
 retry can replay an available committed result; it cannot generate a second summary. A summary
 alone never authorizes work, and a control summary does not replace an accepted ordinary answer.
 
+The bridge checks current work against local thread, owner, lease, instruction, tool-batch, and
+revision records. It does not require completed history to match an earlier copy item by item.
+Changes to old text or display metadata do not update the retained ChatGPT page. Send a new
+instruction to correct the task, or use a new thread to rewrite its history. Old tool records
+cannot authorize a tool or supply a result for an outstanding call.
+
+Current instruction identity and payload, result call IDs and types, and compaction source proof
+still have to match. Identical summaries can belong to different revisions. If local records
+cannot distinguish the requested work or a new increment from completed history, the bridge
+returns `continuity_source_unproven` before submitting it. It does not select the latest revision
+or repeat work to resolve that ambiguity.
+
+An explicitly owned new turn can continue without replaying its completed predecessor. The
+current native instruction prefix, including applicable developer and grouped AGENTS instructions,
+remains part of the current payload. An active ordinary retry updates the current advertised tools
+before replaying its response; a removed tool cannot start a new operation.
+
+The [third-version implementation record](dev/session-continuity/current-work-build.md) tracks local
+validation and independent review. [Real Codex protocol samples](dev/session-continuity/current-work-protocol-evidence.md)
+cover a harmless Native command, compaction, continuation and lost-response retries against a fake
+page. The authenticated ChatGPT page path remains unverified for this change.
+
 Zero Risk remains manual. An active response can return a checkpoint only through its existing
 MCP control path. When that response finishes before the control instruction is delivered, the
 bridge returns `continuity_manual_handoff_required`. It preserves the accepted answer and real

@@ -60,6 +60,35 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
 6. Remote/delegated operation keeps the existing native operation identity, queued/delivered tool
    boundaries, cancellation, helper liveness, and remote-idle behavior. A retained page never
    extends a tool capability or authorizes a replay after its exact owner is lost.
+7. Completed-history text, display IDs, and source metadata changes do not change accepted current
+   work or cause extra browser/Native execution. New increments send all current instruction items
+   and attachments, with the required current environment; they never resend completed work.
+   Ambiguous unowned instructions fail before submission. Current payload and result conflicts
+   remain rejected, and changing tool-call echoes never grants authority.
+8. Old result batches replay their own journal after later batches begin. Cross the 512-round
+   bound and verify that reclaimed results fail while ordinary reconnects retain their original
+   events and usage. Concurrent initial requests preserve the first captured prompt. Shared
+   compaction retries register each accepted cancellation identity without generating another
+   summary. Different sources with identical summaries remain distinct; unresolved revision
+   ambiguity stops instead of selecting the latest revision.
+9. Use the target Codex binary with an isolated Responses fixture first, then a harmless tool and
+   authenticated ChatGPT page. Record the binary, authentication path, JSON/SSE and full/previous-
+   response history forms, local/v1/v2 codec coverage, ordinary → tool result → compact → continue,
+   and lost-response retries. Synthetic metadata variants are not real-client certification.
+
+Current-work validation on 2026-09-30 uses
+[the third-version contract](dev/session-continuity/current-work-validation.md). Source recovery now
+uses the selected bounded checkpoint commit, and active ordinary replay updates its current tool
+registry before returning. Current input preserves the real client's persistent instruction prefixes;
+an explicitly owned new turn need not replay its completed predecessor. The
+[implementation record](dev/session-continuity/current-work-build.md) contains current test and
+independent-review results; prior tenth-round totals apply only to the earlier baseline.
+[Protocol evidence](dev/session-continuity/current-work-protocol-evidence.md) records 34 real Codex
+POSTs against a fake page, including a harmless Native command, retry, steering, local/v2 compact,
+and active/completed checkpoint-only requests. V1, JSON, and previous-response history are not
+covered by these real captures. Zero Risk samples cover the model protocol only. Authenticated
+ChatGPT pages, real 24-hour retention, sustained page-memory load, and remote deployment validation
+remain unexecuted for this change.
 
 Keep the component and synthetic evidence with the implementation record, but distinguish it from
 real authenticated ChatGPT results. Any unexecuted platform, 24-hour, resource-load, or remote-idle

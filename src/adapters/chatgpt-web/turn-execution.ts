@@ -1,17 +1,31 @@
 import { createHash } from "node:crypto";
-import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "../../types";
+import { type AdapterEvent, type CodexParsedRequest, type CodexToolResultMessage } from "../../types";
+import { COMPACT_PROMPT, isReadableCompactionSummaryText } from "../../responses/compaction";
+import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
+  chatGptCurrentInstructionIndex,
+  chatGptCurrentInstructionRevision,
+  chatGptInstructionContent,
+  chatGptInstructionEnvelope,
   chatGptTurnUserRevisionHistory,
+  continuityCurrentInstructionInput,
   extractChatGptCompactionSourceRevision,
   extractChatGptTurnIdentity,
   extractChatGptTurnUserRevision,
+  hasNativeChatGptInstruction,
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import { continuityError } from "./continuity-errors";
-import { retainContinuityOrdinaryReplayTombstone, type ContinuityBinding } from "./continuity-binding";
+import {
+  continuityCheckpoint,
+  continuityDigest,
+  retainContinuityOrdinaryReplayTombstone,
+  type ContinuityBinding,
+  type ContinuityToolResultReplayEvidence,
+} from "./continuity-binding";
 import { CONTINUITY_IDLE_TTL_MS } from "./continuity-contract";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
 
@@ -219,8 +233,83 @@ function canonicalMessageId(parsed: CodexParsedRequest, itemId: string | undefin
   return typeof alias === "string" && alias.length > 0 ? alias : itemId;
 }
 
-function canonicalInputDigest(input: unknown[]): string {
-  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+export function continuityInstructionIdentity(parsed: CodexParsedRequest): string {
+  const identity = extractChatGptTurnIdentity(parsed);
+  const revision = chatGptCurrentInstructionRevision(parsed);
+  if (!identity.turnId || !revision) throw continuityError("continuity_source_unproven");
+  return canonicalMessageId(parsed, revision.itemId) ?? `turn:${identity.turnId}`;
+}
+
+export interface ChatGptContinuityInstructionPrevious {
+  instructionIdentity?: string;
+  nativeTurnId?: string;
+  checkpointDigest?: string;
+}
+
+export interface ContinuitySourceInstructionReplayEvidence {
+  instructionIdentity: string;
+  nativeTurnId?: string;
+  previous?: ChatGptContinuityInstructionPrevious;
+  allowRetainedSourceFallback: boolean;
+  contentDigest: string;
+  sourceDigest: string;
+}
+
+function continuityInstructionSelectionPrevious(
+  parsed: CodexParsedRequest,
+  previous?: ChatGptContinuityInstructionPrevious,
+): { instructionIdentity?: string; nativeTurnId?: string; trustedLowerBound?: number } | undefined {
+  if (!previous) return undefined;
+  const selection = {
+    instructionIdentity: previous.instructionIdentity,
+    nativeTurnId: previous.nativeTurnId,
+  };
+  if (!previous.checkpointDigest) return selection;
+  const checkpoint = continuityCheckpoint(parsed);
+  return checkpoint.index >= 0 && checkpoint.digest === previous.checkpointDigest
+    ? { ...selection, trustedLowerBound: checkpoint.index }
+    : selection;
+}
+
+function continuityInstructionPayloadContents(
+  parsed: CodexParsedRequest,
+  previous?: ChatGptContinuityInstructionPrevious,
+  allowRetainedSourceFallback = false,
+): unknown[] {
+  // Later compaction recovery must not remove an instruction from its already accepted work set.
+  const selected = continuityCurrentInstructionInput(
+    parsed,
+    continuityInstructionSelectionPrevious(parsed, previous),
+    !allowRetainedSourceFallback,
+  );
+  const contents = selected.map(value => {
+    const item = rawRecord(value);
+    if (!item) throw continuityError("continuity_source_unproven");
+    return { ...chatGptInstructionEnvelope(item), content: chatGptInstructionContent(item) };
+  });
+  if (hasNativeChatGptInstruction(parsed, selected) || (contents.length > 0 && !allowRetainedSourceFallback)) return contents;
+  if (!allowRetainedSourceFallback) throw continuityError("continuity_source_unproven");
+  const retained = chatGptCurrentInstructionRevision(parsed);
+  if (!retained) throw continuityError("continuity_source_unproven");
+  return [{ ...(retained.instructionEnvelope ?? { role: "user" }), content: retained.content }, ...contents];
+}
+
+export function chatGptContinuityInstructionPayloadDigest(
+  parsed: CodexParsedRequest,
+  previous?: ChatGptContinuityInstructionPrevious,
+  allowRetainedSourceFallback = false,
+): string {
+  const contents = continuityInstructionPayloadContents(parsed, previous, allowRetainedSourceFallback);
+  return continuityInstructionPayloadDigestForContents(parsed, contents);
+}
+
+function continuityInstructionPayloadDigestForContents(parsed: CodexParsedRequest, contents: unknown[]): string {
+  const { reasoning: _reasoning, promptCacheKey: _promptCacheKey, ...options } = parsed.options;
+  const raw = rawRecord(parsed._rawBody);
+  const instructions = typeof raw?.instructions === "string" && raw.instructions.length > 0
+    ? raw.instructions
+    : null;
+  return createHash("sha256").update(canonicalJson({ contents, instructions, options })).digest("hex");
 }
 
 function rawRecord(value: unknown): Record<string, unknown> | undefined {
@@ -229,25 +318,18 @@ function rawRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function activeToolCallMatches(item: Record<string, unknown>, request: BrokerToolRequest): boolean {
-  if (item.call_id !== request.callId) return false;
-  if (item.type === "tool_search_call") {
-    if (request.freeform || request.wireName !== "tool_search") return false;
-    return canonicalJson(item.arguments ?? {}) === canonicalJson(request.arguments ?? {});
-  }
-  const name = typeof item.name === "string" ? item.name : undefined;
-  const namespace = typeof item.namespace === "string" ? item.namespace : undefined;
-  if (!name || namespacedToolName(namespace, name) !== request.wireName) return false;
-  if (request.freeform) {
-    return item.type === "custom_tool_call" && (item.input ?? "") === (request.input ?? "");
-  }
-  if (item.type !== "function_call") return false;
-  let args: unknown = item.arguments ?? {};
-  if (typeof args === "string") {
-    try { args = JSON.parse(args); }
-    catch { return false; }
-  }
-  return canonicalJson(args) === canonicalJson(request.arguments ?? {});
+function rawMessageText(item: Record<string, unknown>): string {
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content)) return "";
+  return item.content.map(value => {
+    const part = rawRecord(value);
+    return typeof part?.text === "string" ? part.text : "";
+  }).join("\n");
+}
+
+function isContinuityCheckpointBoundary(item: Record<string, unknown>): boolean {
+  if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) return true;
+  return item.role === "user" && isReadableCompactionSummaryText(rawMessageText(item));
 }
 
 function activeToolResultMatches(item: Record<string, unknown>, request: BrokerToolRequest): boolean {
@@ -256,18 +338,144 @@ function activeToolResultMatches(item: Record<string, unknown>, request: BrokerT
   return item.type === (request.freeform ? "custom_tool_call_output" : "function_call_output");
 }
 
-function responseOutputDigest(output: unknown[]): string {
-  return canonicalInputDigest(output.map(value => {
-    const item = rawRecord(value);
-    if (!item || !("id" in item)) return value;
-    const { id: _id, ...owned } = item;
-    return owned;
-  }));
+function continuityInstructionContentDigest(
+  parsed: CodexParsedRequest,
+  previous?: ChatGptContinuityInstructionPrevious,
+  allowRetainedSourceFallback = false,
+): string {
+  return createHash("sha256")
+    .update(canonicalJson(continuityInstructionPayloadContents(parsed, previous, allowRetainedSourceFallback)))
+    .digest("hex");
+}
+
+export function assertContinuitySourceInstructionReplay(
+  parsed: CodexParsedRequest,
+  evidence: ContinuitySourceInstructionReplayEvidence,
+): void {
+  if (continuityInstructionContentDigest(parsed, evidence.previous, evidence.allowRetainedSourceFallback)
+    !== evidence.contentDigest) {
+    throw continuityError("continuity_source_unproven", "The compaction source instruction does not match the accepted current work.");
+  }
+}
+
+export function chatGptContinuityCompactionRequestDigest(
+  parsed: CodexParsedRequest,
+  results: ContinuityToolResultReplayEvidence,
+): string {
+  if (!parsed._compactionRequest) throw continuityError("continuity_source_unproven");
+  const source = extractChatGptCompactionSourceRevision(parsed);
+  let control = COMPACT_PROMPT;
+  if (parsed._compactionOutput === "message") {
+    const message = parsed.context.messages.at(-1);
+    if (message?.role !== "user") throw continuityError("continuity_source_unproven");
+    control = typeof message.content === "string"
+      ? message.content
+      : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+    if (!control.trim()) throw continuityError("continuity_source_unproven");
+  }
+  return createHash("sha256").update(canonicalJson({
+    source: { turnId: source.turnId ?? null, itemId: canonicalMessageId(parsed, source.itemId) ?? null, content: source.content },
+    control,
+    results: { results: results.results },
+  })).digest("hex");
+}
+
+function toolResultPayloadDigest(item: Record<string, unknown>): string {
+  const payload = item.type === "tool_search_output"
+    ? {
+      type: item.type,
+      call_id: item.call_id,
+      status: typeof item.status === "string" ? item.status : null,
+      tools: Array.isArray(item.tools) ? item.tools : [],
+    }
+    : {
+      type: item.type,
+      call_id: item.call_id,
+      output: item.output ?? item.content ?? null,
+    };
+  return createHash("sha256").update(canonicalJson(payload)).digest("hex");
+}
+
+export function assertContinuityToolResultReplayEvidence(
+  parsed: CodexParsedRequest,
+  evidence: ContinuityToolResultReplayEvidence,
+): void {
+  const expected = new Map(evidence.results.map(result => [result.callId, result]));
+  if (expected.size !== evidence.results.length) throw continuityError("continuity_source_unproven");
+  const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+  if (!Array.isArray(input)) throw continuityError("continuity_source_unproven");
+  const lowerBound = chatGptCurrentInstructionIndex(parsed) + 1;
+  const seen = new Set<string>();
+  for (let index = input.length - 1; index >= lowerBound; index -= 1) {
+    const item = rawRecord(input[index]);
+    if (!item) continue;
+    if (isContinuityCheckpointBoundary(item)) {
+      if (seen.size === expected.size) break;
+      throw continuityError("continuity_source_unproven", "The retained compaction result batch crosses a committed checkpoint boundary.");
+    }
+    const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+    const outputType = item.type === "function_call_output"
+      || item.type === "custom_tool_call_output"
+      || item.type === "tool_search_output";
+    if (!outputType) {
+      if (callId && expected.has(callId)
+        && !["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type))) {
+        throw continuityError("continuity_source_unproven", `Tool result ${callId} has an invalid result type.`);
+      }
+      continue;
+    }
+    if (!callId) throw continuityError("continuity_source_unproven", "A terminal tool result has no call_id.");
+    const retained = expected.get(callId);
+    if (!retained) {
+      if (seen.size === expected.size && expected.size > 0 && evidence.earlierCallIds?.includes(callId)) break;
+      throw continuityError("continuity_source_unproven", "A terminal tool result does not belong to the retained compaction result batch.");
+    }
+    if (seen.has(callId)) {
+      throw continuityError("continuity_source_unproven", "The retained compaction result batch is duplicated.");
+    }
+    if (item.type !== retained.type || toolResultPayloadDigest(item) !== retained.digest) {
+      throw continuityError("continuity_source_unproven", `Tool result ${callId} conflicts with its first accepted payload.`);
+    }
+    seen.add(callId);
+  }
+  if (seen.size !== expected.size) {
+    throw continuityError(
+      "continuity_source_unproven",
+      `Codex supplied ${seen.size} of ${expected.size} retained compaction tool results.`,
+    );
+  }
+}
+
+interface ContinuityToolBatch {
+  readonly id: number;
+  readonly requests: BrokerToolRequest[];
+  readonly requestById: Map<string, BrokerToolRequest>;
+  readonly resultRoundKey: string;
+  acceptedResultDigests?: Map<string, string>;
+  readonly delivered: Set<string>;
+  readonly previousCallIds: readonly string[];
 }
 
 export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
+  if (parsed._conversationPolicy === "continuity-first") {
+    if (parsed._compactionRequest) {
+      const source = extractChatGptCompactionSourceRevision(parsed);
+      return executionKey(parsed, {
+        threadId: identity.threadId,
+        turnId: source.turnId ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId,
+        purpose: "compaction",
+        instructionId: canonicalMessageId(parsed, source.itemId) ?? `turn:${source.turnId ?? identity.turnId}`,
+      });
+    }
+    return executionKey(parsed, {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+      purpose: "response",
+      instructionId: continuityInstructionIdentity(parsed),
+    });
+  }
   const currentRevision = chatGptTurnUserRevisionHistory(parsed).at(-1);
   return executionKey(parsed, {
     threadId: identity.threadId,
@@ -297,6 +505,15 @@ export function chatGptInstructionLineage(parsed: CodexParsedRequest): ChatGptIn
 export function chatGptTurnRoundKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for round replay");
+  if (parsed._conversationPolicy === "continuity-first") {
+    return executionKey(parsed, {
+      threadId: identity.threadId,
+      turnId: identity.turnId,
+      purpose: parsed._compactionRequest ? "compaction" : "response",
+      round: "ordinary",
+      instructionId: continuityInstructionIdentity(parsed),
+    });
+  }
   const body = parsed._rawBody;
   if (!body || typeof body !== "object" || Array.isArray(body)
     || !Array.isArray((body as { input?: unknown }).input)) {
@@ -340,6 +557,14 @@ export function chatGptCompactionSourceExecutionKey(parsed: CodexParsedRequest):
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
   const source = extractChatGptCompactionSourceRevision(parsed);
+  if (parsed._conversationPolicy === "continuity-first") {
+    return executionKey({ ...parsed, _continuityHistoryRevision: parsed._continuityHistoryRevision }, {
+      threadId: identity.threadId,
+      turnId: source.turnId ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId,
+      purpose: "response",
+      instructionId: canonicalMessageId(parsed, source.itemId) ?? `turn:${source.turnId ?? identity.turnId}`,
+    });
+  }
   return executionKey(parsed, {
     threadId: identity.threadId,
     turnId: source.turnId ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId,
@@ -361,6 +586,14 @@ export function chatGptDelegatedCompactionSourceExecutionKey(parsed: CodexParsed
     return undefined;
   }
   if (!source.turnId || !source.itemId) return undefined;
+  if (parsed._conversationPolicy === "continuity-first") {
+    return executionKey(parsed, {
+      threadId: identity.threadId,
+      turnId: source.turnId,
+      purpose: "response",
+      instructionId: source.itemId,
+    });
+  }
   return executionKey(parsed, {
     threadId: identity.threadId,
     turnId: source.turnId,
@@ -377,7 +610,6 @@ export class ChatGptTurnSession {
   readonly browserOutcome: Promise<ChatGptBrowserOutcome>;
   readonly physicalSettlement: Promise<void>;
   private readonly outstandingById = new Map<string, BrokerToolRequest>();
-  private readonly deliveredResultIds = new Set<string>();
   private outstandingReasoning: string[] = [];
   private finalReasoning: string[] = [];
   private outstandingPrelude: AdapterEvent[] = [];
@@ -386,10 +618,17 @@ export class ChatGptTurnSession {
   private settledPhysical = false;
   private attachedConversationKey: string | undefined;
   private canonicalInputValue?: unknown[];
-  private readonly canonicalInputDigests = new Set<string>();
-  private readonly canonicalInputGenerationByDigest = new Map<string, number>();
-  private canonicalInputGeneration = 0;
-  private readonly responseOutputByGeneration = new Map<number, { length: number; digest: string }>();
+  private acceptedInstructionIdentity?: string;
+  private acceptedInstructionPayloadDigest?: string;
+  private acceptedInstructionContentDigest?: string;
+  private acceptedInstructionSourceDigest?: string;
+  private acceptedInstructionPrevious?: ChatGptContinuityInstructionPrevious;
+  private acceptedInstructionAllowsRetainedSourceFallback = false;
+  private continuityOrdinaryRoundKey?: string;
+  private continuityGeneration = 0;
+  private nextToolBatchId = 1;
+  private readonly toolBatches = new Map<number, ContinuityToolBatch>();
+  private readonly toolBatchByCallId = new Map<string, ContinuityToolBatch>();
   private tail: Promise<void> = Promise.resolve();
   private capabilityRetirementScheduled = false;
   private readonly rounds = new Map<string, {
@@ -458,141 +697,246 @@ export class ChatGptTurnSession {
     return this.settledBrowserOutcome;
   }
 
-  acceptCanonicalInput(parsed: CodexParsedRequest): void {
+  acceptCanonicalInput(
+    parsed: CodexParsedRequest,
+    previous?: ChatGptContinuityInstructionPrevious,
+    allowRetainedSourceFallback = false,
+  ): void {
     const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
     if (!Array.isArray(input)) throw continuityError("continuity_source_unproven");
-    if (!this.canonicalInputValue) {
-      this.canonicalInputValue = structuredClone(input);
-      const digest = canonicalInputDigest(input);
-      this.canonicalInputDigests.add(digest);
-      this.canonicalInputGeneration += 1;
-      this.canonicalInputGenerationByDigest.set(digest, this.canonicalInputGeneration);
-      return;
+    const instructionIdentity = continuityInstructionIdentity(parsed);
+    const acceptedPrevious = this.acceptedInstructionPayloadDigest === undefined
+      ? previous
+      : this.acceptedInstructionPrevious;
+    const acceptedAllowRetainedSourceFallback = this.acceptedInstructionPayloadDigest === undefined
+      ? allowRetainedSourceFallback
+      : this.acceptedInstructionAllowsRetainedSourceFallback;
+    const contents = continuityInstructionPayloadContents(
+      parsed,
+      acceptedPrevious,
+      acceptedAllowRetainedSourceFallback,
+    );
+    const payload = continuityInstructionPayloadDigestForContents(parsed, contents);
+    const content = createHash("sha256").update(canonicalJson(contents)).digest("hex");
+    if (this.acceptedInstructionIdentity !== undefined && this.acceptedInstructionIdentity !== instructionIdentity) {
+      throw continuityError("continuity_source_unproven");
     }
-    const digest = canonicalInputDigest(input);
-    if (this.runtime.continuityBinding?.state === "compacting"
-      && digest !== canonicalInputDigest(this.canonicalInputValue)) {
-      throw continuityError("continuity_source_unproven", "Compaction owns the canonical input boundary.");
+    if (this.acceptedInstructionPayloadDigest !== undefined && this.acceptedInstructionPayloadDigest !== payload) {
+      throw continuityError("continuity_source_unproven", "The accepted native instruction identity now carries a different current payload.");
     }
-    if (this.canonicalInputDigests.has(digest)) return;
-    this.assertCanonicalExtension(input);
+    if (this.acceptedInstructionPayloadDigest === undefined) {
+      this.acceptedInstructionIdentity = instructionIdentity;
+      this.acceptedInstructionPayloadDigest = payload;
+      this.acceptedInstructionContentDigest = content;
+      const source = chatGptCurrentInstructionRevision(parsed)!;
+      this.acceptedInstructionSourceDigest = continuityDigest({ turnId: source.turnId ?? null,
+        ...(source.instructionEnvelope ?? { role: "user" }), content: source.content });
+      this.acceptedInstructionPrevious = previous ? { ...previous } : undefined;
+      this.acceptedInstructionAllowsRetainedSourceFallback = allowRetainedSourceFallback;
+      this.continuityOrdinaryRoundKey = chatGptTurnRoundKey(parsed);
+      this.continuityGeneration += 1;
+    }
     this.canonicalInputValue = structuredClone(input);
-    this.canonicalInputDigests.add(digest);
-    this.canonicalInputGeneration += 1;
-    this.canonicalInputGenerationByDigest.set(digest, this.canonicalInputGeneration);
   }
 
   assertCanonicalReplayInput(parsed: CodexParsedRequest): void {
-    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
-    if (!Array.isArray(input) || !this.canonicalInputValue) throw continuityError("continuity_source_unproven");
-    if (this.canonicalInputDigests.has(canonicalInputDigest(input))) return;
-    this.assertCanonicalExtension(input);
+    if (!this.acceptedInstructionIdentity || !this.acceptedInstructionPayloadDigest || !this.acceptedInstructionContentDigest) {
+      throw continuityError("continuity_source_unproven");
+    }
+    if (continuityInstructionIdentity(parsed) !== this.acceptedInstructionIdentity
+      || chatGptContinuityInstructionPayloadDigest(
+        parsed,
+        this.acceptedInstructionPrevious,
+        this.acceptedInstructionAllowsRetainedSourceFallback,
+      ) !== this.acceptedInstructionPayloadDigest) {
+      throw continuityError("continuity_source_unproven", "The accepted native instruction identity now carries a different current payload.");
+    }
   }
 
-  assertCompactionSourceHistory(input: unknown[], expectedGeneration?: number): number {
-    if (!this.canonicalInputValue) throw continuityError("continuity_source_unproven");
-    if (expectedGeneration !== undefined && expectedGeneration !== this.canonicalInputGeneration) {
-      throw continuityError("continuity_source_unproven", "The compaction source history changed after preflight.");
-    }
-    if (canonicalInputDigest(input) !== canonicalInputDigest(this.canonicalInputValue)) {
-      this.assertCanonicalExtension(input);
-    }
-    return this.canonicalInputGeneration;
+  acceptedContinuityInstructionIdentity(): string | undefined {
+    return this.acceptedInstructionIdentity;
   }
 
-  canonicalInputGenerationFor(input: unknown[]): number | undefined {
-    return this.canonicalInputGenerationByDigest.get(canonicalInputDigest(input));
+  assertContinuitySourceInstruction(parsed: CodexParsedRequest): void {
+    assertContinuitySourceInstructionReplay(parsed, this.continuitySourceInstructionReplayEvidence());
   }
 
-  recordResponseOutput(output: unknown[], generation = this.canonicalInputGeneration): void {
-    const proof = { length: output.length, digest: responseOutputDigest(output) };
-    const existing = this.responseOutputByGeneration.get(generation);
-    if (existing && (existing.length !== proof.length || existing.digest !== proof.digest)) {
-      throw continuityError("continuity_source_unproven", "A replay changed the owned response output.");
+  continuitySourceInstructionReplayEvidence(): ContinuitySourceInstructionReplayEvidence {
+    if (!this.acceptedInstructionIdentity || !this.acceptedInstructionContentDigest || !this.acceptedInstructionSourceDigest) {
+      throw continuityError("continuity_source_unproven");
     }
-    this.responseOutputByGeneration.set(generation, proof);
+    return {
+      instructionIdentity: this.acceptedInstructionIdentity,
+      nativeTurnId: this.nativeTurnId,
+      previous: this.acceptedInstructionPrevious ? { ...this.acceptedInstructionPrevious } : undefined,
+      allowRetainedSourceFallback: this.acceptedInstructionAllowsRetainedSourceFallback,
+      contentDigest: this.acceptedInstructionContentDigest,
+      sourceDigest: this.acceptedInstructionSourceDigest,
+    };
   }
 
-  recordedResponseOutputLength(input: unknown[], offset: number, required = true): number | undefined {
-    const proof = this.responseOutputByGeneration.get(this.canonicalInputGeneration);
-    if (!proof) return undefined;
-    const output = input.slice(offset, offset + proof.length);
-    if (output.length !== proof.length || responseOutputDigest(output) !== proof.digest) {
-      if (!required) return undefined;
-      throw continuityError("continuity_source_unproven", "The retained history does not contain the exact owned response output.");
+  continuityGenerationValue(): number {
+    return this.continuityGeneration;
+  }
+
+  assertContinuityGeneration(expected: number): void {
+    if (expected !== this.continuityGeneration) {
+      throw continuityError("continuity_source_unproven", "The compaction source advanced after preflight.");
     }
-    return proof.length;
+  }
+
+  continuityRoundKey(parsed: CodexParsedRequest): string {
+    return this.continuityToolResultRoundKey(parsed) ?? chatGptTurnRoundKey(parsed);
+  }
+
+  continuityToolResultRoundKey(parsed: CodexParsedRequest): string | undefined {
+    return this.resolveContinuityToolBatch(parsed)?.batch.resultRoundKey;
+  }
+
+  assertContinuityCompactionResultBatch(parsed: CodexParsedRequest): void {
+    const resolved = this.resolveContinuityToolBatch(parsed);
+    const outstanding = this.outstanding();
+    if (outstanding.length === 0) return;
+    if (!resolved || outstanding.some(request => !resolved.batch.requestById.has(request.callId))) {
+      throw continuityError(
+        "continuity_source_unproven",
+        "Active compaction requires one complete terminal result group for the current local tool batch.",
+      );
+    }
+  }
+
+  assertContinuityToolResultReplay(parsed: CodexParsedRequest): void {
+    this.resolveContinuityToolBatch(parsed);
+  }
+
+  continuityToolResultReplayEvidence(parsed: CodexParsedRequest): ContinuityToolResultReplayEvidence {
+    const resolved = this.resolveContinuityToolBatch(parsed);
+    if (!resolved) return { results: [] };
+    return {
+      earlierCallIds: resolved.earlierCallIds,
+      results: resolved.batch.requests.map(request => {
+        const item = resolved.rawResults.get(request.callId);
+        if (!item || typeof item.type !== "string") throw continuityError("continuity_source_unproven");
+        return {
+          callId: request.callId,
+          type: item.type,
+          digest: toolResultPayloadDigest(item),
+        };
+      }),
+    };
+  }
+
+  continuityToolSearchResults(parsed: CodexParsedRequest): Record<string, unknown>[] {
+    const resolved = this.resolveContinuityToolBatch(parsed);
+    // An accepted batch is replay evidence, not a new registry publication.
+    return resolved && !resolved.batch.acceptedResultDigests
+      ? [...resolved.rawResults.values()].filter(item => item.type === "tool_search_output") : [];
   }
 
   canonicalInput(): unknown[] | undefined {
     return this.canonicalInputValue ? structuredClone(this.canonicalInputValue) : undefined;
   }
 
-  private assertCanonicalExtension(input: unknown[]): void {
-    const canonical = this.canonicalInputValue;
-    if (!canonical) {
-      throw continuityError("continuity_source_unproven", "A replay cannot replace the owned canonical input.");
-    }
-    const outstanding = this.outstanding();
-    if (!canonical.every((item, index) => canonicalInputDigest([item]) === canonicalInputDigest([input[index]]))) {
-      throw continuityError("continuity_source_unproven", "The active input is not owned by the current execution.");
-    }
-    const recordedOutputLength = this.recordedResponseOutputLength(input, canonical.length);
-    if (recordedOutputLength !== undefined) {
-      const resultsInput = input.slice(canonical.length + recordedOutputLength);
-      if (!this.isActive()) {
-        if (outstanding.length > 0 || resultsInput.length > 0) {
-          throw continuityError("continuity_source_unproven", "The settled response history contains an unowned execution record.");
+  acceptContinuityToolResults(parsed: CodexParsedRequest): CodexToolResultMessage[] {
+    const resolved = this.resolveContinuityToolBatch(parsed);
+    if (!resolved) return [];
+    const { batch, rawResults, messages } = resolved;
+    const digests = new Map([...rawResults].map(([callId, item]) => [callId, toolResultPayloadDigest(item)]));
+    if (batch.acceptedResultDigests) {
+      for (const [callId, digest] of digests) {
+        if (batch.acceptedResultDigests.get(callId) !== digest) {
+          throw continuityError("continuity_source_unproven", `Tool result ${callId} conflicts with its first accepted payload.`);
         }
-        return;
       }
-      if (resultsInput.length !== outstanding.length) {
-        throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
+    } else {
+      batch.acceptedResultDigests = digests;
+      this.continuityGeneration += 1;
+    }
+    return batch.requests.flatMap(request => batch.delivered.has(request.callId)
+      ? []
+      : [messages.get(request.callId)!]);
+  }
+
+  private resolveContinuityToolBatch(parsed: CodexParsedRequest): {
+    batch: ContinuityToolBatch;
+    rawResults: Map<string, Record<string, unknown>>;
+    messages: Map<string, CodexToolResultMessage>;
+    earlierCallIds: string[];
+  } | undefined {
+    const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+    if (!Array.isArray(input)) throw continuityError("continuity_source_unproven");
+    const lowerBound = chatGptCurrentInstructionIndex(parsed) + 1;
+    let batch: ContinuityToolBatch | undefined;
+    const rawResults = new Map<string, Record<string, unknown>>();
+    const earlierCallIds = new Set<string>();
+    for (let index = input.length - 1; index >= lowerBound; index -= 1) {
+      const item = rawRecord(input[index]);
+      if (!item) continue;
+      if (isContinuityCheckpointBoundary(item)) {
+        if (!batch) return undefined;
+        if (rawResults.size === batch.requests.length) break;
+        throw continuityError("continuity_source_unproven", "The current local tool batch crosses a committed checkpoint boundary.");
       }
-      const expected = new Map(outstanding.map(request => [request.callId, request]));
-      const results = new Set<string>();
-      for (const value of resultsInput) {
-        const item = rawRecord(value);
-        const callId = typeof item?.call_id === "string" ? item.call_id : undefined;
-        const request = callId ? expected.get(callId) : undefined;
-        if (!item || !callId || !request || !activeToolResultMatches(item, request) || results.has(callId)) {
-          throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
+      const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+      const outputType = item.type === "function_call_output"
+        || item.type === "custom_tool_call_output"
+        || item.type === "tool_search_output";
+      if (!outputType) {
+        if (callId && this.toolBatchByCallId.has(callId)
+          && !["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type))) {
+          throw continuityError("continuity_source_unproven", `Tool result ${callId} has an invalid result type.`);
         }
-        results.add(callId);
-      }
-      if (results.size !== outstanding.length) {
-        throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
-      }
-      return;
-    }
-    if (!this.isActive() || input.length !== canonical.length + outstanding.length * 2) {
-      throw continuityError("continuity_source_unproven", "A replay cannot replace the owned canonical input.");
-    }
-    const expected = new Map(outstanding.map(request => [request.callId, request]));
-    const calls = new Set<string>();
-    const results = new Set<string>();
-    for (const value of input.slice(canonical.length)) {
-      const item = rawRecord(value);
-      const callId = typeof item?.call_id === "string" ? item.call_id : undefined;
-      const request = callId ? expected.get(callId) : undefined;
-      if (!item || !callId || !request) {
-        throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
-      }
-      if (activeToolCallMatches(item, request)) {
-        if (calls.has(callId)) throw continuityError("continuity_source_unproven");
-        calls.add(callId);
         continue;
       }
-      if (activeToolResultMatches(item, request)) {
-        if (results.has(callId)) throw continuityError("continuity_source_unproven");
-        results.add(callId);
-        continue;
+      if (!callId) throw continuityError("continuity_source_unproven", "A terminal tool result has no call_id.");
+      const candidate = this.toolBatchByCallId.get(callId);
+      if (!candidate) {
+        // Retain only the immediate predecessor's issued IDs with each bounded batch.
+        // Reclaiming its journal must not make current results authenticate older history.
+        if (batch && rawResults.size === batch.requests.length && batch.previousCallIds.includes(callId)) break;
+        throw continuityError("continuity_source_unproven", "A terminal tool result does not belong to a retained local batch.");
       }
-      throw continuityError("continuity_source_unproven", "The active input contains an unowned execution record.");
+      if (!batch) {
+        batch = candidate;
+        for (const id of batch.previousCallIds) earlierCallIds.add(id);
+      }
+      if (candidate !== batch) {
+        if (candidate.id < batch.id && rawResults.size === batch.requests.length) {
+          for (const request of candidate.requests) earlierCallIds.add(request.callId);
+          break;
+        }
+        throw continuityError("continuity_source_unproven", "The current result group mixes more than one local tool batch.");
+      }
+      const request = batch.requestById.get(callId)!;
+      if (!activeToolResultMatches(item, request) || rawResults.has(callId)) {
+        throw continuityError("continuity_source_unproven", "The current tool batch is incomplete, duplicated, or has the wrong result type.");
+      }
+      rawResults.set(callId, item);
     }
-    if (calls.size !== outstanding.length || results.size !== outstanding.length) {
-      throw continuityError("continuity_source_unproven", "The active input is incomplete for the current execution.");
+    if (!batch) return undefined;
+    if (rawResults.size !== batch.requests.length) {
+      throw continuityError("continuity_source_unproven", `Codex supplied ${rawResults.size} of ${batch.requests.length} required results for the current local tool batch.`);
     }
+    const messages = new Map<string, CodexToolResultMessage>();
+    const selectedResults = batch.requests.map(request => rawResults.get(request.callId)!);
+    for (const message of parseRequest({ model: parsed.modelId, input: selectedResults }).context.messages) {
+      if (message.role !== "toolResult" || !batch.requestById.has(message.toolCallId)) continue;
+      if (messages.has(message.toolCallId)) {
+        throw continuityError("continuity_source_unproven", `Codex returned duplicate parsed results for tool call ${message.toolCallId}.`);
+      }
+      messages.set(message.toolCallId, message);
+    }
+    if (messages.size !== batch.requests.length) {
+      throw continuityError("continuity_source_unproven", "The current raw tool batch could not be mapped to one complete parsed result group.");
+    }
+    if (batch.acceptedResultDigests) {
+      for (const [callId, item] of rawResults) {
+        if (batch.acceptedResultDigests.get(callId) !== toolResultPayloadDigest(item)) {
+          throw continuityError("continuity_source_unproven", `Tool result ${callId} conflicts with its first accepted payload.`);
+        }
+      }
+    }
+    return { batch, rawResults, messages, earlierCallIds: [...earlierCallIds] };
   }
 
   conversationKey(): string | undefined {
@@ -616,12 +960,26 @@ export class ChatGptTurnSession {
 
   setOutstanding(requests: BrokerToolRequest[], reasoning: string[] = [], prelude: AdapterEvent[] = []): void {
     if (this.outstandingById.size > 0) throw new Error("cannot emit a new ChatGPT tool batch while the previous batch is unresolved");
+    let batch: ContinuityToolBatch | undefined;
+    if (this.runtime.continuityBinding) {
+      const batchId = this.nextToolBatchId++;
+      batch = {
+        id: batchId,
+        requests: [...requests],
+        requestById: new Map(requests.map(request => [request.callId, request])),
+        resultRoundKey: `tool-batch:${batchId}`,
+        delivered: new Set(),
+        previousCallIds: [...this.toolBatches.values()].at(-1)?.requests.map(request => request.callId) ?? [],
+      };
+    }
     for (const request of requests) {
-      if (this.deliveredResultIds.has(request.callId) || this.outstandingById.has(request.callId)) {
+      if (this.toolBatchByCallId.has(request.callId) || this.outstandingById.has(request.callId)) {
         throw new Error(`duplicate ChatGPT bridge tool call id: ${request.callId}`);
       }
       this.outstandingById.set(request.callId, request);
+      if (batch) this.toolBatchByCallId.set(request.callId, batch);
     }
+    if (batch) this.toolBatches.set(batch.id, batch);
     this.outstandingReasoning = [...reasoning];
     this.outstandingPrelude = [...prelude];
   }
@@ -630,9 +988,15 @@ export class ChatGptTurnSession {
     return this.outstandingById.has(callId);
   }
 
+  hasContinuityToolCall(callId: string): boolean {
+    return this.toolBatchByCallId.has(callId);
+  }
+
   markResultDelivered(callId: string): void {
     if (!this.outstandingById.delete(callId)) throw new Error(`ChatGPT bridge tool result does not match an outstanding call: ${callId}`);
-    this.deliveredResultIds.add(callId);
+    const batch = this.toolBatchByCallId.get(callId);
+    if (batch) batch.delivered.add(callId);
+    else if (this.runtime.continuityBinding) throw new Error(`ChatGPT bridge tool result lost its local batch: ${callId}`);
     if (this.outstandingById.size === 0) {
       this.outstandingReasoning = [];
       this.outstandingPrelude = [];
@@ -738,11 +1102,18 @@ export class ChatGptTurnSession {
     round = { events: [], reasoning: [], completed: false };
     this.rounds.set(key, round);
     while (this.rounds.size > 512) {
-      const oldestCompleted = [...this.rounds].find(([, candidate]) => candidate.completed);
+      const oldestCompleted = [...this.rounds].find(([key, candidate]) => candidate.completed
+        && key !== this.continuityOrdinaryRoundKey);
       if (!oldestCompleted) {
         throw new Error("ChatGPT native round journal is full (512 unfinished rounds)");
       }
-      this.rounds.delete(oldestCompleted[0]);
+      const [oldestKey] = oldestCompleted;
+      this.rounds.delete(oldestKey);
+      const batch = [...this.toolBatches.values()].find(candidate => candidate.resultRoundKey === oldestKey);
+      if (batch && batch.delivered.size === batch.requests.length) {
+        this.toolBatches.delete(batch.id);
+        for (const request of batch.requests) this.toolBatchByCallId.delete(request.callId);
+      }
     }
     return round;
   }
@@ -847,16 +1218,11 @@ export class ChatGptTurnSessions {
     return session;
   }
 
-  recordResponseOutput(nativeThreadId: string, nativeTurnId: string, input: unknown[], output: unknown[]): void {
-    const matches = [...this.entries.values()].flatMap(session => {
-      if (session.nativeThreadId !== nativeThreadId || session.nativeTurnId !== nativeTurnId) return [];
-      const generation = session.canonicalInputGenerationFor(input);
-      return generation === undefined ? [] : [{ session, generation }];
-    });
-    if (matches.length !== 1) {
-      throw continuityError("continuity_source_unproven", "The completed response no longer has one exact execution owner.");
-    }
-    matches[0]!.session.recordResponseOutput(output, matches[0]!.generation);
+  continuityToolCallRevision(binding: ContinuityBinding, callId: string): number | undefined {
+    const sources = [...this.entries.values()].filter(session => session.runtime.continuityBinding === binding
+      && session.hasContinuityToolCall(callId));
+    if (sources.length > 1) throw continuityError("continuity_source_unproven");
+    return sources[0]?.runtime.usageInput?._continuityHistoryRevision;
   }
 
   /** Drop only a proved pre-mutation first-creation failure. The durable creation claim remains live. */
@@ -919,6 +1285,35 @@ export class ChatGptTurnSessions {
           break;
         }
         if (!reclaimed) throw blockedByReplayCapacity ?? continuityError("continuity_resource_capacity");
+      }
+    }
+  }
+
+  assertUnconsumedContinuityInstruction(
+    binding: ContinuityBinding,
+    parsed: CodexParsedRequest,
+  ): void {
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (!identity.turnId) return;
+    const instructionIdentity = continuityInstructionIdentity(parsed);
+    for (const session of this.entries.values()) {
+      if (session.runtime.continuityBinding !== binding
+        || session.runtime.usageInput?._compactionRequest === true
+        || !session.nativeTurnId) continue;
+      if (session.acceptedContinuityInstructionIdentity() === instructionIdentity) {
+        throw continuityError(
+          "continuity_source_unproven",
+          "The current native instruction was already consumed by a completed native turn.",
+        );
+      }
+    }
+    for (const tombstone of binding.ordinaryReplayTombstones.values()) {
+      if (!tombstone.nativeTurnId) continue;
+      if (tombstone.instructionIdentity === instructionIdentity) {
+        throw continuityError(
+          "continuity_source_unproven",
+          "The current native instruction was already consumed by a completed native turn.",
+        );
       }
     }
   }
@@ -1189,7 +1584,13 @@ export class ChatGptTurnSessions {
     const binding = session.runtime.continuityBinding;
     const input = session.runtime.usageInput;
     if (!binding || input?._compactionRequest === true || binding.state === "lost" || binding.state === "ended") return;
-    retainContinuityOrdinaryReplayTombstone(binding, key, input?._continuityHistoryRevision as number);
+    retainContinuityOrdinaryReplayTombstone(
+      binding,
+      key,
+      input?._continuityHistoryRevision as number,
+      session.acceptedContinuityInstructionIdentity(),
+      session.nativeTurnId,
+    );
   }
 
   private protectedContinuityBinding(key: string, session: ChatGptTurnSession): ContinuityBinding | undefined {

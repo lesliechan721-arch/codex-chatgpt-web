@@ -231,6 +231,24 @@ capabilities, and physical pages have separate limits and lifetimes; retained pa
 tool authority or authorize recovery across a restart. See [the policy guide](session-continuity.md)
 for limits, failure handling, and release status.
 
+Continuity work identity uses native instruction identity, locally issued tool batches, and the
+accepted source/revision transaction. Completed history, client output echoes, and checkpoint
+prefix positions are not content proofs. Current payload conflicts still fail. An ordinary
+reconnect replays its original journal; a result retry selects its original local batch. Journal
+and batch comparison records share the 512-round bound, with the initial ordinary journal
+protected while its execution is retained. Reclaimed results cannot start new work.
+
+Continuation input uses current native instruction ownership and the committed checkpoint relation.
+An explicitly owned new turn can omit its completed predecessor. The native instruction prefix of
+the current execution-history window remains part of the current payload, including developer and
+grouped AGENTS instructions whose turn metadata records their earlier creation. Unowned instructions
+mixed with completed output remain ambiguous and are rejected before submission. Full source data
+and codec comparison data live in the bounded checkpoint commit; continuity does not recover a source
+from the ordinary mode's continuation cache. Each request reuses its selected commit, and the start
+boundary checks ownership again before consuming its transition once. Historical edits are not sent
+back to the retained page. Active ordinary reconnects publish the current tool registry under the
+execution lock before replaying their journal; historical execution replay cannot update a later owner.
+
 ## Local ChatGPT Limits
 
 The launcher Limits page is an opt-in estimate of its own accepted browser submissions. Setup
