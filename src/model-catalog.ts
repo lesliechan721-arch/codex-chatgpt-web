@@ -191,7 +191,28 @@ export function augmentNativeModelCatalog(
       }
     }
   }
-  const template = selectNativeTemplate(nativeModels, config);
+  let template = selectNativeTemplate(nativeModels, config);
+  if (config.subagentProtocol === "compatibility-v1") {
+    const apiModels = nativeModels.filter(candidate => candidate && typeof candidate === "object"
+      && !Array.isArray(candidate) && (candidate as JsonObject).supported_in_api === true
+      && (candidate as JsonObject).visibility === "list") as JsonObject[];
+    const nativeLeader = apiModels.toSorted((left, right) =>
+      (modelPriority(left) ?? Number.MAX_SAFE_INTEGER) - (modelPriority(right) ?? Number.MAX_SAFE_INTEGER))[0];
+    const priority = nativeLeader && modelPriority(nativeLeader);
+    if (priority !== undefined) {
+      if (priority > Number.MAX_SAFE_INTEGER - 2) {
+        throw new Error("Native Codex model priority cannot reserve the Compatibility V1 roster");
+      }
+      // Reserve one native entry, then Web reasoning/Pro and Instant, before other native models.
+      // The first usable template need not be the highest-priority native API model.
+      for (const model of apiModels) {
+        if (model !== nativeLeader && (modelPriority(model) ?? Number.MAX_SAFE_INTEGER) < priority + 2) {
+          model.priority = priority + 2;
+        }
+      }
+      template = { ...template, priority };
+    }
+  }
   if (contextOverride) {
     // model_context_window is a single top-level Codex setting, not a per-model one. Apply its
     // advertised maximum to every native row so switching native models cannot silently clamp the

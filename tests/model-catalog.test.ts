@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { defaultConfig } from "../src/config";
 import {
   CHATGPT_WEB_LUNA_MODEL_ROUTE,
@@ -174,6 +175,37 @@ describe("native /models augmentation", () => {
     expect(models.find(model => model.slug === "gpt-5.5")?.multi_agent_version).toBe("disabled");
     expect(models.find(model => model.slug === "gpt-5.6-sol")?.multi_agent_version).toBe("v1");
     expect(models.find(model => model.slug === "gpt-5.6-terra")?.multi_agent_version).toBe("v1");
+  });
+
+  test("reserves the V1 Web roster with the locked native catalog", () => {
+    const bundled = JSON.parse(readFileSync(new URL(
+      "../launcher/electron/generated/codex-bundled-models.json", import.meta.url,
+    ), "utf8")) as { models: Array<Record<string, unknown>> };
+    const snapshot = structuredClone(bundled);
+    const nativeLeader = bundled.models
+      .filter(model => model.supported_in_api === true && model.visibility === "list")
+      .toSorted((left, right) => Number(left.priority) - Number(right.priority))[0]!.slug;
+    for (const proAvailable of [true, false]) {
+      const config = {
+        ...defaultConfig("browser-only"), proAvailable, extraHighAvailable: true,
+        subagentProtocol: "compatibility-v1" as const,
+      };
+      const models = augmentNativeModelCatalog(bundled, config).models as Array<Record<string, unknown>>;
+      const selectable = models
+        .filter(model => model.supported_in_api === true && model.visibility === "list")
+        .toSorted((left, right) => Number(left.priority) - Number(right.priority))
+        .map(model => model.slug);
+      const expected = [
+        nativeLeader,
+        ...CHATGPT_WEB_MODEL_ROUTES.slice(1)
+          .filter(route => proAvailable || !route.requiresPro).map(route => route.slug),
+        "chatgpt-web/gpt-5.6-sol-instant",
+      ];
+      expect(selectable.slice(0, expected.length)).toEqual(expected);
+      expect(selectable.filter(modelSlug => !String(modelSlug).startsWith("chatgpt-web/")))
+        .toHaveLength(bundled.models.filter(model => model.supported_in_api === true && model.visibility === "list").length);
+      expect(bundled).toEqual(snapshot);
+    }
   });
 
   test("native protocol mode preserves official native rows and gives Web rows the template surface", () => {

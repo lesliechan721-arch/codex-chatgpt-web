@@ -50,6 +50,19 @@ docker compose --env-file deploy/server/.env -f deploy/server/compose.yaml exec 
 
 ## Publish the server image
 
+The GitHub `Release` workflow publishes the server image after the desktop release succeeds. Configure these repository values under **Settings → Secrets and variables → Actions**:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| Variable | `DOCKERHUB_USERNAME` | Docker Hub login name, normally `lesliechan721` |
+| Secret | `DOCKERHUB_TOKEN` | Docker Hub personal access token with write access to `lesliechan721/codex-chatgpt-web` |
+
+If the repository restricts allowed Actions, also allow `docker/*`. The workflow builds `deploy/server/Dockerfile` for `linux/amd64` and publishes `lesliechan721/codex-chatgpt-web:<package-version>` without the release tag's `v` prefix. A non-prerelease GitHub release also updates `latest`; a prerelease publishes only its version tag. The workflow uses the published GitHub release state, so a version staged as a prerelease does not update `latest`.
+
+After configuring the values, push a new `v<package-version>` tag to start the Release workflow. If image publication fails, configure or correct the credentials and rerun the failed `publish-image` job.
+
+For manual publication, use the existing local script. It always updates both the version tag and `latest`:
+
 Log in to Docker Hub, then run:
 
 ```sh

@@ -154,8 +154,8 @@ describe("server remote desktop deployment", () => {
     expect(dockerfile).toContain("USER codex");
     expect(dockerfile).toContain("ARG CODEX_UID=10001");
     expect(dockerfile).toContain("ARG CODEX_GID=10001");
-    expect(compose).toContain("CODEX_UID: ${CODEX_UID:-10001}");
-    expect(compose).toContain("CODEX_GID: ${CODEX_GID:-10001}");
+    expect(compose).toContain("image: lesliechan721/codex-chatgpt-web:latest");
+    expect(compose).not.toMatch(/^\s+build:/m);
     expect(dockerfile).toContain("APPIMAGE_EXTRACT_AND_RUN=1");
     expect(launcher).toContain('exec "$APPIMAGE_PATH" --password-store=gnome-libsecret');
     expect(all).not.toContain("--no-sandbox");
