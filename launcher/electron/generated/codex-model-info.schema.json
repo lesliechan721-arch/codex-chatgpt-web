@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": "408a77dc1a1cf95413df26b5185623cf245161d7",
+  "revision": "08a7031b6acb4a8e00372be0e83e21cbab0db49d",
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "definitions": {
@@ -38,6 +38,14 @@
           }
         },
         "type": "object"
+      },
+      "AsyncClassifierMode": {
+        "description": "Async classifier experiment, resolved once for each parent task.",
+        "enum": [
+          "snapshot",
+          "conversation"
+        ],
+        "type": "string"
       },
       "AutoReviewMessages": {
         "properties": {
@@ -163,7 +171,7 @@
         "type": "object"
       },
       "CyberAccessProgram": {
-        "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
+        "description": "Requested cyber treatment for an OpenAI model turn. Authorization and model-tier restrictions remain server-owned.",
         "enum": [
           "standard",
           "daybreak_blue",
@@ -300,6 +308,25 @@
       "GuardianV2ModelConfig": {
         "description": "Optional model-owned defaults for Guardian v2 classification experiments.",
         "properties": {
+          "async_classifier_conversation_token_limit": {
+            "description": "Reset retained async history when the next request exceeds this token estimate.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "async_classifier_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/AsyncClassifierMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "classifier_instructions": {
             "type": [
               "string",
@@ -436,6 +463,32 @@
         },
         "type": "object"
       },
+      "IndirectDescriptionPrefixes": {
+        "description": "Plain-text prefixes for Code Mode documentation, ALL_TOOLS, and loaded tool-search namespaces. Values are trimmed, and selectors for the same final namespace must agree, including empty values. Empty values add no prefix; unregistered targets are ignored.",
+        "properties": {
+          "mcp_servers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Configured MCP server names, before callable namespace normalization. Each prefix applies to all namespaces exposed by that server.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "namespaces": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Exact rendered namespaces, including `functions` for plain tools. Overlap with an MCP server prefix is allowed only when the trimmed values match.",
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "InputModality": {
         "description": "Canonical user-input modality tags advertised by a model.",
         "oneOf": [
@@ -461,6 +514,42 @@
             "type": "string"
           }
         ]
+      },
+      "McpResourceToolMessages": {
+        "description": "Model-owned descriptions and parameters for the built-in MCP resource helpers.",
+        "properties": {
+          "list_mcp_resource_templates": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "list_mcp_resources": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_mcp_resource": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
       },
       "ModelAccessPrograms": {
         "properties": {
@@ -576,6 +665,13 @@
               }
             ],
             "description": "Replacement confirmation-policy documents forwarded in actor MCP request metadata."
+          },
+          "content_filter_guidance": {
+            "description": "Developer guidance after a content-filter block. Missing, null, blank, or values over 512 UTF-8 bytes use the bundled guidance.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "guardian_v2": {
             "anyOf": [
@@ -786,9 +882,29 @@
         "type": "object"
       },
       "MultiAgentToolMessages": {
-        "description": "Model-owned descriptions and parameters for Multi-Agent V2 tools, independent of their namespace.",
+        "description": "Model-owned descriptions and parameters for Multi-Agent V2 tools, independent of their namespace. Channel tools consume only the description; their parameter schemas are fixed.",
         "properties": {
+          "create_channel": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "followup_task": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "get_channels": {
             "anyOf": [
               {
                 "$ref": "#/definitions/ToolMessage"
@@ -818,6 +934,56 @@
               }
             ]
           },
+          "list_threads": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "post": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_post": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_thread": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_posts": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "send_message": {
             "anyOf": [
               {
@@ -838,6 +1004,26 @@
               }
             ],
             "description": "Replaces the static description. Missing or null uses the bundled text; an empty string suppresses it. Generated model information and local usage hints are retained."
+          },
+          "subscribe": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unsubscribe": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "wait_agent": {
             "anyOf": [
@@ -941,7 +1127,7 @@
             ]
           },
           "parameters": {
-            "description": "Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools and Code Mode wait. Uses the harness's supported schema subset; unrecognized keywords are ignored. Missing, null, invalid or unsupported structures, or a root without `type: \"object\"` retains the harness parameters. Schema semantics must remain API-compatible. Overrides must declare harness-encrypted properties so their annotations can be retained. Argument handling is unchanged.",
+            "description": "Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait, request_user_input_async (the send_user_message_async catalog key), and MCP resource helpers. Uses the harness's supported schema subset; unrecognized keywords are ignored. Missing, null, invalid or unsupported structures, or a root without `type: \"object\"` retains the harness parameters. Schema semantics must remain API-compatible. Overrides must declare harness-encrypted properties so their annotations can be retained. Argument handling is unchanged.",
             "type": [
               "string",
               "null"
@@ -951,12 +1137,33 @@
         "type": "object"
       },
       "ToolMessages": {
-        "description": "Model-owned messages for built-in tools.",
+        "description": "Model-owned tool messages and indirect namespace guidance.",
         "properties": {
           "code_mode": {
             "anyOf": [
               {
                 "$ref": "#/definitions/CodeModeToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "indirect_description_prefixes": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/IndirectDescriptionPrefixes"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional guidance for indirectly presented tools; missing or empty adds no prefix."
+          },
+          "mcp_resources": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/McpResourceToolMessages"
               },
               {
                 "type": "null"
