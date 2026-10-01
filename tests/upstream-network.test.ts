@@ -45,20 +45,44 @@ function runtime(baseUrl: string, proxy: UpstreamProxyConfig): UpstreamProviderR
   };
 }
 
+// Keep proxy variables out of the test runner's shared native HTTP client state.
+async function fetchWithProxyEnvironment(
+  requests: Array<{ url: string; proxy: UpstreamProxyConfig }>,
+  environment: Record<string, string>,
+): Promise<string[]> {
+  const child = Bun.spawn([process.execPath, "-e", `
+    import { fetchUpstreamProvider } from ${JSON.stringify(new URL("../src/upstream-network.ts", import.meta.url).href)};
+    const keys = ${JSON.stringify(proxyEnvKeys)};
+    const snapshot = () => Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    const before = snapshot();
+    const texts = await Promise.all(${JSON.stringify(requests)}.map(async ({ url, proxy }) =>
+      (await fetchUpstreamProvider(new Request(url), { ...${JSON.stringify(config({ mode: "direct" }))}, proxy })).text()));
+    console.log(JSON.stringify({ texts, before, after: snapshot() }));
+  `], {
+    env: { ...process.env, ...Object.fromEntries(proxyEnvKeys.map(key => [key, undefined])), ...environment },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+  ]);
+  expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const result = JSON.parse(stdout);
+  expect(result.before).toMatchObject(environment);
+  expect(result.after).toEqual(result.before);
+  return result.texts;
+}
+
 test("direct upstream transport ignores process proxy variables without changing them", async () => {
   let proxyCalls = 0;
   const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { proxyCalls++; return new Response("proxy"); } });
   let targetCalls = 0;
   const target = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { targetCalls++; return new Response("direct"); } });
-  process.env.HTTP_PROXY = proxy.url.origin;
-  process.env.HTTPS_PROXY = proxy.url.origin;
-  process.env.ALL_PROXY = proxy.url.origin;
-  const before = { HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY, ALL_PROXY: process.env.ALL_PROXY };
   try {
-    const response = await fetchUpstreamProvider(new Request(`${target.url.origin}/responses`), config({ mode: "direct" }));
-    expect(await response.text()).toBe("direct");
+    const texts = await fetchWithProxyEnvironment([{ url: `${target.url.origin}/responses`, proxy: { mode: "direct" } }], {
+      HTTP_PROXY: proxy.url.origin, HTTPS_PROXY: proxy.url.origin, ALL_PROXY: proxy.url.origin,
+    });
+    expect(texts).toEqual(["direct"]);
     expect({ targetCalls, proxyCalls }).toEqual({ targetCalls: 1, proxyCalls: 0 });
-    expect({ HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY, ALL_PROXY: process.env.ALL_PROXY }).toEqual(before);
   } finally {
     target.stop(true);
     proxy.stop(true);
@@ -75,21 +99,17 @@ test("custom upstream transport uses only its explicit authenticated proxy", asy
   } });
   let globalCalls = 0;
   const global = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { globalCalls++; return new Response("wrong"); } });
-  process.env.HTTP_PROXY = global.url.origin;
-  process.env.HTTPS_PROXY = global.url.origin;
   try {
     const proxyUrl = new URL(selected.url.origin);
     proxyUrl.username = "proxy-user";
     proxyUrl.password = "proxy-pass";
-    const response = await fetchUpstreamProvider(
-      new Request("http://custom-upstream.invalid/responses"),
-      config({ mode: "custom", url: proxyUrl.href }),
-    );
-    expect(await response.text()).toBe("custom");
+    const texts = await fetchWithProxyEnvironment([
+      { url: "http://custom-upstream.invalid/responses", proxy: { mode: "custom", url: proxyUrl.href } },
+    ], { HTTP_PROXY: global.url.origin, HTTPS_PROXY: global.url.origin });
+    expect(texts).toEqual(["custom"]);
     expect(selectedCalls).toBe(1);
     expect(globalCalls).toBe(0);
     expect(proxyAuthorization).toMatch(/^Basic /);
-    expect(process.env.HTTP_PROXY).toBe(global.url.origin);
   } finally {
     selected.stop(true);
     global.stop(true);
@@ -99,17 +119,12 @@ test("custom upstream transport uses only its explicit authenticated proxy", asy
 test("direct and custom requests can run concurrently without changing global proxy state", async () => {
   const directTarget = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { return new Response("direct"); } });
   const customProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { return new Response("custom"); } });
-  process.env.HTTP_PROXY = "http://global.invalid:8123";
-  process.env.HTTPS_PROXY = "http://global.invalid:8123";
-  const before = { HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY };
   try {
-    const [direct, custom] = await Promise.all([
-      fetchUpstreamProvider(new Request(`${directTarget.url.origin}/responses`), config({ mode: "direct" })),
-      fetchUpstreamProvider(new Request("http://custom-target.invalid/responses"), config({ mode: "custom", url: customProxy.url.origin })),
-    ]);
-    expect(await direct.text()).toBe("direct");
-    expect(await custom.text()).toBe("custom");
-    expect({ HTTP_PROXY: process.env.HTTP_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY }).toEqual(before);
+    const texts = await fetchWithProxyEnvironment([
+      { url: `${directTarget.url.origin}/responses`, proxy: { mode: "direct" } },
+      { url: "http://custom-target.invalid/responses", proxy: { mode: "custom", url: customProxy.url.origin } },
+    ], { HTTP_PROXY: "http://global.invalid:8123", HTTPS_PROXY: "http://global.invalid:8123" });
+    expect(texts).toEqual(["direct", "custom"]);
   } finally {
     directTarget.stop(true);
     customProxy.stop(true);

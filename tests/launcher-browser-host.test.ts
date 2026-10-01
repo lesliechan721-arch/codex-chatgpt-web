@@ -55,8 +55,10 @@ test("a blocked sign-in replaces an opaque navigation abort with a non-retryable
 
 test("startup waits beyond five seconds and distinguishes its deadline from caller cancellation", async () => {
   let calls = 0;
+  let onRequest: (() => void) | undefined;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
     calls++;
+    onRequest?.();
     await Bun.sleep(calls === 1 ? 5_100 : 80);
     return Response.json({ surfaceId: "a".repeat(32), reused: false, connectorBound: false });
   } });
@@ -66,10 +68,12 @@ test("startup waits beyond five seconds and distinguishes its deadline from call
     await expect(notifyLauncherTurn(descriptor, activity)).resolves.toMatchObject({ reused: false });
     await expect(notifyLauncherTurn(descriptor, activity, 10)).rejects.toThrow("start timed out after 10ms");
     const controller = new AbortController();
+    let cancelledAfterArrival = false;
+    // Cancel after the request arrives, independent of the runner's scheduling speed.
+    onRequest = () => { cancelledAfterArrival = true; controller.abort(); };
     const pending = notifyLauncherTurn(descriptor, activity, undefined, controller.signal);
-    setTimeout(() => controller.abort(), 10);
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
-    expect(calls).toBe(3);
+    expect(cancelledAfterArrival).toBe(true);
   } finally { server.stop(true); }
 }, 10_000);
 

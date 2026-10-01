@@ -517,7 +517,7 @@ test("API key mode route, subagents and serve never inject Codex configuration",
       ...defaultConfig("browser-only"),
       port: await unusedPort(),
       storageStatePath: join(appHome, "browser", "storage-state.json"),
-      brokerSocketPath: join(appHome, "runtime", "turn-broker.sock"),
+      brokerSocketPath: defaultBrokerEndpoint(appHome),
     };
     writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config)}\n`);
     saveApiAccessPolicy(apiKeyPolicy(`cgw_${"k".repeat(43)}`), appHome);
@@ -584,7 +584,7 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
       ...defaultConfig("browser-only"),
       port: address.port,
       storageStatePath: join(appHome, "browser", "storage-state.json"),
-      brokerSocketPath: join(appHome, "runtime", "turn-broker.sock"),
+      brokerSocketPath: defaultBrokerEndpoint(appHome),
     };
     writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config)}\n`);
     const policy = apiKeyPolicy(`cgw_${"s".repeat(43)}`);

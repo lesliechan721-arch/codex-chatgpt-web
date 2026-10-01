@@ -6,10 +6,14 @@ import { dirname, join, resolve } from "node:path";
 const root = resolve(import.meta.dir, "..");
 const deploy = resolve(root, "deploy/server");
 const dockerPath = Bun.which("docker");
-const dockerAvailable = dockerPath !== null && Bun.spawnSync(
-  [dockerPath, "version", "--format", "{{.Server.Version}}"],
-  { stdout: "ignore", stderr: "ignore" },
-).exitCode === 0;
+// The server image and local filesystem exporter require Linux containers and Buildx.
+const dockerAvailable = dockerPath !== null
+  && Bun.spawnSync([dockerPath, "info", "--format", "{{.OSType}}"], {
+    stdout: "pipe", stderr: "ignore",
+  }).stdout.toString().trim() === "linux"
+  && Bun.spawnSync([dockerPath, "buildx", "version"], {
+    stdout: "ignore", stderr: "ignore",
+  }).exitCode === 0;
 
 function read(relativePath: string): string {
   return readFileSync(resolve(deploy, relativePath), "utf8");
@@ -49,6 +53,7 @@ function buildDockerContextProbe(dockerignore: string, fixturePaths: string[]): 
     const result = Bun.spawnSync(
       [
         dockerPath,
+        "buildx",
         "build",
         "--progress=plain",
         "--output",

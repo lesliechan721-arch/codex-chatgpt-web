@@ -550,7 +550,7 @@ for (const [kind, layout] of [
 });
 
 test("verified pure environment: a derived no-AGENTS checkpoint continuation stays on the same page", async () => {
-  const codexHome = mkdtempSync("/tmp/cgw-cont-pure-env-home-");
+  const codexHome = mkdtempSync(join(tmpdir(), "cgw-cont-pure-env-home-"));
   cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
   const f = fixture(false, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410741" });
   f.provider.chatgptWeb!.toolAuthorityMode = "verified-environment";
@@ -4238,7 +4238,7 @@ for (const manual of [false, true]) test(`Round 8: older accepted discovery cann
 });
 
 for (const manual of [false, true]) for (const aliasedSource of (manual ? [false, true] : [false])) test(`Round 8: real verified source alias replays checkpoint continuation ${manual} original alias ${aliasedSource}`, async () => {
-  const codexHome = mkdtempSync("/tmp/cgw-cont-alias-home-");
+  const codexHome = mkdtempSync(join(tmpdir(), "cgw-cont-alias-home-"));
   cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
   const f = fixture(manual, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410711" });
   const turnId = "019cbcc7-31b2-7028-a632-7f8118410712";
