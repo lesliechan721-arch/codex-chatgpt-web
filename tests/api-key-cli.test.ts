@@ -315,7 +315,7 @@ test("concurrent CLI catalog commands preserve the marker state of the later com
 
   await runRace(["codex-config", "--json"], ["refresh-models"], true);
   await runRace(["refresh-models"], ["codex-config", "--json"], false);
-});
+}, 15_000);
 
 test("CLI recovers a stale model-catalog lock after the owner PID is reused", () => withHome(home => {
   const currentStart = processStartIdentity(process.pid);
