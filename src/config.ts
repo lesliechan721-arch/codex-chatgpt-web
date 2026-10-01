@@ -132,7 +132,7 @@ export interface AppConfig {
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
   useSavedChats: boolean;
-  /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
+  /** Select the Pro-sized model row instead of the default Zero Risk row. */
   zeroRiskProEnabled: boolean;
   /** Require the user to confirm Sent in the Launcher before a Zero Risk connector can start. */
   zeroRiskRequireSentConfirmation: boolean;
@@ -633,14 +633,9 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
   const toolAuthorityMode = effectiveToolAuthorityMode(config.toolAuthorityMode);
   const manual = config.browserInteractionMode === "manual";
   const model = manual
-    ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
+    ? config.zeroRiskProEnabled ? CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL : CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
     : config.solAvailable ? "gpt-5.6-sol" : CHATGPT_WEB_LUNA_BACKEND_MODEL;
-  const models = manual
-    ? [
-      CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
-      ...(config.zeroRiskProEnabled ? [CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL] : []),
-    ]
-    : [model];
+  const models = [model];
   const efforts = manual
     ? ["low"]
     : config.solAvailable

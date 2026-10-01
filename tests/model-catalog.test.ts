@@ -276,8 +276,8 @@ describe("native /models augmentation", () => {
     config.zeroRiskProEnabled = true;
     const proModels = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const proWeb = proModels.filter(model => String(model.slug).startsWith("chatgpt-web/"));
-    expect(proWeb).toHaveLength(2);
-    expect(proWeb[1]).toMatchObject({
+    expect(proWeb).toHaveLength(1);
+    expect(proWeb[0]).toMatchObject({
       slug: CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE.slug,
       display_name: CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE.displayName,
       input_modalities: ["text"],

@@ -1370,10 +1370,10 @@ class RuntimeHost {
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
     const options = {
-      message: enabled ? "Installing the Zero Risk Pro model" : "Removing the Zero Risk Pro model",
+      message: enabled ? "Switching to the Zero Risk Pro profile" : "Switching to the default Zero Risk profile",
       successMessage: enabled
-        ? `Zero Risk Pro installed${this.launcherProfile === "production" ? "; restart Codex" : ""}`
-        : `Default Zero Risk model restored${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
+        ? `Zero Risk Pro profile selected${this.launcherProfile === "production" ? "; restart Codex" : ""}`
+        : `Default Zero Risk profile selected${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
     };
     const result = this.launcherProfile === "development"

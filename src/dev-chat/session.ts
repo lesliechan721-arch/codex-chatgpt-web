@@ -11,6 +11,7 @@ export const DEV_CHAT_MODELS = [
   "chatgpt-web/gpt-5.6-pro",
   "chatgpt-web/gpt-6-pro",
   "chatgpt-web/zero-risk",
+  "chatgpt-web/zero-risk-pro",
   "chatgpt-web/luna",
   "chatgpt-web/think",
   "chatgpt-web/light",

@@ -522,7 +522,7 @@ export function availableChatGptWebModelRoutes(
       throw new Error("Zero Risk does not support Bigger Context");
     }
     return withContinuityRoutes(capabilities.zeroRiskProEnabled
-      ? [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE, CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
+      ? [CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
       : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE], capabilities);
   }
   if (!capabilities.solAvailable) return includeLegacy
@@ -566,7 +566,8 @@ export function requireChatGptWebModelRoute(
     if (route.interactionMode !== "manual") {
       throw new Error(`${route.displayName} is not available while Zero Risk is enabled`);
     }
-    if (route.backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL && !capabilities.zeroRiskProEnabled) {
+    const proRoute = route.backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL;
+    if (proRoute !== (capabilities.zeroRiskProEnabled === true)) {
       throw new Error(`${route.displayName} is not enabled in Zero Risk model settings`);
     }
     return route;

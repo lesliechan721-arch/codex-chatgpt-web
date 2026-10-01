@@ -304,7 +304,7 @@ test("tool authority mode updates the isolated DEV config without installing a C
   });
 });
 
-test("Zero Risk Pro transaction installs or removes only its explicit model profile", async () => {
+test("Zero Risk Pro transaction switches between mutually exclusive model profiles", async () => {
   const config = {
     mode: "full",
     browserHost: "launcher",

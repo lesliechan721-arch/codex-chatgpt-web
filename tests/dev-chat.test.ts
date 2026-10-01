@@ -166,6 +166,12 @@ test("new DEV chats default to the cheapest account-supported browser model", ()
     ...defaultConfig("full"),
     browserInteractionMode: "manual",
   })).toBe("chatgpt-web/zero-risk");
+  expect(defaultDevChatModel({
+    ...defaultConfig("full"),
+    browserInteractionMode: "manual",
+    zeroRiskProEnabled: true,
+  })).toBe("chatgpt-web/zero-risk-pro");
+  expect(DEV_CHAT_MODELS).toContain("chatgpt-web/zero-risk-pro");
 });
 
 test("DEV persistence preserves full continuity slugs without changing the default model", () => {
@@ -177,7 +183,7 @@ test("DEV persistence preserves full continuity slugs without changing the defau
   expect(defaultDevChatModel(defaultConfig("full"))).not.toContain("continuity");
 });
 
-test("Zero Risk DEV chats open only the generic route", () => {
+test("Zero Risk DEV chats open only the selected profile route", () => {
   const root = scratch("cgw-dev-safe-model");
   const config = {
     ...defaultConfig("full"),
@@ -194,6 +200,19 @@ test("Zero Risk DEV chats open only the generic route", () => {
   expect(driver.open("safe").state.model).toBe("chatgpt-web/zero-risk");
   expect(() => driver.open("automatic", "chatgpt-web/high")).toThrow(
     "not available while Zero Risk is enabled",
+  );
+
+  const proDriver = new DevChatDriver(
+    { ...config, zeroRiskProEnabled: true },
+    new DevChatStore(join(root, "pro-chats")),
+    (_provider: CodexProviderConfig): ProviderAdapter => {
+      throw new Error("adapter is not needed to open a DEV chat");
+    },
+    root,
+  );
+  expect(proDriver.open("safe-pro").state.model).toBe("chatgpt-web/zero-risk-pro");
+  expect(() => proDriver.open("safe-default", "chatgpt-web/zero-risk")).toThrow(
+    "not enabled in Zero Risk model settings",
   );
 });
 

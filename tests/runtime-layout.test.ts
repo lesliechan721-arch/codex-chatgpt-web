@@ -335,12 +335,9 @@ test("manual provider configuration preserves a distinct backend without guessin
 
   config.zeroRiskProEnabled = true;
   const proProvider = providerConfig(config);
-  expect(proProvider.models).toEqual([
-    CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
-    CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
-  ]);
+  expect(proProvider.models).toEqual([CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL]);
+  expect(proProvider.defaultModel).toBe(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL);
   expect(proProvider.modelReasoningEfforts).toEqual({
-    [CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL]: ["low"],
     [CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL]: ["low"],
   });
 });

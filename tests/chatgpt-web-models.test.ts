@@ -92,7 +92,13 @@ describe("fixed ChatGPT Web model routes", () => {
     const manual = { ...config, browserInteractionMode: "manual" as const, solAvailable: false };
     expect(requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk", manual).backendModel).toBe(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL);
     expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk-pro", manual)).toThrow("not enabled in Zero Risk model settings");
-    expect(requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk-pro", { ...manual, zeroRiskProEnabled: true }).backendModel)
+    const manualPro = { ...manual, zeroRiskProEnabled: true };
+    expect(availableChatGptWebModelRoutes(manualPro).map(route => route.slug)).toEqual([
+      "chatgpt-web/zero-risk-pro", "chatgpt-web-continuity/zero-risk-pro",
+    ]);
+    expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk", manualPro))
+      .toThrow("not enabled in Zero Risk model settings");
+    expect(requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk-pro", manualPro).backendModel)
       .toBe(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL);
   });
 
@@ -160,7 +166,7 @@ describe("fixed ChatGPT Web model routes", () => {
     })).toThrow("only available for Luna-only accounts");
   });
 
-  test("Zero Risk exposes one generic route independent of account capabilities", () => {
+  test("Zero Risk exposes exactly one route for the selected context profile", () => {
     const manual = {
       solAvailable: false,
       extraHighAvailable: false, proAvailable: false,
@@ -172,10 +178,9 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(() => requireChatGptWebModelRoute("chatgpt-web/zero-risk-pro", manual))
       .toThrow("not enabled in Zero Risk model settings");
     const manualPro = { ...manual, zeroRiskProEnabled: true };
-    expect(availableChatGptWebModelRoutes(manualPro)).toEqual([
-      CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
-      CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
-    ]);
+    expect(availableChatGptWebModelRoutes(manualPro)).toEqual([CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]);
+    expect(() => requireChatGptWebModelRoute("chatgpt-web/zero-risk", manualPro))
+      .toThrow("not enabled in Zero Risk model settings");
     expect(requireChatGptWebModelRoute("chatgpt-web/zero-risk-pro", manualPro))
       .toBe(CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE);
     expect(() => requireChatGptWebModelRoute("chatgpt-web/luna", manual))

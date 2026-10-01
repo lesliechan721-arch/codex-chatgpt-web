@@ -683,6 +683,30 @@ test("Zero Risk Pro commits Launcher state before a best-effort API-key model ca
   assert.match(handler, /catch[\s\S]*?startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
 });
 
+test("Zero Risk model profile copy describes mutually exclusive installation", () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const transpiled = ts.transpileModule(
+    fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"),
+    { fileName: "i18n.ts", compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+  ).outputText;
+  const translated = { exports: {} };
+  vm.runInNewContext(transpiled, translated);
+  const exclusiveMarker = {
+    en: "only",
+    "zh-CN": "仅",
+    "zh-TW": "只",
+    ja: "のみ",
+    ko: "만",
+  };
+  for (const language of Object.keys(require("../electron/languages.json"))) {
+    const copy = translated.exports.copyFor(language);
+    assert.match(copy.zeroRiskDefaultProfileBody, new RegExp(exclusiveMarker[language], "i"));
+    assert.match(copy.zeroRiskProProfileBody, new RegExp(exclusiveMarker[language], "i"));
+    assert.match(copy.zeroRiskProProfileBody, /Zero Risk Pro/);
+  }
+});
+
 test("external model catalog export-required state directs the user to export instead of retrying refresh", () => {
   assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?copy\.catalogExportRequired/);
   assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?exportConfig\(true\)[\s\S]*?copy\.exportCatalog/);

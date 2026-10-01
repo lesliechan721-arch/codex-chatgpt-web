@@ -68,7 +68,7 @@ Setup options:
                                Send prompts and read ChatGPT state through browser automation (default)
   --zero-risk-browser-interaction
                                Full mode: select, paste, and send in the launcher yourself
-  --zero-risk-pro              Zero Risk: also install the explicit Pro-sized model row
+  --zero-risk-pro              Zero Risk: install only the explicit Pro-sized model row
   --zero-risk-default          Zero Risk: install only the default model row
   --zero-risk-sent-confirmation
                                Zero Risk: require the Launcher Sent confirmation (default)
