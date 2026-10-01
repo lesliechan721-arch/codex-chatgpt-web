@@ -35,6 +35,24 @@ work went into it.
 - Never commit browser state, cookies, API keys, tunnel IDs, Codex history, generated logs, or
   absolute user paths.
 
+## Documentation lifetime
+
+Use the [project documentation index](docs/README.md) to find the existing owner of a contract.
+Keep user and operator guidance, public interfaces, domain terms, and non-obvious decision reasons
+in that location. Preserve the conditions, exceptions, and evidence that explain a decision; do not
+turn an accepted target or a test fixture into a claim of real-platform verification.
+
+Task specifications, plans, review rounds, prototypes, and raw validation output normally belong
+in the ignored `.dev-workflows/<task>/` directory. Do not stage that workspace. A small task that
+needs no persistent handoff does not need a process document. An explicitly requested public
+contract remains at its agreed project location instead of being hidden in a local workspace.
+
+After implementation, reconcile lasting behavior and reasons into the owning project document,
+preserve still-relevant validation limits in the release guidance, and remove obsolete process
+files and their links when cleanup is authorized. Do not copy an old spec wholesale if a later
+accepted decision replaced part of it. Existing unimplemented `docs/dev/request-context-navigation/`
+is a separate design exception, not the default home for future development records.
+
 ## Before opening a pull request
 
 1. Run `bun install --frozen-lockfile` in the repository root and in `launcher/`.

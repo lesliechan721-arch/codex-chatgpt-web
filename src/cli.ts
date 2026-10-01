@@ -104,7 +104,7 @@ API key mode:
   api-key codex-config         Export sensitive provider TOML, proxy environment and a local model catalog
                                CODEX_CHATGPT_WEB_API_KEY must contain the current local API key for this explicit export
                                No Codex OAuth is required; restart the service after mode/key changes
-                               See docs/api-key-mode.zh-CN.md for migration and security boundaries
+                               See docs/api-key-mode.md for migration and security boundaries
 
 Global:
   --home PATH                  Override ~/.codex-chatgpt-web

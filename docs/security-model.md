@@ -61,6 +61,32 @@ The direct turn-token MCP schema is attached only through the exact configured c
 `Codex Native2`, and `Codex Native2 DEV` connectors are treated as legacy and are never selected as a fallback. This
 prevents a cached legacy schema from being mistaken for the current capability contract.
 
+### Credential domains and long-running operations
+
+The local API access key, upstream provider key, daemon control token, Tunnel credentials, and
+turn capability are separate authorities. Local client authentication is checked before upstream
+routing; the upstream transport constructs its own Bearer header rather than forwarding client
+credentials. Explicit Codex TOML exports contain the local access key, never the upstream key or
+daemon control token. Treat these exports and authenticated proxy environment values as secrets.
+See [API Key mode](api-key-mode.md) and the
+[upstream credential boundary](upstream-provider.md#network-and-credential-boundaries).
+
+Upstream runtime metadata is untrusted. It cannot replace project Agent-control fields, including
+the entire `model_messages` object, or take over either local Web model namespace. Bundled
+metadata and the field schema are fixed-revision build inputs, not runtime provider assertions.
+Custom metadata also obeys these project boundaries.
+
+The accepted private plaintext proxy-URL storage model is not an exception to the OS-encrypted or
+session-only API key vault policy. Exact proxy challenge matching and fail-closed authentication
+cache cleanup protect credentials across proxy changes; see [network proxy](network-proxy.md).
+
+A Native `operation_id` only identifies work within an already-authorized capability. It is not a
+credential and does not expand the advertised registry. Retry and wait attach to the same accepted
+operation; deterministic admission rejection also occupies its ID. Pending is bridge control, not
+execution evidence. Unread public results block final completion, and owner restart does not
+authorize reexecution. The [Native tool protocol](native-tool-protocol.md) defines this lifecycle,
+including the narrow consumer-lease exception to remote idle termination.
+
 ## Principal risks
 
 ### Prompt injection and destructive tool use

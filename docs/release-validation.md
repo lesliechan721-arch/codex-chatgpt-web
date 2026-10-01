@@ -76,23 +76,124 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
    response history forms, local/v1/v2 codec coverage, ordinary → tool result → compact → continue,
    and lost-response retries. Synthetic metadata variants are not real-client certification.
 
-Current-work validation on 2026-09-30 uses
-[the third-version contract](dev/session-continuity/current-work-validation.md). Source recovery now
-uses the selected bounded checkpoint commit, and active ordinary replay updates its current tool
-registry before returning. Current input preserves the real client's persistent instruction prefixes;
-an explicitly owned new turn need not replay its completed predecessor. The
-[implementation record](dev/session-continuity/current-work-build.md) contains current test and
-independent-review results; prior tenth-round totals apply only to the earlier baseline.
-[Protocol evidence](dev/session-continuity/current-work-protocol-evidence.md) records 34 real Codex
-POSTs against a fake page, including a harmless Native command, retry, steering, local/v2 compact,
-and active/completed checkpoint-only requests. V1, JSON, and previous-response history are not
-covered by these real captures. Zero Risk samples cover the model protocol only. Authenticated
-ChatGPT pages, real 24-hour retention, sustained page-memory load, and remote deployment validation
-remain unexecuted for this change.
+The maintained contract is [current work and committed relationships](session-continuity.md#current-work-and-committed-relationships).
+Keep raw task output in the local ignored workspace, not as a second public implementation spec.
+Record each release's actual results separately from the historical evidence below. Any unexecuted
+platform, 24-hour, resource-load, or remote-idle combination must remain visible in that release's
+record instead of being described as validated.
 
-Keep the component and synthetic evidence with the implementation record, but distinguish it from
-real authenticated ChatGPT results. Any unexecuted platform, 24-hour, resource-load, or remote-idle
-combination must remain visible in the release record instead of being described as validated.
+### Recorded continuity evidence
+
+The September 2026 records established different kinds of evidence, not one interchangeable
+end-to-end pass:
+
+| Evidence | What it established | What it did not establish |
+| --- | --- | --- |
+| Budget probe, Codex 0.157.0, 17 controlled cases | Native app-server configuration, usage-triggered compaction, lower user limits, and a finite upper bound with the 1,000,000 / 900,000 catalog settings | Million-token browser input, throughput, or ChatGPT context capacity; requests were short with controlled usage |
+| 2026-09-28 DEV page probes | Automatic active/completed source and Zero Risk active source each completed two same-page runs with new authority; completed/pre-control-ended Zero Risk stopped | Complete production outer-Codex integration; outer work-tool receipts were simulated |
+| Synthetic component resource sample | About 4.85 MB of history, about 1.03 million estimated tokens, short-increment acceptance, oversized-first-input rejection, and bounded response-cache eviction | Five real pages, checkpoint load, sustained throughput, or a process-memory cap; maximum sampled RSS was about 0.8 GB, not a precise peak |
+| 2026-09-30 current-work protocol capture | 34 real Codex POSTs, a harmless Native `printf`, retry, steering, local/v2 compact, and active/completed checkpoint-only shapes against a fake page | Authenticated ChatGPT DOM, Launcher surface/lease, remote deployment, or complete real Zero Risk interaction |
+
+The [budget probe](../scripts/probe-session-continuity-budget.ts) records the chosen binary,
+configuration, and controlled usage interval. The recorded 0.157.0 binary SHA-256 was
+`ad0be20d04e2ba6146ecdb51d7f8b7b0fe15420a15dc9b0057518d858f1f3714`.
+For the target catalog, its effective window was 900,000: controlled usage of 898,000 did not
+compact and 901,000 did. Setting client window/compact values to 2,000,000 did not remove the
+upper bound. Lower client settings still reduced the threshold. Recheck on the release's actual
+Codex binary; these observations are not a floating-version guarantee.
+
+The [current-work capture/replay script](../scripts/probe-codex-continuity-protocol.ts) used Codex
+0.159.2, binary SHA-256
+`16593cc2f422d5f398a8e40f550ebbaf1245392528957be342c295920a300704`, and Bun 1.4.0.
+It used temporary configuration, loopback-only synthetic authentication, a deterministic page
+substitute, and a harmless real Native command, not production credentials or browser state.
+
+| Replayable sample | Captured POSTs and scope |
+| --- | --- |
+| [Ordinary and steering](../tests/fixtures/session-continuity/current-work-protocol.json) | 8; built-in OpenAI provider with synthetic ChatGPT authentication, manual v2 compaction, one lost-response retry |
+| [API-key provider](../tests/fixtures/session-continuity/current-work-protocol-api-key.json) | 8; custom provider, local compaction, native client removal of item source metadata |
+| [Active and checkpoint-only](../tests/fixtures/session-continuity/current-work-protocol-active.json) | 10; mid-turn automatic v2 compaction and completed-source empty-input continuation |
+| [Zero Risk model protocol](../tests/fixtures/session-continuity/current-work-protocol-zero-risk.json) | 8; model request shape only, not proof that real Zero Risk can compact an already-completed response |
+
+Native thread/turn metadata and item IDs distinguish retry, new turn, and same-turn steering.
+Persistent base/developer and AGENTS/environment prefixes can keep their creation-turn metadata
+while remaining applicable. Tools can arrive in `additional_tools`, not only top-level `tools`.
+The custom-provider capture removes item source metadata; that does not relax delegated source
+proof. Source instruction turn and compaction request turn must not be interchanged.
+
+The captured normal requests retained predecessors. Deleting completed history, adding other
+native developer kinds, removing an AGENTS part, and testing role/attachment conflicts are
+explicit synthetic variants, not additional captured client behavior. The native-source layout
+coverage is retained in the [input regression tests](../tests/session-continuity-input.test.ts).
+These captures do not cover v1 compaction, JSON responses, `previous_response_id` expansion, or
+real file/image/audio attachments. The current-work change still lacked authenticated-page,
+real 24-hour, sustained real-page-memory, and remote-deployment acceptance in its recorded result.
+
+Replay exercises only the parser/normalize boundary. It does not run Native tools or open a page:
+
+```sh
+bun run scripts/probe-codex-continuity-protocol.ts --replay=tests/fixtures/session-continuity/current-work-protocol.json
+bun run scripts/probe-codex-continuity-protocol.ts --replay=tests/fixtures/session-continuity/current-work-protocol-api-key.json
+bun run scripts/probe-codex-continuity-protocol.ts --replay=tests/fixtures/session-continuity/current-work-protocol-active.json
+bun run scripts/probe-codex-continuity-protocol.ts --replay=tests/fixtures/session-continuity/current-work-protocol-zero-risk.json
+```
+
+## Native tool waiting validation
+
+Use the [Native tool protocol](native-tool-protocol.md) as the public contract. Test both Automatic
+Full and Zero Risk with the actual connector, Tunnel, helper, and outer Codex. Record one dispatch
+and original call identity across pending, wait, identical retry, and result replay. Distinct new
+operation IDs must remain distinct calls. Verify that the caller holds the ID before any side
+effect and preserves its allocation counter through same-capability reconnects.
+
+Keep a real `request_user_input` or approval operation open for at least 11 minutes with remote
+deployment's default 600-second idle enabled. Verify 30-second pending responses, valid 120-second
+consumer leases, unchanged idle last-progress time, and delivery of the real answer/rejection.
+Also check a noninteractive long call, cancellation, first pending/result receipt loss, reconnect,
+lease loss, and completion blocked on unread results. Retained compaction must distinguish queued
+control terminals from delivered Native calls; fresh-owner retirement must not redispatch old work.
+Reject an incompatible connector/helper before a Native side effect.
+
+The recorded 2026-09-24 Automatic DEV probe crossed real ChatGPT → Connector → Tunnel, returned a
+45-second **simulated** Native result through wait, reused the original call for same-ID retry,
+and created one new call for a new ID. It established the normal transport topology, not real
+11-minute human input/approval, remote idle, first-receipt loss, or reconnect behavior. Local
+controlled-clock and MCP tests are additional component evidence, not substitutes for those gates.
+The [DEV probe regression](../tests/native-tool-long-wait-probe.test.ts) and
+[waiting regressions](../tests/native-tool-long-wait.test.ts) remain available without retaining
+historical implementation/review rounds as public specifications.
+
+## API access, upstream, and proxy validation
+
+Maintain the [API Key](api-key-mode.md), [upstream](upstream-provider.md), and
+[proxy](network-proxy.md) contracts together. Local automated runs should use isolated `HOME`,
+`CODEX_HOME`, and `CODEX_CHATGPT_WEB_HOME`, with inherited HTTP(S)/ALL proxy variables cleared in
+the test subprocess only. Do not let test cleanup fall back to a user's active configuration.
+
+Check local authentication before routing, private key-vault recovery and session-only fallback,
+save-before-restart failures, API mode's no-automatic-Codex-write rule, and sensitive export
+contents. With a dedicated test upstream, exercise all three proxy policies, selected versus
+unselected models, missing/failed discovery, all metadata modes, protected Agent-control fields,
+degraded custom round-trip, v1 marker/vault cleanup, and dynamic/static catalog consistency for the
+exact response consumed by export. A configured revision does not freeze the remote catalog.
+
+For metadata release verification, use one immutable source lock for generated bundled data,
+schema, and the actual Codex parser. Check repeatable generation, field/type diffs, unique exact
+slugs, final-row validity, and stale-artifact rejection. Run
+[catalog smoke](../scripts/smoke-codex-catalog.ts) only after proving parser identity against that
+lock; a matching display version or an arbitrary installed `codex` is not enough.
+
+For packaged Electron proxy validation, verify exact partition/Basic/host/port challenge matching,
+old-auth cache removal before switching, rollback, and the fixed fatal path if cache clearing
+fails. Confirm that unconfirmed child shutdown keeps supervision rather than falsely reporting
+exit, and that diagnostics redact old as well as current endpoints. Do not interpret mocked
+safeStorage/network tests as real OS-vault, provider, proxy, or Tunnel authentication evidence.
+
+Server release acceptance additionally requires the
+[real two-host delegated harness and packaged secure-storage checks](../deploy/server/README.md#runtime-acceptance-on-the-target-server).
+Same-workstation mocks do not prove child-origin execution, outer sandbox/approval enforcement,
+manual Zero Risk handshakes, private public-facing listeners, or persistence across container
+recreation. A Secret Service substrate probe does not by itself validate Electron safeStorage.
 
 ## Windows 11 gate
 

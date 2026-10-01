@@ -17,6 +17,10 @@ launcher-owned codex-chatgpt-web daemon
       ChatGPT custom connector
 ```
 
+For maintained topic contracts, see the [documentation index](README.md). Native operation identity
+and waiting are defined in the [Native tool protocol](native-tool-protocol.md); API Key upstream
+routing and metadata are defined in the [upstream provider guide](upstream-provider.md).
+
 ## Modes
 
 ### `browser-only`
