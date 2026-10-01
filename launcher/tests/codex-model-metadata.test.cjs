@@ -10,11 +10,14 @@ const UNKNOWN_ID = "provider/model-x";
 const emptyDiscovery = () => metadata.parseUpstreamDiscovery({ data: [] });
 
 test("generated bundled metadata and ModelInfo schema share the immutable Codex source lock", () => {
+  assert.equal(sourceLock.version, 3);
+  assert.match(sourceLock.tag, /^rust-v\d+\.\d+\.\d+$/);
   assert.match(sourceLock.revision, /^[a-f0-9]{40}$/);
   assert.equal(bundledArtifact.revision, sourceLock.revision);
   assert.equal(schemaArtifact.revision, sourceLock.revision);
   assert.ok(bundledArtifact.models.some(model => model.slug === BUNDLED_ID));
   assert.equal(schemaArtifact.schema.type, "object");
+  assert.ok(Object.keys(schemaArtifact.sourceFiles).length > 0);
 });
 
 test("metadata source availability and automatic mode follow all four source combinations", () => {

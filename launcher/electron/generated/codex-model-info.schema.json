@@ -1,6 +1,16 @@
 {
-  "version": 1,
-  "revision": "08a7031b6acb4a8e00372be0e83e21cbab0db49d",
+  "version": 2,
+  "revision": "01fc69f4026735edfdf6789820549727a4867b11",
+  "sourceFiles": {
+    "protocol/src/openai_models.rs": "4c8b5cafd8c55db269f669e352321f787fcaf83785bce4476cb887abfce75dc6",
+    "protocol/src/openai_models/access_programs.rs": "6c8a785431a5a79650279ca702c360d1188a6012828fda538e5eedfc9dba25ce",
+    "protocol/src/openai_models/guardian.rs": "dfe32eebcf97c4004de18f9d312510c01f532e795566d34913445dd59cde541b",
+    "protocol/src/openai_models/guardian_v2.rs": "0e086c9cb2960f38c8f835a5161edf1c4a9552720115f30614715ee28e5e53c4",
+    "protocol/src/openai_models/reasoning_effort.rs": "62089cb92996bb0030d4a219a6ba06b3bcf8f2f45e95ef7204bc8632d07ea08d",
+    "protocol/src/config_types.rs": "ce9b26223db7cc4b5cf474e571e4509e8cc52536e159510f153f94de0fcd37e8",
+    "protocol/src/protocol.rs": "d3d3d384da91b2824c10091de4331a2bc26ec5474887ed0aef1e3f3c4ae110f4",
+    "protocol/src/turn_input.rs": "fb7d3e20230af079cac0ce4b52fd78d0452c54519438adbe74941bde3be4bad0"
+  },
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "definitions": {
@@ -38,14 +48,6 @@
           }
         },
         "type": "object"
-      },
-      "AsyncClassifierMode": {
-        "description": "Async classifier experiment, resolved once for each parent task.",
-        "enum": [
-          "snapshot",
-          "conversation"
-        ],
-        "type": "string"
       },
       "AutoReviewMessages": {
         "properties": {
@@ -171,7 +173,7 @@
         "type": "object"
       },
       "CyberAccessProgram": {
-        "description": "Requested cyber treatment for an OpenAI model turn. Authorization and model-tier restrictions remain server-owned.",
+        "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
         "enum": [
           "standard",
           "daybreak_blue",
@@ -308,25 +310,6 @@
       "GuardianV2ModelConfig": {
         "description": "Optional model-owned defaults for Guardian v2 classification experiments.",
         "properties": {
-          "async_classifier_conversation_token_limit": {
-            "description": "Reset retained async history when the next request exceeds this token estimate.",
-            "format": "uint",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "async_classifier_mode": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/AsyncClassifierMode"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "classifier_instructions": {
             "type": [
               "string",
@@ -665,13 +648,6 @@
               }
             ],
             "description": "Replacement confirmation-policy documents forwarded in actor MCP request metadata."
-          },
-          "content_filter_guidance": {
-            "description": "Developer guidance after a content-filter block. Missing, null, blank, or values over 512 UTF-8 bytes use the bundled guidance.",
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "guardian_v2": {
             "anyOf": [

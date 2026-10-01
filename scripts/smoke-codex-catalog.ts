@@ -1,43 +1,32 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { CHATGPT_WEB_MODEL_ROUTES, availableChatGptWebModelRoutes, chatGptWebRouteEfforts, isChatGptWebModelSlug } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
 import { normalizeUpstreamModelCatalog } from "../src/upstream-model-catalog";
 import { parseUpstreamProviderConfig } from "../src/upstream-provider";
+import { downloadCli, fetchRelease, type SourceLock } from "./codex-release";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const generatedDir = join(repositoryRoot, "launcher", "electron", "generated");
-const sourceLock = JSON.parse(readFileSync(join(generatedDir, "codex-source-lock.json"), "utf8")) as {
-  revision: string;
-};
+const sourceLock = JSON.parse(readFileSync(join(generatedDir, "codex-source-lock.json"), "utf8")) as SourceLock;
 const bundledArtifact = JSON.parse(readFileSync(join(generatedDir, "codex-bundled-models.json"), "utf8")) as {
   revision: string;
   models: unknown[];
 };
-const sourceArg = process.argv.find(argument => argument.startsWith("--source="))?.slice("--source=".length)
-  ?? process.env.CODEX_SOURCE_DIR;
-if (!sourceArg) throw new Error("smoke:codex requires --source=/path/to/openai-codex or CODEX_SOURCE_DIR");
-const sourceRoot = resolve(sourceArg);
-const codexRs = join(sourceRoot, "codex-rs");
-const gitRevision = spawnSync("git", ["rev-parse", "HEAD"], { cwd: sourceRoot, encoding: "utf8" });
-if (gitRevision.status !== 0 || gitRevision.stdout.trim() !== sourceLock.revision
-  || bundledArtifact.revision !== sourceLock.revision) {
-  throw new Error("Codex parser smoke source does not match the generated artifact source lock");
+if (bundledArtifact.revision !== sourceLock.revision) {
+  throw new Error("Codex parser smoke catalog does not match the generated artifact release lock");
 }
-const gitStatus = spawnSync("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: sourceRoot, encoding: "utf8" });
-if (gitStatus.status !== 0 || gitStatus.stdout.trim()) {
-  throw new Error("Codex parser smoke requires a clean tracked checkout at the generated artifact source lock");
-}
+let binary = "";
 function runCodex(args: string[], env = process.env): { stdout: string; stderr: string } {
-  const result = spawnSync("cargo", ["run", "--quiet", "-p", "codex-cli", "--", ...args], {
-    cwd: codexRs,
+  const result = spawnSync(binary, args, {
+    cwd: root,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     env,
-    timeout: 20 * 60_000,
+    timeout: 30_000,
     // Hidden task identities also carry the native harness metadata in this JSON response.
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -53,8 +42,6 @@ if (!sourceCatalog.models?.some(model => model && typeof model === "object" && (
 }
 
 const root = join(tmpdir(), `codex-chatgpt-web-codex-smoke-${process.pid}-${Date.now()}`);
-const cargoLockPath = join(codexRs, "Cargo.lock");
-const originalCargoLock = readFileSync(cargoLockPath);
 process.env.CODEX_HOME = join(root, "codex");
 process.env.CODEX_CHATGPT_WEB_HOME = join(root, "app");
 mkdirSync(process.env.CODEX_HOME, { recursive: true });
@@ -96,7 +83,9 @@ writeFileSync(join(process.env.CODEX_HOME, "config.toml"), [
   "multi_agent_v2 = false",
   "",
 ].join("\n"));
+const temporaryRelease = process.env.CODEX_RELEASE_DIR ? undefined : mkdtempSync(join(tmpdir(), "codex-catalog-release-"));
 try {
+  binary = await downloadCli(process.env.CODEX_RELEASE_DIR ?? temporaryRelease!, await fetchRelease(sourceLock.tag, sourceLock.revision));
   const isolatedEnv = { ...process.env, CODEX_HOME: process.env.CODEX_HOME };
   const result = runCodex(["debug", "models"], isolatedEnv);
   const catalog = JSON.parse(result.stdout) as {
@@ -168,14 +157,7 @@ try {
   }
   process.stdout.write("NATIVE_CODEX_CATALOG_SMOKE_OK\n");
 } finally {
-  if (!readFileSync(cargoLockPath).equals(originalCargoLock)) writeFileSync(cargoLockPath, originalCargoLock);
+  if (binary) rmSync(dirname(binary), { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
-}
-
-const gitStatusAfter = spawnSync("git", ["status", "--porcelain", "--untracked-files=no"], {
-  cwd: sourceRoot,
-  encoding: "utf8",
-});
-if (gitStatusAfter.status !== 0 || gitStatusAfter.stdout.trim()) {
-  throw new Error("Codex parser smoke changed tracked files in the locked source checkout");
+  if (temporaryRelease) rmSync(temporaryRelease, { recursive: true, force: true });
 }

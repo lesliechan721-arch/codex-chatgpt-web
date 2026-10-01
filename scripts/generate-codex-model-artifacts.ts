@@ -1,14 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
-
-interface SourceLock {
-  version: 2;
-  repository: string;
-  branch: string;
-  revision: string;
-}
+import { dirname, join, resolve } from "node:path";
+import { checkoutSource, downloadCli, fetchRelease, run, verifySchemaSources, verifySource, type SourceLock } from "./codex-release";
 
 const root = resolve(import.meta.dir, "..");
 const generatedDir = join(root, "launcher", "electron", "generated");
@@ -17,106 +10,71 @@ const sourceLock = JSON.parse(readFileSync(lockPath, "utf8")) as SourceLock;
 const sourceArg = process.argv.find(argument => argument.startsWith("--source="))?.slice("--source=".length)
   ?? process.env.CODEX_SOURCE_DIR;
 const checkOnly = process.argv.includes("--check");
+const schemaPath = join(generatedDir, "codex-model-info.schema.json");
+const schemaArtifact = JSON.parse(readFileSync(schemaPath, "utf8")) as {
+  schema: Record<string, unknown>;
+  sourceFiles: Record<string, string>;
+};
 
-function run(command: string, args: string[], cwd: string): string {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed: ${result.error?.message || result.stderr || `exit ${result.status}`}`);
-  }
-  return result.stdout;
+// Only synchronization follows latest. Verification uses the recorded stable release.
+if (checkOnly && !sourceLock.tag) throw new Error("Codex source lock must identify a stable release tag");
+const release = await fetchRelease(checkOnly ? sourceLock.tag : undefined, checkOnly ? sourceLock.revision : undefined);
+const temporaryRoot = process.env.CODEX_RELEASE_DIR ? undefined : mkdtempSync(join(tmpdir(), "codex-model-metadata-"));
+const directory = process.env.CODEX_RELEASE_DIR ?? temporaryRoot!;
+let binary: string | undefined;
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right, "en")).map(([key, item]) => [key, canonical(item)]));
 }
 
-function generateArtifacts(sourceRoot: string, refreshRevision: boolean): void {
-  const codexRs = join(sourceRoot, "codex-rs");
-  if (!existsSync(join(codexRs, "protocol", "src", "openai_models.rs"))
-    || !existsSync(join(codexRs, "models-manager", "models.json"))) {
-    throw new Error("The Codex source checkout does not contain the required Rust sources");
-  }
-
-  const revision = run("git", ["rev-parse", "HEAD"], sourceRoot).trim();
-  if (!refreshRevision && revision !== sourceLock.revision) {
-    if (checkOnly && !sourceArg) {
-      throw new Error(`Latest Codex ${sourceLock.branch} revision is ${revision}, but generated artifacts are locked to ${sourceLock.revision}; run bun run generate:codex-model-metadata to update them`);
-    }
-    throw new Error(`Codex source revision mismatch: expected ${sourceLock.revision}, received ${revision}`);
-  }
-  const dirtyTracked = run("git", ["status", "--porcelain", "--untracked-files=no"], sourceRoot).trim();
-  if (dirtyTracked) throw new Error("Codex source checkout has tracked changes; generation requires the exact locked revision");
-
-  const exampleName = `codex_chatgpt_web_model_export_${process.pid}`;
-  const exampleDir = join(codexRs, "protocol", "examples");
-  const examplePath = join(exampleDir, `${exampleName}.rs`);
-  const cargoLockPath = join(codexRs, "Cargo.lock");
-  const originalCargoLock = readFileSync(cargoLockPath);
-  mkdirSync(exampleDir, { recursive: true });
-  if (existsSync(examplePath)) throw new Error(`Temporary Codex exporter already exists: ${examplePath}`);
-
-  const exporter = `use codex_protocol::openai_models::{ModelInfo, ModelsResponse};
-use schemars::schema_for;
-
-fn main() {
-    let bundled: ModelsResponse = serde_json::from_str(include_str!("../../models-manager/models.json")).unwrap();
-    let payload = serde_json::json!({
-        "models": bundled.models,
-        "schema": schema_for!(ModelInfo),
-    });
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-}
-`;
-
-  let output = "";
+try {
+  const sourceRoot = sourceArg ? resolve(sourceArg) : checkoutSource(directory, release);
+  const revision = verifySource(sourceRoot, release.tag_name, release.revision);
+  verifySchemaSources(sourceRoot, schemaArtifact.sourceFiles);
+  binary = await downloadCli(directory, release);
+  const home = mkdtempSync(join(tmpdir(), "codex-model-export-"));
+  let models: unknown[];
   try {
-    writeFileSync(examplePath, exporter);
-    output = run("cargo", ["run", "--quiet", "-p", "codex-protocol", "--example", exampleName], codexRs);
+    const env = { ...process.env, CODEX_HOME: home };
+    const catalogPath = join(sourceRoot, "codex-rs", "models-manager", "models.json");
+    const sourceCatalog = JSON.parse(run(binary, ["-c", `model_catalog_json=${JSON.stringify(catalogPath)}`, "debug", "models"], home, env));
+    const bundledCatalog = JSON.parse(run(binary, ["debug", "models", "--bundled"], home, env));
+    if (!Array.isArray(sourceCatalog.models) || !sourceCatalog.models.length
+      || JSON.stringify(canonical(sourceCatalog.models)) !== JSON.stringify(canonical(bundledCatalog.models))) {
+      throw new Error("Codex release source catalog does not match the official CLI bundled catalog");
+    }
+    // ModelsResponse adds this legacy alias on output; ModelInfo uses model_messages.
+    models = sourceCatalog.models.map((model: { base_instructions?: unknown; model_messages?: { instructions_template?: unknown } }) => {
+      const { base_instructions, ...info } = model;
+      if (base_instructions !== undefined && base_instructions !== model.model_messages?.instructions_template) {
+        throw new Error("Codex legacy instructions do not match model_messages.instructions_template");
+      }
+      return info;
+    });
   } finally {
-    rmSync(examplePath, { force: true });
-    if (!readFileSync(cargoLockPath).equals(originalCargoLock)) writeFileSync(cargoLockPath, originalCargoLock);
+    rmSync(home, { recursive: true, force: true });
   }
 
-  const dirtyAfter = run("git", ["status", "--porcelain", "--untracked-files=no"], sourceRoot).trim();
-  if (dirtyAfter) throw new Error("Codex artifact generation changed tracked files in the source checkout");
-
-  const payload = JSON.parse(output) as { models?: unknown[]; schema?: Record<string, unknown> };
-  if (!Array.isArray(payload.models) || !payload.models.length || !payload.schema
-    || typeof payload.schema !== "object" || Array.isArray(payload.schema)) {
-    throw new Error("Codex exporter returned an invalid ModelInfo artifact payload");
-  }
-
-  mkdirSync(generatedDir, { recursive: true });
-  const bundledJson = `${JSON.stringify({
-    version: 1,
-    revision,
-    models: payload.models,
-  }, null, 2)}\n`;
-  const schemaJson = `${JSON.stringify({
-    version: 1,
-    revision,
-    schema: payload.schema,
-  }, null, 2)}\n`;
   const bundledPath = join(generatedDir, "codex-bundled-models.json");
-  const schemaPath = join(generatedDir, "codex-model-info.schema.json");
+  const bundledJson = `${JSON.stringify({ version: 1, revision, models: canonical(models) }, null, 2)}\n`;
+  const schemaJson = `${JSON.stringify({ version: 2, revision, sourceFiles: schemaArtifact.sourceFiles, schema: schemaArtifact.schema }, null, 2)}\n`;
+  const lockJson = `${JSON.stringify({ version: 3, repository: "https://github.com/openai/codex.git", tag: release.tag_name, revision }, null, 2)}\n`;
   if (checkOnly) {
-    if (readFileSync(bundledPath, "utf8") !== bundledJson || readFileSync(schemaPath, "utf8") !== schemaJson) {
-      throw new Error("Generated Codex ModelInfo artifacts are stale for the locked source revision");
+    if (readFileSync(bundledPath, "utf8") !== bundledJson || readFileSync(schemaPath, "utf8") !== schemaJson
+      || readFileSync(lockPath, "utf8") !== lockJson) {
+      throw new Error("Generated Codex ModelInfo artifacts are stale for the locked release");
     }
   } else {
+    mkdirSync(generatedDir, { recursive: true });
     writeFileSync(bundledPath, bundledJson);
     writeFileSync(schemaPath, schemaJson);
-    if (refreshRevision) {
-      writeFileSync(lockPath, `${JSON.stringify({ ...sourceLock, revision }, null, 2)}\n`);
-    }
+    writeFileSync(lockPath, lockJson);
   }
-
-  process.stdout.write(`${checkOnly ? "Verified" : "Generated"} Codex ModelInfo artifacts from ${basename(sourceRoot)}@${revision}\n`);
-}
-
-const temporaryRoot = sourceArg ? undefined : mkdtempSync(join(tmpdir(), "codex-model-metadata-"));
-const sourceRoot = sourceArg ? resolve(sourceArg) : join(temporaryRoot!, "openai-codex");
-try {
-  if (!sourceArg) {
-    run("git", ["clone", "--depth", "1", "--branch", sourceLock.branch, sourceLock.repository, sourceRoot], temporaryRoot!);
-  }
-  generateArtifacts(sourceRoot, !sourceArg && !checkOnly);
+  verifySource(sourceRoot, release.tag_name, revision);
+  process.stdout.write(`${checkOnly ? "Verified" : "Generated"} Codex ModelInfo artifacts from ${release.tag_name}@${revision}\n`);
 } finally {
+  if (binary) rmSync(dirname(binary), { recursive: true, force: true });
   if (temporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true });
 }
