@@ -233,6 +233,7 @@ test("a compaction control token cannot claim the ordinary Codex tool environmen
   }
 });
 
+// Allow for Windows named-pipe scheduling and broker cleanup across these round trips.
 test("active compaction delivers the current result and converts every later MCP call into the checkpoint request", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-active-compaction-gate-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
@@ -284,7 +285,7 @@ test("active compaction delivers the current result and converts every later MCP
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("active compaction drains an MCP call already queued without an outer Codex waiter", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-queued-before-compaction-"));
@@ -328,7 +329,7 @@ test("active compaction drains an MCP call already queued without an outer Codex
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("a completed retained agent returns an exact checkpoint and its browser is physically retired", async () => {
   expect(MAX_COMPACTION_HANDOFF_TIMEOUT_MS).toBe(5 * 60_000);

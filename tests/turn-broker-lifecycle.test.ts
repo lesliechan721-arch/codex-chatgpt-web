@@ -628,6 +628,7 @@ test("an unbounded broker call fails when the broker closes without answering", 
   }
 }, 10_000);
 
+// Windows named-pipe setup and cleanup also count toward the test timeout.
 test("bounded broker calls preserve server-owned closure before advancing the lifecycle", async () => {
   let peer!: Socket;
   let finishFrame!: () => void;
@@ -657,7 +658,7 @@ test("bounded broker calls preserve server-owned closure before advancing the li
     peer?.destroy();
     await broker.close();
   }
-});
+}, 15_000);
 
 test("broker frame settlement still rejects errors, wrong identities and incomplete replies", async () => {
   for (const [reply, expected] of [
