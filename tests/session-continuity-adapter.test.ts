@@ -32,7 +32,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function fixture(manual = false, options: { codexHome?: string; threadId?: string } = {}) {
+function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number } = {}) {
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
   const statePath = join(root, "continuity");
   const registrations = new ContinuityRegistrationStore(statePath);
@@ -75,6 +75,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     chatgptWeb: {
       browserInteractionMode: manual ? "manual" : "automatic",
       browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
+      ...(options.turnTimeoutMs !== undefined ? { turnTimeoutMs: options.turnTimeoutMs } : {}),
       appName: manual ? ZERO_RISK_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME,
       brokerSocketPath: defaultBrokerEndpoint(root), continuityStateDirectory: statePath,
       localToolsEnabled: true, solAvailable: !manual, proAvailable: false, extraHighAvailable: false,
@@ -287,6 +288,48 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   };
   return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker };
 }
+
+for (const { name, sourceDelay, checkpointDelay, succeeds } of [
+  { name: "gives the checkpoint a separate budget after source settlement", sourceDelay: 700, checkpointDelay: 700, succeeds: true },
+  { name: "still times out during source settlement", sourceDelay: 1600, checkpointDelay: 0, succeeds: false },
+  { name: "still times out during the checkpoint", sourceDelay: 0, checkpointDelay: 1600, succeeds: false },
+]) test(`continuity compaction ${name}`, async () => {
+  const f = fixture(false, { turnTimeoutMs: 1000 });
+  const first = f.request();
+  await f.run(first);
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const source = chatGptTurnSessions.find(binding.executionKey!)!;
+  const ordinary = f.automatic.getMockImplementation()!;
+  let checkpoint: Promise<string> | undefined;
+  f.automatic.mockImplementation(turn => {
+    if (!turn.nativeConnector) return ordinary(turn);
+    checkpoint = (async () => {
+      await Bun.sleep(checkpointDelay);
+      return ordinary(turn);
+    })();
+    return checkpoint;
+  });
+  Object.defineProperty(source, "physicalSettlement", { value: Bun.sleep(sourceDelay) });
+  const compact = structuredClone(first);
+  compact._compactionRequest = true;
+  try {
+    if (!succeeds) {
+      await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+      expect(binding.state).toBe("lost");
+      return;
+    }
+    const events = await f.run(compact);
+    expect(events.find(event => event.type === "text_delta")).toMatchObject({
+      type: "text_delta", text: expect.stringContaining(f.controls.handoffSummary),
+    });
+    expect(binding.state).toBe("ready");
+    expect(f.submissions).toHaveLength(2);
+  } finally {
+    await source.physicalSettlement;
+    await checkpoint?.catch(() => {});
+  }
+});
 
 for (const manual of [false, true]) for (const replacement of ["empty", "removed"] as const) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} cached ordinary round applies ${replacement} tools before Native admission`, async () => {
   const f = fixture(manual);

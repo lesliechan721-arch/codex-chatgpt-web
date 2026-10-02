@@ -199,6 +199,7 @@ export function runContinuityCompaction(
           preserveFinalResponse = true;
         }
         if (!claim) throw continuityError("continuity_source_unproven");
+        reportProgress();
         rawSummary = await requestRetainedCompactionHandoff(worker, parsed, source, broker as TurnBroker,
           capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
             claim,

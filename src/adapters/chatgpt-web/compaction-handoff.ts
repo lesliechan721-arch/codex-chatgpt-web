@@ -394,8 +394,8 @@ export async function requestRetainedCompactionHandoff(
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
+      ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
       ...(continuity ? {
-        modelFamily: parsed._chatgptModelFamily,
         continuity: continuity.claim,
         onContinuityLease: continuity.onLease,
         retainConversation: true,

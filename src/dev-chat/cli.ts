@@ -37,8 +37,8 @@ const DEV_HELP = `Codex Web GPT DEV chat
 Usage:
   codex-chatgpt-web dev launcher
   codex-chatgpt-web dev status [--json]
-  codex-chatgpt-web dev setup --browser-only [--automatic-browser-interaction]
-  codex-chatgpt-web dev setup --full --tunnel-id ID --runtime-key-file PATH [--automatic-browser-interaction|--zero-risk-browser-interaction] [--native-tool-long-wait-probe]
+  codex-chatgpt-web dev setup --browser-only [--automatic-browser-interaction] [--auto-approve-tool-calls]
+  codex-chatgpt-web dev setup --full --tunnel-id ID --runtime-key-file PATH [--automatic-browser-interaction|--zero-risk-browser-interaction] [--auto-approve-tool-calls] [--native-tool-long-wait-probe]
   codex-chatgpt-web dev chat NAME [--model MODEL] [MESSAGE]
   codex-chatgpt-web dev list
 
@@ -347,6 +347,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
     const connectorNameSuffix = takeOption(args, "--connector-name-suffix");
     const acknowledgedUnofficial = takeFlag(args, "--acknowledge-unofficial");
     const refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
+    const autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
     const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
     const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
     if (automaticBrowserInteraction && manualBrowserInteraction) {
@@ -381,6 +382,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
       browserHostDescriptorPath: descriptorPath,
       ...(connectorNameSuffix !== undefined ? { connectorNameSuffix } : {}),
       refreshAccountCapabilities,
+      autoApproveToolCalls,
       acknowledgedUnofficial,
       ...(automaticBrowserInteraction || manualBrowserInteraction
         ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }

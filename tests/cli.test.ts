@@ -648,13 +648,14 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
   const helperScript = join(root, "helper.cjs");
   const controlToken = "dev-launcher-control-token-0123456789abcdefghijklmnop";
   let inspections = 0;
+  const capabilityDetections: boolean[] = [];
   const control = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
     inspections += 1;
     expect(request.url).toBe("/v1/session/inspect");
     expect(request.headers.authorization).toBe(`Bearer ${controlToken}`);
-    expect(JSON.parse(Buffer.concat(chunks).toString("utf8"))).toEqual({ detectCapabilities: true });
+    capabilityDetections.push(JSON.parse(Buffer.concat(chunks).toString("utf8")).detectCapabilities);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       authenticated: true,
@@ -688,6 +689,12 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       createdAt: new Date().toISOString(),
     })}\n`, { mode: 0o600 });
 
+    const env = {
+      ...process.env,
+      CODEX_WEB_GPT_DEV_HOME: devHome,
+      CODEX_CHATGPT_WEB_HOME: join(root, "production"),
+      CODEX_HOME: join(root, "production-codex"),
+    };
     const result = await runCli([
       "dev",
       "setup",
@@ -697,16 +704,12 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       "--tool-authority-mode",
       "delegated",
       "--acknowledge-unofficial",
-    ], {
-      ...process.env,
-      CODEX_WEB_GPT_DEV_HOME: devHome,
-      CODEX_CHATGPT_WEB_HOME: join(root, "production"),
-      CODEX_HOME: join(root, "production-codex"),
-    });
+    ], env);
     expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
     expect(result.stdout).toContain("No Codex route, Responses listener, or system service was installed");
     expect(result.stdout).toContain("DEV launcher owns the isolated MCP tunnel");
     expect(inspections).toBe(1);
+    expect(capabilityDetections).toEqual([true]);
     expect(JSON.parse(readFileSync(join(devHome, "config.json"), "utf8"))).toMatchObject({
       version: 3,
       purpose: "dev-harness",
@@ -715,9 +718,38 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
       toolAuthorityMode: "delegated",
+      autoApproveToolCalls: false,
       solAvailable: true,
       extraHighAvailable: false, proAvailable: false,
     });
+    const config = () => JSON.parse(readFileSync(join(devHome, "config.json"), "utf8"));
+    const { RuntimeHost } = require("../launcher/electron/runtime.cjs");
+    const host = {
+      launcherProfile: "development",
+      browserDescriptorPath: descriptorPath,
+      browserInteractionArgs: ({ refreshCapabilities = false }: { refreshCapabilities?: boolean } = {}) => [
+        "--automatic-browser-interaction", ...(refreshCapabilities ? ["--refresh-account-capabilities"] : []),
+      ],
+      browserInteractionMode: () => "automatic",
+      currentOperation: () => undefined,
+      toolAuthorityControl: () => ({ forced: false }),
+      toolAuthoritySetupArgs: () => ["--tool-authority-mode", config().toolAuthorityMode],
+      runtimeConfigSnapshot: () => ({ configured: true, mode: "browser-only", config: config() }),
+      runDevSetup: async (_operation: string, args: string[]) => {
+        const result = await runCli(args, env);
+        expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
+        return {};
+      },
+    };
+    await RuntimeHost.prototype.setAutoApproveToolCalls.call(host, true);
+    expect(config().autoApproveToolCalls).toBe(true);
+    await RuntimeHost.prototype.setToolAuthorityMode.call(host, "verified-environment");
+    expect(config()).toMatchObject({ toolAuthorityMode: "verified-environment", autoApproveToolCalls: true });
+    await RuntimeHost.prototype.setupDevCore.call(host);
+    expect(config().autoApproveToolCalls).toBe(true);
+    await RuntimeHost.prototype.setAutoApproveToolCalls.call(host, false);
+    expect(config().autoApproveToolCalls).toBe(false);
+    expect(capabilityDetections).toEqual([true, false, false, true, false]);
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);
     expect(existsSync(join(devHome, "codex-home", "config.toml"))).toBe(false);
   } finally {

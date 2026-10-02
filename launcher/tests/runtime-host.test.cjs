@@ -413,6 +413,7 @@ test("DEV MCP setup reuses only DEV-home credentials and targets its distinct co
     mode: "full",
     browserHost: "launcher",
     appName: "Codex Native3",
+    autoApproveToolCalls: true,
     tunnel: {
       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
       runtimeKeyFile,
@@ -430,6 +431,7 @@ test("DEV MCP setup reuses only DEV-home credentials and targets its distinct co
         "/dev/runtime/launcher-browser.json",
         "--automatic-browser-interaction",
         "--acknowledge-unofficial",
+        "--auto-approve-tool-calls",
       ],
     });
   } finally {
@@ -1455,6 +1457,34 @@ test("skill file experiment uses the setup transaction in production and DEV, an
   assert.equal(manual.invocation(), undefined);
 });
 
+
+test("tool approvals opt in and out through setup without refreshing models or changing chat settings", async () => {
+  for (const makeHost of [hostFor, devHostFor]) {
+    for (const mode of ["browser-only", "full"]) {
+      for (const enabled of [true, false]) {
+        const fixture = makeHost({ mode, browserInteractionMode: "automatic", autoApproveToolCalls: !enabled });
+        assert.equal((await fixture.host.setAutoApproveToolCalls(enabled)).enabled, enabled);
+        const { name, args } = fixture.invocation();
+        assert.equal(name, "auto-approve-tool-calls");
+        assert.equal(args.includes("--auto-approve-tool-calls"), enabled);
+        assert.equal(args.includes(`--${mode}`), true);
+        assert.equal(args.includes("--restart-service"), makeHost === hostFor);
+        assert.equal(args.includes("dev"), makeHost === devHostFor);
+        for (const flag of ["--refresh-account-capabilities", "--login", "--fresh-conversation", "--retained-conversation", "--temporary-chats", "--saved-chats"]) {
+          assert.equal(args.includes(flag), false);
+        }
+      }
+    }
+    for (const config of [null, { mode: "full", browserInteractionMode: "manual" }]) {
+      const fixture = makeHost(config);
+      await assert.rejects(() => fixture.host.setAutoApproveToolCalls(true), /Initialize|Zero Risk/);
+      assert.equal(fixture.invocation(), undefined);
+    }
+    const fixture = makeHost({ mode: "full" });
+    await assert.rejects(() => fixture.host.setAutoApproveToolCalls("true"), /boolean/);
+    assert.equal(fixture.invocation(), undefined);
+  }
+});
 
 test("fresh-conversation preference uses production and DEV setup without forcing mode or other preferences", async () => {
   for (const makeHost of [hostFor, devHostFor]) {
