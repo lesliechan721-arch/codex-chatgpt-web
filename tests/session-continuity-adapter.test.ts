@@ -4604,6 +4604,7 @@ for (const retained of [false, true]) for (const idOnly of [false, true]) test(`
   expect(f.pages.size).toBe(1);
 });
 
+// Allow slower CI runners to complete all 600 sequential compaction requests.
 for (const manual of [false, true]) test(`Round 10: cached compact codecs do not retain rewritten historical source evidence ${manual}`, async () => {
   const f = httpFixture(manual);
   f.controls.invokeSourceTools = manual;
@@ -4657,4 +4658,4 @@ for (const manual of [false, true]) test(`Round 10: cached compact codecs do not
   expect(f.controls.toolResults).toHaveLength(manual ? 1 : 0);
   // A later codec replay can change its wire output, but it cannot enlarge committed evidence.
   expect(JSON.stringify(v1Output)).toContain("Older human text 1.");
-});
+}, 30_000);

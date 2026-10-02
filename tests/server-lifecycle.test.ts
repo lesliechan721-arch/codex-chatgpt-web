@@ -864,6 +864,7 @@ test("remote non-Web JSON emits a terminal idle-timeout body after upstream head
   }
 });
 
+// Leave CI headroom for sequential HTTP requests and real idle-lease waits.
 test("remote non-Web continuation renews once for a new tool result but not for its replay", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
   process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
@@ -965,7 +966,7 @@ test("remote non-Web continuation renews once for a new tool result but not for 
     if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
     else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
   }
-});
+}, 15_000);
 
 test("remote non-Web Responses real SSE progress renews the idle lease and final completion releases it", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
@@ -1193,7 +1194,7 @@ test("remote non-Web failed and incomplete responses release the idle lease with
       else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
     }
   }
-});
+}, 15_000);
 
 test("remote non-Web upstream failures release the idle lease and permit the same turn retry", async () => {
   for (const scenario of ["http-error", "transport-error"] as const) {
@@ -1263,7 +1264,7 @@ test("remote non-Web upstream failures release the idle lease and permit the sam
       else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
     }
   }
-});
+}, 15_000);
 
 test("remote non-Web idle timeout wins over a late upstream rejection", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;

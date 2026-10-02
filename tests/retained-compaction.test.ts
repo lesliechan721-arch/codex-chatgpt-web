@@ -233,6 +233,7 @@ test("a compaction control token cannot claim the ordinary Codex tool environmen
   }
 });
 
+// Allow for Windows named-pipe scheduling and broker cleanup across these round trips.
 test("active compaction delivers the current result and converts every later MCP call into the checkpoint request", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-active-compaction-gate-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
@@ -284,7 +285,7 @@ test("active compaction delivers the current result and converts every later MCP
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("active compaction drains an MCP call already queued without an outer Codex waiter", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-queued-before-compaction-"));
@@ -328,7 +329,7 @@ test("active compaction drains an MCP call already queued without an outer Codex
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("a completed retained agent returns an exact checkpoint and its browser is physically retired", async () => {
   expect(MAX_COMPACTION_HANDOFF_TIMEOUT_MS).toBe(5 * 60_000);
@@ -2014,22 +2015,38 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
   let browserStarts = 0;
   let releaseBrowser: (() => void) | undefined;
   let fallbackTrace = "";
+  let fallbackStarted!: () => void;
+  const fallbackReady = new Promise<void>(resolve => { fallbackStarted = resolve; });
+  let fallbackSignal: AbortSignal | undefined;
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
     fallbackTrace = turn.traceId;
+    fallbackSignal = turn.abortSignal;
+    fallbackStarted();
     return new Promise<string>(resolve => { releaseBrowser = () => resolve("browser cleanup completed"); });
   };
   const events: AdapterEvent[] = [];
-  const startedAt = performance.now();
+  let pending: Promise<void> | undefined;
   try {
-    await createChatGptWebAdapter(provider).runTurn!(
+    // Start the socket with real timers before controlling the compaction deadline.
+    const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
+    const setup = await broker.beginCompactionTransaction("deadline-test-setup");
+    broker.abortCompactionTransaction(setup.token);
+    mock.timers.enable({ apis: ["setTimeout"] });
+    pending = createChatGptWebAdapter(provider).runTurn!(
       request(true),
       { headers: new Headers() },
       event => events.push(event),
     );
-    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    await fallbackReady;
     expect(browserStarts).toBe(2);
+    mock.timers.tick(24);
+    expect(fallbackSignal?.aborted).toBeFalse();
+    expect(events.some(event => event.type === "error" || event.type === "done")).toBeFalse();
+    mock.timers.tick(1);
+    await pending;
+    expect(fallbackSignal?.aborted).toBeTrue();
     expect(events.at(-1)).toMatchObject({
       type: "error",
       code: "compaction_handoff_timeout",
@@ -2039,6 +2056,8 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
   } finally {
     releaseBrowser?.();
     await cancelStructuredCompactionTrace(fallbackTrace, new Error("test cleanup"));
+    await pending;
+    mock.timers.reset();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();

@@ -54,6 +54,7 @@ function differentProcessStartIdentity(value: string): string {
   throw new Error(`Unsupported process start identity: ${value}`);
 }
 
+// Four CLI startups share this timeout; allow for slower Windows CI runners.
 test("CLI generates once, reports redacted status, rotates and explicitly disables", () => withHome(home => {
   const enabled = cli(home, ["enable", "--generate"]);
   assert.equal(enabled.code, 0, enabled.err);
@@ -73,8 +74,9 @@ test("CLI generates once, reports redacted status, rotates and explicitly disabl
   const disabled = cli(home, ["disable"]);
   assert.equal(disabled.code, 0, disabled.err);
   assert.equal(loadApiAccessPolicy(home).mode, "openai");
-}));
+}), 15_000);
 
+// These validation cases start four CLI processes in sequence.
 test("CLI stdin import never echoes the key and rejects ambiguous options", () => withHome(home => {
   const key = "test_imported_key_" + "k".repeat(32);
   const imported = cli(home, ["enable", "--key-stdin"], `${key}\r\n`);
@@ -87,7 +89,7 @@ test("CLI stdin import never echoes the key and rejects ambiguous options", () =
   const invalid = cli(home, ["rotate", "--key-stdin"], "short-secret\n");
   assert.notEqual(invalid.code, 0);
   assert.ok(!invalid.err.includes("short-secret"));
-}));
+}), 15_000);
 
 test("CLI fails closed for damaged policy; only explicit disable recovers", () => withHome(home => {
   writeFileSync(join(home, "api-access.json"), "{");
@@ -95,7 +97,7 @@ test("CLI fails closed for damaged policy; only explicit disable recovers", () =
   assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
   assert.equal(cli(home, ["disable"]).code, 0);
   assert.equal(loadApiAccessPolicy(home).mode, "openai");
-}));
+}), 15_000);
 
 test("successful CLI reconnect clears the persisted OpenAI routing warning", () => withHome(home => {
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -132,7 +134,7 @@ test("CLI Codex export requires the current local key and emits sensitive TOML p
   assert.deepEqual(JSON.parse(payload.catalog), JSON.parse(readFileSync(payload.catalogPath, "utf8")));
   assert.equal(payload.environment.HTTP_PROXY, "http://proxy.example:8080");
   for (const host of ["localhost", "127.0.0.1", "::1"]) assert.ok(payload.environment.NO_PROXY.includes(host));
-}));
+}), 15_000);
 
 test("CLI Codex export supports an external HTTPS client without server-local paths or Interrupt hook", () => withHome(home => {
   const localKey = "cgw_" + "r".repeat(43);
@@ -315,7 +317,7 @@ test("concurrent CLI catalog commands preserve the marker state of the later com
 
   await runRace(["codex-config", "--json"], ["refresh-models"], true);
   await runRace(["refresh-models"], ["codex-config", "--json"], false);
-});
+}, 15_000);
 
 test("CLI recovers a stale model-catalog lock after the owner PID is reused", () => withHome(home => {
   const currentStart = processStartIdentity(process.pid);

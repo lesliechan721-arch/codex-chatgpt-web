@@ -134,6 +134,7 @@ test("API preflight accepts manual providers and creates no Codex injection", ()
   api(); preflightSetup({ mode: "browser-only", browserHostDescriptorPath: join(home, "browser.json"), acknowledgedUnofficial: true });
   expect(existsSync(getCodexConfigPath())).toBe(false); expect(existsSync(getCodexJournalPath())).toBe(false);
 });
+// Three CLI commands and one server startup share the test timeout.
 test("manual server mode leaves recorded Codex client files byte-for-byte unchanged on API enable, rotate and serve", async () => {
   const port = await unusedPort();
   saveApiAccessPolicy(OPENAI_ACCESS);
@@ -189,7 +190,7 @@ test("manual server mode leaves recorded Codex client files byte-for-byte unchan
     serve.kill();
     await serve.exited;
   }
-});
+}, 15_000);
 test("export shares V1 feature defaults and Interrupt command but omits conflicting auth/voice/trust", () => {
   const config = defaultConfig();
   const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json", model: "chatgpt-web/high",
