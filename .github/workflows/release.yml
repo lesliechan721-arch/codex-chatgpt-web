@@ -181,7 +181,7 @@ jobs:
           mapfile -d '' release_files < <(find release-assets -type f -print0)
           test "${#release_files[@]}" -gt 0
           release_flags=(--latest)
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          if [[ "$GITHUB_REF_NAME" == *beta* ]]; then
             release_flags=(--prerelease --latest=false)
           fi
           if existing_release="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isPrerelease 2>/dev/null)"; then
