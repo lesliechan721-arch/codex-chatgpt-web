@@ -73,7 +73,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 자동 | MCP를 통해 사용 |
 | **Zero Risk** | 직접 붙여넣고 전송 | 별도 MCP 커넥터를 통해 사용 |
 
-Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk2` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
+Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk3` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
 
 <a id="full-harness"></a>
 
@@ -98,8 +98,10 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.
 2. ChatGPT **Developer Mode**를 활성화하고, **Tunnel** 방식의 새 커넥터를 만들고 이름을 정확히
-   **Codex Native3**로 지정합니다. **Authentication: None**과 **Allow all actions**를 사용합니다.
-3. **런타임 검증**을 실행해 **Codex Native3**가 연결되어 사용 가능한지 확인합니다.
+   **Codex Native4**로 지정합니다. **Authentication: None**과 **Allow all actions**를 사용합니다.
+3. **런타임 검증**을 실행해 **Codex Native4**가 연결되어 사용 가능한지 확인합니다.
+
+`task_updates-v1` 시작 스키마와 ACK 도구에는 새 ID가 필요합니다. Automatic은 **Codex Native4**, Zero Risk는 **Codex Zero Risk3**, 개발 환경은 **Codex Native4 DEV**를 사용합니다. **Codex Native3**, **Codex Native3 DEV**, **Codex Zero Risk2**는 그대로 유지하고 새 커넥터를 만드세요. 기존 이름을 변경하거나 새로고침하지 마세요. 사용자 지정 비레거시 이름은 유지되지만 이전 캐시가 있는 플러그인은 새 이름으로 만들어야 합니다.
 
 쓰기/수정 작업은 ChatGPT 작업 공간과 관리자 정책에서도 허용되어야 합니다.
 [Developer Mode와 MCP 앱](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)을

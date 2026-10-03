@@ -1,3 +1,4 @@
+import { observedTaskAcknowledgement, observedTaskOutputVersion } from "./task-update-ack";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -103,6 +104,7 @@ import type {
   ChatGptExternalTurnProgressSnapshot,
   ChatGptTurnProgressReader,
 } from "./turn-progress";
+import type { TaskUpdateOwnerContext, TaskUpdateState } from "./task-update-protocol";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
@@ -1321,13 +1323,15 @@ export interface BrowserTurn {
   /** Stable visible ChatGPT prose between status/tool rows. */
   onCommentary?: (text: string, continuation?: boolean) => void;
   /** Append-only, structurally stable Markdown chunks. */
-  onTextDelta: (delta: string) => void;
+  onTextDelta: (delta: string, candidate?: TaskUpdateOwnerContext) => void;
   /** Proven current-turn MCP activity; never response content or completion. */
   externalProgress?: ChatGptTurnProgressReader;
+  /** Negotiated when this physical execution is created; never added to an existing run. */
+  taskUpdateProtocol?: 1;
   /** Atomically fences browser completion against concurrent MCP claims in the turn broker. */
   completionFence?: {
-    begin(): Promise<number | undefined>;
-    commit(revision: number): Promise<boolean>;
+    begin(candidate?: TaskUpdateOwnerContext): Promise<number | undefined>;
+    commit(revision: number, candidate?: TaskUpdateOwnerContext): Promise<boolean>;
   };
   /** Allow one clean pre-submit composer retry for isolated history compaction only. */
   compaction?: boolean;
@@ -1570,6 +1574,10 @@ export function chatGptReboundTurnIdentity(
 
 export class ChatGptCompletionTracker {
   private candidate?: { signature: string; since: number };
+  private taskOutputCandidate?: TaskUpdateOwnerContext;
+  private taskObservationContext?: TaskUpdateOwnerContext;
+  private taskOutputCandidateText?: string;
+  private staleTaskOutput?: { text: string; candidate: TaskUpdateOwnerContext };
   private lastToolBatchRevision = 0;
   private postToolAnswerBaselineText?: string;
   private missingPostToolAnswerSince?: number;
@@ -1578,6 +1586,41 @@ export class ChatGptCompletionTracker {
     private readonly stableMs = CHATGPT_COMPLETION_SETTLE_MS,
     private readonly missingPostToolAnswerMs = CHATGPT_COMPLETION_ACTION_GRACE_MS,
   ) {}
+
+  /** The same answer cannot acquire a newer owner or task revision after an asynchronous read. */
+  beginTaskOutputObservation(state: TaskUpdateState | undefined): boolean {
+    if (!state) return false;
+    const changed = this.taskObservationContext !== undefined
+      && (this.taskObservationContext.taskRevision !== state.acceptedRevision
+        || this.taskObservationContext.expectedDriverGeneration !== state.driverGeneration);
+    if (changed) {
+      this.candidate = undefined;
+      if (this.taskOutputCandidate && this.taskOutputCandidateText !== undefined) {
+        this.staleTaskOutput = { text: this.taskOutputCandidateText, candidate: this.taskOutputCandidate };
+      }
+      this.taskOutputCandidate = undefined;
+      this.taskOutputCandidateText = undefined;
+    }
+    this.taskObservationContext = Object.freeze({
+      taskRevision: state.acceptedRevision, expectedDriverGeneration: state.driverGeneration,
+    });
+    return changed;
+  }
+
+  captureTaskOutputCandidate(state: TaskUpdateState | undefined, currentText?: string): TaskUpdateOwnerContext | undefined {
+    if (!this.taskOutputCandidate && this.staleTaskOutput && this.staleTaskOutput.text === currentText) {
+      return this.staleTaskOutput.candidate;
+    }
+    if (!this.taskOutputCandidate && state) {
+      this.taskOutputCandidate = Object.freeze({
+        taskRevision: state.acceptedRevision,
+        expectedDriverGeneration: state.driverGeneration,
+        acknowledgedRevision: state.acknowledgedRevision,
+      });
+    }
+    if (this.taskOutputCandidate && currentText !== undefined) this.taskOutputCandidateText = currentText;
+    return this.taskOutputCandidate;
+  }
 
   needsToolBatchObservation(revision: number): boolean {
     if (!Number.isSafeInteger(revision) || revision < this.lastToolBatchRevision) {
@@ -1594,6 +1637,9 @@ export class ChatGptCompletionTracker {
     this.lastToolBatchRevision = revision;
     this.missingPostToolAnswerSince = undefined;
     this.candidate = undefined;
+    this.taskOutputCandidate = undefined;
+    this.taskOutputCandidateText = undefined;
+    this.staleTaskOutput = undefined;
     return true;
   }
 
@@ -2429,6 +2475,13 @@ export class ChatGptBrowserWorker {
     if (this.config.browserHost !== "launcher") throw new Error("Continuity requires Launcher");
     this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
     await this.launcherHelper.assertContinuityCompatible();
+  }
+
+  /** Only a new physical execution may use the common Broker/prompt/helper update protocol. */
+  async supportsTaskUpdates(): Promise<boolean> {
+    if (this.config.browserHost !== "launcher" || process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS === "1") return true;
+    this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
+    return this.launcherHelper.supportsTaskUpdates();
   }
 
   verifyConnector(traceId = `verify_${randomUUID().replaceAll("-", "")}`): Promise<string> {
@@ -4922,6 +4975,9 @@ export class ChatGptBrowserWorker {
     if ((turn.externalProgress !== undefined) !== (turn.completionFence !== undefined)) {
       throw new Error("Tool-capable ChatGPT turns require both progress and terminal-fence transports");
     }
+    if (turn.taskUpdateProtocol !== undefined && (turn.taskUpdateProtocol !== 1 || !turn.externalProgress)) {
+      throw new Error("ChatGPT task updates require the negotiated v1 progress and completion fence");
+    }
     if ((turn.captureLunaCheckpoint === true) !== (turn.onLunaCheckpoint !== undefined)) {
       throw new Error("ChatGPT Luna checkpoint capture requires exactly one checkpoint callback");
     }
@@ -5470,9 +5526,9 @@ export class ChatGptBrowserWorker {
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
         : undefined;
-      const emitMarkdownDelta = (delta: string): void => {
+      const emitMarkdownDelta = (delta: string, candidate?: TaskUpdateOwnerContext): void => {
         const visible = checkpointStream ? checkpointStream.push(delta) : delta;
-        if (visible) turn.onTextDelta(visible);
+        if (visible) turn.onTextDelta(visible, candidate);
       };
       const throwMarkdownConsistencyError = (error: unknown): never => {
         if (!(error instanceof ChatGptMarkdownConsistencyError)) throw error;
@@ -5494,6 +5550,7 @@ export class ChatGptBrowserWorker {
       let internalObservationFaults = 0;
       let observedThisIteration = false;
       let completionFenceRevision: number | undefined;
+      let completionFenceCandidate: TaskUpdateOwnerContext | undefined;
       for (;;) {
         // The heartbeat is a consumer callback, so it stays outside the observation-fault region:
         // a defect in the caller must not be retried as though the page could not be read.
@@ -5539,7 +5596,39 @@ export class ChatGptBrowserWorker {
           continue;
         }
 
+        // Capture the owner before the asynchronous DOM read. A delayed old projection must not
+        // be promoted to the current head merely because its observation finishes after a takeover.
+        const mirroredTaskState = turn.taskUpdateProtocol
+          ? turn.externalProgress?.snapshot().taskUpdates
+          : undefined;
+        // A complete helper progress frame can lag behind the real update/ACK exchange. Bind
+        // this read to the same-host control source before awaiting DOM; later changes cannot
+        // upgrade this binding, even when the mirror or another head arrives during the read.
+        const taskObservationState = mirroredTaskState
+          ? { ...mirroredTaskState, ...observedTaskOutputVersion(mirroredTaskState) }
+          : undefined;
+        if (turn.taskUpdateProtocol && !taskObservationState) {
+          throw new ChatGptWebAdapterError("ChatGPT task update control state is unavailable", {
+            status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false,
+          });
+        }
+        if (completionTracker.beginTaskOutputObservation(taskObservationState)) {
+          completionFenceRevision = undefined;
+          completionFenceCandidate = undefined;
+        }
+        const captureOutputObservationState = (): TaskUpdateState | undefined => {
+          const current = turn.externalProgress?.snapshot().taskUpdates;
+          // Keep the pre-read task/owner binding. ACK may settle during the read, but it can
+          // only qualify text if already observed when that first DOM projection returns.
+          const bound = taskObservationState && current
+            && current.acceptedRevision === taskObservationState.acceptedRevision
+            && current.driverGeneration === taskObservationState.driverGeneration
+            ? { ...taskObservationState, acknowledgedRevision: current.acknowledgedRevision }
+            : taskObservationState;
+          return bound ? { ...bound, acknowledgedRevision: observedTaskAcknowledgement(bound) } : undefined;
+        };
         let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
+        let taskOutputObservationState = captureOutputObservationState();
         if (!snapshot.responsePresent) {
           try {
             const rebound = await withChatGptBrowserObservationTimeout(
@@ -5556,6 +5645,7 @@ export class ChatGptBrowserWorker {
               responseDomCache.key = undefined;
               responseDomCache.snapshot = undefined;
               snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
+              taskOutputObservationState = captureOutputObservationState();
             }
           } catch (error) {
             if (!(error instanceof ChatGptBrowserObservationTimeoutError) || !launcherSurfaceId) throw error;
@@ -5622,6 +5712,11 @@ export class ChatGptBrowserWorker {
             capturedResponse = true;
             await diagnostics.capture(page, "response-visible");
           }
+          // Markdown may still be settling when the final projection first appears. Bind its
+          // version now; delaying this until serialization would upgrade an old buffered answer.
+          const observedCandidate = snapshot.visibleText
+            ? completionTracker.captureTaskOutputCandidate(taskOutputObservationState, snapshot.visibleText)
+            : undefined;
           const textDelta = (() => {
             try {
               return markdownBuffer.observe(snapshot.markdownSegments);
@@ -5633,7 +5728,7 @@ export class ChatGptBrowserWorker {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
           }
-          if (textDelta) emitMarkdownDelta(textDelta);
+          if (textDelta) emitMarkdownDelta(textDelta, observedCandidate);
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
@@ -5650,16 +5745,21 @@ export class ChatGptBrowserWorker {
             completionActionVisible: snapshot.completionActionVisible,
             externalToolCallsInFlight,
           });
-          if (!completionReady) completionFenceRevision = undefined;
+          if (!completionReady) {
+            completionFenceRevision = undefined;
+            completionFenceCandidate = undefined;
+          }
           if (completionReady) {
             if (turn.completionFence) {
               if (completionFenceRevision === undefined) {
-                const revision = await turn.completionFence.begin();
+                const candidate = completionTracker.captureTaskOutputCandidate(taskOutputObservationState, snapshot.visibleText);
+                const revision = await turn.completionFence.begin(candidate);
                 if (revision === undefined) {
                   await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
                   continue;
                 }
                 completionFenceRevision = revision;
+                completionFenceCandidate = candidate;
                 // The fence revision is captured after this DOM projection. Force one fresh read
                 // before commit so an MCP activity that just settled cannot disappear between a
                 // stale cached completion and the broker's terminal decision.
@@ -5668,8 +5768,9 @@ export class ChatGptBrowserWorker {
                 await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
                 continue;
               }
-              if (!await turn.completionFence.commit(completionFenceRevision)) {
+              if (!await turn.completionFence.commit(completionFenceRevision, completionFenceCandidate)) {
                 completionFenceRevision = undefined;
+                completionFenceCandidate = undefined;
                 responseDomCache.key = undefined;
                 responseDomCache.snapshot = undefined;
                 await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
@@ -5689,10 +5790,11 @@ export class ChatGptBrowserWorker {
             if (!final.markdown && snapshot.visibleText) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
             }
-            if (final.delta) emitMarkdownDelta(final.delta);
+            const finalCandidate = completionTracker.captureTaskOutputCandidate(taskOutputObservationState, snapshot.visibleText);
+            if (final.delta) emitMarkdownDelta(final.delta, finalCandidate);
             if (checkpointStream) {
               const completed = checkpointStream.finishOptional(snapshot.visibleText);
-              if (completed.visibleRemainder) turn.onTextDelta(completed.visibleRemainder);
+              if (completed.visibleRemainder) turn.onTextDelta(completed.visibleRemainder, finalCandidate);
               if (completed.captured) turn.onLunaCheckpoint!(completed.captured);
               else console.warn(`[chatgpt-web] browser turn ${turn.traceId} completed without a Luna rolling checkpoint; preserving full native history`);
               finalText = completed.answer;

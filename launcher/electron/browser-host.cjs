@@ -2225,7 +2225,7 @@ class BrowserHost {
       tab.status = "error";
       tab.message = tab.manualSentConfirmationRequired
         ? `Prompt submission was not confirmed within ${timeoutSeconds} seconds`
-        : `Codex Zero Risk2 did not connect within ${timeoutSeconds} seconds`;
+        : `Codex Zero Risk3 did not connect within ${timeoutSeconds} seconds`;
       this.signalManualTerminal(tab, "timeout");
       this.publishState?.(this.snapshot());
       this.logger.warn("browser.manual_turn_timed_out", {

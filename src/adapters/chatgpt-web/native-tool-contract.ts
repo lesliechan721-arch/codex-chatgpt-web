@@ -154,7 +154,7 @@ export function planNativeTool(
       }
       case "codex_tool_call": {
         const { wire_name, arguments: args, input: freeformInput } = z.object(nativeToolInputSchemas.codex_tool_call).parse(input);
-        if (wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME || /(^|__)codex_tool_wait$/.test(wire_name)) {
+        if (wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME || /(^|__)(codex_tool_wait|codex_task_update_ack)$/.test(wire_name)) {
           throw new NativeToolAdmissionError("Bridge control tools cannot be called through the Native gateway");
         }
         const tool = safeVisibleTools(bound, contract).find(candidate => wireName(candidate) === wire_name);
@@ -224,6 +224,7 @@ export const BRIDGE_TOOL_NAMES = new Set([
   "codex_tool_inventory",
   "codex_tool_call",
   "codex_tool_wait",
+  "codex_task_update_ack",
   "codex_turn_complete",
 ]);
 
@@ -245,11 +246,11 @@ function exactTool(environment: Pick<BrokerTurnSnapshot, "tools">, name: string)
 }
 
 function gatewayToolNameIsValid(name: string): boolean {
-  return /^[A-Za-z0-9_$]+$/.test(name) && !/(^|__)codex_tool_wait$/.test(name);
+  return /^[A-Za-z0-9_$]+$/.test(name) && !/(^|__)(codex_tool_wait|codex_task_update_ack)$/.test(name);
 }
 
 function safeVisibleTools(environment: Pick<BrokerTurnSnapshot, "tools">, contract: ChatGptMcpContract): CodexTool[] {
-  const visible = environment.tools.filter(tool => !/(^|__)codex_tool_wait$/.test(wireName(tool)));
+  const visible = environment.tools.filter(tool => !/(^|__)(codex_tool_wait|codex_task_update_ack)$/.test(wireName(tool)));
   if (contract === "native") return visible;
   const bridgeNamespaces = new Set(environment.tools
     .filter(tool => tool.namespace && BRIDGE_TOOL_NAMES.has(tool.name))
@@ -367,7 +368,7 @@ function gatewayToolCatalogProgram(options: {
     `const excludedNames = new Set(${JSON.stringify(options.excludedNames)});`,
     `const needle = ${JSON.stringify(needle)};`,
     "const visibleName = name => {",
-    "  return typeof name === \"string\" && /^[A-Za-z0-9_$]+$/.test(name) && !/(^|__)codex_tool_wait$/.test(name) && !excludedNames.has(name);",
+    "  return typeof name === \"string\" && /^[A-Za-z0-9_$]+$/.test(name) && !/(^|__)(codex_tool_wait|codex_task_update_ack)$/.test(name) && !excludedNames.has(name);",
     "};",
     "const matches = ALL_TOOLS",
     "  .filter(tool => visibleName(tool?.name))",
@@ -492,8 +493,8 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "    if (wrappers.has(name)) return wrappers.get(name);",
     "    const value = Reflect.get(source, name, source);",
     "    let exposed = value;",
-    "    if (typeof name === \"string\" && /(^|__)codex_tool_wait$/.test(name)) {",
-    "      exposed = () => { throw new Error(\"codex_tool_wait is a bridge query, not a Native gateway tool\"); };",
+    "    if (typeof name === \"string\" && /(^|__)(codex_tool_wait|codex_task_update_ack)$/.test(name)) {",
+    "      exposed = () => { throw new Error(String(name) + \" is a bridge query, not a Native gateway tool\"); };",
     "    } else if (typeof value === \"function\" && name === blockedExecName) {",
     "      exposed = () => { throw new Error(\"Nested raw exec is unavailable inside ChatGPT Web exec\"); };",
     "    } else if (typeof value === \"function\" && typeof name === \"string\" && waitNames.has(name)) {",

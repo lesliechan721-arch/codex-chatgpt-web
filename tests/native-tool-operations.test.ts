@@ -165,7 +165,7 @@ describe("Native operation identity and independent result queries", () => {
         resultContract: { kind: "inventory", offset: 0, includeSchema: true, directPage: [], directTotal: 0, excludedNames: [], nestedLimit: 20, discoveryTools: [] },
       }));
       expect(await store.wait(1, undefined, 1)).toMatchObject({ kind: "pending" });
-      store.complete(1, nativePublicResult({ checkpoint: "control-not-catalog" }), true);
+      store.complete(1, nativePublicResult({ checkpoint: "control-not-catalog" }), "compaction");
       const result = await store.wait(1);
       expect(result).toMatchObject({ kind: "result", result: { structuredContent: { checkpoint: "control-not-catalog" }, _meta: { "codex/native-control": { kind: "compaction" } } } });
       expect(await store.wait(1)).toEqual(result);

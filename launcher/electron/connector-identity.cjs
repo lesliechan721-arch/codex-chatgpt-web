@@ -1,9 +1,9 @@
-const CURRENT_CONNECTOR_NAME = "Codex Native3";
+const CURRENT_CONNECTOR_NAME = "Codex Native4";
 const DEV_CONNECTOR_NAME = `${CURRENT_CONNECTOR_NAME} DEV`;
-const DEV_LONG_WAIT_CONNECTOR_NAME = "Codex Native3 DEV";
-const CURRENT_MANUAL_CONNECTOR_NAME = "Codex Zero Risk2";
-const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native", "Codex Native2", "Codex Native2 DEV"]);
-const LEGACY_MANUAL_CONNECTOR_NAMES = Object.freeze(["Codex Zero Risk"]);
+const DEV_LONG_WAIT_CONNECTOR_NAME = "Codex Native4 DEV";
+const CURRENT_MANUAL_CONNECTOR_NAME = "Codex Zero Risk3";
+const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV"]);
+const LEGACY_MANUAL_CONNECTOR_NAMES = Object.freeze(["Codex Zero Risk", "Codex Zero Risk2"]);
 
 function validateConnectorNameSuffix(value) {
   if (typeof value !== "string" || value.length > 74

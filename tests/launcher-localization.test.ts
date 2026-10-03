@@ -19,6 +19,19 @@ test("supported launcher locales return complete, nonempty dictionaries", () => 
       expect(placeholders(translated[key])).toEqual(placeholders(english[key]));
     }
     expect(translated.biggerContextBody).not.toContain("TXT");
-    expect(translated.manualPromptInstruction).toContain("Codex Zero Risk2");
+    expect(translated.manualPromptInstruction).toContain("Codex Zero Risk3");
+  }
+});
+
+
+test("connector migration notices identify the newly retired modes without rewriting source names", () => {
+  for (const language of Object.keys(languages) as Language[]) {
+    const translated = copyFor(language, { automatic: "Codex Work", manual: "Codex Manual" });
+    expect(translated.connectorMigrationNotice).toContain("Codex Native3");
+    expect(translated.connectorMigrationNotice).toContain("Codex Native3 DEV");
+    expect(translated.connectorMigrationNotice).toContain("Codex Zero Risk2");
+    expect(translated.connectorMigrationNotice).toContain("Codex Work");
+    expect(translated.connectorMigrationNotice).toContain("Codex Manual");
+    expect(translated.manualPromptInstruction).toContain("Codex Manual");
   }
 });

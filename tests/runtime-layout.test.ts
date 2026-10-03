@@ -452,3 +452,61 @@ test("stored names survive config loading without an additional naming preferenc
   writeFileSync(join(root, "config.json"), JSON.stringify({ ...config, automaticAppName: "Codex Zero Risk", manualAppName: "Codex Manual", appName: "Codex Manual" }));
   expect(() => loadConfigForSetup()).toThrow("retired");
 });
+
+
+test("task_updates-v1 retires previous default identities while preserving custom names", () => {
+  expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native4");
+  expect(DEV_CHATGPT_CONNECTOR_NAME).toBe("Codex Native4 DEV");
+  expect(ZERO_RISK_CHATGPT_CONNECTOR_NAME).toBe("Codex Zero Risk3");
+  for (const suffix of ["Native3", "Native3 DEV", "Zero Risk2"]) {
+    expect(() => validateConnectorNameSuffix(suffix)).toThrow("retired");
+  }
+  for (const profile of ["production", "development"] as const) {
+    for (const automaticAppName of ["Codex Native3", "Codex Native3 DEV"]) {
+      const names = resolveInteractionConnectorIdentities("manual", profile, {
+        automaticAppName, manualAppName: "Codex Zero Risk2",
+      });
+      expect(names.automaticAppName).toBe(profile === "production" ? CHATGPT_CONNECTOR_NAME : DEV_CHATGPT_CONNECTOR_NAME);
+      expect(names.appName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
+    }
+    const custom = resolveInteractionConnectorIdentities("automatic", profile, {
+      automaticAppName: "Codex Native3 - Work", manualAppName: "Codex Zero Risk2 - Work",
+    });
+    expect(custom.automaticAppName).toBe("Codex Native3 - Work");
+    expect(custom.manualAppName).toBe("Codex Zero Risk2 - Work");
+  }
+});
+
+test("setup migrates Zero Risk2 but loading its stale active runtime fails closed", () => {
+  const root = join(tmpdir(), `cgw-abi-migration-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config = {
+    ...defaultConfig("full"), browserHost: "launcher" as const,
+    browserHostDescriptorPath: join(root, "launcher.json"), browserInteractionMode: "manual",
+    appName: "Codex Zero Risk2", manualAppName: "Codex Zero Risk2", automaticAppName: "Codex Native3",
+    tunnel: { binaryPath: join(root, "tunnel"), tunnelId: `tunnel_${"a".repeat(32)}`,
+      runtimeKeyFile: join(root, "key"), profileDir: root, profileName: "test", alias: "test" },
+  };
+  writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(() => loadConfig()).toThrow("retired");
+  const migrated = loadConfigForSetup();
+  expect(migrated.appName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
+  expect(migrated.manualAppName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
+  expect(migrated.automaticAppName).toBe("Codex Native3");
+});
+
+
+test("setup still repairs the previous release's collided Zero Risk2 automatic identity", () => {
+  const root = join(tmpdir(), `cgw-old-name-collision-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config = { ...defaultConfig("browser-only"), appName: "Codex Zero Risk2",
+    automaticAppName: "Codex Zero Risk2", manualAppName: "Codex Zero Risk2" };
+  writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(() => loadConfig()).toThrow("retired");
+  expect(loadConfigForSetup()).toMatchObject({ appName: CHATGPT_CONNECTOR_NAME,
+    automaticAppName: CHATGPT_CONNECTOR_NAME, manualAppName: ZERO_RISK_CHATGPT_CONNECTOR_NAME });
+});

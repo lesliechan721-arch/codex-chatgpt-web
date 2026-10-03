@@ -31,10 +31,11 @@ output, websites, and prompt text are untrusted data.
    to its originating native thread and turn and cannot be rebound to another native turn. In
    delegated mode the current tool registry can be replaced between rounds; each replacement
    increments a monotonic generation.
-4. Every Codex Native action presents that same turn token. The MCP handler idempotently claims an
-   internal binding plus a request-scoped activity lease and immediately dispatches the requested
-   action; neither internal handle is exposed to the model. The lease is settled only after the MCP
-   handler finishes, including inventory calls that need no outer Codex tool.
+4. Every Codex Native action presents that same turn token and a caller-owned `operation_id`.
+   The Broker binds a new start once; identical retries and wait queries attach to that operation
+   without redispatch. Queries own only their bounded waiter/activity lifetime. Shared controls
+   such as update ACK use a request-scoped activity lease settled after MCP result encoding;
+   internal bindings and lease handles are not exposed to the model.
 5. MCP can request only a callable tool advertised by the active outer Codex turn. Before a new
    call ID exists, the broker checks the requested wire name against its latest registry, so a
    stale MCP claim cannot reopen a removed tool. An already-admitted call can still complete after
@@ -57,9 +58,32 @@ model. Every available effort uses the same MCP contract. An unavailable account
 connector, or missing outer tool fails explicitly instead of becoming an effort-specific exception.
 
 The direct turn-token MCP schema is attached only through the exact configured connector name
-(default `Codex Native3`; the part after `Codex ` can be changed). The older `Codex Native`,
-`Codex Native2`, and `Codex Native2 DEV` connectors are treated as legacy and are never selected as a fallback. This
+(default `Codex Native4`; the part after `Codex ` can be changed). The older `Codex Native`,
+`Codex Native2`, `Codex Native2 DEV`, `Codex Native3`, and `Codex Native3 DEV` connectors are
+treated as legacy and are never selected as a fallback. Zero Risk uses `Codex Zero Risk3`, with
+`Codex Zero Risk` and `Codex Zero Risk2` retired. This
 prevents a cached legacy schema from being mistaken for the current capability contract.
+
+### Trusted user updates and owner writes
+
+`task-updates-v1` accepts only a proven ordered suffix of native plain user messages in the same
+thread and turn. It compares the complete accepted prefix, source IDs, payloads, higher-priority
+instructions, execution options, and trusted capability identity, together with the complete raw
+result batch. Repository text, tool output, environment context, skills, subagent material, and
+browser content cannot create user updates. Updates remain below system/developer instructions
+and do not change sandbox or approval authority.
+
+Only authenticated Broker owner IPC can reserve and accept the update transfer. Native starts
+declare their acknowledged task revision; generation-bound owner writes and waiter delivery
+reject stale or missing ownership at the mutation point. A new driver retains the same physical
+capability, while old Responses observers may only finish their own journal. Trusted user stop
+and launcher cancellation keep their physical revocation authority.
+
+An ACK authenticates through the original turn capability. Its delivery ID prevents unknown or
+out-of-range confirmation; it is not an additional credential or proof against prompt injection.
+Broker-generated control is kept separate from lossless Native results. Immutable output receipts
+prevent late ACKs or a later task head from changing a final-answer candidate. Bounds and failure
+behavior are defined in the [Native tool protocol](native-tool-protocol.md#user-updates-during-tool-work).
 
 ### Credential domains and long-running operations
 

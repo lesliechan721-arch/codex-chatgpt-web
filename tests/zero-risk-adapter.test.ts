@@ -11,6 +11,8 @@ import {
 } from "../src/adapters/chatgpt-web/index";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
+import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
@@ -80,7 +82,7 @@ function provider(name: string): CodexProviderConfig {
     adapter: "chatgpt-web",
     baseUrl: `manual://${name}-${Date.now()}`,
     chatgptWeb: {
-      appName: "Codex Zero Risk2",
+      appName: "Codex Zero Risk3",
       browserInteractionMode: "manual",
       browserHost: "launcher",
       browserHostDescriptorPath: join(root, `${name}-launcher.json`),
@@ -215,23 +217,21 @@ for (const scenario of [
         return;
       }
       modelAction = (async () => {
-        const claim = await callTurnBroker<{
-          bindingId: string;
-          activityId: string;
-          environment: { registryGeneration: number };
-        }>(socket, {
-          method: "claim", token, contract: "safe",
-        });
-        const result = await callTurnBroker<BrokerToolResult>(socket, {
-          method: "invoke", bindingId: claim.bindingId, wireName: "exec_command", freeform: false,
-          registryGeneration: claim.environment.registryGeneration,
-          arguments: { cmd: "pwd" },
+        type OperationReply = { kind: "pending" } | { kind: "result"; result: BrokerToolResult };
+        let reply = await callTurnBroker<OperationReply>(socket, {
+          method: "native_operation_start", token, contract: "safe", nativeWaitProtocol: 1,
+          taskUpdateProtocol: 1, taskRevision: 0, operationId: 1, entry: "codex_exec",
+          nativeInput: { cmd: "pwd" }, waitMs: 30_000,
         }, null);
+        while (reply.kind === "pending") reply = await callTurnBroker<OperationReply>(socket, {
+          method: "native_operation_wait", token, contract: "safe", nativeWaitProtocol: 1,
+          operationId: 1, waitMs: 30_000,
+        }, null);
+        const result = reply.result;
         if (!scenario.finalWins) expect(JSON.stringify(result)).toContain("codex_turn_complete");
         if (scenario.format === "local" && !scenario.finalWins) {
           expect(JSON.stringify(result)).toContain(localCompactPrompt);
         }
-        await callTurnBroker(socket, { method: "activity_complete", token, activityId: claim.activityId });
         broker.completeSafeTurn(token, scenario.finalWins
           ? "Ordinary final answer before compaction"
           : "Checkpoint: the command finished; continue the task.");
@@ -289,6 +289,7 @@ for (const scenario of [
       },
       body: JSON.stringify({
         ...raw, model: "chatgpt-web/zero-risk", stream: false,
+        reasoning: { effort: parsed.options.reasoning },
         ...(v1 ? { client_metadata: undefined } : {}),
         ...(local ? { client_metadata: { "x-codex-turn-metadata": JSON.stringify({
           ...JSON.parse(raw.client_metadata["x-codex-turn-metadata"]!),
@@ -305,6 +306,7 @@ for (const scenario of [
     // Production constructs a new adapter/environment store for each HTTP request.
     const real = createChatGptWebAdapter(config, { broker, zeroRiskManualControl: control });
     return { ...real, async runTurn(parsed, incoming, emit) {
+      if (!parsed._compactionRequest) Object.assign(source, structuredClone(parsed));
       if (parsed._compactionRequest) {
         expect(parsed.previousResponseId).toBeUndefined();
         expect(parsed._replayPrefixLen ?? 0).toBe(0);
@@ -318,6 +320,7 @@ for (const scenario of [
   const rolloutApiAdapter = (): ProviderAdapter => {
     const real = createAdapter();
     return { ...real, async runTurn(parsed, incoming, emit) {
+      if (!parsed._compactionRequest) Object.assign(source, structuredClone(parsed));
       await real.runTurn!(parsed, incoming, event => {
         (parsed._compactionRequest ? checkpoint : events).push(event);
         emit(event);
@@ -421,6 +424,11 @@ for (const scenario of [
     expect(host.manualCompletionSignals.has(starts[0])).toBeTrue();
     expect(logs).toContain("browser.retained_conversation_released");
     const summary = checkpoint.filter(event => event.type === "text_delta").map(event => event.text).join("");
+    if (!scenario.apiKey) {
+      // Direct Adapter calls omit the HTTP checkpoint-evidence registration used in production.
+      rememberCompactionContinuation(compact, extractChatGptTurnIdentity(compact),
+        [extractChatGptCompactionSourceRevision(compact)], summary);
+    }
     const continuation = structuredClone(source);
     (continuation._rawBody as { input: unknown[] }).input.push(scenario.format === "v2" ? {
       type: "compaction", encrypted_content: encodeCompactionSummary(summary),

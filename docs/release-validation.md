@@ -163,6 +163,39 @@ The [DEV probe regression](../tests/native-tool-long-wait-probe.test.ts) and
 [waiting regressions](../tests/native-tool-long-wait.test.ts) remain available without retaining
 historical implementation/review rounds as public specifications.
 
+## Inflight user update validation
+
+The [task update contract](native-tool-protocol.md#user-updates-during-tool-work) requires both
+Automatic Full (`Codex Native4`, or `Codex Native4 DEV`) and Zero Risk (`Codex Zero Risk3`).
+Refresh the new connector identity and verify the ACK tool and `task_revision` start schema before
+testing. Existing active tasks keep their original protocol; start a new compatible task.
+
+1. Have real Codex execute a harmless tool with a visible delay. While it runs, append one plain
+   user instruction in the same native turn. Record the source Responses batch and tool-use
+   terminal before the request carrying its real result and the new user item.
+2. Confirm that the result carries the ordered update and the model ACKs it before further Native
+   work. The same ChatGPT response, turn token/request ID, operation ID, and tab must continue,
+   with no new Send action. The Native side effect must occur exactly once.
+3. Append twice during the unconfirmed chain. Confirm that the first delivery stays immutable,
+   its ACK response can carry the next delivery, and both updates affect the complete final answer.
+   Drop an ACK receipt and recover with the identical delivery and original operation ID.
+4. Exercise result errors, images/resources, and inventory. Compare the entire original public
+   result with the envelope's `native_result`; control must not alter it. Confirm old queued calls
+   and new calls on an unacknowledged revision return an unexecuted terminal.
+5. Check that commentary remains process output and the first final-answer text closes the update
+   window. A later append uses the ordinary replacement path; a late ACK cannot reopen it. Check
+   strict structured output, stable Automatic completion without ACK, and refused Zero Risk
+   completion followed by a valid ACK and revision-bound complete answer.
+6. Check old-observer disconnect after a continuous append, explicit user stop, initial Zero Risk
+   awaiting Sent, compaction with a pending update, and compaction from the latest acknowledged
+   source. Old observer cleanup must not stop the new driver, while explicit stop still releases
+   the physical task. Record each mode's tab/response identity and terminal result.
+
+Local Broker/Remote owner, MCP, Session, helper, and Adapter tests use controlled fixtures and
+failure injection. They establish local contract behavior, not authenticated ChatGPT/connector
+acceptance. Real-platform validation of this feature remains pending and is reserved for the
+maintainer's subsequent manual run; retain redacted evidence for each mode before claiming it.
+
 ## API access, upstream, and proxy validation
 
 Maintain the [API Key](api-key-mode.md), [upstream](upstream-provider.md), and
@@ -204,7 +237,7 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
 3. Install the Codex model route, restart Codex, and prove that every account-available ChatGPT Web
    effort appears exactly once without removing native models.
 4. Complete one Browser-only turn and verify streamed commentary plus the final answer.
-5. Configure the `Codex Native3` connector, run **Verify runtime**, and complete one Full-mode local
+5. Configure the `Codex Native4` connector, run **Verify runtime**, and complete one Full-mode local
    tool turn. Repeat with Pro when the account exposes Pro.
 6. Drive a chat past the compaction threshold and prove that it continues after compaction without
    a duplicate or orphaned browser turn.

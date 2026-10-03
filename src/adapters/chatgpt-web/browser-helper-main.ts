@@ -38,6 +38,7 @@ interface RunMessage {
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
+    taskUpdateProtocol?: 1;
   };
 }
 
@@ -100,6 +101,7 @@ console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
+const taskUpdateTurns = new Set<string>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
 const sendActivationWaiters = new Map<string, {
   resolve: () => void;
@@ -191,6 +193,10 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.externalProgress !== undefined && typeof message.turn.externalProgress !== "boolean") {
     throw new Error("Browser helper external progress flag is invalid");
   }
+  if (message.turn.taskUpdateProtocol !== undefined
+    && (message.turn.taskUpdateProtocol !== 1 || message.turn.externalProgress !== true)) {
+    throw new Error("Browser helper task update protocol is invalid");
+  }
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: "https://chatgpt.com",
@@ -218,6 +224,7 @@ async function run(message: RunMessage): Promise<void> {
     })
     : undefined;
   if (progress) turnProgress.set(message.id, progress);
+  if (message.turn.taskUpdateProtocol) taskUpdateTurns.add(message.id);
   const promptSelection = createBrowserHelperPromptSelection();
   preparedSelections.set(message.id, promptSelection);
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
@@ -243,10 +250,11 @@ async function run(message: RunMessage): Promise<void> {
     } : {}),
     abortSignal: abortController.signal,
     ...(message.turn.compaction ? { compaction: true } : {}),
+    ...(message.turn.taskUpdateProtocol ? { taskUpdateProtocol: message.turn.taskUpdateProtocol } : {}),
     ...(progress ? {
       externalProgress: progress,
       completionFence: {
-        begin: () => new Promise<number | undefined>((resolve, reject) => {
+        begin: candidate => new Promise<number | undefined>((resolve, reject) => {
           if (completionFenceBeginWaiters.has(message.id)) {
             reject(new Error("Browser helper completion fence already awaits a begin result"));
             return;
@@ -254,12 +262,13 @@ async function run(message: RunMessage): Promise<void> {
           completionFenceRequestId += 1;
           const requestId = completionFenceRequestId;
           completionFenceBeginWaiters.set(message.id, { requestId, resolve, reject });
-          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_begin", requestId })) {
+          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_begin", requestId,
+            ...(candidate ? { candidate } : {}) })) {
             completionFenceBeginWaiters.delete(message.id);
             reject(new Error("Browser helper could not begin the broker completion fence"));
           }
         }),
-        commit: revision => new Promise<boolean>((resolve, reject) => {
+        commit: (revision, candidate) => new Promise<boolean>((resolve, reject) => {
           if (completionFenceCommitWaiters.has(message.id)) {
             reject(new Error("Browser helper completion fence already awaits a commit result"));
             return;
@@ -267,7 +276,8 @@ async function run(message: RunMessage): Promise<void> {
           completionFenceRequestId += 1;
           const requestId = completionFenceRequestId;
           completionFenceCommitWaiters.set(message.id, { requestId, resolve, reject });
-          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_commit", requestId, revision })) {
+          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_commit", requestId, revision,
+            ...(candidate ? { candidate } : {}) })) {
             completionFenceCommitWaiters.delete(message.id);
             reject(new Error("Browser helper could not commit the broker completion fence"));
           }
@@ -310,7 +320,8 @@ async function run(message: RunMessage): Promise<void> {
       ...(continuation ? { continuation: true } : {}),
     }),
     onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-    onTextDelta: text => writeProtocol({ type: "event", id: message.id, event: "text", text }),
+    onTextDelta: (text, candidate) => writeProtocol({ type: "event", id: message.id, event: "text", text,
+      ...(candidate ? { candidate } : {}) }),
     ...(message.turn.captureLunaCheckpoint ? {
       captureLunaCheckpoint: true,
       onLunaCheckpoint: captured => writeProtocol({
@@ -351,6 +362,7 @@ async function run(message: RunMessage): Promise<void> {
     commitWaiter?.reject(new DOMException("Browser helper turn ended before completion-fence commit", "AbortError"));
     abortControllers.delete(message.id);
     turnProgress.delete(message.id);
+    taskUpdateTurns.delete(message.id);
   }
 }
 
@@ -486,6 +498,14 @@ input.on("line", line => {
     try {
       progress.apply(message.snapshot);
     } catch (error) {
+      if (taskUpdateTurns.has(message.id)
+        && (progress.snapshot().taskUpdates !== undefined || message.snapshot?.taskUpdates !== undefined)) {
+        writeProtocol({ type: "error", id: message.id,
+          message: "Browser helper lost valid negotiated task update control state",
+          status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false });
+        abortControllers.get(message.id)?.abort();
+        return;
+      }
       // Progress carries liveness and tool-boundary state, never response content. Invalid progress
       // cannot determine the outcome of the active ChatGPT turn, so it is logged and ignored.
       diagnostic(
@@ -548,4 +568,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE] });

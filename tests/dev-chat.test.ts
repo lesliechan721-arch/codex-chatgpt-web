@@ -351,7 +351,7 @@ test("DEV long-wait probe tool requires explicit opt-in even with the current DE
   };
 
   expect(DEV_CHAT_TOOLS.some(tool => tool.name === DEV_NATIVE_LONG_WAIT_TOOL_NAME)).toBe(false);
-  await run("Codex Native3 DEV", false);
+  await run("Codex Native4 DEV", false);
   await run(DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, true);
 });
 
@@ -387,7 +387,7 @@ test("DEV chat attaches its broker to the launcher-owned tunnel without a Respon
     });
     expect(transport.config).toBe(config);
     expect(await callTurnBroker(transport.config.brokerSocketPath, { method: "owner_status" }))
-      .toMatchObject({ protocolVersion: 7, nativeWaitProtocol: 1 });
+      .toMatchObject({ protocolVersion: 10, nativeWaitProtocol: 1, taskUpdateProtocol: 1 });
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("normal Codex route");
   } finally {
     await transport?.close();
@@ -453,26 +453,26 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
     try {
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
       if (!token) throw new Error("missing DEV broker token");
-      const claimed = await callTurnBroker<{ bindingId: string }>(config.brokerSocketPath, { method: "claim", token });
       turn.onReasoningSummary?.("Exercising the real broker round");
       const progress = turn.externalProgress;
       if (!progress) throw new Error("DEV tool-capable browser has no progress transport");
       const previousBatchRevision = progress.snapshot().lastToolBatchRevision;
-      const invocation = callTurnBroker<BrokerToolResult>(config.brokerSocketPath, {
-        method: "invoke",
-        bindingId: claimed.bindingId,
-        wireName: "exec_command",
-        arguments: { cmd: "git status --short" },
-      }, 30_000);
+      const invocation = callTurnBroker<{ kind: "result"; result: BrokerToolResult }>(config.brokerSocketPath, {
+        method: "native_operation_start", token, contract: "native", nativeWaitProtocol: 1,
+        taskUpdateProtocol: 1, taskRevision: 0, operationId: 1, entry: "codex_exec",
+        nativeInput: { cmd: "git status --short" }, waitMs: 30_000,
+      }, 35_000);
       let snapshot = progress.snapshot();
       while (snapshot.lastToolBatchRevision <= previousBatchRevision) {
         snapshot = await progress.waitForChange(snapshot.revision, turn.abortSignal);
       }
       await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
-      const result = await invocation;
+      const reply = await invocation;
+      expect(reply.kind).toBe("result");
+      const result = reply.result;
       const simulated = (result.structuredContent as { simulated: boolean }).simulated;
       const answer = `DEV receipt simulated=${simulated}`;
-      turn.onTextDelta(answer);
+      turn.onTextDelta(answer, { expectedDriverGeneration: 0, taskRevision: 0 });
       return answer;
     } finally {
       prepared.release();

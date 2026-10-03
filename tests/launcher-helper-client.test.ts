@@ -78,7 +78,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     createdAt: new Date().toISOString(),
   })}\n`, { mode: 0o600 });
   const config: ResolvedBrowserConfig = {
-    appName: "Codex Native3",
+    appName: "Codex Native4",
     browserHost: "launcher",
     browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper,
@@ -199,7 +199,7 @@ test("accepted compaction retires through the helper as completed without hiding
     surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
   }), { mode: 0o600 });
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
+    appName: "Codex Native4", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper, browserDiagnosticsPath: join(root, "diagnostics"),
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
     turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
@@ -246,7 +246,7 @@ test("accepted compaction retires through the helper as completed without hiding
 
 test("an older helper rejects Native waiting before turn preparation or IPC dispatch", async () => {
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    appName: "Codex Native4", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome",
     headed: true, autoApproveToolCalls: false, useSavedChats: false,
   });
@@ -286,7 +286,7 @@ test("an older helper rejects Native waiting before turn preparation or IPC disp
 test("launcher helper protocol preserves multipart context and the compaction flag", async () => {
   const sent: Record<string, unknown>[] = [];
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native3 DEV",
+    appName: "Codex Native4 DEV",
     browserHost: "launcher",
     browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused-state.json",
@@ -468,7 +468,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
 
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
   const client = new LauncherBrowserHelperClient({
-    appName: "Codex Native3", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    appName: "Codex Native4", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useSavedChats: false,
   });
   const internal = client as unknown as {

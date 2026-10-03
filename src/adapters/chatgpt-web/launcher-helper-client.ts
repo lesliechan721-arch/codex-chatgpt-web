@@ -8,6 +8,7 @@ import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import { CONTINUITY_FEATURE, isContinuityLease, type ContinuityLease } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
+import { isTaskRevision, type TaskUpdateOwnerContext } from "./task-update-protocol";
 import {
   parseChatGptLunaCheckpoint,
   type ChatGptLunaCheckpoint,
@@ -27,11 +28,11 @@ interface PendingTurn {
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
-  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
+  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
-  | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
-  | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
+  | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number; candidate?: TaskUpdateOwnerContext }
+  | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "continuity_lease"; lease: ContinuityLease }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
@@ -66,6 +67,17 @@ function parseHelperMessage(line: string): HelperMessage {
   }
   if (message.type === "event") {
     const event = message.event;
+    let candidate: TaskUpdateOwnerContext | undefined;
+    if (message.candidate !== undefined) {
+      const value = message.candidate as TaskUpdateOwnerContext;
+      if (!value || !isTaskRevision(value.taskRevision) || !isTaskRevision(value.expectedDriverGeneration)
+        || (value.acknowledgedRevision !== undefined && (!isTaskRevision(value.acknowledgedRevision)
+          || value.acknowledgedRevision > value.taskRevision))) {
+        throw new Error("Launcher browser helper task output candidate is invalid");
+      }
+      candidate = Object.freeze({ taskRevision: value.taskRevision, expectedDriverGeneration: value.expectedDriverGeneration,
+        ...(value.acknowledgedRevision !== undefined ? { acknowledgedRevision: value.acknowledgedRevision } : {}) });
+    }
     if (event === "continuity_lease") {
       if (!isContinuityLease(message.lease)) throw new Error("Launcher browser helper returned an invalid continuity lease");
       return { type: "event", id: message.id, event, lease: message.lease };
@@ -86,7 +98,7 @@ function parseHelperMessage(line: string): HelperMessage {
       if (!Number.isSafeInteger(message.requestId) || (message.requestId as number) <= 0) {
         throw new Error("Launcher browser helper completion fence request id is invalid");
       }
-      return { type: "event", id: message.id, event, requestId: message.requestId as number };
+      return { type: "event", id: message.id, event, requestId: message.requestId as number, ...(candidate ? { candidate } : {}) };
     }
     if (event === "completion_fence_commit") {
       if (!Number.isSafeInteger(message.requestId) || (message.requestId as number) <= 0
@@ -99,6 +111,7 @@ function parseHelperMessage(line: string): HelperMessage {
         event,
         requestId: message.requestId as number,
         revision: message.revision as number,
+        ...(candidate ? { candidate } : {}),
       };
     }
     if (event === "luna_checkpoint") {
@@ -136,6 +149,7 @@ function parseHelperMessage(line: string): HelperMessage {
       event: event as "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text",
       ...(text !== undefined ? { text: text as string } : {}),
       ...(continuation !== undefined ? { continuation: continuation as boolean } : {}),
+      ...(candidate ? { candidate } : {}),
     };
   }
   if (message.type === "result") {
@@ -241,6 +255,11 @@ export class LauncherBrowserHelperClient {
         { status: 503, errorType: "server_error", code: "codex_tool_upgrade_required", retryable: false },
       );
     }
+    if (turn.taskUpdateProtocol && !this.hasTaskUpdateFeatures()) {
+      throw new ChatGptWebAdapterError("Launcher browser helper no longer supports the negotiated task update protocol", {
+        status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false,
+      });
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
@@ -308,6 +327,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
+            ...(turn.taskUpdateProtocol ? { taskUpdateProtocol: turn.taskUpdateProtocol } : {}),
           },
         })
           // Only mirror once the run frame is on the wire, so the helper never sees progress for a
@@ -338,6 +358,16 @@ export class LauncherBrowserHelperClient {
     if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")) {
       throw continuityError("continuity_configuration_conflict", "Update the runtime and browser helper before starting this mode.");
     }
+  }
+
+  async supportsTaskUpdates(): Promise<boolean> {
+    await this.ensureChild();
+    return this.hasTaskUpdateFeatures();
+  }
+
+  private hasTaskUpdateFeatures(): boolean {
+    return ["task-updates-v1", "task-output-ack-v3", "progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1"]
+      .every(feature => this.helperFeatures.has(feature));
   }
 
   private async ensureChild(): Promise<void> {
@@ -437,6 +467,15 @@ export class LauncherBrowserHelperClient {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     if (message.type === "event") {
+      if (pending.turn.taskUpdateProtocol && (
+        message.event === "text" || message.event === "completion_fence_begin" || message.event === "completion_fence_commit"
+      ) && (!message.candidate || message.candidate.acknowledgedRevision === undefined)) {
+        this.abortWithLocalFailure(message.id, new ChatGptWebAdapterError(
+          "Launcher browser helper omitted the task output candidate or its observed acknowledgment head",
+          { status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false },
+        ), pending);
+        return;
+      }
       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
       else if (message.event === "tool_batch_observed") {
         const progress = pending.turn.externalProgress;
@@ -464,7 +503,7 @@ export class LauncherBrowserHelperClient {
           );
           return;
         }
-        void fence.begin().then(revision => {
+        void fence.begin(message.candidate).then(revision => {
           if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
           return this.send({
             type: "completion_fence_begin_ack",
@@ -488,7 +527,7 @@ export class LauncherBrowserHelperClient {
           );
           return;
         }
-        void fence.commit(message.revision).then(committed => {
+        void fence.commit(message.revision, message.candidate).then(committed => {
           if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
           return this.send({
             type: "completion_fence_commit_ack",
@@ -590,7 +629,7 @@ export class LauncherBrowserHelperClient {
         pending.turn.onReasoningSummary?.(message.text, message.continuation === true);
       }
       else if (message.event === "commentary" && message.text) pending.turn.onCommentary?.(message.text, message.continuation === true);
-      else if (message.event === "text" && message.text) pending.turn.onTextDelta(message.text);
+      else if (message.event === "text" && message.text) pending.turn.onTextDelta(message.text, message.candidate);
       return;
     }
     if (message.type === "result") {

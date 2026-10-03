@@ -19,15 +19,19 @@ export type BrowserInteractionMode = "automatic" | "manual";
 export type SubagentProtocol = "compatibility-v1" | "native";
 
 /**
- * ChatGPT caches a connector's public MCP contract by connector identity. Native operation IDs
- * and the fixed wait tool therefore use new production identities rather than stale tool lists.
+ * ChatGPT caches a connector's public MCP contract by connector identity. The task_updates-v1
+ * start revision and ACK tool require new identities rather than stale cached tool lists.
  */
-export const CHATGPT_CONNECTOR_NAME = "Codex Native3";
+export const CHATGPT_CONNECTOR_NAME = "Codex Native4";
 export const DEV_CHATGPT_CONNECTOR_NAME = `${CHATGPT_CONNECTOR_NAME} DEV`;
 export { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME };
-export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk2";
-const LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk";
-export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native", "Codex Native2", "Codex Native2 DEV"] as const;
+export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk3";
+const LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAMES = ["Codex Zero Risk", "Codex Zero Risk2"] as const;
+
+function isLegacyZeroRiskConnectorName(value: unknown): boolean {
+  return typeof value === "string" && (LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
+}
+export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV"] as const;
 
 export function isLegacyChatGptConnectorName(value: string): boolean {
   return (LEGACY_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
@@ -48,7 +52,7 @@ export function validateConnectorNameSuffix(value: unknown): string {
     throw new Error("The part after Codex must contain 1–74 letters, numbers, spaces, hyphens or underscores");
   }
   const fullName = `Codex ${value}`;
-  if (isLegacyChatGptConnectorName(fullName) || fullName === LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+  if (isLegacyChatGptConnectorName(fullName) || isLegacyZeroRiskConnectorName(fullName)) {
     throw new Error(`${fullName} is retired; choose another plugin name`);
   }
   return value;
@@ -78,6 +82,7 @@ export function resolveInteractionConnectorIdentities(
   let automaticAppName = existing.automaticAppName ?? defaultAutomatic;
   let manualAppName = existing.manualAppName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME;
   if (isLegacyChatGptConnectorName(automaticAppName)) automaticAppName = defaultAutomatic;
+  if (isLegacyZeroRiskConnectorName(manualAppName)) manualAppName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
   if (suffix !== undefined) {
     const name = `Codex ${validateConnectorNameSuffix(suffix)}`;
     if (interactionMode === "manual") manualAppName = name;
@@ -409,15 +414,15 @@ export function loadConfigForSetup(): AppConfig {
     raw.browserHost = "managed-chrome";
   }
   const interactionMode = raw.browserInteractionMode ?? "automatic";
-  if (raw.manualAppName === LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+  if (isLegacyZeroRiskConnectorName(raw.manualAppName)) {
     raw.manualAppName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
   }
-  if (interactionMode === "manual" && raw.appName === LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+  if (interactionMode === "manual" && isLegacyZeroRiskConnectorName(raw.appName)) {
     raw.appName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
   }
   const automaticName = raw.automaticAppName
     ?? (interactionMode === "automatic" ? raw.appName : CHATGPT_CONNECTOR_NAME);
-  if (automaticName === ZERO_RISK_CHATGPT_CONNECTOR_NAME
+  if ((automaticName === ZERO_RISK_CHATGPT_CONNECTOR_NAME || isLegacyZeroRiskConnectorName(automaticName))
     && (raw.manualAppName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME) === ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
     raw.automaticAppName = CHATGPT_CONNECTOR_NAME;
     if (interactionMode === "automatic") raw.appName = CHATGPT_CONNECTOR_NAME;

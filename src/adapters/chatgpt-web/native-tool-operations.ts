@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { BrokerToolRequest, BrokerToolResult } from "./turn-broker";
+import { isTaskRevision, type UpdateDelivery } from "./task-update-protocol";
 import {
   finishNativeToolResult,
   nativePublicResult,
@@ -22,7 +23,7 @@ export const NATIVE_RESULT_TOTAL_BYTES = 64 * 1_024 * 1_024;
 const NATIVE_RESULT_ERROR_RESERVE_BYTES = NATIVE_OPERATION_LIMIT * 1_024;
 
 export class NativeOperationError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly taskUpdate?: UpdateDelivery) {
     super(message);
     this.name = "NativeOperationError";
   }
@@ -35,13 +36,13 @@ export interface NativeWaitingSnapshot {
   remainingMs: number;
 }
 
-export type NativeOperationReply = { kind: "pending"; operation_id: number }
-  | { kind: "result"; result: BrokerToolResult };
+export type NativeOperationReply = ({ kind: "pending"; operation_id: number }
+  | { kind: "result"; result: BrokerToolResult }) & { taskUpdate?: UpdateDelivery };
 
 export type NativeOperationAdmission = {
   request: BrokerToolRequest;
   resultContract: NativeResultContract;
-} | { result: BrokerToolResult; control?: boolean };
+} | { result: BrokerToolResult; control?: "compaction" | "task-update" };
 
 interface OperationWaiter {
   resolve: (reply: NativeOperationReply) => void;
@@ -175,11 +176,14 @@ export class NativeToolOperations {
     entry: NativeToolEntry,
     input: Record<string, unknown>,
     admit: (normalized: Record<string, unknown>) => NativeOperationAdmission,
-  ): { request?: BrokerToolRequest; created: boolean } {
+    taskRevision?: number,
+    taskAdmission?: () => Extract<NativeOperationAdmission, { result: BrokerToolResult }> | undefined,
+  ): { request?: BrokerToolRequest; created: boolean; control?: "compaction" | "task-update" } {
     this.assertActive();
     this.assertId(operationId);
+    if (taskRevision !== undefined && !isTaskRevision(taskRevision)) throw new NativeOperationError("task_update_revision_required", "Native taskRevision must be a nonnegative safe integer");
     const normalized = normalizeNativeToolInput(entry, input);
-    const startDescription = { entry, parameters: normalized };
+    const startDescription = { entry, parameters: normalized, ...(taskRevision !== undefined ? { taskRevision } : {}) };
     let descriptionBytes: number;
     let fingerprint: string;
     let deterministicResourceError: NativeOperationError | undefined;
@@ -205,11 +209,11 @@ export class NativeToolOperations {
     // no half-bound identity; deterministic rejections publish the same replayable terminal slot.
     let admission: NativeOperationAdmission;
     try {
-      admission = deterministicResourceError
+      admission = taskAdmission?.() ?? (deterministicResourceError
         ? { result: nativeOperationFailure(deterministicResourceError.code, deterministicResourceError.message, entry) }
         : descriptionBytes > NATIVE_CONTEXT_LIMIT_BYTES
         ? { result: nativeOperationFailure("codex_tool_resource_limit", "The Native start description exceeds the bounded argument budget", entry) }
-        : admit(normalized);
+        : admit(normalized));
     } catch (error) {
       if (!(error instanceof NativeToolAdmissionError)) throw error;
       admission = { result: nativeOperationFailure("codex_tool_admission_rejected", error.message, entry) };
@@ -228,12 +232,12 @@ export class NativeToolOperations {
     this.operations.set(operationId, operation);
     this.contextBytes += contextBytes;
     if ("result" in admission) {
-      this.cache(operation, admission.control ? nativeControlResult("compaction", admission.result) : admission.result);
+      this.cache(operation, admission.control ? nativeControlResult(admission.control, admission.result) : admission.result);
     } else {
       this.ensureTimer();
       this.changed();
     }
-    return { created: true, ...("request" in admission ? { request: admission.request } : {}) };
+    return { created: true, ...("request" in admission ? { request: admission.request } : admission.control ? { control: admission.control } : {}) };
   }
 
   handoff(operationId: number): void {
@@ -243,19 +247,32 @@ export class NativeToolOperations {
     this.changed();
   }
 
-  complete(operationId: number, raw: BrokerToolResult, control = false): void {
+  complete(operationId: number, raw: BrokerToolResult, control?: "compaction" | "task-update"): void {
+    this.prepareCompletion(operationId, raw, control)();
+  }
+
+  /** Validate/finalize before an owner transaction publishes state; commit never re-admits. */
+  prepareCompletion(operationId: number, raw: BrokerToolResult, control?: "compaction" | "task-update"): () => void {
     const operation = this.get(operationId);
     if (operation.state !== "queued" && operation.state !== "waiting") {
       throw new NativeOperationError("codex_tool_operation_retired", "Native operation cannot accept another result");
     }
     let result: BrokerToolResult;
     try {
-      result = control ? nativeControlResult("compaction", structuredClone(raw))
+      result = control ? nativeControlResult(control, structuredClone(raw))
         : finishNativeToolResult(operation.resultContract!, raw);
     } catch {
       result = nativeOperationFailure("codex_tool_result_unavailable", "The Native result could not be converted to its public result", operation.entry);
     }
-    this.cache(operation, result);
+    try { result = structuredClone(result); } catch {
+      result = nativeOperationFailure("codex_tool_result_unavailable", "The Native result could not be retained", operation.entry);
+    }
+    let committed = false;
+    return () => {
+      if (committed || this.retired || this.operations.get(operationId) !== operation) return;
+      committed = true;
+      this.cache(operation, result);
+    };
   }
 
   wait(operationId: number, signal?: AbortSignal, waitMs = NATIVE_WAIT_WINDOW_MS): Promise<NativeOperationReply> {

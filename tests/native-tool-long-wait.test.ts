@@ -195,7 +195,7 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
         ));
         expect(control).toBeDefined();
         expect((control!.required as string[] | undefined) ?? []).not.toContain("operation_id");
-        expect(control).toMatchObject({ not: { required: ["operation_id"] } });
+        expect(control).toMatchObject({ not: { anyOf: [{ required: ["operation_id"] }, { required: ["task_revision"] }] } });
 
         const rejectedControl = await client.callTool({
           name: "codex_tool_call",
