@@ -15,6 +15,8 @@ import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-erro
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
+// Helper startup can take 15 seconds; IPC and process cleanup also use the test budget.
+const REAL_HELPER_TIMEOUT_MS = 30_000;
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
@@ -261,7 +263,7 @@ test("real helper preserves one candidate when completion commits before the fir
     await expect(progress.waitForToolBatchObservation(batch)).resolves.toBeUndefined();
     expect(progress.snapshot()).toMatchObject({ lastToolBatchRevision: batch, lastProgressAt: 2_000, activeToolCalls: 0 });
   } finally { await client.close(); }
-});
+}, REAL_HELPER_TIMEOUT_MS);
 
 test("real helper forwards an old completion ticket with its original generation after a delayed update", async () => {
   const client = realHelperClient(`
@@ -306,7 +308,7 @@ test("real helper forwards an old completion ticket with its original generation
       [9, { taskRevision: 0, expectedDriverGeneration: 0, acknowledgedRevision: 0 }],
     ]);
   } finally { await client.close(); }
-});
+}, REAL_HELPER_TIMEOUT_MS);
 
 test("direct production DOM loop completes after ACK with no new tools and rereads before commit", async () => {
   const progress = new ChatGptExternalTurnProgress();
@@ -452,7 +454,7 @@ test("real helper reads the same-host ACK publication while its progress mirror 
     expect(seen).toEqual(Array(3).fill({ taskRevision: 1, expectedDriverGeneration: 1, acknowledgedRevision: 1 }));
     expect(progress.snapshot().taskUpdates?.acknowledgedRevision).toBe(0);
   } finally { await client.close(); }
-});
+}, REAL_HELPER_TIMEOUT_MS);
 
 test("real helper preserves a pre-ACK candidate even after observing the acknowledged head", async () => {
   const client = realHelperClient(`
@@ -494,7 +496,7 @@ test("real helper preserves a pre-ACK candidate even after observing the acknowl
       { taskRevision: 1, expectedDriverGeneration: 1, acknowledgedRevision: 0 },
     ]);
   } finally { await client.close(); }
-});
+}, REAL_HELPER_TIMEOUT_MS);
 
 test("direct production DOM loop cannot upgrade an async old final projection to the new head", async () => {
   const progress = new ChatGptExternalTurnProgress();

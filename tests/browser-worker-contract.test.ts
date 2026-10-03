@@ -699,7 +699,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
       localToolsEnabled: true,
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
-      storageStatePath: `/tmp/issue-285-${Date.now()}-${Math.random()}.json`,
+      storageStatePath: join(tmpdir(), `issue-285-${Date.now()}-${Math.random()}.json`),
     },
   };
   type Baseline = {
@@ -842,7 +842,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
       localToolsEnabled: true,
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
-      storageStatePath: `/tmp/multipart-send-budget-${Date.now()}-${Math.random()}.json`,
+      storageStatePath: join(tmpdir(), `multipart-send-budget-${Date.now()}-${Math.random()}.json`),
     },
   };
   const worker = ChatGptBrowserWorker.forProvider(provider) as unknown as {

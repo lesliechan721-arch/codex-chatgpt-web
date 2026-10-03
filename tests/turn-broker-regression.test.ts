@@ -7,7 +7,7 @@ import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-bro
 import { defaultBrokerEndpoint } from "../src/config";
 
 function fixture() {
-  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-race-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-race-"));
   const path = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(path);
   const environment = {

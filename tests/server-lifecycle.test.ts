@@ -2856,7 +2856,7 @@ test("a full-mode runtime exposes its broker endpoint before any turn registers"
 
 test("health reports a failed broker startup without deleting the conflicting file", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync(join("/tmp", "cgw-health-fail-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-health-fail-"));
   const path = join(root, "broker.sock");
   writeFileSync(path, "not a socket");
   const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
@@ -2875,7 +2875,7 @@ test("health reports a failed broker startup without deleting the conflicting fi
 
 test("health checks the broker protocol and detects a subsequently lost endpoint", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync(join("/tmp", "cgw-health-lost-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-health-lost-"));
   const path = join(root, "broker.sock");
   const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
   const broker = TurnBroker.forSocket(path);
@@ -2897,7 +2897,7 @@ test("health checks the broker protocol and detects a subsequently lost endpoint
 
 test("a lost broker rejects new Web work and cannot be made ready by resume", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-admission-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-admission-"));
   const path = join(root, "broker.sock");
   const config = { ...defaultConfig("full"), port: 0, brokerSocketPath: path };
   let adapterCalls = 0;

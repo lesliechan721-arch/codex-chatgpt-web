@@ -1,6 +1,7 @@
 import { observedTaskAcknowledgement, observedTaskOutputVersion, taskUpdateAckPath } from "../src/adapters/chatgpt-web/task-update-ack";
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
@@ -16,7 +17,7 @@ const raw: BrokerToolResult = {
 };
 
 async function fixture(remote: boolean, safe = false, tools?: CodexTool[]) {
-  const root = mkdtempSync("/tmp/cgw-updates-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-updates-"));
   const socket = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socket);
   await broker.listen();

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireBrokerSocketLock } from "../src/adapters/chatgpt-web/turn-broker-lock";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
@@ -16,7 +17,7 @@ async function waitForFile(path: string): Promise<void> {
 
 test("a delayed lock release cannot remove the successor's owner marker", () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-lock-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-lock-"));
   const path = join(root, "broker.sock");
   const firstOwner = `${process.pid}-${randomBytes(16).toString("hex")}`;
   const secondOwner = `${process.pid}-${randomBytes(16).toString("hex")}`;
@@ -37,7 +38,7 @@ test("a delayed lock release cannot remove the successor's owner marker", () => 
 
 test("competing processes recover a crashed owner without unlinking the winning broker", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-crash-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-crash-"));
   const path = join(root, "broker.sock");
   const ready = join(root, "ready");
   const crashed = Bun.spawn([process.execPath, "-e", `
@@ -99,7 +100,7 @@ test("competing processes recover a crashed owner without unlinking the winning 
 
 test("stale-socket probing does not delete a regular file that replaced the socket", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-probe-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-probe-"));
   const path = join(root, "broker.sock");
   const ready = join(root, "ready");
   // A legacy process does not participate in the new ownership lock.
@@ -134,7 +135,7 @@ test("stale-socket probing does not delete a regular file that replaced the sock
 
 test("a reused PID with a different process start identity does not retain a stale lock", () => {
   if (!["darwin", "linux"].includes(process.platform)) return;
-  const root = mkdtempSync("/tmp/cgw-lock-pid-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-lock-pid-"));
   const path = join(root, "broker.sock");
   const oldOwner = `${process.pid}-${randomBytes(16).toString("hex")}`;
   const owner = `${process.pid}-${randomBytes(16).toString("hex")}`;
@@ -159,7 +160,7 @@ test("a reused PID with a different process start identity does not retain a sta
 for (const contents of ["", JSON.stringify({ processStart: null }), JSON.stringify({ processStart: "invalid-start" })]) {
   test(`a live PID with unknown process identity keeps its lock (${contents || "legacy"})`, () => {
     if (process.platform === "win32") return;
-    const root = mkdtempSync("/tmp/cgw-lock-unknown-");
+    const root = mkdtempSync(join(tmpdir(), "cgw-lock-unknown-"));
     const path = join(root, "broker.sock");
     const owner = `${process.pid}-${randomBytes(16).toString("hex")}`;
     mkdirSync(`${path}.lock`, { mode: 0o700 });
@@ -178,7 +179,7 @@ for (const contents of ["", JSON.stringify({ processStart: null }), JSON.stringi
 for (const endpoint of ["public", "listener"] as const) {
 test(`an old process preserves a replaced ${endpoint} socket through refused close and runtime exit`, async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-replaced-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-replaced-"));
   const path = join(root, "broker.sock");
   const ready = join(root, "ready");
   const outcome = join(root, "outcome");
@@ -229,7 +230,7 @@ test(`an old process preserves a replaced ${endpoint} socket through refused clo
 
 test(`a failed close rejects a delayed connection and preserves the ${endpoint} replacement at exit`, async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-replaced-queued-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-replaced-queued-"));
   const path = join(root, "broker.sock");
   const ready = join(root, "ready");
   const queued = join(root, "queued");

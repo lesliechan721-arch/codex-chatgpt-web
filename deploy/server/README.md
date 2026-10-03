@@ -216,7 +216,9 @@ For delegated tool authority, use the two-host acceptance harness. It is intenti
 
 ```sh
 export CODEX_WEB_REMOTE_ACCEPTANCE_CHALLENGE="$(openssl rand -hex 16)"
-bun run accept:delegated:server > /tmp/delegated-server-attestation.json
+SERVER_ATTESTATION="$(mktemp)"
+bun run accept:delegated:server > "$SERVER_ATTESTATION"
+printf 'Server attestation: %s\n' "$SERVER_ATTESTATION"
 ```
 
 Copy that JSON file to the separate machine that runs the real Codex client. On that client, use the same challenge and the exported remote API configuration:
