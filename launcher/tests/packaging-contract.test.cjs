@@ -205,7 +205,7 @@ test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
   assert.match(ci, /prepare-linux-libnotify\.sh/);
   assert.match(ci, /prepare-linux-appimage-tools\.cjs/);
   assert.match(ci, /archlinux:base/);
-  assert.match(ci, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.0/);
+  assert.match(ci, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.2/);
   for (const runner of ["macos-15", "macos-15-intel", "ubuntu-latest", "ubuntu-24.04-arm", "windows-latest"]) {
     assert.match(release, new RegExp(runner));
   }
@@ -216,7 +216,7 @@ test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
   assert.match(release, /archlinux:base/);
   assert.match(release, /runner: ubuntu-24\.04-arm\s+runtime_asset: codex-chatgpt-web-linux-arm64\.tar\.gz/);
   assert.match(release, /Verify Linux AppImage ABI on current Arch\s+if: runner\.os == 'Linux' && runner\.arch == 'X64'/);
-  assert.match(release, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.0/);
+  assert.match(release, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.2/);
   assert.match(release, /codesign --verify --deep --strict --verbose=2/);
   assert.match(release, /Codex Web GPT\.app/);
   assert.doesNotMatch(release, /gh release create[\s\S]*?--draft/);

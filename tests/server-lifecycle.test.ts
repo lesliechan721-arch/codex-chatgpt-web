@@ -1603,24 +1603,30 @@ test("remote thread_title body transport failure releases the idle lease and per
     },
     input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
   });
-  const request = () => fetch(`${endpoint}/v1/responses`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
-    body,
-  });
+  const request = async () => {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+      body,
+    }).catch(error => {
+      // Bun can close the socket before flushing headers when the body fails immediately.
+      expect(error).toMatchObject({ code: "ECONNRESET" });
+      return undefined;
+    });
+    if (response) {
+      expect(response.status).toBe(200);
+      await response.text().catch(() => "");
+    }
+  };
 
   try {
-    const first = await request();
-    expect(first.status).toBe(200);
-    await first.text().catch(() => "");
+    await request();
     expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
       active_http_turns: 0,
       active_remote_turn_idle_leases: 0,
     });
     await Bun.sleep(1_100);
-    const second = await request();
-    expect(second.status).toBe(200);
-    await second.text().catch(() => "");
+    await request();
     expect(upstreamCalls).toBe(2);
   } finally {
     await server.stop(true);
