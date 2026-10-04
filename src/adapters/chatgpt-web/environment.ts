@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { buildCompactV1Output, extractCompactUserMessages, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
+import { buildCompactV1Output, decodeCompactionSummary, extractCompactUserMessages, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "./compaction-continuation";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -859,6 +859,69 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
   if (revisions.length > 0) return revisions;
   const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
   return recovered ? [recovered.source] : [];
+}
+
+export interface ChatGptTrustedUserText {
+  sourceMessageId: string;
+  content: string;
+  /** Preserve the native representation, including its role and content-part ordering. */
+  item: Record<string, unknown>;
+}
+
+/**
+ * This narrow provenance check is intentionally separate from instruction history, which also
+ * includes delegated agent messages. Older API-key Codex omits content kinds, but still supplies
+ * the native turn owner, message role and stable item identity. Typed native fragments never
+ * inherit that compatibility path.
+ */
+export function trustedChatGptTaskUpdateUserText(
+  value: unknown,
+  turnId: string,
+): ChatGptTrustedUserText | undefined {
+  const item = record(value);
+  if (!item || inputItemType(item) !== "message" || item.role !== "user"
+    || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id
+    || contextualUserMessage(item) || item.origin !== undefined || item.author !== undefined
+    || item.recipient !== undefined) return undefined;
+  const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }]
+    : Array.isArray(item.content) ? item.content : [];
+  if (parts.length === 0 || parts.some(value => {
+    const part = record(value);
+    return !part || !["input_text", "text"].includes(String(part.type)) || typeof part.text !== "string";
+  })) return undefined;
+  const kindsValue = record(item.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  if (kindsValue !== undefined && (!Array.isArray(kindsValue) || kindsValue.length !== parts.length
+    || kindsValue.some(kind => kind !== "user.text"))) return undefined;
+  const content = parts.map(value => String(record(value)!.text)).join("\n");
+  if (!content.trim()) return undefined;
+  // Native preambles on old wires have no content kind. They are frozen prefix evidence, never
+  // a newly authorized human instruction. Text inside tool outputs is never examined here.
+  if (kindsValue === undefined && (/^# AGENTS\.md instructions\b/.test(content.trimStart())
+    || /^<(?:environment_context|subagent_notification|skills_instructions|permissions|collaboration_mode|codex_delegation)\b/.test(content.trimStart()))) return undefined;
+  return { sourceMessageId: item.id, content, item };
+}
+
+/** A layout marker only; it grants no checkpoint, environment or user-instruction authority. */
+export function isChatGptReadonlyCompactionBoundary(value: unknown): boolean {
+  const item = record(value);
+  if (!item) return false;
+  if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) {
+    return typeof item.encrypted_content === "string" && decodeCompactionSummary(item.encrypted_content) !== null;
+  }
+  return inputItemType(item) === "message" && item.role === "user"
+    && isReadableCompactionSummaryText(rawMessageText(item));
+}
+
+/** Compare retained requirements separately from compaction summaries and execution outputs. */
+export function chatGptReadonlyCompactionInstructions(parsed: CodexParsedRequest, input?: readonly unknown[]): Record<string, unknown>[] {
+  const body = record(parsed._rawBody);
+  const values = input ?? (Array.isArray(body?.input) ? body.input : []);
+  return values.flatMap(value => {
+    const item = record(value);
+    if (!item || isChatGptReadonlyCompactionBoundary(item)) return [];
+    return ["user", "system", "developer"].includes(String(item.role)) || item.type === "agent_message"
+      || (item.type === "function_call_output" && item.call_id === undefined) ? [item] : [];
+  });
 }
 
 /** A remote compaction may summarize an instruction from an earlier turn. */

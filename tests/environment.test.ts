@@ -13,6 +13,8 @@ import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/threa
 import type { CodexParsedRequest, CodexTool } from "../src/types";
 
 const root = resolve(process.cwd());
+// Repeated on-disk SQLite writes can exceed Bun's default budget on Windows CI.
+const SQLITE_TEST_TIMEOUT_MS = 15_000;
 const temporaryRoots: string[] = [];
 
 afterEach(() => {
@@ -1706,7 +1708,7 @@ describe("trusted Codex task environment continuity", () => {
     writeFileSync(rolloutPath, [JSON.stringify(session), JSON.stringify(childTurnContext())].join("\n") + "\n");
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
       .toThrow("session metadata");
-  });
+  }, SQLITE_TEST_TIMEOUT_MS);
 
   test("a child's untagged environment must match native history before its current task boundary", () => {
     const codexHome = mkdtempSync(join(tmpdir(), "codex-child-history-"));

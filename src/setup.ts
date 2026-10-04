@@ -332,7 +332,7 @@ function baseConfig(
       throw new Error("Zero Risk does not support Bigger Context");
     }
     if (config.mode !== "full") {
-      throw new Error("Zero Risk requires --full so Codex Zero Risk2 can signal start, tools, and completion");
+      throw new Error("Zero Risk requires --full so Codex Zero Risk3 can signal start, tools, and completion");
     }
     if (config.browserHost !== "launcher") {
       throw new Error("Zero Risk requires the Launcher; pass --browser-host-descriptor from the running Launcher");

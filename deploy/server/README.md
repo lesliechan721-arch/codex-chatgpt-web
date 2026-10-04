@@ -216,7 +216,9 @@ For delegated tool authority, use the two-host acceptance harness. It is intenti
 
 ```sh
 export CODEX_WEB_REMOTE_ACCEPTANCE_CHALLENGE="$(openssl rand -hex 16)"
-bun run accept:delegated:server > /tmp/delegated-server-attestation.json
+SERVER_ATTESTATION="$(mktemp)"
+bun run accept:delegated:server > "$SERVER_ATTESTATION"
+printf 'Server attestation: %s\n' "$SERVER_ATTESTATION"
 ```
 
 Copy that JSON file to the separate machine that runs the real Codex client. On that client, use the same challenge and the exported remote API configuration:
@@ -243,4 +245,7 @@ export CODEX_WEB_REMOTE_ZERO_RISK_TIMEOUT_MS="900000"
 bun run accept:delegated:zero-risk
 ```
 
-During this command, complete each visible Zero Risk prompt through the normal Launcher flow: paste/send, confirm **Sent**, use the `Codex Zero Risk2` connector for `codex_turn_start`, the requested Native tool, and `codex_turn_complete`. The Server still has no client rollout/Codex filesystem state, so the delegated Zero Risk round has no trusted filesystem environment even if raw environment text is present in the native request. The harness first requires a native `pwd`/read round and final completion. It then asks the real Codex `app-server` for `thread/compact/start`. Because the source Zero Risk turn has already completed, delegated compaction must retire that retained source and use the fresh compaction fallback; complete that second manual Zero Risk prompt too. A final native turn must recover a challenge marker from the compacted context and complete normally. The harness never uses `--dangerously-bypass-approvals-and-sandbox`.
+The `task_updates-v1` public contract uses the new `Codex Zero Risk3` identity. Preserve any
+`Codex Zero Risk2` connector and create a new connector; do not rename or refresh the old plugin.
+
+During this command, complete each visible Zero Risk prompt through the normal Launcher flow: paste/send, confirm **Sent**, use the `Codex Zero Risk3` connector for `codex_turn_start`, the requested Native tool, and `codex_turn_complete`. The Server still has no client rollout/Codex filesystem state, so the delegated Zero Risk round has no trusted filesystem environment even if raw environment text is present in the native request. The harness first requires a native `pwd`/read round and final completion. It then asks the real Codex `app-server` for `thread/compact/start`. Because the source Zero Risk turn has already completed, delegated compaction must retire that retained source and use the fresh compaction fallback; complete that second manual Zero Risk prompt too. A final native turn must recover a challenge marker from the compacted context and complete normally. The harness never uses `--dangerously-bypass-approvals-and-sandbox`.

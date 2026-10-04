@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstatSync, mkdirSync, readlinkSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readlinkSync, rmSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
+import { createTaskOutputControlSource, publishTaskOutputVersion, taskUpdateAckPath } from "./task-update-ack";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import Ajv from "ajv";
@@ -14,9 +15,41 @@ import {
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnCapability, ChatGptTurnEnvironment } from "./environment";
-import { NativeToolAdmissionError, nativeToolInputSchemas, planNativeTool, type NativeToolEntry } from "./native-tool-contract";
-import { NativeOperationError, NativeToolOperations, NATIVE_WAIT_PROTOCOL_VERSION, type NativeWaitingSnapshot } from "./native-tool-operations";
+import { NativeToolAdmissionError, nativePublicResult, nativeToolInputSchemas, planNativeTool, type NativeToolEntry } from "./native-tool-contract";
+import { NativeOperationError, NativeToolOperations, NATIVE_WAIT_PROTOCOL_VERSION, nativeOperationFailure, nativeControlResult, type NativeWaitingSnapshot } from "./native-tool-operations";
 import { chatGptToolTimeoutError } from "./adapter-error";
+import {
+  TASK_UPDATE_PROTOCOL_VERSION, TASK_UPDATE_LIMIT, TASK_UPDATE_TOTAL_BYTES,
+  TASK_UPDATE_TRANSFER_LIMIT, TASK_UPDATE_DELIVERY_LIMIT, TASK_UPDATE_BATCH_LIMIT_BYTES, isTaskRevision,
+  type TaskUpdateOwnerContext, type TaskUpdateRegistrationOptions, type TaskUpdateState,
+  type UserUpdate, type UpdateDelivery, type TaskUpdateTransfer, type TaskUpdateTransferOutcome,
+  type TaskUpdateAckResult, type TaskOutputReceipt,
+} from "./task-update-protocol";
+export type { TaskUpdateOwnerContext, TaskUpdateState, TaskUpdateTransfer, TaskUpdateTransferOutcome, TaskOutputReceipt } from "./task-update-protocol";
+
+export interface TaskUpdateStateSnapshot { revision: number; state: TaskUpdateState }
+
+interface TaskUpdateTransferRecord {
+  payloadDigest: string;
+  fingerprint?: string;
+  context: TaskUpdateOwnerContext;
+  outcome: TaskUpdateTransferOutcome;
+}
+
+interface TaskUpdateControl {
+  state: TaskUpdateState;
+  updates: UserUpdate[];
+  updateBytes: number;
+  deliveries: Map<string, UpdateDelivery>;
+  currentDeliveryId?: string;
+  transfers: Map<string, TaskUpdateTransferRecord>;
+  lastBatch?: { fingerprint: string; resultsDigest: string };
+  revision: number;
+  observers: Set<SafeWaiter<TaskUpdateStateSnapshot>>;
+  fences: Map<number, TaskUpdateOwnerContext>;
+  outputReceipt?: TaskOutputReceipt;
+  completionReceipt?: TaskOutputReceipt;
+}
 
 interface BrokerRetirementFailure {
   code: "codex_tool_timeout";
@@ -72,6 +105,7 @@ interface ToolWaiter {
   reject: (error: Error) => void;
   signal?: AbortSignal;
   onAbort?: () => void;
+  context?: TaskUpdateOwnerContext;
 }
 
 interface DevLongWaitProbeWaiter {
@@ -140,6 +174,7 @@ interface TurnChannel {
   deadlineTimer?: ReturnType<typeof setTimeout>;
   nativeWaitingObservers: Set<SafeWaiter<NativeWaitingSnapshot>>;
   batchTimer?: ReturnType<typeof setTimeout>;
+  taskUpdates?: TaskUpdateControl;
 }
 
 interface BrokerRequest {
@@ -172,7 +207,28 @@ interface BrokerRequest {
     | "dev_long_wait_probe_wait"
     | "native_operation_start"
     | "native_operation_wait"
-    | "owner_native_waiting";
+    | "owner_native_waiting"
+    | "owner_task_update_state"
+    | "owner_task_update_observe"
+    | "owner_task_update_reserve"
+    | "owner_task_update_accept"
+    | "owner_task_update_reject"
+    | "owner_task_update_outcome"
+    | "owner_final_output_check"
+    | "owner_final_output_begin"
+    | "owner_output_receipt"
+    | "owner_revoke_trusted"
+    | "task_update_ack";
+  ownerContext?: TaskUpdateOwnerContext;
+  taskUpdateProtocol?: number;
+  taskRevision?: number;
+  transfer?: TaskUpdateTransfer;
+  transferId?: string;
+  payloadDigest?: string;
+  deliveryId?: string;
+  throughRevision?: number;
+  rejectionCode?: string;
+  cancelled?: boolean;
   token?: string;
   bindingId?: string;
   wireName?: string;
@@ -208,6 +264,7 @@ interface BrokerResponse {
   error?: string;
   errorKind?: "admission_rejected";
   errorCode?: string;
+  taskUpdate?: UpdateDelivery;
 }
 
 const brokers = new Map<string, TurnBroker>();
@@ -217,7 +274,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 7;
+const TURN_BROKER_PROTOCOL_VERSION = 10;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -250,6 +307,28 @@ export async function closeTurnBrokers(): Promise<void> {
 
 function opaqueId(prefix: string): string {
   return `${prefix}_${randomBytes(24).toString("base64url")}`;
+}
+
+function taskFingerprint(value: unknown): string {
+  const canonical = (item: unknown, depth = 0): unknown => {
+    if (depth > 64) throw new NativeOperationError("task_update_invalid", "Task update payload exceeds the nesting limit");
+    if (Array.isArray(item)) return item.map(value => canonical(value, depth + 1));
+    if (item && typeof item === "object") return Object.fromEntries(Object.entries(item)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, value]) => [key, canonical(value, depth + 1)]));
+    return item;
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+}
+
+function taskUpdateError(code: string, message: string): NativeOperationError {
+  return new NativeOperationError(code, message);
+}
+
+function assertTaskUpdateIdentifier(value: unknown): asserts value is string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 256) {
+    throw taskUpdateError("task_update_invalid", "A bounded task update identity is required");
+  }
 }
 
 function handleFingerprint(value: string): string {
@@ -381,29 +460,39 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 
 export interface TurnBrokerOwner {
   waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot>;
-  register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string): Promise<string>;
+  register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string, options?: TaskUpdateRegistrationOptions): Promise<string>;
   registerSafe(
     environment: ChatGptTurnCapability,
     surfaceNonce: string,
     ttlMs?: number,
     traceId?: string,
-    options?: { requireSentConfirmation?: boolean },
+    options?: { requireSentConfirmation?: boolean } & TaskUpdateRegistrationOptions,
   ): Promise<string>;
-  updateEnvironment(token: string, environment: ChatGptTurnCapability): void | Promise<void>;
+  updateEnvironment(token: string, environment: ChatGptTurnCapability, context?: TaskUpdateOwnerContext): void | Promise<void>;
   confirmSafeTurnSent(
     token: string,
     surfaceNonce: string,
   ): { confirmed: true; duplicate: boolean } | Promise<{ confirmed: true; duplicate: boolean }>;
-  nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]>;
-  completeTool(token: string, callId: string, result: BrokerToolResult): void | Promise<void>;
+  nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]>;
+  completeTool(token: string, callId: string, result: BrokerToolResult, context?: TaskUpdateOwnerContext): void | Promise<void>;
   waitForSafeStart(token: string, signal?: AbortSignal): Promise<void>;
   waitForSafeCompletion(token: string, signal?: AbortSignal): Promise<string>;
-  requestCompaction(token: string, queuedResult: BrokerToolResult): number | Promise<number>;
+  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): number | Promise<number>;
   compactionDeliveryCount(token: string): number | Promise<number>;
-  beginCompletionFence(token: string): number | undefined | Promise<number | undefined>;
-  commitCompletionFence(token: string, revision: number): boolean | Promise<boolean>;
+  beginCompletionFence(token: string, context?: TaskUpdateOwnerContext): number | undefined | Promise<number | undefined>;
+  commitCompletionFence(token: string, revision: number, context?: TaskUpdateOwnerContext): boolean | Promise<boolean>;
   waitForRetirement(token: string, signal?: AbortSignal): Promise<BrokerRetirementFailure | undefined>;
-  revoke(token: string, reason?: Error): void | Promise<void>;
+  revoke(token: string, reason?: Error, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  revokeTrusted?(token: string, reason?: Error): void | Promise<void>;
+  taskUpdateState?(token: string): TaskUpdateState | undefined | Promise<TaskUpdateState | undefined>;
+  waitForTaskUpdateState?(token: string, afterRevision: number, signal?: AbortSignal): Promise<TaskUpdateStateSnapshot>;
+  reserveTaskUpdate?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
+  acceptTaskUpdate?(token: string, transfer: TaskUpdateTransfer): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
+  rejectTaskUpdateReservation?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, code?: string): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
+  taskUpdateTransferOutcome?(token: string, transferId: string): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
+  checkFinalOutputCandidate?(token: string, context: TaskUpdateOwnerContext): void | Promise<void>;
+  beginFinalOutput?(token: string, context: TaskUpdateOwnerContext): TaskOutputReceipt | Promise<TaskOutputReceipt>;
+  taskOutputReceipt?(token: string): TaskOutputReceipt | undefined | Promise<TaskOutputReceipt | undefined>;
 }
 
 /**
@@ -443,6 +532,7 @@ export class TurnBroker implements TurnBrokerOwner {
   // previous turn's handle" from "this handle never existed".
   private readonly retiredBindings = new Map<string, string>();
   private readonly retiredTokens = new Map<string, string>();
+  private readonly retiredTaskUpdates = new Map<string, TaskUpdateControl>();
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
@@ -478,9 +568,14 @@ export class TurnBroker implements TurnBrokerOwner {
     environment: ChatGptTurnCapability,
     ttlMs?: number,
     traceId = "unknown",
-    externalOwner = false,
+    optionsOrExternalOwner: TaskUpdateRegistrationOptions & { externalOwner?: boolean } | boolean = {},
     handlePrefix = "turn",
   ): Promise<string> {
+    const options = typeof optionsOrExternalOwner === "boolean" ? { externalOwner: optionsOrExternalOwner } : optionsOrExternalOwner;
+    const externalOwner = options.externalOwner === true;
+    if (options.taskUpdateProtocol !== undefined && options.taskUpdateProtocol !== TASK_UPDATE_PROTOCOL_VERSION) {
+      throw taskUpdateError("task_update_upgrade_required", "Unsupported task update protocol");
+    }
     await this.start();
     this.prune();
     if (externalOwner && !this.acceptingExternalOwners) {
@@ -512,6 +607,13 @@ export class TurnBroker implements TurnBrokerOwner {
       devLongWaitProbeOperations: new Map(),
       nativeWaitingObservers: new Set(),
       nativeQueryCount: 0,
+      ...(options.taskUpdateProtocol === TASK_UPDATE_PROTOCOL_VERSION ? {
+        taskUpdates: {
+          state: { acknowledgementDirectory: createTaskOutputControlSource(), acceptedRevision: 0, deliveredRevision: 0, acknowledgedRevision: 0, driverGeneration: 0, finalOutputRevision: null },
+          updates: [], updateBytes: 0, deliveries: new Map(), transfers: new Map(),
+          revision: 0, observers: new Set(), fences: new Map(),
+        } satisfies TaskUpdateControl,
+      } : {}),
       nativeOperations: new NativeToolOperations(
         () => {
           this.resolveSafeWaiters(channel.nativeWaitingObservers, channel.nativeOperations.snapshot());
@@ -519,7 +621,7 @@ export class TurnBroker implements TurnBrokerOwner {
             try { listener(); } catch { console.warn("[chatgpt-web] Native waiting observer callback failed"); }
           }
         },
-        reason => this.revoke(token, reason),
+        reason => this.revokeTrusted(token, reason),
       ),
     };
     this.channels.set(token, channel);
@@ -528,7 +630,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (this.channels.get(token) !== channel || channel.authority.expiresAt === undefined) return;
       const remaining = channel.authority.expiresAt - Date.now();
       if (remaining <= 0) {
-        this.revoke(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
+        this.revokeTrusted(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
         return;
       }
       channel.deadlineTimer = setTimeout(enforceDeadline, Math.min(2_147_483_647, remaining));
@@ -544,7 +646,7 @@ export class TurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
-    optionsOrExternalOwner: { requireSentConfirmation?: boolean; externalOwner?: boolean } | boolean = {},
+    optionsOrExternalOwner: { requireSentConfirmation?: boolean; externalOwner?: boolean } & TaskUpdateRegistrationOptions | boolean = {},
   ): Promise<string> {
     const options = typeof optionsOrExternalOwner === "boolean"
       ? { externalOwner: optionsOrExternalOwner }
@@ -552,7 +654,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const requireSentConfirmation = options.requireSentConfirmation !== false;
     const externalOwner = options.externalOwner === true;
     assertSurfaceNonce(surfaceNonce);
-    const token = await this.register(environment, ttlMs, traceId, externalOwner, "request");
+    const token = await this.register(environment, ttlMs, traceId, { externalOwner, taskUpdateProtocol: options.taskUpdateProtocol }, "request");
     const channel = this.channels.get(token);
     if (!channel) throw new Error("Zero Risk turn registration was revoked before initialization");
     channel.safe = {
@@ -588,10 +690,11 @@ export class TurnBroker implements TurnBrokerOwner {
     this.compactionTransactions.abortTrace(traceId);
   }
 
-  updateEnvironment(token: string, environment: ChatGptTurnCapability): void {
+  updateEnvironment(token: string, environment: ChatGptTurnCapability, context?: TaskUpdateOwnerContext): void {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertDriver(channel, context);
     if (capabilityIdentity(channel.authority.capability) !== capabilityIdentity(environment)) {
       throw new Error("Codex turn authority changed during an active ChatGPT tool loop");
     }
@@ -603,10 +706,11 @@ export class TurnBroker implements TurnBrokerOwner {
     channel.authority.registryGeneration += 1;
   }
 
-  async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
+  async nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]> {
     this.prune();
     let channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertDriver(channel, context);
     if (channel.safe?.state === "awaiting_start") {
       // The outer Codex adapter owns this wait. It crosses the start boundary only after the user
       // confirms in the Launcher that the copied prompt was sent in the visible ChatGPT tab.
@@ -614,6 +718,7 @@ export class TurnBroker implements TurnBrokerOwner {
       this.prune();
       channel = this.channels.get(token);
       if (!channel) throw new Error("turn token is invalid or expired");
+      this.assertDriver(channel, context);
     }
     // This owner-only empty batch tells the adapter to consume the already accepted completion.
     // Public Zero Risk MCP calls remain fail-closed after the turn reaches its terminal state.
@@ -639,7 +744,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (signal?.aborted) throw new DOMException("tool wait aborted", "AbortError");
     return new Promise<BrokerToolRequest[]>((resolveWait, rejectWait) => {
-      const waiter: ToolWaiter = { resolve: resolveWait, reject: rejectWait, ...(signal ? { signal } : {}) };
+      const waiter: ToolWaiter = { resolve: resolveWait, reject: rejectWait, ...(signal ? { signal } : {}), ...(context ? { context: structuredClone(context) } : {}) };
       if (signal) {
         waiter.onAbort = () => {
           channel.waiters.delete(waiter);
@@ -651,10 +756,11 @@ export class TurnBroker implements TurnBrokerOwner {
     });
   }
 
-  completeTool(token: string, callId: string, result: BrokerToolResult): void {
+  completeTool(token: string, callId: string, result: BrokerToolResult, context?: TaskUpdateOwnerContext): void {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertDriver(channel, context);
     this.assertSafeHarnessRunning(channel, true);
     const invocation = channel.invocations.get(callId);
     if (!invocation) throw new Error(`tool call is not pending: ${callId}`);
@@ -666,26 +772,366 @@ export class TurnBroker implements TurnBrokerOwner {
     invocation.resolve(result);
   }
 
-  beginCompletionFence(token: string): number | undefined {
+  taskUpdateState(token: string): TaskUpdateState | undefined {
+    this.prune();
+    const updates = this.channels.get(token)?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    return updates ? structuredClone(updates.state) : undefined;
+  }
+
+  waitForTaskUpdateState(token: string, afterRevision: number, signal?: AbortSignal): Promise<TaskUpdateStateSnapshot> {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+    const updates = this.requireTaskUpdates(channel);
+    if (!isTaskRevision(afterRevision)) throw taskUpdateError("task_update_invalid", "Invalid task update observation revision");
+    if (updates.revision > afterRevision) return Promise.resolve({ revision: updates.revision, state: structuredClone(updates.state) });
+    if (updates.observers.size >= 8) throw taskUpdateError("task_update_resource_limit", "Task update observer limit reached");
+    return this.waitForSafeState(updates.observers, signal, "Task update observation aborted");
+  }
+
+  reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): TaskUpdateTransferOutcome {
+    this.prune();
+    assertTaskUpdateIdentifier(transferId);
+    assertTaskUpdateIdentifier(payloadDigest);
+    const channel = this.channels.get(token);
+    const updates = channel?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    const previous = updates?.transfers.get(transferId);
+    if (previous) {
+      if (previous.payloadDigest !== payloadDigest || previous.context.expectedDriverGeneration !== context?.expectedDriverGeneration
+        || previous.context.taskRevision !== context?.taskRevision) {
+        throw taskUpdateError("task_update_transfer_conflict", "The task update transfer identity is already bound");
+      }
+      return structuredClone(previous.outcome);
+    }
+    if (!channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+    const control = this.requireTaskUpdates(channel);
+    this.assertDriver(channel, context);
+    if (context.taskRevision !== control.state.acceptedRevision) throw taskUpdateError("task_update_revision_stale", "The task update head changed before reservation");
+    if (control.transfers.size >= TASK_UPDATE_TRANSFER_LIMIT) throw taskUpdateError("task_update_resource_limit", "The bounded task update transfer journal is full");
+    if ([...control.transfers.values()].some(record => record.outcome.status === "unknown")) {
+      throw taskUpdateError("task_update_transfer_pending", "The previous task update transfer must be resolved first");
+    }
+    if (control.state.finalOutputRevision !== null || channel.completionCommitted) throw taskUpdateError("task_update_final_output_started", "Final answer output has already started");
+    const outcome: TaskUpdateTransferOutcome = { status: "unknown", transferId };
+    control.transfers.set(transferId, { payloadDigest, context: structuredClone(context), outcome });
+    return structuredClone(outcome);
+  }
+
+  taskUpdateTransferOutcome(token: string, transferId: string): TaskUpdateTransferOutcome {
+    this.prune();
+    assertTaskUpdateIdentifier(transferId);
+    const updates = this.channels.get(token)?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    return structuredClone(updates?.transfers.get(transferId)?.outcome ?? { status: "unknown", transferId });
+  }
+
+  rejectTaskUpdateReservation(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, code = "task_update_preparation_rejected"): TaskUpdateTransferOutcome {
+    this.prune();
+    const channel = this.channels.get(token);
+    const updates = channel?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    const record = updates?.transfers.get(transferId);
+    if (!record) return { status: "unknown", transferId };
+    if (record.payloadDigest !== payloadDigest || record.context.expectedDriverGeneration !== context?.expectedDriverGeneration || record.context.taskRevision !== context?.taskRevision) {
+      throw taskUpdateError("task_update_transfer_conflict", "The task update transfer identity is already bound");
+    }
+    if (record.outcome.status !== "unknown") return structuredClone(record.outcome);
+    if (!channel) return { status: "unknown", transferId };
+    this.assertDriver(channel, context);
+    if (typeof code !== "string" || !/^task_update_[a-z_]{1,80}$/.test(code)) throw taskUpdateError("task_update_invalid", "Invalid task update rejection code");
+    record.outcome = { status: "not_committed", transferId, code, message: "The task update transfer was definitively rejected before commit" };
+    return structuredClone(record.outcome);
+  }
+
+  acceptTaskUpdate(token: string, transfer: TaskUpdateTransfer): TaskUpdateTransferOutcome {
+    this.prune();
+    assertTaskUpdateIdentifier(transfer?.transferId);
+    const channel = this.channels.get(token);
+    const updates = channel?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    const record = updates?.transfers.get(transfer.transferId);
+    if (!record) throw taskUpdateError("task_update_not_reserved", "Reserve a task update transfer outcome before preparing the transfer");
+    if (record.payloadDigest !== transfer.payloadDigest) throw taskUpdateError("task_update_transfer_conflict", "The task update transfer payload changed");
+    if (record.outcome.status !== "unknown" && !record.fingerprint) return structuredClone(record.outcome);
+    let fingerprint: string;
+    try { fingerprint = taskFingerprint(transfer); } catch {
+      record.outcome = { status: "not_committed", transferId: transfer.transferId, code: "task_update_invalid", message: "The task update transfer payload cannot be represented within the bounded protocol" };
+      return structuredClone(record.outcome);
+    }
+    if (record.fingerprint && record.fingerprint !== fingerprint) throw taskUpdateError("task_update_transfer_conflict", "The task update transfer payload changed");
+    record.fingerprint = fingerprint;
+    if (record.outcome.status !== "unknown") return structuredClone(record.outcome);
+    try {
+      if (!channel || !updates) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+      const context = { expectedDriverGeneration: transfer.expectedDriverGeneration, taskRevision: transfer.expectedRevision };
+      this.assertDriver(channel, context);
+      if (context.expectedDriverGeneration !== record.context.expectedDriverGeneration || context.taskRevision !== record.context.taskRevision
+        || transfer.expectedRevision !== updates.state.acceptedRevision) throw taskUpdateError("task_update_revision_stale", "The task update head changed before commit");
+      if (updates.state.finalOutputRevision !== null || channel.completionCommitted || channel.safe?.state === "completed") {
+        throw taskUpdateError("task_update_final_output_started", "Final answer output has already started");
+      }
+      if (channel.compactionRequested) throw taskUpdateError("task_update_compaction_pending", "Context compaction excludes task updates");
+      this.assertSafeHarnessRunning(channel);
+      const environment = ownerCapability(transfer.environment);
+      if (capabilityIdentity(environment) !== capabilityIdentity(channel.authority.capability)) throw taskUpdateError("task_update_authority_changed", "Task update authority does not match the active capability");
+      if (!Array.isArray(transfer.updates) || transfer.updates.length === 0) throw taskUpdateError("task_update_invalid", "A nonempty consecutive update suffix is required");
+      if (updates.updates.length + transfer.updates.length > TASK_UPDATE_LIMIT
+        || updates.deliveries.size >= TASK_UPDATE_DELIVERY_LIMIT
+        || !isTaskRevision(updates.state.acceptedRevision + transfer.updates.length)
+        || !isTaskRevision(updates.state.driverGeneration + 1)) throw taskUpdateError("task_update_resource_limit", "The bounded task update journal is full");
+      const identities = new Set(updates.updates.map(update => update.sourceMessageId));
+      let bytes = 0;
+      for (let index = 0; index < transfer.updates.length; index += 1) {
+        const update = transfer.updates[index]!;
+        if (!update || update.revision !== updates.state.acceptedRevision + index + 1 || !isTaskRevision(update.revision)
+          || typeof update.content !== "string" || update.content.length === 0) throw taskUpdateError("task_update_invalid", "Task update revisions must form a consecutive nonempty suffix");
+        assertTaskUpdateIdentifier(update.sourceMessageId);
+        assertTaskUpdateIdentifier(update.payloadDigest);
+        if (identities.has(update.sourceMessageId)) throw taskUpdateError("task_update_message_conflict", "The task update source message identity was already accepted");
+        identities.add(update.sourceMessageId);
+        bytes += Buffer.byteLength(JSON.stringify(update));
+      }
+      if (updates.updateBytes + bytes > TASK_UPDATE_TOTAL_BYTES) throw taskUpdateError("task_update_resource_limit", "The bounded task update text budget is full");
+      assertTaskUpdateIdentifier(transfer.batchFingerprint);
+      if (!Array.isArray(transfer.results) || transfer.results.length === 0) throw taskUpdateError("task_update_batch_invalid", "A complete proven tool result batch is required");
+      const resultIds = new Set<string>();
+      for (const item of transfer.results) {
+        if (!item || typeof item.callId !== "string" || resultIds.has(item.callId)
+          || !item.result || !Array.isArray(item.result.content)) throw taskUpdateError("task_update_batch_invalid", "Task update tool results are invalid or duplicated");
+        resultIds.add(item.callId);
+      }
+      if (Buffer.byteLength(JSON.stringify(transfer.results)) > TASK_UPDATE_BATCH_LIMIT_BYTES) throw taskUpdateError("task_update_resource_limit", "The task update result batch exceeds its bounded transport budget");
+      const resultsDigest = taskFingerprint(transfer.results);
+      if (transfer.mode === "results") {
+        if (resultIds.size !== channel.deliveredCallIds.size || [...resultIds].some(id => !channel.deliveredCallIds.has(id) || !channel.invocations.has(id))) {
+          throw taskUpdateError("task_update_batch_invalid", "Task update results must exactly cover the current handed-off batch");
+        }
+      } else if (transfer.mode === "replay") {
+        if (updates.state.acknowledgedRevision === updates.state.acceptedRevision) throw taskUpdateError("task_update_no_boundary", "The acknowledged task has no open tool return boundary");
+        if (!updates.lastBatch || updates.lastBatch.fingerprint !== transfer.batchFingerprint || updates.lastBatch.resultsDigest !== resultsDigest) {
+          throw taskUpdateError("task_update_batch_invalid", "Task update replay does not match the last committed result batch");
+        }
+      } else throw taskUpdateError("task_update_batch_invalid", "Invalid task update transfer mode");
+
+      // No promise is resolved until registry, revision, generation, and outcome all commit.
+      const acceptedUpdates = structuredClone(transfer.updates);
+      const acceptedResults = structuredClone(transfer.results);
+      const completions: (() => void)[] = [];
+      const queuedIds = [...channel.queuedCallIds];
+      for (const callId of queuedIds) {
+        const invocation = channel.invocations.get(callId);
+        if (!invocation) continue;
+        const result = this.notExecutedResult("queued_before_update");
+        completions.push(invocation.operationId !== undefined
+          ? channel.nativeOperations.prepareCompletion(invocation.operationId, result, "task-update")
+          : () => invocation.resolve(nativeControlResult("task-update", result)));
+      }
+      if (transfer.mode === "results") {
+        for (const item of acceptedResults) {
+          const invocation = channel.invocations.get(item.callId)!;
+          completions.push(invocation.operationId !== undefined
+            ? channel.nativeOperations.prepareCompletion(invocation.operationId, item.result)
+            : () => invocation.resolve(item.result));
+        }
+      }
+      // Preparation can tick an expired Native lease and revoke this physical capability.
+      if (this.channels.get(token) !== channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability retired before commit");
+      publishTaskOutputVersion(updates.state.acknowledgementDirectory!,
+        updates.state.acceptedRevision + acceptedUpdates.length, updates.state.driverGeneration + 1);
+      channel.authority.capability = environment;
+      channel.authority.registryGeneration += 1;
+      updates.updates.push(...acceptedUpdates);
+      updates.updateBytes += bytes;
+      updates.state.acceptedRevision += acceptedUpdates.length;
+      updates.state.driverGeneration += 1;
+      updates.fences.clear();
+      if (transfer.mode === "results") updates.lastBatch = { fingerprint: transfer.batchFingerprint, resultsDigest };
+      record.outcome = { status: "committed", transferId: transfer.transferId, state: structuredClone(updates.state), batchFingerprint: transfer.batchFingerprint };
+      channel.activityRevision += 1;
+      this.invalidateToolWaiters(channel);
+      this.taskStateChanged(channel);
+      // Queued calls have not crossed the Native execution boundary. Bind a fixed terminal;
+      // previously handed-off calls continue to receive their exact real result below.
+      for (const callId of channel.queuedCallIds.splice(0)) {
+        channel.invocations.delete(callId);
+      }
+      if (transfer.mode === "results") {
+        for (const item of acceptedResults) {
+          channel.deliveredCallIds.delete(item.callId);
+          channel.invocations.delete(item.callId);
+        }
+      }
+      for (const complete of completions) complete();
+      return structuredClone(record.outcome);
+    } catch (error) {
+      if (record.outcome.status === "committed") {
+        this.revokeTrusted(token, errorOf(error));
+        return structuredClone(record.outcome);
+      }
+      // Every validated rejection uses the pre-reserved slot. Late retries cannot commit later.
+      const failure = error instanceof NativeOperationError ? error : taskUpdateError("task_update_invalid", "The task update transfer was rejected");
+      record.outcome = { status: "not_committed", transferId: transfer.transferId, code: failure.code, message: failure.message };
+      return structuredClone(record.outcome);
+    }
+  }
+
+  acknowledgeTaskUpdate(token: string, deliveryId: string, throughRevision: number, contract: "native" | "safe"): TaskUpdateAckResult {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel || channel.completionCommitted || channel.safe?.state === "completed") throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+    if (contract !== (channel.safe ? "safe" : "native")) throw taskUpdateError("task_update_delivery_invalid", "The task update delivery does not belong to this MCP contract");
+    const updates = this.requireTaskUpdates(channel);
+    const result = (): TaskUpdateAckResult => ({ acknowledgedRevision: updates.state.acknowledgedRevision, acceptedRevision: updates.state.acceptedRevision });
+    if (updates.state.finalOutputRevision !== null) return { ...result(), ignored: "final_output_started" };
+    const delivery = updates.deliveries.get(deliveryId);
+    if (!delivery || !isTaskRevision(throughRevision) || throughRevision !== delivery.throughRevision) {
+      throw taskUpdateError("task_update_delivery_invalid", "Task update acknowledgment must exactly match a delivered range");
+    }
+    if (delivery.throughRevision > updates.state.acknowledgedRevision) {
+      if (updates.currentDeliveryId !== deliveryId || delivery.fromRevision !== updates.state.acknowledgedRevision + 1) throw taskUpdateError("task_update_delivery_invalid", "Task update acknowledgment is not consecutive");
+      // Creating an empty immutable marker is the ACK publication point. There are no partial
+      // contents to observe, and synchronous publication precedes every successful ACK reply.
+      // A storage error leaves the ACK head unchanged and cannot produce a successful receipt.
+      closeSync(openSync(taskUpdateAckPath(updates.state.acknowledgementDirectory!, delivery.throughRevision), "wx", 0o600));
+      updates.state.acknowledgedRevision = delivery.throughRevision;
+      updates.currentDeliveryId = undefined;
+      this.taskStateChanged(channel);
+    }
+    const next = this.deliverTaskUpdate(channel);
+    return { ...result(), ...(next ? { taskUpdate: next } : {}) };
+  }
+
+  /** Admission at text observation does not lock output or close the update window. */
+  checkFinalOutputCandidate(token: string, context: TaskUpdateOwnerContext): void {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+    if (!isTaskRevision(context.acknowledgedRevision)) throw taskUpdateError(
+      "task_update_output_unproven", "The final text lacks its observed acknowledgment head");
+    this.assertOutputCandidate(channel, context);
+    if (!this.outputIdle(channel)) throw taskUpdateError("task_update_tools_pending", "Final output cannot start before all tool results and control requests settle");
+  }
+
+  beginFinalOutput(token: string, context: TaskUpdateOwnerContext): TaskOutputReceipt {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+    this.assertOutputCandidate(channel, context);
+    const updates = this.requireTaskUpdates(channel);
+    const previous = updates.outputReceipt ?? updates.completionReceipt;
+    if (previous) return structuredClone(previous);
+    if (!this.outputIdle(channel)) throw taskUpdateError("task_update_tools_pending", "Final output cannot start before all tool results and control requests settle");
+    updates.state.finalOutputRevision = context.taskRevision;
+    updates.outputReceipt = { kind: "output_started", taskRevision: context.taskRevision, driverGeneration: context.expectedDriverGeneration };
+    this.taskStateChanged(channel);
+    return structuredClone(updates.outputReceipt);
+  }
+
+  taskOutputReceipt(token: string): TaskOutputReceipt | undefined {
+    this.prune();
+    const updates = this.channels.get(token)?.taskUpdates ?? this.retiredTaskUpdates.get(token);
+    const receipt = updates?.completionReceipt ?? updates?.outputReceipt;
+    return receipt ? structuredClone(receipt) : undefined;
+  }
+
+  private requireTaskUpdates(channel: TurnChannel): TaskUpdateControl {
+    if (!channel.taskUpdates) throw taskUpdateError("task_update_upgrade_required", "This capability was not created with the task update protocol");
+    return channel.taskUpdates;
+  }
+
+  private assertDriver(channel: TurnChannel, context?: TaskUpdateOwnerContext): void {
+    if (!channel.taskUpdates) return;
+    if (!context || !isTaskRevision(context.expectedDriverGeneration) || !isTaskRevision(context.taskRevision)
+      || context.expectedDriverGeneration !== channel.taskUpdates.state.driverGeneration) {
+      throw taskUpdateError("task_update_driver_stale", "The task update driver generation is missing or stale");
+    }
+  }
+
+  private assertOutputCandidate(channel: TurnChannel, context?: TaskUpdateOwnerContext): void {
+    this.assertDriver(channel, context);
+    if (!channel.taskUpdates) return;
+    const updates = channel.taskUpdates;
+    if (context!.acknowledgedRevision !== undefined && context!.acknowledgedRevision !== context!.taskRevision) {
+      throw taskUpdateError("task_update_unacknowledged", "The final answer was observed before its task revision was acknowledged");
+    }
+    if (updates.state.acknowledgedRevision !== updates.state.acceptedRevision) throw taskUpdateError("task_update_unacknowledged", "The model started or completed a final answer before acknowledging all accepted task updates");
+    if (context!.taskRevision !== updates.state.acceptedRevision
+      || (updates.state.finalOutputRevision !== null && updates.state.finalOutputRevision !== context!.taskRevision)) throw taskUpdateError("task_update_revision_stale", "The final answer candidate belongs to an outdated task revision");
+    if ([...updates.transfers.values()].some(record => record.outcome.status === "unknown")) throw taskUpdateError("task_update_transfer_pending", "The task update transfer must be resolved before final output");
+  }
+
+  private outputIdle(channel: TurnChannel): boolean {
+    return channel.activities.size === 0 && channel.invocations.size === 0 && channel.nativeQueryCount === 0
+      && !channel.nativeOperations.hasOutstanding() && ![...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered);
+  }
+
+  private deliverTaskUpdate(channel: TurnChannel): UpdateDelivery | undefined {
+    const updates = channel.taskUpdates;
+    if (!updates || updates.state.finalOutputRevision !== null || channel.completionCommitted || channel.safe?.state === "completed") return undefined;
+    if (updates.currentDeliveryId) return structuredClone(updates.deliveries.get(updates.currentDeliveryId)!);
+    if (updates.state.acknowledgedRevision === updates.state.acceptedRevision) return undefined;
+    if (updates.deliveries.size >= TASK_UPDATE_DELIVERY_LIMIT) throw taskUpdateError("task_update_resource_limit", "The bounded task update delivery journal is full");
+    const delivery: UpdateDelivery = {
+      protocolVersion: TASK_UPDATE_PROTOCOL_VERSION, deliveryId: opaqueId("delivery"),
+      fromRevision: updates.state.acknowledgedRevision + 1, throughRevision: updates.state.acceptedRevision,
+      updates: structuredClone(updates.updates.filter(update => update.revision > updates.state.acknowledgedRevision)),
+    };
+    updates.deliveries.set(delivery.deliveryId, delivery);
+    updates.currentDeliveryId = delivery.deliveryId;
+    updates.state.deliveredRevision = delivery.throughRevision;
+    this.taskStateChanged(channel);
+    return structuredClone(delivery);
+  }
+
+  private taskStateChanged(channel: TurnChannel): void {
+    const updates = channel.taskUpdates;
+    if (!updates) return;
+    updates.revision += 1;
+    this.resolveSafeWaiters(updates.observers, { revision: updates.revision, state: structuredClone(updates.state) });
+  }
+
+  private notExecutedResult(reason: string): BrokerToolResult {
+    return nativePublicResult({ code: "task_update_not_executed", reason, retryable: false,
+      message: `This Native operation was not executed (${reason}). Read and acknowledge task updates, then use a new operation_id with the current task_revision for any new decision.` }, true);
+  }
+
+  private invalidateToolWaiters(channel: TurnChannel): void {
+    for (const waiter of [...channel.waiters]) {
+      try { this.assertDriver(channel, waiter.context); } catch (error) {
+        channel.waiters.delete(waiter);
+        if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+        waiter.reject(errorOf(error));
+      }
+    }
+  }
+
+  beginCompletionFence(token: string, context?: TaskUpdateOwnerContext): number | undefined {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertOutputCandidate(channel, context);
     if (channel.completionCommitted) return channel.completionRevision;
     if (channel.activities.size > 0
       || channel.invocations.size > 0
       || channel.nativeQueryCount > 0
       || channel.nativeOperations.hasOutstanding()
       || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return undefined;
+    if (channel.taskUpdates && context) {
+      channel.taskUpdates.fences.clear();
+      channel.taskUpdates.fences.set(channel.activityRevision, structuredClone(context));
+    }
     return channel.activityRevision;
   }
 
-  commitCompletionFence(token: string, revision: number): boolean {
+  commitCompletionFence(token: string, revision: number, context?: TaskUpdateOwnerContext): boolean {
     this.prune();
     if (!Number.isSafeInteger(revision) || revision < 0) {
       throw new Error("turn completion fence revision is invalid");
     }
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertOutputCandidate(channel, context);
+    if (channel.taskUpdates && !channel.completionCommitted) {
+      const bound = channel.taskUpdates.fences.get(revision);
+      if (!bound || bound.expectedDriverGeneration !== context?.expectedDriverGeneration || bound.taskRevision !== context?.taskRevision) return false;
+    }
     if (channel.completionCommitted) return channel.completionRevision === revision;
     if (channel.activityRevision !== revision
       || channel.activities.size > 0
@@ -695,6 +1141,12 @@ export class TurnBroker implements TurnBrokerOwner {
       || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return false;
     channel.completionCommitted = true;
     channel.completionRevision = revision;
+    if (channel.taskUpdates) {
+      const updates = channel.taskUpdates;
+      updates.state.finalOutputRevision = context!.taskRevision;
+      updates.completionReceipt = { kind: "completed", taskRevision: context!.taskRevision, driverGeneration: context!.expectedDriverGeneration, fenceRevision: revision };
+      this.taskStateChanged(channel);
+    }
     channel.nativeOperations.retire(new NativeOperationError("codex_tool_operation_retired", "The turn completed"));
     console.info(
       `[chatgpt-web] broker trace=${channel.traceId} committed browser completion revision=${revision}`,
@@ -737,10 +1189,18 @@ export class TurnBroker implements TurnBrokerOwner {
     return remaining;
   }
 
-  requestCompaction(token: string, queuedResult: BrokerToolResult): number {
+  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): number {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.assertDriver(channel, context);
+    if (channel.taskUpdates && channel.taskUpdates.state.finalOutputRevision !== null) {
+      throw taskUpdateError("task_update_final_output_started", "Final answer output excludes new context compaction control");
+    }
+    if (channel.taskUpdates && (channel.taskUpdates.state.acceptedRevision !== channel.taskUpdates.state.acknowledgedRevision
+      || [...channel.taskUpdates.transfers.values()].some(record => record.outcome.status === "unknown"))) {
+      throw taskUpdateError("task_update_pending", "Task updates must be confirmed before context compaction");
+    }
     this.assertSafeHarnessRunning(channel);
     if (channel.compactionRequested) {
       throw new Error("Codex context compaction was already requested for this turn");
@@ -757,7 +1217,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!invocation) continue;
       channel.invocations.delete(callId);
       channel.compactionDeliveryCount += 1;
-      if (invocation.operationId !== undefined) channel.nativeOperations.complete(invocation.operationId, queuedResult, true);
+      if (invocation.operationId !== undefined) channel.nativeOperations.complete(invocation.operationId, queuedResult, "compaction");
       else invocation.resolve(structuredClone(queuedResult));
     }
     if (queued.length > 0) {
@@ -810,6 +1270,7 @@ export class TurnBroker implements TurnBrokerOwner {
   completeSafeTurn(
     requestId: string,
     finalAnswer: string,
+    taskRevision?: number,
   ): { completed: true; duplicate: boolean } {
     this.prune();
     if (typeof finalAnswer !== "string" || finalAnswer.trim().length === 0) {
@@ -819,6 +1280,11 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!channel) throw new Error("Zero Risk request_id is invalid, expired, or revoked");
     const safe = channel.safe;
     if (!safe) throw new Error("request_id is not registered for Zero Risk browser interaction");
+    const updates = channel.taskUpdates;
+    if (updates && (!isTaskRevision(taskRevision ?? (updates.state.acceptedRevision === 0 ? 0 : undefined))
+      || (taskRevision ?? 0) !== updates.state.acceptedRevision || updates.state.acknowledgedRevision !== updates.state.acceptedRevision)) {
+      throw new NativeOperationError("task_update_unacknowledged", "Declare the current acknowledged task_revision before completing the Zero Risk turn", this.deliverTaskUpdate(channel));
+    }
     if (safe.state === "completed") {
       if (safe.finalAnswer !== finalAnswer) {
         throw new Error("Zero Risk turn completion conflicts with the accepted final_answer");
@@ -836,7 +1302,13 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.nativeOperations.hasOutstanding()) {
       throw new Error("Zero Risk turn cannot complete before all Native operation results have been delivered");
     }
+    if (updates && [...updates.transfers.values()].some(record => record.outcome.status === "unknown")) throw taskUpdateError("task_update_transfer_pending", "Resolve the task update transfer before completing the turn");
     safe.state = "completed";
+    if (updates) {
+      updates.state.finalOutputRevision = taskRevision ?? 0;
+      updates.completionReceipt = { kind: "completed", taskRevision: taskRevision ?? 0, driverGeneration: updates.state.driverGeneration };
+      this.taskStateChanged(channel);
+    }
     channel.nativeOperations.retire(new NativeOperationError("codex_tool_operation_retired", "The Zero Risk turn completed"));
     safe.finalAnswer = finalAnswer;
     this.resolveSafeWaiters(safe.completionWaiters, finalAnswer);
@@ -877,7 +1349,14 @@ export class TurnBroker implements TurnBrokerOwner {
     return this.waitForSafeState(safe.completionWaiters, signal, "Zero Risk turn completion wait aborted");
   }
 
-  revoke(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure): void {
+  revoke(token: string, reason = new Error("Codex turn binding was revoked"), context?: TaskUpdateOwnerContext): void {
+    const channel = this.channels.get(token);
+    if (!channel) return;
+    this.assertDriver(channel, context);
+    this.revokeTrusted(token, reason);
+  }
+
+  revokeTrusted(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure): void {
     const channel = this.channels.get(token);
     if (!channel) return;
     console.info(`[chatgpt-web] broker_retired ${JSON.stringify({
@@ -890,6 +1369,24 @@ export class TurnBroker implements TurnBrokerOwner {
       ...(failure ? { failure } : {}),
     })}`);
     this.channels.delete(token);
+    if (channel.taskUpdates) {
+      const updates = channel.taskUpdates;
+      for (const [transferId, record] of updates.transfers) {
+        if (record.outcome.status === "unknown") record.outcome = { status: "not_committed", transferId, code: "codex_tool_operation_retired", message: "The physical capability retired before this transfer committed" };
+      }
+      this.rejectSafeWaiters(updates.observers, reason);
+      // Only recovery receipts survive retirement; user text and delivery payloads are released.
+      updates.updates = [];
+      updates.deliveries.clear();
+      updates.fences.clear();
+      this.retiredTaskUpdates.set(token, updates);
+      while (this.retiredTaskUpdates.size > MAX_RETIRED_TURN_HANDLES) {
+        const oldest = this.retiredTaskUpdates.keys().next().value!;
+        const directory = this.retiredTaskUpdates.get(oldest)?.state.acknowledgementDirectory;
+        if (directory) rmSync(directory, { recursive: true, force: true });
+        this.retiredTaskUpdates.delete(oldest);
+      }
+    }
     this.pending.delete(token);
     clearTimeout(channel.deadlineTimer);
     channel.deadlineTimer = undefined;
@@ -924,7 +1421,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const tokens = [...this.channels]
       .filter(([, channel]) => channel.externalOwner)
       .map(([token]) => token);
-    for (const token of tokens) this.revoke(token);
+    for (const token of tokens) this.revokeTrusted(token);
     return tokens.length;
   }
 
@@ -932,7 +1429,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const tokens = [...this.channels]
       .filter(([, channel]) => channel.traceId === traceId)
       .map(([token]) => token);
-    for (const token of tokens) this.revoke(token, reason);
+    for (const token of tokens) this.revokeTrusted(token, reason);
     return tokens.length;
   }
 
@@ -1047,7 +1544,10 @@ export class TurnBroker implements TurnBrokerOwner {
       // recreate a live endpoint after close has already returned.
       await this.startPromise?.catch(() => {});
       this.compactionTransactions.close();
-      for (const token of [...this.channels.keys()]) this.revoke(token, this.endpointFailure);
+      for (const token of [...this.channels.keys()]) this.revokeTrusted(token, this.endpointFailure);
+      for (const updates of this.retiredTaskUpdates.values()) {
+        if (updates.state.acknowledgementDirectory) rmSync(updates.state.acknowledgementDirectory, { recursive: true, force: true });
+      }
       const server = this.server;
       if (server?.listening) {
         if (!isWindowsPipeEndpoint(this.socketPath)) {
@@ -1191,7 +1691,7 @@ export class TurnBroker implements TurnBrokerOwner {
       this.acceptingExternalOwners = false;
       this.lifecycle("endpoint_unavailable", { reason: error.message, ownedSocket: this.ownedSocket });
       this.compactionTransactions.close();
-      for (const token of [...this.channels.keys()]) this.revoke(token, error);
+      for (const token of [...this.channels.keys()]) this.revokeTrusted(token, error);
       for (const socket of this.sockets) socket.destroy();
     }
     throw this.endpointFailure;
@@ -1454,32 +1954,46 @@ export class TurnBroker implements TurnBrokerOwner {
         this.writeSocketResponse(socket, { id: request?.id ?? "unknown", error: errorOf(error).message });
         return;
       }
+      const controlChannel = request!.method === "task_update_ack" ? this.channels.get(request!.token ?? "") : undefined;
+      let controlSettled = false;
+      const settleControl = () => {
+        if (!controlChannel || controlSettled) return;
+        controlSettled = true;
+        controlChannel.nativeQueryCount -= 1;
+        controlChannel.activityRevision += 1;
+        socket.removeListener("close", settleControl);
+      };
+      if (controlChannel) {
+        controlChannel.nativeQueryCount += 1;
+        controlChannel.activityRevision += 1;
+        socket.once("close", settleControl);
+      }
       void Promise.resolve().then(() => this.dispatch(request!, disconnected.signal)).then(
-        result => this.writeSocketResponse(socket, { id: request!.id, result }),
+        result => this.writeSocketResponse(socket, { id: request!.id, result }, settleControl),
         error => this.writeSocketResponse(socket, {
           id: request!.id,
           error: errorOf(error).message,
           ...(error instanceof TurnBrokerAdmissionError ? { errorKind: "admission_rejected" as const } : {}),
-          ...(error instanceof NativeOperationError ? { errorCode: error.code } : {}),
-        }),
+          ...(error instanceof NativeOperationError ? { errorCode: error.code, ...(error.taskUpdate ? { taskUpdate: error.taskUpdate } : {}) } : {}),
+        }, settleControl),
       );
     });
   }
 
-  private writeSocketResponse(socket: Socket, response: BrokerResponse): void {
+  private writeSocketResponse(socket: Socket, response: BrokerResponse, settled?: () => void): void {
     const line = `${JSON.stringify(response)}\n`;
     if (line.length > MAX_BROKER_LINE_CHARS) {
-      socket.end(`${JSON.stringify({ id: response.id, error: "turn broker response exceeds size limit" } satisfies BrokerResponse)}\n`);
+      socket.end(`${JSON.stringify({ id: response.id, error: "turn broker response exceeds size limit" } satisfies BrokerResponse)}\n`, settled);
       return;
     }
-    socket.end(line);
+    socket.end(line, settled);
   }
 
   private validateRequest(request: BrokerRequest): void {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -1489,6 +2003,65 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error("ChatGPT web turn broker is closed");
     }
     this.prune();
+    if (request.method === "owner_task_update_state") {
+      if (!request.token) throw new Error("turn owner token is required");
+      return { state: this.taskUpdateState(request.token) ?? null };
+    }
+    if (request.method === "owner_task_update_observe") {
+      if (!request.token || request.revision === undefined) throw new Error("Task update owner and revision are required");
+      return this.waitForTaskUpdateState(request.token, request.revision, socketSignal);
+    }
+    if (request.method === "owner_task_update_reserve") {
+      if (!request.token || !request.transferId || !request.payloadDigest || !request.ownerContext) throw new Error("Task update reservation fields are required");
+      return this.reserveTaskUpdate(request.token, request.transferId, request.payloadDigest, request.ownerContext);
+    }
+    if (request.method === "owner_task_update_accept") {
+      if (!request.token || !request.transfer) throw new Error("Task update transfer is required");
+      return this.acceptTaskUpdate(request.token, request.transfer);
+    }
+    if (request.method === "owner_task_update_reject") {
+      if (!request.token || !request.transferId || !request.payloadDigest || !request.ownerContext) throw new Error("Task update reservation fields are required");
+      return this.rejectTaskUpdateReservation(request.token, request.transferId, request.payloadDigest, request.ownerContext, request.rejectionCode);
+    }
+    if (request.method === "owner_task_update_outcome") {
+      if (!request.token || !request.transferId) throw new Error("Task update transfer identity is required");
+      return this.taskUpdateTransferOutcome(request.token, request.transferId);
+    }
+    if (request.method === "owner_final_output_check") {
+      if (!request.token || !request.ownerContext) throw new Error("Final output owner context is required");
+      this.checkFinalOutputCandidate(request.token, request.ownerContext);
+      return { checked: true };
+    }
+    if (request.method === "owner_final_output_begin") {
+      if (!request.token || !request.ownerContext) throw new Error("Final output owner context is required");
+      return this.beginFinalOutput(request.token, request.ownerContext);
+    }
+    if (request.method === "owner_output_receipt") {
+      if (!request.token) throw new Error("Final output owner token is required");
+      return { receipt: this.taskOutputReceipt(request.token) ?? null };
+    }
+    if (request.method === "owner_revoke_trusted") {
+      if (!request.token) throw new Error("turn owner token is required");
+      if (request.cancelled !== undefined && typeof request.cancelled !== "boolean") throw new Error("turn owner cancellation is invalid");
+      this.revokeTrusted(request.token, request.cancelled ? new DOMException("The Native turn was explicitly cancelled", "AbortError") : undefined);
+      return { revoked: true };
+    }
+    if (request.method === "task_update_ack") {
+      if (!request.token) throw taskUpdateError("task_update_delivery_invalid", "A task update capability is required");
+      if (request.taskUpdateProtocol !== TASK_UPDATE_PROTOCOL_VERSION) throw taskUpdateError("task_update_upgrade_required", "The task update acknowledgment protocol is required");
+      if (request.activityId !== undefined) {
+        const channel = this.channels.get(request.token);
+        if (!channel || channel.completionCommitted || channel.safe?.state === "completed") throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
+        if (request.contract !== (channel.safe ? "safe" : "native")) throw taskUpdateError("task_update_delivery_invalid", "The task update delivery does not belong to this MCP contract");
+        if (!/^activity_[A-Za-z0-9_-]{16,128}$/.test(request.activityId)) throw taskUpdateError("task_update_invalid", "Invalid task update activity identity");
+        if (channel.completedActivities.has(request.activityId)) throw taskUpdateError("task_update_activity_completed", "The task update control request was already cleaned up");
+        if (!channel.activities.has(request.activityId)) {
+          channel.activities.add(request.activityId);
+          channel.activityRevision += 1;
+        }
+      }
+      return this.acknowledgeTaskUpdate(request.token, request.deliveryId!, request.throughRevision!, request.contract!);
+    }
     if (request.method === "native_operation_start" || request.method === "native_operation_wait") {
       return this.nativeQuery(request, socketSignal);
     }
@@ -1511,7 +2084,8 @@ export class TurnBroker implements TurnBrokerOwner {
         this.prune();
         channel = this.channels.get(request.token);
       }
-      return this.completeSafeTurn(request.token, request.finalAnswer);
+      if (channel?.taskUpdates && request.taskUpdateProtocol !== TASK_UPDATE_PROTOCOL_VERSION) throw taskUpdateError("task_update_upgrade_required", "The task update completion protocol is required");
+      return this.completeSafeTurn(request.token, request.finalAnswer, request.taskRevision);
     }
     if (request.method === "submit_compaction_handoff") {
       if (typeof request.token !== "string" || request.token.length === 0) {
@@ -1530,6 +2104,7 @@ export class TurnBroker implements TurnBrokerOwner {
       return {
         protocolVersion: TURN_BROKER_PROTOCOL_VERSION,
         nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
+        taskUpdateProtocol: TASK_UPDATE_PROTOCOL_VERSION,
         acceptingExternalOwners: this.acceptingExternalOwners,
         owner: this.ownerId,
       };
@@ -1539,7 +2114,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
-      return this.register(environment, request.ttlMs, request.traceId, true).then(token => ({ token }));
+      return this.register(environment, request.ttlMs, request.traceId, { externalOwner: true, taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined }).then(token => ({ token }));
     }
     if (request.method === "owner_register_safe") {
       const environment = ownerCapability(request.environment);
@@ -1559,12 +2134,13 @@ export class TurnBroker implements TurnBrokerOwner {
         {
           requireSentConfirmation: request.requireSentConfirmation !== false,
           externalOwner: true,
+          taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined,
         },
       ).then(token => ({ token }));
     }
     if (request.method === "owner_update") {
       if (!request.token) throw new Error("turn owner token is required");
-      this.updateEnvironment(request.token, ownerCapability(request.environment));
+      this.updateEnvironment(request.token, ownerCapability(request.environment), request.ownerContext);
       return { updated: true };
     }
     if (request.method === "owner_safe_sent") {
@@ -1574,7 +2150,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_next") {
       if (!request.token) throw new Error("turn owner token is required");
-      return this.nextToolBatch(request.token, socketSignal).then(requests => ({ requests }));
+      return this.nextToolBatch(request.token, socketSignal, request.ownerContext).then(requests => ({ requests }));
     }
     if (request.method === "owner_complete") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -1582,19 +2158,19 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!request.toolResult || !Array.isArray(request.toolResult.content)) {
         throw new Error("turn owner tool result is invalid");
       }
-      this.completeTool(request.token, request.callId, request.toolResult);
+      this.completeTool(request.token, request.callId, request.toolResult, request.ownerContext);
       return { completed: true };
     }
     if (request.method === "owner_completion_fence_begin") {
       if (!request.token) throw new Error("turn owner token is required");
-      return { revision: this.beginCompletionFence(request.token) ?? null };
+      return { revision: this.beginCompletionFence(request.token, request.ownerContext) ?? null };
     }
     if (request.method === "owner_completion_fence_commit") {
       if (!request.token) throw new Error("turn owner token is required");
       if (!Number.isSafeInteger(request.revision) || request.revision! < 0) {
         throw new Error("turn completion fence revision is invalid");
       }
-      return { committed: this.commitCompletionFence(request.token, request.revision!) };
+      return { committed: this.commitCompletionFence(request.token, request.revision!, request.ownerContext) };
     }
     if (request.method === "owner_wait_retirement") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -1604,7 +2180,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_revoke") {
       if (!request.token) throw new Error("turn owner token is required");
-      this.revoke(request.token);
+      this.revoke(request.token, undefined, request.ownerContext);
       return { revoked: true };
     }
     if (request.method === "owner_safe_wait_start") {
@@ -1620,7 +2196,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!request.toolResult || !Array.isArray(request.toolResult.content)) {
         throw new Error("turn owner compaction result is invalid");
       }
-      return { interrupted: this.requestCompaction(request.token, request.toolResult) };
+      return { interrupted: this.requestCompaction(request.token, request.toolResult, request.ownerContext) };
     }
     if (request.method === "owner_compaction_delivery_count") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -1732,13 +2308,14 @@ export class TurnBroker implements TurnBrokerOwner {
     if (request.method === "release") {
       if (request.failure !== undefined) {
         assertRetirementFailure(request.failure);
-        this.revoke(binding.token, chatGptToolTimeoutError(request.failure.tool, request.failure.timeoutMs), request.failure);
+        this.revokeTrusted(binding.token, chatGptToolTimeoutError(request.failure.tool, request.failure.timeoutMs), request.failure);
       } else {
-        this.revoke(binding.token);
+        this.revokeTrusted(binding.token);
       }
       return { released: true };
     }
     if (request.method === "resolve") return { environment: turnSnapshot(binding.channel) };
+    if (binding.channel.taskUpdates) throw taskUpdateError("task_update_revision_required", "Use the versioned Native operation start protocol for this capability");
     this.assertSafeHarnessRunning(binding.channel);
     if (binding.channel.compactionRequested) {
       const result = binding.channel.compactionResult;
@@ -1877,10 +2454,13 @@ export class TurnBroker implements TurnBrokerOwner {
           || !request.nativeInput || typeof request.nativeInput !== "object" || Array.isArray(request.nativeInput)) {
           throw new NativeOperationError("codex_tool_admission_rejected", "A valid Native entry and its arguments are required");
         }
+        if (channel.taskUpdates && (request.taskUpdateProtocol !== TASK_UPDATE_PROTOCOL_VERSION || !isTaskRevision(request.taskRevision))) {
+          throw taskUpdateError("task_update_revision_required", "Declare a nonnegative safe integer task_revision on every Native start, including initial revision 0");
+        }
         const started = channel.nativeOperations.start(operationId, request.entry, request.nativeInput, normalized => {
           if (channel.compactionRequested) {
             if (!channel.compactionResult) throw new Error("Compaction control result is unavailable");
-            return { result: structuredClone(channel.compactionResult), control: true };
+            return { result: structuredClone(channel.compactionResult), control: "compaction" };
           }
           const plan = planNativeTool(request.entry!, normalized, turnSnapshot(channel), request.contract!);
           if ("result" in plan) return plan;
@@ -1896,8 +2476,15 @@ export class TurnBroker implements TurnBrokerOwner {
             request: { callId: opaqueId("call"), wireName, freeform: plan.tool.freeform === true, ...plan.payload },
             resultContract: plan.resultContract,
           };
+        }, channel.taskUpdates ? request.taskRevision : undefined, () => {
+          if (!channel.taskUpdates) return undefined;
+          const state = channel.taskUpdates.state;
+          const reason = state.finalOutputRevision !== null ? "final_output_started"
+            : request.taskRevision !== state.acceptedRevision ? "revision_mismatch"
+            : state.acknowledgedRevision !== state.acceptedRevision ? "unacknowledged" : undefined;
+          return reason ? { result: this.notExecutedResult(reason), control: "task-update" } : undefined;
         });
-        if (started.created && channel.compactionRequested) channel.compactionDeliveryCount += 1;
+        if (started.created && started.control === "compaction") channel.compactionDeliveryCount += 1;
         if (started.request) {
           const toolRequest = started.request;
           channel.invocations.set(toolRequest.callId, {
@@ -1913,7 +2500,8 @@ export class TurnBroker implements TurnBrokerOwner {
       const reply = await channel.nativeOperations.wait(operationId, socketSignal, request.waitMs ?? 30_000);
       this.prune();
       if (!this.channels.has(token)) throw new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached");
-      return reply;
+      const taskUpdate = this.deliverTaskUpdate(channel);
+      return { ...reply, ...(taskUpdate ? { taskUpdate } : {}) };
     } finally {
       channel.nativeQueryCount -= 1;
       channel.activityRevision += 1;
@@ -2003,6 +2591,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private wakeToolWaiters(channel: TurnChannel): void {
+    this.invalidateToolWaiters(channel);
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     const batch = this.takeQueued(channel);
     this.logToolDelivery(channel, batch, "waiter");
@@ -2039,7 +2628,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const now = Date.now();
     for (const [token, channel] of this.channels) {
       if (channel.authority.expiresAt === undefined || channel.authority.expiresAt > now) continue;
-      this.revoke(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
+      this.revokeTrusted(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
     }
   }
 }
@@ -2096,7 +2685,7 @@ export async function callTurnBroker<T>(
       clearTimeout(timer);
       cleanup();
       if (response.error) {
-        rejectCall(response.errorCode ? new NativeOperationError(response.errorCode, response.error)
+        rejectCall(response.errorCode ? new NativeOperationError(response.errorCode, response.error, response.taskUpdate)
           : response.errorKind === "admission_rejected"
           ? new TurnBrokerAdmissionError(response.error)
           : new Error(response.error));
@@ -2186,10 +2775,11 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
-  async register(environment: ChatGptTurnCapability, ttlMs?: number, traceId = "unknown"): Promise<string> {
+  async register(environment: ChatGptTurnCapability, ttlMs?: number, traceId = "unknown", options: TaskUpdateRegistrationOptions = {}): Promise<string> {
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
       method: "owner_register",
       environment,
+      taskUpdateProtocol: options.taskUpdateProtocol,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
     });
@@ -2204,7 +2794,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
-    options: { requireSentConfirmation?: boolean } = {},
+    options: { requireSentConfirmation?: boolean } & TaskUpdateRegistrationOptions = {},
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
@@ -2212,6 +2802,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
       environment,
       surfaceNonce,
       requireSentConfirmation: options.requireSentConfirmation !== false,
+      taskUpdateProtocol: options.taskUpdateProtocol,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
     });
@@ -2221,8 +2812,8 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.token;
   }
 
-  async updateEnvironment(token: string, environment: ChatGptTurnCapability): Promise<void> {
-    await callTurnBroker(this.socketPath, { method: "owner_update", token, environment });
+  async updateEnvironment(token: string, environment: ChatGptTurnCapability, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_update", token, environment, ownerContext: context });
   }
 
   async confirmSafeTurnSent(
@@ -2240,10 +2831,10 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return { confirmed: true, duplicate: response.duplicate };
   }
 
-  async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
+  async nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]> {
     const response = await callTurnBroker<{ requests?: unknown }>(
       this.socketPath,
-      { method: "owner_next", token },
+      { method: "owner_next", token, ownerContext: context },
       null,
       signal,
     );
@@ -2259,12 +2850,13 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.requests as BrokerToolRequest[];
   }
 
-  async completeTool(token: string, callId: string, result: BrokerToolResult): Promise<void> {
+  async completeTool(token: string, callId: string, result: BrokerToolResult, context?: TaskUpdateOwnerContext): Promise<void> {
     await callTurnBroker(this.socketPath, {
       method: "owner_complete",
       token,
       callId,
       toolResult: result,
+      ownerContext: context,
     }, null);
   }
 
@@ -2291,11 +2883,12 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.finalAnswer;
   }
 
-  async requestCompaction(token: string, queuedResult: BrokerToolResult): Promise<number> {
+  async requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): Promise<number> {
     const response = await callTurnBroker<{ interrupted?: unknown }>(this.socketPath, {
       method: "owner_request_compaction",
       token,
       toolResult: queuedResult,
+      ownerContext: context,
     }, null);
     if (!Number.isSafeInteger(response.interrupted) || Number(response.interrupted) < 0) {
       throw new Error("DEV Zero Risk turn owner received an invalid compaction interrupt count");
@@ -2314,10 +2907,11 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return Number(response.count);
   }
 
-  async beginCompletionFence(token: string): Promise<number | undefined> {
+  async beginCompletionFence(token: string, context?: TaskUpdateOwnerContext): Promise<number | undefined> {
     const response = await callTurnBroker<{ revision?: unknown }>(this.socketPath, {
       method: "owner_completion_fence_begin",
       token,
+      ownerContext: context,
     });
     if (response.revision === null) return undefined;
     if (!Number.isSafeInteger(response.revision) || (response.revision as number) < 0) {
@@ -2326,11 +2920,12 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.revision as number;
   }
 
-  async commitCompletionFence(token: string, revision: number): Promise<boolean> {
+  async commitCompletionFence(token: string, revision: number, context?: TaskUpdateOwnerContext): Promise<boolean> {
     const response = await callTurnBroker<{ committed?: unknown }>(this.socketPath, {
       method: "owner_completion_fence_commit",
       token,
       revision,
+      ownerContext: context,
     });
     if (typeof response.committed !== "boolean") {
       throw new Error("DEV turn owner received an invalid completion fence result");
@@ -2350,7 +2945,49 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.failure;
   }
 
-  async revoke(token: string, _reason?: Error): Promise<void> {
-    await callTurnBroker(this.socketPath, { method: "owner_revoke", token });
+  async revoke(token: string, _reason?: Error, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_revoke", token, ownerContext: context });
+  }
+
+  async revokeTrusted(token: string, reason?: Error): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_revoke_trusted", token, cancelled: reason?.name === "AbortError" });
+  }
+
+  async taskUpdateState(token: string): Promise<TaskUpdateState | undefined> {
+    const response = await callTurnBroker<{ state: TaskUpdateState | null }>(this.socketPath, { method: "owner_task_update_state", token });
+    return response.state ?? undefined;
+  }
+
+  waitForTaskUpdateState(token: string, afterRevision: number, signal?: AbortSignal): Promise<TaskUpdateStateSnapshot> {
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_observe", token, revision: afterRevision }, null, signal);
+  }
+
+  reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): Promise<TaskUpdateTransferOutcome> {
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_reserve", token, transferId, payloadDigest, ownerContext: context });
+  }
+
+  acceptTaskUpdate(token: string, transfer: TaskUpdateTransfer): Promise<TaskUpdateTransferOutcome> {
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_accept", token, transfer }, null);
+  }
+
+  rejectTaskUpdateReservation(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, code?: string): Promise<TaskUpdateTransferOutcome> {
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_reject", token, transferId, payloadDigest, ownerContext: context, rejectionCode: code });
+  }
+
+  taskUpdateTransferOutcome(token: string, transferId: string): Promise<TaskUpdateTransferOutcome> {
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_outcome", token, transferId });
+  }
+
+  async checkFinalOutputCandidate(token: string, context: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_final_output_check", token, ownerContext: context });
+  }
+
+  beginFinalOutput(token: string, context: TaskUpdateOwnerContext): Promise<TaskOutputReceipt> {
+    return callTurnBroker(this.socketPath, { method: "owner_final_output_begin", token, ownerContext: context });
+  }
+
+  async taskOutputReceipt(token: string): Promise<TaskOutputReceipt | undefined> {
+    const response = await callTurnBroker<{ receipt: TaskOutputReceipt | null }>(this.socketPath, { method: "owner_output_receipt", token });
+    return response.receipt ?? undefined;
   }
 }

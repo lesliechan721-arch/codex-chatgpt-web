@@ -20,6 +20,7 @@ import type { ChatGptBrowserOutcome, ChatGptTurnSession } from "./turn-execution
 import type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import { continuityError } from "./continuity-errors";
+import { taskUpdateSourceError } from "./task-update-source";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -221,25 +222,33 @@ export async function settleActiveCompactionSource(
       throw new Error("The active ChatGPT compaction source has no MCP tool boundary");
     }
     const outstanding = source.outstanding();
+    if (source.hasPendingTaskUpdate()) throw taskUpdateSourceError("task_update_pending", "Resolve the task update transfer before starting compaction.");
+    const driverContext = source.taskUpdatesEnabled() ? source.taskUpdateOwnerContext() : undefined;
     const results = parsed._conversationPolicy === "continuity-first"
       ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
-      : currentToolResults(parsed, source);
+      : source.taskUpdatesEnabled()
+        ? new Map(source.acceptTaskUpdateToolResults(parsed).map(message => [message.toolCallId, message]))
+        : currentToolResults(parsed, source);
     if (results.size !== outstanding.length) {
       throw new Error(
         `Codex supplied ${results.size} of ${outstanding.length} required tool results for compaction`,
       );
     }
     let token: string | undefined;
+    let compactionAccepted = false;
     try {
       token = await source.runtime.token;
-      broker.requestCompaction(token, interruptedByActiveCompaction());
+      await broker.requestCompaction(token, interruptedByActiveCompaction(), driverContext);
+      compactionAccepted = true;
       for (const request of outstanding) {
         const result = results.get(request.callId)!;
         await broker.completeTool(
           token,
           request.callId,
           toolResult(result),
+          driverContext,
         );
+        if (driverContext) source.assertDriverGeneration(driverContext.expectedDriverGeneration);
         source.runtime.externalProgress.recordToolResult();
         onProgress?.();
         source.markResultDelivered(request.callId);
@@ -260,7 +269,7 @@ export async function settleActiveCompactionSource(
       if (signal?.aborted) source.cancel(abortReason(signal));
       throw error;
     } finally {
-      if (token) await broker.revoke(token);
+      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext);
     }
   };
   return alreadyExclusive ? settle() : source.runExclusive(settle);
@@ -291,21 +300,28 @@ export async function settleActiveZeroRiskCompactionSource(
       throw new Error("The active Zero Risk compaction source has no manual MCP tool boundary");
     }
     const outstanding = source.outstanding();
+    if (source.hasPendingTaskUpdate()) throw taskUpdateSourceError("task_update_pending", "Resolve the task update transfer before starting compaction.");
+    const driverContext = source.taskUpdatesEnabled() ? source.taskUpdateOwnerContext() : undefined;
     const results = parsed._conversationPolicy === "continuity-first"
       ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
-      : currentToolResults(parsed, source);
+      : source.taskUpdatesEnabled()
+        ? new Map(source.acceptTaskUpdateToolResults(parsed).map(message => [message.toolCallId, message]))
+        : currentToolResults(parsed, source);
     if (results.size !== outstanding.length) {
       throw new Error(
         `Codex supplied ${results.size} of ${outstanding.length} required tool results for Zero Risk compaction`,
       );
     }
     let token: string | undefined;
+    let compactionAccepted = false;
     try {
       token = await source.runtime.token;
       const interruptedQueued = await broker.requestCompaction(
         token,
         interruptedByZeroRiskCompaction(compactPrompt),
+        driverContext,
       );
+      compactionAccepted = true;
       for (const [index, request] of outstanding.entries()) {
         const result = results.get(request.callId)!;
         const canonical = toolResult(result);
@@ -315,7 +331,9 @@ export async function settleActiveZeroRiskCompactionSource(
           interruptedQueued === 0 && index === outstanding.length - 1
             ? withZeroRiskCompactionInstruction(canonical, compactPrompt)
             : canonical,
+          driverContext,
         );
+        if (driverContext) source.assertDriverGeneration(driverContext.expectedDriverGeneration);
         source.runtime.externalProgress.recordToolResult();
         onProgress?.();
         source.markResultDelivered(request.callId);
@@ -336,7 +354,7 @@ export async function settleActiveZeroRiskCompactionSource(
       if (signal?.aborted) source.cancel(abortReason(signal));
       throw error;
     } finally {
-      if (token) await broker.revoke(token);
+      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext);
     }
   };
   return alreadyExclusive ? settle() : source.runExclusive(settle);

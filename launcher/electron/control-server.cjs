@@ -288,7 +288,7 @@ class BrowserControlServer {
           }
           if (observed.status === "timeout") {
             writeJson(response, 408, {
-              error: "Codex Zero Risk2 did not receive its required confirmation within the allowed time",
+              error: "Codex Zero Risk3 did not receive its required confirmation within the allowed time",
               code: "manual_turn_timed_out",
             });
             return;

@@ -1,13 +1,14 @@
 import { expect, spyOn, test } from "bun:test";
 import { fstatSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type ListenOptions } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listenOnUnixBrokerSocket } from "../src/adapters/chatgpt-web/turn-broker-unix";
 
 const unixTest = process.platform === "win32" ? test.skip : test;
 
 unixTest("fd-only listener is private, close-on-exec, and closes its descriptor without unlink", async () => {
-  const root = mkdtempSync("/tmp/cgw-unix-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-unix-"));
   const path = join(root, "broker.sock");
   const server = createServer();
   const originalListen = server.listen.bind(server);
@@ -42,7 +43,7 @@ unixTest("fd-only listener is private, close-on-exec, and closes its descriptor 
 
 for (const asynchronous of [false, true]) {
 unixTest(`failed fd adoption releases the descriptor without a pathname fallback (async: ${asynchronous})`, async () => {
-  const root = mkdtempSync("/tmp/cgw-unix-failed-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-unix-failed-"));
   const path = join(root, "broker.sock");
   const server = createServer();
   const failure = new Error("injected fd adoption failure");
@@ -71,7 +72,7 @@ unixTest(`failed fd adoption releases the descriptor without a pathname fallback
 }
 
 unixTest("binding a used Unix path preserves its listener and reports the native errno", async () => {
-  const root = mkdtempSync("/tmp/cgw-unix-used-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-unix-used-"));
   const path = join(root, "broker.sock");
   const owner = createServer(socket => socket.end("owner alive"));
   const contender = createServer();

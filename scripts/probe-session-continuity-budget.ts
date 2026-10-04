@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 // P0 only: real Codex, a private catalog, and short requests to a loopback model stub.
@@ -10,7 +11,7 @@ const args = process.argv.slice(2);
 const option = (name: string) => args.find(value => value.startsWith(`${name}=`))?.slice(name.length + 1);
 const codex = realpathSync(resolve(option("--codex") ?? Bun.which("codex")!));
 const output = resolve(option("--output") ?? "output/session-continuity-p0/budget.json");
-const root = mkdtempSync("/tmp/continuity-budget-");
+const root = mkdtempSync(join(tmpdir(), "continuity-budget-"));
 const bootstrapHome = join(root, "bootstrap");
 mkdirSync(bootstrapHome);
 const isolatedEnv = { ...process.env, CODEX_HOME: bootstrapHome, OPENAI_API_KEY: "p0-loopback-only" };

@@ -1099,8 +1099,8 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   let config = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: true };
   const runtimeHost = {
     currentOperation: () => null,
-    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native3",
-    setupConnectorName: () => "Codex Native3", mcpCredentialsConfigured: () => true,
+    runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native4",
+    setupConnectorName: () => "Codex Native4", mcpCredentialsConfigured: () => true,
     toolAuthorityControl: mode => ({ effectiveMode: mode ?? "verified-environment", forced: false, source: null }),
     setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
   };
@@ -1174,7 +1174,7 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
       }
       for (const [mode, configured, enabled] of [["automatic", true, false], ["automatic", true, true], ["manual", true, true], ["automatic", false, false]]) {
         const tree = render({ copy, devProfile: false, language, configureInteractionMode() {}, setError() {},
-          snapshot: { toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null }, connectorNames: { automatic: "Codex Native3", manual: "Codex Zero Risk2" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, [property]: enabled } },
+          snapshot: { toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null }, connectorNames: { automatic: "Codex Native4", manual: "Codex Zero Risk3" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, [property]: enabled } },
           updateState: value => { saved = value; },
         });
         const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy[label]);
@@ -1262,7 +1262,7 @@ test("plugin rename invalidates verification only after success and rejects acti
     runtimeHost: {
       setConnectorNameSuffix: async () => { calls++; if (fail) throw new Error("setup failed"); return { changed: true }; },
       browserConnectorName: () => "Codex Work",
-      setupConnectorName: mode => mode === "manual" ? "Codex Zero Risk2" : "Codex Work",
+      setupConnectorName: mode => mode === "manual" ? "Codex Zero Risk3" : "Codex Work",
       runtimeConfigSnapshot: () => ({ config: { appName: "Codex Work" } }),
     },
     stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
@@ -1280,11 +1280,11 @@ test("plugin rename invalidates verification only after success and rejects acti
   assert.equal(state.mcpSetupComplete, false);
   assert.equal(state.mcpGuideStep, 2);
   assert.equal(events[0].channel, "launcher:connector-names-changed");
-  assert.equal(events[0].body.connectorNames.manual, "Codex Zero Risk2");
+  assert.equal(events[0].body.connectorNames.manual, "Codex Zero Risk3");
   assert.equal(events[1].channel, "launcher:state-changed");
 });
 
-test("plugin name editor fixes Codex and edits Native3 before asking to reconfigure", async () => {
+test("plugin name editor fixes Codex and edits Native4 before asking to reconfigure", async () => {
   const ts = require("typescript");
   const vm = require("node:vm");
   const transpile = (source, fileName) => ts.transpileModule(source, {
@@ -1310,7 +1310,7 @@ test("plugin name editor fixes Codex and edits Native3 before asking to reconfig
     ? [tree, ...visit(tree.children ?? [])] : [];
   const render = () => { cursor = 0; return visit(sandbox.render({ copy, devProfile: false, language: "en",
     snapshot: {
-      connectorNames: { automatic: "Codex Native3", manual: "Codex Zero Risk2" },
+      connectorNames: { automatic: "Codex Native4", manual: "Codex Zero Risk3" },
       toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null },
       state: { browserInteractionMode: "automatic", coreSetupComplete: true, toolAuthorityMode: "verified-environment" },
     },
@@ -1321,7 +1321,7 @@ test("plugin name editor fixes Codex and edits Native3 before asking to reconfig
   const group = nodes.find(node => node.props.className === "plugin-name-input");
   assert.ok(visit(group).some(node => node.type === "span" && node.children[0] === "Codex"));
   const input = visit(group).find(node => node.type === "input");
-  assert.equal(input.props.value, "Native3");
+  assert.equal(input.props.value, "Native4");
   input.props.onChange({ target: { value: "Work" } });
   nodes = render();
   assert.ok(nodes.some(node => node.type === "code" && node.children[0] === "Codex Work"));

@@ -1,5 +1,7 @@
+import { isAbsolute } from "node:path";
 import { NATIVE_WAIT_LEASE_MS } from "./native-tool-wait-protocol";
 import type { NativeWaitingSnapshot } from "./native-tool-operations";
+import { isTaskRevision, type TaskUpdateState } from "./task-update-protocol";
 
 /** This evidence is recorded from an authorized Broker observation, not model-authored text. */
 interface NativeWaitingEvidence {
@@ -16,6 +18,8 @@ export interface ChatGptExternalTurnProgressSnapshot {
   activeToolCalls: number;
   lastProgressAt?: number;
   nativeWaiting?: NativeWaitingEvidence;
+  /** Authoritative Broker control state; its changes do not prove Native business progress. */
+  taskUpdates?: TaskUpdateState;
 }
 
 interface ProgressWaiter {
@@ -103,6 +107,7 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
   private lastProgressAt?: number;
   private nativeWaitingRevision = 0;
   private nativeWaiting?: NativeWaitingEvidence;
+  private taskUpdates?: TaskUpdateState;
   private retirementError?: Error;
   private readonly toolBatchObservationWaiters = new Set<ToolBatchObservationWaiter>();
 
@@ -113,6 +118,7 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
       activeToolCalls: this.activeToolCalls,
       ...(this.lastProgressAt !== undefined ? { lastProgressAt: this.lastProgressAt } : {}),
       ...(this.nativeWaiting ? { nativeWaiting: { ...this.nativeWaiting } } : {}),
+      ...(this.taskUpdates ? { taskUpdates: { ...this.taskUpdates } } : {}),
     };
   }
 
@@ -145,6 +151,18 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
     // Waiting changes transport state only. It must not invent a tool batch or business progress.
     this.revision += 1;
     this.notify(this.snapshot());
+  }
+
+  /** Mirrors an owner-authorized Broker snapshot without creating a tool boundary or renewing work. */
+  recordTaskUpdateState(state: TaskUpdateState): boolean {
+    this.assertNotRetired();
+    assertChatGptTaskUpdateState(state);
+    assertTaskUpdateStateDoesNotRegress(this.taskUpdates, state);
+    if (this.taskUpdates && taskUpdateStatesEqual(this.taskUpdates, state)) return false;
+    this.taskUpdates = { ...state };
+    this.revision += 1;
+    this.notify(this.snapshot());
+    return true;
   }
 
   async acknowledgeToolBatch(revision: number): Promise<void> {
@@ -260,7 +278,11 @@ export class ChatGptMirroredTurnProgress extends ChatGptTurnProgressBroadcaster 
   }
 
   snapshot(): ChatGptExternalTurnProgressSnapshot {
-    return { ...this.current, ...(this.current.nativeWaiting ? { nativeWaiting: { ...this.current.nativeWaiting } } : {}) };
+    return {
+      ...this.current,
+      ...(this.current.nativeWaiting ? { nativeWaiting: { ...this.current.nativeWaiting } } : {}),
+      ...(this.current.taskUpdates ? { taskUpdates: { ...this.current.taskUpdates } } : {}),
+    };
   }
 
   async acknowledgeToolBatch(revision: number): Promise<void> {
@@ -278,6 +300,7 @@ export class ChatGptMirroredTurnProgress extends ChatGptTurnProgressBroadcaster 
   apply(next: ChatGptExternalTurnProgressSnapshot): boolean {
     assertChatGptTurnProgressSnapshot(next);
     if (next.revision <= this.current.revision) return false;
+    assertTaskUpdateStateDoesNotRegress(this.current.taskUpdates, next.taskUpdates);
     // A frame that advances the revision must not contradict what it already reported: the
     // recorder only ever moves these forward, so a regression means a corrupt or forged frame
     // rather than an ordering artefact, and accepting it would desynchronise observed liveness.
@@ -293,7 +316,11 @@ export class ChatGptMirroredTurnProgress extends ChatGptTurnProgressBroadcaster 
         && next.lastProgressAt < this.current.lastProgressAt)) {
       throw new Error("ChatGPT external progress snapshot regressed against the observed state");
     }
-    this.current = { ...next, ...(next.nativeWaiting ? { nativeWaiting: { ...next.nativeWaiting } } : {}) };
+    this.current = {
+      ...next,
+      ...(next.nativeWaiting ? { nativeWaiting: { ...next.nativeWaiting } } : {}),
+      ...(next.taskUpdates ? { taskUpdates: { ...next.taskUpdates } } : {}),
+    };
     this.notify(this.snapshot());
     return true;
   }
@@ -311,15 +338,46 @@ export function assertChatGptTurnProgressSnapshot(
     || (value.lastProgressAt !== undefined && !Number.isFinite(value.lastProgressAt))
     // Any recorded activity stamps a timestamp, so a frame claiming progress without one is
     // malformed and would otherwise report liveness the daemon never observed.
-    || (value.revision > 0 && value.lastProgressAt === undefined && value.nativeWaiting === undefined)) {
+    || (value.revision > 0 && value.lastProgressAt === undefined && value.nativeWaiting === undefined
+      && value.taskUpdates === undefined)) {
     throw new Error("ChatGPT external progress snapshot is invalid");
   }
   const waiting = value.nativeWaiting;
+  if (value.taskUpdates !== undefined) assertChatGptTaskUpdateState(value.taskUpdates);
   if (waiting && (!finiteIndex(waiting.sourceRevision) || waiting.sourceRevision === 0
     || !finiteIndex(waiting.activeOperations) || !finiteIndex(waiting.unreadResults)
     || !Number.isFinite(waiting.observedAt) || !Number.isFinite(waiting.expiresAt)
     || waiting.expiresAt < waiting.observedAt || waiting.expiresAt - waiting.observedAt > NATIVE_WAIT_LEASE_MS)) {
     throw new Error("ChatGPT Native waiting evidence is invalid");
+  }
+}
+
+export function assertChatGptTaskUpdateState(state: TaskUpdateState): void {
+  if (!state || (state.acknowledgementDirectory !== undefined && (typeof state.acknowledgementDirectory !== "string" || !isAbsolute(state.acknowledgementDirectory))) || !isTaskRevision(state.acceptedRevision) || !isTaskRevision(state.deliveredRevision)
+    || !isTaskRevision(state.acknowledgedRevision) || !isTaskRevision(state.driverGeneration)
+    || state.acknowledgedRevision > state.deliveredRevision
+    || state.deliveredRevision > state.acceptedRevision
+    || (state.finalOutputRevision !== null && (!isTaskRevision(state.finalOutputRevision)
+      || state.finalOutputRevision !== state.acceptedRevision
+      || state.finalOutputRevision !== state.acknowledgedRevision))) {
+    throw new Error("ChatGPT task update state is invalid");
+  }
+}
+
+function taskUpdateStatesEqual(a: TaskUpdateState, b: TaskUpdateState): boolean {
+  return a.acknowledgementDirectory === b.acknowledgementDirectory && a.acceptedRevision === b.acceptedRevision && a.deliveredRevision === b.deliveredRevision
+    && a.acknowledgedRevision === b.acknowledgedRevision && a.driverGeneration === b.driverGeneration
+    && a.finalOutputRevision === b.finalOutputRevision;
+}
+
+function assertTaskUpdateStateDoesNotRegress(previous: TaskUpdateState | undefined, next: TaskUpdateState | undefined): void {
+  if (!previous) return;
+  if (!next || next.acknowledgementDirectory !== previous.acknowledgementDirectory || next.acceptedRevision < previous.acceptedRevision
+    || next.deliveredRevision < previous.deliveredRevision
+    || next.acknowledgedRevision < previous.acknowledgedRevision
+    || next.driverGeneration < previous.driverGeneration
+    || (previous.finalOutputRevision !== null && !taskUpdateStatesEqual(previous, next))) {
+    throw new Error("ChatGPT task update state regressed against the observed state");
   }
 }
 

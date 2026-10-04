@@ -97,6 +97,81 @@ This separation preserves long human waits with a live consumer while still recl
 turns. Polling has tool-call, context, and response-latency costs; increasing a transport timeout or
 renaming polling as business progress would not preserve the same failure boundaries.
 
+## User updates during tool work
+
+New compatible Full Native Automatic and started Zero Risk runtimes negotiate `task-updates-v1`.
+The Adapter may retain one physical ChatGPT response when the same native thread and turn append
+trusted plain user text without changing prior instructions, environment, model, options, or
+permissions. The prior Responses round must have journaled its complete real tool batch,
+`done(tool_use, endTurn:false)`, and source observation proof before sending the batch to the
+HTTP observer. An exact reconnect replays that same source round. A known outstanding or
+handed-off batch lacking its source proof fails with `task_update_source_unproven`.
+With no current batch, raw results must exactly match accepted historical results before
+fallback is allowed; unknown or changed results fail before retiring the existing owner.
+Pure text work, changed instructions, unsupported source shapes, continuity-first work, and
+initial Zero Risk requests awaiting Sent use their existing behavior.
+
+The Broker tracks accepted, delivered, and acknowledged revisions independently, beginning at 0.
+Each appended user item has a stable source ID; equal text in different items remains distinct.
+An owner-only transfer binds its ID to the exact updates, registry, and original result batch.
+Reservation precedes the short Session preparation barrier; atomic acceptance installs the new
+revision and driver generation before waking real result promises. Outcomes are immutable:
+`committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
+same transfer. A timeout or absent lookup is not evidence that it failed to commit.
+
+Native query replies retain their original `pending` or `result` plus a separate `taskUpdate`
+delivery. With a delivery, MCP presents a visible fixed control block and a structured envelope:
+`native_result` preserves the complete original public result; `task_update` comes only from the
+Broker. Text, images, resources, `structuredContent`, `_meta`, and error semantics are preserved.
+No update is stored in the Native result cache or sent through the browser composer.
+
+Apply delivered updates in order, then call `codex_task_update_ack` with the same capability,
+`delivery_id`, and `through_revision`. One immutable delivery is outstanding at a time; retries
+return it unchanged. A further append during the ACK gap stays queued and can be delivered in
+that ACK response. Without a new real batch, an append after the gap closes uses the existing
+replacement path. ACK is confirmation, not Native execution or extra business progress.
+
+Every Native start on a negotiated capability declares a nonnegative safe integer `task_revision`,
+initially 0. That revision joins the bound start fingerprint and is removed from Native arguments.
+An identical ID retry replays its original outcome before current-version admission. A new ID
+requires `task_revision === acceptedRevision === acknowledgedRevision` and no final output lock;
+otherwise it caches `task_update_not_executed` with zero Native dispatches. Previously handed-off
+calls keep their real results. Old queued calls are intercepted rather than executed after ACK.
+`codex_tool_wait` uses the original ID and does not declare a new task revision.
+
+All owner writes and waiter delivery capture `expectedDriverGeneration` and check it at the actual
+Broker mutation, including Remote IPC. Session generation checks also run after asynchronous
+owner calls. A superseded active observer ends with `incomplete(task_update_handoff)`; an already
+completed source round keeps its terminal journal. Late observer cancellation cannot revoke the
+new driver. Trusted user stop remains a separate physical cancellation operation.
+
+The first nonempty final-answer delta locks its captured acknowledged version. Commentary and
+reasoning do not lock it. A strict buffered answer or worker-first completion may lock inside
+the completion CAS before text is sent; sending then reuses that immutable receipt. Candidates
+are never upgraded to a later head. Automatic unacknowledged final output fails explicitly;
+Zero Risk completion requires the acknowledged revision after an update and can return the
+pending delivery on refusal. Its initial revision 0 remains the compatible default. After the
+lock, appends use the existing replacement path and late ACKs cannot change the answer.
+Compaction refuses unresolved updates or prepared transfers and requires the latest exact source.
+
+An exact Automatic reconnect can finish its own incomplete round after the browser has completed
+and the capability has retired. This is a read-only recovery: the accepted request, current task
+revision, driver generation, output-owning round, and completed receipt must agree, with no cancellation,
+supersession, prepared transfer, or outstanding tools. Strict buffered candidates retain their original admission
+evidence on the round and remain subject to JSON/schema validation. Recovery journals the answer
+and terminal events before sending them; subsequent retries replay that journal. It does not renew
+tool authority, update the registry, or create another browser submission.
+Another accepted round with the same task version cannot inherit these events. A delayed output-start
+reply cannot replace a completed receipt that was committed while that reply was in flight.
+Once final text is consumed or an output receipt exists, another round cannot rebind that answer,
+including before the browser outcome settles. While strict text is only buffered and no output
+receipt exists, the owning round can still finish a real Native tool batch. Its ordinary result
+round may continue the same execution only with the complete raw results and the owning source
+round's recorded tool boundary; it inherits the buffered candidates' original admission evidence.
+An old result boundary cannot transfer ownership again. Rejecting a non-owning round can journal its own
+error, but cannot cancel or retire the owning execution. A newly committed task update may still
+bind its new revision/generation while strict text is buffered and no final-output lock exists.
+
 ## Compaction, retirement, and completion
 
 The retained-compaction boundary is the Broker handoff, not the later emission of the Native batch.
@@ -130,16 +205,43 @@ The implementation bounds resources per capability:
 | Active queries / waiters | 64 |
 | Start description and finalizer context | 8 MiB per operation; 64 MiB total |
 | Public results | 16 MiB each; 64 MiB total, including a 1 MiB reserve for fixed unavailable terminals |
+| Accepted user updates / total text | 128 / 1 MiB per capability |
+| Transfer outcomes / immutable deliveries | 128 / 128 per capability |
+| One task-update result batch | 32 MiB |
+| Session logical routes / retained transfer conclusions | 128 / 128 |
+| Session source proof plus round event journal | 32 MiB, including bounded error and transfer-terminal reserves |
 
 Capacity failures do not evict accepted operations or rerun Native work. Distinct errors identify
 unknown/conflicting IDs, rejected admission, unavailable results, resource limits, lease expiry,
 Native deadlines, cancellation, retirement, infrastructure failure, and required upgrades.
+Session event admission preserves a bounded error terminal for each admitted round; journal
+exhaustion closes current physical authority and leaves the capacity error available for exact replay.
+An ordinary result round proved against the current owning tool boundary takes responsibility
+for cleanup before saving inherited candidates. If that storage exhausts the journal, cancellation
+and capability revocation still occur; a rejected non-owning or older-generation round cannot
+gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 7 and Native waiting protocol is 1. The helper advertises
-`native-tool-wait-v1`. Check for `codex_tool_wait` and `operation_id` on Native entry schemas before
+The implemented Broker protocol is 10, Native waiting protocol is 1, and task update protocol is 1.
+The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
+For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
+directory before returning an ACK. The same directory carries an atomically published revision /
+driver-generation pair; transfers publish that pair before any irreversible commit effects or
+result replies. Owner and helper workers synchronously bind each DOM read to this same-host
+version before awaiting it, then sample ACK at the first returned final-text projection. A delayed
+whole progress frame cannot bind a new answer to an old owner; a head change during the read cannot
+upgrade that read. The asynchronous progress mirror remains responsible for tool activity and
+liveness, rather than negative ACK or version evidence. Candidates retain that result; late ACKs cannot upgrade it during helper
+transport or a delayed Broker check. Publications contain only version counters, never user text, do not lock output, and
+are released with the bounded retired-turn cache or Broker shutdown. Missing or invalid sources
+fail the turn. Helpers
+without `task-output-ack-v3` do not negotiate hot updates for a new execution.
+Check for `codex_tool_wait`,
+`operation_id`, `task_revision`, and `codex_task_update_ack` on the selected connector before
 any side-effecting dispatch. An incompatible connector or helper fails before execution; it must
 not silently fall back to the former timeout behavior. Production connector defaults are
-`Codex Native3` and `Codex Zero Risk2`; Automatic DEV uses `Codex Native3 DEV`. Connector identity
+`Codex Native4` and `Codex Zero Risk3`; Automatic DEV uses `Codex Native4 DEV`. Old active runtimes
+are not upgraded in place; a negotiated runtime fails explicitly on a later protocol downgrade.
+Connector identity
 and cached-schema migration follow the [architecture](architecture.md), not an in-place rename of
 an old production connector.
 
@@ -159,5 +261,9 @@ The maintained implementation is in [operations](../src/adapters/chatgpt-web/nat
 [operation tests](../tests/native-tool-operations.test.ts),
 [MCP waiting tests](../tests/native-tool-long-wait.test.ts), and
 [waiting progress tests](../tests/native-tool-long-wait-progress.test.ts).
+Task-update behavior is covered by the [Local/Remote Broker tests](../tests/task-update-broker.test.ts),
+[MCP encoding tests](../tests/task-update-mcp.test.ts), [source/session tests](../tests/task-update-session.test.ts),
+[Automatic Adapter tests](../tests/task-update-adapter.test.ts), and
+[Zero Risk Adapter tests](../tests/task-update-zero-risk-adapter.test.ts).
 Real-platform coverage is separate from those tests; see
 [release validation](release-validation.md#native-tool-waiting-validation).

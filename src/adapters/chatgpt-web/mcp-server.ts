@@ -1,6 +1,6 @@
 import { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -10,12 +10,16 @@ import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 import { observeMcpToolCalls } from "./mcp-observation";
 import { BRIDGE_TOOL_NAMES, nativePublicResult, nativeToolInputSchemas, type ChatGptMcpContract, type NativeToolEntry } from "./native-tool-contract";
 import { NativeOperationError, nativeOperationFailure, nativePendingResult, NATIVE_WAIT_PROTOCOL_VERSION, type NativeOperationReply } from "./native-tool-operations";
+import { TASK_UPDATE_INSTRUCTIONS } from "./prompt";
+import type { TaskUpdateAckResult, UpdateDelivery } from "./task-update-protocol";
 export { CHATGPT_WEB_AGENT_WAIT_POLL_MS } from "./native-tool-contract";
 export type { ChatGptMcpContract } from "./native-tool-contract";
 
 const turnTokenSchema = z.string().min(20).max(256);
 const operationIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
   .describe("Allocate the next positive operation_id before the first call. Retry and wait reuse it. A new logical operation needs a new ID. Keep this counter across reconnects within the same capability.");
+const taskRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+  .describe("Required for every Native start in task-updates-v1, initially 0. Pass the exact acknowledged task revision. An identical start retry retains its original revision; never upgrade an old operation or infer the current revision.");
 // An infrastructure deadline, not a Native operation deadline. Broker queries normally settle at 30 seconds.
 export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 export function chatGptMcpInvocationTimeout<T extends object>(environment: T & { expiresAt?: number }, now = Date.now()): number {
@@ -29,6 +33,27 @@ function asMcpResult(value: BrokerToolResult) {
   return value as { content: never[]; structuredContent?: Record<string, unknown>; isError?: boolean; _meta?: Record<string, unknown> };
 }
 function result(value: Record<string, unknown>, isError = false) { return asMcpResult(nativePublicResult(value, isError)); }
+
+/** Project only a Broker sidecar, after the Native public-result finalizer and cache. */
+export function encodeTaskUpdateMcpResult(value: BrokerToolResult, taskUpdate?: UpdateDelivery): BrokerToolResult {
+  if (!taskUpdate) return value;
+  const nativeResult = structuredClone(value);
+  const delivery = structuredClone(taskUpdate);
+  return {
+    ...structuredClone(value),
+    content: [...nativeResult.content, {
+      type: "text",
+      text: [
+        "[Codex task-updates-v1 control]",
+        "The original Native result above remains the actual operation result. The Broker supplies the following verified, ordered user-level additions; preserve higher-priority instructions.",
+        JSON.stringify({ task_update: delivery }),
+        "Process the original result first, then apply every update in order and call codex_task_update_ack with this capability, delivery_id=deliveryId and through_revision=throughRevision. Read and ACK any next delivery before new work or the complete final answer. Do not call ACK or tools after starting the final answer.",
+        "[/Codex task-updates-v1 control]",
+      ].join("\n"),
+    }],
+    structuredContent: { native_result: nativeResult, task_update: delivery },
+  };
+}
 
 function turnReferenceInput(contract: ChatGptMcpContract): Record<string, z.ZodString> {
   return contract === "safe"
@@ -79,15 +104,15 @@ function requestScopeSummary(extra: McpRequestExtra): string {
 export async function runChatGptMcpServer(options: { brokerSocketPath: string; contract?: ChatGptMcpContract }): Promise<void> {
   const contract = options.contract ?? "native";
   const instructions = contract === "safe"
-    ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete. " + NATIVE_WAIT_INSTRUCTIONS
-    : NATIVE_WAIT_INSTRUCTIONS;
+    ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete and its exact acknowledged task_revision (initially 0). " + NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS
+    : NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS;
   const server = new McpServer({ name: contract === "safe" ? "codex-safe" : "codex-native", version: VERSION }, { instructions });
 
   if (contract === "safe") {
     server.registerTool(
       "codex_turn_start",
       {
-        title: "Connect a Codex Zero Risk2 request",
+        title: "Connect a Codex Zero Risk3 request",
         description: "Connect the request_id included in the pasted Codex Web GPT request so its Codex tools can be used.",
         inputSchema: {
           request_id: turnTokenSchema,
@@ -110,7 +135,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
   }
 
   const nativeCall = async (entry: NativeToolEntry | "codex_tool_wait", input: Record<string, unknown>, extra: McpRequestExtra) => {
-    const { operation_id, turn_token: _turnToken, request_id: _requestId, ...nativeInput } = input;
+    const { operation_id, task_revision, turn_token: _turnToken, request_id: _requestId, ...nativeInput } = input;
     if (!Number.isSafeInteger(operation_id) || (operation_id as number) <= 0) {
       return asMcpResult(nativeOperationFailure("codex_tool_operation_id_required", "Allocate operation_id before the first Native call. Refresh the connector to obtain the current operation_id and codex_tool_wait schemas."));
     }
@@ -124,19 +149,21 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
         method: entry === "codex_tool_wait" ? "native_operation_wait" : "native_operation_start",
         token: turnReference(contract, input), contract, nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         operationId: operation_id as number,
-        ...(entry === "codex_tool_wait" ? {} : { entry, nativeInput }),
+        ...(entry === "codex_tool_wait" ? {} : {
+          entry, nativeInput, taskRevision: task_revision as number | undefined, taskUpdateProtocol: 1,
+        }),
       }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
-      if (reply.kind === "pending" && reply.operation_id === operation_id) return asMcpResult(nativePendingResult(reply.operation_id));
-      if (reply.kind === "result" && Array.isArray(reply.result?.content)) return asMcpResult(reply.result);
+      if (reply.kind === "pending" && reply.operation_id === operation_id) return asMcpResult(encodeTaskUpdateMcpResult(nativePendingResult(reply.operation_id), reply.taskUpdate));
+      if (reply.kind === "result" && Array.isArray(reply.result?.content)) return asMcpResult(encodeTaskUpdateMcpResult(reply.result, reply.taskUpdate));
       throw new NativeOperationError("codex_tool_infrastructure_failure", "The Native waiting channel returned an invalid reply; preserve the original operation_id");
     } catch (error) {
       // A query owns only its waiter/activity. Neither cancellation nor a lost response owns the
       // Native operation, which remains replayable until explicit retirement or lease loss.
       if (extra.signal?.aborted) throw error;
-      return asMcpResult(nativeOperationFailure(
+      return asMcpResult(encodeTaskUpdateMcpResult(nativeOperationFailure(
         error instanceof NativeOperationError ? error.code : "codex_tool_infrastructure_failure",
         error instanceof NativeOperationError ? error.message : "The Native waiting channel is unavailable. Preserve the original operation_id; do not repeat the operation with a new ID.", entry,
-      ));
+      ), error instanceof NativeOperationError ? error.taskUpdate : undefined));
     }
   };
 
@@ -153,12 +180,14 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
     const ordinaryInputSchema = z.object({
       ...turnReferenceInput(contract),
       operation_id: operationIdSchema,
+      task_revision: taskRevisionSchema.optional(),
       ...nativeToolInputSchemas[entry],
     }).strict();
     const inputSchema = contract === "native" && entry === "codex_tool_call"
       ? z.object({
         ...turnReferenceInput(contract),
         operation_id: operationIdSchema.optional(),
+        task_revision: taskRevisionSchema.optional(),
         ...nativeToolInputSchemas.codex_tool_call,
       }).strict().meta({
         anyOf: [
@@ -169,7 +198,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
           {
             properties: { wire_name: { const: CODEX_COMPACTION_CONTROL_WIRE_NAME } },
             required: ["wire_name"],
-            not: { required: ["operation_id"] },
+            not: { anyOf: [{ required: ["operation_id"] }, { required: ["task_revision"] }] },
           },
         ],
       })
@@ -180,13 +209,15 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
         ? "List tools available to the connected Zero Risk request, including configured MCP and app tools."
         : (contract === "safe" ? "For a Zero Risk request connected by codex_turn_start. " : "") + info.description)
         + " Allocate operation_id before the first call; reuse it for retry/wait. Pending requires codex_tool_wait, not another execution."
-        + (contract === "native" && entry === "codex_tool_call" ? " Only codex.control.compaction_handoff is exempt from operation_id." : ""),
+        + " In task-updates-v1 every Native start, including inventory, requires the exact acknowledged task_revision (initially 0); a start retry retains its original revision."
+        + (contract === "native" && entry === "codex_tool_call" ? " Only codex.control.compaction_handoff is exempt from operation_id and task_revision." : ""),
       inputSchema,
       annotations: { readOnlyHint: info.readOnly, destructiveHint: !info.readOnly, idempotentHint: true, openWorldHint: !info.readOnly && entry !== "codex_apply_patch" },
     }, async (input: Record<string, unknown>, extra: McpRequestExtra) => {
       const args = input as Record<string, unknown>;
       if (contract === "native" && entry === "codex_tool_call" && args.wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME) {
         if (args.operation_id !== undefined) throw new Error("Compaction control handoff does not accept operation_id");
+        if (args.task_revision !== undefined) throw new Error("Compaction control handoff does not accept task_revision");
         if (args.input !== undefined) throw new Error("Compaction control handoff does not accept freeform input");
         const control = args.arguments as Record<string, unknown> | undefined;
         if (typeof control?.handoff_id !== "string" || !control.handoff_id || typeof control.summary !== "string") {
@@ -206,6 +237,34 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, (input, extra) => nativeCall("codex_tool_wait", input, extra));
 
+  server.registerTool("codex_task_update_ack", {
+    title: "Acknowledge delivered Codex task additions",
+    description: "After reading a Broker task_update, acknowledge its exact deliveryId and throughRevision. This control query never dispatches Native work, has no operation_id, and cannot create or modify user instructions. Read any next delivery in its reply and ACK it before new work. After final output starts, a late ACK is ignored and does not reopen tool work.",
+    inputSchema: z.object({
+      ...turnReferenceInput(contract),
+      delivery_id: z.string().min(1).max(256),
+      through_revision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async (input, extra) => {
+    console.error(`[chatgpt-web-mcp] codex_task_update_ack scope=${requestScopeSummary(extra)}`);
+    const capability = turnReference(contract, input);
+    const activityId = `activity_${randomBytes(24).toString("base64url")}`;
+    try {
+      const response = await callTurnBroker<TaskUpdateAckResult>(options.brokerSocketPath, {
+        method: "task_update_ack", token: capability, contract, activityId,
+        taskUpdateProtocol: 1, deliveryId: input.delivery_id, throughRevision: input.through_revision,
+      }, 5_000, extra.signal);
+      const { taskUpdate, ...acknowledgement } = response;
+      return asMcpResult(encodeTaskUpdateMcpResult(nativePublicResult(acknowledgement), taskUpdate));
+    } finally {
+      // A query owns only its control activity. Cleanup outlives cancellation and cannot cancel
+      // the physical capability or acknowledge an update on the model's behalf.
+      await callTurnBroker(options.brokerSocketPath, { method: "activity_complete", token: capability, activityId })
+        .catch(() => console.error("[chatgpt-web-mcp] task update activity cleanup unavailable"));
+    }
+  });
+
   if (contract === "safe") {
     server.registerTool(
       "codex_turn_complete",
@@ -215,6 +274,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
         inputSchema: {
           request_id: turnTokenSchema,
           final_answer: z.string().min(1).max(5_000_000),
+          task_revision: taskRevisionSchema.optional()
+            .describe("The exact acknowledged task revision for this complete answer. Omission is allowed only for an initial revision-0 answer; it never upgrades an answer to a later revision."),
         },
         outputSchema: {
           completed: z.literal(true),
@@ -222,14 +283,20 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async ({ request_id, final_answer }, extra) => {
+      async ({ request_id, final_answer, task_revision }, extra) => {
         console.error(`[chatgpt-web-mcp] codex_turn_complete scope=${requestScopeSummary(extra)}`);
-        const response = await callTurnBroker<{ completed: true; duplicate: boolean }>(options.brokerSocketPath, {
-          method: "safe_complete",
-          token: request_id,
-          finalAnswer: final_answer,
-        }, null, extra.signal);
-        return result(response);
+        try {
+          const response = await callTurnBroker<{ completed: true; duplicate: boolean }>(options.brokerSocketPath, {
+            method: "safe_complete",
+            token: request_id,
+            finalAnswer: final_answer, taskRevision: task_revision, taskUpdateProtocol: 1,
+          }, null, extra.signal);
+          return result(response);
+        } catch (error) {
+          if (extra.signal.aborted) throw error;
+          if (!(error instanceof NativeOperationError)) throw error;
+          return asMcpResult(encodeTaskUpdateMcpResult(nativeOperationFailure(error.code, error.message), error.taskUpdate));
+        }
       },
     );
   }

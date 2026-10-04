@@ -16,6 +16,8 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptTurnUserRevision,
   hasNativeChatGptInstruction,
+  chatGptReadonlyCompactionInstructions,
+  isChatGptReadonlyCompactionBoundary,
 } from "./environment";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import { continuityError } from "./continuity-errors";
@@ -28,6 +30,12 @@ import {
 } from "./continuity-binding";
 import { CONTINUITY_IDLE_TTL_MS } from "./continuity-contract";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
+import type { TaskOutputReceipt, TaskUpdateOwnerContext, TaskUpdateState, TaskUpdateTransferOutcome, UserUpdate } from "./task-update-protocol";
+import {
+  assertTaskUpdateSourceExtension, captureTaskUpdateSource, isTaskUpdateRawResult,
+  taskUpdateDigest, taskUpdateRawResultDigest, taskUpdateSourceError,
+  type TaskUpdateExecutionIdentity, type TaskUpdateSourceProof,
+} from "./task-update-source";
 
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
@@ -125,15 +133,15 @@ interface TextWaiter {
 
 /** Append-only browser Markdown feed. Waiters are notifications; `drain` owns consumption. */
 export class ChatGptTextFeed {
-  private readonly queued: string[] = [];
+  private readonly queued: { text: string; context?: TaskUpdateOwnerContext }[] = [];
   private readonly waiters = new Set<TextWaiter>();
   private readonly observers = new Set<() => void>();
   private text = "";
 
-  push(delta: string): void {
+  push(delta: string, context?: TaskUpdateOwnerContext): void {
     if (!delta) return;
     this.text += delta;
-    this.queued.push(delta);
+    this.queued.push({ text: delta, ...(context ? { context: { ...context } } : {}) });
     for (const observer of this.observers) observer();
     const waiter = this.waiters.values().next().value as TextWaiter | undefined;
     if (!waiter) return;
@@ -143,6 +151,10 @@ export class ChatGptTextFeed {
   }
 
   drain(): string[] {
+    return this.drainWithContext().map(item => item.text);
+  }
+
+  drainWithContext(): { text: string; context?: TaskUpdateOwnerContext }[] {
     return this.queued.splice(0);
   }
 
@@ -189,6 +201,13 @@ interface ChatGptTurnRuntimeBase {
   submission?: { phase: "prepared" | "send_activated" | "accepted" };
   /** Present only when the visible ChatGPT tab is driven manually through the Codex Zero Risk2 MCP contract. */
   manualControl?: { surfaceNonce: string };
+  /** Negotiated at physical runtime creation; old executions never hot-upgrade. */
+  taskUpdates?: {
+    protocolVersion: 1;
+    outputReceipt?: TaskOutputReceipt;
+    /** First-observation admission survives ACKs, completion, and HTTP observer reconnects. */
+    bufferedTextAdmission?: (candidate: TaskUpdateOwnerContext) => Promise<void> | undefined;
+  };
   cancel: (reason?: Error) => void;
 }
 
@@ -603,6 +622,81 @@ export function chatGptDelegatedCompactionSourceExecutionKey(parsed: CodexParsed
   });
 }
 
+export const TASK_UPDATE_SESSION_ROUTE_LIMIT = 128;
+export const TASK_UPDATE_SESSION_JOURNAL_BYTES = 32 * 1024 * 1024;
+type RoundErrorEvent = Extract<AdapterEvent, { type: "error" }>;
+const TASK_UPDATE_CAPACITY_TERMINAL: RoundErrorEvent = Object.freeze({ type: "error",
+  message: "Task update round journal capacity is exhausted.", status: 409,
+  errorType: "invalid_request_error", code: "task_update_capacity", retryable: false });
+const TASK_UPDATE_HANDOFF_TERMINAL: AdapterEvent = Object.freeze({ type: "incomplete",
+  reason: "task_update_handoff", retryable: false, endTurn: false });
+export const TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES = Buffer.byteLength(canonicalJson([TASK_UPDATE_CAPACITY_TERMINAL]));
+const TASK_UPDATE_HANDOFF_TERMINAL_BYTES = Buffer.byteLength(canonicalJson([TASK_UPDATE_HANDOFF_TERMINAL]));
+
+export interface ChatGptTaskUpdateRoute {
+  executionKey: string;
+  roundKey: string;
+  requestIdentity: string;
+  requestFingerprint: string;
+  acceptedRevision: number;
+  driverGeneration: number;
+}
+
+export interface ChatGptPreservedCompactionFinalReplay {
+  roundKey: string;
+  /** False permits registration of the already-settled receipt's final text in this canonical round. */
+  terminalJournal: boolean;
+  outputReceipt: TaskOutputReceipt;
+}
+
+interface OrdinaryTaskUpdateBatch {
+  id: number;
+  requests: BrokerToolRequest[];
+  sourceRoundKey?: string;
+  observationRevision?: number;
+  acceptedRawResults?: Map<string, string>;
+  fingerprint?: string;
+}
+
+export interface ChatGptTaskUpdateBatchProof {
+  batchId: number;
+  sourceRoundKey: string;
+  observationRevision: number;
+  batchFingerprint: string;
+  requests: BrokerToolRequest[];
+  rawResults: Record<string, unknown>[];
+  messages: CodexToolResultMessage[];
+}
+
+export type ChatGptTaskUpdateProof =
+  | { status: "eligible"; source: TaskUpdateSourceProof; route: ChatGptTaskUpdateRoute;
+      updates: UserUpdate[]; batch: ChatGptTaskUpdateBatchProof; mode: "results" | "replay";
+      expectedRevision: number; expectedDriverGeneration: number }
+  | { status: "replay"; route: ChatGptTaskUpdateRoute }
+  | { status: "inapplicable"; reason: string }
+  | { status: "stale"; error: ChatGptWebAdapterError }
+  | { status: "conflict"; error: ChatGptWebAdapterError };
+
+type EligibleTaskUpdateProof = Extract<ChatGptTaskUpdateProof, { status: "eligible" }>;
+
+export interface ChatGptPreparedTaskUpdate {
+  readonly transferId: string;
+  readonly payloadDigest: string;
+  readonly expectedDriverGeneration: number;
+  readonly expectedRevision: number;
+  readonly requestFingerprint: string;
+  readonly previousRoundKey?: string;
+}
+
+export interface ChatGptTaskUpdateRestoreAuthority {
+  /** Fresh authoritative Broker state after its immutable not_committed conclusion. */
+  state?: TaskUpdateState;
+  ownerValid: boolean;
+  cancelled?: boolean;
+  retired?: boolean;
+  completed?: boolean;
+}
+
 export class ChatGptTurnSession {
   supersededError?: Error;
   readonly createdAt = Date.now();
@@ -631,9 +725,42 @@ export class ChatGptTurnSession {
   private readonly toolBatchByCallId = new Map<string, ContinuityToolBatch>();
   private tail: Promise<void> = Promise.resolve();
   private capabilityRetirementScheduled = false;
+  private capabilityRetired = false;
+  private taskUpdateSource?: TaskUpdateSourceProof;
+  private taskUpdateExecutionDigest?: string;
+  private taskUpdateCanonicalAliases: Record<string, string> = {};
+  private taskUpdateFinalSource?: { id: string; contentDigest: string };
+  private preservedCompactionFinal?: { executionKey: string; receipt: TaskOutputReceipt };
+  private readonly preservedCompactionFinalRequests = new Map<string, { fingerprint: string; roundKey: string }>();
+  private taskUpdateRevision = 0;
+  private taskUpdateDriverGeneration = 0;
+  private taskUpdateDriverOpen = true;
+  private taskUpdateCancelled = false;
+  private readonly taskUpdateRoutes = new Map<string, ChatGptTaskUpdateRoute>();
+  private readonly taskUpdateRequests = new Map<string, ChatGptTaskUpdateRoute>();
+  private readonly ordinaryTaskUpdateBatches = new Map<number, OrdinaryTaskUpdateBatch>();
+  private readonly ordinaryTaskUpdateBatchByCallId = new Map<string, OrdinaryTaskUpdateBatch>();
+  private readonly taskUpdateHistoricalResults = new Map<string, string>();
+  private latestTaskUpdateBatch?: OrdinaryTaskUpdateBatch;
+  private latestTaskUpdateExecutionKey?: string;
+  private activeTaskUpdateRound?: { key: string; generation: number; connected: boolean };
+  private taskUpdateOutputRoundKey?: string;
+  private taskUpdateOutputRoundBound = false;
+  private preparedTaskUpdate?: { record: ChatGptPreparedTaskUpdate; proof: EligibleTaskUpdateProof;
+    sourceBytes: number; handoffBytes: number; newErrorRound: boolean };
+  private readonly taskUpdateTransferConclusions = new Map<string, TaskUpdateTransferOutcome>();
+  private readonly taskUpdateFinalizations = new Map<string, "committed" | "restored" | "closed">();
+  private readonly driverChangeObservers = new Set<() => void>();
+  private readonly lifecycleObservers = new Set<() => void>();
+  private observerCount = 0;
+  private taskUpdateTransactionCount = 0;
+  private taskUpdateSourceBytes = 0;
+  private taskUpdateJournalBytes = 0;
+  private readonly taskUpdateErrorRoundReserves = new Set<string>();
   private readonly rounds = new Map<string, {
     events: AdapterEvent[];
     reasoning: string[];
+    bufferedTextCandidates?: TaskUpdateOwnerContext[];
     completed: boolean;
     failure?: Error;
   }>();
@@ -680,6 +807,658 @@ export class ChatGptTurnSession {
     this.scheduleCapabilityRetirement();
     return run;
   }
+
+  /** Synchronous methods below form a short handoff critical section, separate from tail. */
+  initializeTaskUpdates(parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity): boolean {
+    if (this.runtime.taskUpdates?.protocolVersion !== 1 || this.runtime.mode !== "tools"
+      || this.runtime.continuityBinding) return false;
+    const source = captureTaskUpdateSource(parsed, execution);
+    if (!source) return false;
+    if (this.taskUpdateSource) {
+      if (assertTaskUpdateSourceExtension(this.taskUpdateSource, source) !== "equal") {
+        throw taskUpdateSourceError("task_update_stale", "Task update initialization cannot advance or roll back an established instruction chain.");
+      }
+      return true;
+    }
+    if (this.nativeThreadId !== source.threadId || this.nativeTurnId !== source.turnId) {
+      throw taskUpdateSourceError("task_update_source_conflict", "Task update source does not own this physical native turn.");
+    }
+    const sourceBytes = Buffer.byteLength(canonicalJson(source.input));
+    const existingJournalBytes = [...this.rounds.values()].reduce((bytes, round) => bytes
+      + Buffer.byteLength(canonicalJson(round.events)) + Buffer.byteLength(canonicalJson(round.reasoning)), 0);
+    if (sourceBytes + existingJournalBytes + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+      throw taskUpdateSourceError("task_update_capacity", "Task update source history capacity is exhausted.");
+    }
+    this.taskUpdateSource = { ...structuredClone(source), input: [] };
+    this.taskUpdateExecutionDigest = this.readonlyExecutionDigest(parsed, execution);
+    this.taskUpdateCanonicalAliases = { ...parsed._chatGptMessageIdAliases };
+    const finalSource = chatGptTurnUserRevisionHistory(parsed).at(-1);
+    if (finalSource?.itemId) this.taskUpdateFinalSource = {
+      id: canonicalMessageId(parsed, finalSource.itemId)!, contentDigest: taskUpdateDigest(finalSource.content),
+    };
+    this.taskUpdateSourceBytes = sourceBytes;
+    this.taskUpdateJournalBytes = existingJournalBytes;
+    this.canonicalInputValue = structuredClone(source.input) as unknown[];
+    const route: ChatGptTaskUpdateRoute = {
+      executionKey: chatGptTurnExecutionKey(parsed), roundKey: chatGptTurnRoundKey(parsed),
+      requestIdentity: source.requestIdentity, requestFingerprint: source.requestFingerprint,
+      acceptedRevision: 0, driverGeneration: 0,
+    };
+    this.recordTaskUpdateRoute(route);
+    this.taskUpdateOutputRoundKey = route.roundKey;
+    this.latestTaskUpdateExecutionKey = route.executionKey;
+    for (const value of source.input) {
+      const item = rawRecord(value);
+      if (item && isTaskUpdateRawResult(item) && typeof item.call_id === "string") {
+        this.taskUpdateHistoricalResults.set(item.call_id, taskUpdateRawResultDigest(item));
+      }
+    }
+    return true;
+  }
+
+  taskUpdatesEnabled(): boolean { return this.taskUpdateSource !== undefined; }
+  driverGeneration(): number { return this.taskUpdateDriverGeneration; }
+  taskRevision(): number { return this.taskUpdateRevision; }
+  taskUpdateOwnerContext(): TaskUpdateOwnerContext {
+    return { expectedDriverGeneration: this.taskUpdateDriverGeneration, taskRevision: this.taskUpdateRevision };
+  }
+  latestLogicalExecutionKey(): string | undefined { return this.latestTaskUpdateExecutionKey; }
+  taskUpdateRoute(executionKey: string): ChatGptTaskUpdateRoute | undefined {
+    const route = this.taskUpdateRoutes.get(executionKey);
+    return route ? { ...route } : undefined;
+  }
+  hasPendingTaskUpdate(): boolean { return this.preparedTaskUpdate !== undefined; }
+  isTaskUpdateCancelled(): boolean { return this.taskUpdateCancelled; }
+
+  /** Registry bookkeeping after explicit successful compaction preservation, never an update. */
+  retainPreservedCompactionFinal(executionKey: string): void {
+    if (!this.taskUpdatesEnabled()) return;
+    const receipt = this.runtime.taskUpdates?.outputReceipt;
+    if (executionKey.slice(executionKey.lastIndexOf(":") + 1) !== this.latestTaskUpdateExecutionKey
+      || this.isActive() || !this.isPhysicallySettled() || this.conversationKey()
+      || this.settledOutcome()?.type !== "final" || this.outstandingById.size || this.preparedTaskUpdate
+      || !this.taskUpdateFinalSource || !receipt || receipt.kind !== "completed"
+      || receipt.taskRevision !== this.taskUpdateRevision || receipt.driverGeneration !== this.taskUpdateDriverGeneration) {
+      throw taskUpdateSourceError("task_update_source_unproven", "Compaction preservation lacks the exact completed physical source and version receipt.");
+    }
+    if (this.preservedCompactionFinal && (this.preservedCompactionFinal.executionKey !== executionKey
+      || taskUpdateDigest(this.preservedCompactionFinal.receipt) !== taskUpdateDigest(receipt))) {
+      throw taskUpdateSourceError("task_update_source_conflict", "The preserved compaction final already has different immutable source evidence.");
+    }
+    this.preservedCompactionFinal = { executionKey, receipt: structuredClone(receipt) };
+  }
+
+  /**
+   * Read only replay of an explicitly preserved completed source. Compaction may remove history
+   * and re-ID a retained instruction through trusted aliases; every retained requirement/result
+   * still has to match its original evidence. No observer, registry, revision or driver is revived.
+   */
+  preservedCompactionFinalReplay(
+    parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity, executionKey: string,
+  ): ChatGptPreservedCompactionFinalReplay | undefined {
+    const preserved = this.preservedCompactionFinal;
+    const input = rawRecord(parsed._rawBody)?.input;
+    if (!preserved || !Array.isArray(input) || parsed._compactionRequest
+      || parsed._conversationPolicy === "continuity-first"
+      || !input.some(isChatGptReadonlyCompactionBoundary)) return undefined;
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (preserved.executionKey !== executionKey || this.conversationKey() || this.isActive()
+      || !this.isPhysicallySettled() || this.settledOutcome()?.type !== "final"
+      || this.supersededError || this.taskUpdateCancelled || this.preparedTaskUpdate || this.outstandingById.size
+      || identity.threadId !== this.nativeThreadId || identity.turnId !== this.nativeTurnId
+      || this.readonlyExecutionDigest(parsed, execution) !== this.taskUpdateExecutionDigest
+      || chatGptTurnExecutionKey(parsed) !== executionKey.slice(executionKey.lastIndexOf(":") + 1)) {
+      throw taskUpdateSourceError("task_update_source_conflict", "The compacted final replay changed its preserved source or execution identity.");
+    }
+    const current = chatGptTurnUserRevisionHistory(parsed).at(-1);
+    const finalSource = this.taskUpdateFinalSource;
+    if (!current?.itemId || !finalSource || canonicalMessageId(parsed, current.itemId) !== finalSource.id
+      || taskUpdateDigest(current.content) !== finalSource.contentDigest
+      || (current.turnId !== undefined && current.turnId !== this.nativeTurnId)) {
+      throw taskUpdateSourceError("task_update_source_conflict", "The compacted request changed its canonical final source instruction.");
+    }
+    const previous = chatGptReadonlyCompactionInstructions(parsed, this.canonicalInputValue ?? []);
+    let previousIndex = -1;
+    for (const item of chatGptReadonlyCompactionInstructions(parsed)) {
+      const id = typeof item.id === "string" ? canonicalMessageId(parsed, item.id) : undefined;
+      const digest = this.readonlyInstructionDigest(item);
+      const index = previous.findIndex((prior, index) => index > previousIndex
+        && (id === undefined ? prior.id === undefined
+          : typeof prior.id === "string" && (this.taskUpdateCanonicalAliases[prior.id] ?? prior.id) === id)
+        && this.readonlyInstructionDigest(prior) === digest
+        && (rawRecord(item.internal_chat_message_metadata_passthrough)?.turn_id === undefined
+          || rawRecord(prior.internal_chat_message_metadata_passthrough)?.turn_id === undefined
+          || rawRecord(item.internal_chat_message_metadata_passthrough)?.turn_id === rawRecord(prior.internal_chat_message_metadata_passthrough)?.turn_id));
+      if (index < 0) throw taskUpdateSourceError("task_update_source_conflict", "Compaction retained edited, new or reordered requirements instead of the preserved source.");
+      previousIndex = index;
+    }
+    for (const value of input) {
+      const item = rawRecord(value);
+      if (!item || !isTaskUpdateRawResult(item) || item.call_id === undefined) continue;
+      if (typeof item.call_id !== "string") throw taskUpdateSourceError("task_update_source_conflict", "The compacted replay contains an invalid tool result identity.");
+      const accepted = this.ordinaryTaskUpdateBatchByCallId.get(item.call_id)?.acceptedRawResults?.get(item.call_id)
+        ?? this.taskUpdateHistoricalResults.get(item.call_id);
+      if (!accepted || accepted !== taskUpdateRawResultDigest(item)) throw taskUpdateSourceError("task_update_source_conflict", "The compacted replay changed or invented a retained tool result.");
+    }
+    const normalizedInput = input.map(value => {
+      const item = rawRecord(value);
+      return item && typeof item.id === "string" ? { ...item, id: canonicalMessageId(parsed, item.id) } : value;
+    });
+    const fingerprint = taskUpdateDigest({ input: normalizedInput, execution: this.taskUpdateExecutionDigest });
+    const body = rawRecord(parsed._rawBody)!;
+    let metadata = rawRecord(rawRecord(body.client_metadata)?.["x-codex-turn-metadata"]);
+    const rawMetadata = rawRecord(body.client_metadata)?.["x-codex-turn-metadata"];
+    if (typeof rawMetadata === "string") { try { metadata = rawRecord(JSON.parse(rawMetadata)); } catch {} }
+    const nativeRequestId = metadata?.request_id ?? body.request_id ?? body.id;
+    const requestIdentity = typeof nativeRequestId === "string" && nativeRequestId ? `native:${nativeRequestId}` : fingerprint;
+    const known = this.preservedCompactionFinalRequests.get(requestIdentity);
+    if (known && known.fingerprint !== fingerprint) throw taskUpdateSourceError("task_update_source_conflict", "The same compacted request identity changed its accepted payload.");
+    const terminal = [...this.rounds].findLast(([, round]) => {
+      const event = round.events.at(-1);
+      return round.completed && !round.failure && event?.type === "done" && event.endTurn === true;
+    });
+    const roundKey = known?.roundKey ?? terminal?.[0] ?? `preserved-final:${taskUpdateDigest({ executionKey, fingerprint })}`;
+    if (!known) {
+      if (this.preservedCompactionFinalRequests.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT) throw taskUpdateSourceError("task_update_capacity", "Preserved compaction final replay routes are full.");
+      this.reserveTaskUpdateRoundError(roundKey);
+      this.preservedCompactionFinalRequests.set(requestIdentity, { fingerprint, roundKey });
+    }
+    return { roundKey, terminalJournal: this.roundCompleted(roundKey), outputReceipt: structuredClone(preserved.receipt) };
+  }
+
+  private readonlyExecutionDigest(parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity): string {
+    return taskUpdateDigest({ modelId: parsed.modelId, options: parsed.options,
+      modelFamily: parsed._chatgptModelFamily ?? null, instructions: rawRecord(parsed._rawBody)?.instructions ?? null, execution });
+  }
+
+  private readonlyInstructionDigest(item: Record<string, unknown>): string {
+    const { id: _id, internal_chat_message_metadata_passthrough: _metadata, ...value } = item;
+    return taskUpdateDigest({ ...value, type: item.type ?? (typeof item.role === "string" ? "message" : undefined) });
+  }
+
+  /** Ordinary result rounds keep current revision/generation and receive only their own journal. */
+  acceptTaskUpdateRound(parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity): ChatGptTaskUpdateRoute | undefined {
+    if (!this.taskUpdateSource) return undefined;
+    const source = captureTaskUpdateSource(parsed, execution);
+    if (!source) throw taskUpdateSourceError("task_update_source_unproven", "The current request lost its trusted native source proof.");
+    const known = this.taskUpdateRequests.get(source.requestIdentity);
+    if (known) {
+      if (known.requestFingerprint !== source.requestFingerprint) throw taskUpdateSourceError("task_update_source_conflict", "The same request identity changed its accepted payload.");
+      assertTaskUpdateSourceExtension(this.taskUpdateSource, source);
+      if (known.driverGeneration !== this.taskUpdateDriverGeneration && !this.hasOwnTaskUpdateJournal(known.roundKey)) {
+        throw taskUpdateSourceError("task_update_stale", "The historical request has no own retained output journal.");
+      }
+      return { ...known };
+    }
+    if (assertTaskUpdateSourceExtension(this.taskUpdateSource, source) !== "equal") {
+      throw taskUpdateSourceError("task_update_stale", "This request has no own retained round and does not address the current instruction chain.");
+    }
+    this.assertDriverGeneration(this.taskUpdateDriverGeneration);
+    if (this.outstandingById.size || this.latestTaskUpdateBatch) this.proveOrdinaryTaskUpdateBatch(parsed);
+    if (this.taskUpdateRequests.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT) throw taskUpdateSourceError("task_update_capacity", "Task update logical request route capacity is exhausted.");
+    const route: ChatGptTaskUpdateRoute = {
+      executionKey: chatGptTurnExecutionKey(parsed), roundKey: chatGptTurnRoundKey(parsed),
+      requestIdentity: source.requestIdentity, requestFingerprint: source.requestFingerprint,
+      acceptedRevision: this.taskUpdateRevision, driverGeneration: this.taskUpdateDriverGeneration,
+    };
+    this.recordTaskUpdateRoute(route);
+    return { ...route };
+  }
+
+  assertDriverGeneration(expected: number): void {
+    if (expected !== this.taskUpdateDriverGeneration || this.supersededError || this.capabilityRetired
+      || !this.taskUpdateDriverOpen || this.taskUpdateCancelled) {
+      throw taskUpdateSourceError("task_update_driver_stale", "This Responses observer no longer owns the physical execution.");
+    }
+    if (this.preparedTaskUpdate) throw taskUpdateSourceError("task_update_prepared", "Task update transfer is awaiting an authoritative conclusion.");
+  }
+
+  /** Recover only this accepted round's committed answer; this grants no live driver writes. */
+  assertCompletedTaskUpdateRound(key: string, context: TaskUpdateOwnerContext): void {
+    const receipt = this.runtime.taskUpdates?.outputReceipt;
+    const route = [...this.taskUpdateRequests.values()].find(candidate => candidate.roundKey === key
+      && candidate.driverGeneration === context.expectedDriverGeneration
+      && candidate.acceptedRevision === context.taskRevision);
+    if (!route || !this.ownsTaskUpdateOutputRound(key, context.expectedDriverGeneration)
+      || this.supersededError || this.taskUpdateCancelled || !this.taskUpdateDriverOpen
+      || this.preparedTaskUpdate || this.outstandingById.size || this.settledOutcome()?.type !== "final"
+      || !receipt || receipt.kind !== "completed"
+      || context.taskRevision !== this.taskUpdateRevision
+      || receipt.driverGeneration !== context.expectedDriverGeneration || receipt.taskRevision !== context.taskRevision) {
+      throw taskUpdateSourceError("task_update_driver_stale", "This Responses round cannot recover the completed physical answer.");
+    }
+  }
+
+  ownsTaskUpdateOutputRound(key: string, expectedGeneration: number): boolean {
+    return this.taskUpdateOutputRoundKey === key && this.taskUpdateDriverGeneration === expectedGeneration;
+  }
+
+  /** Consumed final text remains on its round even before completion or HTTP emission. */
+  retainTaskUpdateOutputRound(key: string, expectedGeneration: number): void {
+    if (!this.ownsTaskUpdateOutputRound(key, expectedGeneration)) {
+      throw taskUpdateSourceError("task_update_driver_stale", "This Responses round does not own the final text.");
+    }
+    this.taskUpdateOutputRoundBound = true;
+  }
+
+  /** Protect only transaction bookkeeping before reservation; this does not freeze a driver. */
+  retainTaskUpdateTransaction(): () => void {
+    if (this.capabilityRetired || this.taskUpdateCancelled || !this.taskUpdateDriverOpen) {
+      throw taskUpdateSourceError("task_update_driver_stale", "The physical execution cannot admit another task update transaction.");
+    }
+    this.taskUpdateTransactionCount++;
+    this.scheduleCapabilityRetirement();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.taskUpdateTransactionCount--;
+      this.notifyTaskUpdateLifecycle();
+    };
+  }
+
+  /** Holds physical retirement until this admitted logical observer has finished registration. */
+  enterTaskUpdateObserver(roundKey: string, expectedGeneration: number, parsed?: CodexParsedRequest): () => void {
+    this.assertDriverGeneration(expectedGeneration);
+    if (!this.roundCompleted(roundKey)) {
+      if (this.taskUpdateOutputRoundKey !== roundKey
+        && (this.taskUpdateOutputRoundBound || this.runtime.taskUpdates?.outputReceipt)) {
+        // Buffered strict text leaves the Native work window open. Only the current
+        // owner's completed real tool boundary can pass that evidence to its result round.
+        const proof = parsed && !this.runtime.taskUpdates?.outputReceipt && this.outstandingById.size > 0
+          ? this.proveOrdinaryTaskUpdateBatch(parsed) : undefined;
+        if (!proof || proof.sourceRoundKey !== this.taskUpdateOutputRoundKey
+          || !this.roundCompleted(proof.sourceRoundKey)) {
+          throw taskUpdateSourceError("task_update_driver_stale", "The final answer already belongs to another Responses round.");
+        }
+        // This proved continuation owns failure cleanup too. Claim it before candidate
+        // storage can fail, so capacity errors close its physical execution rather than
+        // leaving an unresumable Native result waiting on the completed source round.
+        this.taskUpdateOutputRoundKey = roundKey;
+        for (const candidate of this.roundBufferedTextCandidates(proof.sourceRoundKey)) {
+          this.appendRoundBufferedTextCandidate(roundKey, candidate);
+        }
+      }
+      this.activeTaskUpdateRound = { key: roundKey, generation: expectedGeneration, connected: true };
+      this.taskUpdateOutputRoundKey = roundKey;
+    }
+    this.observerCount++;
+    this.scheduleCapabilityRetirement();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.observerCount--;
+      if (this.activeTaskUpdateRound?.key === roundKey && this.activeTaskUpdateRound.generation === expectedGeneration) {
+        this.activeTaskUpdateRound.connected = false;
+      }
+      this.notifyTaskUpdateLifecycle();
+    };
+  }
+
+  waitForDriverChange(expectedGeneration: number, signal?: AbortSignal): Promise<void> {
+    if (this.taskUpdateDriverGeneration !== expectedGeneration || this.preparedTaskUpdate || this.supersededError
+      || this.taskUpdateCancelled || this.capabilityRetired || !this.taskUpdateDriverOpen) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(new DOMException("ChatGPT driver observation aborted", "AbortError"));
+    return new Promise((resolve, reject) => {
+      const finish = () => { this.driverChangeObservers.delete(finish); signal?.removeEventListener("abort", abort); resolve(); };
+      const abort = () => { this.driverChangeObservers.delete(finish); reject(new DOMException("ChatGPT driver observation aborted", "AbortError")); };
+      this.driverChangeObservers.add(finish);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  async waitForTaskUpdatePreparation(signal?: AbortSignal): Promise<void> {
+    // Cancellation ends this observer's authority independently of an unavailable transfer
+    // receipt. Keep the immutable prepared evidence, then let assertDriverGeneration reject
+    // the canceled observer instead of requiring a disconnected request to recover first.
+    while (this.preparedTaskUpdate && !this.taskUpdateCancelled) {
+      if (signal?.aborted) throw new DOMException("ChatGPT driver observation aborted", "AbortError");
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => { this.lifecycleObservers.delete(changed); signal?.removeEventListener("abort", aborted); };
+        const changed = () => { cleanup(); resolve(); };
+        const aborted = () => { cleanup(); reject(new DOMException("ChatGPT driver observation aborted", "AbortError")); };
+        this.lifecycleObservers.add(changed);
+        signal?.addEventListener("abort", aborted, { once: true });
+      });
+    }
+  }
+
+  proveTaskUpdate(parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity): ChatGptTaskUpdateProof {
+    if (!this.taskUpdateSource) return { status: "inapplicable", reason: "execution_not_updatable" };
+    try {
+      const source = captureTaskUpdateSource(parsed, execution);
+      if (!source) return { status: "inapplicable", reason: "source_not_supported" };
+      if (this.preparedTaskUpdate?.proof.source.requestFingerprint === source.requestFingerprint) {
+        // Recovery remains reachable after the physical worker settles or the response disconnects.
+        // It resolves the original transfer, never authorizes a second append.
+        assertTaskUpdateSourceExtension(this.taskUpdateSource, source);
+        return structuredClone(this.preparedTaskUpdate.proof);
+      }
+      const known = this.taskUpdateRequests.get(source.requestIdentity);
+      if (known) {
+        if (known.requestFingerprint !== source.requestFingerprint) {
+          throw taskUpdateSourceError("task_update_source_conflict", "The same native request identity changed its payload.");
+        }
+        assertTaskUpdateSourceExtension(this.taskUpdateSource, source);
+        if (known.driverGeneration !== this.taskUpdateDriverGeneration && !this.hasOwnTaskUpdateJournal(known.roundKey)) {
+          return { status: "stale", error: taskUpdateSourceError("task_update_stale", "The historical request has no own retained output journal.") };
+        }
+        return { status: "replay", route: { ...known } };
+      }
+      const unsupported = this.unsupportedTaskUpdateUserSuffix(parsed, execution);
+      if (unsupported) {
+        assertTaskUpdateSourceExtension(this.taskUpdateSource, unsupported);
+        // Out-of-scope modality cannot bypass the full batch's provenance checks.
+        this.proveOrdinaryTaskUpdateBatch(parsed);
+        return { status: "inapplicable", reason: "multimodal_user_update" };
+      }
+      if (!this.isActive() || this.capabilityRetired || this.runtime.taskUpdates?.outputReceipt) return { status: "inapplicable", reason: "execution_not_updatable" };
+      const relation = assertTaskUpdateSourceExtension(this.taskUpdateSource, source);
+      if (relation !== "extension") return { status: "stale", error: taskUpdateSourceError("task_update_stale", "This request does not extend the current accepted instruction chain and has no own journal.") };
+      const batch = this.proveOrdinaryTaskUpdateBatch(parsed);
+      if (!batch) return { status: "inapplicable", reason: "no_emitted_result_boundary" };
+      const mode = this.outstandingById.size > 0 ? "results" : "replay";
+      const updates = source.messages.slice(this.taskUpdateSource.messages.length).map((message, index): UserUpdate => ({
+        revision: this.taskUpdateRevision + index + 1,
+        sourceMessageId: message.sourceMessageId, payloadDigest: message.payloadDigest, content: message.content,
+      }));
+      return { status: "eligible", source, updates, batch, mode,
+        expectedRevision: this.taskUpdateRevision, expectedDriverGeneration: this.taskUpdateDriverGeneration,
+        route: { executionKey: chatGptTurnExecutionKey(parsed), roundKey: chatGptTurnRoundKey(parsed),
+          requestIdentity: source.requestIdentity, requestFingerprint: source.requestFingerprint,
+          acceptedRevision: this.taskUpdateRevision + updates.length, driverGeneration: this.taskUpdateDriverGeneration + 1 } };
+    } catch (error) {
+      if (error instanceof ChatGptWebAdapterError) return { status: "conflict", error };
+      throw error;
+    }
+  }
+
+  /** Record only after complete tool-call events, done(tool_use), and observed browser boundary. */
+  recordTaskUpdateToolBatch(roundKey: string, requests: readonly BrokerToolRequest[], observationRevision: number): void {
+    if (!this.taskUpdateSource) return;
+    const events = this.rounds.get(roundKey)?.events;
+    const starts = events?.filter(event => event.type === "tool_call_start") ?? [];
+    const terminal = events?.at(-1);
+    if (!this.roundCompleted(roundKey) || terminal?.type !== "done"
+      || terminal.stopReason !== "tool_use" || terminal.endTurn !== false
+      || events!.filter(event => ["done", "error", "incomplete"].includes(event.type)).length !== 1
+      || !Number.isSafeInteger(observationRevision) || observationRevision <= 0
+      || starts.length !== requests.length
+      || starts.some((event, index) => event.type !== "tool_call_start" || event.id !== requests[index]!.callId)
+      || events!.filter(event => event.type === "tool_call_end").length !== requests.length) {
+      throw taskUpdateSourceError("task_update_source_unproven", "The source batch lacks its complete tool round or observed browser boundary.");
+    }
+    const batch = this.ordinaryTaskUpdateBatchByCallId.get(requests[0]?.callId ?? "");
+    if (!batch || taskUpdateDigest(batch.requests) !== taskUpdateDigest(requests)) {
+      throw taskUpdateSourceError("task_update_source_unproven", "The source tool round does not match the outstanding physical batch.");
+    }
+    if (batch.sourceRoundKey && (batch.sourceRoundKey !== roundKey || batch.observationRevision !== observationRevision)) {
+      throw taskUpdateSourceError("task_update_source_conflict", "The source batch already has a different observation proof.");
+    }
+    batch.sourceRoundKey = roundKey;
+    batch.observationRevision = observationRevision;
+  }
+
+  /** Broker must reserve transfer/receipt space first. No await and no browser/model wait here. */
+  prepareTaskUpdate(proof: EligibleTaskUpdateProof, transferId: string, payloadDigest: string): ChatGptPreparedTaskUpdate {
+    const conclusion = this.taskUpdateTransferConclusions.get(transferId);
+    if (conclusion && conclusion.status !== "unknown") throw taskUpdateSourceError("task_update_transfer_conflict", "This transfer already has an immutable conclusion.");
+    if (this.preparedTaskUpdate) {
+      const existing = this.preparedTaskUpdate.record;
+      if (existing.transferId !== transferId || existing.payloadDigest !== payloadDigest
+        || existing.requestFingerprint !== proof.source.requestFingerprint) throw taskUpdateSourceError("task_update_transfer_busy", "A different task update transfer is unresolved.");
+      return existing;
+    }
+    this.assertDriverGeneration(proof.expectedDriverGeneration);
+    if (!this.isActive() || this.taskUpdateRevision !== proof.expectedRevision
+      || this.runtime.taskUpdates?.outputReceipt) throw taskUpdateSourceError("task_update_stale", "The task update source changed before preparation.");
+    assertTaskUpdateSourceExtension(this.taskUpdateSource!, proof.source);
+    const previous = this.activeTaskUpdateRound;
+    const previousRoundKey = previous && previous.generation === proof.expectedDriverGeneration
+      && !this.roundHasTerminalEvent(previous.key) && !this.roundCompleted(previous.key) ? previous.key : undefined;
+    const sourceBytes = Buffer.byteLength(canonicalJson(proof.source.input));
+    const handoffBytes = previousRoundKey ? TASK_UPDATE_HANDOFF_TERMINAL_BYTES : 0;
+    const newErrorRound = !this.taskUpdateErrorRoundReserves.has(proof.route.roundKey)
+      && !this.roundCompleted(proof.route.roundKey);
+    if (this.taskUpdateRequests.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT
+      || this.taskUpdateTransferConclusions.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT
+      || this.rounds.size >= 512
+      || this.taskUpdateStorageBytes() + sourceBytes + handoffBytes
+        + (newErrorRound ? TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES : 0) > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+      throw taskUpdateSourceError("task_update_capacity", "Task update route or round journal capacity is exhausted.");
+    }
+    this.reserveTaskUpdateRoundError(proof.route.roundKey);
+    const record: ChatGptPreparedTaskUpdate = Object.freeze({ transferId, payloadDigest,
+      expectedDriverGeneration: proof.expectedDriverGeneration, expectedRevision: proof.expectedRevision,
+      requestFingerprint: proof.source.requestFingerprint,
+      ...(previousRoundKey ? { previousRoundKey } : {}) });
+    this.preparedTaskUpdate = { record, proof: structuredClone(proof), sourceBytes, handoffBytes, newErrorRound };
+    this.taskUpdateTransferConclusions.set(transferId, { status: "unknown", transferId });
+    this.notifyTaskUpdateDriverChange();
+    this.scheduleCapabilityRetirement();
+    return record;
+  }
+
+  preparedTaskUpdateRecord(): ChatGptPreparedTaskUpdate | undefined { return this.preparedTaskUpdate?.record; }
+
+  /** not_found is observational uncertainty, not a terminal rejection. */
+  finishTaskUpdateTransfer(
+    outcome: TaskUpdateTransferOutcome | { status: "not_found"; transferId: string },
+    authority?: ChatGptTaskUpdateRestoreAuthority,
+  ): "committed" | "restored" | "closed" | "unknown" {
+    const prior = this.taskUpdateTransferConclusions.get(outcome.transferId);
+    if (prior && prior.status !== "unknown") {
+      if (outcome.status !== "not_found" && taskUpdateDigest(prior) !== taskUpdateDigest(outcome)) {
+        throw taskUpdateSourceError("task_update_transfer_conflict", "The transfer conclusion is immutable.");
+      }
+      return this.taskUpdateFinalizations.get(outcome.transferId) ?? (prior.status === "committed" ? "committed" : "closed");
+    }
+    const prepared = this.preparedTaskUpdate;
+    if (!prepared || prepared.record.transferId !== outcome.transferId) throw taskUpdateSourceError("task_update_transfer_conflict", "The conclusion does not own the current prepared transfer.");
+    if (outcome.status === "unknown" || outcome.status === "not_found") return "unknown";
+    const { record, proof } = prepared;
+    if (outcome.status === "committed") {
+      if (outcome.state.driverGeneration !== record.expectedDriverGeneration + 1
+        || outcome.state.acceptedRevision !== record.expectedRevision + proof.updates.length
+        || !Number.isSafeInteger(outcome.state.deliveredRevision) || outcome.state.deliveredRevision < 0
+        || !Number.isSafeInteger(outcome.state.acknowledgedRevision) || outcome.state.acknowledgedRevision < 0
+        || outcome.state.acknowledgedRevision > outcome.state.deliveredRevision
+        || outcome.state.deliveredRevision > outcome.state.acceptedRevision
+        || outcome.state.finalOutputRevision !== null
+        || outcome.batchFingerprint !== proof.batch.batchFingerprint) {
+        throw taskUpdateSourceError("task_update_transfer_conflict", "The commit receipt does not match the reserved transfer.");
+      }
+      this.taskUpdateDriverGeneration = outcome.state.driverGeneration;
+      this.taskUpdateRevision = outcome.state.acceptedRevision;
+      this.taskUpdateDriverOpen = !this.taskUpdateCancelled;
+      this.taskUpdateSource = { ...structuredClone(proof.source), input: [] };
+      this.taskUpdateSourceBytes = Buffer.byteLength(canonicalJson(proof.source.input));
+      this.canonicalInputValue = structuredClone(proof.source.input) as unknown[];
+      const latestMessage = proof.source.messages.at(-1);
+      const sourceItem = proof.source.input.map(rawRecord).find(item => item?.id === latestMessage?.sourceMessageId);
+      if (latestMessage && sourceItem) this.taskUpdateFinalSource = {
+        id: this.taskUpdateCanonicalAliases[latestMessage.sourceMessageId] ?? latestMessage.sourceMessageId,
+        contentDigest: taskUpdateDigest(sourceItem.content),
+      };
+      this.recordTaskUpdateRoute(proof.route);
+      this.taskUpdateOutputRoundKey = proof.route.roundKey;
+      this.taskUpdateOutputRoundBound = false;
+      this.latestTaskUpdateExecutionKey = proof.route.executionKey;
+      const batch = this.ordinaryTaskUpdateBatches.get(proof.batch.batchId)!;
+      batch.acceptedRawResults = new Map(proof.batch.rawResults.map(item => [String(item.call_id), taskUpdateRawResultDigest(item)]));
+      batch.fingerprint = proof.batch.batchFingerprint;
+      this.latestTaskUpdateBatch = batch;
+      if (proof.mode === "results") for (const request of batch.requests) {
+        if (this.outstandingById.has(request.callId)) this.markResultDelivered(request.callId);
+      }
+      if (!this.taskUpdateCancelled && record.previousRoundKey && !this.roundHasTerminalEvent(record.previousRoundKey)
+        && !this.roundCompleted(record.previousRoundKey)) {
+        // This is registration from the immutable Broker receipt, not a frozen driver's write.
+        this.taskUpdateJournalBytes += TASK_UPDATE_HANDOFF_TERMINAL_BYTES;
+        this.round(record.previousRoundKey).events.push(structuredClone(TASK_UPDATE_HANDOFF_TERMINAL));
+        this.completeRound(record.previousRoundKey);
+      }
+      this.activeTaskUpdateRound = undefined;
+      this.taskUpdateTransferConclusions.set(outcome.transferId, structuredClone(outcome));
+      this.taskUpdateFinalizations.set(outcome.transferId, "committed");
+      this.preparedTaskUpdate = undefined;
+      this.notifyTaskUpdateDriverChange();
+      this.notifyTaskUpdateLifecycle();
+      return "committed";
+    }
+    this.taskUpdateTransferConclusions.set(outcome.transferId, structuredClone(outcome));
+    // Clearing only our own local barrier never rolls back authoritative owner/head state.
+    this.preparedTaskUpdate = undefined;
+    if (prepared.newErrorRound && !this.rounds.has(proof.route.roundKey)
+      && !this.taskUpdateRequests.has(proof.route.requestIdentity)) this.taskUpdateErrorRoundReserves.delete(proof.route.roundKey);
+    const restored = authority?.ownerValid === true && authority.state !== undefined
+      && authority.state.driverGeneration === record.expectedDriverGeneration
+      && this.taskUpdateDriverGeneration === record.expectedDriverGeneration
+      && authority.state.acceptedRevision === record.expectedRevision
+      && authority.state.finalOutputRevision === null && !authority.cancelled && !authority.retired
+      && !authority.completed && this.isActive() && !this.supersededError && !this.capabilityRetired
+      && !this.taskUpdateCancelled;
+    this.taskUpdateDriverOpen = restored && !this.taskUpdateCancelled;
+    this.taskUpdateFinalizations.set(outcome.transferId, restored ? "restored" : "closed");
+    this.notifyTaskUpdateLifecycle();
+    this.notifyTaskUpdateDriverChange();
+    return restored ? "restored" : "closed";
+  }
+
+  private recordTaskUpdateRoute(route: ChatGptTaskUpdateRoute): void {
+    const old = this.taskUpdateRequests.get(route.requestIdentity);
+    if (old && taskUpdateDigest(old) !== taskUpdateDigest(route)) throw taskUpdateSourceError("task_update_source_conflict", "The native request route conflicts with its original registration.");
+    this.reserveTaskUpdateRoundError(route.roundKey);
+    const frozen = Object.freeze({ ...route });
+    this.taskUpdateRoutes.set(route.executionKey, frozen);
+    this.taskUpdateRequests.set(route.requestIdentity, frozen);
+  }
+
+  private hasOwnTaskUpdateJournal(roundKey: string): boolean {
+    const round = this.rounds.get(roundKey);
+    return Boolean(round && (round.events.length > 0 || round.reasoning.length > 0 || round.completed || round.failure));
+  }
+
+  private unsupportedTaskUpdateUserSuffix(
+    parsed: CodexParsedRequest, execution: TaskUpdateExecutionIdentity,
+  ): TaskUpdateSourceProof | undefined {
+    const body = rawRecord(parsed._rawBody);
+    const input = body?.input;
+    if (!Array.isArray(input) || !this.taskUpdateSource) return undefined;
+    const existingIds = new Set((this.canonicalInputValue ?? []).flatMap(value => {
+      const id = rawRecord(value)?.id;
+      return typeof id === "string" ? [id] : [];
+    }));
+    const lastAcceptedId = this.taskUpdateSource.messages.at(-1)?.sourceMessageId;
+    const lastAcceptedIndex = input.findLastIndex(value => rawRecord(value)?.id === lastAcceptedId);
+    const excluded = new Set<number>();
+    for (let index = lastAcceptedIndex + 1; index < input.length; index++) {
+      const item = rawRecord(input[index]);
+      const metadata = rawRecord(item?.internal_chat_message_metadata_passthrough);
+      if (!item || item.role !== "user" || (item.type !== undefined && item.type !== "message")
+        || metadata?.turn_id !== this.taskUpdateSource.turnId || typeof item.id !== "string" || !item.id
+        || existingIds.has(item.id) || item.origin !== undefined || item.author !== undefined || item.recipient !== undefined
+        || !Array.isArray(item.content)) continue;
+      const parts = item.content.map(rawRecord);
+      if (!parts.every(part => part && ["input_text", "text", "input_image", "input_file"].includes(String(part.type)))
+        || !parts.some(part => part?.type === "input_image" || part?.type === "input_file")) continue;
+      const kinds = metadata.content_item_kinds;
+      if (kinds !== undefined && (!Array.isArray(kinds) || kinds.length !== parts.length
+        || kinds.some((kind, partIndex) => kind !== (parts[partIndex]?.type === "input_image" ? "user.image"
+          : parts[partIndex]?.type === "input_file" ? "user.file" : "user.text")))) continue;
+      excluded.add(index);
+    }
+    if (excluded.size === 0) return undefined;
+    return captureTaskUpdateSource({ ...parsed, _rawBody: { ...body, input: input.filter((_, index) => !excluded.has(index)) } }, execution);
+  }
+
+  private proveOrdinaryTaskUpdateBatch(parsed: CodexParsedRequest): ChatGptTaskUpdateBatchProof | undefined {
+    const input = rawRecord(parsed._rawBody)?.input;
+    if (!Array.isArray(input)) throw taskUpdateSourceError("task_update_source_unproven", "The full native input history is required.");
+    const outstanding = this.outstanding();
+    const batch = outstanding.length ? this.ordinaryTaskUpdateBatchByCallId.get(outstanding[0]!.callId)
+      : this.latestTaskUpdateBatch ?? [...this.ordinaryTaskUpdateBatches.values()].at(-1);
+    if (!batch && outstanding.length === 0 && this.ordinaryTaskUpdateBatches.size === 0) {
+      // No emitted boundary permits ordinary fallback, not acceptance of a newly introduced
+      // result. A Broker handoff whose owner_next reply is still in flight is unproven here.
+      const seen = new Set<string>();
+      for (const value of input) {
+        const item = rawRecord(value);
+        if (!item) continue;
+        if (!isTaskUpdateRawResult(item)) {
+          if (item.call_id !== undefined && !["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type))) {
+            throw taskUpdateSourceError("task_update_source_unproven", "A tool result has an invalid raw result type.");
+          }
+          continue;
+        }
+        if (item.call_id === undefined && item.type === "function_call_output" && item.name === "send_message_to_thread") continue;
+        const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+        const accepted = callId ? this.taskUpdateHistoricalResults.get(callId) : undefined;
+        if (!callId || seen.has(callId) || !accepted || accepted !== taskUpdateRawResultDigest(item)) {
+          throw taskUpdateSourceError("task_update_source_unproven", "Without an emitted source batch, tool results must exactly match unique accepted initial history.");
+        }
+        seen.add(callId);
+      }
+      return undefined;
+    }
+    if (!batch?.sourceRoundKey || !batch.observationRevision) {
+      throw taskUpdateSourceError("task_update_source_unproven", "The known physical tool batch lacks its completed source round or observed browser boundary.");
+    }
+    if (outstanding.length && outstanding.length !== batch.requests.length) throw taskUpdateSourceError("task_update_source_unproven", "The current outstanding batch was partially released.");
+    const rawResults = new Map<string, Record<string, unknown>>();
+    for (const value of input) {
+      const item = rawRecord(value);
+      if (!item) continue;
+      const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+      if (!isTaskUpdateRawResult(item)) {
+        if (callId && this.ordinaryTaskUpdateBatchByCallId.has(callId)
+          && !["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type))) {
+          throw taskUpdateSourceError("task_update_source_unproven", "A tool result has an invalid raw result type.");
+        }
+        continue;
+      }
+      if (!callId) {
+        // Delegation is frozen instruction prefix evidence, not an ordinary tool result.
+        if (item.type === "function_call_output" && item.name === "send_message_to_thread") continue;
+        throw taskUpdateSourceError("task_update_source_unproven", "A terminal tool result has no call ID.");
+      }
+      const candidate = this.ordinaryTaskUpdateBatchByCallId.get(callId);
+      if (candidate !== batch) {
+        const accepted = candidate?.acceptedRawResults?.get(callId) ?? this.taskUpdateHistoricalResults.get(callId);
+        if (!accepted || accepted !== taskUpdateRawResultDigest(item)) throw taskUpdateSourceError("task_update_source_unproven", "The current result group includes an unknown, mixed or changed historical tool result.");
+        continue;
+      }
+      const request = batch.requests.find(request => request.callId === callId)!;
+      if (!activeToolResultMatches(item, request) || rawResults.has(callId)) throw taskUpdateSourceError("task_update_source_unproven", "The current result batch has duplicated or wrongly typed results.");
+      if (batch.acceptedRawResults && batch.acceptedRawResults.get(callId) !== taskUpdateRawResultDigest(item)) throw taskUpdateSourceError("task_update_source_conflict", "A result differs from its first accepted raw payload.");
+      rawResults.set(callId, item);
+    }
+    if (rawResults.size !== batch.requests.length) throw taskUpdateSourceError("task_update_source_unproven", "The new request must carry the complete emitted result batch.");
+    const ordered = batch.requests.map(request => structuredClone(rawResults.get(request.callId)!));
+    const messages = parseRequest({ model: parsed.modelId, input: ordered }).context.messages.filter((message): message is CodexToolResultMessage => message.role === "toolResult");
+    if (messages.length !== batch.requests.length || messages.some(message => !batch.requests.some(request => request.callId === message.toolCallId))) throw taskUpdateSourceError("task_update_source_unproven", "The raw results cannot be mapped to the complete emitted batch.");
+    const fingerprint = taskUpdateDigest({ requests: batch.requests, results: ordered });
+    if (batch.fingerprint && batch.fingerprint !== fingerprint) throw taskUpdateSourceError("task_update_source_conflict", "The replay batch changed its accepted payload.");
+    return { batchId: batch.id, sourceRoundKey: batch.sourceRoundKey, observationRevision: batch.observationRevision,
+      batchFingerprint: fingerprint, requests: structuredClone(batch.requests), rawResults: ordered,
+      messages: batch.requests.map(request => messages.find(message => message.toolCallId === request.callId)!) };
+  }
+
+  /** Bind first raw result evidence even on an ordinary continuation without added user text. */
+  acceptTaskUpdateToolResults(parsed: CodexParsedRequest): CodexToolResultMessage[] {
+    if (!this.taskUpdateSource) return [];
+    const proof = this.proveOrdinaryTaskUpdateBatch(parsed);
+    if (!proof) return [];
+    const batch = this.ordinaryTaskUpdateBatches.get(proof.batchId)!;
+    if (!batch.acceptedRawResults) {
+      batch.acceptedRawResults = new Map(proof.rawResults.map(item => [String(item.call_id), taskUpdateRawResultDigest(item)]));
+    }
+    return proof.messages.filter(message => this.outstandingById.has(message.toolCallId));
+  }
+
+  private notifyTaskUpdateDriverChange(): void { for (const observer of [...this.driverChangeObservers]) observer(); }
+  private notifyTaskUpdateLifecycle(): void { for (const observer of [...this.lifecycleObservers]) observer(); }
 
   touch(): void {
     if (!this.runtime.continuityBinding) this.lastTouchedAt = Date.now();
@@ -960,6 +1739,16 @@ export class ChatGptTurnSession {
 
   setOutstanding(requests: BrokerToolRequest[], reasoning: string[] = [], prelude: AdapterEvent[] = []): void {
     if (this.outstandingById.size > 0) throw new Error("cannot emit a new ChatGPT tool batch while the previous batch is unresolved");
+    if (this.taskUpdateSource) {
+      if (this.ordinaryTaskUpdateBatches.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT) throw taskUpdateSourceError("task_update_capacity", "Task update batch proof capacity is exhausted.");
+      if (requests.length === 0 || new Set(requests.map(request => request.callId)).size !== requests.length
+        || requests.some(request => this.ordinaryTaskUpdateBatchByCallId.has(request.callId))) {
+        throw taskUpdateSourceError("task_update_source_conflict", "Tool batch call identities must be new and unique.");
+      }
+      const batch: OrdinaryTaskUpdateBatch = { id: this.nextToolBatchId++, requests: structuredClone(requests) };
+      this.ordinaryTaskUpdateBatches.set(batch.id, batch);
+      for (const request of requests) this.ordinaryTaskUpdateBatchByCallId.set(request.callId, batch);
+    }
     let batch: ContinuityToolBatch | undefined;
     if (this.runtime.continuityBinding) {
       const batchId = this.nextToolBatchId++;
@@ -981,7 +1770,7 @@ export class ChatGptTurnSession {
     }
     if (batch) this.toolBatches.set(batch.id, batch);
     this.outstandingReasoning = [...reasoning];
-    this.outstandingPrelude = [...prelude];
+    this.outstandingPrelude = structuredClone(prelude);
   }
 
   hasOutstanding(callId: string): boolean {
@@ -1008,7 +1797,7 @@ export class ChatGptTurnSession {
   }
 
   eventsForOutstandingReplay(): AdapterEvent[] {
-    return [...this.outstandingPrelude];
+    return structuredClone(this.outstandingPrelude);
   }
 
   setFinalReasoning(reasoning: string[]): void {
@@ -1020,47 +1809,98 @@ export class ChatGptTurnSession {
   }
 
   setFinalEvents(events: AdapterEvent[]): void {
-    this.finalPrelude = [...events];
+    this.finalPrelude = structuredClone(events);
   }
 
   eventsForFinalReplay(): AdapterEvent[] {
-    return [...this.finalPrelude];
+    return structuredClone(this.finalPrelude);
   }
 
   roundEvents(key: string): AdapterEvent[] {
-    return [...this.round(key).events];
+    return structuredClone(this.round(key).events);
   }
 
   roundReasoning(key: string): string[] {
     return [...this.round(key).reasoning];
   }
 
+  roundBufferedTextCandidates(key: string): TaskUpdateOwnerContext[] {
+    return structuredClone(this.round(key).bufferedTextCandidates ?? []);
+  }
+
+  appendRoundBufferedTextCandidate(key: string, candidate: TaskUpdateOwnerContext): void {
+    const round = this.round(key);
+    if (round.completed) throw new Error("cannot append to a completed ChatGPT native round");
+    const value = canonicalJson(candidate);
+    if (round.bufferedTextCandidates?.some(existing => canonicalJson(existing) === value)) return;
+    const bytes = Buffer.byteLength(value);
+    if (this.taskUpdateStorageBytes() + bytes > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+      throw taskUpdateSourceError("task_update_capacity", "Task update round journal capacity is exhausted.");
+    }
+    this.taskUpdateJournalBytes += bytes;
+    (round.bufferedTextCandidates ??= []).push(structuredClone(candidate));
+  }
+
   appendRoundEvent(key: string, event: AdapterEvent): void {
     this.appendRoundEvents(key, [event]);
   }
 
-  appendRoundEvents(key: string, events: readonly AdapterEvent[]): void {
+  /** Return the exact replayable error; only real budget exhaustion uses the fixed reserved terminal. */
+  appendRoundError(key: string, event: RoundErrorEvent): RoundErrorEvent {
+    try {
+      this.appendRoundEvents(key, [event]);
+      return structuredClone(event);
+    } catch (error) {
+      if (!(error instanceof ChatGptWebAdapterError) || error.code !== "task_update_capacity") throw error;
+      const round = this.rounds.get(key);
+      if (!round || round.completed || !this.taskUpdateErrorRoundReserves.has(key)) throw error;
+      this.taskUpdateErrorRoundReserves.delete(key);
+      this.taskUpdateJournalBytes += TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES;
+      const terminal = structuredClone(TASK_UPDATE_CAPACITY_TERMINAL);
+      round.events.push(terminal);
+      return structuredClone(terminal);
+    }
+  }
+
+  appendRoundEvents(key: string, events: readonly AdapterEvent[], expectedGeneration?: number): void {
     if (events.length === 0) return;
+    if (expectedGeneration !== undefined && this.taskUpdatesEnabled()) this.assertDriverGeneration(expectedGeneration);
     const round = this.round(key);
     if (round.completed) throw new Error("cannot append to a completed ChatGPT native round");
-    round.events.push(...events);
+    if (this.taskUpdatesEnabled()) {
+      const bytes = Buffer.byteLength(canonicalJson(events));
+      if (this.taskUpdateStorageBytes() + bytes > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+        throw taskUpdateSourceError("task_update_capacity", "Task update round journal capacity is exhausted.");
+      }
+      this.taskUpdateJournalBytes += bytes;
+    }
+    round.events.push(...structuredClone(events));
   }
 
   appendRoundReasoning(key: string, values: readonly string[]): void {
     if (values.length === 0) return;
     const round = this.round(key);
     if (round.completed) throw new Error("cannot append reasoning to a completed ChatGPT native round");
+    if (this.taskUpdatesEnabled()) {
+      const bytes = Buffer.byteLength(canonicalJson(values));
+      if (this.taskUpdateStorageBytes() + bytes > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+        throw taskUpdateSourceError("task_update_capacity", "Task update round journal capacity is exhausted.");
+      }
+      this.taskUpdateJournalBytes += bytes;
+    }
     round.reasoning.push(...values);
   }
 
   completeRound(key: string): void {
     this.round(key).completed = true;
+    this.taskUpdateErrorRoundReserves.delete(key);
   }
 
   failRound(key: string, error: Error): void {
     const round = this.round(key);
     round.failure = error;
     round.completed = true;
+    this.taskUpdateErrorRoundReserves.delete(key);
   }
 
   roundCompleted(key: string): boolean {
@@ -1072,11 +1912,40 @@ export class ChatGptTurnSession {
   }
 
   roundHasTerminalEvent(key: string): boolean {
-    return this.rounds.get(key)?.events.some(event => event.type === "done" || event.type === "error") === true;
+    return this.rounds.get(key)?.events.some(event => event.type === "done" || event.type === "error" || event.type === "incomplete") === true;
   }
 
   cancel(reason?: Error): void {
+    if (this.taskUpdatesEnabled()) {
+      this.taskUpdateCancelled = true;
+      this.taskUpdateDriverOpen = false;
+    }
     this.runtime.cancel(reason);
+    this.notifyTaskUpdateDriverChange();
+    this.notifyTaskUpdateLifecycle();
+  }
+
+  cancelDriver(expectedGeneration: number, reason?: Error): void {
+    this.assertDriverGeneration(expectedGeneration);
+    this.cancel(reason);
+  }
+
+  /** Physical retirement waits for admitted observers and live, independently prepared handoffs. */
+  async waitForLogicalSettlement(): Promise<void> {
+    for (;;) {
+      const tail = this.tail;
+      await tail;
+      // A real physical cancellation permanently closes the driver. Unavailable RPC receipts
+      // retain their original proof/outcome but cannot keep this owner or capability alive.
+      // Their own release callbacks and late receipts remain valid bookkeeping operations.
+      const pendingTransfer = !this.taskUpdateCancelled
+        && (this.preparedTaskUpdate !== undefined || this.taskUpdateTransactionCount > 0);
+      if (!pendingTransfer && this.observerCount === 0 && tail === this.tail) return;
+      if (pendingTransfer || this.observerCount > 0) await new Promise<void>(resolve => {
+        const changed = () => { this.lifecycleObservers.delete(changed); resolve(); };
+        this.lifecycleObservers.add(changed);
+      });
+    }
   }
 
   private scheduleCapabilityRetirement(): void {
@@ -1087,8 +1956,12 @@ export class ChatGptTurnSession {
     // At physical settlement, read the current tail so every tool-result/reconnect observer that
     // was already admitted finishes before the capability is retired.
     void this.physicalSettlement
-      .then(() => this.tail)
-      .then(() => this.runtime.retireCapability!())
+      .then(() => this.waitForLogicalSettlement())
+      .then(() => {
+        if (this.capabilityRetired) return;
+        this.capabilityRetired = true;
+        return this.runtime.retireCapability!();
+      })
       .catch(error => {
         console.error(
           `[chatgpt-web] failed to retire settled turn capability: ${error instanceof Error ? error.message : String(error)}`,
@@ -1099,6 +1972,7 @@ export class ChatGptTurnSession {
   private round(key: string) {
     let round = this.rounds.get(key);
     if (round) return round;
+    this.reserveTaskUpdateRoundError(key);
     round = { events: [], reasoning: [], completed: false };
     this.rounds.set(key, round);
     while (this.rounds.size > 512) {
@@ -1117,10 +1991,29 @@ export class ChatGptTurnSession {
     }
     return round;
   }
+
+  private taskUpdateStorageBytes(): number {
+    return this.taskUpdateSourceBytes + this.taskUpdateJournalBytes
+      + this.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES
+      + (this.preparedTaskUpdate?.sourceBytes ?? 0) + (this.preparedTaskUpdate?.handoffBytes ?? 0);
+  }
+
+  private reserveTaskUpdateRoundError(key: string): void {
+    if (!this.taskUpdatesEnabled() || this.roundCompleted(key) || this.taskUpdateErrorRoundReserves.has(key)) return;
+    const admittedRounds = new Set([...this.rounds.keys(), ...this.taskUpdateErrorRoundReserves]);
+    if ((!admittedRounds.has(key) && admittedRounds.size >= 512)
+      || this.taskUpdateStorageBytes() + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+      throw taskUpdateSourceError("task_update_capacity", "Task update round error-terminal capacity is exhausted.");
+    }
+    this.taskUpdateErrorRoundReserves.add(key);
+  }
 }
 
 export class ChatGptTurnSessions {
+  /** Each entry represents exactly one physical browser/capability epoch. */
   private readonly entries = new Map<string, ChatGptTurnSession>();
+  private readonly logicalRoutes = new Map<string, ChatGptTurnSession>();
+  private readonly physicalRetirements = new WeakMap<ChatGptTurnSession, Promise<void>>();
   private readonly conversationHeads = new Map<string, ChatGptTurnSession>();
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
@@ -1141,7 +2034,7 @@ export class ChatGptTurnSessions {
     instruction?: string,
   ): ChatGptTurnSession {
     this.prune();
-    const existing = this.entries.get(key);
+    const existing = this.entries.get(key) ?? this.logicalRoutes.get(key);
     if (existing) {
       if (existing.supersededError) throw existing.supersededError;
       existing.touch();
@@ -1173,7 +2066,7 @@ export class ChatGptTurnSessions {
   ): Promise<ChatGptTurnSession> {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-      const existing = this.entries.get(key);
+      const existing = this.entries.get(key) ?? this.logicalRoutes.get(key);
       if (existing) {
         if (existing.supersededError) throw existing.supersededError;
         existing.touch();
@@ -1213,9 +2106,35 @@ export class ChatGptTurnSessions {
   }
 
   find(key: string): ChatGptTurnSession | undefined {
-    const session = this.entries.get(key);
+    const session = this.entries.get(key) ?? this.logicalRoutes.get(key);
     session?.touch();
     return session;
+  }
+
+  findTaskUpdateOwner(threadId: string, turnId: string, ownerKey: string): ChatGptTurnSession | undefined {
+    const matches = [...this.entries.values()].filter(session => session.ownerKey === ownerKey
+      && session.nativeThreadId === threadId && session.nativeTurnId === turnId
+      && session.taskUpdatesEnabled() && !session.supersededError && !session.isTaskUpdateCancelled()
+      && (session.isActive() || session.hasPendingTaskUpdate()));
+    if (matches.length > 1) throw taskUpdateSourceError("task_update_source_conflict", "More than one physical session claims the native turn.");
+    return matches[0];
+  }
+
+  /** Commit receipt has already registered this exact logical route inside the session. */
+  registerTaskUpdateRoute(executionKey: string, session: ChatGptTurnSession, logicalExecutionKey = executionKey.slice(executionKey.lastIndexOf(":") + 1)): void {
+    if (![...this.entries.values()].includes(session) || !session.taskUpdateRoute(logicalExecutionKey)) {
+      throw taskUpdateSourceError("task_update_source_unproven", "The task update route lacks its physical session and commit receipt.");
+    }
+    const old = this.entries.get(executionKey) ?? this.logicalRoutes.get(executionKey);
+    if (old && old !== session) throw taskUpdateSourceError("task_update_source_conflict", "The logical request route already belongs to another physical session.");
+    if (this.entries.get(executionKey) !== session) this.logicalRoutes.set(executionKey, session);
+  }
+
+  /** Compaction must locate the latest exact source key, never an older alias of this epoch. */
+  findTaskUpdateSource(executionKey: string): ChatGptTurnSession | undefined {
+    const session = this.entries.get(executionKey) ?? this.logicalRoutes.get(executionKey);
+    const logicalExecutionKey = executionKey.slice(executionKey.lastIndexOf(":") + 1);
+    return session?.taskUpdatesEnabled() && session.latestLogicalExecutionKey() !== logicalExecutionKey ? undefined : session;
   }
 
   continuityToolCallRevision(binding: ContinuityBinding, callId: string): number | undefined {
@@ -1386,10 +2305,13 @@ export class ChatGptTurnSessions {
     if (!outcome || outcome.type !== "final") {
       throw new Error("Only a settled final ChatGPT response can survive retained-conversation retirement");
     }
-    return this.closeConversationAndWait(conversationKey, {
+    const retired = await this.closeConversationAndWait(conversationKey, {
       session: preserved,
       executionKey: preservedExecutionKey,
     });
+    if (this.entries.get(preservedExecutionKey) !== preserved) throw taskUpdateSourceError("task_update_source_conflict", "The preserved final source changed during physical retirement.");
+    preserved.retainPreservedCompactionFinal(preservedExecutionKey);
+    return retired;
   }
 
   private async closeConversationAndWait(
@@ -1418,6 +2340,7 @@ export class ChatGptTurnSessions {
         && (session !== preserved?.session || key !== preserved.executionKey)) {
         this.entries.delete(key);
       }
+      for (const [routeKey, routed] of this.logicalRoutes) if (routed === session) this.logicalRoutes.delete(routeKey);
       if (session.isActive()) session.cancel();
       if (!session.detachConversation(conversationKey)) {
         throw new Error("ChatGPT retained-conversation ownership changed during retirement");
@@ -1450,18 +2373,18 @@ export class ChatGptTurnSessions {
       await awaitWithAbort(pending, signal);
       return true;
     }
-    const session = this.entries.get(key);
+    const session = this.entries.get(key) ?? this.logicalRoutes.get(key);
     if (!session) return false;
 
-    this.entries.delete(key);
+    this.removePhysicalSession(session);
     this.forgetConversationHead(session);
     await awaitWithAbort(this.beginRetirement(key, session), signal);
     return true;
   }
 
   retire(key: string, session: ChatGptTurnSession): boolean {
-    if (this.entries.get(key) !== session) return false;
-    this.entries.delete(key);
+    if ((this.entries.get(key) ?? this.logicalRoutes.get(key)) !== session) return false;
+    this.removePhysicalSession(session);
     this.forgetConversationHead(session);
     this.beginRetirement(key, session);
     return true;
@@ -1481,7 +2404,7 @@ export class ChatGptTurnSessions {
       && session.isActive()
     ));
     for (const [key, session] of matches) {
-      this.entries.delete(key);
+      this.removePhysicalSession(session);
       this.forgetConversationHead(session);
       this.beginRetirement(key, session);
     }
@@ -1492,6 +2415,7 @@ export class ChatGptTurnSessions {
     const cancelled = this.entries.size;
     for (const [key, session] of this.entries) this.beginRetirement(key, session);
     this.entries.clear();
+    this.logicalRoutes.clear();
     this.conversationHeads.clear();
     return cancelled;
   }
@@ -1529,7 +2453,7 @@ export class ChatGptTurnSessions {
     ));
     for (const [key, session] of matches) {
       if (this.entries.get(key) !== session) continue;
-      this.entries.delete(key);
+      this.removePhysicalSession(session);
       this.forgetConversationHead(session);
     }
     const settlement = Promise.all(
@@ -1560,7 +2484,7 @@ export class ChatGptTurnSessions {
     const now = Date.now();
     for (const [key, session] of this.entries) {
       const binding = this.protectedContinuityBinding(key, session);
-      if (session.isActive() || (session.runtime.continuityBinding
+      if (session.isActive() || (session.hasPendingTaskUpdate() && !session.isTaskUpdateCancelled()) || (session.runtime.continuityBinding
         && (!session.isPhysicallySettled() || session.outstanding().length > 0))) continue;
       if (binding && binding.state !== "ready") continue;
       const idleSince = binding?.lastUsedAt ?? session.lastUsedAt();
@@ -1576,6 +2500,7 @@ export class ChatGptTurnSessions {
         }
       }
       this.entries.delete(key);
+      for (const [routeKey, routed] of this.logicalRoutes) if (routed === session) this.logicalRoutes.delete(routeKey);
       this.forgetConversationHead(session);
     }
   }
@@ -1612,12 +2537,18 @@ export class ChatGptTurnSessions {
     }
   }
 
+  private removePhysicalSession(session: ChatGptTurnSession): void {
+    for (const [key, physical] of this.entries) if (physical === session) this.entries.delete(key);
+    for (const [key, routed] of this.logicalRoutes) if (routed === session) this.logicalRoutes.delete(key);
+  }
+
   private beginRetirement(key: string, session: ChatGptTurnSession, reason?: Error): Promise<void> {
-    const existing = this.retirements.get(key);
+    const existing = this.physicalRetirements.get(session) ?? this.retirements.get(key);
     if (existing) return existing;
     const conversationKey = session.conversationKey();
     session.cancel(reason);
-    const retirement = session.physicalSettlement;
+    const retirement = session.physicalSettlement.then(() => session.waitForLogicalSettlement());
+    this.physicalRetirements.set(session, retirement);
     this.retirements.set(key, retirement);
     void retirement.then(() => {
       if (this.retirements.get(key) === retirement) this.retirements.delete(key);

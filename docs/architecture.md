@@ -66,9 +66,9 @@ DEV launchers can therefore run at the same time with different ChatGPT accounts
 
 The working-tree adapter attaches to a tab leased only from that DEV launcher. In Full mode the DEV
 launcher owns one persistent, isolated tunnel runtime; a named CLI chat owns only the private turn
-broker attached to that tunnel for the command's lifetime. The distinct `Codex Native3 DEV`
+broker attached to that tunnel for the command's lifetime. The distinct `Codex Native4 DEV`
 connector reaches the same MCP server and turn-token contract without requiring any Responses
-daemon or colliding with the production `Codex Native3` connector.
+daemon or colliding with the production `Codex Native4` connector.
 
 Only the responsibilities normally owned by native Codex are synthetic: named history storage,
 turn metadata, tool-result execution, context-threshold scheduling, and installation of compacted
@@ -84,23 +84,29 @@ probe. The DEV launcher supervisor owns only the isolated MCP tunnel. Browser di
 state, thread authority, checkpoints, and named chat state live
 under `~/.codex-chatgpt-web-dev` by default.
 
-The ChatGPT connector name is also the public MCP ABI identity. The direct turn-token contract defaults
-to `Codex Native3`; Settings can change the part after `Codex ` for the selected mode. The retired
-`Codex Native`, `Codex Native2`, and `Codex Native2 DEV` identities are never selected or refreshed in
+The ChatGPT connector name is also the public MCP ABI identity. The `task_updates-v1` start
+revision and ACK tool require new identities: `Codex Native4` in Automatic and `Codex Zero Risk3`
+in Zero Risk; Settings can change the part after `Codex ` for the selected mode. The retired
+`Codex Native`, `Codex Native2`, `Codex Native2 DEV`, `Codex Native3`, `Codex Native3 DEV`,
+`Codex Zero Risk`, and `Codex Zero Risk2` identities are never selected or refreshed in
 place. Setup migrates known legacy local configuration to the current identity, clears prior verification state, and
 requires the user to create the new connector. Browser verification accepts the exact new identity,
 reports a specific migration error when only the legacy identity is visible, and never falls back to
 the legacy connector. Future public schema changes require another explicit connector identity.
-Repository DEV mode uses `Codex Native3 DEV` so the same ChatGPT account can keep both production
+Repository DEV mode uses `Codex Native4 DEV` so the same ChatGPT account can keep both production
 and development connectors installed without renaming, refreshing, or deleting either one.
 
-Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native3`
-by default in Automatic, `Zero Risk2` in manual mode, and `Native3 DEV` in Automatic DEV. Mode names
-are stored independently and must differ. Setup preserves them across upgrades and mode changes.
+Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native4`
+by default in Automatic, `Zero Risk3` in manual mode, and `Native4 DEV` in Automatic DEV. Mode names
+are stored independently and must differ. Setup preserves custom nonlegacy names across upgrades
+and mode changes. When upgrading from
+`Codex Native3`, `Codex Native3 DEV`, or `Codex Zero Risk2`, preserve the old remote connector and
+create the corresponding new connector; never rename or refresh an old identity.
 A name change uses the existing setup transaction, rejects active work, and clears MCP verification
 only after success. The user must create a new plugin with that exact name. Renaming a display
 label does not itself replace a remote connector's cached schema; retired connector identities cannot
-be selected as new names and legacy connectors are still never reused.
+be selected as new names and legacy connectors are still never reused. If a preserved custom name
+still caches an older public contract, choose a new name and create a new plugin.
 
 ## Browser lifecycle
 
@@ -206,6 +212,28 @@ by Codex. A prompt-level checkpoint marker is translated into a visible Codex tr
 every later tool action in the same turn continues to present the current turn capability. Visible
 ChatGPT status rows become reasoning summaries, while stable prose between rows becomes native
 Codex commentary.
+
+### User updates during Native tool work
+
+A new compatible Full Native runtime negotiates `task-updates-v1`. A proven plain user suffix in
+the same native thread and turn can keep the existing physical ChatGPT response after the old
+Responses round has registered its tools and tool-use terminal and Codex returns the complete
+real results. Broker state separates accepted, delivered, and acknowledged revisions from driver
+generation and registry generation. A short owner transfer commits the registry, updates, new
+driver, and real result batch together; an unknown receipt recovers the same transfer.
+
+The Session registry stores one physical execution with bounded logical request routes. Exact
+reconnects replay only their own immutable journals. During the ACK gap, a further append can
+replace the active Responses observer; that observer ends with `task_update_handoff` while the
+physical response continues. Control arrives only in existing MCP replies or ACK replies.
+It adds no composer message, Native tool, or extra browser observation barrier. Versioned browser
+and helper candidates preserve their captured task head through completion and final text.
+
+Once final output starts, the ordinary replacement path applies. Continuity-first work, initial
+manual requests awaiting Sent, and unproven or unsupported inputs retain their existing mode
+boundaries. Unresolved updates block compaction; accepted updates make the latest logical route
+the exact compaction source. See the [public protocol](native-tool-protocol.md#user-updates-during-tool-work)
+and [acceptance gate](release-validation.md#inflight-user-update-validation).
 
 ### Continuity policy
 

@@ -73,7 +73,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 自動 | MCP 経由で利用可能 |
 | **Zero Risk** | 手動で貼り付けて送信 | 専用 MCP コネクタ経由で利用可能 |
 
-Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk2` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
+Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk3` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
 
 <a id="full-harness"></a>
 
@@ -96,11 +96,13 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
    Tunnel と通常の API キーを作成します。キーの作成は無料で、モデル API クレジットを消費しません。
 3. Tunnel ID と API キーを貼り付け、**ハーネスを接続**を押します。
 4. ChatGPT の設定で **Developer Mode** を有効にします。**Tunnel** を使う**新しい**コネクタを作成し、
-   対象の Tunnel を選択して、**Authentication** を **None**、名前を正確に **Codex Native3** に設定します。
-5. **Codex Native3** の **Permissions** で **Allow all actions** を選択します。
+   対象の Tunnel を選択して、**Authentication** を **None**、名前を正確に **Codex Native4** に設定します。
+5. **Codex Native4** の **Permissions** で **Allow all actions** を選択します。
    **Allow low-risk actions** では、コマンドとパッチがこのランタイムへ到達する前にブロックされます。
    外側の Codex ハーネスでは、引き続きサンドボックスと承認が適用されます。
-6. **ランタイムを検証**を実行し、**Codex Native3** が接続済みで利用可能であることを確認します。
+6. **ランタイムを検証**を実行し、**Codex Native4** が接続済みで利用可能であることを確認します。
+
+`task_updates-v1` の開始スキーマと ACK ツールには新しい識別子が必要です。Automatic は **Codex Native4**、Zero Risk は **Codex Zero Risk3**、開発環境は **Codex Native4 DEV** を使います。**Codex Native3**、**Codex Native3 DEV**、**Codex Zero Risk2** はそのまま残し、新しいコネクタを作成してください。旧コネクタの名前変更や更新は行わないでください。独自の非旧版名は保持されますが、古いキャッシュを使うプラグインには新しい名前が必要です。
 
 書き込み／変更操作には、ChatGPT ワークスペースと管理者ポリシー側での許可も必要です。
 [Developer Mode と MCP アプリ](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)を参照してください。
@@ -170,7 +172,7 @@ cd codex-chatgpt-web && \
 bun run app
 ```
 
-ソースからの実行には Bun 1.4.0 が必要です。このコマンドはロックされた依存関係をインストールしてアプリを開きます。
+ソースからの実行には Bun 1.4.2 が必要です。このコマンドはロックされた依存関係をインストールしてアプリを開きます。
 
 ```bash
 bun run app

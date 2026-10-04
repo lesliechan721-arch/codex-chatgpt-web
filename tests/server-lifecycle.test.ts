@@ -1603,24 +1603,30 @@ test("remote thread_title body transport failure releases the idle lease and per
     },
     input: [{ role: "user", content: [{ type: "input_text", text: "Generate a title" }] }],
   });
-  const request = () => fetch(`${endpoint}/v1/responses`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
-    body,
-  });
+  const request = async () => {
+    const response = await fetch(`${endpoint}/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+      body,
+    }).catch(error => {
+      // Bun can close the socket before flushing headers when the body fails immediately.
+      expect(error).toMatchObject({ code: "ECONNRESET" });
+      return undefined;
+    });
+    if (response) {
+      expect(response.status).toBe(200);
+      await response.text().catch(() => "");
+    }
+  };
 
   try {
-    const first = await request();
-    expect(first.status).toBe(200);
-    await first.text().catch(() => "");
+    await request();
     expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
       active_http_turns: 0,
       active_remote_turn_idle_leases: 0,
     });
     await Bun.sleep(1_100);
-    const second = await request();
-    expect(second.status).toBe(200);
-    await second.text().catch(() => "");
+    await request();
     expect(upstreamCalls).toBe(2);
   } finally {
     await server.stop(true);
@@ -2850,7 +2856,7 @@ test("a full-mode runtime exposes its broker endpoint before any turn registers"
 
 test("health reports a failed broker startup without deleting the conflicting file", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync(join("/tmp", "cgw-health-fail-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-health-fail-"));
   const path = join(root, "broker.sock");
   writeFileSync(path, "not a socket");
   const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
@@ -2869,7 +2875,7 @@ test("health reports a failed broker startup without deleting the conflicting fi
 
 test("health checks the broker protocol and detects a subsequently lost endpoint", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync(join("/tmp", "cgw-health-lost-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-health-lost-"));
   const path = join(root, "broker.sock");
   const server = startServer({ ...defaultConfig("full"), port: 0, brokerSocketPath: path });
   const broker = TurnBroker.forSocket(path);
@@ -2891,7 +2897,7 @@ test("health checks the broker protocol and detects a subsequently lost endpoint
 
 test("a lost broker rejects new Web work and cannot be made ready by resume", async () => {
   if (process.platform === "win32") return;
-  const root = mkdtempSync("/tmp/cgw-admission-");
+  const root = mkdtempSync(join(tmpdir(), "cgw-admission-"));
   const path = join(root, "broker.sock");
   const config = { ...defaultConfig("full"), port: 0, brokerSocketPath: path };
   let adapterCalls = 0;

@@ -246,7 +246,7 @@ test("DEV runtime supervision ignores launcher version mismatch and starts only 
     releaseVersion: "9.9.9",
     purpose: "dev-harness",
     mode: "full",
-    appName: "Codex Native3 DEV",
+    appName: "Codex Native4 DEV",
     tunnel: {
       binaryPath: path.join(root, "bin", "tunnel-client"),
       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
@@ -2419,7 +2419,7 @@ test("observed CLI fresh-conversation changes retire completed tabs once and def
   const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
   const key = "a".repeat(64);
   const old = { id: "old", traceId: "old-trace", status: "ready", interactionMode: "automatic", conversationKey: key,
-    connectorIdentity: "Codex Native3", connectorBound: true };
+    connectorIdentity: "Codex Native4", connectorBound: true };
   const active = { id: "active", traceId: "active-trace", status: "running", interactionMode: "automatic", conversationKey: key };
   const manual = { id: "manual", status: "ready", interactionMode: "manual", conversationKey: "b".repeat(64) };
   let operation = null, updates = 0;
@@ -2468,7 +2468,7 @@ test("observed CLI fresh-conversation changes retire completed tabs once and def
     assert.deepEqual(removed, [old.id]);
     assert.equal(browserHost.turnTabs.get(active.id), active);
     assert.equal(browserHost.turnTabs.get(manual.id), manual);
-    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native3");
+    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native4");
     assert.equal(lease.reused, false);
     assert.equal(lease.tabId, "new");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
