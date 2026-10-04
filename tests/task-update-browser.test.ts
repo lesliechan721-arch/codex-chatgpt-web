@@ -17,6 +17,7 @@ import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/la
 
 // Helper startup can take 15 seconds; IPC and process cleanup also use the test budget.
 const REAL_HELPER_TIMEOUT_MS = 30_000;
+const REAL_HELPER_IPC_TIMEOUT_MS = 5_000;
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
@@ -29,9 +30,36 @@ function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
     import { ChatGptBrowserWorker, ChatGptCompletionTracker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       if (turn.taskUpdateProtocol !== 1) throw new Error("Task update protocol lost in IPC");
-      await turn.onPreparedSelected(false);
-      await turn.prepare();
-      await turn.onSendActivated();
+      async function step(label, action) {
+        let timer;
+        try {
+          return await Promise.race([
+            Promise.resolve().then(action),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(
+                "Real browser helper timed out during " + label + "; progress="
+                  + JSON.stringify(turn.externalProgress.snapshot())
+              )), ${REAL_HELPER_IPC_TIMEOUT_MS});
+            }),
+          ]);
+        } finally { clearTimeout(timer); }
+      }
+      async function waitForProgress(label, predicate) {
+        const stop = new AbortController();
+        const signal = AbortSignal.any([turn.abortSignal, stop.signal]);
+        try {
+          return await step(label, async () => {
+            let snapshot = turn.externalProgress.snapshot();
+            while (!predicate(snapshot)) {
+              snapshot = await turn.externalProgress.waitForChange(snapshot.revision, signal);
+            }
+            return snapshot;
+          });
+        } finally { stop.abort(); }
+      }
+      await step("prompt selection", () => turn.onPreparedSelected(false));
+      await step("prompt preparation", () => turn.prepare());
+      await step("Send activation", () => turn.onSendActivated());
       ${browserFixture}
     };
     await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
@@ -212,21 +240,19 @@ test("ACK followed by a direct final answer reuses the real source tool observat
 test("real helper preserves one candidate when completion commits before the first final text", async () => {
   const client = realHelperClient(`
     const tracker = new ChatGptCompletionTracker(0);
-    let snapshot = turn.externalProgress.snapshot();
-    if (!snapshot.taskUpdates) snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal);
+    let snapshot = await waitForProgress("initial task state", snapshot => snapshot.taskUpdates !== undefined);
     tracker.observeToolBatch(snapshot.lastToolBatchRevision, "Before tool");
-    await turn.externalProgress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
+    await step("tool observation", () => turn.externalProgress.acknowledgeToolBatch(snapshot.lastToolBatchRevision));
     turn.onSubmitted();
-    do { snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal); }
-    while (snapshot.taskUpdates.acknowledgedRevision !== 1);
+    snapshot = await waitForProgress("task ACK", snapshot => snapshot.taskUpdates?.acknowledgedRevision === 1);
     if (snapshot.activeToolCalls !== 0 || snapshot.lastProgressAt === undefined || snapshot.nativeWaiting)
       throw new Error("Task control fabricated work or a Native lease");
     tracker.beginTaskOutputObservation(snapshot.taskUpdates);
     const candidate = tracker.captureTaskOutputCandidate(snapshot.taskUpdates, "Revised final answer");
     turn.onCommentary("Continuing after acknowledged instructions");
     turn.onReasoningSummary("Checking result");
-    const ticket = await turn.completionFence.begin(candidate);
-    if (!await turn.completionFence.commit(ticket, candidate)) throw new Error("Completion refused");
+    const ticket = await step("completion begin", () => turn.completionFence.begin(candidate));
+    if (!await step("completion commit", () => turn.completionFence.commit(ticket, candidate))) throw new Error("Completion refused");
     turn.onTextDelta("Revised final answer", candidate);
     return "Revised final answer";
   `);
@@ -265,17 +291,59 @@ test("real helper preserves one candidate when completion commits before the fir
   } finally { await client.close(); }
 }, REAL_HELPER_TIMEOUT_MS);
 
+test("real helper accepts an already acknowledged task without waiting for another progress frame", async () => {
+  const client = realHelperClient(`
+    await waitForProgress("task ACK", snapshot => snapshot.taskUpdates?.acknowledgedRevision === 1);
+    return "Already acknowledged";
+  `);
+  const progress = new ChatGptExternalTurnProgress();
+  progress.recordTaskUpdateState({ ...delivered, acknowledgedRevision: 1 });
+  const revision = progress.snapshot().revision;
+  try {
+    expect(await client.run({
+      traceId: "helper_already_acknowledged", modelId: "gpt-5.6-sol", capabilities: {
+        localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false,
+      }, taskUpdateProtocol: 1, externalProgress: progress,
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    })).toBe("Already acknowledged");
+    expect(progress.snapshot().revision).toBe(revision);
+  } finally { await client.close(); }
+}, REAL_HELPER_TIMEOUT_MS);
+
+test("real helper reports the stalled IPC step and progress before the test runner kills it", async () => {
+  const client = realHelperClient(`
+    await waitForProgress("initial task state", snapshot => snapshot.taskUpdates !== undefined);
+    await waitForProgress("task ACK", snapshot => snapshot.taskUpdates?.acknowledgedRevision === 1);
+    throw new Error("Missing ACK unexpectedly arrived");
+  `);
+  const progress = new ChatGptExternalTurnProgress();
+  progress.recordTaskUpdateState(delivered);
+  try {
+    const error = await client.run({
+      traceId: "helper_missing_task_ack", modelId: "gpt-5.6-sol", capabilities: {
+        localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false,
+      }, taskUpdateProtocol: 1, externalProgress: progress,
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    }).catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(
+      `Real browser helper timed out during task ACK; progress=${JSON.stringify(progress.snapshot())}`,
+    );
+    expect(await client.supportsTaskUpdates()).toBeTrue();
+  } finally { await client.close(); }
+}, REAL_HELPER_TIMEOUT_MS);
+
 test("real helper forwards an old completion ticket with its original generation after a delayed update", async () => {
   const client = realHelperClient(`
-    let snapshot = turn.externalProgress.snapshot();
-    if (!snapshot.taskUpdates) snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal);
+    let snapshot = await waitForProgress("initial task state", snapshot => snapshot.taskUpdates !== undefined);
     const tracker = new ChatGptCompletionTracker(0);
     tracker.beginTaskOutputObservation(snapshot.taskUpdates);
     const candidate = tracker.captureTaskOutputCandidate(snapshot.taskUpdates, "Old final answer");
-    const ticket = await turn.completionFence.begin(candidate);
-    do { snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal); }
-    while (snapshot.taskUpdates.driverGeneration !== 1);
-    await turn.completionFence.commit(ticket, candidate);
+    const ticket = await step("completion begin", () => turn.completionFence.begin(candidate));
+    snapshot = await waitForProgress("new driver", snapshot => snapshot.taskUpdates?.driverGeneration === 1);
+    await step("completion commit", () => turn.completionFence.commit(ticket, candidate));
     throw new Error("Old completion unexpectedly succeeded");
   `);
   const progress = new ChatGptExternalTurnProgress();
@@ -421,15 +489,14 @@ test("real helper reads the same-host ACK publication while its progress mirror 
   const directory = mkdtempSync(join(tmpdir(), "task-update-helper-ack-"));
   roots.push(directory);
   const client = realHelperClient(`
-    let snapshot = turn.externalProgress.snapshot();
-    if (!snapshot.taskUpdates) snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal);
+    const snapshot = await waitForProgress("initial task state", snapshot => snapshot.taskUpdates !== undefined);
     if (snapshot.taskUpdates.acknowledgedRevision !== 0) throw new Error("The mirror must still be delayed");
     const tracker = new ChatGptCompletionTracker(0);
     const captured = { ...snapshot.taskUpdates, acknowledgedRevision: observedTaskAcknowledgement(snapshot.taskUpdates) };
     const candidate = tracker.captureTaskOutputCandidate(captured, "Acknowledged answer");
     turn.onTextDelta("Acknowledged answer", candidate);
-    const ticket = await turn.completionFence.begin(candidate);
-    if (!await turn.completionFence.commit(ticket, candidate)) throw new Error("Completion refused");
+    const ticket = await step("completion begin", () => turn.completionFence.begin(candidate));
+    if (!await step("completion commit", () => turn.completionFence.commit(ticket, candidate))) throw new Error("Completion refused");
     return "Acknowledged answer";
   `);
   const progress = new ChatGptExternalTurnProgress();
@@ -459,14 +526,12 @@ test("real helper reads the same-host ACK publication while its progress mirror 
 test("real helper preserves a pre-ACK candidate even after observing the acknowledged head", async () => {
   const client = realHelperClient(`
     const tracker = new ChatGptCompletionTracker(0);
-    let snapshot = turn.externalProgress.snapshot();
-    if (!snapshot.taskUpdates) snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal);
+    let snapshot = await waitForProgress("initial task state", snapshot => snapshot.taskUpdates !== undefined);
     const candidate = tracker.captureTaskOutputCandidate(snapshot.taskUpdates, "Unacknowledged answer");
     turn.onSubmitted();
-    do { snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal); }
-    while (snapshot.taskUpdates.acknowledgedRevision !== 1);
+    snapshot = await waitForProgress("task ACK", snapshot => snapshot.taskUpdates?.acknowledgedRevision === 1);
     turn.onTextDelta("Unacknowledged answer", candidate);
-    await turn.completionFence.begin(candidate);
+    await step("completion begin", () => turn.completionFence.begin(candidate));
     throw new Error("The pre-ACK candidate must not complete");
   `);
   const progress = new ChatGptExternalTurnProgress();
