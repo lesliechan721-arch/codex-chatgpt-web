@@ -1461,6 +1461,8 @@ test("Remote strict answer generated after real ACK succeeds while its owner sta
 
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+// Budget includes helper startup (up to 15 seconds), the real DOM settle loop, and cleanup.
+const REAL_HELPER_TIMEOUT_MS = 30_000;
 const roots: string[] = [];
 afterAll(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
@@ -1569,4 +1571,4 @@ test("Remote strict answer after ACK succeeds when the real helper receives its 
     await helperResult;
     await helper.close();
   }
-});
+}, REAL_HELPER_TIMEOUT_MS);
