@@ -262,7 +262,9 @@ test("real helper preserves one candidate when completion commits before the fir
   const calls: unknown[] = [];
   try {
     expect(await client.supportsTaskUpdates()).toBeTrue();
-    await expect(client.run({
+    // Await IPC before asserting: Bun's .resolves matcher synchronously waits and
+    // can reenter the Windows pipe callback that resolved helper readiness.
+    const result = await client.run({
       traceId: "completed_before_text", modelId: "gpt-5.6-sol", capabilities: {
         localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false,
       },
@@ -280,13 +282,14 @@ test("real helper preserves one candidate when completion commits before the fir
         commit: async (ticket, candidate) => { calls.push(["commit", ticket, candidate]); return true; },
       },
       onTextDelta: (text, candidate) => { calls.push(["text", text, candidate]); },
-    })).resolves.toBe("Revised final answer");
+    });
+    expect(result).toBe("Revised final answer");
     const candidate = { taskRevision: 1, expectedDriverGeneration: 1, acknowledgedRevision: 1 };
     expect(calls).toEqual([
       ["commentary", "Continuing after acknowledged instructions"], ["reasoning", "Checking result"],
       ["begin", candidate], ["commit", 7, candidate], ["text", "Revised final answer", candidate],
     ]);
-    await expect(progress.waitForToolBatchObservation(batch)).resolves.toBeUndefined();
+    expect(await progress.waitForToolBatchObservation(batch)).toBeUndefined();
     expect(progress.snapshot()).toMatchObject({ lastToolBatchRevision: batch, lastProgressAt: 2_000, activeToolCalls: 0 });
   } finally { await client.close(); }
 }, REAL_HELPER_TIMEOUT_MS);
