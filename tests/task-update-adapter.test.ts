@@ -674,6 +674,12 @@ describe("Automatic Adapter task updates", () => {
           taskUpdateErrorRoundReserves: Set<string> };
         const available = () => TASK_UPDATE_SESSION_JOURNAL_BYTES - budget.taskUpdateSourceBytes
           - budget.taskUpdateJournalBytes - budget.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES;
+        // Fill the journal directly and leave 8 KiB for browser commentary and tool events.
+        // Counting tokens for large commentary in the ACK callback can block pending broker IPC.
+        const journalPadding: AdapterEvent = { type: "text_delta", text: "", phase: "commentary" };
+        const journalOverhead = Buffer.byteLength(JSON.stringify([journalPadding]));
+        journalPadding.text = " ".repeat(available() - journalOverhead - 8_192);
+        session.appendRoundEvents(chatGptTurnRoundKey(f.initial), [journalPadding]);
         const progress = turn.externalProgress!;
         const originalAck = progress.acknowledgeToolBatch.bind(progress);
         let filled = false;
@@ -684,8 +690,8 @@ describe("Automatic Adapter task updates", () => {
             const room = available();
             const traceOverhead = Buffer.byteLength(JSON.stringify([""]))
               + Buffer.byteLength(JSON.stringify([{ type: "text_delta", text: "", phase: "commentary" }]));
-            // Fill through normal browser commentary, leaving space for error reservation
-            // but fewer bytes than the original candidate. Spaces keep tokenization bounded.
+            // Fill the remaining space through normal browser commentary, leaving room for
+            // error reservation but fewer bytes than the original candidate.
             const padding = (length: number) => " x".repeat(Math.floor(length / 2)) + (length % 2 ? "x" : "");
             let length = Math.floor((room - traceOverhead - 600 - 24) / 2);
             for (let attempt = 0; attempt < 3; attempt++) {
