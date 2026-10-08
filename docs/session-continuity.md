@@ -15,7 +15,9 @@ prompt must fit the original model's single-input limits before a page is create
 
 The policy requires Full Native tools and Launcher. It preserves the account, model, effort,
 connector, and Zero Risk manual-submission requirements. Luna and Think have no continuity alias.
-Fresh Conversation Per Turn and Bigger Context are incompatible with this policy.
+Fresh Conversation Per Turn is incompatible with this policy. Bigger Context can remain enabled;
+it applies only to non-continuity models. Continuity keeps its fixed history budget and original
+single-input limits without multipart staging.
 
 The catalog advertises a 1,000,000-token execution history window and a 900,000-token
 auto-compaction limit. These are Codex history budgets, not a larger ChatGPT context window or

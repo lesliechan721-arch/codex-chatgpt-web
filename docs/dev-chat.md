@@ -139,9 +139,9 @@ the complete expanded history.
 Any missing or malformed acknowledgement fails the whole transaction. No later part or final
 commit is sent, and a retry starts again from part one in a fresh Temporary Chat. The model context
 and auto-compaction ceilings follow the model and account rules above. Every individual stage
-must still fit the selected ChatGPT mode's measured one-message boundary. Session continuity
-requires Bigger Context to be disabled; its 1,000,000 / 900,000-token history budget does not
-increase that browser input boundary.
+must still fit the selected ChatGPT mode's measured one-message boundary. Bigger Context applies
+only to non-continuity models. Session continuity ignores this preference; its
+1,000,000 / 900,000-token history budget does not increase that browser input boundary.
 
 Small turns use one request. Two-part turns use one inert staging request and one final request;
 six-part turns use five staging requests and one final request. Browser-only compaction also uses

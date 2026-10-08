@@ -67,6 +67,19 @@ test("Bigger Context compaction selects six parts before the legacy inline byte 
     .toEqual([parsed.context.messages[0]!.content]);
 });
 
+test("continuity skips Bigger Context staging and keeps the same usage for ordinary and compaction work", () => {
+  for (const compaction of [false, true]) {
+    const parsed = request(compaction ? "Summarize the task." : "word ".repeat(100_000));
+    parsed._compactionRequest = compaction;
+    parsed._conversationPolicy = "recoverable";
+    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeDefined();
+    parsed._conversationPolicy = "continuity-first";
+    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeUndefined();
+    expect(estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, true))
+      .toEqual(estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, false));
+  }
+});
+
 test("GPT-6 Sol on Plus keeps standard context while Pro can stage the same complete input", () => {
   const plus = { ...capabilities, proAvailable: false };
   const parsed = request("");

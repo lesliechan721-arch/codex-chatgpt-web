@@ -86,7 +86,7 @@ describe("fixed ChatGPT Web model routes", () => {
     }
     for (const conflict of [
       { mode: "browser-only" as const }, { browserHost: "managed-chrome" as const },
-      { experimentalBiggerContext: true }, { experimentalFreshConversationPerTurn: true },
+      { experimentalFreshConversationPerTurn: true },
     ]) {
       const unavailable = { ...config, ...conflict };
       expect(availableChatGptWebModelRoutes(unavailable).some(route => route.conversationPolicy === "continuity-first")).toBe(false);
@@ -144,9 +144,13 @@ describe("fixed ChatGPT Web model routes", () => {
         .toBe(contextWindow);
       expect(resolveChatGptWebTransportLimits(route.backendModel, route.adapterEffort, config).browserMessageTokenLimit)
         .toBe(messageTokens);
-      expect(() => requireChatGptWebModelRoute(route.slug, {
+      const biggerConfig = {
         ...config, experimentalBiggerContext: true,
-      }, effort)).toThrow("Bigger Context to be disabled");
+      };
+      expect(requireChatGptWebModelRoute(route.slug, biggerConfig, effort)).toEqual(route);
+      expect(resolveChatGptWebHistoryLimits(route, biggerConfig))
+        .toEqual(resolveChatGptWebHistoryLimits(route, config));
+      expect(availableChatGptWebModelRoutes(biggerConfig).map(candidate => candidate.slug)).toContain(route.slug);
     }
   });
 

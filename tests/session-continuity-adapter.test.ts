@@ -166,6 +166,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     }
     turn.onContinuityLease!(lease);
     const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
+    expect(compiled.multipart).toBeUndefined();
     submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
     if (turn.nativeConnector) {
       const token = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
@@ -1420,8 +1421,26 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   if (manual) { expect(f.automatic).not.toHaveBeenCalled(); expect(f.compatible).not.toHaveBeenCalled(); }
 });
 
-test("first input preflight rejects the actual over-limit prompt before registration or page creation", async () => {
+test("automatic continuity keeps the same page with Bigger Context enabled and sends each input without staging", async () => {
   const f = fixture();
+  f.provider.chatgptWeb!.experimentalBiggerContext = true;
+  const first = f.request();
+  first.options.reasoning = "medium";
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const next = f.next(first, "turn-next", "word ".repeat(85_000));
+  next.options.reasoning = "medium";
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
+  expect(f.submissions[1]!.reused).toBe(true);
+  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
+  expect(f.submissions[1]!.prompt).not.toContain("word word");
+});
+
+for (const biggerContext of [false, true]) test(`first input preflight rejects over-limit prompts with Bigger Context ${biggerContext}`, async () => {
+  const f = fixture();
+  f.provider.chatgptWeb!.experimentalBiggerContext = biggerContext;
   await expect(f.run(f.request("oversized ".repeat(100_000)))).rejects.toMatchObject({ code: "continuity_input_limit", retryable: false });
   expect(f.registrations.get(continuityDigest(f.threadId))).toBeUndefined();
   expect(f.submissions).toHaveLength(0);
@@ -2049,9 +2068,9 @@ test("disconnect during initial capacity preflight does not consume registration
 
 test("an uninitialized store, old launcher, and conflicting configuration fail before creating a page", async () => {
   const f = fixture();
-  f.provider.chatgptWeb!.experimentalBiggerContext = true;
+  f.provider.chatgptWeb!.experimentalFreshConversationPerTurn = true;
   await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
-  delete f.provider.chatgptWeb!.experimentalBiggerContext;
+  delete f.provider.chatgptWeb!.experimentalFreshConversationPerTurn;
   writeFileSync(f.descriptorPath, JSON.stringify({ ...f.descriptor, features: [] }));
   await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
   writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor));

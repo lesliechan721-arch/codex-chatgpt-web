@@ -198,7 +198,8 @@ the advertised context and compaction thresholds depend on the model and account
 GPT-6 Pro retain three-times budgets. GPT-6 Sol on Pro accounts at Medium, High, or Extra High
 uses a 240,000-token context window and a 220,000-token compaction threshold. GPT-6 Instant and
 GPT-6 Sol on other plans use standard budgets. More parts reduce message size without increasing
-these total limits. Session continuity requires Bigger Context to be disabled; its separate
+these total limits. Bigger Context applies only to non-continuity models. Session continuity
+ignores this preference and does not use multipart staging; its separate
 1,000,000 / 900,000-token history budget does not increase browser input capacity.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control

@@ -140,6 +140,23 @@ describe("native /models augmentation", () => {
     expect(pro.auto_compact_token_limit).toBe(285_000);
   });
 
+  test("Bigger Context expands ordinary models while keeping continuity aliases and their fixed history budgets", () => {
+    const config = {
+      ...defaultConfig("full"), browserHost: "launcher" as const,
+      proAvailable: true, extraHighAvailable: true, experimentalBiggerContext: true,
+    };
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    const aliases = models.filter(model => String(model.slug).startsWith("chatgpt-web-continuity/"));
+    expect(aliases).toHaveLength(6);
+    for (const alias of aliases) {
+      expect(alias).toMatchObject({ context_window: 1_000_000, auto_compact_token_limit: 900_000 });
+    }
+    expect(models.find(model => model.slug === "chatgpt-web/gpt-6-sol"))
+      .toMatchObject({ context_window: 240_000, auto_compact_token_limit: 220_000 });
+    expect(models.find(model => model.slug === "chatgpt-web/gpt-5.6-sol"))
+      .toMatchObject({ context_window: 333_579, auto_compact_token_limit: 285_000 });
+  });
+
   test("publishes measured GPT-6 context by account and effort while preserving GPT-5.6 and Pro budgets", () => {
     for (const proAvailable of [false, true]) {
       const config = {

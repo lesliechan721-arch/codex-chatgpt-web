@@ -563,8 +563,7 @@ export function isChatGptWebModelSlug(modelId: string): boolean {
 export function chatGptWebContinuityAvailable(capabilities: ChatGptWebAccountCapabilities): boolean {
   return capabilities.mode === "full"
     && capabilities.browserHost === "launcher"
-    && !capabilities.experimentalFreshConversationPerTurn
-    && !capabilities.experimentalBiggerContext;
+    && !capabilities.experimentalFreshConversationPerTurn;
 }
 
 function withContinuityRoutes(
@@ -584,10 +583,9 @@ export function resolveChatGptWebHistoryLimits(
     & { modelFamily?: ChatGptWebModelFamily },
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebContextLimits {
-  const base = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, capabilities, route.modelFamily);
   return route.conversationPolicy === "continuity-first"
     ? contextLimits(CHATGPT_WEB_CONTINUITY_CONTEXT_WINDOW, CHATGPT_WEB_CONTINUITY_AUTO_COMPACT_TOKEN_LIMIT)
-    : base;
+    : resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, capabilities, route.modelFamily);
 }
 
 export function availableChatGptWebModelRoutes(
@@ -632,8 +630,8 @@ export function requireChatGptWebModelRoute(
   const route = routesBySlug.get(modelId);
   if (!route) throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
   if (route.conversationPolicy === "continuity-first") {
-    if (capabilities.experimentalFreshConversationPerTurn || capabilities.experimentalBiggerContext) {
-      throw new Error("Session continuity first requires Fresh Conversation Per Turn and Bigger Context to be disabled");
+    if (capabilities.experimentalFreshConversationPerTurn) {
+      throw new Error("Session continuity first requires Fresh Conversation Per Turn to be disabled");
     }
     if (!chatGptWebContinuityAvailable(capabilities)) {
       throw new Error("Session continuity first is not enabled: Launcher and Native-tool support are required");

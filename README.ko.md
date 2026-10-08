@@ -194,7 +194,7 @@ bun run app:package
 
 `dev:launcher`는 `~/.codex-chatgpt-web-dev`의 별도 프로필과 계정을 사용합니다. `dev:chat`은 실제 브라우저와 compaction 경로를 사용하며, 도구 결과는 명시적인 시뮬레이션입니다. 일반 Codex 경로는 변경하지 않습니다. 설정과 명령은 [DEV chat harness](docs/dev-chat.md)를 참고하세요.
 
-[세션 연속성 우선](docs/session-continuity.md)은 compaction 후에도 동일한 대화를 유지하며, 기존 페이지를 잃으면 다시 만들지 않고 중지합니다. 호환되는 Full Native + Launcher 구성에서는 선택형 `chatgpt-web-continuity/` 별칭을 제공합니다. Fresh Conversation Per Turn과 Bigger Context는 계속 호환되지 않습니다. 더 큰 Codex 기록 예산은 ChatGPT의 단일 입력 한도를 늘리거나 기존 모델을 변경하지 않습니다.
+[세션 연속성 우선](docs/session-continuity.md)은 compaction 후에도 동일한 대화를 유지하며, 기존 페이지를 잃으면 다시 만들지 않고 중지합니다. 호환되는 Full Native + Launcher 구성에서는 선택형 `chatgpt-web-continuity/` 별칭을 제공합니다. Fresh Conversation Per Turn은 계속 호환되지 않습니다. Bigger Context는 켜 둬도 되며 Continuity first가 아닌 모델에만 적용됩니다. 더 큰 Codex 기록 예산은 ChatGPT의 단일 입력 한도를 늘리거나 기존 모델을 변경하지 않습니다.
 
 </details>
 

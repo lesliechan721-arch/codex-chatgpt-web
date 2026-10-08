@@ -177,7 +177,7 @@ export async function prepareContinuityRequest(
   const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
   if (parsed._conversationPolicy !== "continuity-first" || !config?.continuityStateDirectory
     || !config.localToolsEnabled || config.browserHost !== "launcher" || !config.browserHostDescriptorPath
-    || config.experimentalBiggerContext || config.experimentalFreshConversationPerTurn
+    || config.experimentalFreshConversationPerTurn
     || (config.browserInteractionMode === "manual") !== manual
     || (!manual && parsed.modelId !== CHATGPT_WEB_MODEL_ID)) throw continuityError("continuity_configuration_conflict");
   const descriptor = resolve(expandUserPath(config.browserHostDescriptorPath));

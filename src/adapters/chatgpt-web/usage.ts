@@ -71,6 +71,9 @@ export function resolveBiggerContextMultipartParts(
   capabilities: ChatGptWebCapabilities,
   experimentalSkillAttachments = false,
 ): ChatGptWebMultipartPartCount | undefined {
+  // Continuity keeps one page and its original single-input limits. The shared preference
+  // applies only to recoverable routes, including prompt staging and usage estimates.
+  if (parsed._conversationPolicy === "continuity-first") return undefined;
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
     throw new Error("Bigger Context is unavailable for ChatGPT Zero Risk");
   }
