@@ -192,6 +192,7 @@ test("CLI refresh-models rewrites only the model catalog", () => withHome(home =
   assert.ok(!refreshed.out.includes(localKey));
 }));
 
+// Both catalog commands share this timeout; allow for slower Windows CLI startups.
 test("CLI manual remote refresh-models keeps catalog export pending until explicit Codex export", () => withHome(home => {
   const localKey = "cgw_" + "e".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
@@ -217,7 +218,7 @@ test("CLI manual remote refresh-models keeps catalog export pending until explic
   assert.equal(exported.code, 0, exported.err);
   assert.ok(Array.isArray(JSON.parse(JSON.parse(exported.out).catalog).models));
   assert.equal(existsSync(pending), false);
-}));
+}), 15_000);
 
 test("concurrent CLI catalog commands preserve the marker state of the later command", async () => {
   async function runRace(
