@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
@@ -34,7 +35,8 @@ function resultStorage(session: ReturnType<Awaited<ReturnType<typeof fixture>>["
 }
 
 async function fixture(manual = false, protocol = true, search = false) {
-  const root = mkdtempSync("/tmp/cgw-cont-update-");
+  // Keep Unix socket paths short; Windows uses its system temp directory and named pipes.
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-update-"));
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     if (new URL(request.url).pathname.endsWith("continuity-capacity")) return Response.json({ ok: true, available: true });

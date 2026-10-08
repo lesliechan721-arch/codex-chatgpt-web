@@ -137,11 +137,12 @@ try {
     .toSorted((left, right) => (typeof left.priority === "number" ? left.priority : Number.MAX_SAFE_INTEGER)
       - (typeof right.priority === "number" ? right.priority : Number.MAX_SAFE_INTEGER))[0]?.slug;
   if (typeof nativeSpawnLeader !== "string") throw new Error("Codex smoke catalog has no native API model for the V1 roster");
+  // V1 has five slots: the native leader, reasoning/Pro routes, then Instant if space remains.
   const expectedSpawnOverrides = [
     nativeSpawnLeader,
-    ...CHATGPT_WEB_MODEL_ROUTES.slice(1).map(route => route.slug),
-    "chatgpt-web/gpt-5.6-sol-instant",
-  ];
+    ...CHATGPT_WEB_MODEL_ROUTES.filter(route => route.adapterEffort !== "low").map(route => route.slug),
+    ...CHATGPT_WEB_MODEL_ROUTES.filter(route => route.adapterEffort === "low").map(route => route.slug),
+  ].slice(0, 5);
   if (JSON.stringify(spawnOverrides) !== JSON.stringify(expectedSpawnOverrides)) {
     throw new Error(`Codex did not preserve the bounded V1 subagent roster: ${JSON.stringify(spawnOverrides)}`);
   }
