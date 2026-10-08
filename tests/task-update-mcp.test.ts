@@ -69,7 +69,8 @@ describe("MCP task-update public-result projection", () => {
       kind: "inventory", offset: 0, includeSchema: false,
       directPage: [{ wire_name: "direct", kind: "function" }], directTotal: 1,
       excludedNames: [], nestedLimit: 1, discoveryTools: [],
-    }, nativePublicResult({ tools: [{ name: "outside", description: "outside tool" }], total: 1 }));
+      catalogMarker: "codex-tool-catalog:task-update-test:",
+    }, { content: [{ type: "text", text: 'codex-tool-catalog:task-update-test:{"tools":[{"name":"outside","description":"outside tool"}],"total":1}' }] });
     const first = encodeTaskUpdateMcpResult(original, delivery());
     const later = encodeTaskUpdateMcpResult(original, delivery(2));
     expect(envelope(first).native_result).toEqual(original);

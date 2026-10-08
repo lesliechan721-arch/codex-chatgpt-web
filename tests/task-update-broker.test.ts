@@ -288,7 +288,11 @@ for (const remote of [false, true]) describe(`${remote ? "Remote" : "Local"} tas
       await callTurnBroker(f.socket, { method: "native_operation_start", token: f.token, contract: "native", nativeWaitProtocol: 1,
         taskUpdateProtocol: 1, taskRevision: 0, operationId: 1, entry: "codex_tool_inventory", nativeInput: { query: "missing candidate" }, waitMs: 1 });
       const [call] = await f.owner.nextToolBatch(f.token, undefined, context(0));
-      const catalog = { content: [{ type: "text", text: JSON.stringify({ tools: [], total: 0 }) }], structuredContent: { tools: [], total: 0 } };
+      const catalog: BrokerToolResult = { content: [] };
+      const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+      await new AsyncFunction("ALL_TOOLS", "text", call!.input!)([], (text: string) => {
+        catalog.content.push({ type: "text", text });
+      });
       const value = f.transfer("inventory", 0, [{ callId: call!.callId, result: catalog }], "results", "{\"tools\":[{\"name\":\"fake\"}],\"total\":1}");
       value.environment = { ...f.capability, tools: [] };
       await f.accept(value);

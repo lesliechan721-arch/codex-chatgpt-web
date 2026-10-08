@@ -2998,7 +2998,13 @@ class BrowserHost {
     const operation = this.withManualOperation("session refresh", async () => {
       this.setState({ status: "loading", message: "Checking saved ChatGPT session" });
       if (!isTemporaryChatUrl(this.view.webContents.getURL())) {
-        await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+        try {
+          await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+        } catch (error) {
+          // ChatGPT may replace the home navigation with its sign-in page. The
+          // observed auth URL is a signed-out state, not a broken installation.
+          if (!isAbortedNavigationError(error) || !allowedAuthUrl(this.view.webContents.getURL())) throw error;
+        }
       }
       const state = await this.probeAuthentication();
       if (state.authenticated) {
@@ -3007,7 +3013,14 @@ class BrowserHost {
       return this.snapshot();
     });
     let tracked;
-    tracked = operation.finally(() => {
+    tracked = operation.catch((error) => {
+      this.setState({
+        status: "error",
+        message: "Could not check ChatGPT sign-in. Open sign in to try again.",
+        loading: false,
+      });
+      throw error;
+    }).finally(() => {
       if (this.sessionRefreshOperation === tracked) this.sessionRefreshOperation = null;
     });
     this.sessionRefreshOperation = tracked;
@@ -3033,7 +3046,8 @@ class BrowserHost {
         });
         return this.snapshot();
       }
-      if (!url.startsWith(CHATGPT_ORIGIN)) {
+      const awaitingLogin = allowedAuthUrl(url) && this.manualOperation !== "ChatGPT login" && !this.authView;
+      if (awaitingLogin || !url.startsWith(`${CHATGPT_ORIGIN}/`)) {
         this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
         return this.snapshot();
       }

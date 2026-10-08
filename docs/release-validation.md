@@ -28,8 +28,12 @@ a newer stable release. Launchers discover it on their next startup update check
 version is newer and its platform asset and checksums are present. Already running launchers
 do not poll for publication changes.
 
-The tag workflow marks new suffixed versions such as `v6.0.0-rc.1` as pre-releases automatically
-and preserves an existing release's pre-release flag when rerun.
+This fork's installers and launcher updater use releases from
+`lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
+`6.1.7-1` follows `6.1.7`, and `6.1.7-2` follows `6.1.7-1`.
+The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an
+existing release's pre-release flag when rerun. Other preview builds must have that flag set
+explicitly before publication. Named version suffixes retain preview ordering below the base release.
 Use a new version for changed binaries; toggling publication flags promotes the existing build.
 Do not publish a stable tag and only mark it as a pre-release afterwards: an older launcher could
 offer it during that interval. To keep a final version out of the updater during testing,

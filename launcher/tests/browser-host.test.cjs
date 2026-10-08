@@ -2356,6 +2356,39 @@ test("concurrent launcher session refresh requests share one browser operation",
   assert.equal(fixture.sessionRefreshOperation, null);
 });
 
+test("startup sign-in redirects become signed-out state while real navigation errors remain errors", async () => {
+  for (const redirected of [true, false]) {
+    let url = IDLE_BROWSER_URL;
+    const failure = Object.assign(new Error("navigation stopped"), { code: -3 });
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      state: { authenticated: true },
+      snapshot() { return { ...this.state }; },
+      setState(patch) { Object.assign(this.state, patch); },
+      withManualOperation: async (_name, action) => await action(),
+      view: { webContents: {
+        isDestroyed: () => false,
+        getURL: () => url,
+        loadURL: async () => {
+          if (redirected) url = "https://chatgpt.com/auth/login?next=%2F";
+          throw failure;
+        },
+        executeJavaScript: async () => { throw new Error("must not probe a login page"); },
+      } },
+    });
+    if (redirected) {
+      const state = await fixture.refreshAuthentication();
+      assert.equal(state.status, "signed-out");
+      assert.equal(state.authenticated, false);
+      assert.equal(state.message, "Sign in to ChatGPT");
+    } else {
+      await assert.rejects(fixture.refreshAuthentication(), error => error === failure);
+      assert.equal(fixture.state.status, "error");
+      assert.equal(fixture.state.loading, false);
+    }
+    assert.equal(fixture.sessionRefreshOperation, null);
+  }
+});
+
 test("manual browser operations disable background throttling until completion", async () => {
   const throttling = [];
   const surfaces = [];

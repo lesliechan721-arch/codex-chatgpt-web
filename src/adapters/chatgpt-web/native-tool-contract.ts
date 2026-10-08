@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
@@ -53,6 +54,7 @@ export type NativeResultContract = { kind: "pass-through" } | {
   excludedNames: string[];
   nestedLimit: number;
   discoveryTools: Array<Record<string, unknown>>;
+  catalogMarker: string;
 };
 
 export type NativeToolPlan = {
@@ -139,16 +141,22 @@ export function planNativeTool(
           ...(include_schema ? { parameters: browserToolParameters(tool) } : {}),
         });
         const directPage = matches.slice(offset, offset + limit).map(descriptor);
+        // Bind the record marker at admission with the fixed finalizer, so retry and wait
+        // accept only the output of this operation's original native gateway request.
+        const catalogMarker = `codex-tool-catalog:${randomBytes(16).toString("hex")}:`;
         const resultContract: NativeResultContract = {
           kind: "inventory", offset, includeSchema: include_schema, directPage, directTotal: matches.length,
           excludedNames: bound.tools.map(wireName), nestedLimit: Math.max(0, limit - directPage.length),
           discoveryTools: needle ? visibleTools.filter(tool => tool.toolSearch).map(descriptor) : [],
+          catalogMarker,
         };
         const gateway = execGateway(bound);
-        if (!gateway) return { result: finishNativeToolResult(resultContract, nativePublicResult({ tools: [], total: 0 })) };
+        if (!gateway) return { result: finishNativeToolResult(resultContract, {
+          content: [{ type: "text", text: catalogMarker + JSON.stringify({ tools: [], total: 0 }) }],
+        }) };
         return {
           tool: gateway,
-          payload: { input: gatewayToolCatalogProgram({ query, offset: Math.max(0, offset - matches.length), limit: resultContract.nestedLimit, excludedNames: resultContract.excludedNames }) },
+          payload: { input: gatewayToolCatalogProgram({ query, offset: Math.max(0, offset - matches.length), limit: resultContract.nestedLimit, excludedNames: resultContract.excludedNames, marker: catalogMarker }) },
           resultContract,
         };
       }
@@ -188,7 +196,7 @@ export function planNativeTool(
 /** A fixed, Broker-owned finalizer. It never executes model-provided code. */
 export function finishNativeToolResult(contract: NativeResultContract, response: BrokerToolResult): BrokerToolResult {
   if (contract.kind === "pass-through") return structuredClone(response);
-  const catalog = gatewayToolCatalogPage(response, new Set(contract.excludedNames));
+  const catalog = gatewayToolCatalogPage(response, new Set(contract.excludedNames), contract.catalogMarker);
   if (catalog.tools.length > contract.nestedLimit || catalog.tools.length > catalog.total) {
     throw new Error("Native nested tool inventory returned invalid pagination");
   }
@@ -361,6 +369,7 @@ function gatewayToolCatalogProgram(options: {
   offset: number;
   limit: number;
   excludedNames: string[];
+  marker: string;
 }): string {
   const needle = options.query?.trim().toLowerCase() ?? "";
   return [
@@ -375,14 +384,14 @@ function gatewayToolCatalogProgram(options: {
     "  .map(tool => ({ name: tool.name, description: typeof tool.description === \"string\" ? tool.description : \"\" }))",
     "  .filter(tool => !needle || (tool.name + \"\\n\" + tool.description).toLowerCase().includes(needle));",
     `const page = matches.slice(${options.offset}, ${options.offset + options.limit});`,
-    "text(JSON.stringify({ tools: page, total: matches.length }));",
+    `text(${JSON.stringify(options.marker)} + JSON.stringify({ tools: page, total: matches.length }));`,
   ].join("\n");
 }
 
 function gatewayToolCatalogPage(response: {
   content: unknown[];
   isError?: boolean;
-}, excludedNames: ReadonlySet<string>): GatewayToolCatalogPage {
+}, excludedNames: ReadonlySet<string>, marker: string): GatewayToolCatalogPage {
   const textBlocks = response.content
     .map(item => item && typeof item === "object" && !Array.isArray(item)
       ? item as Record<string, unknown>
@@ -392,12 +401,16 @@ function gatewayToolCatalogPage(response: {
   if (response.isError) {
     throw new Error("Native nested tool inventory failed");
   }
-  if (textBlocks.length !== 1) {
-    throw new Error("Native nested tool inventory returned an invalid text response");
+  // exec may wrap text() output with timing/status text. Only this request's single
+  // marked line is a catalog; surrounding JSON and another operation's output are not.
+  const records = textBlocks.flatMap(text => text.split(/\r?\n/))
+    .filter(line => line.startsWith(marker));
+  if (records.length !== 1) {
+    throw new Error("Native nested tool inventory did not return one matching catalog record");
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(textBlocks[0]!);
+    parsed = JSON.parse(records[0]!.slice(marker.length));
   } catch {
     throw new Error("Native nested tool inventory returned invalid JSON");
   }

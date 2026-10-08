@@ -2,12 +2,12 @@ import { skillFileTokens } from "./skill-attachments";
 import { estimateTokens } from "../../lib/token-estimate";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
-  CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
   CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR,
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
   resolveChatGptWebTransportLimits,
+  supportsChatGptWebBiggerContext,
 } from "../../chatgpt-web-models";
 import type { CodexParsedRequest, CodexUsage } from "../../types";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "./input-tokens";
@@ -78,11 +78,17 @@ export function resolveBiggerContextMultipartParts(
     throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
   }
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
+  if (!supportsChatGptWebBiggerContext(parsed.modelId, mode.effort, capabilities, parsed._chatgptModelFamily)) return undefined;
   if (parsed._compactionRequest) return CHATGPT_BIGGER_CONTEXT_PARTS;
   const { contextWindow, autoCompactTokenLimit } = resolveChatGptWebContextLimits(
     CHATGPT_WEB_BACKEND_MODEL,
     mode.effort,
     { ...capabilities, experimentalBiggerContext: false },
+    parsed._chatgptModelFamily,
+  );
+  const { contextWindow: expandedContextWindow } = resolveChatGptWebContextLimits(
+    CHATGPT_WEB_BACKEND_MODEL, mode.effort,
+    { ...capabilities, experimentalBiggerContext: true }, parsed._chatgptModelFamily,
   );
   const compile = (parts?: ChatGptWebMultipartPartCount): CompiledChatGptWebPrompt => compileChatGptWebPrompt(
     parsed, capabilities, mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
@@ -91,6 +97,8 @@ export function resolveBiggerContextMultipartParts(
   const inline = compile();
   const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
   const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit, false);
+  // This is a transport plan. The browser preflight enforces the total family window even when
+  // all six parts are needed; selecting more parts never admits input above that window.
   if (initialParts === CHATGPT_BIGGER_CONTEXT_PARTS) return initialParts;
 
   const fits = (compiled: CompiledChatGptWebPrompt): boolean => {
@@ -109,7 +117,7 @@ export function resolveBiggerContextMultipartParts(
       if (estimateTokens(text, parsed.modelId) > budget) return false;
     }
     return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId)
-      < contextWindow * Math.min(messages.length, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER);
+      < Math.min(expandedContextWindow, contextWindow * messages.length);
   };
   if (initialParts === undefined && fits(inline)) return undefined;
   return fits(compile(2)) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;

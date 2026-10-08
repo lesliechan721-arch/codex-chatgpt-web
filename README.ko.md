@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6-1/codex-web-gpt-6.1.6-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6-1/codex-web-gpt-6.1.6-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6-1/codex-web-gpt-6.1.6-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-1/codex-web-gpt-6.1.7-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-1/codex-web-gpt-6.1.7-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-1/codex-web-gpt-6.1.7-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.1.6-1/codex-web-gpt-6.1.6-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">모든 릴리스</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-1/codex-web-gpt-6.1.7-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">모든 릴리스</a>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="#get-started">시작하기</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases">업데이트</a> · <a href="docs/architecture.md">아키텍처</a> · <a href="TROUBLESHOOTING.md">문제 해결</a>
+  <a href="#get-started">시작하기</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases">업데이트</a> · <a href="docs/architecture.md">아키텍처</a> · <a href="TROUBLESHOOTING.md">문제 해결</a>
 </p>
 
 Codex의 네이티브 모델 선택기에서 Pro를 포함해 계정에 제공되는 ChatGPT Web 모델을 사용하세요. ChatGPT Web의 별도 사용 한도를 사용하므로 Work나 Codex의 사용량은 차감되지 않습니다. 기존 인터페이스, 작업, 이미지, 스트리밍은 그대로 유지됩니다.
@@ -49,13 +49,13 @@ Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미�
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 </details>
@@ -92,8 +92,13 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 > GPT-5.6 Sol Pro 및 GPT-6 Astra의 현재 ChatGPT 메시지 허용량은
 > [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)를 참고하세요.
 > 컨텍스트 한도는 계정 유형과 선택한 effort에 따라 달라집니다. Plus의 Medium/High는 실측
-> 90,000-token 창을 사용하며, 실험적 3× context를 활성화하면 최대 270,000 tokens까지 확장됩니다.
-> 모든 경우에 네이티브 Codex compaction이 지원됩니다.
+> 90,000-token 창을 사용합니다. GPT-5.6은 실험적 3× context를 활성화하면 최대 270,000 tokens까지
+> 확장되며, 네이티브 Codex compaction을 지원합니다.
+>
+> GPT-6 Sol의 Bigger Context는 Pro 계정의 Medium, High, Extra High에서만 지원합니다.
+> 컨텍스트 창은 **240,000 tokens**이며 **220,000 tokens**에서 압축합니다. GPT-6 Instant와
+> 다른 요금제의 GPT-6 Sol은 표준 용량을 사용합니다.
+> GPT-5.6과 GPT-6 Pro는 기존 Bigger Context 한도를 유지합니다.
 
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.
@@ -170,7 +175,7 @@ Temporary Chat은 [ChatGPT의 개인정보 보호 모드](https://help.openai.co
 <a id="development"></a>
 
 ```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
+git clone https://github.com/lesliechan721-arch/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```

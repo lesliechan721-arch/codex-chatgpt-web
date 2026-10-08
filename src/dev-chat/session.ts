@@ -5,6 +5,8 @@ import { atomicWriteFile } from "../config";
 import { estimateTokens } from "../lib/token-estimate";
 
 export const DEV_CHAT_MODELS = [
+  "chatgpt-web/gpt-6-sol-instant",
+  "chatgpt-web/gpt-6-sol",
   "chatgpt-web/gpt-5.6-luna",
   "chatgpt-web/gpt-5.6-sol-instant",
   "chatgpt-web/gpt-5.6-sol",
@@ -20,6 +22,8 @@ export const DEV_CHAT_MODELS = [
   "chatgpt-web/extra-high",
   "chatgpt-web/pro",
   // Parsing/persistence does not bypass trusted route release and mode admission checks.
+  "chatgpt-web-continuity/gpt-6-sol-instant",
+  "chatgpt-web-continuity/gpt-6-sol",
   "chatgpt-web-continuity/gpt-5.6-sol-instant",
   "chatgpt-web-continuity/gpt-5.6-sol",
   "chatgpt-web-continuity/gpt-5.6-pro",

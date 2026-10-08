@@ -162,7 +162,7 @@ describe("Native operation identity and independent result queries", () => {
     try {
       store.start(1, "codex_tool_inventory", {}, () => ({
         request: { callId: "inventory", wireName: "exec", freeform: true, input: "inert catalog" },
-        resultContract: { kind: "inventory", offset: 0, includeSchema: true, directPage: [], directTotal: 0, excludedNames: [], nestedLimit: 20, discoveryTools: [] },
+        resultContract: { kind: "inventory", offset: 0, includeSchema: true, directPage: [], directTotal: 0, excludedNames: [], nestedLimit: 20, discoveryTools: [], catalogMarker: "codex-tool-catalog:compaction-test:" },
       }));
       expect(await store.wait(1, undefined, 1)).toMatchObject({ kind: "pending" });
       store.complete(1, nativePublicResult({ checkpoint: "control-not-catalog" }), "compaction");

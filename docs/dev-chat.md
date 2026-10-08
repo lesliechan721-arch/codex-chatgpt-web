@@ -104,14 +104,17 @@ that ChatGPT will follow them more reliably.
 Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by
 default. The switch updates the profile's canonical runtime configuration through the normal setup
 transaction; it is not a launcher-only preference. Production setup also rewrites the managed
-Codex model catalog with 3x context and auto-compaction thresholds and asks you to restart Codex.
+Codex model catalog with the selected model's context and auto-compaction thresholds and asks
+you to restart Codex. GPT-5.6 and GPT-6 Pro keep their three-times budgets. GPT-6 Sol uses
+240,000 context tokens and a 220,000-token compaction threshold only on Pro accounts at Medium,
+High, or Extra High. GPT-6 Instant and GPT-6 Sol on other account plans keep standard budgets.
 The DEV CLI reads the same setting from its isolated runtime configuration on each command.
 
 When enabled, a normal turn stays on the original single-message path while its estimated input
 is below the selected mode's existing auto-compaction threshold. At the first threshold it uses two
 messages; at twice that threshold it uses six messages. The final context part also commits the
 transaction and starts the task, so there is no extra request. The existing DEV compaction threshold
-remains three times the selected mode's base limit.
+uses the same model- and account-specific budget as the production catalog.
 
 Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
 must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.
@@ -135,8 +138,10 @@ the complete expanded history.
 
 Any missing or malformed acknowledgement fails the whole transaction. No later part or final
 commit is sent, and a retry starts again from part one in a fresh Temporary Chat. The model context
-and auto-compaction ceilings are reported as 3× while the switch is active, but every individual
-stage must still fit the selected ChatGPT mode's measured one-message boundary.
+and auto-compaction ceilings follow the model and account rules above. Every individual stage
+must still fit the selected ChatGPT mode's measured one-message boundary. Session continuity
+requires Bigger Context to be disabled; its 1,000,000 / 900,000-token history budget does not
+increase that browser input boundary.
 
 Small turns use one request. Two-part turns use one inert staging request and one final request;
 six-part turns use five staging requests and one final request. Browser-only compaction also uses

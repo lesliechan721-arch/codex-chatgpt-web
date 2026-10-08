@@ -749,7 +749,9 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     expect(config().autoApproveToolCalls).toBe(true);
     await RuntimeHost.prototype.setAutoApproveToolCalls.call(host, false);
     expect(config().autoApproveToolCalls).toBe(false);
-    expect(capabilityDetections).toEqual([true, false, false, true, false]);
+    // Only initial setup and explicit model refresh inspect the browser account.
+    // Local policy changes reuse the saved capabilities without a session probe.
+    expect(capabilityDetections).toEqual([true, true]);
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);
     expect(existsSync(join(devHome, "codex-home", "config.toml"))).toBe(false);
   } finally {

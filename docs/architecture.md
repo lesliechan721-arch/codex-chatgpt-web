@@ -194,8 +194,12 @@ composer budgets. Inert stages carry text; the final message also carries all re
 the execution contract and any output schema. Their reserves are deducted before partitioning,
 then preflight checks the actual compiled messages and total transaction. The selected execution
 effort and attachment references remain unchanged. Large transactions use up to six messages;
-the advertised context and compaction thresholds remain three times the base limits. More parts
-reduce message size, not the amount of history retained.
+the advertised context and compaction thresholds depend on the model and account. GPT-5.6 and
+GPT-6 Pro retain three-times budgets. GPT-6 Sol on Pro accounts at Medium, High, or Extra High
+uses a 240,000-token context window and a 220,000-token compaction threshold. GPT-6 Instant and
+GPT-6 Sol on other plans use standard budgets. More parts reduce message size without increasing
+these total limits. Session continuity requires Bigger Context to be disabled; its separate
+1,000,000 / 900,000-token history budget does not increase browser input capacity.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool

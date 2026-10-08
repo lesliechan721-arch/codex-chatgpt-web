@@ -56,7 +56,7 @@ function routedModelPriority(
   }
   if (priority === undefined
     || config.subagentProtocol !== "compatibility-v1"
-    || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant"].includes(route.slug)) return priority;
+    || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-6-sol-instant"].includes(route.slug)) return priority;
   if (priority === Number.MAX_SAFE_INTEGER) {
     throw new Error("Native Codex model template priority cannot reserve the Compatibility V1 roster");
   }

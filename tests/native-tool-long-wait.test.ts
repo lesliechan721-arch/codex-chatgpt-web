@@ -14,6 +14,15 @@ const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 let sequence = 0;
 
+async function executeCatalog(program: string): Promise<BrokerToolResult> {
+  const content: Array<{ type: "text"; text: string }> = [];
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  await new AsyncFunction("ALL_TOOLS", "text", program)([], (text: string) => {
+    content.push({ type: "text", text });
+  });
+  return { content };
+}
+
 async function fixture(contract: "native" | "safe", tools: CodexTool[] = [{
   name: "exec_command", description: "Execute in the outer harness",
   parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"], additionalProperties: false },
@@ -132,7 +141,7 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
       const [request] = await f.broker.nextToolBatch(f.token);
       expect(request?.wireName).toBe("exec");
       f.broker.updateEnvironment(f.token, { ...f.capability, tools: [] });
-      f.broker.completeTool(f.token, request!.callId, nativePublicResult({ tools: [], total: 0 }));
+      f.broker.completeTool(f.token, request!.callId, await executeCatalog(request!.input!));
       const publicResult = await f.wait(1);
       expect(publicResult).toMatchObject({ kind: "result", result: { structuredContent: {
         tools: [], total: 0, next_offset: null,
@@ -152,7 +161,7 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
       const queued = await f.wait(2);
       expect(queued).toMatchObject({ kind: "result", result: { structuredContent: { checkpoint: "control, not inventory" }, _meta: { "codex/native-control": { kind: "compaction" } } } });
       expect(await f.wait(1)).toMatchObject({ kind: "pending" });
-      f.broker.completeTool(f.token, waiting!.callId, nativePublicResult({ tools: [], total: 0 }));
+      f.broker.completeTool(f.token, waiting!.callId, await executeCatalog(waiting!.input!));
       expect(await f.wait(1)).toMatchObject({ kind: "result", result: { structuredContent: { total: contract === "native" ? 1 : 0 } } });
       expect(await f.wait(2)).toEqual(queued);
       expect(f.broker.compactionDeliveryCount(f.token)).toBe(1);

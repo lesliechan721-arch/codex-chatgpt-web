@@ -180,7 +180,31 @@ test("DEV persistence preserves full continuity slugs without changing the defau
   const { state } = store.loadOrCreate("continuity", "chatgpt-web-continuity/gpt-5.6-sol", root);
   store.save(state);
   expect(store.load("continuity")?.model).toBe("chatgpt-web-continuity/gpt-5.6-sol");
+  for (const suffix of ["sol-instant", "sol"] as const) {
+    const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
+    expect(DEV_CHAT_MODELS).toContain(model);
+    const { state: six } = store.loadOrCreate(`six-${suffix}`, model, root);
+    store.save(six);
+    expect(store.load(`six-${suffix}`)?.model).toBe(model);
+  }
   expect(defaultDevChatModel(defaultConfig("full"))).not.toContain("continuity");
+});
+
+test("GPT-6 continuity DEV status uses the canonical history budget", () => {
+  const root = scratch("cgw-dev-six-continuity-context");
+  const driver = new DevChatDriver(
+    { ...defaultConfig("full"), browserHost: "launcher" },
+    new DevChatStore(join(root, "chats")),
+    (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
+    root,
+  );
+  for (const suffix of ["sol-instant", "sol"] as const) {
+    const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
+    const { state } = driver.open(suffix, model);
+    expect(driver.status(state)).toMatchObject({
+      model, contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
+    });
+  }
 });
 
 test("Zero Risk DEV chats open only the selected profile route", () => {
@@ -281,6 +305,15 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
     contextWindow: 333_579,
   });
   expect(biggerStatus.percent).toBe(Math.round((biggerStatus.inputTokens / 285_000) * 1_000) / 10);
+  for (const [model, contextWindow, autoCompactTokenLimit] of [
+    ["chatgpt-web/gpt-6-sol", 240_000, 220_000],
+    ["chatgpt-web/gpt-6-sol-instant", 111_193, 95_000],
+  ] as const) {
+    const state = bigger.open(model.split("/")[1]!, model).state;
+    expect(bigger.status(state)).toMatchObject({ contextWindow, autoCompactTokenLimit });
+  }
+  const proState = bigger.open("six-pro", "chatgpt-web/gpt-6-pro").state;
+  expect(bigger.status(proState)).toMatchObject({ contextWindow: 336_579, autoCompactTokenLimit: 285_000 });
   const luna = new DevChatDriver({
     ...biggerConfig,
     solAvailable: false,
