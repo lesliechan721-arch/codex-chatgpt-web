@@ -97,6 +97,51 @@ test("Pro preserves the same native Codex delegation contract as Extra High", ()
   }
 });
 
+test("local task prompts batch content and retry unexplained safety-check rejections without replacing other error rules", () => {
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  const token = "turn_12345678901234567890123456789012";
+  const manual = request("high");
+  manual.modelId = "chatgpt-web-zero-risk";
+  const prompts = [
+    compileChatGptWebPrompt(request("high"), capabilities, token),
+    compileChatGptWebPrompt(request("high"), capabilities, token, { retainedContinuity: true, taskUpdateProtocol: 1 }),
+    compileChatGptWebPrompt(request("high"), capabilities, token, { experimentalMultipartParts: 2 }),
+    compileChatGptWebPrompt(manual, capabilities, "request_12345678901234567890123456789012", { manualControl: true }),
+  ];
+
+  for (const { text } of prompts) {
+    expect(text).toContain("small batches by file or independent content unit");
+    expect(text).toContain("Preserve required content and atomic changes");
+    expect(text).toContain("When a tool result or platform error explicitly reports an unexplained platform safety-check rejection");
+    expect(text).toContain("do not end the task or request repeated confirmation if the user's authorization already covers the action");
+    expect(text).toContain("reduce the batch, remove unnecessary content, simplify parameters");
+    expect(text).toContain("another available method within the same authorized scope");
+    expect(text).toContain("For an unexplained platform safety-check rejection, make at most 3 recovery attempts per affected step across all batches and methods");
+    expect(text).toContain("verify any uncertain write state before issuing a replacement write");
+    expect(text).toContain("Pending queries and recovery of a lost receipt are not safety-check recovery attempts");
+    expect(text).toContain("This retry rule applies only to unexplained platform safety-check rejections; handle other tool errors under their existing rules");
+    expect(text).toContain("If approval is required, use the declared Codex approval flow; a denial does not authorize retrying the action through another tool");
+    expect(text).toContain("Without an error or execution result, say the action was not executed and its cause is unconfirmed");
+    expect(text).toContain("Except for an unexplained platform safety-check rejection handled below, after an explicit safety or permission refusal");
+    expect(text).toContain("If the refusal remains, report it rather than retrying through another tool");
+    expect(text).toContain("After a deterministic tool failure, update the working hypothesis from that result");
+    expect(text).toContain("continue all independent authorized work");
+    expect(text).toContain("Continue using the available tools until the requested work is complete and verified.");
+    expect(text).not.toContain("A single tool call failure or platform rejection does not by itself end the task");
+    expect(text).not.toContain("all remaining steps have no permitted executable path after bounded recovery");
+  }
+
+  const compact = request("high");
+  compact._compactionRequest = true;
+  for (const { text } of [
+    compileChatGptWebPrompt(request("medium"), { ...capabilities, localToolsEnabled: false }),
+    compileChatGptWebPrompt(compact, capabilities, token),
+  ]) {
+    expect(text).not.toContain("at most 3 recovery attempts");
+    expect(text).not.toContain("small batches by file or independent content unit");
+  }
+});
+
 test("read-only prompts resume without exposing a bind capability", () => {
   const compiled = compileChatGptWebPrompt(
     request("max"),
