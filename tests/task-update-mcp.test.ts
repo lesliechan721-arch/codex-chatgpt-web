@@ -326,7 +326,9 @@ test("initial protocol is opt in and keeps tool results below user instructions 
   expect(compiled.text).toContain("normal streaming");
   expect(compiled.text).toContain("Once the final answer starts, call no ACK or other tool");
   expect(compileChatGptWebPrompt(parsed, capabilities, token).text).not.toContain("task-updates-v1");
-  expect(() => compileChatGptWebPrompt(parsed, capabilities, token, { taskUpdateProtocol: 1, retainedContinuity: true })).toThrow("new ordinary Full Native execution");
+  const retained = compileChatGptWebPrompt(parsed, capabilities, token, { taskUpdateProtocol: 1, retainedContinuity: true });
+  expect(retained.text).toContain('"protocol":"task-updates-v1","task_revision":0');
+  expect(retained.text).toContain("This response continues the same retained conversation");
   expect(() => compileChatGptWebPrompt({ ...parsed, _compactionRequest: true }, capabilities, token, { taskUpdateProtocol: 1 })).toThrow("new ordinary Full Native execution");
 });
 

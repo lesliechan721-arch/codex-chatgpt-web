@@ -453,8 +453,10 @@ export function compileChatGptWebPrompt(
   options?: CompileChatGptWebPromptOptions,
 ): CompiledChatGptWebPrompt {
   const manualControl = options?.manualControl === true;
+  // A retained page can host a new ordinary execution with a new capability and revision 0.
+  // Page continuity does not reuse the previous execution's task-update authority.
   if (options?.taskUpdateProtocol !== undefined
-    && (options.taskUpdateProtocol !== 1 || parsed._compactionRequest || options.retainedContinuity)) {
+    && (options.taskUpdateProtocol !== 1 || parsed._compactionRequest)) {
     throw new Error("task-updates-v1 requires a new ordinary Full Native execution");
   }
   const attachSkills = options?.experimentalSkillAttachments === true;

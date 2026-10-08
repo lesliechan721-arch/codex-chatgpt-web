@@ -32,7 +32,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number } = {}) {
+function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean } = {}) {
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
   const statePath = join(root, "continuity");
   const registrations = new ContinuityRegistrationStore(statePath);
@@ -85,10 +85,10 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
-  // These legacy lifecycle fixtures have no versioned helper or model ACK implementation.
-  const taskUpdatesSupport = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(false);
+  // Legacy lifecycle cases do not negotiate task updates. Regression cases opt in explicitly.
+  const taskUpdatesSupport = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(options.taskUpdates === true);
   const originalAcceptTaskUpdate = broker.acceptTaskUpdate;
-  if (manual) broker.acceptTaskUpdate = undefined as never;
+  if (manual && !options.taskUpdates) broker.acceptTaskUpdate = undefined as never;
   const controls = {
     capacityAvailable: true,
     emitReviewCommentary: false,
@@ -215,7 +215,9 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       }
     }
     const answer = controls.invokeSourceTools ? "Stopped at the accepted tool boundary." : `Completed response ${submissions.length}.`;
-    turn.onTextDelta(answer);
+    turn.onTextDelta(answer, options.taskUpdates
+      ? { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 }
+      : undefined);
     expect(turn.retainConversation).toBe(true);
     pages.get(turn.conversationKey!)!.state = "ready";
     return answer;
@@ -294,6 +296,43 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   };
   return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker };
 }
+
+for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "Automatic"} negotiated task updates allow successive ordinary turns on the same page`, async () => {
+  const f = fixture(manual, { taskUpdates: true });
+  let request = f.request();
+  const tokens = new Set<string>();
+  let lease: ContinuityLease | undefined;
+  for (let turn = 1; turn <= 3; turn++) {
+    const events = await f.run(request);
+    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    expect(events.filter(event => event.type === "text_delta" && event.phase === "final_answer")
+      .map(event => event.type === "text_delta" ? event.text : "").join("")).toBe(`Completed response ${turn}.`);
+    expect(f.submissions).toHaveLength(turn);
+    const submission = f.submissions.at(-1)!;
+    expect(submission.reused).toBe(turn > 1);
+    expect(submission.prompt).toContain('"protocol":"task-updates-v1","task_revision":0');
+    const token = manual
+      ? JSON.parse(submission.prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id
+      : submission.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+    expect(tokens.has(token)).toBe(false);
+    tokens.add(token);
+    expect(f.broker.taskOutputReceipt(token)).toMatchObject({ taskRevision: 0, driverGeneration: 0 });
+    expect(f.pages.size).toBe(1);
+    const page = [...f.pages.values()][0]!;
+    expect(page.state).toBe("ready");
+    if (lease) {
+      expect(page.continuity.owner).toBe(lease.owner);
+      expect(page.continuity.leaseId).toBe(lease.leaseId);
+      expect(page.continuity.traceId).not.toBe(lease.traceId);
+      expect(submission.claim.expected).toEqual(lease);
+    }
+    lease = { ...page.continuity };
+    const registration = f.registrations.get(continuityDigest(f.threadId))!;
+    expect(registration.state).toBe("entered");
+    expect(continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), registration.scope)!.state).toBe("ready");
+    request = f.next(request, `turn-next-${turn}`, `Completed response ${turn}.`);
+  }
+});
 
 for (const { name, sourceDelay, checkpointDelay, succeeds } of [
   { name: "gives the checkpoint a separate budget after source settlement", sourceDelay: 700, checkpointDelay: 700, succeeds: true },

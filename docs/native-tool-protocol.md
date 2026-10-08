@@ -100,6 +100,9 @@ renaming polling as business progress would not preserve the same failure bounda
 ## User updates during tool work
 
 New compatible Full Native Automatic and started Zero Risk runtimes negotiate `task-updates-v1`.
+A new ordinary turn on a retained continuity page also negotiates this protocol with a new
+tool capability and task revision 0. It keeps the page owner and lease; it does not reuse the
+previous turn's tool authority or task revision. Compaction requests do not negotiate this protocol.
 The Adapter may retain one physical ChatGPT response when the same native thread and turn append
 trusted plain user text. In the ordinary policy, prior instructions, environment, model, options,
 and permissions must remain unchanged. The prior Responses round must have journaled its complete real tool batch,
