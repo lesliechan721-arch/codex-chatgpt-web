@@ -717,6 +717,7 @@ export interface ChatGptTaskUpdateRestoreAuthority {
 
 export class ChatGptTurnSession {
   supersededError?: Error;
+  private cancelledWith?: Error;
   readonly createdAt = Date.now();
   private lastTouchedAt = this.createdAt;
   readonly browserOutcome: Promise<ChatGptBrowserOutcome>;
@@ -2182,7 +2183,13 @@ export class ChatGptTurnSession {
     return this.rounds.get(key)?.events.some(event => event.type === "done" || event.type === "error" || event.type === "incomplete") === true;
   }
 
+  get cancellationReason(): Error | undefined {
+    return this.cancelledWith;
+  }
+
   cancel(reason?: Error): void {
+    // Revocation is synchronous; the browser outcome is published in later microtasks.
+    this.cancelledWith ??= reason;
     if (this.taskUpdatesEnabled()) {
       this.taskUpdateCancelled = true;
       this.taskUpdateDriverOpen = false;

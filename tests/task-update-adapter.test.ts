@@ -288,13 +288,14 @@ describe("Automatic Adapter task updates", () => {
     } finally { release.resolve(); await f.close(); }
   });
 
-  test("disconnect at the tool terminal retains complete source proof for replay and an in-flight update", async () => {
+  test.each([false, true])("disconnect at the tool terminal retains append and replay proof with writer-only failure=%s", async (writerOnly) => {
     const f = await fixture();
     try {
       const abort = new AbortController();
       const sourceEvents: AdapterEvent[] = [];
       const sourceRound = f.run(f.initial, sourceEvents, abort.signal, event => {
         if (event.type === "done" && event.stopReason === "tool_use") {
+          if (writerOnly) throw new TypeError("HTTP response writer closed at tool terminal");
           abort.abort();
           throw new DOMException("HTTP observer disconnected at tool terminal", "AbortError");
         }

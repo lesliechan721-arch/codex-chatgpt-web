@@ -426,6 +426,7 @@ export async function requestRetainedCompactionHandoff(
       prepareResume: prepare,
       conversationKey,
       requireRetainedConversation: true,
+      compaction: true,
       abortSignal: browserAbort.signal,
       onTextDelta: () => { onProgress?.(); },
     });

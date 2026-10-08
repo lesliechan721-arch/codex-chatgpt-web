@@ -95,6 +95,12 @@ function abortError(signal?: AbortSignal): Error {
   return new DOMException("ChatGPT web turn aborted", "AbortError");
 }
 
+class ChatGptObserverDisconnected extends DOMException {
+  constructor(readonly cause: unknown) {
+    super("The Codex response stream disconnected", "AbortError");
+  }
+}
+
 function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) {
@@ -1183,6 +1189,25 @@ export function createChatGptWebAdapter(
     },
     async runTurn(parsed, incoming, emit) {
       bindContinuityRequestScope(parsed, executionNamespace);
+      const observerAbort = new AbortController();
+      incoming = {
+        ...incoming,
+        abortSignal: incoming.abortSignal
+          ? AbortSignal.any([incoming.abortSignal, observerAbort.signal])
+          : observerAbort.signal,
+      };
+      const write = emit;
+      emit = event => {
+        if (observerAbort.signal.aborted) throw observerAbort.signal.reason;
+        try { write(event); }
+        catch (cause) {
+          // The response writer is an observer, not the owner of browser execution. Its
+          // failure must follow the existing disconnect path even before HTTP signals abort.
+          const error = new ChatGptObserverDisconnected(cause);
+          observerAbort.abort(error);
+          throw error;
+        }
+      };
       const runChatGptWebTurn = async (): Promise<void> => {
         if (parsed._conversationPolicy === "continuity-first") incoming.abortSignal?.throwIfAborted();
         const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -1831,6 +1856,8 @@ export function createChatGptWebAdapter(
         // Keep a settled capability through terminal registration in the outer error handler.
         const releaseRoundRegistration = driverContext && !session.roundCompleted(roundKey) && session.isActive()
           ? session.retainTaskUpdateTransaction() : undefined;
+        let awaitingRuntime = false;
+        let refreshingEnvironment = false;
         try {
           await session.runExclusive(async () => {
             if (!driverContext && parsed._conversationPolicy === "continuity-first"
@@ -1860,7 +1887,9 @@ export function createChatGptWebAdapter(
                 environment = { ...environment, tools: registry.tools };
               }
               await ensureDriver();
+              refreshingEnvironment = true;
               await broker.updateEnvironment(token, environment, driverContext);
+              refreshingEnvironment = false;
               await ensureDriver();
               // Owner IPC can finish after this browser settles and another execution takes the
               // page. Its old response may replay, but cannot publish into the new owner's registry.
@@ -1956,7 +1985,9 @@ export function createChatGptWebAdapter(
                 turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
                 if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
                 await ensureDriver();
+                refreshingEnvironment = true;
                 await broker.updateEnvironment(turnToken, environment, driverContext);
+                refreshingEnvironment = false;
                 await ensureDriver();
               }
               const updatedOutcome = session.settledOutcome();
@@ -2093,6 +2124,7 @@ export function createChatGptWebAdapter(
               let driverChange = driverContext ? session.waitForDriverChange(driverContext.expectedDriverGeneration, toolWaitAbort.signal)
                 .then(() => ({ type: "driver_change" as const })) : undefined;
               for (;;) {
+                awaitingRuntime = true;
                 const next = await withAbort(
                   Promise.race([
                     ...(nextTools ? [nextTools] : []),
@@ -2103,6 +2135,7 @@ export function createChatGptWebAdapter(
                   ]),
                   incoming.abortSignal,
                 );
+                awaitingRuntime = false;
                 if (next.type === "driver_change") {
                   await ensureDriver();
                   driverChange = session.waitForDriverChange(driverContext!.expectedDriverGeneration, toolWaitAbort.signal)
@@ -2184,6 +2217,15 @@ export function createChatGptWebAdapter(
             // owned DOM observer can continue proving the same accepted ChatGPT submission.
             throw error;
           }
+          // Browser failure can retire tools before their next wait starts. Once that exact
+          // browser has failed, its cause takes precedence over the cleanup's token error.
+          // A refresh can also race that retirement. Only the missing-token error may
+          // yield to the browser cause; authority validation and result delivery may not.
+          const retiredDuringRefresh = refreshingEnvironment && error instanceof Error
+            && error.message === "turn token is invalid or expired";
+          const settled = awaitingRuntime || retiredDuringRefresh ? session.settledOutcome() : undefined;
+          if (settled?.type === "error") error = settled.error;
+          else if (retiredDuringRefresh && session.cancellationReason) error = session.cancellationReason;
           const turnError = submittedTurnFailure(session, error);
           const handledError = turnError instanceof ChatGptWebAdapterError && turnError.retryable
             ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
@@ -2252,7 +2294,10 @@ export function createChatGptWebAdapter(
       // while direct adapter callers keep the original runTurn event contract.
       emit({ type: "heartbeat" });
       const heartbeat = setInterval(
-        () => emit({ type: "heartbeat" }),
+        () => {
+          try { emit({ type: "heartbeat" }); }
+          catch { /* emit detached the observer and wakes its pending awaits. */ }
+        },
         CHATGPT_WEB_ADAPTER_HEARTBEAT_MS,
       );
       try {

@@ -5,28 +5,16 @@ contract on macOS, Windows, and Linux. It does not prove an authenticated ChatGP
 MCP connector, or a complete Codex turn. A release candidate is not ready until those account-bound
 flows are exercised manually on the platforms below.
 
-## Launcher dependency audit exception
+## Dependency audits
 
-`bun run launcher:audit` temporarily excludes only
-[GHSA-ch52-4w7c-c8xp](https://github.com/advisories/GHSA-ch52-4w7c-c8xp).
-As of 2026-10-03, `http-cache-semantics` has no published fixed version. The locked
-dependency comes from `app-builder-lib` 26.15.3 → `@electron/get` 3.1.0 → `got` 11.8.6
-→ `cacheable-request` 7.0.4 → `http-cache-semantics` 4.2.0. Electron itself uses
-`@electron/get` 5.1.0, which uses Fetch instead of Got.
+The root and Launcher audits run without advisory exclusions. Both audits must pass
+before release validation proceeds. The Launcher pins `http-cache-semantics` to 4.3.0;
+the previous 4.2.0 advisory exclusion has been removed.
 
-The advisory requires a shared HTTP response cache. Got disables that cache by default,
-and the current launcher build configuration does not enable `downloadOptions.cache`.
-Electron's file cache stores downloaded artifacts; it is separate from Got's HTTP response
-cache. These packages are build tools, not launcher runtime dependencies. This exception
-does not fix the dependency's vulnerability. The root audit and all other launcher advisories
-still block verification.
-
-Reassess this exception when changing the build dependencies or download configuration.
-Do not enable Got's HTTP response cache while the exception is active. Remove the exclusion
-when a fixed version is available or the build dependency no longer includes the affected
-package. Do not force `@electron/get` 5.x over the builder's 3.x requirement: its download
-options and proxy API changed, so that migration requires packaging validation on all three
-platforms.
+When changing build dependencies or download configuration, check the resolved lockfile
+and run both audits. Do not force `@electron/get` 5.x over the builder's 3.x requirement:
+its download options and proxy API differ, so that migration requires packaging validation
+on all three platforms.
 
 ## Preview releases and updater visibility
 

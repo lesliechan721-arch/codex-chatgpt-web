@@ -653,13 +653,15 @@ function smokePassedForCurrentVersion(state) {
 }
 
 function syncBrowserPreferences(stateStore, config) {
+  const biggerContextAvailable = config?.solAvailable === true;
   const useSavedChats = config?.useSavedChats === true;
   const enabled = config?.experimentalFreshConversationPerTurn === true;
   const autoApproveToolCalls = config?.autoApproveToolCalls === true;
   const current = stateStore.read();
   if (runtimeHost?.currentOperation()) return current;
   const retentionChanged = current.experimentalFreshConversationPerTurn !== enabled || current.useSavedChats !== useSavedChats;
-  if (!retentionChanged && current.autoApproveToolCalls === autoApproveToolCalls) return current;
+  if (!retentionChanged && current.autoApproveToolCalls === autoApproveToolCalls
+    && current.biggerContextAvailable === biggerContextAvailable) return current;
   // Runtime restarts leave browser views alive. Retire completed chats when their
   // persistence policy changes, including changes made by the CLI.
   const retainedKeys = new Set((retentionChanged ? [...browserHost.turnTabs.values()] : [])
@@ -667,7 +669,7 @@ function syncBrowserPreferences(stateStore, config) {
       && (current.useSavedChats !== useSavedChats || tab.interactionMode === "automatic"))
     .map(tab => tab.conversationKey));
   for (const key of retainedKeys) releaseRetainedConversation(browserHost, key);
-  const state = stateStore.update({ experimentalFreshConversationPerTurn: enabled, useSavedChats, autoApproveToolCalls });
+  const state = stateStore.update({ experimentalFreshConversationPerTurn: enabled, useSavedChats, autoApproveToolCalls, biggerContextAvailable });
   send("launcher:state-changed", state);
   return state;
 }
@@ -1031,6 +1033,7 @@ function registerIpc({ logger, stateStore }) {
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
+      biggerContextAvailable: runtimeHost.runtimeConfigSnapshot().config?.solAvailable === true,
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
@@ -1083,6 +1086,7 @@ function registerIpc({ logger, stateStore }) {
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
+      biggerContextAvailable: runtimeHost.runtimeConfigSnapshot().config?.solAvailable === true,
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
@@ -1259,6 +1263,7 @@ function registerIpc({ logger, stateStore }) {
     );
     const state = stateStore.update({
       browserInteractionMode: mode,
+      biggerContextAvailable: runtimeHost.runtimeConfigSnapshot().config?.solAvailable === true,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
       useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats === true,
       autoApproveToolCalls: runtimeHost.runtimeConfigSnapshot().config?.autoApproveToolCalls === true,

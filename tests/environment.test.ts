@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
 import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
@@ -728,11 +728,12 @@ describe("authenticated full-history compaction environment", () => {
     return { source, compact, body, metadata };
   }
 
-  test("authenticates only an accepted source prefix and preserves current tools across store instances and retries", () => {
+  test.each([false, true])("authenticates the source prefix across store instances and retries after corrupt recovery=%s", (corrupt) => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-compaction-provenance-"));
     temporaryRoots.push(stateRoot);
     const path = join(stateRoot, "environments.json");
     const { source, compact } = fixture();
+    if (corrupt) writeFileSync(path, '{"version":1,"threads":');
     const store = () => new ChatGptThreadEnvironmentStore(path);
     const trusted = store().resolve(source);
     const persisted = readFileSync(path, "utf8");
@@ -922,11 +923,62 @@ describe("authenticated full-history compaction environment", () => {
     const saved = JSON.parse(readFileSync(path, "utf8"));
     saved.threads.thread_current.compactionSource.prefixLength = 0;
     writeFileSync(path, JSON.stringify(saved));
-    expect(() => new ChatGptThreadEnvironmentStore(path).resolve(compact)).toThrow("Invalid persisted ChatGPT compaction source");
+    const invalid = readFileSync(path, "utf8");
+    expect(() => new ChatGptThreadEnvironmentStore(path).resolve(compact))
+      .toThrow("contains invalid workspace or permission records");
+    expect(readFileSync(path, "utf8")).toBe(invalid);
   });
 });
 
 describe("trusted Codex task environment continuity", () => {
+  test("preserves corrupt state and rebuilds only from a verified current environment", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-corrupt-environment-"));
+    temporaryRoots.push(stateRoot);
+    const statePath = join(stateRoot, "thread-environments.json");
+    const corrupt = '{"version":1,"threads":{"private-original":"unfinished';
+    writeFileSync(statePath, corrupt);
+    const store = new ChatGptThreadEnvironmentStore(statePath, Date.now, join(stateRoot, "codex"));
+    const continuation = currentWire();
+    (continuation._rawBody as { input: unknown[] }).input = [{
+      type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }],
+    }];
+    // Repeating a failed load must not mark the empty in-memory cache as successfully loaded.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(() => store.resolve(continuation)).toThrow("contains invalid JSON");
+      try { store.resolve(continuation); } catch (error) {
+        expect(error).toMatchObject({ code: "thread_environment_state_invalid", retryable: false });
+        expect((error as Error).message).not.toContain("private-original");
+      }
+      expect(readFileSync(statePath, "utf8")).toBe(corrupt);
+      expect(readdirSync(stateRoot)).toEqual(["thread-environments.json"]);
+    }
+    expect(store.resolve(currentWire()).cwd).toBe(root);
+    const backups = readdirSync(stateRoot).filter(name => name.startsWith("thread-environments.json.corrupt-"));
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(stateRoot, backups[0]!), "utf8")).toBe(corrupt);
+    expect(Object.keys(JSON.parse(readFileSync(statePath, "utf8")).threads)).toEqual(["thread_current"]);
+    expect(new ChatGptThreadEnvironmentStore(statePath).resolve(continuation).cwd).toBe(root);
+  });
+
+  test("fresh trusted tasks do not erase unfamiliar or invalid permission records", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "codex-invalid-environment-"));
+    temporaryRoots.push(stateRoot);
+    const statePath = join(stateRoot, "thread-environments.json");
+    for (const original of [
+      '{"version":2,"threads":{}}',
+      'null',
+      '{"version":1,"threads":{"thread_current":{"cwd":"relative","updatedAt":123}}}',
+    ]) {
+      writeFileSync(statePath, original);
+      const store = new ChatGptThreadEnvironmentStore(statePath);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(() => store.resolve(currentWire())).toThrow("thread-environments.json");
+        expect(readFileSync(statePath, "utf8")).toBe(original);
+        expect(readdirSync(stateRoot)).toEqual(["thread-environments.json"]);
+      }
+    }
+  });
+
   test("persists the trusted first-turn authority and refreshes tools from every follow-up", () => {
     const stateRoot = mkdtempSync(join(tmpdir(), "codex-chatgpt-thread-environment-"));
     temporaryRoots.push(stateRoot);
@@ -2065,7 +2117,7 @@ describe("trusted Codex task environment continuity", () => {
       (field === "writableRoots" ? row.writableRoots : row.sandboxPolicy.writableRoots).push(resolve(root, "..", "unapproved"));
       writeFileSync(cache, JSON.stringify(state));
       expect(() => new ChatGptThreadEnvironmentStore(cache, Date.now, fixture.codexHome).resolve(environmentlessChild(rolloutTurnId, "workspace-write")))
-        .toThrow("Invalid persisted ChatGPT workspace-write policy");
+        .toThrow("invalid workspace or permission records");
     }
     // The explicit legacy grant alone cannot authorize a missing profile write.
     entries.splice(4, 2);

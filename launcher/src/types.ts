@@ -21,6 +21,7 @@ export interface LauncherState {
   browserInteractionMode: BrowserInteractionMode;
   toolAuthorityMode: ToolAuthorityMode;
   experimentalBiggerContext: boolean;
+  biggerContextAvailable?: boolean;
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
   useSavedChats: boolean;
