@@ -59,7 +59,7 @@ export interface TaskUpdateTransfer {
   updates: UserUpdate[];
   results: { callId: string; result: BrokerToolResult }[];
   batchFingerprint: string;
-  mode: "results" | "replay";
+  mode: "results" | "replay" | "continuity";
 }
 
 export type TaskUpdateTransferOutcome =

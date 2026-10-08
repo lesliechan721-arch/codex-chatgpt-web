@@ -86,8 +86,9 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
 7. Completed-history text, display IDs, and source metadata changes do not change accepted current
    work or cause extra browser/Native execution. New increments send all current instruction items
    and attachments, with the required current environment; they never resend completed work.
-   Ambiguous unowned instructions fail before submission. Current payload and result conflicts
-   remain rejected, and changing tool-call echoes never grants authority.
+   Ambiguous unowned instructions fail before submission. Current payload conflicts remain
+   rejected, and changing tool-call echoes never grants authority. Active appends use the
+   first-result and partial-result rules below instead of ordinary full-batch replay checks.
 8. Old result batches replay their own journal after later batches begin. Cross the 512-round
    bound and verify that reclaimed results fail while ordinary reconnects retain their original
    events and usage. Concurrent initial requests preserve the first captured prompt. Shared
@@ -206,7 +207,8 @@ testing. Existing active tasks keep their original protocol; start a new compati
    result with the envelope's `native_result`; control must not alter it. Confirm old queued calls
    and new calls on an unacknowledged revision return an unexecuted terminal.
 5. Check that commentary remains process output and the first final-answer text closes the update
-   window. A later append uses the ordinary replacement path; a late ACK cannot reopen it. Check
+   window. A later ordinary-policy append uses the replacement path; an active continuity append
+   is explicitly not accepted until the locked response ends. A late ACK cannot reopen it. Check
    strict structured output, stable Automatic completion without ACK, and refused Zero Risk
    completion followed by a valid ACK and revision-bound complete answer.
 6. Check old-observer disconnect after a continuous append, explicit user stop, initial Zero Risk
@@ -214,10 +216,34 @@ testing. Existing active tasks keep their original protocol; start a new compati
    source. Old observer cleanup must not stop the new driver, while explicit stop still releases
    the physical task. Record each mode's tab/response identity and terminal result.
 
+For `chatgpt-web-continuity/`, also verify that a tool boundary accepts a text-only append and a
+partial result batch. Supply the missing results later without more user text. Trim completed
+history, reorder results, and repeat known results with changed bodies: locally identified work
+must continue, the first result must remain unchanged, and each call must complete once. A wrong
+result type for a still-pending call must fail before accepting the append. After acknowledgement,
+compact the latest logical source without resending already accepted result bodies. Verify that
+only compaction advances history revision and that a stale preflight cannot retire a new driver.
+Without a boundary or negotiated protocol, record that the append was not accepted and that the
+original physical response survived. Keep real-client evidence separate from controlled fixtures.
+
+The [continuity append probe](../scripts/probe-continuity-append-live.ts) runs a real local Codex
+app-server, the working-tree Adapter and helper, the isolated DEV Launcher, and one harmless
+Native `sleep`/`printf` command. It steers the same native turn while that command runs, then
+checks delivery, ACK, the changed answer, and one physical response. Run `--check-only` first;
+`--model=chatgpt-web-continuity/gpt-6-pro` selects that supported route when the DEV account has
+Pro access. The probe uses the DEV profile's current interaction mode; Zero Risk still needs
+the first manual send and Sent confirmation. It saves local evidence under `.dev-workflows/`.
+Script availability and a successful preflight are not a real-platform pass.
+
 Local Broker/Remote owner, MCP, Session, helper, and Adapter tests use controlled fixtures and
 failure injection. They establish local contract behavior, not authenticated ChatGPT/connector
-acceptance. Real-platform validation of this feature remains pending and is reserved for the
-maintainer's subsequent manual run; retain redacted evidence for each mode before claiming it.
+acceptance. On 2026-10-08, the continuity append probe passed the result-plus-append scenario
+with the real Codex app-server and DEV Automatic GPT-6 Pro. It recorded one Native command and
+result, one page and physical response, two logical execution keys, delivery and ACK, and the
+changed final answer, with no 409 response. Local evidence is retained at
+`.dev-workflows/continuity-append-handoff/tmp/a1-live-automatic-8/evidence.json`.
+This pass covers that scenario only. Zero Risk and the other real-platform scenarios above
+remain unverified; retain separate redacted evidence before claiming those passes.
 
 ## API access, upstream, and proxy validation
 

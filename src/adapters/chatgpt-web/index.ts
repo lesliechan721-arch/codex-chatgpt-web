@@ -1644,10 +1644,6 @@ export function createChatGptWebAdapter(
         const continuityReplay = retainedContinuitySession
           && retainedContinuitySession.roundCompleted(retainedContinuitySession.continuityRoundKey(parsed))
           ? retainedContinuitySession : undefined;
-        if (parsed._conversationPolicy === "continuity-first") {
-          incoming.abortSignal?.throwIfAborted();
-          if (!continuityReplay) chatGptTurnSessions.assertContinuityThreadAvailable(nativeIdentity.threadId!, executionKey);
-        }
         const taskExecution = environment ? taskUpdateExecutionIdentity(environment, executionNamespace, parsed) : undefined;
         const existingTaskSession = parsed._conversationPolicy !== "continuity-first"
           ? chatGptTurnSessions.find(executionKey) : undefined;
@@ -1655,9 +1651,13 @@ export function createChatGptWebAdapter(
           ? await tryTaskUpdateHandoff({ parsed, executionKey, ownerKey, namespace: executionNamespace,
             environment, execution: taskExecution, broker, result: brokerResult, onProgress: incoming.onProgress })
           : undefined;
+        if (parsed._conversationPolicy === "continuity-first") {
+          incoming.abortSignal?.throwIfAborted();
+          if (!continuityReplay) chatGptTurnSessions.assertContinuityThreadAvailable(nativeIdentity.threadId!, executionKey);
+        }
         const initialTaskSource = !existingTaskSession && !updatedTaskSession && taskExecution
           ? captureTaskUpdateSource(parsed, taskExecution) : undefined;
-        if (initialTaskSource && broker.acceptTaskUpdate && broker.beginFinalOutput
+        if (initialTaskSource?.messages.length && broker.acceptTaskUpdate && broker.beginFinalOutput
           && broker.waitForTaskUpdateState && broker.revokeTrusted
           && (manualRequest || await worker.supportsTaskUpdates())) {
           if (Buffer.byteLength(canonicalJson(initialTaskSource.input)) + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES
@@ -1667,7 +1667,7 @@ export function createChatGptWebAdapter(
           negotiatedTaskUpdates.add(parsed);
         }
         const session = parsed._conversationPolicy === "continuity-first"
-          ? continuityReplay ?? chatGptTurnSessions.getOrCreate(
+          ? updatedTaskSession ?? continuityReplay ?? chatGptTurnSessions.getOrCreate(
             executionKey,
             () => startRuntime(parsed, environment, traceId, turnCapabilities),
             traceId, ownerKey, nativeTurnId, nativeIdentity.threadId, chatGptInstructionLineage(parsed).current,
@@ -1833,7 +1833,7 @@ export function createChatGptWebAdapter(
           ? session.retainTaskUpdateTransaction() : undefined;
         try {
           await session.runExclusive(async () => {
-            if (parsed._conversationPolicy === "continuity-first"
+            if (!driverContext && parsed._conversationPolicy === "continuity-first"
               && session.continuityRoundKey(parsed) !== roundKey) {
               throw continuityError("continuity_source_unproven", "The local work identity changed while this request was waiting for the execution lock.");
             }
@@ -1847,7 +1847,7 @@ export function createChatGptWebAdapter(
               if (binding) {
                 if (!session.isActive()) return token;
                 if (prepared.bindings.lookup(binding.thread, binding.scope) !== binding
-                  || binding.executionKey !== executionKey || binding.revision !== prepared.revision
+                  || chatGptTurnSessions.find(binding.executionKey!) !== session || binding.revision !== prepared.revision
                   || chatGptTurnSessions.findConversationHead(prepared.conversationKey) !== session
                   || session.supersededError) {
                   throw continuityError("continuity_source_unproven", "This execution no longer owns the current page environment.");
@@ -1866,7 +1866,7 @@ export function createChatGptWebAdapter(
               // page. Its old response may replay, but cannot publish into the new owner's registry.
               if (binding && registry && binding.state !== "lost" && binding.state !== "ended"
                 && prepared.bindings.observed(binding.thread) === binding
-                && binding.executionKey === executionKey && binding.revision === prepared.revision
+                && chatGptTurnSessions.find(binding.executionKey!) === session && binding.revision === prepared.revision
                 && chatGptTurnSessions.findConversationHead(prepared.conversationKey) === session
                 && !session.supersededError) {
                 binding.discoveredTools = registry.discoveredTools;
@@ -1979,17 +1979,25 @@ export function createChatGptWebAdapter(
                   session.completeRound(roundKey);
                   return;
                 }
-                if (results.length !== outstanding.length) {
+                if (results.length !== outstanding.length && !session.runtime.continuityBinding) {
                   throw new Error(`Codex returned ${results.length} of ${outstanding.length} results for a parallel ChatGPT tool batch`);
                 }
                 for (const message of results) {
                   await ensureDriver();
                   await broker.completeTool(turnToken, message.toolCallId, brokerResult(message,
-                    driverContext ? rawToolResult(parsed, message.toolCallId) : undefined), driverContext);
+                    session.continuityReceivedToolResult(message.toolCallId)
+                      ?? (driverContext ? rawToolResult(parsed, message.toolCallId) : undefined)), driverContext);
                   await ensureDriver();
                   session.runtime.externalProgress.recordToolResult();
                   incoming.onProgress?.();
                   session.markResultDelivered(message.toolCallId);
+                }
+                if (session.outstanding().length > 0) {
+                  emitRoundBatch(buffer => emitToolBatch(session.outstanding(),
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { toolRequests: session.outstanding() }, turnCapabilities,
+                      experimentalBiggerContext, experimentalSkillAttachments), buffer));
+                  session.completeRound(roundKey);
+                  return;
                 }
               }
             } else if (session.outstanding().length > 0) {

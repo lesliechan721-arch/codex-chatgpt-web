@@ -85,6 +85,10 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
+  // These legacy lifecycle fixtures have no versioned helper or model ACK implementation.
+  const taskUpdatesSupport = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(false);
+  const originalAcceptTaskUpdate = broker.acceptTaskUpdate;
+  if (manual) broker.acceptTaskUpdate = undefined as never;
   const controls = {
     capacityAvailable: true,
     emitReviewCommentary: false,
@@ -253,7 +257,8 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   cleanups.push(async () => {
     controls.releaseDeferredCompletion?.();
     controls.releaseAfterToolResults?.();
-    automatic.mockRestore(); compatible.mockRestore();
+    automatic.mockRestore(); compatible.mockRestore(); taskUpdatesSupport.mockRestore();
+    broker.acceptTaskUpdate = originalAcceptTaskUpdate;
     await broker.close();
     await controls.modelTask?.catch(() => {});
   });

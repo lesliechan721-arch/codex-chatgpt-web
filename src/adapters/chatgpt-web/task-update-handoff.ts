@@ -52,7 +52,8 @@ export async function tryTaskUpdateHandoff(options: {
   onProgress?: () => void;
 }): Promise<ChatGptTurnSession | undefined> {
   const { parsed, broker } = options;
-  if (parsed._conversationPolicy === "continuity-first" || parsed._compactionRequest) return undefined;
+  if (parsed._compactionRequest) return undefined;
+  const continuity = parsed._conversationPolicy === "continuity-first";
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId || !identity.turnId) return undefined;
   const foundSession = chatGptTurnSessions.findTaskUpdateOwner(identity.threadId, identity.turnId, options.ownerKey);
@@ -69,20 +70,35 @@ export async function tryTaskUpdateHandoff(options: {
     if (attempt) {
       // No second transfer ID, even if a previous accept timed out before its receipt arrived.
       const incoming = captureTaskUpdateSource(parsed, options.execution);
-      if (incoming?.requestFingerprint !== attempt.proof.source.requestFingerprint
-        || incoming?.immutableDigest !== attempt.proof.source.immutableDigest) {
+      const originalUpdates = attempt.proof.updates;
+      if (incoming?.continuity && originalUpdates.some(update => incoming.conflictingMessageIds?.includes(update.sourceMessageId))) {
+        throw taskUpdateSourceError("task_update_message_conflict", "The original appended instruction ID has conflicting text in this retry.");
+      }
+      const sameAppend = incoming?.continuity && incoming.immutableDigest === attempt.proof.source.immutableDigest
+        && originalUpdates.every(update => incoming.messages.some(message => message.sourceMessageId === update.sourceMessageId
+          && message.payloadDigest === update.payloadDigest))
+        && incoming.messages.every(message => attempt!.proof.source.messages.some(known => known.sourceMessageId === message.sourceMessageId));
+      if (!sameAppend && (incoming?.requestFingerprint !== attempt.proof.source.requestFingerprint
+        || incoming?.immutableDigest !== attempt.proof.source.immutableDigest)) {
         throw taskUpdateSourceError("task_update_transfer_pending", "The original task update transfer must be recovered before another request can take ownership.");
       }
     } else {
       const state = await broker.taskUpdateState!(token);
-      if (!state || state.finalOutputRevision !== null) return undefined;
+      if (!state) {
+        if (continuity) throw taskUpdateSourceError("task_update_upgrade_required", "This append was not accepted because the active response has no task update protocol.");
+        return undefined;
+      }
+      if (state.finalOutputRevision !== null) {
+        if (continuity) throw taskUpdateSourceError("task_update_final_output_started", "This append was not accepted. Wait for the current answer to finish, then send it again.");
+        return undefined;
+      }
       const proof = session.proveTaskUpdate(parsed, options.execution);
       if (proof.status === "inapplicable") return undefined;
       if (proof.status === "conflict" || proof.status === "stale") throw proof.error;
       if (proof.status === "replay") return session;
       if (proof.mode === "replay" && state.acknowledgedRevision === state.acceptedRevision) return undefined;
       const transferId = `update_${taskUpdateDigest({ namespace: options.namespace,
-        physical: session.traceId, request: proof.source.requestIdentity })}`;
+        physical: session.traceId, request: continuity ? proof.route.requestIdentity : proof.source.requestIdentity })}`;
       const payload = {
         transferId, expectedDriverGeneration: proof.expectedDriverGeneration,
         expectedRevision: proof.expectedRevision, environment: options.environment,
@@ -106,7 +122,7 @@ export async function tryTaskUpdateHandoff(options: {
         if (errorCode(error)?.startsWith("task_update_") || errorCode(error)?.startsWith("codex_tool_")) {
           attempts.delete(session);
           attempt.release();
-          if (errorCode(error) === "task_update_final_output_started") return undefined;
+          if (errorCode(error) === "task_update_final_output_started" && !continuity) return undefined;
           throw error;
         }
         // Reservation receipt loss also recovers the identical outcome slot. A not-found
@@ -160,7 +176,7 @@ export async function tryTaskUpdateHandoff(options: {
         chatGptTurnSessions.registerTaskUpdateRoute(options.executionKey, session);
         if (session.runtime.mode === "tools") {
           mirrorLatestTaskUpdateState(session.runtime.externalProgress, outcome.state);
-          if (attempt!.proof.mode === "results" && !attempt!.recordedResults) {
+          if ((attempt!.proof.mode === "results" || attempt!.proof.mode === "continuity") && !attempt!.recordedResults) {
             for (const _message of attempt!.proof.batch.messages) session.runtime.externalProgress.recordToolResult();
             attempt!.recordedResults = true;
             options.onProgress?.();
@@ -176,7 +192,7 @@ export async function tryTaskUpdateHandoff(options: {
         completed: state?.finalOutputRevision !== null && state?.finalOutputRevision !== undefined });
       attempts.delete(session);
       attempt!.release();
-      if (outcome.code === "task_update_final_output_started" || outcome.code === "task_update_no_boundary") return undefined;
+      if (!continuity && (outcome.code === "task_update_final_output_started" || outcome.code === "task_update_no_boundary")) return undefined;
       throw taskUpdateSourceError(outcome.code, outcome.message);
     }
   });

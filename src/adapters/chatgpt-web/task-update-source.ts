@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { CodexParsedRequest } from "../../types";
 import { canonicalJson } from "./canonical-json";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { extractChatGptTurnIdentity, trustedChatGptTaskUpdateUserText } from "./environment";
+import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity, trustedChatGptTaskUpdateUserText } from "./environment";
 
 export interface TaskUpdateExecutionIdentity {
   /** Resolved by the trusted adapter: account/connector, namespace, authority and epoch identity. */
@@ -18,6 +18,10 @@ export interface TaskUpdateSourceMessage {
 }
 
 export interface TaskUpdateSourceProof {
+  continuity?: true;
+  currentMessageId?: string;
+  currentInstruction?: unknown;
+  conflictingMessageIds?: readonly string[];
   threadId: string;
   turnId: string;
   immutableDigest: string;
@@ -58,20 +62,40 @@ export function captureTaskUpdateSource(
 ): TaskUpdateSourceProof | undefined {
   const identity = extractChatGptTurnIdentity(parsed);
   const body = record(parsed._rawBody);
-  if (parsed._conversationPolicy === "continuity-first" || parsed._compactionRequest
+  if (parsed._compactionRequest
     || !identity.threadId || !identity.turnId || identity.subagentKind
     || execution.capabilityIdentity === undefined || !Array.isArray(body?.input)) return undefined;
   const messages: TaskUpdateSourceMessage[] = [];
+  const continuity = parsed._conversationPolicy === "continuity-first";
+  const conflictingMessageIds: string[] = [];
   const prefix: unknown[] = [];
   const ids = new Set<string>();
-  for (const value of body.input) {
+  for (const [index, value] of body.input.entries()) {
     const item = record(value);
     if (!item) continue;
-    const user = trustedChatGptTaskUpdateUserText(item, identity.turnId);
+    let user = trustedChatGptTaskUpdateUserText(item, identity.turnId);
+    // The native resolver can establish the current input when optional wire fields are absent.
+    if (!user && continuity && index === chatGptCurrentInstructionIndex(parsed)) {
+      const current = chatGptCurrentInstructionRevision(parsed);
+      if (current) user = trustedChatGptTaskUpdateUserText({ ...item,
+        id: current.itemId ?? `turn:${identity.turnId}`,
+        internal_chat_message_metadata_passthrough: {
+          ...record(item.internal_chat_message_metadata_passthrough), turn_id: identity.turnId,
+        } }, identity.turnId);
+    }
     if (user) {
-      if (ids.has(user.sourceMessageId)) throw taskUpdateSourceError("task_update_source_conflict", "A native user message identity is duplicated.");
-      ids.add(user.sourceMessageId);
-      messages.push({ sourceMessageId: user.sourceMessageId, content: user.content,
+      const sourceMessageId = continuity ? parsed._chatGptMessageIdAliases?.[user.sourceMessageId] ?? user.sourceMessageId : user.sourceMessageId;
+      if (ids.has(sourceMessageId)) {
+        if (continuity) {
+          if (messages.find(message => message.sourceMessageId === sourceMessageId)?.payloadDigest !== taskUpdateDigest(user.content)) {
+            conflictingMessageIds.push(sourceMessageId);
+          }
+          continue;
+        }
+        throw taskUpdateSourceError("task_update_source_conflict", "A native user message identity is duplicated.");
+      }
+      ids.add(sourceMessageId);
+      messages.push({ sourceMessageId, content: user.content,
         payloadDigest: taskUpdateDigest(user.content),
         representationDigest: taskUpdateDigest(instructionRepresentation(user.item)) });
     } else if (["system", "developer", "user"].includes(String(item.role))
@@ -81,7 +105,7 @@ export function captureTaskUpdateSource(
         instruction: instructionRepresentation(item) });
     }
   }
-  if (messages.length === 0) return undefined;
+  if (messages.length === 0 && !continuity) return undefined;
   const input = structuredClone(body.input);
   const requestFingerprint = taskUpdateDigest({ input, modelId: parsed.modelId, options: parsed.options,
     instructions: body.instructions ?? null, previousResponseId: parsed.previousResponseId ?? null });
@@ -89,9 +113,16 @@ export function captureTaskUpdateSource(
   let metadata = record(metadataRaw);
   if (typeof metadataRaw === "string") { try { metadata = record(JSON.parse(metadataRaw)); } catch {} }
   const requestId = metadata?.request_id ?? body.request_id ?? body.id;
+  const current = continuity ? chatGptCurrentInstructionRevision(parsed) : undefined;
   return {
+    ...(continuity ? { continuity: true as const } : {}),
+    ...(conflictingMessageIds.length ? { conflictingMessageIds } : {}),
+    ...(current ? { currentMessageId: current.itemId
+      ? parsed._chatGptMessageIdAliases?.[current.itemId] ?? current.itemId : `turn:${identity.turnId}`,
+    currentInstruction: structuredClone(body.input[chatGptCurrentInstructionIndex(parsed)]) } : {}),
     threadId: identity.threadId, turnId: identity.turnId,
-    immutableDigest: taskUpdateDigest({ threadId: identity.threadId, turnId: identity.turnId,
+    immutableDigest: continuity ? taskUpdateDigest({ threadId: identity.threadId, turnId: identity.turnId,
+      scope: parsed._continuityScope, capabilityIdentity: execution.capabilityIdentity }) : taskUpdateDigest({ threadId: identity.threadId, turnId: identity.turnId,
       modelId: parsed.modelId, modelFamily: parsed._chatgptModelFamily ?? null,
       options: parsed.options, instructions: body.instructions ?? null, prefix,
       capabilityIdentity: execution.capabilityIdentity, executionConfig: execution.executionConfig ?? null }),

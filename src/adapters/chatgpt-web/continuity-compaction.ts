@@ -12,6 +12,7 @@ import {
 } from "./compaction-handoff";
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
+import { taskUpdateSourceError } from "./task-update-source";
 import { continuityToolRegistry } from "./continuity-tools";
 import type { PreparedContinuityRequest } from "./continuity-request";
 import { extractChatGptCompactionSourceRevision, extractChatGptCompactV1SourceRevision, extractChatGptTurnIdentity } from "./environment";
@@ -134,10 +135,19 @@ export function runContinuityCompaction(
     try {
       if (signal.aborted) throw signal.reason;
       let claim: ContinuityClaim | undefined;
-      const begin = (): ContinuityClaim => {
+      const begin = async (): Promise<ContinuityClaim> => {
         signal.throwIfAborted();
         if (prepared.verifiedSourceGeneration === undefined) {
           throw continuityError("continuity_source_unproven");
+        }
+        if (source.taskUpdatesEnabled() && source.runtime.mode === "tools") {
+          const state = await broker.taskUpdateState?.(await source.runtime.token);
+          if (source.hasPendingTaskUpdate() || !state || state.acknowledgedRevision !== state.acceptedRevision) {
+            throw taskUpdateSourceError("task_update_pending", "Confirm the accepted task updates before starting compaction. Current work continues.");
+          }
+          if (source.isActive()) source.assertDriverGeneration(state.driverGeneration);
+          if (source.driverGeneration() !== state.driverGeneration || source.taskRevision() !== state.acceptedRevision
+            || source.isTaskUpdateCancelled()) throw taskUpdateSourceError("task_update_source_stale", "The task update source advanced before compaction.");
         }
         source.assertContinuityCompactionResultBatch(parsed);
         const resultReplay = source.continuityToolResultReplayEvidence(parsed);
@@ -163,14 +173,14 @@ export function runContinuityCompaction(
       if (manual) {
         if (source.isActive()) {
           rawSummary = await source.runExclusive(async () => {
-            begin();
+            await begin();
             return withCompactionAbort(
               settleActiveZeroRiskCompactionSource(parsed, source, broker, signal, reportProgress, acceptHandoff, true),
               signal,
             );
           });
         } else {
-          await source.runExclusive(async () => { begin(); });
+          await source.runExclusive(async () => { await begin(); });
           const outcome = await source.browserOutcome;
           if (outcome.type === "error") throw outcome.error;
           await withCompactionAbort(source.physicalSettlement, signal);
@@ -184,7 +194,7 @@ export function runContinuityCompaction(
       } else {
         if (source.isActive() && source.runtime.mode === "tools") {
           const settled = await source.runExclusive(async () => {
-            begin();
+            await begin();
             return withCompactionAbort(
               settleActiveCompactionSource(parsed, source, broker as TurnBroker, signal, reportProgress, true),
               signal,
@@ -192,7 +202,7 @@ export function runContinuityCompaction(
           });
           preserveFinalResponse = !settled.compactionInstructionDelivered;
         } else {
-          await source.runExclusive(async () => { begin(); });
+          await source.runExclusive(async () => { await begin(); });
           const outcome = await source.browserOutcome;
           if (outcome.type === "error") throw outcome.error;
           await withCompactionAbort(source.physicalSettlement, signal);

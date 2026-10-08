@@ -890,7 +890,7 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       if (updates.updateBytes + bytes > TASK_UPDATE_TOTAL_BYTES) throw taskUpdateError("task_update_resource_limit", "The bounded task update text budget is full");
       assertTaskUpdateIdentifier(transfer.batchFingerprint);
-      if (!Array.isArray(transfer.results) || transfer.results.length === 0) throw taskUpdateError("task_update_batch_invalid", "A complete proven tool result batch is required");
+      if (!Array.isArray(transfer.results) || (transfer.mode !== "continuity" && transfer.results.length === 0)) throw taskUpdateError("task_update_batch_invalid", "A complete proven tool result batch is required");
       const resultIds = new Set<string>();
       for (const item of transfer.results) {
         if (!item || typeof item.callId !== "string" || resultIds.has(item.callId)
@@ -899,7 +899,14 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       if (Buffer.byteLength(JSON.stringify(transfer.results)) > TASK_UPDATE_BATCH_LIMIT_BYTES) throw taskUpdateError("task_update_resource_limit", "The task update result batch exceeds its bounded transport budget");
       const resultsDigest = taskFingerprint(transfer.results);
-      if (transfer.mode === "results") {
+      if (transfer.mode === "continuity") {
+        if (channel.deliveredCallIds.size === 0 && updates.state.acknowledgedRevision === updates.state.acceptedRevision) {
+          throw taskUpdateError("task_update_no_boundary", "This append was not accepted because no tool delivery or confirmation boundary is open");
+        }
+        if ([...resultIds].some(id => !channel.deliveredCallIds.has(id) || !channel.invocations.has(id))) {
+          throw taskUpdateError("task_update_batch_invalid", "A supplied result does not belong to a pending local call");
+        }
+      } else if (transfer.mode === "results") {
         if (resultIds.size !== channel.deliveredCallIds.size || [...resultIds].some(id => !channel.deliveredCallIds.has(id) || !channel.invocations.has(id))) {
           throw taskUpdateError("task_update_batch_invalid", "Task update results must exactly cover the current handed-off batch");
         }
@@ -923,7 +930,7 @@ export class TurnBroker implements TurnBrokerOwner {
           ? channel.nativeOperations.prepareCompletion(invocation.operationId, result, "task-update")
           : () => invocation.resolve(nativeControlResult("task-update", result)));
       }
-      if (transfer.mode === "results") {
+      if (transfer.mode === "results" || transfer.mode === "continuity") {
         for (const item of acceptedResults) {
           const invocation = channel.invocations.get(item.callId)!;
           completions.push(invocation.operationId !== undefined
@@ -952,7 +959,7 @@ export class TurnBroker implements TurnBrokerOwner {
       for (const callId of channel.queuedCallIds.splice(0)) {
         channel.invocations.delete(callId);
       }
-      if (transfer.mode === "results") {
+      if (transfer.mode === "results" || transfer.mode === "continuity") {
         for (const item of acceptedResults) {
           channel.deliveredCallIds.delete(item.callId);
           channel.invocations.delete(item.callId);

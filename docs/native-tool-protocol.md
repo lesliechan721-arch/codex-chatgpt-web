@@ -101,19 +101,35 @@ renaming polling as business progress would not preserve the same failure bounda
 
 New compatible Full Native Automatic and started Zero Risk runtimes negotiate `task-updates-v1`.
 The Adapter may retain one physical ChatGPT response when the same native thread and turn append
-trusted plain user text without changing prior instructions, environment, model, options, or
-permissions. The prior Responses round must have journaled its complete real tool batch,
+trusted plain user text. In the ordinary policy, prior instructions, environment, model, options,
+and permissions must remain unchanged. The prior Responses round must have journaled its complete real tool batch,
 `done(tool_use, endTurn:false)`, and source observation proof before sending the batch to the
 HTTP observer. An exact reconnect replays that same source round. A known outstanding or
 handed-off batch lacking its source proof fails with `task_update_source_unproven`.
 With no current batch, raw results must exactly match accepted historical results before
 fallback is allowed; unknown or changed results fail before retiring the existing owner.
-Pure text work, changed instructions, unsupported source shapes, continuity-first work, and
-initial Zero Risk requests awaiting Sent use their existing behavior.
+Pure text work, changed instructions, unsupported source shapes, and initial Zero Risk requests
+awaiting Sent use their existing behavior.
+
+Continuity-first work uses local source records instead of the ordinary policy's full-prefix and
+complete-result-batch proof. The same active thread, turn, scope, owner, and page lease must be
+identifiable. A current tool boundary or open update-confirmation window is required. Completed
+history may be trimmed or reserialized; changed old text is not sent back to the page. Stable
+new user item IDs preserve order and prevent duplicate acceptance. Equal text with different IDs
+remains separate input; changing the text of an already accepted new item is a conflict.
+
+A continuity append may contain zero or some pending results. Known pending call IDs retain their
+expected result-type check. The first accepted result completes each call once; duplicates,
+completed historical results, and unknown IDs do not complete current calls or authorize tools.
+Later result-only requests can fill the remaining calls without another update or generation.
+Result bodies and full history are not source proofs. A replay with a new HTTP request ID recovers
+the original update outcome, and any new pending results can still be accepted independently.
 
 The Broker tracks accepted, delivered, and acknowledged revisions independently, beginning at 0.
 Each appended user item has a stable source ID; equal text in different items remains distinct.
-An owner-only transfer binds its ID to the exact updates, registry, and original result batch.
+An owner-only transfer binds its ID to immutable local commit data. For the ordinary policy this
+includes the exact updates, registry, and original result batch. Continuity retries recover that
+local data without requiring the client to repeat the original batch or history.
 Reservation precedes the short Session preparation barrier; atomic acceptance installs the new
 revision and driver generation before waking real result promises. Outcomes are immutable:
 `committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
@@ -128,8 +144,10 @@ No update is stored in the Native result cache or sent through the browser compo
 Apply delivered updates in order, then call `codex_task_update_ack` with the same capability,
 `delivery_id`, and `through_revision`. One immutable delivery is outstanding at a time; retries
 return it unchanged. A further append during the ACK gap stays queued and can be delivered in
-that ACK response. Without a new real batch, an append after the gap closes uses the existing
-replacement path. ACK is confirmation, not Native execution or extra business progress.
+that ACK response. In the ordinary policy, without a new real batch an append after the gap closes
+uses the existing replacement path. An active continuity response without an available boundary
+rejects the append as not accepted and preserves the running work. ACK is confirmation, not Native
+execution or extra business progress.
 
 Every Native start on a negotiated capability declares a nonnegative safe integer `task_revision`,
 initially 0. That revision joins the bound start fingerprint and is removed from Native arguments.
@@ -151,8 +169,13 @@ the completion CAS before text is sent; sending then reuses that immutable recei
 are never upgraded to a later head. Automatic unacknowledged final output fails explicitly;
 Zero Risk completion requires the acknowledged revision after an update and can return the
 pending delivery on refusal. Its initial revision 0 remains the compatible default. After the
-lock, appends use the existing replacement path and late ACKs cannot change the answer.
-Compaction refuses unresolved updates or prepared transfers and requires the latest exact source.
+lock, ordinary-policy appends use the existing replacement path and late ACKs cannot change the
+answer. Continuity appends are not accepted while that locked response is still running; wait for
+it to finish before sending a normal continuation. A response that did not negotiate the update
+protocol cannot be upgraded by an append. Compaction refuses unresolved updates or prepared
+transfers and requires the latest exact source. Continuity compaction reuses locally accepted
+results, without requiring their old bodies again. Appends advance task revision and driver
+generation, while only committed compaction advances history revision.
 
 An exact Automatic reconnect can finish its own incomplete round after the browser has completed
 and the capability has retired. This is a read-only recovery: the accepted request, current task

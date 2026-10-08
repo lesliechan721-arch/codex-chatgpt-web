@@ -75,7 +75,7 @@ later turns; that alone does not make it obsolete. An ambiguous unowned group st
 submission. The recorded real-client layouts and synthetic variants have distinct evidence limits
 in [release validation](release-validation.md#recorded-continuity-evidence).
 
-Result rounds use locally issued batch/call IDs and their expected result types. Identify the
+Ordinary result rounds without an active append use locally issued batch/call IDs and their expected result types. Identify the
 terminal result group and validate its entire batch before delivery; reject unknown, duplicate,
 partial, mixed, or conflicting results. Normalize permitted result ordering to the locally issued
 batch order. Old tool-call echoes cannot authorize calls or substitute for current results.
@@ -92,6 +92,55 @@ then returns its cached response. Recheck ownership after asynchronous updates. 
 execution's replay is read-only and cannot replace the new owner's registry. Removed tools cannot
 start new operations; already admitted operations retain their original completion rights.
 Replay alone does not advance generation, revision, or the successful-work retention clock.
+
+### User updates during an active response
+
+Compatible Full Native Automatic and already-started Zero Risk responses can accept new plain
+user text at a local tool boundary or while a previous update awaits confirmation. The bridge
+locates the same active thread, native turn, scope, owner, and lease before applying the normal
+thread-occupancy rejection. It retains the original page and physical response, maps the new
+logical instruction to that response, and transfers driver authority before delivering results.
+It does not send a second browser message or repeat Native calls.
+
+Local instruction identities, retained source relationships, or issued call IDs must uniquely
+identify the source. Completed history, old user text, and old result bodies need not match an
+earlier copy. The bridge uses stable IDs for new user items: different IDs with equal text remain
+distinct, and a retry cannot silently change text already accepted under the same new item ID.
+An ambiguous source or a conflicting thread, turn, scope, or expired owner still fails.
+
+At an available boundary, an append can arrive without results or with only part of a batch.
+Known pending calls retain their expected result-type check before acceptance. Each call keeps
+its first accepted result; duplicates are skipped even when their bodies differ. Unknown and
+completed historical call IDs cannot complete a pending call or add tool authority. Missing calls
+keep waiting. Later requests can supply only the missing results without accepting the same user
+update twice, advancing driver generation, or reproducing the full batch. These rules apply to
+the active append and its later result rounds; ordinary work retains its existing batch rules.
+
+Acceptance, delivery, and model acknowledgement are separate states. Pending updates travel
+through the existing MCP control path and remain separate from cached Native results. New Native
+work requires the accepted revision to be acknowledged. Another append during confirmation is
+queued in order. An HTTP disconnect does not cancel the transferred work, and a late old observer
+cannot overwrite or cancel the current driver. Explicit user stop still ends the physical task.
+
+An append advances task revision and driver generation, not history revision. Only committed
+compaction advances history revision. Compaction uses the latest logical source and locally
+accepted results; it does not request their old bodies again. Unacknowledged updates, prepared
+transfers, and pending calls are not completed work. A stale compaction preflight cannot stop a
+newer driver.
+
+| Active source state | Append outcome |
+| --- | --- |
+| Tool boundary or open confirmation window | Accept and queue the update; delivery and acknowledgement follow separately. |
+| Running without an available boundary | The append is not accepted. Keep the current task and send again when a boundary is available or the response has ended. |
+| Final answer locked but response still running | The append is not accepted. Wait for completion, then send a normal continuity instruction. |
+| Compaction owns the source | The append is not accepted. Report the busy state and preserve the compaction. |
+| Earlier transfer outcome unknown | Recover the same transfer identity; do not assume rejection or start another transfer. |
+| Old response without negotiated update support | The append is not accepted. Preserve that response; do not restart or upgrade it. |
+| Response normally completed on a healthy page | Use ordinary continuity continuation with only the new increment. Zero Risk still requires manual sending. |
+
+These checks prevent misrouting, duplicate execution, and competing writers. They do not verify
+complete history or tool-result content integrity. See the [Native update protocol](native-tool-protocol.md#user-updates-during-tool-work)
+for delivery, acknowledgement, and final-answer admission.
 
 ### Checkpoint selection and one-time continuation
 

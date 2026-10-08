@@ -26,14 +26,19 @@ export interface ContinuityHandoffEvidence {
   summary: string;
 }
 
-export interface ContinuityToolResultReplayEvidence {
+export type ContinuityToolResultReplayEvidence = {
+  /** Appended tasks reuse locally received results; request echoes are not evidence. */
+  localResults: true;
+  results: Array<{ callId: string; type: string }>;
+} | {
+  localResults?: never;
   earlierCallIds?: string[];
   results: Array<{
     callId: string;
     type: string;
     digest: string;
   }>;
-}
+};
 
 export interface ContinuityCheckpointCommit extends Omit<ContinuityHandoffEvidence, "key"> {
   revision: number;
@@ -157,6 +162,8 @@ export interface ContinuityBinding {
   /** Trusted local ownership metadata only; never persisted or supplied by request JSON. */
   conversation?: { key: string; descriptor: string };
   executionKey?: string;
+  /** Latest logical instruction; executionKey remains the physical response identity. */
+  logicalExecutionKey?: string;
   compactionKey?: string;
   compactionSourceState?: "ready" | "running";
   compactionEvidenceBytes?: number;
@@ -364,6 +371,7 @@ export class ContinuityBindings {
     }
     binding.state = "running";
     binding.executionKey = executionKey;
+    binding.logicalExecutionKey = undefined;
     return { owner: this.owner, expected: { ...binding.lease } };
   }
 
@@ -465,6 +473,7 @@ export class ContinuityBindings {
     binding.compactionEvidenceBytes = undefined;
     binding.acceptedHandoff = undefined;
     binding.executionKey = undefined;
+    binding.logicalExecutionKey = undefined;
     binding.state = "ready";
     binding.lastUsedAt = this.now();
   }

@@ -14,6 +14,7 @@ import {
 } from "./continuity-binding";
 import { isContinuityLease, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
+import { taskUpdateSourceError } from "./task-update-source";
 import { continuityToolRegistry } from "./continuity-tools";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
 import { existingStructuredCompactionRun } from "./compaction-handoff";
@@ -49,6 +50,7 @@ export interface PreparedContinuityRequest {
   finalReplaySource?: ChatGptTurnSession;
   verifiedSourceGeneration?: number;
   checkpointTransition?: ContinuityCheckpointSelection;
+  appendSource?: ChatGptTurnSession;
 }
 
 function sameLease(left: ContinuityLease | undefined, right: ContinuityLease | undefined): boolean {
@@ -192,6 +194,12 @@ export async function prepareContinuityRequest(
   bindContinuityRequestScope(parsed, namespace);
   const scope = parsed._continuityScope!;
   let binding = bindings.lookup(thread, scope);
+  const localOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
+  const appendSource = !parsed._compactionRequest && binding?.lease && localOwner?.isActive()
+    && localOwner.nativeThreadId === identity.threadId && localOwner.nativeTurnId === identity.turnId
+    && localOwner.runtime.continuityBinding === binding && !localOwner.supersededError
+    ? localOwner : undefined;
+  if (!parsed._compactionRequest && localOwner?.nativeTurnId === identity.turnId) localOwner.bindContinuityResultSource(parsed);
   const checkpointSelection = selectContinuityCheckpoint(parsed, identity);
   const checkpointProof = continuityCheckpoint(parsed);
   const checkpoint = checkpointProof.digest;
@@ -244,7 +252,7 @@ export async function prepareContinuityRequest(
       : [...binding?.checkpoints.values() ?? []].find(value => value.revision === revision) : undefined;
   const sourceReplay = selectedCheckpoint?.sourceInstructionReplay;
   // The retained source remains protected even before the checkpoint and on cached retries.
-  if (!parsed._compactionRequest && sourceReplay && continuityInstructionIdentity(parsed) === sourceReplay.instructionIdentity) {
+  if (!appendSource?.taskUpdatesEnabled() && !parsed._compactionRequest && sourceReplay && continuityInstructionIdentity(parsed) === sourceReplay.instructionIdentity) {
     for (const value of (parsed._rawBody as { input: unknown[] }).input) {
       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const item = value as Record<string, unknown>;
@@ -278,7 +286,7 @@ export async function prepareContinuityRequest(
   if (!binding && !hasInitialChatGptTurnInstruction(parsed)) throw continuityError("continuity_source_unproven");
   if (binding && !parsed._compactionRequest && existing) {
     existing.assertCanonicalReplayInput(parsed);
-    existing.continuityRoundKey(parsed);
+    if (!existing.taskUpdatesEnabled()) existing.continuityRoundKey(parsed);
   }
   if (binding && revision !== binding.revision
     && !(parsed._compactionRequest && binding.checkpoints.has(executionKey))
@@ -290,7 +298,7 @@ export async function prepareContinuityRequest(
   let verifiedSourceGeneration: number | undefined;
   const exactCurrentWork = (): boolean => Boolean(binding && (parsed._compactionRequest
     ? (binding.compactionKey === executionKey || binding.checkpoints.has(executionKey)) && existingStructuredCompactionRun(executionKey)
-    : binding.executionKey === executionKey && chatGptTurnSessions.find(executionKey)));
+      : (binding.executionKey === executionKey || appendSource === localOwner) && chatGptTurnSessions.find(binding.executionKey!)));
   if (parsed._compactionRequest && binding && !binding.checkpoints.has(executionKey)
     && !(binding.state === "compacting" && binding.compactionKey === executionKey)) {
     let candidate: string | undefined;
@@ -300,10 +308,10 @@ export async function prepareContinuityRequest(
         : chatGptCompactionSourceExecutionKey(parsed);
     } catch { /* A missing or malformed source is not a retained-page creation authority. */ }
     const source = sourceExecutionKey ? chatGptTurnSessions.find(sourceExecutionKey) : undefined;
-    if (!candidate || `${namespace}:${candidate}` !== sourceExecutionKey || !source
+    if (!candidate || `${namespace}:${candidate}` !== (binding.logicalExecutionKey ?? sourceExecutionKey) || !source
       || source !== chatGptTurnSessions.findConversationHead(conversationKey)
       || source.supersededError || (binding.state === "compacting" && binding.compactionKey !== executionKey)) {
-      if (config.toolAuthorityMode === "delegated" && source) {
+      if (config.toolAuthorityMode === "delegated" && source && source.taskRevision() === 0) {
         source.cancel(continuityError("continuity_source_unproven"));
         await source.runtime.retireCapability?.();
         bindings.lose(binding, sourceExecutionKey);
@@ -313,7 +321,7 @@ export async function prepareContinuityRequest(
     try {
       source.assertContinuitySourceInstruction(parsed);
     } catch (error) {
-      if (config.toolAuthorityMode === "delegated") {
+      if (config.toolAuthorityMode === "delegated" && source.taskRevision() === 0) {
         const reason = error instanceof Error ? error : continuityError("continuity_source_unproven");
         source.cancel(reason);
         await source.runtime.retireCapability?.();
@@ -355,7 +363,12 @@ export async function prepareContinuityRequest(
   let allowRetainedSourceInstructionPayload = false;
   let finalReplaySource: ChatGptTurnSession | undefined;
   let checkpointTransition: ContinuityCheckpointSelection | undefined;
-  if (!parsed._compactionRequest && !existing) {
+  if (!parsed._compactionRequest && !existing && appendSource) {
+    if (!appendSource.taskUpdatesEnabled()) {
+      throw taskUpdateSourceError("task_update_upgrade_required", "This append was not accepted because the active response did not negotiate task-updates-v1. Its current work continues.");
+    }
+    if (binding!.state === "compacting") throw taskUpdateSourceError("task_update_compaction_pending", "This append was not accepted because context compaction owns the current source.");
+  } else if (!parsed._compactionRequest && !existing) {
     assertNoUnownedTerminalResults(parsed, checkpointProof.index);
     chatGptTurnSessions.assertContinuityThreadAvailable(identity.threadId, executionKey);
     if (binding && binding.state !== "ready"
@@ -411,6 +424,7 @@ export async function prepareContinuityRequest(
     revision, sourceExecutionKey, expected, input, instructionPrevious,
     allowRetainedSourceInstructionPayload, finalReplaySource, verifiedSourceGeneration,
     checkpointTransition,
+    appendSource,
   };
 }
 
