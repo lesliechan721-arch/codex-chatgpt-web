@@ -30,7 +30,7 @@ do not poll for publication changes.
 
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
-`6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, and `6.1.7-4` follows `6.1.7-3`.
+`6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
 The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an
 existing release's pre-release flag when rerun. Other preview builds must have that flag set
 explicitly before publication. Named version suffixes retain preview ordering below the base release.
