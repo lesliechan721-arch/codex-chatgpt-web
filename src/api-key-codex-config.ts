@@ -44,16 +44,18 @@ export function renderApiKeyCodexConfig(options: {
     'auto_recap = false',
     '',
   ].join("\n");
+  // Disable instant steering interruption for both subagent protocols.
+  let defaults = "[features]\ninstant_interrupt = false";
   // Reuse the same V1 defaults as OpenAI forwarding; native mode must not be pinned to V1.
   if ((options.subagentProtocol ?? "compatibility-v1") === "compatibility-v1") {
-    const defaults = installCompatibilityV1Features("").text
+    defaults = installCompatibilityV1Features(defaults).text
       .split(/\r\n|\n|\r/)
       .filter(line => !line.trimStart().startsWith("#"))
       .map(line => line.replace(/[ \t]+#.*$/, ""))
       .join("\n").trim();
-    // Exported settings belong to the user, not to the automatic injection journal.
-    text = text.trimEnd() + "\n\n" + defaults + "\n";
   }
+  // Exported settings belong to the user, not to the automatic injection journal.
+  text = text.trimEnd() + "\n\n" + defaults + "\n";
   if (options.runtimeCommand?.length) {
     const command = codexInterruptHookCommand({ runtimeCommand: options.runtimeCommand });
     text = text.trimEnd() + "\n\n" + [

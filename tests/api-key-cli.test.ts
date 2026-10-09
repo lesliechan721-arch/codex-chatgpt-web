@@ -129,6 +129,7 @@ test("CLI Codex export requires the current local key and emits sensitive TOML p
   assert.equal(exported.code, 0, exported.err);
   const payload = JSON.parse(exported.out);
   assert.ok(payload.config.includes(`experimental_bearer_token = "${localKey}"`));
+  assert.equal((Bun.TOML.parse(payload.config) as { features: { instant_interrupt: boolean } }).features.instant_interrupt, false);
   assert.ok(!payload.config.includes("env_key ="));
   assert.equal(payload.catalogPath, join(home, "api-key-models.json"));
   assert.deepEqual(JSON.parse(payload.catalog), JSON.parse(readFileSync(payload.catalogPath, "utf8")));
@@ -153,6 +154,7 @@ test("CLI Codex export supports an external HTTPS client without server-local pa
   assert.equal(payload.catalogPath, clientCatalog);
   assert.ok(payload.config.includes('base_url = "https://server.example.com/v1"'));
   assert.ok(payload.config.includes(`model_catalog_json = "${clientCatalog}"`));
+  assert.equal((Bun.TOML.parse(payload.config) as { features: { instant_interrupt: boolean } }).features.instant_interrupt, false);
   assert.ok(!payload.config.includes("[[hooks.Interrupt]]"));
   assert.ok(!payload.config.includes(home));
   assert.ok(Array.isArray(JSON.parse(payload.catalog).models));

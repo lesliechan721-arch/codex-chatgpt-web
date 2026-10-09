@@ -137,6 +137,7 @@ Compatible settings from the original forwarding integration are generated throu
 | `supports_websockets = false` | Keep; use the existing HTTP/SSE transport only |
 | `web_search = "disabled"` | Keep; do not call blocked native search endpoints |
 | `[tui] auto_recap = false` | Disable background recap requests in all exported profiles, matching automatic integration |
+| `[features] instant_interrupt = false` | Disable instant model-stream interruption in all exported profiles; this steering path does not invoke the Interrupt hook |
 | `[features] multi_agent = true` | Export in Compatibility V1 mode, matching automatic integration |
 | `[features] multi_agent_v2 = false` | Export in Compatibility V1 mode; native mode does not force a downgrade |
 | `[agents] max_depth` | Reuse the V1 default, currently 2; the user can retain a larger existing value |
@@ -154,6 +155,10 @@ Detection requires Codex turn metadata with `thread_source=system` and the bound
 (`summary` and nullable `next_action`). Ordinary summary prompts and other system schemas keep their
 normal route. Automatic and manual `/recap` calls use the same contract and are both rejected.
 Restart Codex after merging `tui.auto_recap = false`; existing clients retain their loaded setting.
+
+Codex enables `instant_interrupt` by default. Exported configurations disable it because the
+bridge does not support instant interruption of an active model response. Merge
+`features.instant_interrupt = false` into existing client settings and restart Codex.
 
 On a normal local installation, the exported Interrupt hook is a declaration, not automatic authorization. After merging it, the user approves the command through Codex as required. Server remote-desktop deployment does not depend on a client command hook for correctness. It continues to use HTTP disconnect cancellation and additionally enables a no-progress timeout for native turns. When `[features]`, `[agents]`, or hooks already exist, merge by field instead of appending duplicate TOML tables or importing the same hook twice.
 
