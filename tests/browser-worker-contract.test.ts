@@ -13,6 +13,7 @@ import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
 import { CHATGPT_SEND_BUTTON_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
+import type { ChatGptVisibleTraceBlock } from "../src/adapters/chatgpt-web/browser-worker";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
@@ -746,7 +747,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
       userIdentities: string[];
       responseIdentities: string[];
     }>;
-    responseDomSnapshot(locator: unknown): Promise<{ visibleText: string }>;
+    responseDomSnapshot(locator: unknown): Promise<{ visibleText: string; traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }>;
     sendAttachedPrompt(
       page: Page,
       baseline: Baseline,
@@ -760,6 +761,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
         cause: ChatGptBrowserObservationTimeoutError,
         baseline: Baseline,
       ) => Promise<Recovery>,
+      observeToolBoundary?: (snapshot: { traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }) => void,
     ): Promise<string>;
   };
 
@@ -800,7 +802,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
       responseIdentities: ["conversation-turn-assistant"],
     };
   };
-  worker.responseDomSnapshot = async () => ({ visibleText: "tool preface" });
+  worker.responseDomSnapshot = async () => ({ visibleText: "tool preface", completionActionVisible: false, traceBlocks: [{ kind: "commentary", text: "Activity preface", key: "activity", streamable: true, complete: false }] });
 
   const baseline: Baseline = {
     responseTurns: { last: () => hiddenLocator },
@@ -810,6 +812,18 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
   const reboundBaseline: Baseline = { ...baseline, domCache: {} };
   const progress = new ChatGptExternalTurnProgress();
   const completionTracker = new ChatGptCompletionTracker();
+  const traceTracker = new ChatGptVisibleTraceTracker();
+  const order: string[] = [];
+  const acknowledge = progress.acknowledgeToolBatch.bind(progress);
+  progress.acknowledgeToolBatch = async revision => {
+    order.push("ACK");
+    await acknowledge(revision);
+  };
+  const observeToolBoundary = (snapshot: { traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }) => {
+    for (const event of traceTracker.observe(snapshot.traceBlocks, snapshot.completionActionVisible, Date.now(), true)) {
+      order.push(event.text);
+    }
+  };
   const lifecycle: string[] = [];
   let recoveries = 0;
   let toolBatchRevision = 0;
@@ -836,9 +850,12 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
         toolBatchRevision = progress.recordToolBatch(1);
         return { page, baseline: reboundBaseline };
       },
+      observeToolBoundary,
     ),
   );
 
+  expect(order).toEqual(["Activity preface", "ACK"]);
+  expect(traceTracker.finish()).toEqual([]);
   expect(evidence).toBe("mcp_tool_call");
   expect(sendPresses).toBe(1);
   expect(domObservations).toBe(2);
@@ -1099,13 +1116,15 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
         baseline: Baseline,
         signal?: AbortSignal,
       ) => Promise<Recovery>,
+      observeBinding?: unknown,
+      observeToolBoundary?: (snapshot: { traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }) => void,
     ): Promise<{ identity: string; locator: unknown }>;
     submissionDomState(page: Page, cache: Record<string, unknown>): Promise<{
       turnIdentities: string[];
       userIdentities: string[];
       responseIdentities: string[];
     }>;
-    responseDomSnapshot(): Promise<{ visibleText: string }>;
+    responseDomSnapshot(): Promise<{ visibleText: string; traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }>;
   };
 
   const hiddenLocator = {
@@ -1127,6 +1146,18 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
   const reboundBaseline: Baseline = { initialTurnIdentities: [], domCache: {} };
   const progress = new ChatGptExternalTurnProgress();
   const completionTracker = new ChatGptCompletionTracker();
+  const traceTracker = new ChatGptVisibleTraceTracker();
+  const order: string[] = [];
+  const acknowledge = progress.acknowledgeToolBatch.bind(progress);
+  progress.acknowledgeToolBatch = async revision => {
+    order.push("ACK");
+    await acknowledge(revision);
+  };
+  const observeToolBoundary = (snapshot: { traceBlocks: ChatGptVisibleTraceBlock[]; completionActionVisible: boolean }) => {
+    for (const event of traceTracker.observe(snapshot.traceBlocks, snapshot.completionActionVisible, Date.now(), true)) {
+      order.push(event.text);
+    }
+  };
   const observedPages: Page[] = [];
   worker.submissionDomState = async (page) => {
     observedPages.push(page);
@@ -1137,7 +1168,7 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
       responseIdentities: ["conversation-turn-assistant"],
     };
   };
-  worker.responseDomSnapshot = async () => ({ visibleText: "tool preface" });
+  worker.responseDomSnapshot = async () => ({ visibleText: "tool preface", completionActionVisible: false, traceBlocks: [{ kind: "commentary", text: "Activity preface", key: "activity", streamable: true, complete: false }] });
 
   let toolBatchRevision = 0;
   const binding = await worker.waitForNewAssistantTurn(
@@ -1155,8 +1186,12 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
       toolBatchRevision = progress.recordToolBatch(1);
       return { page: reboundPage, baseline: reboundBaseline };
     },
+    undefined,
+    observeToolBoundary,
   );
 
+  expect(order).toEqual(["Activity preface", "ACK"]);
+  expect(traceTracker.finish()).toEqual([]);
   expect(binding.identity).toBe("conversation-turn-assistant");
   expect(binding.locator).toBe(assistantLocator);
   expect(observedPages).toEqual([firstPage, reboundPage]);
@@ -3936,6 +3971,50 @@ test("browser stage diagnostics use safe bounded artifact names", () => {
   expect(browserDiagnosticCheckpoint("x".repeat(200))).toHaveLength(80);
 });
 
+test("live Activity commentary appends stable deltas before the next tool or paragraph", () => {
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  const first = [{ kind: "commentary", text: "Checking", complete: false, streamable: true }] as const;
+  expect(tracker.observe([...first], false, 0)).toEqual([]);
+  expect(tracker.observe([...first], false, 250)).toEqual([{ kind: "commentary", text: "Checking" }]);
+  const growing = [{ ...first[0], text: "Checking sources" }];
+  expect(tracker.observe(growing, false, 300)).toEqual([]);
+  expect(tracker.observe(growing, false, 550)).toEqual([
+    { kind: "commentary", text: " sources", continuation: true },
+  ]);
+  expect(tracker.finish()).toEqual([]);
+});
+
+test("a proven tool boundary releases newly observed Activity text before its stability timer", () => {
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  const blocks = [{ kind: "commentary", text: "Checking sources", complete: false, streamable: true }] as const;
+  expect(tracker.observe([...blocks], false, 0, true)).toEqual([
+    { kind: "commentary", text: "Checking sources" },
+  ]);
+  expect(tracker.observe([...blocks], false, 250)).toEqual([]);
+  expect(tracker.finish()).toEqual([]);
+});
+
+test("Activity completion flushes pending reasoning with bolding and preserves emitted prefixes", () => {
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  expect(tracker.observe([{ kind: "status", key: "summary", text: "Planning", streamable: true }], false, 0)).toEqual([]);
+  expect(tracker.observe([{ kind: "status", key: "summary", text: "Planning", streamable: true }], false, 250)).toEqual([
+    { kind: "reasoning", text: "**Planning**" },
+  ]);
+  expect(tracker.observe([{ kind: "status", key: "summary", text: "Planning checks", streamable: true }], false, 300)).toEqual([]);
+  expect(tracker.observe([], true, 400)).toEqual([]);
+  expect(tracker.finish()).toEqual([{ kind: "reasoning", text: " __checks__", continuation: true }]);
+  expect(tracker.finish()).toEqual([]);
+});
+
+test("Activity completion does not flush unfinished legacy commentary or animated legacy statuses", () => {
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  expect(tracker.observe([
+    { kind: "commentary", text: "Unfinished legacy paragraph", complete: false },
+    { kind: "status", text: "Animated fragment" },
+  ], false, 0)).toEqual([]);
+  expect(tracker.finish()).toEqual([]);
+});
+
 test("visible DOM trace interleaves statuses and explicit intermediate commentary", () => {
   const tracker = new ChatGptVisibleTraceTracker(100);
   const initialBlocks = [
@@ -4870,3 +4949,16 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   await stage;
   expect(outcome).toEqual(["ChatGPT browser stage timed out: probe"]);
 }, 10_000);
+
+
+test("Activity remount does not merge ambiguous growing prefixes", () => {
+  const tracker = new ChatGptVisibleTraceTracker(0);
+  tracker.observe([
+    { kind: "commentary", text: "Checking", key: "a", streamable: true },
+    { kind: "commentary", text: "Checking files", key: "b", streamable: true },
+  ], false, 0);
+  expect(tracker.observe([
+    { kind: "commentary", text: "Checking files now", key: "c", streamable: true },
+  ], false, 100)).toEqual([{ kind: "commentary", text: "Checking files now" }]);
+  expect(tracker.finish()).toEqual([]);
+});

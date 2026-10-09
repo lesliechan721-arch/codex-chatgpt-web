@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import type { Locator } from "playwright-core";
-import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptVisibleTraceTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptVisibleTraceTracker, CHATGPT_COMPLETION_SETTLE_MS, type ChatGptVisibleTraceBlock } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptMarkdownBuffer, ChatGptMarkdownConsistencyError, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
 
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
@@ -12,13 +12,14 @@ const powerStreamingHtml = readFileSync(new URL("./fixtures/chatgpt-power-stream
 // normalize before inserting test variants so they exercise the same DOM everywhere.
 const powerActivityHtml = readFileSync(new URL("./fixtures/chatgpt-power-activity.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const activitySummariesHtml = readFileSync(new URL("./fixtures/chatgpt-activity-summaries.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const liveActivityHtml = readFileSync(new URL("./fixtures/chatgpt-activity-live-commentary.html", import.meta.url), "utf8");
 type Snapshot = {
   responsePresent: boolean;
   visibleText: string;
   fullHtml: string;
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
-  traceBlocks: { kind: "answer" | "commentary" | "status"; text: string }[];
+  traceBlocks: ChatGptVisibleTraceBlock[];
 };
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
@@ -93,6 +94,62 @@ test("captured Activity progress is commentary before any assistant answer exist
   const answer = await snapshot(combined);
   expect(answer.visibleText).toBe("Final answer.");
   expect(answer.traceBlocks.some(block => block.kind === "commentary")).toBeTrue();
+});
+
+test("live Activity commentary streams without a later paragraph or legacy tool anchor", async () => {
+  const result = await snapshot(liveActivityHtml);
+  expect(result.visibleText).toBe("");
+  expect(result.traceBlocks).toEqual([expect.objectContaining({
+    kind: "commentary", text: "First update.", complete: false, streamable: true,
+  })]);
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  expect(tracker.observe(result.traceBlocks, false, 0)).toEqual([]);
+  expect(tracker.observe(result.traceBlocks, false, 250)).toEqual([
+    { kind: "commentary", text: "First update." },
+  ]);
+  expect(tracker.observe(result.traceBlocks, false, 10_000)).toEqual([]);
+});
+
+test("Activity completion preserves the last observed commentary after its panel collapses", async () => {
+  const [visible, collapsed] = await snapshots(liveActivityHtml, [document => {
+    document.getElementById("activity-content")!.remove();
+    document.getElementById("turn")!.insertAdjacentHTML("beforeend", '<div data-content-search-unit-key="answer"><h4 data-conversation-role="assistant"></h4><div data-markdown-text-style="assistant-message"><p>Final answer.</p></div><button data-testid="copy-turn-action-button">Copy</button></div>');
+  }]);
+  expect(collapsed!.visibleText).toBe("Final answer.");
+  expect(collapsed!.traceBlocks.some(block => block.kind === "commentary")).toBeFalse();
+  const tracker = new ChatGptVisibleTraceTracker(250);
+  expect(tracker.observe(visible!.traceBlocks, false, 0)).toEqual([]);
+  expect(tracker.observe(collapsed!.traceBlocks, true, 100)).toEqual([]);
+  expect(tracker.finish()).toEqual([{ kind: "commentary", text: "First update." }]);
+  expect(tracker.finish()).toEqual([]);
+});
+
+test("Activity identities survive earlier-root removal and same-content root replacement", async () => {
+  // The second text extends the first, so a prefix-only remount match can select the wrong root.
+  const html = liveActivityHtml.replace('<p>First update.</p>', '<p>Checking</p></div><div data-markdown-text-style="assistant-message" data-markdown-text-tone="primary"><p>Checking files</p>');
+  const [both, removed, replaced] = await snapshots(html, [
+    document => document.querySelector('[data-markdown-text-style]')!.remove(),
+    document => {
+      const remaining = document.querySelector('[data-markdown-text-style]')!;
+      remaining.replaceWith(remaining.cloneNode(true));
+    },
+  ]);
+  expect(both!.traceBlocks.map(block => block.key).every(Boolean)).toBeTrue();
+  expect(removed!.traceBlocks[0]!.key).toBe(both!.traceBlocks[1]!.key);
+  expect(replaced!.traceBlocks[0]!.key).not.toBe(removed!.traceBlocks[0]!.key);
+  const pending = new ChatGptVisibleTraceTracker(250);
+  pending.observe(both!.traceBlocks, false, 0);
+  pending.observe(removed!.traceBlocks, false, 100);
+  pending.observe(replaced!.traceBlocks, false, 150);
+  expect(pending.finish()).toEqual([
+    { kind: "commentary", text: "Checking" },
+    { kind: "commentary", text: "Checking files" },
+  ]);
+  const emitted = new ChatGptVisibleTraceTracker(0);
+  expect(emitted.observe(both!.traceBlocks, false, 0)).toHaveLength(2);
+  expect(emitted.observe(removed!.traceBlocks, false, 100)).toEqual([]);
+  expect(emitted.observe(replaced!.traceBlocks, false, 150)).toEqual([]);
+  expect(emitted.finish()).toEqual([]);
 });
 
 test("captured activity summaries use the status stream and keep actual commentary and answers separate", async () => {

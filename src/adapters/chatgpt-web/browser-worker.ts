@@ -1893,6 +1893,8 @@ export interface ChatGptVisibleTraceBlock {
   text: string;
   key?: string;
   complete?: boolean;
+  /** Activity text can grow without the legacy tool-item anchors. */
+  streamable?: boolean;
   uiControl?: boolean;
 }
 
@@ -1940,11 +1942,22 @@ export class ChatGptVisibleTraceTracker {
   private readonly emittedTrace = new Map<string, string>();
   private readonly traceCandidates = new Map<string, { text: string; changedAt: number }>();
   private readonly reasoningDelimiter = new Map<string, "**" | "__">();
+  private readonly activityTrace = new Map<string, ChatGptVisibleTraceBlock>();
+  private readonly activityAliases = new Map<string, string>();
 
   constructor(private readonly traceStabilityMs = 250) {}
 
-  observe(blocks: ChatGptVisibleTraceBlock[], completionActionVisible: boolean, now = Date.now()): ChatGptVisibleTraceEvent[] {
+  observe(
+    blocks: ChatGptVisibleTraceBlock[],
+    completionActionVisible: boolean,
+    now = Date.now(),
+    toolBoundary = false,
+  ): ChatGptVisibleTraceEvent[] {
     const output: ChatGptVisibleTraceEvent[] = [];
+    const presentActivitySlots = new Set(blocks.filter(block => block.streamable && block.key).map(block => {
+      const slot = `${block.kind}:${block.key}`;
+      return this.activityAliases.get(slot) ?? slot;
+    }));
     let statusSlot = 0;
     let commentarySlot = 0;
     for (const block of blocks) {
@@ -1952,7 +1965,7 @@ export class ChatGptVisibleTraceTracker {
       // structurally by responseDomSnapshot before they reach this tracker.
       if (block.kind === "answer") continue;
       const index = block.kind === "status" ? statusSlot++ : commentarySlot++;
-      const slot = block.key ? `${block.kind}:${block.key}` : `${block.kind}:${index}`;
+      let slot = block.key ? `${block.kind}:${block.key}` : `${block.kind}:${index}`;
       const stripped = block.text
         .replace(/\r\n/g, "\n")
         .split("\n")
@@ -1962,17 +1975,40 @@ export class ChatGptVisibleTraceTracker {
         .trim();
       const text = block.kind === "status" ? stripped.replace(/\s+/g, " ") : stripped;
       if (!text) continue;
+      if (block.streamable) {
+        const rawSlot = slot;
+        slot = this.activityAliases.get(rawSlot) ?? rawSlot;
+        // React can replace an Activity root. Reuse an absent root's identity only for the
+        // same text or its growing prefix; roots still present retain independent identities.
+        if (block.key && !this.activityTrace.has(slot)) {
+          const absent = [...this.activityTrace].filter(([key, retained]) =>
+            !presentActivitySlots.has(key) && retained.kind === block.kind);
+          const exact = absent.filter(([, retained]) => text === retained.text);
+          const growing = exact.length ? exact : absent.filter(([, retained]) => text.startsWith(retained.text));
+          const previous = growing.length === 1 ? growing[0] : undefined;
+          if (previous) {
+            slot = previous[0];
+            this.activityAliases.set(rawSlot, slot);
+            presentActivitySlots.add(slot);
+          }
+        }
+        // Retain observed text because the panel can unmount before final completion evidence.
+        this.activityTrace.set(slot, { ...block, text, key: slot.slice(block.kind.length + 1) });
+      }
+      const settled = completionActionVisible || (toolBoundary && block.streamable === true);
       let candidate = this.traceCandidates.get(slot);
       if (!candidate || candidate.text !== text) {
         candidate = { text, changedAt: now };
         this.traceCandidates.set(slot, candidate);
-        if (!completionActionVisible && this.traceStabilityMs > 0) continue;
+        if (!settled && this.traceStabilityMs > 0) continue;
       }
       // A commentary Markdown root remains mutable until ChatGPT appends the next reasoning item.
       // Emitting it earlier lets a tool-status boundary split one semantic paragraph into multiple
       // Codex messages. The next anchored item (or final completion evidence) is the stable boundary.
-      if (block.kind === "commentary" && block.complete === false && !completionActionVisible) continue;
-      if (!completionActionVisible && now - candidate.changedAt < this.traceStabilityMs) continue;
+      // Activity has no legacy item anchors. Its stable text can stream before the next paragraph;
+      // a proven MCP boundary also settles the current observed Activity prefix.
+      if (block.kind === "commentary" && block.complete === false && !block.streamable && !settled) continue;
+      if (!settled && now - candidate.changedAt < this.traceStabilityMs) continue;
 
       const previous = this.emittedTrace.get(slot);
       if (previous === text) continue;
@@ -2006,6 +2042,12 @@ export class ChatGptVisibleTraceTracker {
         }
       }
     }
+    return output;
+  }
+
+  finish(): ChatGptVisibleTraceEvent[] {
+    const output = this.observe([...this.activityTrace.values()], true);
+    this.activityTrace.clear();
     return output;
   }
 }
@@ -3066,6 +3108,7 @@ export class ChatGptBrowserWorker {
     externalProgress?: ChatGptTurnProgressReader,
     initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0,
     completionTracker?: ChatGptCompletionTracker,
+    observeToolBoundary?: (snapshot: ChatGptResponseDomSnapshot) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     for (;;) {
@@ -3074,8 +3117,9 @@ export class ChatGptBrowserWorker {
       if (progress
         && externalProgress
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
-        const boundaryText = await this.currentSubmissionAnswerText(page, baseline, signal);
-        completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
+        const boundary = await this.currentSubmissionAnswerSnapshot(page, baseline, signal);
+        if (boundary) observeToolBoundary?.(boundary);
+        completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundary?.visibleText ?? "");
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
       if (progress && progress.lastToolBatchRevision > initialToolBatchRevision) return "mcp_tool_call";
@@ -3254,20 +3298,20 @@ export class ChatGptBrowserWorker {
     return evidence;
   }
 
-  private async currentSubmissionAnswerText(
+  private async currentSubmissionAnswerSnapshot(
     page: Page,
     baseline: ChatGptSubmissionBaseline,
     signal?: AbortSignal,
-  ): Promise<string> {
+  ): Promise<ChatGptResponseDomSnapshot | undefined> {
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     await this.reconcileMultipartHistory(page, baseline, state, signal);
     const identity = chatGptNewTurnIdentity(
       baseline.initialTurnIdentities,
       state.responseIdentities,
     );
-    if (!identity) return "";
+    if (!identity) return undefined;
     const locator = page.locator(chatGptAssistantTurnSelector(identity));
-    return (await this.responseDomSnapshot(locator, {})).visibleText;
+    return this.responseDomSnapshot(locator, {});
   }
 
   private async reconcileMultipartHistory(
@@ -3355,6 +3399,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     observeBinding?: ChatGptBindingObserver,
+    observeToolBoundary?: (snapshot: ChatGptResponseDomSnapshot) => void,
   ): Promise<ChatGptAssistantTurnBinding> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -3430,13 +3475,14 @@ export class ChatGptBrowserWorker {
       if (progress
         && externalProgress
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
-        const boundaryText = identity
-          ? (await this.responseDomSnapshot(
+        const boundary = identity
+          ? await this.responseDomSnapshot(
             observationPage.locator(chatGptAssistantTurnSelector(identity)),
             {},
-          )).visibleText
-          : "";
-        completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundaryText);
+          )
+          : undefined;
+        if (boundary) observeToolBoundary?.(boundary);
+        completionTracker.observeToolBatch(progress.lastToolBatchRevision, boundary?.visibleText ?? "");
         await externalProgress.acknowledgeToolBatch(progress.lastToolBatchRevision);
       }
       if (identity) {
@@ -3995,6 +4041,7 @@ export class ChatGptBrowserWorker {
     initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    observeToolBoundary?: (snapshot: ChatGptResponseDomSnapshot) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     let observationPage = page;
     let observationBaseline = baseline;
@@ -4008,6 +4055,7 @@ export class ChatGptBrowserWorker {
           externalProgress,
           initialToolBatchRevision,
           completionTracker,
+          observeToolBoundary,
         );
         return evidence;
       } catch (error) {
@@ -4040,6 +4088,7 @@ export class ChatGptBrowserWorker {
     submissionLifecycle?: Pick<BrowserTurn, "onSendActivated" | "onSubmitted">,
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
+    observeToolBoundary?: (snapshot: ChatGptResponseDomSnapshot) => void,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -4079,6 +4128,7 @@ export class ChatGptBrowserWorker {
       initialToolBatchRevision,
       completionTracker,
       recoverObservation,
+      observeToolBoundary,
     );
     await submissionLifecycle?.onSubmitted?.();
     return evidence;
@@ -4866,7 +4916,11 @@ export class ChatGptBrowserWorker {
       const traceKey = (candidate: HTMLElement, kind: ChatGptVisibleTraceBlock["kind"]): string | undefined => {
         const statusContainer = candidate.closest<HTMLElement>("[data-streaming-response-status]");
         const itemAnchor = candidate.closest<HTMLElement>("[data-item-anchor]");
-        if (!statusContainer || !itemAnchor) return undefined;
+        if (!statusContainer || !itemAnchor) {
+          return activityContainers.some(container => container.contains(candidate))
+            ? nodeKey(candidate)
+            : undefined;
+        }
         const anchorIndex = [...statusContainer.querySelectorAll<HTMLElement>("[data-item-anchor]")]
           .indexOf(itemAnchor);
         return anchorIndex >= 0 ? `${kind}:anchor:${anchorIndex}` : undefined;
@@ -4918,6 +4972,9 @@ export class ChatGptBrowserWorker {
           text: traceText(candidate),
           key: traceKey(candidate, kind),
           ...(kind === "commentary" ? { complete: hasFollowingRenderedSibling(candidate) } : {}),
+          ...((kind === "commentary" || activitySummaryRoots.has(candidate))
+            && activityContainers.some(container => container.contains(candidate))
+            && !candidate.closest("[data-item-anchor]") ? { streamable: true } : {}),
           // Footer controls such as the model picker and overflow menu are siblings of the final
           // Markdown inside the assistant turn. They are UI, not model trace. Real action buttons
           // are scoped by ChatGPT's streaming-status container.
@@ -5688,6 +5745,16 @@ export class ChatGptBrowserWorker {
         this.attachFiles(page, prepared)
       ));
       await diagnostics.capture(page, "file-attachment-complete");
+      const visibleTrace = new ChatGptVisibleTraceTracker();
+      const emitVisibleTrace = (events: ChatGptVisibleTraceEvent[]): void => {
+        for (const trace of events) {
+          if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
+          else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+        }
+      };
+      const observeToolBoundary = (snapshot: ChatGptResponseDomSnapshot): void => {
+        emitVisibleTrace(visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible, Date.now(), true));
+      };
       const completionTracker = new ChatGptCompletionTracker();
       const recordFinalUsage = await usageSubmission();
       const finalSubmissionEvidence = await this.runStage(
@@ -5718,6 +5785,7 @@ export class ChatGptBrowserWorker {
               return recovered;
             }
             : undefined,
+          observeToolBoundary,
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);
@@ -5737,6 +5805,7 @@ export class ChatGptBrowserWorker {
           }
           : undefined,
         diagnostic => diagnostics.recordBinding(diagnostic),
+        observeToolBoundary,
       );
       await diagnostics.capture(page, "send-accepted");
 
@@ -5746,7 +5815,6 @@ export class ChatGptBrowserWorker {
       let loggedCompletionWait = false;
       let capturedResponse = false;
       const sentAt = Date.now();
-      const visibleTrace = new ChatGptVisibleTraceTracker();
       const markdownBuffer = new ChatGptMarkdownBuffer(undefined, undefined, turn.compaction ? "complete" : "stream");
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
@@ -5910,6 +5978,8 @@ export class ChatGptBrowserWorker {
         if (turn.externalProgress
           && externalProgressSnapshot
           && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
+          // Queue the observed Activity prefix before ACK releases the outer tool-call response.
+          emitVisibleTrace(visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible, Date.now(), true));
           completionTracker.observeToolBatch(
             externalProgressSnapshot.lastToolBatchRevision,
             snapshot.visibleText,
@@ -5949,10 +6019,7 @@ export class ChatGptBrowserWorker {
               return throwMarkdownConsistencyError(error);
             }
           })();
-          for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
-            if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
-            else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
-          }
+          emitVisibleTrace(visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible));
           if (textDelta) emitMarkdownDelta(textDelta, observedCandidate);
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
@@ -6016,6 +6083,7 @@ export class ChatGptBrowserWorker {
             if (!final.markdown && snapshot.visibleText) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
             }
+            emitVisibleTrace(visibleTrace.finish());
             const finalCandidate = completionTracker.captureTaskOutputCandidate(taskOutputObservationState, snapshot.visibleText);
             if (final.delta) emitMarkdownDelta(final.delta, finalCandidate);
             if (checkpointStream) {
