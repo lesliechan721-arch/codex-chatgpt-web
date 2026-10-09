@@ -40,6 +40,9 @@ export function renderApiKeyCodexConfig(options: {
     'requires_openai_auth = false',
     'supports_websockets = false',
     '',
+    '[tui]',
+    'auto_recap = false',
+    '',
   ].join("\n");
   // Reuse the same V1 defaults as OpenAI forwarding; native mode must not be pinned to V1.
   if ((options.subagentProtocol ?? "compatibility-v1") === "compatibility-v1") {

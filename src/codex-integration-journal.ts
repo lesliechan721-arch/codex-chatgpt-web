@@ -22,6 +22,8 @@ import type {
   LegacyCodexIntegrationJournalV8,
 } from "./codex-integration-shared";
 import { verifyManagedJournalState } from "./codex-integration-route";
+import { installCodexInterruptHookCommand, restoreCodexInterruptHook } from "./codex-interrupt-hook";
+import { restoreAutoRecap } from "./codex-integration-tui";
 
 function isPreviousAssignment(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
@@ -39,6 +41,18 @@ function isInstalledInterruptHook(value: unknown): boolean {
     && typeof hook.stateKey === "string" && hook.stateKey.length > 0
     && typeof hook.trustedHash === "string" && /^sha256:[a-f0-9]{64}$/.test(hook.trustedHash)
     && typeof hook.fragment === "string" && hook.fragment.length > 0;
+}
+
+function isPreviousAutoRecap(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const assignment = value as Record<string, unknown>;
+  return isPreviousAssignment(value)
+    && typeof assignment.tablePresent === "boolean"
+    && (assignment.location === "table" || assignment.location === "dotted" || assignment.location === "inline")
+    && typeof assignment.installedAssignment === "string" && assignment.installedAssignment.length > 0
+    && (!assignment.present || assignment.value === "true" || assignment.value === "false")
+    && (assignment.inlineInsertion === undefined || typeof assignment.inlineInsertion === "string")
+    && (assignment.separatorInserted === undefined || typeof assignment.separatorInserted === "boolean");
 }
 
 function parseJournal(path: string): AnyCodexIntegrationJournal {
@@ -59,6 +73,7 @@ function parseJournal(path: string): AnyCodexIntegrationJournal {
     && value.previous
     && isPreviousAssignment(value.previousRealtimeWebrtcCallBaseUrl)
     && isInstalledInterruptHook(value.interruptHook)
+    && (value.previousAutoRecap === undefined || isPreviousAutoRecap(value.previousAutoRecap))
     && typeof value.configPath === "string") {
     return value as unknown as CodexIntegrationJournal;
   }
@@ -147,6 +162,32 @@ function journalMatchesConfig(journal: AnyCodexIntegrationJournal): boolean {
   }
 }
 
+function matchesAutoRecapMigration(newer: CodexIntegrationJournal, older: CodexIntegrationJournal): boolean {
+  if (!newer.previousAutoRecap || older.previousAutoRecap) return false;
+  const { previousAutoRecap: _recap, ...prior } = newer;
+  const sameBaseline = {
+    ...prior,
+    interruptHook: { ...prior.interruptHook, fragment: older.interruptHook.fragment },
+  };
+  // All previous route/feature assignments and the hook's command, trust and index must agree.
+  if (serializeJournal(sameBaseline) !== serializeJournal(older)) return false;
+  if (newer.interruptHook.fragment === older.interruptHook.fragment) return true;
+  if (!newer.active || !older.active) return false;
+  try {
+    const text = readFileSync(newer.configPath, "utf8");
+    const withoutHook = restoreCodexInterruptHook(text, newer.interruptHook);
+    const regeneratedNew = installCodexInterruptHookCommand(withoutHook, newer.configPath, newer.interruptHook.command);
+    if (JSON.stringify(regeneratedNew.installed) !== JSON.stringify(newer.interruptHook)) return false;
+    // Adding [tui] can change the hook's leading separator. Reproduce both installations to
+    // accept only that generated difference, rather than ignoring arbitrary fragment changes.
+    const withoutRecap = restoreAutoRecap(withoutHook, newer.previousAutoRecap);
+    const regeneratedOld = installCodexInterruptHookCommand(withoutRecap, older.configPath, older.interruptHook.command);
+    return JSON.stringify(regeneratedOld.installed) === JSON.stringify(older.interruptHook);
+  } catch {
+    return false;
+  }
+}
+
 export function readJournal(): AnyCodexIntegrationJournal | undefined {
   const primaryPath = getCodexJournalPath();
   const recoveryPath = getCodexJournalRecoveryPath();
@@ -180,6 +221,19 @@ export function readJournal(): AnyCodexIntegrationJournal | undefined {
 
   const primaryMatches = primary ? journalMatchesConfig(primary) : false;
   const recoveryMatches = recovery ? journalMatchesConfig(recovery) : false;
+  // Released v10 journals do not own auto_recap. After adding its baseline, both copies can
+  // still match the config. Accept only the added baseline and its reproducible hook separator.
+  let migrated: CodexIntegrationJournal | undefined;
+  if (primaryMatches && recoveryMatches && primary?.version === 10 && recovery?.version === 10) {
+    const newer = primary.previousAutoRecap ? primary : recovery.previousAutoRecap ? recovery : undefined;
+    const older = newer === primary ? recovery : primary;
+    if (newer && matchesAutoRecapMigration(newer, older)) migrated = newer;
+  }
+  if (migrated) {
+    const data = serializeJournal(migrated);
+    writeFilesWithCompensation([{ path: recoveryPath, data }, { path: primaryPath, data }]);
+    return migrated;
+  }
   if (primaryMatches === recoveryMatches) {
     throw new Error(
       primaryMatches

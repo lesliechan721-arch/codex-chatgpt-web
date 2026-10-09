@@ -16,6 +16,7 @@ import {
   extractChatGptCompactionSourceRevision,
   extractChatGptCompactV1SourceRevision,
   isCodexGuardianReviewRequestFromBody,
+  isCodexRecapRequestFromBody,
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
@@ -950,6 +951,11 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
+  // Reject hidden recap turns before acquiring a browser/continuity lease or forwarding upstream.
+  if (isCodexRecapRequestFromBody(raw)) {
+    return apiAccessError(400, "codex_recap_not_supported",
+      "Codex recap requests are disabled by this service. Set tui.auto_recap = false in the Codex configuration.");
+  }
   const threadTitle = isCodexThreadTitleRequestFromBody(raw);
   const guardianReview = isCodexGuardianReviewRequestFromBody(raw);
   if (!threadTitle && !guardianReview) {

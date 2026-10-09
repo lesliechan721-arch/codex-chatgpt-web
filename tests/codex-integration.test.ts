@@ -18,6 +18,7 @@ import {
   uninstallCodexIntegration,
 } from "../src/codex-integration";
 import { defaultConfig, loadConfig, saveConfig } from "../src/config";
+import { restoreAutoRecap } from "../src/codex-integration-tui";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   MANAGED_COMMENT,
@@ -920,9 +921,10 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
-    const legacyConfig = readFileSync(configPath, "utf8").replace(interruptFragment, "");
+    const legacyConfig = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), legacy.previousAutoRecap);
     legacy.version = 9;
     delete legacy.interruptHook;
+    delete legacy.previousAutoRecap;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
     writeFileSync(configPath, legacyConfig);
     writeFileSync(getCodexJournalPath(), legacyJournal);
@@ -1033,12 +1035,14 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const withoutRecap = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), legacy.previousAutoRecap);
     legacy.version = 8;
     delete legacy.interruptHook;
+    delete legacy.previousAutoRecap;
     delete legacy.installed.experimental_realtime_webrtc_call_base_url;
     delete legacy.previousRealtimeWebrtcCallBaseUrl;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
-    const legacyConfig = readFileSync(configPath, "utf8").replace(interruptFragment, "")
+    const legacyConfig = withoutRecap
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*$/m, customVoiceLine);
     writeFileSync(configPath, legacyConfig);
@@ -1069,12 +1073,14 @@ describe("reversible native Codex route integration", () => {
 
     const legacy = JSON.parse(currentJournal);
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const withoutRecap = restoreAutoRecap(currentConfig.replace(interruptFragment, ""), legacy.previousAutoRecap);
     legacy.version = 8;
     delete legacy.interruptHook;
+    delete legacy.previousAutoRecap;
     delete legacy.installed.experimental_realtime_webrtc_call_base_url;
     delete legacy.previousRealtimeWebrtcCallBaseUrl;
     const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
-    const legacyConfig = currentConfig.replace(interruptFragment, "")
+    const legacyConfig = withoutRecap
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "");
 
@@ -1101,7 +1107,7 @@ describe("reversible native Codex route integration", () => {
     installCodexIntegration(nativeConfig("browser-only"));
     const previous = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = previous.interruptHook.fragment as string;
-    const legacyInstalled = readFileSync(configPath, "utf8").replace(interruptFragment, "")
+    const legacyInstalled = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), previous.previousAutoRecap)
       .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
       .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "")
       .replace(/^(?:remote_compaction_v2 = false|multi_agent = true|multi_agent_v2 = false).*\n/gm, "");
@@ -1112,6 +1118,7 @@ describe("reversible native Codex route integration", () => {
     delete previous.previousMultiAgentV2;
     delete previous.previousRealtimeWebrtcCallBaseUrl;
     delete previous.interruptHook;
+    delete previous.previousAutoRecap;
     delete previous.installed.remote_compaction_v2;
     delete previous.installed.multi_agent;
     delete previous.installed.multi_agent_v2;
@@ -1136,7 +1143,9 @@ describe("reversible native Codex route integration", () => {
     installCodexIntegration(nativeConfig("browser-only"));
     const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
     const interruptFragment = legacy.interruptHook.fragment as string;
+    const withoutRecap = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), legacy.previousAutoRecap);
     delete legacy.interruptHook;
+    delete legacy.previousAutoRecap;
     delete legacy.previousRemoteCompactionV2;
     delete legacy.previousMultiAgent;
     delete legacy.previousMultiAgentV2;
@@ -1149,7 +1158,7 @@ describe("reversible native Codex route integration", () => {
     writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
     writeFileSync(
       configPath,
-      readFileSync(configPath, "utf8").replace(interruptFragment, "")
+      withoutRecap
         .replace(MANAGED_ROUTE_COMMENT, MANAGED_COMMENT)
         .replace(/^experimental_realtime_webrtc_call_base_url\s*=.*\n/gm, "")
         .replace(/^(?:remote_compaction_v2 = false|multi_agent = true|multi_agent_v2 = false).*\n/gm, ""),

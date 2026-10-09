@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { parseTOML, type AST } from "toml-eslint-parser";
 import { stripUtf8Bom } from "./config";
 import {
   MANAGED_COMMENT,
@@ -22,9 +23,21 @@ import type {
   PreviousFeatureAssignment,
 } from "./codex-integration-shared";
 
+function parseTomlLines(lines: string[]): AST.TOMLProgram {
+  return parseTOML(lines.join("\n").replace(/^\uFEFF/, " "), { tomlVersion: "1.0" });
+}
+
 export function firstTableIndex(lines: string[]): number {
-  const index = lines.findIndex(line => /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line));
-  return index < 0 ? lines.length : index;
+  // A line such as [example] can belong to a multiline string, rather than a TOML table.
+  const ast = parseTomlLines(lines);
+  const table = ast.body[0].body.find(node => node.type === "TOMLTable");
+  return table ? table.loc.start.line - 1 : lines.length;
+}
+
+function topLevelAssignmentIndices(lines: string[]): number[] {
+  return parseTomlLines(lines).body[0].body
+    .filter(node => node.type === "TOMLKeyValue")
+    .map(node => node.loc.start.line - 1);
 }
 function assignmentRegex(key: string): RegExp {
   return new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+?)\\s*$`);
@@ -212,7 +225,7 @@ function decodeTomlString(raw: string, key: string): string {
 export function findTopLevelAssignment(lines: string[], key: string): PreviousAssignment {
   const regex = assignmentRegex(key);
   const matches: PreviousAssignment[] = [];
-  for (let index = 0; index < firstTableIndex(lines); index += 1) {
+  for (const index of topLevelAssignmentIndices(lines)) {
     const line = lines[index]!;
     if (/^\s*#/.test(line)) continue;
     const match = regex.exec(line);
@@ -225,7 +238,7 @@ export function findTopLevelAssignment(lines: string[], key: string): PreviousAs
 function findTopLevelPositiveInteger(lines: string[], key: string): number | undefined {
   const regex = assignmentRegex(key);
   const matches: string[] = [];
-  for (let index = 0; index < firstTableIndex(lines); index += 1) {
+  for (const index of topLevelAssignmentIndices(lines)) {
     const line = lines[index]!;
     if (/^\s*#/.test(line)) continue;
     const match = regex.exec(line);
@@ -528,13 +541,8 @@ export function installCompatibilityV1Features(text: string): {
     : foundMultiAgent;
   const previousMultiAgentV2 = findMultiAgentV2Assignment(document.lines);
   const foundAgentMaxDepth = findAgentMaxDepthAssignment(document.lines);
-  const previousAgentMaxDepth: PreviousAgentAssignment = !foundAgentMaxDepth.tablePresent
-    && document.lines.length > 0
-    && Boolean(document.lines.at(-1)?.trim())
-    ? { ...foundAgentMaxDepth, separatorInserted: true }
-    : foundAgentMaxDepth;
   const installedAgentMaxDepth = Math.max(
-    previousAgentMaxDepth.present ? Number(previousAgentMaxDepth.value) : 0,
+    foundAgentMaxDepth.present ? Number(foundAgentMaxDepth.value) : 0,
     MIN_COMPATIBILITY_V1_AGENT_DEPTH,
   );
   setScalarFeature(document, "multi_agent", MANAGED_MULTI_AGENT_LINE);
@@ -559,6 +567,12 @@ export function installCompatibilityV1Features(text: string): {
   } else {
     setScalarFeature(document, "multi_agent_v2", MANAGED_MULTI_AGENT_V2_LINE);
   }
+  // Feature insertion can change the final line before the agents table is appended.
+  const previousAgentMaxDepth: PreviousAgentAssignment = !foundAgentMaxDepth.tablePresent
+    && document.lines.length > 0
+    && Boolean(document.lines.at(-1)?.trim())
+    ? { ...foundAgentMaxDepth, separatorInserted: true }
+    : foundAgentMaxDepth;
   setAgentMaxDepth(document, installedAgentMaxDepth);
   return {
     text: renderDocument(document),

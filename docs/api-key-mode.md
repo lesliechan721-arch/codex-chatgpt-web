@@ -136,6 +136,7 @@ Compatible settings from the original forwarding integration are generated throu
 | `experimental_bearer_token` / `requires_openai_auth = false` / Responses wire API | Keep; `experimental_bearer_token` contains the current local service API Key and `env_key` is no longer emitted |
 | `supports_websockets = false` | Keep; use the existing HTTP/SSE transport only |
 | `web_search = "disabled"` | Keep; do not call blocked native search endpoints |
+| `[tui] auto_recap = false` | Disable background recap requests in all exported profiles, matching automatic integration |
 | `[features] multi_agent = true` | Export in Compatibility V1 mode, matching automatic integration |
 | `[features] multi_agent_v2 = false` | Export in Compatibility V1 mode; native mode does not force a downgrade |
 | `[agents] max_depth` | Reuse the V1 default, currently 2; the user can retain a larger existing value |
@@ -146,6 +147,13 @@ Compatible settings from the original forwarding integration are generated throu
 | Custom upstream API Key, OAuth, Tunnel credentials | Never export; the local service API Key enters TOML only during an explicit sensitive Codex export |
 
 After values are generated from the shared feature builder, automatic-management comments are removed. Manually exported settings are owned by the user and must not look like a new journal-managed installation.
+
+The Responses endpoint rejects identified Codex recap requests with HTTP 400 and
+`codex_recap_not_supported` before browser creation, continuation changes, or upstream forwarding.
+Detection requires Codex turn metadata with `thread_source=system` and the bounded recap JSON schema
+(`summary` and nullable `next_action`). Ordinary summary prompts and other system schemas keep their
+normal route. Automatic and manual `/recap` calls use the same contract and are both rejected.
+Restart Codex after merging `tui.auto_recap = false`; existing clients retain their loaded setting.
 
 On a normal local installation, the exported Interrupt hook is a declaration, not automatic authorization. After merging it, the user approves the command through Codex as required. Server remote-desktop deployment does not depend on a client command hook for correctness. It continues to use HTTP disconnect cancellation and additionally enables a no-progress timeout for native turns. When `[features]`, `[agents]`, or hooks already exist, merge by field instead of appending duplicate TOML tables or importing the same hook twice.
 

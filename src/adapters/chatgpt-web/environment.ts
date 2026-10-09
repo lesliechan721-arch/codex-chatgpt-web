@@ -148,6 +148,38 @@ export function isCodexGuardianReviewRequestFromBody(value: unknown): boolean {
     && (metadata.thread_source === "guardian_review" || metadata.turn_trigger === "guardian_review");
 }
 
+/** Codex recaps share the generic system source; match their bounded output contract too. */
+export function isCodexRecapRequestFromBody(value: unknown): boolean {
+  const metadata = clientTurnMetadataFromBody(value);
+  if (metadata?.request_kind !== "turn" || metadata.thread_source !== "system") return false;
+
+  const format = record(record(record(value)?.text)?.format);
+  const schema = record(format?.schema);
+  const properties = record(schema?.properties);
+  const summary = record(properties?.summary);
+  const nextAction = record(properties?.next_action);
+  const required = schema?.required;
+  const nextActionTypes = nextAction?.type;
+  return format?.type === "json_schema"
+    && format.strict === true
+    && schema?.type === "object"
+    && schema.additionalProperties === false
+    && properties !== undefined
+    && Object.keys(properties).length === 2
+    && summary?.type === "string"
+    && summary.minLength === 1
+    && summary.maxLength === 700
+    && Array.isArray(nextActionTypes)
+    && nextActionTypes.length === 2
+    && nextActionTypes.includes("string")
+    && nextActionTypes.includes("null")
+    && nextAction?.maxLength === 200
+    && Array.isArray(required)
+    && required.length === 2
+    && required.includes("summary")
+    && required.includes("next_action");
+}
+
 function clientTurnMetadata(parsed: CodexParsedRequest): Record<string, unknown> | undefined {
   return clientTurnMetadataFromBody(parsed._rawBody);
 }

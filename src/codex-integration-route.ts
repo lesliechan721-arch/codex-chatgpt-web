@@ -28,6 +28,7 @@ import {
   verifyCodexInterruptHook,
   verifyCodexInterruptHookRestored,
 } from "./codex-interrupt-hook";
+import { restoreAutoRecap, restoreOwnedAutoRecap, verifyAutoRecap, verifyRestoredAutoRecap } from "./codex-integration-tui";
 import {
   assignments,
   findFeatureAssignment,
@@ -195,7 +196,10 @@ export function replacementBaseline(
     const withoutHook = journal.version === 10
       ? restoreCodexInterruptHook(currentText, journal.interruptHook, { allowAbsent: true })
       : currentText;
-    const baseline = restoreOwnedManagedFeatures(withoutHook, journal);
+    const withoutRecap = journal.version === 10 && journal.previousAutoRecap
+      ? restoreOwnedAutoRecap(withoutHook, journal.previousAutoRecap)
+      : withoutHook;
+    const baseline = restoreOwnedManagedFeatures(withoutRecap, journal);
     const document = parseDocument(baseline);
     removeManagedComment(document);
     for (const [key, installedValue, previous] of [
@@ -320,6 +324,7 @@ function verifyOwnedInstalledRoute(text: string, journal: ManagedRouteJournal): 
     }
   }
   if (journal.version === 10) verifyCodexInterruptHook(text, journal.interruptHook);
+  if (journal.version === 10 && journal.previousAutoRecap) verifyAutoRecap(text, journal.previousAutoRecap);
   if (journal.version === 8 || journal.version === 9 || journal.version === 10) {
     const evidence = compatibilityV1Evidence(journal);
     if (evidence) {
@@ -374,6 +379,7 @@ export function verifyRestoredRoute(
     }
   }
   if (journal.version === 10) verifyCodexInterruptHookRestored(text);
+  if (journal.version === 10 && journal.previousAutoRecap) verifyRestoredAutoRecap(text, journal.previousAutoRecap);
   if (journal.version === 5 || journal.version === 6) {
     const previousFeatures: Array<readonly [string, PreviousFeatureAssignment]> = [
       ["remote_compaction_v2", journal.previousRemoteCompactionV2],
@@ -453,7 +459,10 @@ export function restoreManagedRoute(text: string, journal: ManagedRouteJournal):
   const withoutHook = journal.version === 10
     ? restoreCodexInterruptHook(text, journal.interruptHook)
     : text;
-  const document = parseDocument(withoutHook);
+  const withoutRecap = journal.version === 10 && journal.previousAutoRecap
+    ? restoreAutoRecap(withoutHook, journal.previousAutoRecap)
+    : withoutHook;
+  const document = parseDocument(withoutRecap);
   removeManagedComment(document);
   const currentBaseUrl = findTopLevelAssignment(document.lines, "openai_base_url");
   if (currentBaseUrl.index === undefined) throw new Error("Managed Codex openai_base_url is missing");

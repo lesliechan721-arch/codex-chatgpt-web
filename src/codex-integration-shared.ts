@@ -17,6 +17,8 @@ export const MANAGED_MULTI_AGENT_V2_LINE =
   "multi_agent_v2 = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
 export const MANAGED_MULTI_AGENT_V2_TABLE_LINE =
   "enabled = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
+export const MANAGED_AUTO_RECAP_LINE =
+  "auto_recap = false # Managed by codex-chatgpt-web: disables unsupported automatic recap requests.";
 export const MIN_COMPATIBILITY_V1_AGENT_DEPTH = 2;
 export function managedAgentMaxDepthLine(value: number): string {
   return `max_depth = ${value} # Managed by codex-chatgpt-web: allows nested routed Web subagents in Compatibility V1.`;
@@ -39,6 +41,14 @@ export interface PreviousFeatureAssignment extends PreviousAssignment {
 
 export interface PreviousAgentAssignment extends PreviousAssignment {
   tablePresent: boolean;
+  separatorInserted?: boolean;
+}
+
+export interface PreviousAutoRecapAssignment extends PreviousAssignment {
+  tablePresent: boolean;
+  location: "table" | "dotted" | "inline";
+  installedAssignment: string;
+  inlineInsertion?: string;
   separatorInserted?: boolean;
 }
 
@@ -66,6 +76,8 @@ export interface CodexIntegrationJournal {
   previousMultiAgent?: PreviousFeatureAssignment;
   previousMultiAgentV2?: PreviousFeatureAssignment;
   previousAgentMaxDepth?: PreviousAgentAssignment;
+  // Optional so released version 10 journals can be upgraded without losing their baseline.
+  previousAutoRecap?: PreviousAutoRecapAssignment;
   format?: {
     lineEnding: "\n" | "\r\n" | "\r";
     trailingNewline: boolean;

@@ -30,6 +30,7 @@ import type {
   UninstallCodexIntegrationResult,
 } from "./codex-integration-shared";
 import { assertJournalTargetsConfig, readJournal } from "./codex-integration-journal";
+import { installAutoRecap } from "./codex-integration-tui";
 import {
   findTopLevelAssignment,
   installCompatibilityV1Features,
@@ -65,6 +66,7 @@ function installConfiguredRoute(
   previousMultiAgent?: CodexIntegrationJournal["previousMultiAgent"];
   previousMultiAgentV2?: CodexIntegrationJournal["previousMultiAgentV2"];
   previousAgentMaxDepth?: CodexIntegrationJournal["previousAgentMaxDepth"];
+  previousAutoRecap: NonNullable<CodexIntegrationJournal["previousAutoRecap"]>;
   installedAgentMaxDepth?: number;
   interruptHook: CodexIntegrationJournal["interruptHook"];
 } {
@@ -88,10 +90,11 @@ function installConfiguredRoute(
         };
       })()
     : route;
+  const tui = installAutoRecap(configured.text);
   const hook = "interruptHookCommand" in config
-    ? installCodexInterruptHookCommand(configured.text, getCodexConfigPath(), config.interruptHookCommand)
-    : installCodexInterruptHook(configured.text, getCodexConfigPath(), config);
-  return { ...configured, text: hook.text, interruptHook: hook.installed };
+    ? installCodexInterruptHookCommand(tui.text, getCodexConfigPath(), config.interruptHookCommand)
+    : installCodexInterruptHook(tui.text, getCodexConfigPath(), config);
+  return { ...configured, text: hook.text, previousAutoRecap: tui.previousAutoRecap, interruptHook: hook.installed };
 }
 
 function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version: 2 }>): AppConfig["subagentProtocol"] {
@@ -199,7 +202,7 @@ export function preflightCodexIntegration(
       );
       return;
     }
-    if (existing.version === 10) {
+    if (existing.version === 10 && existing.previousAutoRecap) {
       assertBuiltinModelProvider(currentText);
       return;
     }
@@ -211,7 +214,7 @@ export function preflightCodexIntegration(
       installedUrl,
       config,
       true,
-      options.replaceExistingRoute === true,
+      existing.version === 9 || existing.version === 10 || options.replaceExistingRoute === true,
     );
     return;
   }
@@ -293,6 +296,7 @@ export function installCodexIntegration(
         ? existing.previousRealtimeWebrtcCallBaseUrl
         : patched.previousRealtimeWebrtcCallBaseUrl,
       interruptHook: patched.interruptHook,
+      previousAutoRecap: patched.previousAutoRecap,
       ...(config.subagentProtocol === "compatibility-v1" ? {
         previousMultiAgent: patched.previousMultiAgent,
         previousMultiAgentV2: patched.previousMultiAgentV2,
@@ -333,6 +337,7 @@ export function installCodexIntegration(
     previous: patched.previous,
     previousRealtimeWebrtcCallBaseUrl: patched.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: patched.interruptHook,
+    previousAutoRecap: patched.previousAutoRecap,
     ...(config.subagentProtocol === "compatibility-v1" ? {
       previousMultiAgent: patched.previousMultiAgent,
       previousMultiAgentV2: patched.previousMultiAgentV2,
@@ -383,7 +388,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
   const current = readFileSync(existing.configPath, "utf8");
-  if (existing.version === 10 && existing.active) {
+  if (existing.version === 10 && existing.active && existing.previousAutoRecap) {
     verifyInstalledRoute(current, existing);
     return { changed: false, active: true };
   }
@@ -430,6 +435,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
       ? existing.previousRealtimeWebrtcCallBaseUrl
       : route.previousRealtimeWebrtcCallBaseUrl,
     interruptHook: route.interruptHook,
+    previousAutoRecap: route.previousAutoRecap,
     ...(protocol === "compatibility-v1" ? {
       previousMultiAgent: route.previousMultiAgent,
       previousMultiAgentV2: route.previousMultiAgentV2,

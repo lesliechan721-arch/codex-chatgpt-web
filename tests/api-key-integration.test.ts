@@ -199,6 +199,7 @@ test("export shares V1 feature defaults and Interrupt command but omits conflict
   const defaults = Bun.TOML.parse(installCompatibilityV1Features("").text) as any;
   expect(text).not.toContain("Managed by codex-chatgpt-web");
   expect(parsed.features).toEqual(defaults.features); expect(parsed.agents).toEqual(defaults.agents);
+  expect(parsed.tui.auto_recap).toBe(false);
   expect(parsed.hooks.Interrupt[0].hooks[0].command).toBe(codexInterruptHookCommand(config));
   expect(parsed.hooks.state).toBeUndefined(); expect(parsed.openai_base_url).toBeUndefined();
   expect(parsed.experimental_realtime_webrtc_call_base_url).toBeUndefined();
@@ -209,6 +210,7 @@ test("native subagent export does not inject Compatibility V1 feature overrides"
   const parsed = Bun.TOML.parse(renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json",
     model: "chatgpt-web/high", reasoningEffort: "high", apiKey: "cgw_" + "a".repeat(43), subagentProtocol: "native" })) as any;
   expect(parsed.features).toBeUndefined(); expect(parsed.agents).toBeUndefined();
+  expect(parsed.tui.auto_recap).toBe(false);
 });
 
 test("API-key export catalog includes only validated rich models from the current upstream runtime", async () => {
