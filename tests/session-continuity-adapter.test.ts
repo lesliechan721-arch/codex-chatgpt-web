@@ -1,5 +1,6 @@
 import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { createRequire } from "node:module";
+import { mock } from "node:test";
 import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { $ } from "bun";
@@ -406,36 +407,65 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
   const first = f.request();
   await f.run(first);
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
-  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const bindings = continuityBindingsFor(f.statePath);
+  const binding = bindings.lookup(continuityDigest(f.threadId), stored.scope)!;
   const source = chatGptTurnSessions.find(binding.executionKey!)!;
   const ordinary = f.automatic.getMockImplementation()!;
+  let compactionStarted!: () => void;
+  const started = new Promise<void>(resolve => { compactionStarted = resolve; });
+  const beginCompaction = bindings.beginCompaction.bind(bindings);
+  const begin = spyOn(bindings, "beginCompaction").mockImplementation((...args) => {
+    const claim = beginCompaction(...args);
+    compactionStarted();
+    return claim;
+  });
+  let settleSource!: () => void;
+  Object.defineProperty(source, "physicalSettlement", { value: new Promise<void>(resolve => { settleSource = resolve; }) });
   let checkpoint: Promise<string> | undefined;
   f.automatic.mockImplementation(turn => {
     if (!turn.nativeConnector) return ordinary(turn);
     checkpoint = (async () => {
-      await Bun.sleep(checkpointDelay);
+      mock.timers.tick(checkpointDelay);
+      turn.abortSignal?.throwIfAborted();
       return ordinary(turn);
     })();
     return checkpoint;
   });
-  Object.defineProperty(source, "physicalSettlement", { value: Bun.sleep(sourceDelay) });
   const compact = structuredClone(first);
   compact._compactionRequest = true;
+  // Real filesystem and broker work must not consume the simulated phase budgets.
+  mock.timers.enable({ apis: ["setTimeout"] });
+  let run: Promise<AdapterEvent[]> | undefined;
   try {
+    run = f.run(compact);
+    void run.catch(() => {});
+    await Promise.race([
+      started,
+      run.then(() => { throw new Error("Compaction finished before source settlement"); }),
+    ]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(binding.state).toBe("compacting");
+    mock.timers.tick(sourceDelay);
+    settleSource();
     if (!succeeds) {
-      await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+      await expect(run).rejects.toMatchObject({ code: "continuity_session_lost" });
       expect(binding.state).toBe("lost");
+      if (sourceDelay > 1000) expect(checkpoint).toBeUndefined();
       return;
     }
-    const events = await f.run(compact);
+    const events = await run;
     expect(events.find(event => event.type === "text_delta")).toMatchObject({
       type: "text_delta", text: expect.stringContaining(f.controls.handoffSummary),
     });
     expect(binding.state).toBe("ready");
     expect(f.submissions).toHaveLength(2);
   } finally {
+    settleSource();
+    await run?.catch(() => {});
     await source.physicalSettlement;
     await checkpoint?.catch(() => {});
+    mock.timers.reset();
+    begin.mockRestore();
   }
 });
 
