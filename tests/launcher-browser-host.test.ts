@@ -463,7 +463,13 @@ test("launcher liveness verification checks only owned process and loopback CDP 
 
 test("launcher session verification reports its own deadline instead of a generic abort", async () => {
   const server = createServer(async (request, response) => {
-    for await (const _chunk of request) { /* consume request */ }
+    try {
+      for await (const _chunk of request) { /* consume request */ }
+    } catch (error) {
+      // The inspection deadline can abort the client before its request body is consumed.
+      if (request.aborted) return;
+      throw error;
+    }
     await new Promise(resolveDelay => setTimeout(resolveDelay, 30));
     if (!response.destroyed) {
       response.writeHead(500, { "content-type": "application/json" });
