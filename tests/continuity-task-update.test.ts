@@ -1,4 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { $ } from "bun";
+import { harmlessContinuityCommand } from "./helpers/continuity-command";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -472,6 +474,7 @@ for (const blockReadback of [false, true]) test(`recovery E3: atomic B replaceme
   blocked = false;
   const events: AdapterEvent[] = [];
   const running = f.run(f.request(input, "same-atomic-transfer"), events);
+  void running.catch(() => {});
   let reply = await f.wait(1);
   while (reply.kind !== "result") reply = await f.wait(1);
   f.ack(reply.taskUpdate!);
@@ -899,7 +902,7 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
   const f = await fixture(false, true, false, { root, preserveRoot: true });
   const counter = join(root, "harmless-command-count");
   const command = backendScenario === "recover"
-    ? `printf x >> '${counter}'; printf 'real predecessor result'` : "simulated only";
+    ? harmlessContinuityCommand(counter, "real predecessor result") : "simulated only";
   const sourceEvents: AdapterEvent[] = [];
   const first = f.run(f.initial, sourceEvents);
   await f.ready;
@@ -990,11 +993,9 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
   if (backendScenario === "recover") {
     // Execute only the command that the adapter actually dispatched. No browser text echo
     // is accepted as evidence that the outer command ran.
-    const processResult = Bun.spawn(["/bin/sh", "-c", JSON.parse(argumentsText).cmd], { stdout: "pipe", stderr: "pipe" });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(processResult.stdout).text(), new Response(processResult.stderr).text(), processResult.exited,
-    ]);
-    expect(exitCode, stderr).toBe(0);
+    const processResult = await $`${{ raw: JSON.parse(argumentsText).cmd }}`.quiet().nothrow();
+    const stdout = processResult.stdout.toString();
+    expect(processResult.exitCode, processResult.stderr.toString()).toBe(0);
     expect(readFileSync(counter, "utf8")).toBe("x");
     firstResult = output(call.id, stdout);
     const running = f.run(f.request([...appendInput, firstResult]));

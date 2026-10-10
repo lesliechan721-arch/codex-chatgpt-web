@@ -4,6 +4,7 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { join, win32 } from "node:path";
 import { atomicWriteFile } from "../../config";
 import { continuityError } from "./continuity-errors";
+import { moveContinuityLockWithoutReplacement } from "./continuity-lock-windows";
 
 export const MAX_CONTINUITY_RECOVERY_BYTES = 24 * 1024 * 1024;
 export const MAX_CONTINUITY_RECOVERY_ITEM_BYTES = 2 * 1024 * 1024;
@@ -228,10 +229,30 @@ export function withContinuityStorageLock<T>(lock: string, operation: () => T): 
     writeFileSync(join(staging, owner), JSON.stringify(continuityProcessInstance()), { mode: 0o600, flag: "wx" });
     let acquired = false;
     for (let attempt = 0; attempt < 4; attempt++) {
-      try { renameSync(staging, lock); acquired = true; break; }
-      catch (error) { if (!["ENOTEMPTY", "EEXIST", "ENOTDIR", "EISDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
       let stat;
-      try { stat = lstatSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      // Inspect existing evidence before attempting publication. On Windows the
+      // publication itself must also refuse replacements during this window.
+      try { stat = lstatSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (!stat) {
+        try {
+          if (process.platform === "win32") moveContinuityLockWithoutReplacement(staging, lock);
+          else renameSync(staging, lock);
+          acquired = true; break;
+        }
+        catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "";
+          const windowsDenied = process.platform === "win32" && ["EPERM", "EACCES"].includes(code);
+          if (!windowsDenied && !["ENOTEMPTY", "EEXIST", "ENOTDIR", "EISDIR"].includes(code)) throw error;
+          // Another process can publish between inspection and rename. Only treat
+          // access errors as contention when an existing lock can be inspected.
+          try { stat = lstatSync(lock); }
+          catch (readError) {
+            if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
+            if (windowsDenied) throw error;
+            continue;
+          }
+        }
+      }
       if (!stat.isDirectory() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0) || (typeof process.getuid === "function" && stat.uid !== process.getuid())) throw invalid("Continuity storage is busy or its lock is unsafe.");
       let entries;
       try { entries = readdirSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
@@ -248,7 +269,8 @@ export function withContinuityStorageLock<T>(lock: string, operation: () => T): 
   } finally { removeLockOwner(staging, owner); }
 }
 function syncStoredFile(path: string): void {
-  const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
+  // Windows FlushFileBuffers requires write access; r+ preserves existing bytes.
+  const fd = openSync(path, process.platform === "win32" ? "r+" : "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
   if (process.platform !== "win32") { const directoryFd = openSync(join(path, ".."), "r"); try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); } }
 }
 function durableWrite(path: string, encoded: string, afterAtomicReplace?: () => void): void {

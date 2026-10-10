@@ -2,6 +2,8 @@ import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapt
 import { createRequire } from "node:module";
 import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { $ } from "bun";
+import { harmlessContinuityCommand } from "./helpers/continuity-command";
 import { OPENAI_ACCESS } from "../src/api-access";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5224,14 +5226,17 @@ test("recovery v3: a real harmless command runs once and its accepted result ent
   const f = fixture();
   f.controls.invokeSourceTools = true; f.controls.singleSourceTool = true; f.controls.failAfterToolsOnce = true;
   const counter = join(f.statePath, "safe-execution-count");
-  f.controls.command = `printf x >> '${counter}'; printf 'real recovery result'`;
+  f.controls.command = harmlessContinuityCommand(counter, "real recovery result");
   const original = f.request();
   const events = await f.run(original);
   const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
   expect(call).toBeDefined();
-  const processResult = Bun.spawn(["/bin/sh", "-c", f.controls.command], { stdout: "pipe", stderr: "pipe" });
-  const stdout = await new Response(processResult.stdout).text();
-  expect(await processResult.exited).toBe(0);
+  const argumentsText = events.filter((event): event is Extract<AdapterEvent, { type: "tool_call_delta" }> => event.type === "tool_call_delta")
+    .map(event => event.arguments).join("");
+  expect(JSON.parse(argumentsText).cmd).toBe(f.controls.command);
+  const processResult = await $`${{ raw: JSON.parse(argumentsText).cmd }}`.quiet().nothrow();
+  const stdout = processResult.stdout.toString();
+  expect(processResult.exitCode, processResult.stderr.toString()).toBe(0);
   const raw = (original._rawBody as { input: unknown[] }).input;
   const resultInput = [...raw, { type: "function_call_output", call_id: call.id, output: stdout }];
   const interrupted = await f.run(f.request("", "turn-first", resultInput));

@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ContinuityBindings, continuityCheckpoint, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
@@ -34,7 +35,8 @@ const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAva
 const launcherRecovery = require("../launcher/electron/continuity-recovery.cjs");
 
 function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boolean; sourceText?: string; sourceInstance?: boolean; threadId?: string } = {}) {
-  const directory = mkdtempSync("/tmp/cgw-recovery-compact-");
+  // Keep Unix socket paths short; Windows uses the system temp directory.
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-recovery-compact-"));
   const state = join(directory, "continuity");
   const registrations = new ContinuityRegistrationStore(state);
   registrations.initialize();
