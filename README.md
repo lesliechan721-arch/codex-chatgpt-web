@@ -190,7 +190,7 @@ bun run app:package
 
 `dev:launcher` uses a separate profile and account under `~/.codex-chatgpt-web-dev`. `dev:chat` exercises the real browser and compaction paths with explicit simulated tool results, without changing your normal Codex route. See the [DEV chat harness](docs/dev-chat.md) for setup and commands.
 
-[Session continuity first](docs/session-continuity.md) keeps one exact conversation across compaction and stops instead of rebuilding a lost page. Compatible Full Native + Launcher setups expose the opt-in `chatgpt-web-continuity/` aliases; Fresh Conversation Per Turn remains incompatible. Bigger Context can remain enabled and applies only to non-continuity models. The larger Codex history budget does not increase ChatGPT's single-input limit or change existing models.
+[Session continuity first](docs/session-continuity.md) prefers the original conversation across ordinary work and compaction. If that page is lost, it can load the current request into a new page after the old writer and delivered tools are settled. Recovery also supports component restarts when durable evidence is available. Compatible Full Native + Launcher setups expose the opt-in `chatgpt-web-continuity/` aliases; Fresh Conversation Per Turn remains incompatible. Bigger Context can remain enabled and applies only to non-continuity models. The larger Codex history budget does not increase ChatGPT's single-input limit or change existing models.
 
 </details>
 

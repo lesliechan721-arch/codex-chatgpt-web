@@ -214,12 +214,23 @@ forever. A queued compaction-control terminal stops blocking after its public de
 
 Configured fresh compaction and recoverable-mode delegated source fallback retire the old browser
 and tool owner, including that owner's queued, waiting, and result-ready operations. The fresh
-owner cannot adopt or reexecute them. Continuity-first policy forbids this fresh fallback; see
-[session continuity](session-continuity.md).
+owner cannot adopt or reexecute them. Continuity-first admits a replacement page only from durable writer-retirement and tool-settlement
+evidence, with actual current request context; see [session continuity](session-continuity.md).
 
-There is no operation recovery across Broker or owner-process restart. Retained pages, HTTP rounds,
-and reconnects are not new operation stores. Missing results or expired evidence must fail
-explicitly rather than trigger a second side effect.
+There is no operation-object or capability recovery across Broker or owner-process restart.
+Continuity's durable admission journal records issued calls and their possible delivery before
+external dispatch, then accepts real results before exposing their receipts. It permits a new
+execution after settlement; it does not revive the old operation or replay its batch. A queued
+call can be cancelled only with proof it was not delivered. Process exit or revocation alone does
+not stop a delivered outer tool. Its actual return, including any live command session ID, remains
+necessary for recovery context unless a reliable committed checkpoint covers that settled result.
+
+Recovery follows the durable source lineage through accepted user appends and prior attempts.
+Each call keeps its original emitter work/attempt and first accepted result digest. Reconstructing
+empty in-memory maps cannot prove that the lineage has no pending tools. Current authenticated
+requests can supply matching real results after restart. Missing or conflicting results stop
+recovery instead of triggering a second side effect. New model suggestions remain new operations
+subject to current permissions; the bridge does not claim semantic deduplication of all commands.
 
 ## Capacity and compatibility
 

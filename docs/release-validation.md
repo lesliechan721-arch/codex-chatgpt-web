@@ -50,19 +50,23 @@ capture cookies, tunnel IDs, API keys, bearer tokens, or prompt contents.
 
 ## Session continuity validation
 
-`chatgpt-web-continuity/` has additional validation because it deliberately keeps one exact
-ChatGPT conversation across ordinary turns and compaction. These checks record release coverage;
+`chatgpt-web-continuity/` has additional validation because it retains conversations and can
+recover unfinished work in a new page under durable admission checks. These checks record release coverage;
 they are not an additional runtime feature flag or alias gate.
 
 For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, record:
 
 1. First-use creation, a normal continuation, and a compaction continuation all keep the exact
-   expected native thread, history revision, Launcher surface, and continuity lease. A lost page,
-   changed scope, restart, or explicit mode exit must stop instead of creating a replacement page.
+   expected native thread, history revision, Launcher surface, and continuity lease. Lost-page and
+   restart recovery can create one new generation only after old write authority and delivered tools
+   settle. Scope conflicts still fail. A stopped request stays stopped; a distinct new instruction
+   can restart after mode exit without clear.
 2. Automatic completed-response and active-response compaction each commit one structured
    checkpoint and continue on the same page with new tool authority. Zero Risk active compaction
    uses the delivered control path; a response that ended before control delivery preserves its
-   ordinary result and requires manual handoff without a second automatic prompt.
+   ordinary result and requires manual handoff without a second automatic prompt. Automatic lost
+   compaction can generate a tool-free summary in one new page if not committed; a valid existing
+   handoff commits once and committed results only replay.
 3. The published 1,000,000-token history window and 900,000-token automatic-compaction target do
    not increase the existing single-browser-input limits. Test a large canonical history with a
    short valid increment and a first input that exceeds the original browser boundary.
@@ -91,6 +95,37 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
    authenticated ChatGPT page. Record the binary, authentication path, JSON/SSE and full/previous-
    response history forms, local/v1/v2 codec coverage, ordinary → tool result → compact → continue,
    and lost-response retries. Synthetic metadata variants are not real-client certification.
+10. Inject crashes before/after creation acknowledgement, send-possible, Native delivery-possible,
+    result acceptance, stop, final receipt, and checkpoint/continuation commit. Restart backend,
+    helper, and Launcher independently. Check the actual external execution count, not empty maps.
+    A live backend whose target-thread writer is retired may recover; active/unknown old rights may not.
+    Include a crash after durable admission but before first page acquisition, and a fresh Launcher
+    with no old transaction table. Missing receipts need process-instance and no-surviving-writer
+    proof; a reused PID or an unreadable process identity must not grant a new Send.
+11. Concurrent recovery shares one authenticated transaction. Late responses cannot overwrite new
+    generation/attempt/snapshot versions. Proven-unsent H1 with lost body can rebind H2 atomically;
+    possibly sent H1 must reconnect or settle before any successor Send. Budget counts survive restart.
+12. Verify missing, edited, and correct results along A → B append → restart, with reliable checkpoint
+    coverage as the only old-body exception. Also stop the A/B chain, restart, retry both old requests,
+    and admit a distinct C only under settlement checks. No old request regains write authority.
+    Use the actual authenticated interrupt event and durable-only state after backend restart.
+    Inject append acknowledgement write/rename failures after durable acceptance; the committed
+    instruction must reconcile once and cannot be reported as unaccepted.
+13. Retry checkpoint-only work after its continuation was consumed but before Send, and after possible
+    Send. Consumer identity remains fixed and consumption occurs once. A completed source only replays
+    its answer; missing body returns replay unavailable. Equal summaries and different logical targets
+    remain distinct across page generations and multiple restarts.
+14. Exercise shared 24 MiB recovery/checkpoint capacity, 2 MiB per item, 256 checkpoints/tombstones,
+    512 rounds, and 10,000-thread/4 MiB registration bounds. Reserved result/stop/commit records still
+    fit after new work is refused. Upgrade v1 entries without clearing them; missing proof stays a gap.
+15. Verify transient inspection errors pause rather than declare permanent loss. Input/capacity errors
+    preserve later eligibility. Unknown tool results, conflicts, and stopped requests do not loop.
+    A new Zero Risk prompt must be manually sent and confirmed even if an old prompt was sent.
+16. Use real Electron documents to delay destruction after a close request. Repeated and concurrent
+    authenticated retirement requests, queries, and missing receipts must not report a retired writer
+    or permit successor acquisition while that document survives. After verified destruction, the
+    same retirement retry succeeds. Check late destruction against newer identities and count closing
+    documents against the five-page limit. A synchronous close fixture alone is insufficient.
 
 The maintained contract is [current work and committed relationships](session-continuity.md#current-work-and-committed-relationships).
 Keep raw task output in the local ignored workspace, not as a second public implementation spec.

@@ -7,7 +7,7 @@ import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adap
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
-import { CONTINUITY_FEATURE, isContinuityClaim, type ContinuityClaim } from "./continuity-contract";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityClaim, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
@@ -71,7 +71,7 @@ interface LimitsMessage {
 }
 
 type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage | LimitsMessage;
-type InputMessage = RunMessage
+type InputMessage = { recovery?: ContinuityRecoveryIdentity } & (RunMessage
   | MaintenanceMessage
   | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
   | { type: "send_activation_ack"; id: string }
@@ -79,7 +79,7 @@ type InputMessage = RunMessage
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
   | { type: "abort"; id: string; reason?: "compaction_handoff_accepted" }
-  | { type: "shutdown" };
+  | { type: "shutdown" });
 
 let outputFailure: Error | undefined;
 const handleOutputFailure = (error: Error): void => {
@@ -100,6 +100,7 @@ console.warn = diagnostic;
 console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
+const turnRecoveryIdentities = new Map<string, ContinuityRecoveryIdentity>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
 const taskUpdateTurns = new Set<string>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
@@ -197,6 +198,9 @@ async function run(message: RunMessage): Promise<void> {
     && (message.turn.taskUpdateProtocol !== 1 || message.turn.externalProgress !== true)) {
     throw new Error("Browser helper task update protocol is invalid");
   }
+  const recovery = message.turn.continuity?.recovery;
+  if (recovery) turnRecoveryIdentities.set(message.id, recovery);
+  const writeTurnProtocol = (value: Record<string, unknown>): boolean => writeProtocol({ ...value, ...(recovery ? { recovery } : {}) });
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: "https://chatgpt.com",
@@ -218,7 +222,7 @@ async function run(message: RunMessage): Promise<void> {
   // inheriting revisions recorded for an earlier turn that happened to share the id.
   const progress = message.turn.externalProgress
     ? new ChatGptMirroredTurnProgress(revision => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "tool_batch_observed", revision })) {
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "tool_batch_observed", revision })) {
         throw new Error("Browser helper could not acknowledge the observed Codex tool boundary");
       }
     })
@@ -243,7 +247,7 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.continuity ? {
       continuity: message.turn.continuity,
       onContinuityLease: lease => {
-        if (!writeProtocol({ type: "event", id: message.id, event: "continuity_lease", lease })) {
+        if (!writeTurnProtocol({ type: "event", id: message.id, event: "continuity_lease", lease })) {
           throw new Error("Browser helper could not return the continuity lease");
         }
       },
@@ -262,7 +266,7 @@ async function run(message: RunMessage): Promise<void> {
           completionFenceRequestId += 1;
           const requestId = completionFenceRequestId;
           completionFenceBeginWaiters.set(message.id, { requestId, resolve, reject });
-          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_begin", requestId,
+          if (!writeTurnProtocol({ type: "event", id: message.id, event: "completion_fence_begin", requestId,
             ...(candidate ? { candidate } : {}) })) {
             completionFenceBeginWaiters.delete(message.id);
             reject(new Error("Browser helper could not begin the broker completion fence"));
@@ -276,7 +280,7 @@ async function run(message: RunMessage): Promise<void> {
           completionFenceRequestId += 1;
           const requestId = completionFenceRequestId;
           completionFenceCommitWaiters.set(message.id, { requestId, resolve, reject });
-          if (!writeProtocol({ type: "event", id: message.id, event: "completion_fence_commit", requestId, revision,
+          if (!writeTurnProtocol({ type: "event", id: message.id, event: "completion_fence_commit", requestId, revision,
             ...(candidate ? { candidate } : {}) })) {
             completionFenceCommitWaiters.delete(message.id);
             reject(new Error("Browser helper could not commit the broker completion fence"));
@@ -284,9 +288,9 @@ async function run(message: RunMessage): Promise<void> {
         }),
       },
     } : {}),
-    onHeartbeat: () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" }),
+    onHeartbeat: () => writeTurnProtocol({ type: "event", id: message.id, event: "heartbeat" }),
     onPreparedSelected: reused => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
         throw new Error("Browser helper could not request prompt selection");
       }
       return promptSelection.wait().then(() => undefined);
@@ -297,34 +301,34 @@ async function run(message: RunMessage): Promise<void> {
         return;
       }
       sendActivationWaiters.set(message.id, { resolve, reject });
-      if (!writeProtocol({ type: "event", id: message.id, event: "send_activated" })) {
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "send_activated" })) {
         sendActivationWaiters.delete(message.id);
         reject(new Error("Browser helper could not request the Send activation boundary"));
       }
     }),
     onSubmitted: () => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "submitted" })) {
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
     },
     onMultipartStageAcknowledged: stageIndex => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
         throw new Error("Browser helper could not persist multipart acknowledgement evidence");
       }
     },
-    onReasoningSummary: (text, continuation) => writeProtocol({
+    onReasoningSummary: (text, continuation) => writeTurnProtocol({
       type: "event",
       id: message.id,
       event: "reasoning",
       text,
       ...(continuation ? { continuation: true } : {}),
     }),
-    onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-    onTextDelta: (text, candidate) => writeProtocol({ type: "event", id: message.id, event: "text", text,
+    onCommentary: (text, continuation) => writeTurnProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
+    onTextDelta: (text, candidate) => writeTurnProtocol({ type: "event", id: message.id, event: "text", text,
       ...(candidate ? { candidate } : {}) }),
     ...(message.turn.captureLunaCheckpoint ? {
       captureLunaCheckpoint: true,
-      onLunaCheckpoint: captured => writeProtocol({
+      onLunaCheckpoint: captured => writeTurnProtocol({
         type: "event",
         id: message.id,
         event: "luna_checkpoint",
@@ -334,9 +338,9 @@ async function run(message: RunMessage): Promise<void> {
   };
   try {
     const text = await ChatGptBrowserWorker.forProvider(provider).run(turn);
-    writeProtocol({ type: "result", id: message.id, text });
+    writeTurnProtocol({ type: "result", id: message.id, text });
   } catch (error) {
-    writeProtocol({
+    writeTurnProtocol({
       type: "error",
       id: message.id,
       name: error instanceof Error ? error.name : "Error",
@@ -361,6 +365,7 @@ async function run(message: RunMessage): Promise<void> {
     completionFenceCommitWaiters.delete(message.id);
     commitWaiter?.reject(new DOMException("Browser helper turn ended before completion-fence commit", "AbortError"));
     abortControllers.delete(message.id);
+    turnRecoveryIdentities.delete(message.id);
     turnProgress.delete(message.id);
     taskUpdateTurns.delete(message.id);
   }
@@ -428,6 +433,10 @@ input.on("line", line => {
   catch {
     writeProtocol({ type: "error", id: "protocol", message: "Browser helper received invalid JSON" });
     return;
+  }
+  if (message.type !== "run" && "id" in message) {
+    const recovery = turnRecoveryIdentities.get(message.id);
+    if (recovery && (!message.recovery || !sameContinuityRecoveryIdentity(message.recovery, recovery))) return;
   }
   if (message.type === "prepared_selected_ack") {
     const prepared = message.prepared;
@@ -568,4 +577,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE] });

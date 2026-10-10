@@ -14,7 +14,7 @@ export function createTaskOutputControlSource(): string {
   }
 }
 
-/** Publish before the transfer's irreversible effects; readers see one complete version pair. */
+/** Readers see one complete version pair. Continuity reconciles publication after durable acceptance. */
 export function publishTaskOutputVersion(directory: string, acceptedRevision: number, driverGeneration: number): void {
   const pending = join(directory, "version.next");
   writeFileSync(pending, JSON.stringify({ acceptedRevision, driverGeneration }), { mode: 0o600 });

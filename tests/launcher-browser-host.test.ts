@@ -12,6 +12,11 @@ import {
   endLauncherManualTurn,
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
+  inspectLauncherContinuityConversation,
+  queryLauncherContinuityTransaction,
+  updateLauncherContinuityPreparation,
+  markLauncherContinuitySendPossible,
+  retireLauncherContinuityWriter,
   notifyLauncherTurn,
   markLauncherManualTurnStarted,
   readLauncherBrowserHostDescriptor,
@@ -21,11 +26,153 @@ import {
   waitForLauncherManualSent,
   waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
-import { CONTINUITY_FEATURE } from "../src/adapters/chatgpt-web/continuity-contract";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
 import type { Browser, BrowserContext, Page } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 
 const roots: string[] = [];
+const launcherInstance = { pid: process.pid, startIdentity: "darwin:Sat Oct 10 00:00:00 2026", instanceId: "0".repeat(64) };
+
+function recoveryIdentity(overrides: Partial<ContinuityRecoveryIdentity> = {}): ContinuityRecoveryIdentity {
+  return { schemaVersion: 2, installationId: "a".repeat(64), threadKey: "b".repeat(64), epoch: 0,
+    transactionId: "c".repeat(64), transactionVersion: 0, logicalWorkId: "d".repeat(64), attempt: 0,
+    snapshotVersion: 0, snapshotDigest: "e".repeat(64), ownerProcess: { pid: process.pid, startIdentity: "verified-start" }, launcherInstance, ...overrides };
+}
+
+test("continuity inspect distinguishes transient control failures from a confirmed missing page", async () => {
+  const lease = { owner: "a".repeat(64), leaseId: "b".repeat(32), traceId: "inspect-trace" };
+  let state = "transient";
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return state === "transient" ? Response.json({ error: "not ready" }, { status: 503 })
+      : state === "lost" ? Response.json({ code: "continuity_session_lost" }, { status: 409 })
+      : Response.json({ ok: true, continuity: lease, state: "ready" });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE]);
+    await expect(inspectLauncherContinuityConversation(path, "c".repeat(64), lease)).rejects.toMatchObject({ code: "continuity_unverified", retryable: true });
+    state = "ready";
+    await expect(inspectLauncherContinuityConversation(path, "c".repeat(64), lease)).resolves.toEqual({ continuity: lease, state: "ready" });
+    state = "lost";
+    await expect(inspectLauncherContinuityConversation(path, "c".repeat(64), lease)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  } finally { server.stop(true); }
+});
+
+test("a v2 Launcher rejects instance recovery before a start request can create a page", async () => {
+  let requests = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { requests++; return Response.json({}); } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, "session-continuity-recovery-v2"]);
+    await expect(notifyLauncherTurn(path, { phase: "start", traceId: "old-launcher", helperPid: process.pid,
+      conversationKey: "f".repeat(64), continuity: { owner: "f".repeat(64), recovery: recoveryIdentity() } })).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+    expect(requests).toBe(0);
+  } finally { server.stop(true); }
+});
+
+test("recovery helpers authenticate and reject late snapshot and repeated Send authorization", async () => {
+  let identity = recoveryIdentity();
+  let preparationExpected: ContinuityRecoveryIdentity | undefined;
+  let sent = false;
+  const actions: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    expect(request.headers.get("authorization")).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
+    const action = new URL(request.url).pathname.split("continuity-")[1]!;
+    actions.push(action);
+    const body = await request.json() as { recovery: ContinuityRecoveryIdentity; expected?: ContinuityRecoveryIdentity };
+    if (action === "prepare") { expect(body.expected).toEqual(identity); preparationExpected = body.expected; identity = body.recovery; }
+    if (action === "send-possible") {
+      const sendAuthorized = !sent; sent = true;
+      return Response.json({ ok: true, recovery: identity, state: "send-possible", writerRetired: false, toolsSettled: false, launcherInstance, hostNoWriter: false, sendAuthorized });
+    }
+    return Response.json({ ok: true, recovery: identity, state: action === "retire" ? "retired" : "prepared",
+      writerRetired: action === "retire", toolsSettled: false, launcherInstance, hostNoWriter: action === "retire", preparationExpected });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    await expect(queryLauncherContinuityTransaction(path, identity)).resolves.toMatchObject({ state: "prepared" });
+    const before = identity;
+    const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1, snapshotDigest: "1".repeat(64) });
+    await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).resolves.toMatchObject({ preparationExpected: before });
+    await expect(queryLauncherContinuityTransaction(path, before)).rejects.toMatchObject({ code: "continuity_unverified" });
+    await markLauncherContinuitySendPossible(path, after);
+    await expect(markLauncherContinuitySendPossible(path, after)).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
+    await expect(retireLauncherContinuityWriter(path, after)).resolves.toMatchObject({ writerRetired: true, toolsSettled: false });
+    expect(actions).toEqual(["query", "prepare", "query", "send-possible", "send-possible", "retire"]);
+  } finally { server.stop(true); }
+});
+
+test("prepared CAS receipts must prove their complete predecessor before a migration can finish", async () => {
+  const before = recoveryIdentity();
+  const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1,
+    ownerProcess: { pid: process.pid, startIdentity: "second-backend-instance" } });
+  let preparationExpected: ContinuityRecoveryIdentity | undefined;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ ok: true, recovery: after, state: "prepared", writerRetired: false,
+      toolsSettled: false, launcherInstance, hostNoWriter: false, preparationExpected });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).rejects.toMatchObject({ code: "continuity_unverified" });
+    preparationExpected = { ...before, ownerProcess: after.ownerProcess };
+    await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).rejects.toMatchObject({ code: "continuity_unverified" });
+    preparationExpected = { ...before, snapshotVersion: 1 };
+    await expect(queryLauncherContinuityTransaction(path, after)).rejects.toMatchObject({ code: "continuity_unverified" });
+    preparationExpected = before;
+    await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).resolves.toMatchObject({ recovery: after, preparationExpected: before });
+    await expect(queryLauncherContinuityTransaction(path, after)).resolves.toMatchObject({ preparationExpected: before });
+  } finally { server.stop(true); }
+});
+
+test("a late lifecycle acknowledgement cannot be accepted for the next snapshot", async () => {
+  const before = recoveryIdentity();
+  const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1 });
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ ok: true, cancelledByUser: false, recovery: before });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    await expect(notifyLauncherTurn(path, { phase: "end", traceId: "late-end-trace", helperPid: process.pid,
+      recovery: after, status: "failed" })).rejects.toMatchObject({ code: "continuity_unverified" });
+  } finally { server.stop(true); }
+});
+
+test("a lost recovery start response queries the original transaction before retrying identical acquisition", async () => {
+  const recovery = recoveryIdentity();
+  const owner = "f".repeat(64);
+  const traceId = "recovery-response-loss";
+  const continuity = { owner, leaseId: "a".repeat(32), traceId, recovery };
+  const routes: string[] = [];
+  const starts: unknown[] = [];
+  let allocated = false;
+  let pages = 0;
+  const server = createServer(async (request, response) => {
+    const parts: Buffer[] = [];
+    for await (const chunk of request) parts.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(parts).toString());
+    routes.push(request.url!);
+    if (request.url === "/v1/turn/start") {
+      starts.push(body);
+      if (!allocated) { allocated = true; pages++; response.destroy(); return; }
+    } else {
+      expect(body.recovery).toEqual(recovery);
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(request.url === "/v1/turn/continuity-query"
+      ? { ok: true, recovery, state: "prepared", writerRetired: false, toolsSettled: false, launcherInstance, hostNoWriter: false, continuity,
+        surfaceId: "s".repeat(32), tabId: "single-page" }
+      : { ok: true, surfaceId: "s".repeat(32), reused: false, connectorBound: false, continuity }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No test control port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    await expect(notifyLauncherTurn(path, { phase: "start", traceId, helperPid: process.pid,
+      conversationKey: "e".repeat(64), continuity: { owner, recovery } }, 500)).resolves.toMatchObject({ continuity });
+    expect(routes).toEqual(["/v1/turn/start", "/v1/turn/continuity-query", "/v1/turn/start"]);
+    expect(starts[0]).toEqual(starts[1]);
+    expect(pages).toBe(1);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
 
 test("launcher activity follows actual send callbacks and current-turn tool counts", async () => {
   const messages: Array<{ phase: string; progress?: { stage: string; activeToolCalls: number } }> = [];
@@ -140,6 +287,7 @@ function descriptorFile(
     kind: LAUNCHER_BROWSER_HOST_KIND,
     profile,
     pid: process.pid,
+    launcherInstance,
     endpoint,
     control: {
       endpoint: controlEndpoint,

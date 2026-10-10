@@ -1,9 +1,13 @@
+import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
+import { continuityProcessInstance, continuityProcessInstanceStatus, type RecoveryThreadRecord } from "./continuity-recovery-store";
+import { recoveryContext, recoveryDigest, recoveryIdentity, retireRecoveryWriter, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
+import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { expandUserPath } from "../../config";
 import {
   assertLauncherContinuityCapacity, assertLauncherContinuityFeature, inspectLauncherContinuityConversation,
-  readLauncherBrowserHostDescriptor,
+  readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
 } from "../../launcher-browser-host";
 import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
 import { parseRequest } from "../../responses/parser";
@@ -48,9 +52,14 @@ export interface PreparedContinuityRequest {
   instructionPrevious?: ChatGptContinuityInstructionPrevious;
   allowRetainedSourceInstructionPayload?: boolean;
   finalReplaySource?: ChatGptTurnSession;
+  durableFinalReplay?: ChatGptTurnSession;
   verifiedSourceGeneration?: number;
   checkpointTransition?: ContinuityCheckpointSelection;
   appendSource?: ChatGptTurnSession;
+  recovery?: ContinuityRecoveryIdentity;
+  recovered?: boolean;
+  /** The exact accepted checkpoint selected for this recovery input. */
+  recoveryCheckpointId?: string;
 }
 
 function sameLease(left: ContinuityLease | undefined, right: ContinuityLease | undefined): boolean {
@@ -163,6 +172,53 @@ function checkpointResumeInput(
   return { input, instructionPrevious, allowRetainedSourceInstructionPayload: true, finalReplaySource: source };
 }
 
+function assertCheckpointSourceReplay(parsed: CodexParsedRequest, identity: ReturnType<typeof extractChatGptTurnIdentity>, checkpoint?: ContinuityCheckpointCommit): void {
+  const sourceReplay = checkpoint?.sourceInstructionReplay;
+  // The retained source remains protected even before the checkpoint and on cached retries.
+  if (!parsed._compactionRequest && sourceReplay && continuityInstructionIdentity(parsed) === sourceReplay.instructionIdentity) {
+    for (const value of (parsed._rawBody as { input: unknown[] }).input) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const item = value as Record<string, unknown>;
+      const canonicalId = typeof item.id === "string" ? parsed._chatGptMessageIdAliases?.[item.id] ?? item.id : undefined;
+      const turnId = (item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined)?.turn_id;
+      if (canonicalId !== sourceReplay.instructionIdentity
+        && !(sourceReplay.instructionIdentity === `turn:${sourceReplay.nativeTurnId}`
+          && turnId === sourceReplay.nativeTurnId && hasNativeChatGptInstruction(parsed, [item]))) continue;
+      const envelope = chatGptInstructionEnvelope(item);
+      const content = chatGptInstructionContent(item);
+      if (!hasNativeChatGptInstruction(parsed, [item])
+        || (continuityDigest({ turnId: turnId ?? null, ...envelope, content }) !== sourceReplay.sourceDigest
+          && !isAcceptedCompactionContinuation(parsed, identity, {
+            itemId: typeof item.id === "string" ? item.id : undefined, turnId: turnId as string | undefined,
+            instructionEnvelope: envelope, content,
+          }))) {
+        throw continuityError("continuity_source_unproven", "The checkpoint source instruction conflicts with its accepted native payload.");
+      }
+    }
+  }
+}
+
+/** A stopped instruction is terminal even when a newer instruction owns the live binding. */
+export function assertContinuityStoppedReceipt(parsed: CodexParsedRequest): void {
+  if (parsed._conversationPolicy !== "continuity-first" || parsed._compactionRequest
+    || !parsed._continuityStateDirectory || !parsed._continuityScope) return;
+  const identity = extractChatGptTurnIdentity(parsed);
+  if (!identity.threadId || !identity.turnId) return;
+  const record = continuityBindingsFor(parsed._continuityStateDirectory).recoveryStore.get(continuityDigest(identity.threadId));
+  if (!record || record.scope !== parsed._continuityScope || record.legacyUnproven) return;
+  // Resolver-established aliases are not available yet. Use only direct native IDs,
+  // without caching any checkpoint or instruction interpretation before verification.
+  if (continuityCheckpoint(parsed).index >= 0) return;
+  const input = (parsed._rawBody as { input?: unknown[] }).input ?? [];
+  const instructions = input.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"
+    && ["user", "agent_message"].includes(String((item as Record<string, unknown>).role))));
+  if (!instructions.length) return;
+  const last = instructions.at(-1)!;
+  const instruction = typeof last.id === "string" ? parsed._chatGptMessageIdAliases?.[last.id] ?? last.id : `turn:${identity.turnId}`;
+  if (Object.values(record.works).some(work => work.purpose === "ordinary" && work.state === "stopped"
+    && work.nativeTurnId === identity.turnId && work.instructionIdentity === instruction)) throw continuityError("continuity_stopped");
+}
+
 /** Resolves trusted history identity before trace/replay lookup or browser/clipboard mutation. */
 export async function prepareContinuityRequest(
   parsed: CodexParsedRequest,
@@ -181,19 +237,46 @@ export async function prepareContinuityRequest(
     || (config.browserInteractionMode === "manual") !== manual
     || (!manual && parsed.modelId !== CHATGPT_WEB_MODEL_ID)) throw continuityError("continuity_configuration_conflict");
   const descriptor = resolve(expandUserPath(config.browserHostDescriptorPath));
-  try {
-    assertLauncherContinuityFeature(readLauncherBrowserHostDescriptor(descriptor));
-    if (!manual) await worker.assertContinuityCompatible();
-  } catch {
-    throw continuityError("continuity_configuration_conflict", "Update and restart Launcher and its helper before starting this mode.");
-  }
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId || !identity.turnId) throw continuityError("continuity_source_unproven");
   const bindings = continuityBindingsFor(resolve(expandUserPath(config.continuityStateDirectory)));
   const thread = continuityDigest(identity.threadId);
   bindContinuityRequestScope(parsed, namespace);
   const scope = parsed._continuityScope!;
+  parsed._continuityStateDirectory = bindings.registrations.directory;
   let binding = bindings.lookup(thread, scope);
+  const durable = bindings.recoveryStore.get(thread);
+  if (durable?.scope !== undefined && durable.scope !== scope) throw continuityError("continuity_configuration_conflict");
+  if (durable?.legacyUnproven) throw continuityError("continuity_legacy_unproven");
+  let compatible = false;
+  const assertExecutionCompatible = async (): Promise<void> => {
+    if (compatible) return;
+    try {
+      assertLauncherContinuityFeature(readLauncherBrowserHostDescriptor(descriptor), true);
+      if (!manual) await worker.assertContinuityCompatible();
+      compatible = true;
+    } catch {
+      throw continuityError("continuity_configuration_conflict", "Update and restart Launcher and its helper before starting this mode.");
+    }
+  };
+  if (parsed._compactionRequest) {
+    const { prepareRecoveryCompaction } = await import("./continuity-recovery-compaction");
+    const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    if (prepared) return prepared;
+  }
+  const initialLocalOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
+  if (!parsed._compactionRequest && initialLocalOwner?.nativeTurnId === identity.turnId) initialLocalOwner.bindContinuityResultSource(parsed);
+  if (!parsed._compactionRequest && durable) {
+    const checkpointPrepared = await prepareDurableContinuation(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    if (checkpointPrepared) return checkpointPrepared;
+    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    if (recovered) return recovered;
+    binding = bindings.lookup(thread, scope);
+  }
+  parsed._continuityEpoch = binding?.epoch ?? durable?.epoch ?? 0;
+  const currentInstruction = !parsed._compactionRequest ? continuityInstructionIdentity(parsed) : undefined;
+  const currentWork = currentInstruction && durable ? Object.values(durable.works).find(work => work.instructionIdentity === currentInstruction && work.nativeTurnId === identity.turnId && work.purpose === "ordinary") : undefined;
+  if (currentWork) parsed._continuityAttempt = currentWork.attempts.at(-1)!.attempt;
   const localOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
   const appendSource = !parsed._compactionRequest && binding?.lease && localOwner?.isActive()
     && localOwner.nativeThreadId === identity.threadId && localOwner.nativeTurnId === identity.turnId
@@ -250,29 +333,7 @@ export async function prepareContinuityRequest(
   const selectedCheckpoint = checkpointProof.index >= 0
     ? checkpointSelection?.checkpoint.revision === revision ? checkpointSelection.checkpoint
       : [...binding?.checkpoints.values() ?? []].find(value => value.revision === revision) : undefined;
-  const sourceReplay = selectedCheckpoint?.sourceInstructionReplay;
-  // The retained source remains protected even before the checkpoint and on cached retries.
-  if (!appendSource?.taskUpdatesEnabled() && !parsed._compactionRequest && sourceReplay && continuityInstructionIdentity(parsed) === sourceReplay.instructionIdentity) {
-    for (const value of (parsed._rawBody as { input: unknown[] }).input) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const item = value as Record<string, unknown>;
-      const canonicalId = typeof item.id === "string" ? parsed._chatGptMessageIdAliases?.[item.id] ?? item.id : undefined;
-      const turnId = (item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined)?.turn_id;
-      if (canonicalId !== sourceReplay.instructionIdentity
-        && !(sourceReplay.instructionIdentity === `turn:${sourceReplay.nativeTurnId}`
-          && turnId === sourceReplay.nativeTurnId && hasNativeChatGptInstruction(parsed, [item]))) continue;
-      const envelope = chatGptInstructionEnvelope(item);
-      const content = chatGptInstructionContent(item);
-      if (!hasNativeChatGptInstruction(parsed, [item])
-        || (continuityDigest({ turnId: turnId ?? null, ...envelope, content }) !== sourceReplay.sourceDigest
-          && !isAcceptedCompactionContinuation(parsed, identity, {
-            itemId: typeof item.id === "string" ? item.id : undefined, turnId: turnId as string | undefined,
-            instructionEnvelope: envelope, content,
-          }))) {
-        throw continuityError("continuity_source_unproven", "The checkpoint source instruction conflicts with its accepted native payload.");
-      }
-    }
-  }
+  if (!appendSource?.taskUpdatesEnabled()) assertCheckpointSourceReplay(parsed, identity, selectedCheckpoint);
   parsed._continuityHistoryRevision = revision;
   const conversationKey = chatGptConversationKey(parsed, namespace)!;
   let existing = chatGptTurnSessions.find(executionKey);
@@ -293,6 +354,10 @@ export async function prepareContinuityRequest(
     && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     throw continuityError("continuity_source_unproven", "An older history revision cannot start new work.");
   }
+  // Keep the existing history and round selectors ahead of browser dependency checks.
+  const readonlyReplay = parsed._compactionRequest ? binding?.checkpoints.has(executionKey)
+    : existing?.roundCompleted(existing.continuityRoundKey(parsed));
+  if (!readonlyReplay) await assertExecutionCompatible();
   let expected = binding?.lease ? { ...binding.lease } : undefined;
   const sourceExecutionKey = binding?.executionKey;
   let verifiedSourceGeneration: number | undefined;
@@ -331,9 +396,13 @@ export async function prepareContinuityRequest(
     }
     verifiedSourceGeneration = source.continuityGenerationValue();
   }
-  if (binding && expected) {
+  if (binding && expected && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     try { await inspectLauncherContinuityConversation(descriptor, conversationKey, expected); }
-    catch {
+    catch (inspectionError) {
+      if ((inspectionError as { code?: string }).code === "continuity_unverified" && sameLease(binding.lease, expected)) {
+        binding.state = "unverified";
+        throw inspectionError;
+      }
       // Another observer of this exact transaction can advance the physical head while this
       // read is in flight. An obsolete proof must never retire the newly accepted lease.
       if (!sameLease(binding.lease, expected)) {
@@ -347,6 +416,11 @@ export async function prepareContinuityRequest(
         }
       } else {
         bindings.lose(binding, sourceExecutionKey);
+        const current = bindings.recoveryStore.get(thread);
+        if (!parsed._compactionRequest && current) {
+          const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, current, descriptor, abortSignal);
+          if (recovered) return recovered;
+        }
         throw continuityError("continuity_session_lost");
       }
     }
@@ -373,7 +447,7 @@ export async function prepareContinuityRequest(
     chatGptTurnSessions.assertContinuityThreadAvailable(identity.threadId, executionKey);
     if (binding && binding.state !== "ready"
       && !(binding.state === "creating" && binding.initialExecutionKey === executionKey && !expected)) {
-      throw continuityError("continuity_source_unproven");
+      throw continuityError("continuity_source_unproven", `The current page is ${binding.state}.`);
     }
     if (expected && binding?.executionKey === undefined && binding!.revision > 0) {
       ({ input, instructionPrevious, allowRetainedSourceInstructionPayload, finalReplaySource } = checkpointResumeInput(
@@ -406,6 +480,11 @@ export async function prepareContinuityRequest(
     await assertLauncherContinuityCapacity(descriptor);
     abortSignal?.throwIfAborted();
     const payloadDigest = chatGptContinuityInstructionPayloadDigest(parsed);
+    if (parsed._compactionRequest) throw continuityError("continuity_source_unproven", "A standalone compaction cannot enter continuity.");
+    bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
+      logicalWorkId: recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary"]),
+      instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId,
+      workPayloadDigest: payloadDigest, snapshotDigest: recoveryDigest(input!.context), createPage: true, dispatchProtocolComplete: true });
     binding = bindings.create(thread, scope, executionKey, checkpoint, identity.turnId);
     if (binding.initialAcceptedInput) {
       if (binding.initialInstructionPayloadDigest !== payloadDigest) {
@@ -419,12 +498,25 @@ export async function prepareContinuityRequest(
   }
   abortSignal?.throwIfAborted();
   binding.conversation ??= { key: conversationKey, descriptor };
+  let recovery: ContinuityRecoveryIdentity | undefined;
+  if (!parsed._compactionRequest && input && !finalReplaySource) {
+    const logicalWorkId = recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary"]);
+    if (instructionPrevious && !instructionPrevious.instructionIdentity) throw continuityError("continuity_source_unproven");
+    const record = bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
+      logicalWorkId, instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId,
+      workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed, instructionPrevious, allowRetainedSourceInstructionPayload),
+      instructionPrevious: instructionPrevious ? { ...instructionPrevious, instructionIdentity: instructionPrevious.instructionIdentity! } : undefined,
+      allowRetainedSourceFallback: allowRetainedSourceInstructionPayload,
+      snapshotDigest: recoveryDigest(input.context), createPage: !expected, dispatchProtocolComplete: true });
+    binding.recovery = { directory: bindings.registrations.directory, thread, logicalWorkId, attempt: record.works[logicalWorkId]!.attempts.at(-1)!.attempt, ownerId: record.owner.id };
+    recovery = recoveryIdentity(record, bindings.recoveryStore.installationId());
+  }
   return {
     bindings, binding, descriptor, conversationKey, executionKey, nativeThreadId: identity.threadId,
     revision, sourceExecutionKey, expected, input, instructionPrevious,
     allowRetainedSourceInstructionPayload, finalReplaySource, verifiedSourceGeneration,
     checkpointTransition,
-    appendSource,
+    appendSource, recovery,
   };
 }
 
@@ -445,6 +537,7 @@ export function beginContinuityResponse(prepared: PreparedContinuityRequest): Co
     throw continuityError("continuity_source_unproven", "The checkpoint transition was already consumed by another execution.");
   }
   const claim = bindings.beginResponse(binding, prepared.executionKey);
+  if (prepared.recovery) claim.recovery = prepared.recovery;
   if (transition) transition.checkpoint.continuationExecutionKey = prepared.executionKey;
   return claim;
 }
@@ -452,6 +545,13 @@ export function beginContinuityResponse(prepared: PreparedContinuityRequest): Co
 export function acceptContinuityResponseLease(prepared: PreparedContinuityRequest, traceId: string, value: unknown): ContinuityLease {
   if (!isContinuityLease(value) || value.traceId !== traceId || prepared.binding.executionKey !== prepared.executionKey) {
     throw continuityError("continuity_session_lost");
+  }
+  if (prepared.recovery && (!value.recovery || recoveryDigest(value.recovery) !== recoveryDigest(prepared.recovery))) throw continuityError("continuity_source_unproven", "The page receipt belongs to an obsolete recovery snapshot.");
+  if (prepared.binding.recovery) {
+    const ref = prepared.binding.recovery;
+    const record = prepared.bindings.recoveryStore.get(ref.thread)!;
+    const attempt = record.works[ref.logicalWorkId]!.attempts[ref.attempt]!;
+    if (["prepared", "page-possible", "page-acquired"].includes(attempt.stage)) prepared.bindings.recoveryStore.markAttempt(ref.thread, { scope: record.scope }, { logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "page-acquired", pageReceiptId: value.leaseId, transactionVersion: prepared.recovery?.transactionVersion });
   }
   prepared.bindings.acceptLease(prepared.binding, value);
   return { ...value };
@@ -461,6 +561,323 @@ export async function finishContinuityResponse(prepared: PreparedContinuityReque
   const { binding, bindings } = prepared;
   if (!binding.lease || binding.executionKey !== prepared.executionKey) throw continuityError("continuity_session_lost");
   const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease);
-  if (physical.state !== "ready") throw continuityError("continuity_session_lost");
+  if (physical.state !== "ready") throw continuityError("continuity_unverified");
+  if (binding.state === "unverified") binding.state = "running";
   bindings.responseReady(binding, prepared.executionKey);
+}
+
+/** Durable receipts win before any page inspection. Only the current request supplies context. */
+async function prepareDurableOrdinary(
+  parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
+  attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
+  descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
+): Promise<PreparedContinuityRequest | undefined> {
+  const identity = extractChatGptTurnIdentity(parsed);
+  const liveBinding = bindings.observed(observed.thread);
+  const instruction = continuityInstructionIdentity(parsed);
+  const store = bindings.recoveryStore;
+  const logicalWorkId = recoveryDigest([observed.scope, identity.turnId, instruction, "ordinary"]);
+  let record = observed;
+  let work = record.works[logicalWorkId];
+  const binding = bindings.observed(record.thread);
+  if (work && work.state === "stopped") throw continuityError("continuity_stopped");
+  if (liveBinding && !["lost", "ended", "unverified"].includes(liveBinding.state) && observed.owner.id === bindings.owner) return undefined;
+  const payload = chatGptContinuityInstructionPayloadDigest(parsed, work?.instructionPrevious, work?.allowRetainedSourceFallback);
+  if (work && work.workPayloadDigest !== payload) throw continuityError("continuity_source_unproven", "The accepted instruction has a different current payload.");
+  if (work) {
+    parsed._continuityAttempt = work.attempts.at(-1)!.attempt;
+    parsed._continuityEpoch = work.attempts.at(-1)!.epoch;
+    parsed._continuityHistoryRevision = work.attempts.at(-1)!.historyRevision;
+  }
+  const existingKey = work ? `${namespace}:${chatGptTurnExecutionKey(parsed)}` : undefined;
+  const existing = existingKey ? chatGptTurnSessions.find(existingKey) : undefined;
+  if (work?.state === "completed") {
+    // The durable receipt can precede local publication while page cleanup finishes.
+    const outcome = existing ? existing.settledOutcome() ?? await existing.browserOutcome : undefined;
+    abortSignal?.throwIfAborted();
+    if (!existing || outcome?.type !== "final" || !binding || !work.terminalReceiptId
+      || work.terminalDigest !== recoveryDigest(outcome.answer)) throw continuityError("continuity_replay_unavailable");
+    existing.assertCanonicalReplayInput(parsed);
+    return { bindings, binding, descriptor, conversationKey: binding.conversation?.key ?? chatGptConversationKey(parsed, namespace)!,
+      executionKey: existingKey!, nativeThreadId: identity.threadId!, revision: parsed._continuityHistoryRevision! };
+  }
+  await assertExecutionCompatible?.();
+  if (binding?.state === "unverified" && binding.lease && binding.conversation) {
+    try {
+      const physical = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, binding.lease);
+      binding.state = physical.state === "ready" ? "ready" : "running";
+    } catch (error) {
+      if ((error as { code?: string }).code === "continuity_unverified") throw error;
+      bindings.lose(binding, binding.executionKey);
+    }
+  }
+  if (binding && !["lost", "ended"].includes(binding.state) && record.owner.id === bindings.owner) return undefined;
+  // Historical discovery cannot define new capabilities while rebuilding a lost page.
+  parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
+  // Preflight precedes every new page. The old call set remains authoritative even when
+  // this request is a new instruction after an explicit stop.
+  let input = parsed;
+  const previous = work ?? (record.currentWorkId ? record.works[record.currentWorkId] : undefined);
+  if (!previous) throw continuityError("continuity_context_missing");
+  const ref: RuntimeRecoveryReference = { directory: bindings.registrations.directory, thread: record.thread,
+    logicalWorkId: previous.logicalWorkId, attempt: previous.attempts.at(-1)!.attempt };
+  const checkpointProof = continuityCheckpoint(parsed);
+  const checkpoints = checkpointProof.index < 0 ? [] : Object.values(record.checkpoints).filter(checkpoint =>
+    checkpoint.summaryDigest === checkpointProof.digest && checkpoint.workLineageId === previous.workLineageId
+    && checkpoint.targetHistoryRevision === previous.attempts.at(-1)!.historyRevision);
+  if (checkpoints.length > 1) throw continuityError("continuity_source_unproven", "The recovery input cannot distinguish its accepted checkpoint.");
+  const recoveryCheckpoint = checkpoints[0];
+  if (work || previous.state !== "completed") input = recoveryContext(parsed, ref, recoveryCheckpoint?.commitId);
+  if (work && binding?.initialAcceptedInput && ["prepared", "page-possible", "page-acquired"].includes(work.attempts.at(-1)!.stage)) input = structuredClone(binding.initialAcceptedInput);
+  preflightContinuityInput(input, capabilities, attachments, false);
+  await assertLauncherContinuityCapacity(descriptor);
+  abortSignal?.throwIfAborted();
+  const current = store.get(record.thread)!;
+  if (current.currentWorkId !== record.currentWorkId || recoveryDigest(current.transaction) !== recoveryDigest(record.transaction)
+    || recoveryDigest(current.pendingPreparation ?? null) !== recoveryDigest(record.pendingPreparation ?? null)) throw continuityError("continuity_unverified");
+  record = current;
+  // A pending CAS retains both identities until the Launcher has confirmed the
+  // exact migration. A later backend must finish it before proposing its own input.
+  if (record.pendingPreparation) {
+    const pending = record.pendingPreparation;
+    const preparationStopped = record.works[pending.expected.transaction.logicalWorkId]!.state === "stopped";
+    if (!preparationStopped && pending.target.owner.id !== bindings.owner
+      && continuityProcessInstanceStatus(pending.target.owner) !== "exited") throw continuityError("continuity_unverified");
+    const expected = recoveryIdentity({ ...record, ...pending.expected }, store.installationId());
+    const target = recoveryIdentity({ ...record, ...pending.target }, store.installationId());
+    if (preparationStopped) {
+      // Stop fences the old Broker. Retire the exact physical tag that the host
+      // retained, then preserve both tags as a retirement receipt for a new task.
+      let receipt;
+      try { receipt = await retireLauncherContinuityWriter(descriptor, target); }
+      catch { receipt = await retireLauncherContinuityWriter(descriptor, expected); }
+      if (!receipt.writerRetired) throw continuityError("continuity_unverified");
+      record = store.retirePreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, pending.preparationId);
+    } else {
+      let missing = false;
+      try {
+        const receipt = await updateLauncherContinuityPreparation(descriptor, { expected, recovery: target });
+        if (receipt.state !== "prepared") throw continuityError("continuity_execution_unsettled");
+      } catch (error) {
+        // A host restart may erase both tags, but an absent table alone is not a
+        // retirement proof. This branch can only close the unsent migration after
+        // the original Broker process and the original Launcher are proved gone.
+        const receipt = await queryLauncherContinuityTransaction(descriptor, target).catch(() => undefined);
+        if (!receipt || !["missing", "retired"].includes(receipt.state) || !receipt.writerRetired
+          || (receipt.state === "missing" && !receipt.hostNoWriter)
+          || continuityProcessInstanceStatus(pending.expected.owner) !== "exited") {
+          if ((error as { code?: string }).code === "continuity_execution_unsettled") throw error;
+          throw continuityError("continuity_unverified", "The pending input preparation has no exact applied or retired receipt yet.");
+        }
+        missing = true;
+      }
+      record = store.completePreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, pending.preparationId);
+      if (missing) record = store.retireAttempt(record.thread, { scope: record.scope, expectedVersion: record.version },
+        pending.target.transaction.logicalWorkId, pending.target.transaction.attempt);
+    }
+    work = record.works[logicalWorkId];
+  }
+  const attemptBefore = work?.attempts.at(-1);
+  const unsentCandidate = work && attemptBefore && ["prepared", "page-possible", "page-acquired"].includes(attemptBefore.stage)
+    && work.retryBudget?.lastFailureAt === undefined
+    && !binding?.initialAcceptedInput
+    && (record.owner.id === bindings.owner || continuityProcessInstanceStatus(record.owner) === "exited");
+  let sameAttempt = false;
+  if (unsentCandidate) {
+    const previousIdentity = recoveryIdentity(record, store.installationId());
+    const receipt = await queryLauncherContinuityTransaction(descriptor, previousIdentity);
+    // Creating is still the original acquisition. Keep its sole queryable identity
+    // and wait for a prepared receipt; do not create a migration or another page.
+    if (receipt.state === "creating") throw continuityError("continuity_unverified", "The original page acquisition is still in progress.");
+    if (!["missing", "prepared", "retired"].includes(receipt.state)) throw continuityError("continuity_execution_unsettled");
+    if (receipt.state === "missing" && (!receipt.hostNoWriter
+      || (attemptBefore.launcherInstance ? !receipt.writerRetired : attemptBefore.stage !== "prepared"))) throw continuityError("continuity_unverified");
+    if (receipt.state === "prepared") {
+      if (!receipt.launcherInstance) throw continuityError("continuity_unverified");
+      if (record.owner.id !== bindings.owner || record.transaction!.snapshotDigest !== recoveryDigest(input.context)) {
+        record = store.beginPreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, {
+          logicalWorkId, owner: continuityProcessInstance(bindings.owner), snapshotDigest: recoveryDigest(input.context),
+          launcherInstance: receipt.launcherInstance,
+        });
+        const pending = record.pendingPreparation!;
+        const prepared = await updateLauncherContinuityPreparation(descriptor, { expected: previousIdentity,
+          recovery: recoveryIdentity({ ...record, ...pending.target }, store.installationId()) });
+        if (prepared.state !== "prepared") throw continuityError("continuity_execution_unsettled");
+        record = store.completePreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, pending.preparationId);
+      }
+      sameAttempt = true;
+    } else if (receipt.state === "missing" && attemptBefore.stage === "prepared" && !attemptBefore.launcherInstance) {
+      // No acquisition was authorized at all. This is the only empty-table case
+      // that can reuse the initial budget without an actual prepared page receipt.
+      record = store.transact(record.thread, { scope: record.scope, expectedVersion: record.version }, draft => { draft.owner = continuityProcessInstance(bindings.owner); });
+      record = store.rebindSnapshot(record.thread, { scope: record.scope, expectedVersion: record.version }, logicalWorkId, recoveryDigest(input.context));
+      sameAttempt = true;
+    }
+  }
+  if (!sameAttempt) record = await retireRecoveryWriter(bindings, record, descriptor);
+  abortSignal?.throwIfAborted();
+  if (work && !sameAttempt) {
+    record = store.reserveRecovery(record.thread, { scope: record.scope, expectedVersion: record.version }, {
+      logicalWorkId, owner: continuityProcessInstance(bindings.owner), snapshotDigest: recoveryDigest(input.context),
+    });
+  } else if (!work) {
+    if (!hasInitialChatGptTurnInstruction(parsed)) throw continuityError("continuity_context_missing");
+    record = store.admitWork({ thread: record.thread, scope: record.scope, owner: continuityProcessInstance(bindings.owner),
+      logicalWorkId, instructionIdentity: instruction, nativeTurnId: identity.turnId, workPayloadDigest: payload,
+      snapshotDigest: recoveryDigest(input.context), createPage: true, dispatchProtocolComplete: true });
+  }
+  work = record.works[logicalWorkId]!;
+  parsed._continuityAttempt = work.attempts.at(-1)!.attempt;
+  parsed._continuityEpoch = record.epoch;
+  parsed._continuityHistoryRevision = record.historyRevision;
+  input._continuityAttempt = parsed._continuityAttempt;
+  input._continuityEpoch = record.epoch;
+  input._continuityHistoryRevision = record.historyRevision;
+  const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+  const checkpoint = continuityCheckpoint(parsed);
+  const restored = bindings.installRecovered(record, executionKey, checkpoint.digest, identity.turnId);
+  restored.initialAcceptedInput = structuredClone(input);
+  restored.initialInstructionPayloadDigest = payload;
+  const conversationKey = chatGptConversationKey(parsed, namespace)!;
+  restored.conversation = { key: conversationKey, descriptor };
+  return { bindings, binding: restored, descriptor, conversationKey, executionKey, nativeThreadId: identity.threadId!,
+    revision: record.historyRevision, input, recovery: recoveryIdentity(record, store.installationId()), recovered: true,
+    recoveryCheckpointId: recoveryCheckpoint?.workLineageId === work.workLineageId ? recoveryCheckpoint.commitId : undefined,
+    instructionPrevious: work.instructionPrevious, allowRetainedSourceInstructionPayload: work.allowRetainedSourceFallback };
+}
+
+async function prepareDurableContinuation(
+  parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
+  attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
+  descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
+): Promise<PreparedContinuityRequest | undefined> {
+  const proof = continuityCheckpoint(parsed);
+  if (proof.index < 0 || hasNativeChatGptInstruction(parsed,
+    continuityCurrentInstructionInput(parsed, { trustedLowerBound: proof.index }))) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const selection = selectRecoveryContinuation(parsed, observed, identity);
+  if (!selection) return undefined;
+  const { checkpoint } = selection;
+  let record = observed;
+  let binding = bindings.observed(record.thread);
+  const store = bindings.recoveryStore;
+  const work = selection.work;
+  parsed._continuityHistoryRevision = record.historyRevision;
+  parsed._continuityEpoch = record.epoch;
+  const localCheckpoint = [...binding?.checkpoints.values() ?? []].find(value => value.revision === checkpoint.targetHistoryRevision);
+  assertCheckpointSourceReplay(parsed, identity, localCheckpoint);
+  if (selection.action === "stopped") throw continuityError("continuity_stopped");
+  if (selection.action === "replay") {
+    parsed._continuityHistoryRevision = record.historyRevision;
+    parsed._continuityEpoch = record.epoch;
+    parsed._continuityAttempt = work.attempts.at(-1)!.attempt;
+    const activeKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+    const active = chatGptTurnSessions.find(activeKey);
+    if (active?.isActive() && binding?.recovery?.logicalWorkId === work.logicalWorkId
+      && binding.executionKey === activeKey) {
+      active.assertCanonicalReplayInput(parsed);
+      return { bindings, binding, descriptor, executionKey: activeKey, nativeThreadId: identity.threadId!,
+        conversationKey: binding.conversation!.key, revision: record.historyRevision,
+        allowRetainedSourceInstructionPayload: true, instructionPrevious: work.instructionPrevious };
+    }
+    const source = work.terminalReceiptId && work.terminalDigest ? chatGptTurnSessions.findRecoveryFinal(bindings.registrations.directory,
+      record.thread, work.workLineageId, work.terminalReceiptId, work.terminalDigest) : undefined;
+    if (!source || !binding) throw continuityError("continuity_replay_unavailable");
+    if (checkpoint.continuation.state === "consumed") source.assertCanonicalReplayInput(parsed);
+    return { bindings, binding, descriptor, executionKey: binding.executionKey ?? "replay", nativeThreadId: identity.threadId!,
+      conversationKey: binding.conversation?.key ?? "replay", revision: record.historyRevision, durableFinalReplay: source };
+  }
+  await assertExecutionCompatible?.();
+  if (selection.action === "admit" && checkpoint.targetHistoryRevision !== record.historyRevision) {
+    throw continuityError("continuity_source_unproven", "An older checkpoint cannot allocate a continuation at the current history revision.");
+  }
+  const consumerLogicalWorkId = selection.consumerLogicalWorkId ?? recoveryDigest([record.scope, work.nativeTurnId, work.instructionIdentity, "continuation", checkpoint.commitId]);
+  parsed._continuityHistoryRevision = selection.action === "resume" ? work.attempts.at(-1)!.historyRevision : checkpoint.targetHistoryRevision;
+  parsed._continuityEpoch = record.epoch;
+  parsed._continuityAttempt = selection.action === "resume" ? work.attempts.at(-1)!.attempt : 0;
+  let executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+  const existing = chatGptTurnSessions.find(executionKey);
+  if (selection.action === "resume" && existing?.isActive() && binding && !["lost", "ended"].includes(binding.state)) {
+    existing.assertCanonicalReplayInput(parsed);
+    return { bindings, binding, descriptor, executionKey, nativeThreadId: identity.threadId!,
+      conversationKey: binding.conversation!.key, revision: parsed._continuityHistoryRevision!,
+      allowRetainedSourceInstructionPayload: true,
+      instructionPrevious: work.instructionPrevious ?? { instructionIdentity: work.instructionIdentity, nativeTurnId: work.nativeTurnId, checkpointDigest: checkpoint.summaryDigest } };
+  }
+  const beforeRecovery = store.get(record.thread)!;
+  if (beforeRecovery.version !== record.version) {
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, beforeRecovery, descriptor, abortSignal);
+  }
+  let input = recoveryContext(parsed, { directory: bindings.registrations.directory, thread: record.thread,
+    logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt }, checkpoint.commitId);
+  // recoveryContext can accept a first real result synchronously. Observe that write
+  // before waiting on the page; later version changes still require reconciliation.
+  record = store.get(record.thread)!;
+  let expected = selection.action === "admit" && binding?.state === "ready" ? binding.lease : undefined;
+  if (expected && binding?.conversation) {
+    try { await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, expected); }
+    catch (error) {
+      if ((error as { code?: string }).code === "continuity_unverified") throw error;
+      expected = undefined;
+    }
+  }
+  // Another observer can consume or finish this exact transition while the page
+  // inspection is in flight. Reconcile that receipt before retiring any writer.
+  const afterInspection = store.get(record.thread)!;
+  if (afterInspection.version !== record.version) {
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, afterInspection, descriptor, abortSignal);
+  }
+  if (expected && binding && localCheckpoint) input = checkpointResumeInput(parsed, binding, localCheckpoint, proof).input;
+  parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
+  input.context.tools = parsed.context.tools;
+  preflightContinuityInput(input, capabilities, attachments, Boolean(expected));
+  if (!expected) {
+    await assertLauncherContinuityCapacity(descriptor);
+    record = await retireRecoveryWriter(bindings, record, descriptor);
+  }
+  abortSignal?.throwIfAborted();
+  if (selection.action === "admit") {
+    const current = store.get(record.thread)!;
+    if (current.version !== record.version) {
+      const currentCheckpoint = current.checkpoints[checkpoint.commitId];
+      if (currentCheckpoint?.continuation.state === "consumed"
+        && currentCheckpoint.continuation.consumerLogicalWorkId === consumerLogicalWorkId) {
+        return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, current, descriptor, abortSignal);
+      }
+    }
+    record = store.consumeContinuation(record.thread, { scope: record.scope, expectedVersion: record.version }, checkpoint.commitId, {
+      thread: record.thread, scope: record.scope, owner: continuityProcessInstance(bindings.owner), logicalWorkId: consumerLogicalWorkId,
+      instructionIdentity: work.instructionIdentity, nativeTurnId: identity.turnId, workPayloadDigest: work.workPayloadDigest,
+      instructionPrevious: { instructionIdentity: work.instructionIdentity, nativeTurnId: work.nativeTurnId, checkpointDigest: checkpoint.summaryDigest },
+      allowRetainedSourceFallback: true,
+      snapshotDigest: recoveryDigest(input.context), createPage: !expected, dispatchProtocolComplete: true,
+    });
+  } else {
+    record = store.reserveRecovery(record.thread, { scope: record.scope, expectedVersion: record.version }, {
+      logicalWorkId: consumerLogicalWorkId, owner: continuityProcessInstance(bindings.owner), snapshotDigest: recoveryDigest(input.context),
+    });
+  }
+  const consumer = record.works[consumerLogicalWorkId]!;
+  parsed._continuityHistoryRevision = record.historyRevision;
+  parsed._continuityEpoch = record.epoch;
+  parsed._continuityAttempt = consumer.attempts.at(-1)!.attempt;
+  input = { ...input, _continuityHistoryRevision: record.historyRevision, _continuityEpoch: record.epoch, _continuityAttempt: parsed._continuityAttempt };
+  executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+  const sourceExecutionKey = binding?.executionKey;
+  if (!expected) binding = bindings.installRecovered(record, executionKey, checkpoint.summaryDigest, identity.turnId);
+  if (!binding) throw continuityError("continuity_source_unproven");
+  // The journal has atomically selected this consumer. Publish that same execution
+  // to retained checkpoint evidence; a successor attempt may have a different key.
+  const retainedCheckpoint = [...binding.checkpoints.values()].find(value =>
+    value.revision === checkpoint.targetHistoryRevision && continuityDigest(value.summary) === checkpoint.summaryDigest);
+  if (retainedCheckpoint) retainedCheckpoint.continuationExecutionKey = executionKey;
+  binding.recovery = { directory: bindings.registrations.directory, thread: record.thread, logicalWorkId: consumerLogicalWorkId,
+    attempt: consumer.attempts.at(-1)!.attempt, ownerId: record.owner.id };
+  const conversationKey = expected ? binding.conversation!.key : chatGptConversationKey(parsed, namespace)!;
+  binding.conversation = { key: conversationKey, descriptor };
+  return { bindings, binding, descriptor, conversationKey, executionKey, nativeThreadId: identity.threadId!, revision: record.historyRevision,
+    sourceExecutionKey, expected, input, recovery: recoveryIdentity(record, store.installationId()), recovered: !expected,
+    recoveryCheckpointId: checkpoint.commitId,
+    allowRetainedSourceInstructionPayload: true,
+    instructionPrevious: consumer.instructionPrevious ?? { instructionIdentity: work.instructionIdentity, nativeTurnId: work.nativeTurnId, checkpointDigest: checkpoint.summaryDigest } };
 }

@@ -2,6 +2,8 @@ const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { inspectContinuityConversation, validateContinuityClaim } = require("./continuity-lease.cjs");
+const { queryContinuityTransaction, updateContinuityPreparation, markContinuitySendPossible, retireContinuityWriter,
+  assertContinuityActivity } = require("./continuity-recovery.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
@@ -104,6 +106,12 @@ class BrowserControlServer {
     const isTurnRelease = request.url === "/v1/turn/release";
     const isContinuityInspect = request.url === "/v1/turn/continuity";
     const isContinuityCapacity = request.url === "/v1/turn/continuity-capacity";
+    const recoveryAction = new Map([
+      ["/v1/turn/continuity-query", "query"],
+      ["/v1/turn/continuity-prepare", "prepare"],
+      ["/v1/turn/continuity-send-possible", "send-possible"],
+      ["/v1/turn/continuity-retire", "retire"],
+    ]).get(request.url);
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isProxyResolution = request.url === "/v1/network/resolve-proxy";
     const manualAction = new Map([
@@ -114,7 +122,7 @@ class BrowserControlServer {
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
     ]).get(request.url);
-    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isContinuityInspect && !isContinuityCapacity && !isSessionInspect && !isProxyResolution && !manualAction)) {
+    if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isContinuityInspect && !isContinuityCapacity && !isSessionInspect && !isProxyResolution && !manualAction && !recoveryAction)) {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
@@ -138,7 +146,19 @@ class BrowserControlServer {
       }
       const preferences = this.getPreferences();
       const host = this.getBrowserHost();
-      if (!host) throw new Error("browser host is not ready");
+      if (!host) {
+        const error = new Error("browser host is not ready");
+        if (isContinuityInspect || recoveryAction) error.code = "continuity_unverified";
+        throw error;
+      }
+      if (recoveryAction) {
+        const result = recoveryAction === "query" ? queryContinuityTransaction(host, body.recovery)
+          : recoveryAction === "prepare" ? updateContinuityPreparation(host, body.expected, body.recovery)
+          : recoveryAction === "send-possible" ? markContinuitySendPossible(host, body.recovery)
+          : await retireContinuityWriter(host, body.recovery);
+        writeJson(response, 200, { ok: true, ...result });
+        return;
+      }
       if (isContinuityCapacity) {
         writeJson(response, 200, { ok: true, available: host.hasContinuityCapacity() });
         return;
@@ -198,6 +218,10 @@ class BrowserControlServer {
       if (body.continuity !== undefined && body.conversationKey === undefined) {
         throw new Error("continuity requires conversationKey");
       }
+      if (!(request.url === "/v1/turn/start" || manualAction === "start")) {
+        assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+      }
+      const recoveryAcknowledgement = body.recovery ? { recovery: body.recovery } : {};
       if (body.retain !== undefined && typeof body.retain !== "boolean") {
         throw new Error("retain is invalid");
       }
@@ -258,7 +282,8 @@ class BrowserControlServer {
             MANUAL_SENT_OBSERVER_TIMEOUT_MS,
           );
           if (observed.status === "pending") {
-            writeJson(response, 202, { ok: true, status: "pending" });
+            assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+            writeJson(response, 202, { ok: true, status: "pending", ...recoveryAcknowledgement });
             return;
           }
           if (observed.status === "timeout") {
@@ -273,7 +298,8 @@ class BrowserControlServer {
             writeJson(response, 409, { error: "Zero Risk turn failed before Sent confirmation", code: "manual_turn_failed" });
             return;
           }
-          writeJson(response, 200, { ok: true, status: "sent", sentAt: observed.sentAt });
+          assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+          writeJson(response, 200, { ok: true, status: "sent", sentAt: observed.sentAt, ...recoveryAcknowledgement });
           return;
         }
         if (manualAction === "wait-terminal") {
@@ -283,7 +309,8 @@ class BrowserControlServer {
             MANUAL_SENT_OBSERVER_TIMEOUT_MS,
           );
           if (observed.status === "pending") {
-            writeJson(response, 202, { ok: true, status: "pending" });
+            assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+            writeJson(response, 202, { ok: true, status: "pending", ...recoveryAcknowledgement });
             return;
           }
           if (observed.status === "timeout") {
@@ -296,17 +323,18 @@ class BrowserControlServer {
           if (!['cancelled', 'failed'].includes(observed.status)) {
             throw new Error("manual terminal state is invalid");
           }
-          writeJson(response, 200, { ok: true, status: observed.status });
+          assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+          writeJson(response, 200, { ok: true, status: observed.status, ...recoveryAcknowledgement });
           return;
         }
         if (manualAction === "started") {
           host.markManualTurnStarted(body.traceId, body.helperPid);
-          writeJson(response, 200, { ok: true });
+          writeJson(response, 200, { ok: true, ...recoveryAcknowledgement });
           return;
         }
         if (manualAction === "cancel") {
           const result = host.cancelManualTurn(body.traceId, body.helperPid);
-          writeJson(response, 200, { ok: true, ...result });
+          writeJson(response, 200, { ok: true, ...result, ...recoveryAcknowledgement });
           return;
         }
         if (!['completed', 'failed', 'aborted'].includes(body.status)) {
@@ -318,14 +346,14 @@ class BrowserControlServer {
           body.status,
           body.retain === true,
         );
-        writeJson(response, 200, { ok: true, ...release });
+        writeJson(response, 200, { ok: true, ...release, ...recoveryAcknowledgement });
         return;
       }
       if (request.url === "/v1/turn/approval") {
         if (host.browserInteractionMode() === "manual") throw new Error("Automatic browser interaction is disabled");
         host.setTurnApprovalPending(body.traceId, body.helperPid, body.pending);
         this.logger.info("browser.tool_approval", { traceId: body.traceId, pending: body.pending });
-        writeJson(response, 200, { ok: true });
+        writeJson(response, 200, { ok: true, ...recoveryAcknowledgement });
         return;
       }
       if (request.url === "/v1/turn/usage") {
@@ -334,7 +362,7 @@ class BrowserControlServer {
         host.heartbeatTurn(body.traceId, body.helperPid);
         if (!this.limits) throw new Error("Limits tracking is unavailable");
         const recorded = this.limits.record(body);
-        writeJson(response, 200, { ok: true, recorded });
+        writeJson(response, 200, { ok: true, recorded, ...recoveryAcknowledgement });
         return;
       }
       if (request.url === "/v1/turn/start") {
@@ -368,7 +396,7 @@ class BrowserControlServer {
       } else if (request.url === "/v1/turn/heartbeat") {
         host.heartbeatTurn(body.traceId, body.helperPid, body.refreshViewport === true, body.progress);
         this.logger.debug?.("browser.turn_heartbeat", { traceId: body.traceId });
-        writeJson(response, 200, { ok: true });
+        writeJson(response, 200, { ok: true, ...recoveryAcknowledgement });
         return;
       } else {
         if (!['completed', 'failed', 'aborted'].includes(body.status)) throw new Error("turn status is invalid");
@@ -382,7 +410,7 @@ class BrowserControlServer {
           body.connectorBound === true,
         );
         this.logger.info("browser.turn_ended", { traceId: body.traceId, status: body.status });
-        writeJson(response, 200, { ok: true, ...release });
+        writeJson(response, 200, { ok: true, ...release, ...recoveryAcknowledgement });
         return;
       }
     } catch (error) {
@@ -394,11 +422,11 @@ class BrowserControlServer {
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
       const manualSentPolicyMismatch = error?.code === "manual_sent_policy_mismatch";
       const manualTimedOut = error?.code === "manual_turn_timed_out";
-      const continuityCode = ["continuity_session_lost", "continuity_source_unproven", "continuity_resource_capacity"].includes(error?.code)
+      const continuityCode = ["continuity_session_lost", "continuity_source_unproven", "continuity_resource_capacity", "continuity_unverified", "continuity_execution_unsettled", "continuity_configuration_conflict"].includes(error?.code)
         ? error.code : undefined;
       writeJson(
         response,
-        cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
+        continuityCode === "continuity_unverified" ? 503 : cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
           ? 409
           : manualTimedOut ? 408 : 400,
         {

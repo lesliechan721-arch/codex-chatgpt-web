@@ -1,3 +1,5 @@
+import { continuityBindingsFor } from "./continuity-binding";
+import { assertRecoveryWriter, completeRecoveryWork, recoveryIdentity, recoveryStore, stopRecoveryWork, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { observedTaskAcknowledgement } from "./task-update-ack";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
@@ -10,6 +12,8 @@ import {
   LauncherManualTurnFailedError,
   LauncherManualTurnTimedOutError,
   markLauncherManualTurnStarted,
+  markLauncherContinuitySendPossible,
+  readLauncherContinuityInstance,
   releaseLauncherRetainedConversation,
   startLauncherManualTurn,
   waitForLauncherManualSent,
@@ -59,7 +63,7 @@ import { assertContinuityCompactionResult, runContinuityCompaction } from "./con
 import type { ContinuityLease } from "./continuity-contract";
 import {
   acceptContinuityResponseLease, beginContinuityResponse, bindContinuityRequestScope, finishContinuityResponse,
-  prepareContinuityRequest, type PreparedContinuityRequest,
+  prepareContinuityRequest, assertContinuityStoppedReceipt, type PreparedContinuityRequest,
 } from "./continuity-request";
 import {
   canonicalizeCompactionHandoff,
@@ -429,10 +433,12 @@ export function createChatGptWebAdapter(
     codexHome?: string;
   } = {},
 ): ProviderAdapter {
+  if (provider.chatgptWeb?.continuityStateDirectory) continuityBindingsFor(resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory)));
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const preparedContinuity = new WeakMap<CodexParsedRequest, PreparedContinuityRequest>();
   const negotiatedTaskUpdates = new WeakSet<CodexParsedRequest>();
   const broker = dependencies.broker ?? TurnBroker.forSocket(brokerSocketPath(provider));
+  if (provider.chatgptWeb?.continuityStateDirectory) continuityBindingsFor(resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory))).broker = broker;
   const zeroRiskManualControl = dependencies.zeroRiskManualControl ?? launcherZeroRiskManualControl;
   const structuredBroker = broker instanceof TurnBroker ? broker : undefined;
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
@@ -539,6 +545,8 @@ export function createChatGptWebAdapter(
     abortSignal?: AbortSignal,
   ): Promise<void> => {
     bindContinuityRequestScope(parsed, executionNamespace);
+    if (provider.chatgptWeb?.continuityStateDirectory) parsed._continuityStateDirectory = resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory));
+    assertContinuityStoppedReceipt(parsed);
     preparedEnvironment = undefined;
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) return;
@@ -551,7 +559,7 @@ export function createChatGptWebAdapter(
     // Preserve runTurn's deterministic validation order before accepting trusted authority.
     if (!parsed._compactionRequest) createChatGptStructuredOutputValidator(parsed.options.outputFormat);
     const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
-    if (chatGptWebTurnRetryPolicy.exhaustedError(retryKey) || !mode.localTools) return;
+    if ((parsed._conversationPolicy !== "continuity-first" && chatGptWebTurnRetryPolicy.exhaustedError(retryKey)) || !mode.localTools) return;
     preparedEnvironment = { parsed, environment: await resolveToolAuthority(parsed, abortSignal) };
   };
 
@@ -585,16 +593,63 @@ export function createChatGptWebAdapter(
     const continuity = preparedContinuity.get(parsed);
     if (parsed._conversationPolicy === "continuity-first" && !continuity) throw continuityError("continuity_source_unproven");
     const continuityClaim = continuity ? beginContinuityResponse(continuity) : undefined;
+    if (continuity?.binding.recovery && continuityClaim && !continuity.finalReplaySource) {
+      const ref = continuity.binding.recovery;
+      const store = recoveryStore(ref);
+      const observed = assertRecoveryWriter(ref);
+      const attempt = observed.works[ref.logicalWorkId]!.attempts[ref.attempt]!;
+      const updated = store.markAttempt(ref.thread, { scope: observed.scope, expectedVersion: observed.version }, {
+        logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: attempt.stage === "prepared" ? "page-possible" : attempt.stage,
+        launcherInstance: readLauncherContinuityInstance(continuity.descriptor),
+      });
+      continuity.recovery = recoveryIdentity(updated, store.installationId());
+      continuityClaim.recovery = continuity.recovery;
+    }
     let continuityLease: ContinuityLease | undefined;
+    const reportLoadedRecovery = (): void => {
+      if (continuity?.recovered) {
+        trace.push({ kind: "commentary", text: "A new ChatGPT conversation was created with the current context." });
+        continuity.recovered = false;
+      }
+    };
     const acceptContinuityLease = (lease: unknown): void => {
       continuityLease = acceptContinuityResponseLease(continuity!, traceId, lease);
+      // Manual acquisition returns only after Launcher has captured the visible prompt.
+      if (manualInteraction) reportLoadedRecovery();
     };
     const loseContinuity = (): void => {
       if (!continuity) return;
       try { continuity.bindings.lose(continuity.binding, continuity.executionKey); }
       catch { console.error("[chatgpt-web] continuity owner is lost and its registration could not be updated"); }
     };
+    const unverifyContinuity = (): void => {
+      if (!continuity || continuity.binding.executionKey !== continuity.executionKey) return;
+      continuity.binding.state = "unverified";
+      if (continuity.binding.recovery) {
+        const ref = continuity.binding.recovery;
+        recoveryStore(ref).transact(ref.thread, { scope: continuity.binding.scope }, record => {
+          if (record.epoch === continuity.binding.epoch && record.state !== "stopped") record.state = "unverified";
+        });
+      }
+    };
     const promptInput = continuity?.input ?? checkpointInput.parsed;
+    const recoveryBaselineResults: Record<string, string> = {};
+    const recoveryCoveredCallIds = new Set<string>();
+    if (continuity?.binding.recovery) {
+      const ref = continuity.binding.recovery;
+      const record = recoveryStore(ref).get(ref.thread)!;
+      const work = record.works[ref.logicalWorkId]!;
+      const checkpoint = continuity.recoveryCheckpointId ? record.checkpoints[continuity.recoveryCheckpointId] : undefined;
+      if (continuity.recoveryCheckpointId && (!checkpoint || checkpoint.workLineageId !== work.workLineageId)) {
+        throw continuityError("continuity_context_missing", "The selected recovery checkpoint does not belong to this instruction lineage.");
+      }
+      const covered = new Set(checkpoint?.coveredCallIds ?? []);
+      for (const call of Object.values(record.calls)) {
+        if (call.workLineageId !== work.workLineageId || call.state !== "settled" || !call.firstResultDigest) continue;
+        if (covered.has(call.callId)) recoveryCoveredCallIds.add(call.callId);
+        else if (call.logicalWorkId !== ref.logicalWorkId || call.attempt !== ref.attempt) recoveryBaselineResults[call.callId] = call.firstResultDigest;
+      }
+    }
     const conversationKey = continuity?.conversationKey ?? (!parsed._compactionRequest
       && !freshConversationPerTurn
       && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
@@ -650,24 +705,48 @@ export function createChatGptWebAdapter(
       if (capturedCheckpoint) lunaCheckpointStore.commit(parsed, capturedCheckpoint, answer);
       return answer;
     });
+    let recoveryFinal: RuntimeRecoveryFinalReceipt | undefined;
     const finalizeContinuity = (browser: Promise<string>): Promise<string> => !continuity ? browser : browser.then(
       async answer => {
+        const compactionBoundary = continuity.binding.state === "compacting"
+          && continuity.binding.executionKey === continuity.executionKey;
+        if (continuity.binding.recovery && !compactionBoundary) recoveryFinal = completeRecoveryWork(continuity.binding.recovery, answer);
         try { await finishContinuityResponse(continuity); }
-        catch {
-          // The accepted ordinary answer remains authoritative. Only continued page ownership is
-          // lost; a later request must fail closed rather than replace this result or recreate it.
-          loseContinuity();
+        catch (error) {
+          if ((error as { code?: string }).code === "continuity_session_lost") loseContinuity();
+          else unverifyContinuity();
         }
         return answer;
       },
       error => {
-        if (error instanceof ChatGptWebAdapterError && error.code === "continuity_resource_capacity"
+        if ((submission.phase === "prepared" || (error as { code?: string }).code === "continuity_resource_capacity")
           && continuity.binding.state === "creating"
           && continuity.binding.initialExecutionKey === continuity.executionKey
           && !continuity.binding.lease && !continuityLease) {
+          if ((error as { code?: string }).code !== "continuity_resource_capacity" && continuity.binding.recovery) {
+            const ref = continuity.binding.recovery;
+            const record = recoveryStore(ref).get(ref.thread)!;
+            recoveryStore(ref).recordFailure(ref.thread, { scope: record.scope }, ref.logicalWorkId);
+            loseContinuity();
+          }
           throw error;
         }
-        loseContinuity();
+        if (continuity.binding.recovery) {
+          const ref = continuity.binding.recovery;
+          const record = recoveryStore(ref).get(ref.thread)!;
+          if (!["completed", "stopped"].includes(record.works[ref.logicalWorkId]!.state)) recoveryStore(ref).recordFailure(ref.thread, { scope: record.scope }, ref.logicalWorkId);
+        }
+        if (continuity.binding.recovery && (error as { code?: string }).code === "client_cancelled") stopRecoveryWork(continuity.binding.recovery, "page-close");
+        if ((error as { code?: string }).code === "continuity_unverified") continuity.binding.state = "unverified";
+        else loseContinuity();
+        if (continuity.binding.recovery && (error as { code?: string }).code === "continuity_session_lost") {
+          const ref = continuity.binding.recovery;
+          const record = recoveryStore(ref).get(ref.thread)!;
+          const work = record.works[ref.logicalWorkId]!;
+          if (Object.values(record.calls).some(call => call.workLineageId === work.workLineageId && call.state === "delivery-possible")) throw continuityError("continuity_execution_unsettled");
+          const lost = continuityError("continuity_session_lost");
+          throw new ChatGptWebAdapterError(lost.message, { status: 503, errorType: "server_error", code: lost.code, retryable: true, cause: error });
+        }
         if (error instanceof ChatGptWebAdapterError && !error.retryable) throw error;
         throw continuityError("continuity_session_lost");
       },
@@ -757,13 +836,28 @@ export function createChatGptWebAdapter(
       );
     };
     const submission: NonNullable<ChatGptTurnRuntime["submission"]> = { phase: "prepared" };
-    // A canonical compaction request is side-effect free and remains safe to rebuild after an
-    // ambiguous browser send. Normal task prompts must never be replayed after Send activation.
+    // Ordinary submissions persist their Send boundary here. Dedicated continuity
+    // compaction owns the same protocol in its separate control-only runtime.
     const submissionLifecycle = {
       ...(!parsed._compactionRequest ? {
-        onSendActivated: () => { submission.phase = "send_activated" as const; },
+        onSendActivated: async () => {
+          if (continuity?.binding.recovery) {
+            const ref = continuity.binding.recovery;
+            const record = assertRecoveryWriter(ref);
+            recoveryStore(ref).markAttempt(ref.thread, { scope: record.scope, expectedVersion: record.version }, { logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "send-possible", transactionVersion: continuity.recovery?.transactionVersion });
+            if (continuity.recovery) await markLauncherContinuitySendPossible(continuity.descriptor, continuity.recovery);
+          }
+          reportLoadedRecovery();
+          if (continuity) { delete continuity.binding.initialAcceptedInput; delete continuity.binding.initialInstructionPayloadDigest; }
+          submission.phase = "send_activated" as const;
+        },
       } : {}),
       onSubmitted: () => {
+        if (continuity?.binding.recovery) {
+          const ref = continuity.binding.recovery;
+          const record = assertRecoveryWriter(ref);
+          recoveryStore(ref).markAttempt(ref.thread, { scope: record.scope }, { logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "accepted" });
+        }
         if (!parsed._compactionRequest) submission.phase = "accepted";
         hooks.onCompactionProgress?.();
       },
@@ -777,7 +871,7 @@ export function createChatGptWebAdapter(
       const token = deferred<string>();
       const externalProgress = new ChatGptExternalTurnProgress();
       const surfaceNonce = randomBytes(32).toString("base64url");
-      const owner: LauncherManualTurnOwner = { traceId, helperPid: process.pid };
+      const owner: LauncherManualTurnOwner = { traceId, helperPid: process.pid, ...(continuityClaim?.recovery ? { recovery: continuityClaim.recovery } : {}) };
       let tokenSettled = false;
       let activeToken: string | undefined;
       let launcherStarted = false;
@@ -799,6 +893,7 @@ export function createChatGptWebAdapter(
             undefined,
             traceId,
             { requireSentConfirmation: zeroRiskRequireSentConfirmation,
+              ...(continuity?.binding.recovery ? { recovery: continuity.binding.recovery } : {}),
               ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}) },
           );
           observeCapabilityRetirement(activeToken, externalProgress);
@@ -829,6 +924,12 @@ export function createChatGptWebAdapter(
                 retryable: false,
               });
             }
+          }
+          if (continuity?.binding.recovery) {
+            const ref = continuity.binding.recovery;
+            const record = assertRecoveryWriter(ref);
+            recoveryStore(ref).markAttempt(ref.thread, { scope: record.scope }, { logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "send-possible" });
+            submission.phase = "send_activated";
           }
           const manualLease = await zeroRiskManualControl.start(retainedLauncherDescriptor, {
             ...owner,
@@ -907,7 +1008,7 @@ export function createChatGptWebAdapter(
           try {
             await finishLauncher("completed");
           } catch (controlError) {
-            loseContinuity();
+            unverifyContinuity();
             // The broker result is already authoritative. A launcher acknowledgement failure may
             // leave UI cleanup pending, but it must not replace a completed Codex answer with an
             // error or trigger a contradictory failed terminal mutation.
@@ -918,6 +1019,9 @@ export function createChatGptWebAdapter(
           return answer;
         } catch (error) {
           const normalized = safeManualAdapterError(error);
+          // Launcher capacity rejection occurs before prompt publication. Keep the local
+          // captured input, while the durable marker remains conservatively send-possible.
+          if (!launcherStarted && !continuityLease && (normalized as { code?: string }).code === "continuity_resource_capacity") submission.phase = "prepared";
           // Capture the causal state before our own cleanup revokes the broker capability. The
           // retirement observer also aborts browserAbort, but that self-induced abort must not turn
           // an ordinary launcher/runtime failure into a user cancellation.
@@ -956,7 +1060,8 @@ export function createChatGptWebAdapter(
         text,
         usageInput: checkpointInput.parsed,
         manualControl: { surfaceNonce },
-        ...(continuity ? { continuityBinding: continuity.binding } : {}),
+        ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
+        get recoveryFinal() { return recoveryFinal; },
         ...(conversationKey ? { conversationKey } : {}),
         ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
         retireCapability: async () => {
@@ -1068,7 +1173,7 @@ export function createChatGptWebAdapter(
         environment,
         timeoutMs === undefined ? undefined : timeoutMs + 60_000,
         traceId,
-        taskUpdates ? { taskUpdateProtocol: 1 } : undefined,
+        { ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}), ...(continuity?.binding.recovery ? { recovery: continuity.binding.recovery } : {}) },
       );
       activeToken = turnToken;
       try {
@@ -1156,7 +1261,8 @@ export function createChatGptWebAdapter(
       trace,
       text,
       usageInput: checkpointInput.parsed,
-      ...(continuity ? { continuityBinding: continuity.binding } : {}),
+      ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
+      get recoveryFinal() { return recoveryFinal; },
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
       retireCapability: async () => {
@@ -1235,7 +1341,7 @@ export function createChatGptWebAdapter(
           : createChatGptStructuredOutputValidator(parsed.options.outputFormat);
         const bufferStructuredOutput = structuredOutputValidator !== undefined;
         const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
-        const exhaustedRetry = chatGptWebTurnRetryPolicy.exhaustedError(retryKey);
+        const exhaustedRetry = parsed._conversationPolicy !== "continuity-first" ? chatGptWebTurnRetryPolicy.exhaustedError(retryKey) : undefined;
         if (exhaustedRetry) {
           emit({
             type: "error",
@@ -1266,11 +1372,25 @@ export function createChatGptWebAdapter(
           incoming.abortSignal?.throwIfAborted();
           await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, extractChatGptTurnIdentity(parsed).threadId);
         }
+        const durableFinalReplay = preparedContinuity.get(parsed)?.durableFinalReplay;
+        if (durableFinalReplay) {
+          const outcome = durableFinalReplay.settledOutcome();
+          if (outcome?.type !== "final") throw continuityError("continuity_replay_unavailable");
+          const completedEvents = durableFinalReplay.completedFinalResponseEvents();
+          if (completedEvents) { replayEvents(completedEvents, emit); return; }
+          const finalEvents = durableFinalReplay.eventsForFinalReplay();
+          replayEvents(finalEvents, emit);
+          if (finalEvents.length === 0) emit({ type: "text_delta", text: outcome.answer, phase: "final_answer" });
+          emitBrowserCompletion(outcome, estimateChatGptWebUsage(parsed, { answer: outcome.answer, reasoning: durableFinalReplay.reasoningForFinalReplay() }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments), emit);
+          return;
+        }
         if (parsed._conversationPolicy === "continuity-first" && parsed._compactionRequest) {
           const prepared = preparedContinuity.get(parsed)!;
           emit({ type: "heartbeat" });
           const shared = runContinuityCompaction(parsed, prepared, worker, broker, configuredCapabilities,
-            executionNamespace, timeoutMs, incoming.onProgress);
+            executionNamespace, timeoutMs, incoming.onProgress, () => {
+              emit({ type: "text_delta", text: "A new ChatGPT conversation was created with the current context.", phase: "commentary" });
+            });
           const summary = await withAbort(shared, incoming.abortSignal);
           await assertContinuityCompactionResult(prepared);
           emit({ type: "text_delta", text: summary, phase: "final_answer" });
@@ -2227,14 +2347,13 @@ export function createChatGptWebAdapter(
           if (settled?.type === "error") error = settled.error;
           else if (retiredDuringRefresh && session.cancellationReason) error = session.cancellationReason;
           const turnError = submittedTurnFailure(session, error);
-          const handledError = turnError instanceof ChatGptWebAdapterError && turnError.retryable
+          const handledError = parsed._conversationPolicy !== "continuity-first" && turnError instanceof ChatGptWebAdapterError && turnError.retryable
             ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
             : turnError;
           if (!(turnError instanceof ChatGptWebAdapterError && turnError.retryable)) {
             chatGptWebTurnRetryPolicy.clear(retryKey);
           }
-          const retryableContinuityCreation = handledError instanceof ChatGptWebAdapterError
-            && handledError.code === "continuity_resource_capacity"
+          const retryableContinuityCreation = session.runtime.submission?.phase === "prepared"
             && session.runtime.continuityBinding !== undefined
             && chatGptTurnSessions.discardRetryableContinuityCreation(
               executionKey,
@@ -2268,7 +2387,9 @@ export function createChatGptWebAdapter(
                 if ((handledError instanceof ChatGptWebAdapterError && !handledError.retryable)
                   || (terminalError?.type === "error" && terminalError.retryable === false)) {
                   // Keep deterministic request failures replayable on their original round.
-                  session.cancel();
+                  session.cancel(turnError);
+                } else if (session.runtime.continuityBinding) {
+                  session.cancel(turnError);
                 } else {
                   chatGptTurnSessions.retire(executionKey, session);
                 }

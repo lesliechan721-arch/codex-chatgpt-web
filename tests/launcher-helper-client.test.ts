@@ -8,8 +8,13 @@ import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launche
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
 
 const roots: string[] = [];
+const recovery: ContinuityRecoveryIdentity = { schemaVersion: 2, installationId: "a".repeat(64), threadKey: "b".repeat(64),
+  epoch: 1, transactionId: "c".repeat(64), transactionVersion: 2, logicalWorkId: "d".repeat(64), attempt: 1,
+  snapshotVersion: 2, snapshotDigest: "e".repeat(64), ownerProcess: { pid: process.pid, startIdentity: "helper-test-instance" },
+  launcherInstance: { pid: process.pid, startIdentity: "darwin:Sat Oct 10 00:00:00 2026", instanceId: "0".repeat(64) } };
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -24,6 +29,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       if (this.config.useSavedChats !== true) throw new Error("Saved chat preference lost in helper IPC");
       if (turn.modelFamily !== "5.6") throw new Error("Pinned model family lost in helper IPC");
+      if (JSON.stringify(turn.continuity.recovery) !== ${JSON.stringify(JSON.stringify(recovery))}) throw new Error("Recovery identity lost in helper IPC");
+      turn.onContinuityLease({ owner: turn.continuity.owner, leaseId: "f".repeat(32), traceId: turn.traceId, recovery: turn.continuity.recovery });
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
@@ -31,6 +38,9 @@ test("daemon streams browser lifecycle through the real helper process", async (
       for (let index = 1; index < prepared.multipart.parts.length; index++) {
         await turn.onMultipartStageAcknowledged?.(index);
       }
+      // An old run can share a trace. Its late Send observation must not invoke the new hook.
+      process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "send_activated",
+        recovery: { ...turn.continuity.recovery, snapshotVersion: 1 } }) + "\\n");
       await turn.onSendActivated();
       const initial = turn.externalProgress.snapshot();
       if (initial.nativeWaiting?.activeOperations !== 1) throw new Error("Initial Native lease lost in IPC");
@@ -94,18 +104,22 @@ test("daemon streams browser lifecycle through the real helper process", async (
   const checkpoints: unknown[] = [];
   const acknowledgedStages: number[] = [];
   let sendActivated = false;
+  let activations = 0;
   let submitted = false;
   let released = false;
   const externalProgress = new ChatGptExternalTurnProgress();
   externalProgress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
   const client = new LauncherBrowserHelperClient(config);
   try {
+    await client.assertContinuityCompatible(true);
     const result = await client.run({
       traceId: "abcdef123456",
       externalProgress,
       modelId: "gpt-5.6-sol",
       reasoning: "high",
       modelFamily: "5.6",
+      continuity: { owner: "f".repeat(64), recovery },
+      onContinuityLease: lease => { expect(lease.recovery).toEqual(recovery); },
       capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
       prepare: async () => ({
         text: "inspect", images: [],
@@ -116,7 +130,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
         release: () => { released = true; },
       }),
       onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
-      onSendActivated: () => { sendActivated = true; },
+      onSendActivated: async () => { await Bun.sleep(5); sendActivated = true; activations++; },
       onSubmitted: () => {
         submitted = true;
         externalProgress.recordNativeWaiting({ revision: 2, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
@@ -133,6 +147,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     ]);
     expect(deltas).toEqual(["done"]);
     expect(sendActivated).toBe(true);
+    expect(activations).toBe(1);
     expect(submitted).toBe(true);
     expect(acknowledgedStages).toEqual([1, 2, 3, 4, 5]);
     expect(checkpoints).toEqual([{
@@ -150,6 +165,23 @@ test("daemon streams browser lifecycle through the real helper process", async (
   } finally {
     await client.close();
   }
+});
+
+test("a v2 helper rejects instance recovery before prompt preparation or IPC run dispatch", async () => {
+  let prepared = 0;
+  let dispatched = 0;
+  const client = Object.assign(Object.create(LauncherBrowserHelperClient.prototype), {
+    ensureChild: async () => {}, helperFeatures: new Set([CONTINUITY_FEATURE, "session-continuity-recovery-v2", "native-tool-wait-v1"]),
+    send: async () => { dispatched++; },
+  }) as LauncherBrowserHelperClient;
+  await expect(client.run({ traceId: "legacy-recovery-helper", modelId: "gpt-6-sol",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false }, continuity: { owner: "f".repeat(64), recovery },
+    prepare: async () => { prepared++; return { text: "never prepare", images: [], release() {} }; },
+    onTextDelta() {},
+  })).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+  expect(prepared).toBe(0);
+  expect(dispatched).toBe(0);
+  expect(CONTINUITY_RECOVERY_FEATURE).toBe("session-continuity-recovery-v3");
 });
 
 test("accepted compaction retires through the helper as completed without hiding cancellations or errors", async () => {

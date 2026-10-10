@@ -20,7 +20,7 @@ import {
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
-import { cancelAbandonedContinuityCreation, leaveContinuityMode } from "./adapters/chatgpt-web/continuity-lifecycle";
+import { cancelAbandonedContinuityCreation, leaveContinuityMode, stopDurableContinuity } from "./adapters/chatgpt-web/continuity-lifecycle";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
@@ -1540,11 +1540,6 @@ export function startServer(
       identity.turnId,
       reason,
     );
-    cancelAbandonedContinuityCreation(
-      providerConfig(config).chatgptWeb?.continuityStateDirectory,
-      identity.threadId,
-      identity.turnId,
-    );
     const compactionCancellation = cancelStructuredCompactionNativeTurn(
       identity.threadId,
       identity.turnId,
@@ -1724,6 +1719,10 @@ export function startServer(
           );
         }
         const reason = new DOMException("Codex turn interrupted", "AbortError");
+        stopDurableContinuity(providerConfig(config).chatgptWeb?.continuityStateDirectory,
+          identity.threadId, identity.turnId, "native-interrupt");
+        cancelAbandonedContinuityCreation(providerConfig(config).chatgptWeb?.continuityStateDirectory,
+          identity.threadId, identity.turnId);
         turnIdleLeases?.terminate(identity, reason);
         const cancellation = beginNativeTurnCancellation(identity, reason);
         logNativeTurnCleanup("interrupted turn", cancellation);

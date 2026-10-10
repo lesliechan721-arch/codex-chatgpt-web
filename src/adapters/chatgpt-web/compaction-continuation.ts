@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest } from "../../types";
-import type { ChatGptTurnIdentity, ChatGptTurnUserRevision } from "./environment";
+import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
 import { continuityError } from "./continuity-errors";
-import { continuitySourceRepresentationDigest, selectContinuityCheckpoint } from "./continuity-binding";
+import { continuityDigest, continuitySourceRepresentationDigest, findContinuityRecoveryRecord, selectContinuityCheckpoint } from "./continuity-binding";
+import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
 
 interface CompletedCheckpoint {
   summaryHash: string;
@@ -16,6 +17,25 @@ interface CompletedCheckpoint {
 const checkpoints = new Map<string, CompletedCheckpoint>();
 const MAX_CHECKPOINTS = 256;
 const reservations = new Set<string>();
+// Missing instruction content is never reconstructed from a digest. This identity-only
+// object supports recognition; the recovery caller compiles the actual current context.
+const durableSources = new WeakMap<CodexParsedRequest, { commitId: string; workId: string; source: ChatGptTurnUserRevision }>();
+
+function durableContinuation(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
+  if (!parsed._continuityScope || !identity.threadId || !identity.turnId) return undefined;
+  const record = findContinuityRecoveryRecord(continuityDigest(identity.threadId), parsed._continuityScope, parsed._continuityStateDirectory);
+  return record ? selectRecoveryContinuation(parsed, record, identity) : undefined;
+}
+
+function liveCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
+  try { return selectContinuityCheckpoint(parsed, identity); }
+  catch (error) {
+    // A missing page cannot discard an existing durable relationship. Other source and
+    // payload conflicts are preserved, rather than hidden by this recognition fallback.
+    if (error && typeof error === "object" && "code" in error && error.code === "continuity_session_lost") return undefined;
+    throw error;
+  }
+}
 
 function scope(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): string | undefined {
   if (!identity.threadId || !identity.turnId) return undefined;
@@ -75,8 +95,14 @@ export function isAcceptedCompactionContinuation(
   source: ChatGptTurnUserRevision,
 ): boolean {
   if (parsed._conversationPolicy === "continuity-first") {
-    return selectContinuityCheckpoint(parsed, identity)?.checkpoint.sourceRepresentationDigests
-      ?.includes(continuitySourceRepresentationDigest(parsed, source)) === true;
+    const live = liveCheckpoint(parsed, identity);
+    if (live?.checkpoint.sourceRepresentationDigests?.includes(continuitySourceRepresentationDigest(parsed, source))) return true;
+    const durable = durableContinuation(parsed, identity);
+    if (!durable) return false;
+    const retained = durableSources.get(parsed);
+    return (retained?.source === source && retained.commitId === durable.checkpoint.commitId
+      && retained.workId === durable.work.logicalWorkId)
+      || durable.checkpoint.representationDigests.includes(continuitySourceRepresentationDigest(parsed, source));
   }
   return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(source)) === true;
 }
@@ -87,9 +113,21 @@ export function recoverCompactionInstruction(
   identity: ChatGptTurnIdentity,
 ): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
   if (parsed._conversationPolicy === "continuity-first") {
-    const selected = selectContinuityCheckpoint(parsed, identity);
-    return selected?.checkpoint.sourceInstruction
-      ? { source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex } : undefined;
+    const selected = liveCheckpoint(parsed, identity);
+    if (selected?.checkpoint.sourceInstruction) return { source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex };
+    // An explicitly new instruction uses its own normal identity and must not inherit
+    // a summary's consumer or the stopped source's execution rights.
+    if (requestCarriedChatGptInstructionRevision(parsed, identity.turnId)) return undefined;
+    const durable = durableContinuation(parsed, identity);
+    if (!durable) return undefined;
+    let retained = durableSources.get(parsed);
+    if (!retained || retained.commitId !== durable.checkpoint.commitId || retained.workId !== durable.work.logicalWorkId) {
+      retained = { commitId: durable.checkpoint.commitId, workId: durable.work.logicalWorkId,
+        source: { itemId: durable.work.instructionIdentity,
+          ...(durable.work.nativeTurnId ? { turnId: durable.work.nativeTurnId } : {}), content: [] } };
+      durableSources.set(parsed, retained);
+    }
+    return { source: retained.source, summaryIndex: durable.summaryIndex };
   }
   const accepted = acceptedCheckpoint(parsed, identity);
   return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;

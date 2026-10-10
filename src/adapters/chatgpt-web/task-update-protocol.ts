@@ -15,7 +15,10 @@ export interface TaskUpdateOwnerContext {
   acknowledgedRevision?: number;
 }
 
-export interface TaskUpdateRegistrationOptions { taskUpdateProtocol?: 1 }
+export interface TaskUpdateRegistrationOptions {
+  taskUpdateProtocol?: 1;
+  recovery?: import("./continuity-recovery-runtime").RuntimeRecoveryReference;
+}
 
 export interface TaskUpdateState {
   /** Private, turn-scoped same-host ACK publications, supplied only to owner/helper control readers. */
@@ -51,6 +54,7 @@ export interface TaskUpdateAckResult {
 }
 
 export interface TaskUpdateTransfer {
+  recovery?: import("./continuity-recovery-runtime").RecoveryAppendAdmission;
   transferId: string;
   payloadDigest: string;
   expectedDriverGeneration: number;
@@ -65,7 +69,10 @@ export interface TaskUpdateTransfer {
 export type TaskUpdateTransferOutcome =
   | { status: "unknown"; transferId: string }
   | { status: "not_committed"; transferId: string; code: string; message: string }
-  | { status: "committed"; transferId: string; state: TaskUpdateState; batchFingerprint: string };
+  | { status: "committed"; transferId: string; state: TaskUpdateState; batchFingerprint: string;
+      /** Durable acceptance cannot be rolled back. Retry this same transfer to publish its
+       * helper version before projecting the final receipt into the local Session. */
+      synchronizationPending?: true };
 
 export interface TaskOutputReceipt {
   taskRevision: number;

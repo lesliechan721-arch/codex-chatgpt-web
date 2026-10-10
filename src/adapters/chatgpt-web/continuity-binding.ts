@@ -1,3 +1,5 @@
+import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryCheckpointRecord } from "./continuity-recovery-store";
+import type { RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
 import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest, CodexTool } from "../../types";
@@ -40,7 +42,8 @@ export type ContinuityToolResultReplayEvidence = {
   }>;
 };
 
-export interface ContinuityCheckpointCommit extends Omit<ContinuityHandoffEvidence, "key"> {
+export interface ContinuityCheckpointCommit extends Omit<ContinuityHandoffEvidence, "key" | "lease"> {
+  lease?: ContinuityLease;
   revision: number;
   preserveFinalResponse: boolean;
   sourceResultReplay?: ContinuityToolResultReplayEvidence;
@@ -85,7 +88,7 @@ export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity:
     const selected = cached.selection;
     if (!selected) return undefined;
     const checkpoint = selected.checkpoint.deref();
-    if (selected.binding.state === "lost" || selected.binding.state === "ended") throw continuityError("continuity_session_lost");
+
     if (!checkpoint || selected.binding.checkpoints.get(selected.key) !== checkpoint) {
       throw continuityError("continuity_source_unproven", "The selected checkpoint relation is no longer retained.");
     }
@@ -100,7 +103,8 @@ export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity:
   };
   const thread = continuityDigest(identity.threadId);
   let binding: ContinuityBinding | undefined;
-  for (const registry of registries.values()) {
+  for (const [location, registry] of registries) {
+    if (parsed._continuityStateDirectory && location !== parsed._continuityStateDirectory) continue;
     const observed = registry.observed(thread);
     if (observed?.scope === parsed._continuityScope) {
       binding = registry.lookup(thread, parsed._continuityScope);
@@ -149,13 +153,15 @@ export interface ContinuityBinding {
   readonly scope: string;
   readonly owner: string;
   readonly initialExecutionKey: string;
+  epoch?: number;
+  recovery?: RuntimeRecoveryReference;
   readonly initialNativeTurnId?: string;
   /** First request accepted after initial preflight. Retained only while creation is retryable. */
   initialAcceptedInput?: CodexParsedRequest;
   initialInstructionPayloadDigest?: string;
   /** Current locally approved discovery only; released with this live binding. */
   discoveredTools?: CodexTool[];
-  state: "creating" | "running" | "ready" | "compacting" | "lost" | "ended";
+  state: "creating" | "running" | "ready" | "compacting" | "unverified" | "lost" | "ended";
   revision: number;
   lastUsedAt: number;
   lease?: ContinuityLease;
@@ -289,6 +295,7 @@ export function continuityCompactionSourceHistory(parsed: CodexParsedRequest): u
 
 /** Live ownership is deliberately separate from durable, content-free registration. */
 export class ContinuityBindings {
+  broker?: import("./turn-broker").TurnBrokerOwner;
   private readonly bindings = new Map<string, ContinuityBinding>();
   private checkpointBytes = 0;
   private checkpointCount = 0;
@@ -302,16 +309,36 @@ export class ContinuityBindings {
   lookup(thread: string, scope: string): ContinuityBinding | undefined {
     const registration = this.registrations.get(thread);
     if (!registration) return undefined;
-    if (registration.owner !== this.owner || registration.state !== "entered") {
-      throw continuityError("continuity_session_lost");
-    }
     if (registration.scope !== scope) throw continuityError("continuity_configuration_conflict", "This native thread is already bound to a different model or provider scope.");
     const binding = this.bindings.get(thread);
-    if (!binding || binding.state === "lost" || binding.state === "ended") throw continuityError("continuity_session_lost");
+    if (!binding) return undefined;
     if (binding.state === "ready" && this.now() - binding.lastUsedAt >= CONTINUITY_IDLE_TTL_MS) {
       this.lose(binding);
-      throw continuityError("continuity_session_lost", "The conversation exceeded the 24-hour idle limit.");
+
     }
+    return binding;
+  }
+
+  get recoveryStore(): ContinuityRecoveryStore { return new ContinuityRecoveryStore(this.registrations.directory); }
+
+  installRecovered(record: RecoveryThreadRecord, executionKey: string, checkpoint: string, nativeTurnId?: string): ContinuityBinding {
+    const registration = this.registrations.get(record.thread);
+    if (registration) this.registrations.compareAndSwap(record.thread, registration, { owner: this.owner, state: "entered", epoch: record.epoch, transactionId: record.transaction?.transactionId });
+    else this.registrations.claim(record.thread, record.scope, this.owner);
+    const previous = this.bindings.get(record.thread);
+    const work = record.works[record.currentWorkId!];
+    if (!work) throw continuityError("continuity_source_unproven");
+    const binding: ContinuityBinding = {
+      thread: record.thread, scope: record.scope, owner: this.owner, epoch: record.epoch,
+      initialExecutionKey: executionKey, initialNativeTurnId: nativeTurnId, executionKey,
+      state: "creating", revision: record.historyRevision, lastUsedAt: this.now(),
+      recovery: { directory: this.registrations.directory, thread: record.thread, logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt, ownerId: record.owner.id },
+      revisionDigests: previous?.revisionDigests ?? new Map(), revisions: previous?.revisions ?? new Map(),
+      checkpoints: previous?.checkpoints ?? new Map(), ordinaryReplayTombstones: previous?.ordinaryReplayTombstones ?? new Map(),
+    };
+    binding.revisionDigests.set(record.historyRevision, checkpoint);
+    binding.revisions.set(checkpoint, record.historyRevision);
+    this.bindings.set(record.thread, binding);
     return binding;
   }
 
@@ -338,7 +365,7 @@ export class ContinuityBindings {
       throw continuityError("continuity_session_lost");
     }
     const binding: ContinuityBinding = {
-      thread, scope, owner: this.owner, initialExecutionKey: executionKey,
+      thread, scope, owner: this.owner, epoch: 0, initialExecutionKey: executionKey,
       ...(nativeTurnId ? { initialNativeTurnId: nativeTurnId } : {}),
       state: "creating", revision: 0, lastUsedAt: this.now(), executionKey,
       revisionDigests: new Map([[0, checkpoint]]), revisions: new Map([[checkpoint, 0]]), checkpoints: new Map(),
@@ -384,8 +411,7 @@ export class ContinuityBindings {
     binding.lease = { ...lease };
     if (binding.state === "creating") {
       binding.state = "running";
-      delete binding.initialAcceptedInput;
-      delete binding.initialInstructionPayloadDigest;
+      // Keep the compiled baseline until Send is possible, including acquisition failures.
     }
   }
 
@@ -478,12 +504,36 @@ export class ContinuityBindings {
     binding.lastUsedAt = this.now();
   }
 
+  installRecoveryCheckpoint(
+    binding: ContinuityBinding, key: string, checkpoint: RecoveryCheckpointRecord, summary: string,
+    sourceInstruction: ChatGptTurnUserRevision, sourceRepresentationDigests: readonly string[], preserveFinalResponse: boolean,
+  ): void {
+    const bytes = Buffer.byteLength(summary) + Buffer.byteLength(JSON.stringify(sourceInstruction));
+    const prior = binding.checkpoints.get(key);
+    if (prior) {
+      if (prior.summary !== summary || prior.revision !== checkpoint.targetHistoryRevision) throw continuityError("continuity_source_unproven");
+      return;
+    }
+    if (bytes > MAX_CHECKPOINT_BYTES || this.checkpointCount >= MAX_CHECKPOINTS || this.checkpointBytes + bytes > MAX_TOTAL_CHECKPOINT_BYTES) throw continuityError("continuity_resource_capacity");
+    const sourceExecutionKey = binding.executionKey ?? key;
+    const source = chatGptTurnSessions.find(sourceExecutionKey);
+    const replay = source?.acceptedContinuityInstructionIdentity() ? source.continuitySourceInstructionReplayEvidence() : undefined;
+    binding.checkpoints.set(key, { sourceRevision: checkpoint.sourceHistoryRevision, revision: checkpoint.targetHistoryRevision,
+      sourceExecutionKey, bytes, summary, preserveFinalResponse,
+      ...(binding.lease ? { lease: { ...binding.lease } } : {}),
+      ...(replay ? { sourceInstructionReplay: replay } : {}), sourceInstruction: structuredClone(sourceInstruction),
+      sourceRepresentationDigests: [...sourceRepresentationDigests], continuationNativeTurnId: checkpoint.continuation.nativeTurnId });
+    this.checkpointBytes += bytes; this.checkpointCount++;
+    binding.revision = checkpoint.targetHistoryRevision;
+    binding.revisionDigests.set(binding.revision, checkpoint.summaryDigest);
+    binding.revisions.set(checkpoint.summaryDigest, binding.revision);
+    binding.compactionKey = undefined; binding.executionKey = undefined; binding.logicalExecutionKey = undefined;
+    binding.acceptedHandoff = undefined; binding.state = binding.lease ? "ready" : "creating";
+  }
+
   assertCompactionReplay(binding: ContinuityBinding, key: string, sourceRevision: number): void {
-    this.assertCurrent(binding);
     const checkpoint = binding.checkpoints.get(key);
-    if (!checkpoint || checkpoint.sourceRevision !== sourceRevision || checkpoint.revision > binding.revision
-      || !binding.lease || checkpoint.lease.owner !== binding.lease.owner
-      || checkpoint.lease.leaseId !== binding.lease.leaseId) {
+    if (!checkpoint || checkpoint.sourceRevision !== sourceRevision || checkpoint.revision > binding.revision) {
       throw continuityError("continuity_source_unproven");
     }
   }
@@ -505,22 +555,28 @@ export class ContinuityBindings {
 
   /** Old cleanup can only retire the execution that still owns this binding. */
   lose(binding: ContinuityBinding, executionKey?: string): void {
+    if (this.bindings.get(binding.thread) !== binding) return;
     if (executionKey !== undefined && binding.executionKey !== executionKey) return;
     if (binding.state === "lost" || binding.state === "ended") return;
     binding.state = "lost";
-    this.retireCheckpointAuthority(binding);
+    binding.evidenceExpiresAt = this.now() + TERMINAL_EVIDENCE_TTL_MS;
+    if (binding.recovery) this.recoveryStore.transact(binding.thread, { scope: binding.scope }, record => {
+      if (record.epoch === binding.epoch && record.state !== "stopped") record.state = "lost";
+    });
     this.registrations.finish(binding.thread, this.owner, "lost");
   }
 
   end(binding: ContinuityBinding): void {
-    if (binding.state === "lost" || binding.state === "ended") return;
+    if (this.bindings.get(binding.thread) !== binding) return;
+    if (binding.state === "ended") return;
+    if (binding.recovery) this.recoveryStore.stopWork(binding.thread, { scope: binding.scope }, binding.recovery.logicalWorkId, "mode-exit");
     binding.state = "ended";
     this.retireCheckpointAuthority(binding);
     this.registrations.finish(binding.thread, this.owner, "ended");
   }
 
   private assertCurrent(binding: ContinuityBinding): void {
-    if (this.lookup(binding.thread, binding.scope) !== binding) throw continuityError("continuity_session_lost");
+    if (this.lookup(binding.thread, binding.scope) !== binding || binding.state === "lost" || binding.state === "ended" || binding.state === "unverified") throw continuityError("continuity_session_lost");
   }
 
   private retireCheckpointAuthority(binding: ContinuityBinding): void {
@@ -549,6 +605,14 @@ export class ContinuityBindings {
         this.checkpointBytes -= binding.acceptedHandoff.bytes;
         binding.acceptedHandoff = undefined;
       }
+      const durable = this.recoveryStore.get(binding.thread);
+      if (durable && binding.checkpoints.size > 0) {
+        const commits = Object.values(durable.checkpoints).filter(checkpoint =>
+          [...binding.checkpoints.values()].some(body => body.revision === checkpoint.targetHistoryRevision
+            && continuityDigest(body.summary) === checkpoint.summaryDigest));
+        if (commits.length) this.recoveryStore.releaseCheckpointBodies(binding.thread,
+          { scope: durable.scope, expectedVersion: durable.version }, commits.map(checkpoint => checkpoint.commitId));
+      }
       for (const checkpoint of binding.checkpoints.values()) {
         this.checkpointCount -= 1;
         this.checkpointBytes -= checkpoint.bytes;
@@ -575,4 +639,16 @@ export function continuityBindingsFor(directory: string): ContinuityBindings {
     registries.set(directory, registry);
   }
   return registry;
+}
+
+export function findContinuityRecoveryRecord(thread: string, scope: string, directory?: string): RecoveryThreadRecord | undefined {
+  const matches: RecoveryThreadRecord[] = [];
+  for (const [location, registry] of registries) {
+    if (directory !== undefined && directory !== location) continue;
+    if (directory === undefined && registry.observed(thread)?.scope !== scope) continue;
+    const record = registry.recoveryStore.get(thread);
+    if (record?.scope === scope) matches.push(record);
+  }
+  if (matches.length > 1) throw continuityError("continuity_source_unproven", "More than one installation matches this recovery thread.");
+  return matches[0];
 }

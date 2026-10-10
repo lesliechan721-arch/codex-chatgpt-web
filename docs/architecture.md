@@ -245,14 +245,16 @@ and [acceptance gate](release-validation.md#inflight-user-update-validation).
 `chatgpt-web-continuity/` is a separate, opt-in namespace. Only trusted routing selects the policy.
 Full Native tools, Launcher, supported
 account/model/effort controls, and compatible helper features are required. Fresh Conversation
-Per Turn and Bigger Context are rejected. No additional internal release-verification flag is
+Per Turn is rejected. Bigger Context applies only to non-continuity models. No additional internal release-verification flag is
 required to expose these models.
 
 The physical conversation key does not change at compaction. Execution keys and response rounds
 include a trusted scope and a separate history revision. Before first-page creation, the actual
 ordinary input passes environment, identity, version, input, and capacity checks, then a durable
-content-free registry records the thread's one creation right. A missing live owner, changed
-scope, or damaged registration is not an empty thread and cannot trigger a fresh-page fallback.
+content-free registry records the thread and current ownership. Logical work identity is independent
+of page generation; completed or stopped receipts are checked before loss handling. A missing live
+owner is coordinated through durable admission records. A changed scope or damaged registration
+still fails before new work.
 
 The compaction driver accepts the exact source's handoff, waits for physical settlement, retires
 old execution authority, and commits one checkpoint/revision while retaining the page. Accepted
@@ -265,7 +267,7 @@ still use the original transport checks. Healthy ready pages and their current l
 use a 24-hour successful-work clock; queries and replay do not renew it. Five protected pages
 block a sixth allocation. Durable registration, checkpoint evidence, response caches, tool
 capabilities, and physical pages have separate limits and lifetimes; retained pages do not extend
-tool authority or authorize recovery across a restart. See [the policy guide](session-continuity.md)
+tool authority. Restart recovery uses separate durable evidence. See [the policy guide](session-continuity.md)
 for limits, failure handling, and release status.
 
 Continuity work identity uses native instruction identity, locally issued tool batches, and the
@@ -279,12 +281,31 @@ Continuation input uses current native instruction ownership and the committed c
 An explicitly owned new turn can omit its completed predecessor. The native instruction prefix of
 the current execution-history window remains part of the current payload, including developer and
 grouped AGENTS instructions whose turn metadata records their earlier creation. Unowned instructions
-mixed with completed output remain ambiguous and are rejected before submission. Full source data
-and codec comparison data live in the bounded checkpoint commit; continuity does not recover a source
-from the ordinary mode's continuation cache. Each request reuses its selected commit, and the start
+mixed with completed output remain ambiguous and are rejected before submission. Source relationships and codec comparison data live in the bounded checkpoint commit; continuity
+does not recover source authority from the ordinary mode's continuation cache. Each request reuses its selected commit, and the start
 boundary checks ownership again before consuming its transition once. Historical edits are not sent
 back to the retained page. Active ordinary reconnects publish the current tool registry under the
 execution lock before replaying their journal; historical execution replay cannot update a later owner.
+
+
+Recovery introduces sequential page generations while preserving the thread's monotonic history
+revision. A versioned, content-minimal journal records source lineages, work/attempt/snapshot
+identities, send/delivery-possible stages, first-result digests, stop/completion receipts, stable
+compaction targets, and continuation consumers. New side effects require durable admission first.
+No operation object or capability is restored from disk. A missing result must be supplied through
+the authenticated request or remain a specific recovery gap.
+
+A lost page can initialize from the current canonical request after old thread write authority and
+delivered calls settle. Authenticated Launcher creation/query/preparation transactions are unique
+across retries and versions; late receipts cannot take over a later generation. Healthy pages are
+preferred, and a transient inspect failure pauses submission rather than declaring permanent loss.
+A new explicit instruction can restart after stop or mode exit; stopped retries cannot revive.
+
+Automatic can finish an uncommitted lost compaction in a new tool-free page, or commit an existing
+valid handoff once. Committed results only replay. Checkpoints keep durable call coverage and one
+consumer relationship; that consumer's later attempts reuse the relationship without consuming it
+again. Completed-source checkpoint-only requests replay the original answer. Zero Risk ended
+compaction still needs manual handoff, and all new ordinary Zero Risk prompts need actual sending.
 
 ## Local ChatGPT Limits
 

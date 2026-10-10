@@ -184,23 +184,42 @@ source message ID, source content, current native thread, model, and reasoning i
 and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof retires the
 retained conversation before a fresh compaction starts from the full request history.
 
-The `chatgpt-web-continuity/` policy never uses that fresh fallback. Its physical
-conversation key is stable, while execution authority is isolated by trusted scope, revision,
-and exact owner/lease/head. A summary or response-cache hit cannot establish a new owner. After
-loss, restart, or mode exit, a durable first-use record prevents the same native thread from
-silently creating another page. That record stores only irreversible indexes and minimal owner
-state, not content or credentials, and is capped at 10,000 threads / 4 MiB without automatic
-expiry or repair. Checkpoint evidence is capped at 256 entries, 2 MiB each and 24 MiB total.
+The `chatgpt-web-continuity/` policy prefers the original page. A recovery page requires explicit
+admission proof: the previous thread writer is retired, delivered tools have real terminal results,
+and current request context is valid. Thread page generation can change, while logical work and
+history revision remain durable. A summary, empty memory map, process exit, or response-cache hit
+cannot establish settled tools or authorize new execution.
+
+The registry keeps irreversible indexes and minimal ownership state, capped at 10,000 threads /
+4 MiB without automatic reset. A versioned recovery journal stores work and source-lineage
+identities, attempts/snapshots, send/delivery stages, issued IDs and first-result digests, stops,
+completion receipts, checkpoint targets/coverage, and one-time consumers. It stores no prompts,
+result bodies, chat URLs, or capabilities. Recovery and checkpoint evidence share 24 MiB, with
+2 MiB per item and 256 checkpoints. Admission reserves terminal/stop space within that budget.
+Unknown calls, stops, and anti-replay records cannot be evicted into fresh execution rights.
+
+Send-possible is durable before Send, and delivery-possible before every external Native dispatch.
+Accepted results and stop/final/compaction receipts persist before success is exposed. All writers
+recheck thread, scope, generation, transaction, attempt, snapshot, and cancellation at mutation.
+Authenticated Launcher transactions coordinate lost receipts without parallel pages or a second
+unknown Send. Locks are recovered only with a verified process instance, never an arbitrary timeout.
+A page acquisition records its Launcher process and host instance before it starts. A missing
+transaction in a new Launcher needs authenticated proof of no surviving thread writer and verified
+old-instance retirement; missing memory alone grants no right to send.
+A living backend can retire one thread while continuing others; retirement is not external tool
+settlement. Old operations and credentials are never resurrected across restart.
 
 Within the existing authenticated Codex boundary, continuity trusts the client's current native
 task identity. It does not authenticate completed history against a full saved copy. This permits
-old text and metadata changes, but those changes do not update the retained page and may hide
-external execution that the bridge did not observe. Current instruction payload, delegated
+old text and metadata changes. They do not update a healthy retained page, but can enter a recovery
+page through the current canonical request. They may hide external execution the bridge did not observe.
+Required results from the unfinished source lineage, including append predecessors and prior attempts,
+must match the first accepted digest unless a reliable accepted checkpoint already covers them. Current instruction payload, delegated
 source proof, local outstanding call IDs/types, accepted result payload, capability, lease, and
 revision conflicts still fail. Historical tool echoes cannot create calls or deliver new results.
 Repeated summaries and unclear instruction ownership stop when local records cannot select one
-work item. Retry comparison records are bounded with their journals or checkpoints; first-input
-capture is released when creation succeeds or the binding becomes terminal.
+work item. Retry comparison records are bounded with their journals or checkpoints; in-memory first-input
+capture can be released without dropping the durable identity or send-state protections.
 
 Continuity source recovery reads one selected committed checkpoint relation. Identical summaries
 cannot merge different source identities or extend the accepted source representations on replay.
@@ -216,6 +235,12 @@ capacity-eviction candidates. Zero Risk cannot generate a second checkpoint prom
 active control path has ended. The separate
 [release validation matrix](release-validation.md#session-continuity-validation) records validation
 coverage; it is not an additional runtime alias gate.
+
+Old v1 registrations lack complete send/call/stop facts and remain legacy-unproven until real
+evidence can be supplied. Missing or corrupt initialized records cannot be silently replaced.
+An explicit stop survives restart; a distinct new instruction can restart only after settlement.
+HTTP observer disconnect does not revoke the task or clear its evidence. Current permission and
+approval checks apply to all new work; recovery does not restore old tool authority.
 
 ## Network exposure
 

@@ -6,7 +6,8 @@ import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../lau
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
-import { CONTINUITY_FEATURE, isContinuityLease, type ContinuityLease } from "./continuity-contract";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityLease, isContinuityRecoveryIdentity,
+  sameContinuityRecoveryIdentity, type ContinuityLease, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
 import { isTaskRevision, type TaskUpdateOwnerContext } from "./task-update-protocol";
 import {
@@ -26,7 +27,7 @@ interface PendingTurn {
   acknowledgedMultipartStage?: number;
 }
 
-type HelperMessage =
+type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "ready"; features?: string[] }
   | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
@@ -46,7 +47,7 @@ type HelperMessage =
       errorType?: string;
       code?: string;
       retryable?: boolean;
-    };
+    });
 
 function parseHelperMessage(line: string): HelperMessage {
   const value = JSON.parse(line) as unknown;
@@ -54,6 +55,13 @@ function parseHelperMessage(line: string): HelperMessage {
     throw new Error("Launcher browser helper message is not an object");
   }
   const message = value as Record<string, unknown>;
+  if (message.recovery !== undefined && !isContinuityRecoveryIdentity(message.recovery)) {
+    throw new Error("Launcher browser helper returned an invalid recovery identity");
+  }
+  return { ...parseHelperPayload(message), ...(message.recovery ? { recovery: message.recovery as ContinuityRecoveryIdentity } : {}) };
+}
+
+function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
   if (message.type === "ready") {
     const features = message.features;
     if (features !== undefined
@@ -232,7 +240,10 @@ export class LauncherBrowserHelperClient {
   async run(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     await this.ensureChild();
-    if (turn.continuity) await this.assertContinuityCompatible();
+    if (turn.continuity) await this.assertContinuityCompatible(Boolean(turn.continuity.recovery));
+    if (turn.continuity?.recovery && !turn.onSendActivated) {
+      throw continuityError("continuity_configuration_conflict", "Recovery requires an acknowledged durable Send boundary before browser submission.");
+    }
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
       throw new Error(
@@ -353,9 +364,10 @@ export class LauncherBrowserHelperClient {
     await this.terminateChild(child, 2_000);
   }
 
-  async assertContinuityCompatible(): Promise<void> {
+  async assertContinuityCompatible(recovery = false): Promise<void> {
     await this.ensureChild();
-    if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")) {
+    if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")
+      || (recovery && !this.helperFeatures.has(CONTINUITY_RECOVERY_FEATURE))) {
       throw continuityError("continuity_configuration_conflict", "Update the runtime and browser helper before starting this mode.");
     }
   }
@@ -466,6 +478,14 @@ export class LauncherBrowserHelperClient {
     }
     const pending = this.pending.get(message.id);
     if (!pending) return;
+    const recovery = pending.turn.continuity?.recovery;
+    if (recovery) {
+      if (!message.recovery) {
+        this.abortWithLocalFailure(message.id, continuityError("continuity_configuration_conflict", "Browser helper omitted a recovery frame identity."), pending);
+        return;
+      }
+      if (!sameContinuityRecoveryIdentity(message.recovery, recovery)) return;
+    }
     if (message.type === "event") {
       if (pending.turn.taskUpdateProtocol && (
         message.event === "text" || message.event === "completion_fence_begin" || message.event === "completion_fence_commit"
@@ -576,7 +596,8 @@ export class LauncherBrowserHelperClient {
         try {
           const claim = pending.turn.continuity;
           if (!claim || message.lease.owner !== claim.owner || message.lease.traceId !== pending.turn.traceId
-            || (claim.expected && message.lease.leaseId !== claim.expected.leaseId)) {
+            || (claim.expected && message.lease.leaseId !== claim.expected.leaseId)
+            || (claim.recovery && (!message.lease.recovery || !sameContinuityRecoveryIdentity(message.lease.recovery, claim.recovery)))) {
             throw continuityError("continuity_session_lost");
           }
           pending.turn.onContinuityLease?.(message.lease);
@@ -795,7 +816,9 @@ export class LauncherBrowserHelperClient {
       || child.signalCode !== null) {
       return Promise.reject(new Error("Launcher browser helper is not running"));
     }
-    return this.sendTo(child, message);
+    const frame = message as { id?: string; recovery?: ContinuityRecoveryIdentity };
+    const recovery = frame?.id ? this.pending.get(frame.id)?.turn.continuity?.recovery : undefined;
+    return this.sendTo(child, recovery && !frame.recovery ? { ...frame, recovery } : message);
   }
 
   private async sendTo(child: ChildProcessWithoutNullStreams, message: unknown): Promise<void> {

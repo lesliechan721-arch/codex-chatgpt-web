@@ -375,6 +375,9 @@ export async function requestRetainedCompactionHandoff(
     onLease: (lease: ContinuityLease) => void;
     onPhysicalSettlement: (settlement: Promise<void>) => void;
     onAcceptedHandoff: (summary: string) => void;
+    onPrepared?: (instruction: string) => Promise<ContinuityClaim>;
+    onSendActivated?: () => Promise<void>;
+    onSubmitted?: () => void;
   },
 ): Promise<string> {
   const conversationKey = source.conversationKey();
@@ -408,14 +411,18 @@ export async function requestRetainedCompactionHandoff(
       ...parsed, context: { ...parsed.context, messages: [] },
     }, capabilities);
     const prepare = async () => ({ text: instruction, images: [], release: () => {} });
+    const continuityClaim = continuity?.onPrepared ? await continuity.onPrepared(instruction) : continuity?.claim;
+    operationSignal.throwIfAborted();
     browser = worker.run({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
       ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
       ...(continuity ? {
-        continuity: continuity.claim,
+        continuity: continuityClaim!,
         onContinuityLease: continuity.onLease,
+        onSendActivated: continuity.onSendActivated,
+        onSubmitted: continuity.onSubmitted,
         retainConversation: true,
       } : {}),
       // The retained connector exposes only the one-shot control token embedded above. It does

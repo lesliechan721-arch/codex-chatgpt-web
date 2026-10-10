@@ -13,6 +13,12 @@ import {
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
+import {
+  acceptHealthyRecoveryCompactionLease, admitHealthyRecoveryCompaction, assertHealthyRecoveryCompactionAuthority, assertRecoveryCompactionResult,
+  beginHealthyRecoveryCompaction, commitRecoveryCompaction, failHealthyRecoveryCompaction,
+  assertRecoveryCompactionNotStopped, isRecoveryCompaction, markHealthyRecoveryCompactionAccepted, markHealthyRecoveryCompactionSend,
+  prepareHealthyRecoveryCompactionControl, recoveryCompactionTarget, runRecoveryCompaction,
+} from "./continuity-recovery-compaction";
 import { continuityToolRegistry } from "./continuity-tools";
 import type { PreparedContinuityRequest } from "./continuity-request";
 import { extractChatGptCompactionSourceRevision, extractChatGptCompactV1SourceRevision, extractChatGptTurnIdentity } from "./environment";
@@ -23,27 +29,18 @@ import {
   chatGptThreadOwnershipKey, chatGptTurnSessions,
 } from "./turn-execution";
 
-async function readyPage(prepared: PreparedContinuityRequest, allowRunning = false): Promise<void> {
+async function readyPage(prepared: PreparedContinuityRequest): Promise<void> {
   const { binding } = prepared;
   if (!binding.lease) throw continuityError("continuity_session_lost");
   const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease);
-  if (physical.state !== "ready" && !(allowRunning && physical.state === "running")) {
+  if (physical.state !== "ready") {
     throw continuityError("continuity_session_lost");
   }
 }
 
 export async function assertContinuityCompactionResult(prepared: PreparedContinuityRequest): Promise<void> {
+  if (isRecoveryCompaction(prepared)) return assertRecoveryCompactionResult(prepared);
   const { binding, bindings, executionKey, revision } = prepared;
-  bindings.assertCompactionReplay(binding, executionKey, revision);
-  const lease = binding.lease!;
-  // A committed compaction replay is read-only. Later work may currently own the same
-  // retained lease, so physical proof may be ready or running without changing that owner.
-  try { await readyPage(prepared, true); }
-  catch {
-    if (binding.lease?.traceId !== lease.traceId || binding.executionKey !== undefined) throw continuityError("continuity_source_unproven");
-    bindings.lose(binding);
-    throw continuityError("continuity_session_lost");
-  }
   bindings.assertCompactionReplay(binding, executionKey, revision);
 }
 
@@ -57,7 +54,11 @@ export function runContinuityCompaction(
   namespace: string,
   configuredTimeout?: number,
   onProgress?: () => void,
+  onRecovered?: () => void,
 ): Promise<string> {
+  if (isRecoveryCompaction(prepared)) {
+    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered);
+  }
   const { binding, bindings, executionKey } = prepared;
   const checkpoint = binding.checkpoints.get(executionKey);
   const replaySourceKey = checkpoint?.sourceExecutionKey ?? prepared.sourceExecutionKey;
@@ -115,6 +116,7 @@ export function runContinuityCompaction(
     const sourceInstructionReplay = source.continuitySourceInstructionReplayEvidence();
     let sourceResultReplay: ContinuityToolResultReplayEvidence | undefined;
     let begun = false;
+    let durableCompactionWorkId: string | undefined;
     let noControlDelivered = false;
     const timeoutMs = Math.min(configuredTimeout ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
     const deadline = new AbortController();
@@ -129,6 +131,7 @@ export function runContinuityCompaction(
     reportProgress();
     const signal = AbortSignal.any([operatorSignal, deadline.signal]);
     const acceptHandoff = (raw: string): void => {
+      if (durableCompactionWorkId) assertHealthyRecoveryCompactionAuthority(prepared);
       bindings.acceptCompactionHandoff(binding, executionKey, sourceExecutionKey, canonicalizeCompactionHandoff(parsed, raw));
       reportProgress();
     };
@@ -158,6 +161,12 @@ export function runContinuityCompaction(
           + Buffer.byteLength(JSON.stringify(sourceInstructionReplay))
           + Buffer.byteLength(JSON.stringify(identity.turnId)) + 128 + 512;
         const accepted = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
+        try {
+          if (!manual || source.isActive()) durableCompactionWorkId = beginHealthyRecoveryCompaction(parsed, prepared);
+        } catch (error) {
+          bindings.abandonUndeliveredCompaction(binding, executionKey, sourceExecutionKey);
+          throw error;
+        }
         if (source.continuityToolSearchResults(parsed).length > 0) {
           binding.discoveredTools = continuityToolRegistry(parsed, binding, source).discoveredTools;
         }
@@ -209,15 +218,25 @@ export function runContinuityCompaction(
           preserveFinalResponse = true;
         }
         if (!claim) throw continuityError("continuity_source_unproven");
+        await source.runtime.retireCapability?.();
+        const ordinaryFinal = preserveFinalResponse ? source.settledOutcome() : undefined;
+        durableCompactionWorkId = admitHealthyRecoveryCompaction(parsed, prepared,
+          ordinaryFinal?.type === "final" ? ordinaryFinal.answer : undefined);
         reportProgress();
         rawSummary = await requestRetainedCompactionHandoff(worker, parsed, source, broker as TurnBroker,
           capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
             claim,
+            ...(durableCompactionWorkId ? {
+              onPrepared: (instruction: string) => prepareHealthyRecoveryCompactionControl(prepared, instruction),
+              onSendActivated: () => markHealthyRecoveryCompactionSend(prepared),
+              onSubmitted: () => markHealthyRecoveryCompactionAccepted(prepared),
+            } : {}),
             onLease: lease => {
               if (binding.state !== "compacting" || binding.compactionKey !== executionKey
                 || binding.executionKey !== sourceExecutionKey || lease.traceId !== handoffTraceId) {
                 throw continuityError("continuity_source_unproven");
               }
+              if (durableCompactionWorkId) acceptHealthyRecoveryCompactionLease(prepared, lease);
               bindings.acceptLease(binding, lease);
             },
             onPhysicalSettlement: retainOwnershipUntil,
@@ -230,6 +249,13 @@ export function runContinuityCompaction(
       await chatGptTurnSessions.retireContinuityExecution(sourceExecutionKey, source, prepared.conversationKey, preserveFinalResponse);
       if (signal.aborted) throw signal.reason;
       if (!sourceResultReplay) throw continuityError("continuity_source_unproven");
+      const ordinaryFinal = preserveFinalResponse ? source.settledOutcome() : undefined;
+      durableCompactionWorkId = admitHealthyRecoveryCompaction(parsed, prepared,
+        ordinaryFinal?.type === "final" ? ordinaryFinal.answer : undefined);
+      const durableTarget = recoveryCompactionTarget(parsed);
+      if (durableCompactionWorkId && durableTarget) {
+        commitRecoveryCompaction(parsed, prepared, durableTarget, durableCompactionWorkId, summary, preserveFinalResponse);
+      }
       bindings.commitCompaction(
         binding,
         executionKey,
@@ -245,12 +271,34 @@ export function runContinuityCompaction(
       );
       return summary;
     } catch (error) {
+      try { assertRecoveryCompactionNotStopped(parsed, prepared); }
+      catch (stopped) {
+        source.cancel(stopped instanceof Error ? stopped : continuityError("continuity_stopped"));
+        await source.runtime.retireCapability?.();
+        const lease = binding.lease ? { ...binding.lease } : undefined;
+        if (lease) {
+          const release = source.physicalSettlement.then(() => releaseLauncherRetainedConversation(
+            prepared.descriptor, prepared.conversationKey, undefined, lease,
+          )).then(() => undefined);
+          retainOwnershipUntil(release);
+          void release.catch(() => {});
+        }
+        throw stopped;
+      }
       if (!begun || noControlDelivered) throw error;
+      if (durableCompactionWorkId) {
+        try { assertHealthyRecoveryCompactionAuthority(prepared); }
+        catch {
+          if (error instanceof ChatGptWebAdapterError) throw error;
+          throw continuityError("continuity_source_unproven", "The late handoff cannot retire a newer compaction attempt.");
+        }
+      }
       const lease = binding.lease ? { ...binding.lease } : undefined;
       try { bindings.lose(binding); }
       catch { /* The in-memory lost state is already terminal even if the durable store failed. */ }
       source.cancel(continuityError("continuity_session_lost"));
       await source.runtime.retireCapability?.();
+      await failHealthyRecoveryCompaction(parsed, prepared);
       if (lease) {
         const release = source.physicalSettlement.then(() => releaseLauncherRetainedConversation(
           prepared.descriptor, prepared.conversationKey, undefined, lease,

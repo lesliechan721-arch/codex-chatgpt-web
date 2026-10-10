@@ -2599,7 +2599,7 @@ export class ChatGptBrowserWorker {
   async assertContinuityCompatible(): Promise<void> {
     if (this.config.browserHost !== "launcher") throw new Error("Continuity requires Launcher");
     this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
-    await this.launcherHelper.assertContinuityCompatible();
+    await this.launcherHelper.assertContinuityCompatible(true);
   }
 
   /** Only a new physical execution may use the common Broker/prompt/helper update protocol. */
@@ -5110,6 +5110,7 @@ export class ChatGptBrowserWorker {
       phase: "start",
       traceId: turn.traceId,
       helperPid: process.pid,
+      ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
       ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
       ...((turn.conversationKey
         && (turn.nativeConnector || turn.capabilities.localToolsEnabled || turn.requireRetainedConversation))
@@ -5143,6 +5144,7 @@ export class ChatGptBrowserWorker {
         phase: "heartbeat",
         traceId: turn.traceId,
         helperPid: process.pid,
+        ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
         progress: { stage: activityStage, activeToolCalls: turn.externalProgress?.snapshot().activeToolCalls ?? 0 },
       }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(error => {
         if (activityFinished) return;
@@ -5204,6 +5206,7 @@ export class ChatGptBrowserWorker {
           phase: "end",
           traceId: turn.traceId,
           helperPid: process.pid,
+          ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
           status: terminal,
           ...(terminalMessage ? { message: terminalMessage } : {}),
           ...(terminal === "completed" && turn.retainConversation ? { retain: true } : {}),
@@ -5411,6 +5414,7 @@ export class ChatGptBrowserWorker {
                   phase: "heartbeat",
                   traceId: turn.traceId,
                   helperPid: process.pid,
+                  ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
                   refreshViewport: true,
                 });
                 const rebound = await connectLauncherBrowserHost(
@@ -5538,6 +5542,7 @@ export class ChatGptBrowserWorker {
           // Drain these bounded writes before releasing this turn's launcher lease.
           const write = notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
             phase: "usage", traceId: turn.traceId, helperPid: process.pid,
+            ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
             ...(accountKey ? { receipt: { id, accountKey, model, at: Date.now() } }
               : { trackingError: "account-unavailable" as const }),
           }).then(() => {}, () => {
@@ -5880,6 +5885,7 @@ export class ChatGptBrowserWorker {
               phase: "approval",
               traceId: turn.traceId,
               helperPid: process.pid,
+              ...(turn.continuity?.recovery ? { recovery: turn.continuity.recovery } : {}),
               pending,
             });
           },

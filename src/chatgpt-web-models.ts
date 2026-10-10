@@ -535,8 +535,8 @@ export const CHATGPT_WEB_CONTINUITY_MODEL_ROUTES: readonly ChatGptWebModelRoute[
   ...route,
   slug: route.slug.replace(CHATGPT_WEB_MODEL_PREFIX, CHATGPT_WEB_CONTINUITY_MODEL_PREFIX),
   displayName: `${route.displayName} — Continuity first`,
-  description: "Session continuity first. Starts one new conversation for this native thread; "
-    + "retains it across compaction and stops if ownership is lost. "
+  description: "Session continuity first. Prefers the original conversation across work and compaction; "
+    + "can recover a lost page from current context after the previous writer and tools settle. "
     + "The 1,000,000-token execution history budget does not increase the single-input limit.",
   conversationPolicy: "continuity-first" as const,
 }));

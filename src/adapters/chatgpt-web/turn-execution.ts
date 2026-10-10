@@ -1,3 +1,4 @@
+import { acceptRecoveryResults, stopRecoveryWork, recoveryRecord, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { createHash } from "node:crypto";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest, type CodexToolResultMessage } from "../../types";
 import { COMPACT_PROMPT, isReadableCompactionSummaryText } from "../../responses/compaction";
@@ -194,6 +195,10 @@ interface ChatGptTurnRuntimeBase {
   usageInput?: CodexParsedRequest;
   /** The live binding owns the ready-page clock; replay and queries never renew it. */
   continuityBinding?: ContinuityBinding;
+  /** Captured at durable completion; the page binding can later accept another work. */
+  readonly recoveryFinal?: RuntimeRecoveryFinalReceipt;
+  recoveryBaselineResults?: Readonly<Record<string, string>>;
+  recoveryCoveredCallIds?: ReadonlySet<string>;
   conversationKey?: string;
   releaseRetainedConversation?: () => Promise<void>;
   /** Idempotently retire the turn-bound MCP capability after browser and observer settlement. */
@@ -228,6 +233,7 @@ function executionKey(parsed: CodexParsedRequest, payload: unknown): string {
     reasoning: parsed.options.reasoning,
     ...(continuity ? {
       policy: "continuity-first", historyRevision: parsed._continuityHistoryRevision,
+      ...(parsed._continuityAttempt ? { attempt: parsed._continuityAttempt } : {}),
       modelFamily: parsed._chatgptModelFamily,
     } : {}),
     payload,
@@ -434,6 +440,7 @@ function toolResultPayloadDigest(item: Record<string, unknown>): string {
 export function assertContinuityToolResultReplayEvidence(
   parsed: CodexParsedRequest,
   evidence: ContinuityToolResultReplayEvidence,
+  coveredCallIds?: ReadonlySet<string>,
 ): void {
   if (evidence.localResults) return;
   const expected = new Map(evidence.results.map(result => [result.callId, result]));
@@ -461,6 +468,8 @@ export function assertContinuityToolResultReplayEvidence(
       continue;
     }
     if (!callId) throw continuityError("continuity_source_unproven", "A terminal tool result has no call_id.");
+    // Only the caller's selected durable checkpoint can exempt a settled historical call.
+    if (coveredCallIds?.has(callId)) continue;
     const retained = expected.get(callId);
     if (!retained) {
       if (seen.size === expected.size && expected.size > 0 && evidence.earlierCallIds?.includes(callId)) break;
@@ -728,6 +737,7 @@ export class ChatGptTurnSession {
   private outstandingPrelude: AdapterEvent[] = [];
   private finalPrelude: AdapterEvent[] = [];
   private settledBrowserOutcome?: ChatGptBrowserOutcome;
+  private preservedRecoveryFinalReceipt?: RuntimeRecoveryFinalReceipt;
   private settledPhysical = false;
   private attachedConversationKey: string | undefined;
   private canonicalInputValue?: unknown[];
@@ -829,6 +839,21 @@ export class ChatGptTurnSession {
     this.tail = run.then(() => undefined, () => undefined);
     this.scheduleCapabilityRetirement();
     return run;
+  }
+
+  /** Compaction can commit an ordinary final after its browser has already settled. */
+  retainRecoveryFinalReceipt(receipt: RuntimeRecoveryFinalReceipt): void {
+    const outcome = this.settledOutcome();
+    const previous = this.recoveryFinalReceipt();
+    if (outcome?.type !== "final" || continuityDigest(outcome.answer) !== receipt.terminalDigest
+      || (previous && continuityDigest(previous) !== continuityDigest(receipt))) {
+      throw continuityError("continuity_source_unproven", "The final receipt does not match this completed execution.");
+    }
+    this.preservedRecoveryFinalReceipt ??= Object.freeze({ ...receipt });
+  }
+
+  recoveryFinalReceipt(): RuntimeRecoveryFinalReceipt | undefined {
+    return this.preservedRecoveryFinalReceipt ?? this.runtime.recoveryFinal;
   }
 
   /** Synchronous methods below form a short handoff critical section, separate from tail. */
@@ -1282,6 +1307,7 @@ export class ChatGptTurnSession {
     outcome: TaskUpdateTransferOutcome | { status: "not_found"; transferId: string },
     authority?: ChatGptTaskUpdateRestoreAuthority,
   ): "committed" | "restored" | "closed" | "unknown" {
+    if (outcome.status === "committed" && outcome.synchronizationPending) return "unknown";
     const prior = this.taskUpdateTransferConclusions.get(outcome.transferId);
     if (prior && prior.status !== "unknown") {
       if (outcome.status !== "not_found" && taskUpdateDigest(prior) !== taskUpdateDigest(outcome)) {
@@ -1324,6 +1350,11 @@ export class ChatGptTurnSession {
         for (const update of proof.updates) this.continuityAddedMessageIds.add(update.sourceMessageId);
         this.continuityGeneration += 1;
         const binding = this.runtime.continuityBinding!;
+        if (binding.recovery) {
+          binding.recovery.logicalWorkId = recoveryRecord(binding.recovery).currentWorkId!;
+          binding.recovery.attempt = 0;
+          acceptRecoveryResults(binding.recovery, proof.batch.rawResults);
+        }
         const physical = binding.executionKey!;
         binding.logicalExecutionKey = `${physical.slice(0, physical.lastIndexOf(":") + 1)}${proof.route.executionKey}`;
         this.acceptedInstructionIdentity = proof.source.messages.at(-1)?.sourceMessageId;
@@ -1536,6 +1567,7 @@ export class ChatGptTurnSession {
     if (this.taskUpdateStorageBytes() + bytes > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
       throw taskUpdateSourceError("task_update_capacity", "Pending continuity result capacity is exhausted.");
     }
+    if (this.runtime.continuityBinding?.recovery) acceptRecoveryResults(this.runtime.continuityBinding.recovery, fresh.map(result => result.item));
     for (const result of fresh) this.continuityReceivedResults.set(String(result.item.call_id),
       { item: structuredClone(result.item), bytes: result.bytes });
     this.continuityReceivedResultBytes += bytes;
@@ -1883,6 +1915,7 @@ export class ChatGptTurnSession {
     const resolved = this.resolveContinuityToolBatch(parsed);
     if (!resolved) return [];
     const { batch, rawResults, messages } = resolved;
+    if (this.runtime.continuityBinding?.recovery) acceptRecoveryResults(this.runtime.continuityBinding.recovery, rawResults.values());
     const digests = new Map([...rawResults].map(([callId, item]) => [callId, toolResultPayloadDigest(item)]));
     if (batch.acceptedResultDigests) {
       for (const [callId, digest] of digests) {
@@ -1933,6 +1966,12 @@ export class ChatGptTurnSession {
       if (!callId) throw continuityError("continuity_source_unproven", "A terminal tool result has no call_id.");
       const candidate = this.toolBatchByCallId.get(callId);
       if (!candidate) {
+        if (this.runtime.recoveryCoveredCallIds?.has(callId)) continue;
+        const acceptedRecoveryResult = this.runtime.recoveryBaselineResults?.[callId];
+        if (acceptedRecoveryResult !== undefined) {
+          if (toolResultPayloadDigest(item) !== acceptedRecoveryResult) throw continuityError("continuity_result_conflict");
+          continue;
+        }
         // Retain only the immediate predecessor's issued IDs with each bounded batch.
         // Reclaiming its journal must not make current results authenticate older history.
         if (batch && rawResults.size === batch.requests.length && batch.previousCallIds.includes(callId)) break;
@@ -2084,6 +2123,12 @@ export class ChatGptTurnSession {
     return structuredClone(this.finalPrelude);
   }
 
+  completedFinalResponseEvents(): AdapterEvent[] | undefined {
+    const round = [...this.rounds.values()].findLast(value => value.completed
+      && value.events.some(event => event.type === "done" && event.endTurn));
+    return round ? structuredClone(round.events) : undefined;
+  }
+
   roundEvents(key: string): AdapterEvent[] {
     return structuredClone(this.round(key).events);
   }
@@ -2188,6 +2233,7 @@ export class ChatGptTurnSession {
   }
 
   cancel(reason?: Error): void {
+    if (this.runtime.continuityBinding?.recovery && (!reason || (reason as { code?: string }).code === "client_cancelled")) stopRecoveryWork(this.runtime.continuityBinding.recovery);
     // Revocation is synchronous; the browser outcome is published in later microtasks.
     this.cancelledWith ??= reason;
     if (this.taskUpdatesEnabled()) {
@@ -2286,6 +2332,7 @@ export class ChatGptTurnSession {
 export class ChatGptTurnSessions {
   /** Each entry represents exactly one physical browser/capability epoch. */
   private readonly entries = new Map<string, ChatGptTurnSession>();
+  private readonly failedCreationWriters = new WeakMap<ContinuityBinding, ChatGptTurnSession>();
   private readonly logicalRoutes = new Map<string, ChatGptTurnSession>();
   private readonly physicalRetirements = new WeakMap<ChatGptTurnSession, Promise<void>>();
   private readonly conversationHeads = new Map<string, ChatGptTurnSession>();
@@ -2322,6 +2369,7 @@ export class ChatGptTurnSessions {
     }
     if (this.entries.size >= this.maxEntries) throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
     const session = new ChatGptTurnSession(start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction);
+    if (session.runtime.continuityBinding) this.failedCreationWriters.delete(session.runtime.continuityBinding);
     this.entries.set(key, session);
     const conversationKey = session.conversationKey();
     if (conversationKey) this.conversationHeads.set(conversationKey, session);
@@ -2379,6 +2427,16 @@ export class ChatGptTurnSessions {
     }
   }
 
+  findRecoveryFinal(directory: string, thread: string, workLineageId: string, terminalReceiptId: string, terminalDigest: string): ChatGptTurnSession | undefined {
+    return [...this.entries.values()].find(session => {
+      const receipt = session.recoveryFinalReceipt();
+      const outcome = session.settledOutcome();
+      return receipt?.directory === directory && receipt.thread === thread && receipt.workLineageId === workLineageId
+        && receipt.terminalReceiptId === terminalReceiptId && receipt.terminalDigest === terminalDigest
+        && outcome?.type === "final" && continuityDigest(outcome.answer) === terminalDigest;
+    });
+  }
+
   find(key: string): ChatGptTurnSession | undefined {
     const session = this.entries.get(key) ?? this.logicalRoutes.get(key);
     session?.touch();
@@ -2419,6 +2477,10 @@ export class ChatGptTurnSessions {
   }
 
   /** Drop only a proved pre-mutation first-creation failure. The durable creation claim remains live. */
+  findFailedContinuityCreation(binding: ContinuityBinding): ChatGptTurnSession | undefined {
+    return this.failedCreationWriters.get(binding);
+  }
+
   discardRetryableContinuityCreation(
     key: string,
     session: ChatGptTurnSession,
@@ -2428,6 +2490,7 @@ export class ChatGptTurnSessions {
       || binding.state !== "creating" || binding.initialExecutionKey !== key
       || binding.executionKey !== key || binding.lease || session.runtime.submission?.phase !== "prepared"
       || session.settledOutcome()?.type !== "error") return false;
+    this.failedCreationWriters.set(binding, session);
     this.entries.delete(key);
     this.forgetConversationHead(session);
     return true;
@@ -2656,11 +2719,11 @@ export class ChatGptTurnSessions {
     return true;
   }
 
-  retire(key: string, session: ChatGptTurnSession): boolean {
+  retire(key: string, session: ChatGptTurnSession, reason?: Error): boolean {
     if ((this.entries.get(key) ?? this.logicalRoutes.get(key)) !== session) return false;
     this.removePhysicalSession(session);
     this.forgetConversationHead(session);
-    this.beginRetirement(key, session);
+    this.beginRetirement(key, session, reason);
     return true;
   }
 

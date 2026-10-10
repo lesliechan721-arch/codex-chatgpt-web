@@ -8,6 +8,10 @@ const {
   assertContinuityStart, bindContinuityTab,
 } = require("./continuity-lease.cjs");
 const {
+  RECOVERY_FEATURE, acquireContinuityTransaction, completeContinuityTransaction, removedContinuityTab, physicalTurnTabs,
+} = require("./continuity-recovery.cjs");
+const { launcherInstance } = require("./continuity-process-instance.cjs");
+const {
   runBrowserHelperOperation,
   verifyConnectorWithBrowserHelper,
 } = require("./browser-helper-verifier.cjs");
@@ -405,6 +409,7 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.turnTabs = new Map();
+    this.closingTurnTabs = new Map();
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
     this.manualTerminalSignals = new Map();
@@ -604,8 +609,8 @@ class BrowserHost {
 
   async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal, continuity) {
     signal?.throwIfAborted();
-    if (this.turnTabs.size >= MAX_BROWSER_TABS
-      && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
+    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS
+      && (!BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this) || physicalTurnTabs(this).length >= MAX_BROWSER_TABS)) {
       if (continuity) throw continuityFailure("continuity_resource_capacity");
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
@@ -614,7 +619,7 @@ class BrowserHost {
     const id = randomBytes(12).toString("base64url");
     const surfaceId = randomBytes(24).toString("base64url");
     const ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
-      .find(candidate => ![...this.turnTabs.values()].some(tab => tab.ordinal === candidate));
+      .find(candidate => !physicalTurnTabs(this).some(tab => tab.ordinal === candidate));
     if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
     const view = new WebContentsView({
       webPreferences: {
@@ -703,8 +708,8 @@ class BrowserHost {
     manualSentConfirmationRequired,
     continuity,
   ) {
-    if (this.turnTabs.size >= MAX_BROWSER_TABS
-      && !BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this)) {
+    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS
+      && (!BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this) || physicalTurnTabs(this).length >= MAX_BROWSER_TABS)) {
       if (continuity) throw continuityFailure("continuity_resource_capacity");
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
@@ -712,7 +717,7 @@ class BrowserHost {
     }
     const id = randomBytes(12).toString("base64url");
     const ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
-      .find(candidate => ![...this.turnTabs.values()].some(tab => tab.ordinal === candidate));
+      .find(candidate => !physicalTurnTabs(this).some(tab => tab.ordinal === candidate));
     if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
     const view = new WebContentsView({
       webPreferences: {
@@ -814,13 +819,14 @@ class BrowserHost {
       .filter(tab => tab.status === "ready" && (!tab.continuityOwner || continuityExpired(tab)))
       .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
     if (!retained) return false;
+    const before = physicalTurnTabs(this).length;
     this.removeTurnTab(retained, false);
-    return true;
+    return physicalTurnTabs(this).length < before;
   }
 
   /** Read-only admission check; allocation repeats it synchronously before creating a page. */
   hasContinuityCapacity() {
-    return this.turnTabs.size < MAX_BROWSER_TABS || [...this.turnTabs.values()].some(tab => (
+    return physicalTurnTabs(this).length < MAX_BROWSER_TABS || [...this.turnTabs.values()].some(tab => (
       (tab.status === "ready" && (!tab.continuityOwner || continuityExpired(tab)))
       || (tab.interactionMode === "manual" && tab.status === "error"
         && ["timed-out", "failed", "cancelled"].includes(tab.manualState))
@@ -834,8 +840,9 @@ class BrowserHost {
         && ["timed-out", "failed", "cancelled"].includes(tab.manualState))
       .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
     if (terminalManual) {
+      const before = physicalTurnTabs(this).length;
       this.removeTurnTab(terminalManual, false);
-      return true;
+      return physicalTurnTabs(this).length < before;
     }
     return BrowserHost.prototype.evictOldestRetainedTurnTab.call(this);
   }
@@ -1853,8 +1860,28 @@ class BrowserHost {
     return this.snapshot();
   }
 
+  trackClosingTurnTab(tab) {
+    tab.continuityInvalidated = true;
+    const contents = tab.view.webContents;
+    if (!contents.isDestroyed()) {
+      this.closingTurnTabs ??= new Map();
+      if (this.closingTurnTabs.has(contents)) return contents;
+      // Keep only physical identity and capacity data. A close request may return before
+      // Electron destroys the document; delayed events must never adopt a newer tag.
+      const closing = { id: tab.id, ordinal: tab.ordinal, traceId: tab.traceId, helperPid: tab.helperPid,
+        view: tab.view, closing: true, ...(tab.continuityRecovery ? { continuityRecovery: structuredClone(tab.continuityRecovery) } : {}) };
+      this.closingTurnTabs.set(contents, closing);
+      contents.once?.("destroyed", () => {
+        if (!contents.isDestroyed() || this.closingTurnTabs.get(contents) !== closing) return;
+        this.closingTurnTabs.delete(contents);
+        removedContinuityTab(this, closing);
+      });
+    }
+    return contents;
+  }
+
   removeTurnTab(tab, abortRunning) {
-    if (!this.turnTabs.has(tab.id)) return;
+    if (this.turnTabs.get(tab.id) !== tab) return;
     this.turnTabs.delete(tab.id);
     if (tab.interactionMode === "manual") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
@@ -1869,13 +1896,15 @@ class BrowserHost {
       }
       tab.manualTerminalWaiters?.clear();
     }
+    const contents = BrowserHost.prototype.trackClosingTurnTab.call(this, tab);
     this.syncPowerSaveBlocker();
     if (abortRunning && tab.status === "running") {
       this.closedTurnOwners.set(tab.traceId, tab.helperPid);
       tab.status = "aborted";
     }
     try { this.window.contentView.removeChildView(tab.view); } catch {}
-    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+    try { if (!contents.isDestroyed()) contents.close(); }
+    finally { removedContinuityTab(this, tab); }
     if (this.selectedTabId === tab.id) {
       this.selectedTabId = [...this.turnTabs.keys()].at(-1) || "home";
       const homeContents = this.view?.webContents;
@@ -2253,7 +2282,17 @@ class BrowserHost {
     this.clipboard.writeText(prompt);
   }
 
-  beginManualTurn(
+  beginManualTurn(traceId, helperPid, prompt, conversationKey, resumePrompt, compaction = false,
+    manualSentConfirmationRequired = true, expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
+    continuity, requireRetainedConversation = false) {
+    const create = () => (this.beginManualTurnAcquisition ?? BrowserHost.prototype.beginManualTurnAcquisition).call(this, traceId, helperPid, prompt, conversationKey, resumePrompt,
+      compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation);
+    return continuity?.recovery
+      ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create)
+      : create();
+  }
+
+  beginManualTurnAcquisition(
     traceId,
     helperPid,
     prompt,
@@ -2571,6 +2610,7 @@ class BrowserHost {
       throw new Error(`Zero Risk turn ${traceId} cannot complete before Sent confirmation`);
     }
     if (status === "completed" && retain && tab.conversationKey) {
+      completeContinuityTransaction(this, tab, true);
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
       tab.manualDeadlineTimer = null;
       tab.manualDeadlineAt = null;
@@ -2588,6 +2628,7 @@ class BrowserHost {
       return { cancelledByUser: false };
     }
     const cancelledByUser = this.manualTerminalSignals.get(traceId)?.status === "cancelled";
+    completeContinuityTransaction(this, tab, status === "completed");
     if (status === "completed") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
       tab.manualDeadlineTimer = null;
@@ -2617,7 +2658,19 @@ class BrowserHost {
     return { cancelledByUser: true };
   }
 
-  async beginTurn(
+  async beginTurn(traceId, reveal, helperPid, conversationKey, connectorIdentity,
+    requireRetainedConversation = false, signal, continuity) {
+    if (!continuity?.recovery) {
+      return (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
+        requireRetainedConversation, signal, continuity);
+    }
+    // Acquisition belongs to its transaction. Closing one HTTP observer does not retire it.
+    return acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "automatic", () =>
+      (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
+        requireRetainedConversation, undefined, continuity));
+  }
+
+  async beginTurnAcquisition(
     traceId,
     reveal,
     helperPid,
@@ -2750,6 +2803,7 @@ class BrowserHost {
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
     const authenticationRequired = tab.authenticationRequired === true;
     if (authenticationRequired && status === "completed") status = "failed";
+    completeContinuityTransaction(this, tab, status === "completed");
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     tab.approvalPending = false;
     tab.turnProgress = undefined;
@@ -3314,10 +3368,11 @@ class BrowserHost {
     }
     const descriptor = {
       version: 3,
-      features: [CONTINUITY_FEATURE],
+      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE],
       kind: "codex-web-gpt-launcher",
       profile: this.profile,
       pid: process.pid,
+      launcherInstance: launcherInstance(this),
       endpoint: `http://127.0.0.1:${this.cdpPort}`,
       control: this.control,
       helper: this.helper,
@@ -3375,8 +3430,10 @@ class BrowserHost {
         for (const resolve of tab.manualTerminalWaiters || []) resolve({ status: "cancelled" });
         tab.manualTerminalWaiters?.clear();
       }
+      const contents = BrowserHost.prototype.trackClosingTurnTab.call(this, tab);
       try { this.window.contentView.removeChildView(tab.view); } catch {}
-      if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+      try { if (!contents.isDestroyed()) contents.close(); }
+      finally { removedContinuityTab(this, tab); }
     }
     this.turnTabs.clear();
     if (this.view && !this.view.webContents.isDestroyed()) this.view.webContents.close();

@@ -1,8 +1,9 @@
+import { recoveryDigest, recoveryResultDigest, acceptRecoveryResults } from "./continuity-recovery-runtime";
 import type { CodexParsedRequest, CodexToolResultMessage } from "../../types";
 import type { ChatGptTurnCapability } from "./environment";
 import { extractChatGptTurnIdentity } from "./environment";
 import type { BrokerToolResult, TurnBrokerOwner } from "./turn-broker";
-import { chatGptTurnSessions, type ChatGptTaskUpdateProof, type ChatGptTurnSession } from "./turn-execution";
+import { chatGptTurnSessions, continuityInstructionIdentity, chatGptContinuityInstructionPayloadDigest, type ChatGptTaskUpdateProof, type ChatGptTurnSession } from "./turn-execution";
 import type { TaskUpdateState, TaskUpdateTransfer, TaskUpdateTransferOutcome } from "./task-update-protocol";
 import { captureTaskUpdateSource, taskUpdateDigest, taskUpdateSourceError, type TaskUpdateExecutionIdentity } from "./task-update-source";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
@@ -106,6 +107,13 @@ export async function tryTaskUpdateHandoff(options: {
         results: proof.batch.messages.map((message, index) => ({ callId: message.toolCallId,
           result: options.result(message, proof.batch.rawResults[index]) })),
         batchFingerprint: proof.batch.batchFingerprint, mode: proof.mode,
+        ...(continuity && session.runtime.continuityBinding?.recovery ? { recovery: {
+          logicalWorkId: recoveryDigest([session.runtime.continuityBinding.scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary"]),
+          instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId!,
+          workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed), snapshotDigest: recoveryDigest(parsed.context),
+          localSessionId: session.traceId ?? session.runtime.continuityBinding!.recovery!.logicalWorkId, localTaskRevision: proof.expectedRevision + proof.updates.length,
+          results: proof.batch.rawResults.map(item => ({ callId: String(item.call_id), resultType: String(item.type), resultDigest: recoveryResultDigest(item) })),
+        } } : {}),
       };
       attempt = { proof, transfer: { ...payload, payloadDigest: taskUpdateDigest(payload) }, reserved: false, prepared: false,
         release: session.retainTaskUpdateTransaction() };
@@ -168,6 +176,16 @@ export async function tryTaskUpdateHandoff(options: {
     return finish(outcome);
 
     async function finish(outcome: TaskUpdateTransferOutcome): Promise<ChatGptTurnSession | undefined> {
+      if (outcome.status === "committed" && outcome.synchronizationPending) {
+        // The durable B acceptance already retired A. Keep our preparation barrier and
+        // reconcile only this original transfer, rather than interpreting publication
+        // failure as permission to restore A or prepare another append.
+        try { outcome = await broker.acceptTaskUpdate!(token, attempt!.transfer); }
+        catch { throw taskUpdateSourceError("task_update_transfer_pending", "The instruction was accepted; retry this request to finish its helper publication."); }
+        if (outcome.status !== "committed" || outcome.synchronizationPending) {
+          throw taskUpdateSourceError("task_update_transfer_pending", "The instruction was accepted; retry this request to finish its helper publication.");
+        }
+      }
       if (outcome.status === "unknown") {
         throw taskUpdateSourceError("task_update_transfer_unknown", "The task update commit is unknown; the original transfer remains isolated.");
       }

@@ -1,3 +1,4 @@
+import { assertRecoveryWriter, recordRecoveryDelivery, recordRecoveryAppend, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, lstatSync, mkdirSync, openSync, readlinkSync, rmSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
 import { createTaskOutputControlSource, publishTaskOutputVersion, taskUpdateAckPath } from "./task-update-ack";
@@ -34,6 +35,10 @@ interface TaskUpdateTransferRecord {
   fingerprint?: string;
   context: TaskUpdateOwnerContext;
   outcome: TaskUpdateTransferOutcome;
+  /** Present only between irreversible acceptance and helper publication/result release. */
+  synchronize?: () => void;
+  /** Retained after retirement when atomic replacement cannot yet be read back exactly. */
+  commitUnverified?: true;
 }
 
 interface TaskUpdateControl {
@@ -148,6 +153,7 @@ interface SafeTurnControl {
 }
 
 interface TurnChannel {
+  recovery?: RuntimeRecoveryReference;
   traceId: string;
   externalOwner: boolean;
   authority: PendingTurnAuthority;
@@ -186,6 +192,7 @@ interface BrokerRequest {
     | "release"
     | "invoke"
     | "owner_status"
+    | "owner_recovery_retire"
     | "owner_register"
     | "owner_register_safe"
     | "owner_update"
@@ -222,6 +229,7 @@ interface BrokerRequest {
     | "task_update_ack";
   ownerContext?: TaskUpdateOwnerContext;
   taskUpdateProtocol?: number;
+  recovery?: RuntimeRecoveryReference;
   taskRevision?: number;
   transfer?: TaskUpdateTransfer;
   transferId?: string;
@@ -460,6 +468,7 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
+  retireRecoveryWriter?(reference: RuntimeRecoveryReference): Promise<boolean>;
   waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot>;
   register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string, options?: TaskUpdateRegistrationOptions): Promise<string>;
   registerSafe(
@@ -565,6 +574,14 @@ export class TurnBroker implements TurnBrokerOwner {
     await this.start();
   }
 
+  async retireRecoveryWriter(reference: RuntimeRecoveryReference): Promise<boolean> {
+    const matches = [...this.channels].filter(([, channel]) => channel.recovery?.directory === reference.directory
+      && channel.recovery.thread === reference.thread && channel.recovery.logicalWorkId === reference.logicalWorkId
+      && channel.recovery.attempt === reference.attempt);
+    for (const [token] of matches) this.revokeTrusted(token, new Error("The old continuity Broker writer is retired."));
+    return matches.length > 0;
+  }
+
   async register(
     environment: ChatGptTurnCapability,
     ttlMs?: number,
@@ -585,8 +602,10 @@ export class TurnBroker implements TurnBrokerOwner {
     if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) {
       throw new Error("ChatGPT web turn broker TTL must be a positive finite number");
     }
+    if (options.recovery) assertRecoveryWriter(options.recovery);
     const token = opaqueId(handlePrefix);
     const channel: TurnChannel = {
+      ...(options.recovery ? { recovery: structuredClone(options.recovery) } : {}),
       traceId,
       externalOwner,
       authority: {
@@ -655,7 +674,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const requireSentConfirmation = options.requireSentConfirmation !== false;
     const externalOwner = options.externalOwner === true;
     assertSurfaceNonce(surfaceNonce);
-    const token = await this.register(environment, ttlMs, traceId, { externalOwner, taskUpdateProtocol: options.taskUpdateProtocol }, "request");
+    const token = await this.register(environment, ttlMs, traceId, { externalOwner, taskUpdateProtocol: options.taskUpdateProtocol, recovery: options.recovery }, "request");
     const channel = this.channels.get(token);
     if (!channel) throw new Error("Zero Risk turn registration was revoked before initialization");
     channel.safe = {
@@ -735,6 +754,7 @@ export class TurnBroker implements TurnBrokerOwner {
       .map(id => channel.invocations.get(id)?.request)
       .filter((request): request is BrokerToolRequest => Boolean(request));
     if (delivered.length > 0) {
+      if (channel.recovery) assertRecoveryWriter(channel.recovery);
       this.logToolDelivery(channel, delivered, "replay");
       return delivered;
     }
@@ -809,7 +829,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.assertDriver(channel, context);
     if (context.taskRevision !== control.state.acceptedRevision) throw taskUpdateError("task_update_revision_stale", "The task update head changed before reservation");
     if (control.transfers.size >= TASK_UPDATE_TRANSFER_LIMIT) throw taskUpdateError("task_update_resource_limit", "The bounded task update transfer journal is full");
-    if ([...control.transfers.values()].some(record => record.outcome.status === "unknown")) {
+    if ([...control.transfers.values()].some(record => record.outcome.status === "unknown" || record.synchronize)) {
       throw taskUpdateError("task_update_transfer_pending", "The previous task update transfer must be resolved first");
     }
     if (control.state.finalOutputRevision !== null || channel.completionCommitted) throw taskUpdateError("task_update_final_output_started", "Final answer output has already started");
@@ -853,12 +873,20 @@ export class TurnBroker implements TurnBrokerOwner {
     if (record.outcome.status !== "unknown" && !record.fingerprint) return structuredClone(record.outcome);
     let fingerprint: string;
     try { fingerprint = taskFingerprint(transfer); } catch {
+      if (record.outcome.status !== "unknown" || record.synchronize || record.commitUnverified) throw taskUpdateError("task_update_transfer_conflict", "The concluded transfer payload changed");
       record.outcome = { status: "not_committed", transferId: transfer.transferId, code: "task_update_invalid", message: "The task update transfer payload cannot be represented within the bounded protocol" };
       return structuredClone(record.outcome);
     }
     if (record.fingerprint && record.fingerprint !== fingerprint) throw taskUpdateError("task_update_transfer_conflict", "The task update transfer payload changed");
     record.fingerprint = fingerprint;
-    if (record.outcome.status !== "unknown") return structuredClone(record.outcome);
+    if (channel && record.synchronize) {
+      try { record.synchronize(); } catch { /* The accepted or unverified transfer remains fenced. */ }
+      return structuredClone(record.outcome);
+    }
+    if (record.outcome.status !== "unknown") {
+      return structuredClone(record.outcome);
+    }
+    if (!channel && record.commitUnverified) return structuredClone(record.outcome);
     try {
       if (!channel || !updates) throw taskUpdateError("codex_tool_operation_retired", "The task update capability is no longer active");
       const context = { expectedDriverGeneration: transfer.expectedDriverGeneration, taskRevision: transfer.expectedRevision };
@@ -941,36 +969,73 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       // Preparation can tick an expired Native lease and revoke this physical capability.
       if (this.channels.get(token) !== channel) throw taskUpdateError("codex_tool_operation_retired", "The task update capability retired before commit");
-      publishTaskOutputVersion(updates.state.acknowledgementDirectory!,
-        updates.state.acceptedRevision + acceptedUpdates.length, updates.state.driverGeneration + 1);
-      channel.authority.capability = environment;
-      channel.authority.registryGeneration += 1;
-      updates.updates.push(...acceptedUpdates);
-      updates.updateBytes += bytes;
-      updates.state.acceptedRevision += acceptedUpdates.length;
-      updates.state.driverGeneration += 1;
-      updates.fences.clear();
-      if (transfer.mode === "results") updates.lastBatch = { fingerprint: transfer.batchFingerprint, resultsDigest };
-      record.outcome = { status: "committed", transferId: transfer.transferId, state: structuredClone(updates.state), batchFingerprint: transfer.batchFingerprint };
-      channel.activityRevision += 1;
-      this.invalidateToolWaiters(channel);
-      this.taskStateChanged(channel);
-      // Queued calls have not crossed the Native execution boundary. Bind a fixed terminal;
-      // previously handed-off calls continue to receive their exact real result below.
-      for (const callId of channel.queuedCallIds.splice(0)) {
-        channel.invocations.delete(callId);
-      }
-      if (transfer.mode === "results" || transfer.mode === "continuity") {
-        for (const item of acceptedResults) {
-          channel.deliveredCallIds.delete(item.callId);
-          channel.invocations.delete(item.callId);
+      const acceptedState = { ...structuredClone(updates.state),
+        acceptedRevision: updates.state.acceptedRevision + acceptedUpdates.length,
+        driverGeneration: updates.state.driverGeneration + 1 };
+      const committed: Extract<TaskUpdateTransferOutcome, { status: "committed" }> = {
+        status: "committed", transferId: transfer.transferId, state: acceptedState,
+        batchFingerprint: transfer.batchFingerprint, synchronizationPending: true,
+      };
+      let publicationComplete = false;
+      let projectionComplete = false;
+      let confirmDurable: void | (() => void);
+      let recoveryConfirmed = true;
+      const synchronize = () => {
+        if (!recoveryConfirmed) {
+          confirmDurable!(); confirmDurable = undefined;
+          recoveryConfirmed = true; record.outcome = committed; delete record.commitUnverified;
         }
+        if (!projectionComplete) {
+          channel.authority.capability = environment;
+          channel.authority.registryGeneration += 1;
+          updates.updates.push(...acceptedUpdates);
+          updates.updateBytes += bytes;
+          updates.state.acceptedRevision = acceptedState.acceptedRevision;
+          updates.state.driverGeneration = acceptedState.driverGeneration;
+          updates.fences.clear();
+          if (transfer.mode === "results") updates.lastBatch = { fingerprint: transfer.batchFingerprint, resultsDigest };
+          channel.activityRevision += 1;
+          // No accepted call remains eligible for delivery to the outer executor. The
+          // prepared completion retains its first result until the helper can read B.
+          for (const callId of channel.queuedCallIds.splice(0)) channel.invocations.delete(callId);
+          if (transfer.mode === "results" || transfer.mode === "continuity") {
+            for (const item of acceptedResults) {
+              channel.deliveredCallIds.delete(item.callId);
+              channel.invocations.delete(item.callId);
+            }
+          }
+          projectionComplete = true;
+          this.invalidateToolWaiters(channel);
+        }
+        if (confirmDurable) { confirmDurable(); confirmDurable = undefined; }
+        if (!publicationComplete) {
+          publishTaskOutputVersion(updates.state.acknowledgementDirectory!, acceptedState.acceptedRevision, acceptedState.driverGeneration);
+          publicationComplete = true;
+        }
+        for (const complete of completions) complete();
+        delete committed.synchronizationPending;
+        delete record.synchronize;
+        this.taskStateChanged(channel);
+      };
+      // Without durable recovery, publication remains the existing pre-commit boundary.
+      // With recovery, the durable predecessor CAS is irreversible; a later publication
+      // failure can only delay this same committed transfer, never restore its old driver.
+      if (channel.recovery) {
+        if (!transfer.recovery) throw taskUpdateError("task_update_upgrade_required", "Continuity append requires durable predecessor evidence");
+        const acceptance = recordRecoveryAppend(channel.recovery, transfer.recovery);
+        if (acceptance) { confirmDurable = acceptance.confirm; recoveryConfirmed = acceptance.committed; }
+      } else {
+        publishTaskOutputVersion(updates.state.acknowledgementDirectory!, acceptedState.acceptedRevision, acceptedState.driverGeneration);
+        publicationComplete = true;
       }
-      for (const complete of completions) complete();
+      if (recoveryConfirmed) record.outcome = committed;
+      else record.commitUnverified = true;
+      record.synchronize = synchronize;
+      record.synchronize();
       return structuredClone(record.outcome);
     } catch (error) {
-      if (record.outcome.status === "committed") {
-        this.revokeTrusted(token, errorOf(error));
+      if (record.synchronize || record.outcome.status === "committed") {
+        if (record.outcome.status === "committed" && !record.outcome.synchronizationPending) this.revokeTrusted(token, errorOf(error));
         return structuredClone(record.outcome);
       }
       // Every validated rejection uses the pre-reserved slot. Late retries cannot commit later.
@@ -1050,6 +1115,9 @@ export class TurnBroker implements TurnBrokerOwner {
       || context.expectedDriverGeneration !== channel.taskUpdates.state.driverGeneration) {
       throw taskUpdateError("task_update_driver_stale", "The task update driver generation is missing or stale");
     }
+    if ([...channel.taskUpdates.transfers.values()].some(record => record.synchronize)) {
+      throw taskUpdateError("task_update_transfer_pending", "The committed task update requires helper publication before further work");
+    }
   }
 
   private assertOutputCandidate(channel: TurnChannel, context?: TaskUpdateOwnerContext): void {
@@ -1062,7 +1130,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (updates.state.acknowledgedRevision !== updates.state.acceptedRevision) throw taskUpdateError("task_update_unacknowledged", "The model started or completed a final answer before acknowledging all accepted task updates");
     if (context!.taskRevision !== updates.state.acceptedRevision
       || (updates.state.finalOutputRevision !== null && updates.state.finalOutputRevision !== context!.taskRevision)) throw taskUpdateError("task_update_revision_stale", "The final answer candidate belongs to an outdated task revision");
-    if ([...updates.transfers.values()].some(record => record.outcome.status === "unknown")) throw taskUpdateError("task_update_transfer_pending", "The task update transfer must be resolved before final output");
+    if ([...updates.transfers.values()].some(record => record.outcome.status === "unknown" || record.synchronize)) throw taskUpdateError("task_update_transfer_pending", "The task update transfer must be resolved before final output");
   }
 
   private outputIdle(channel: TurnChannel): boolean {
@@ -1073,6 +1141,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private deliverTaskUpdate(channel: TurnChannel): UpdateDelivery | undefined {
     const updates = channel.taskUpdates;
     if (!updates || updates.state.finalOutputRevision !== null || channel.completionCommitted || channel.safe?.state === "completed") return undefined;
+    if ([...updates.transfers.values()].some(record => record.synchronize)) return undefined;
     if (updates.currentDeliveryId) return structuredClone(updates.deliveries.get(updates.currentDeliveryId)!);
     if (updates.state.acknowledgedRevision === updates.state.acceptedRevision) return undefined;
     if (updates.deliveries.size >= TASK_UPDATE_DELIVERY_LIMIT) throw taskUpdateError("task_update_resource_limit", "The bounded task update delivery journal is full");
@@ -1310,7 +1379,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.nativeOperations.hasOutstanding()) {
       throw new Error("Zero Risk turn cannot complete before all Native operation results have been delivered");
     }
-    if (updates && [...updates.transfers.values()].some(record => record.outcome.status === "unknown")) throw taskUpdateError("task_update_transfer_pending", "Resolve the task update transfer before completing the turn");
+    if (updates && [...updates.transfers.values()].some(record => record.outcome.status === "unknown" || record.synchronize)) throw taskUpdateError("task_update_transfer_pending", "Resolve the task update transfer before completing the turn");
     safe.state = "completed";
     if (updates) {
       updates.state.finalOutputRevision = taskRevision ?? 0;
@@ -1380,7 +1449,8 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.taskUpdates) {
       const updates = channel.taskUpdates;
       for (const [transferId, record] of updates.transfers) {
-        if (record.outcome.status === "unknown") record.outcome = { status: "not_committed", transferId, code: "codex_tool_operation_retired", message: "The physical capability retired before this transfer committed" };
+        if (record.outcome.status === "unknown" && !record.synchronize && !record.commitUnverified) record.outcome = { status: "not_committed", transferId, code: "codex_tool_operation_retired", message: "The physical capability retired before this transfer committed" };
+        delete record.synchronize;
       }
       this.rejectSafeWaiters(updates.observers, reason);
       // Only recovery receipts survive retirement; user text and delivery payloads are released.
@@ -2001,7 +2071,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -2117,12 +2187,16 @@ export class TurnBroker implements TurnBrokerOwner {
         owner: this.ownerId,
       };
     }
+    if (request.method === "owner_recovery_retire") {
+      if (!request.recovery) throw new Error("Missing recovery writer identity");
+      return { writerRetired: await this.retireRecoveryWriter(request.recovery) };
+    }
     if (request.method === "owner_register") {
       const environment = ownerCapability(request.environment);
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
-      return this.register(environment, request.ttlMs, request.traceId, { externalOwner: true, taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined }).then(token => ({ token }));
+      return this.register(environment, request.ttlMs, request.traceId, { externalOwner: true, taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined, recovery: request.recovery }).then(token => ({ token, recoveryProtocol: 1 }));
     }
     if (request.method === "owner_register_safe") {
       const environment = ownerCapability(request.environment);
@@ -2143,8 +2217,9 @@ export class TurnBroker implements TurnBrokerOwner {
           requireSentConfirmation: request.requireSentConfirmation !== false,
           externalOwner: true,
           taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined,
+          recovery: request.recovery,
         },
-      ).then(token => ({ token }));
+      ).then(token => ({ token, recoveryProtocol: 1 }));
     }
     if (request.method === "owner_update") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -2491,7 +2566,8 @@ export class TurnBroker implements TurnBrokerOwner {
         }, channel.taskUpdates ? request.taskRevision : undefined, () => {
           if (!channel.taskUpdates) return undefined;
           const state = channel.taskUpdates.state;
-          const reason = state.finalOutputRevision !== null ? "final_output_started"
+          const reason = [...channel.taskUpdates.transfers.values()].some(record => record.synchronize) ? "transfer_pending"
+            : state.finalOutputRevision !== null ? "final_output_started"
             : request.taskRevision !== state.acceptedRevision ? "revision_mismatch"
             : state.acknowledgedRevision !== state.acceptedRevision ? "unacknowledged" : undefined;
           return reason ? { result: this.notExecutedResult(reason), control: "task-update" } : undefined;
@@ -2521,6 +2597,13 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private takeQueued(channel: TurnChannel): BrokerToolRequest[] {
+    if (channel.recovery) {
+      const batch = channel.queuedCallIds.flatMap(id => {
+        const invocation = channel.invocations.get(id);
+        return invocation ? [{ ...invocation.request, operationId: invocation.operationId }] : [];
+      });
+      recordRecoveryDelivery(channel.recovery, batch);
+    }
     const ids = channel.queuedCallIds.splice(0);
     for (const id of ids) {
       const invocation = channel.invocations.get(id);
@@ -2787,14 +2870,21 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
+  async retireRecoveryWriter(reference: RuntimeRecoveryReference): Promise<boolean> {
+    const reply = await callTurnBroker<{ writerRetired?: boolean }>(this.socketPath, { method: "owner_recovery_retire", recovery: reference });
+    return reply.writerRetired === true;
+  }
+
   async register(environment: ChatGptTurnCapability, ttlMs?: number, traceId = "unknown", options: TaskUpdateRegistrationOptions = {}): Promise<string> {
-    const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
+    const response = await callTurnBroker<{ token?: unknown; recoveryProtocol?: number }>(this.socketPath, {
       method: "owner_register",
       environment,
       taskUpdateProtocol: options.taskUpdateProtocol,
+      recovery: options.recovery,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
     });
+    if (options.recovery && response.recoveryProtocol !== 1) throw new NativeOperationError("continuity_configuration_conflict", "The Broker does not support durable recovery dispatch");
     if (typeof response.token !== "string" || !response.token.startsWith("turn_")) {
       throw new Error("DEV turn owner received an invalid broker token");
     }
@@ -2809,15 +2899,17 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     options: { requireSentConfirmation?: boolean } & TaskUpdateRegistrationOptions = {},
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
-    const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
+    const response = await callTurnBroker<{ token?: unknown; recoveryProtocol?: number }>(this.socketPath, {
       method: "owner_register_safe",
       environment,
       surfaceNonce,
       requireSentConfirmation: options.requireSentConfirmation !== false,
       taskUpdateProtocol: options.taskUpdateProtocol,
+      recovery: options.recovery,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
     });
+    if (options.recovery && response.recoveryProtocol !== 1) throw new NativeOperationError("continuity_configuration_conflict", "The Broker does not support durable recovery dispatch");
     if (typeof response.token !== "string" || !response.token.startsWith("request_")) {
       throw new Error("DEV Zero Risk turn owner received an invalid broker request id");
     }

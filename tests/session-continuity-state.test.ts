@@ -12,9 +12,12 @@ import {
   continuitySourceRepresentationDigest, selectContinuityCheckpoint,
 } from "../src/adapters/chatgpt-web/continuity-binding";
 import { parseRequest } from "../src/responses/parser";
+import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { acceptRecoveryResults, evictOptionalRecoveryResults, recoveryContext, recoveryDigest, type RuntimeRecoveryReference } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { encodeCompactionSummary } from "../src/responses/compaction";
 import { continuityCurrentInstructionInput, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, chatGptContinuityInstructionPayloadDigest, continuityInstructionIdentity } from "../src/adapters/chatgpt-web/turn-execution";
+import { stopDurableContinuity } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 
 const roots: string[] = [];
 const thread = "1".repeat(64);
@@ -214,7 +217,7 @@ test("live binding keeps the page across an authenticated checkpoint and rejects
   expect(binding.lease?.leaseId).toBe(lease.leaseId);
 });
 
-test("a restart, changed scope, or expired idle binding cannot create a replacement page", () => {
+test("restart and expired idle bindings require durable recovery admission before replacement", () => {
   const { store } = fixture();
   store.initialize();
   let now = 1_000;
@@ -222,14 +225,14 @@ test("a restart, changed scope, or expired idle binding cannot create a replacem
   const binding = bindings.create(thread, scope, "exec-0", continuityDigest(null));
   bindings.acceptLease(binding, { owner, leaseId: "6".repeat(32), traceId: "trace-first" });
   bindings.responseReady(binding, "exec-0");
-  expect(() => new ContinuityBindings(store, "7".repeat(64)).lookup(thread, scope)).toThrow();
-  expect(() => new ContinuityBindings(store, owner).lookup(thread, scope)).toThrow();
+  expect(new ContinuityBindings(store, "7".repeat(64)).lookup(thread, scope)).toBeUndefined();
+  expect(new ContinuityBindings(store, owner).lookup(thread, scope)).toBeUndefined();
   expect(() => bindings.lookup(thread, "8".repeat(64))).toThrow();
   now += CONTINUITY_IDLE_TTL_MS - 1;
   expect(bindings.lookup(thread, scope)).toBe(binding);
   expect(binding.lastUsedAt).toBe(1_000);
   now += 1;
-  expect(() => bindings.lookup(thread, scope)).toThrow("24-hour");
+  expect(bindings.lookup(thread, scope)?.state).toBe("lost");
   expect(store.get(thread)?.state).toBe("lost");
   expect(() => bindings.create(thread, scope, "exec-1", continuityDigest(null))).toThrow();
 });
@@ -305,7 +308,7 @@ test("losing a committed page preserves its result while disabling all continuit
   expect(binding.checkpoints.get("compact")).toBe(committed);
   expect(committed?.summary).toBe("Unique committed summary");
   expect(binding.revisions.get(continuityDigest("Unique committed summary"))).toBe(1);
-  expect(() => bindings.assertCompactionReplay(binding, "compact", 0)).toThrow();
+  expect(() => bindings.assertCompactionReplay(binding, "compact", 0)).not.toThrow();
 });
 
 test("source evidence is charged before control and together with its bounded summary", () => {
@@ -350,3 +353,74 @@ test("terminal evidence keeps the aggregate budget until its ordinary replay ret
   expect(first.checkpoints.size).toBe(0);
   expect(store.get(first.thread)?.state).toBe("lost");
 });
+
+test("recovery result bodies and checkpoint reservations use one capacity account", () => {
+  const { path, store: registrations } = fixture();
+  registrations.initialize();
+  const store = new ContinuityRecoveryStore(path);
+  const refs: RuntimeRecoveryReference[] = [];
+  for (let index = 0; index < 12; index++) {
+    const key = recoveryDigest(["capacity-thread", index]);
+    const work = `work-${index}`;
+    store.admitWork({ thread: key, scope, owner: continuityProcessInstance(), logicalWorkId: work,
+      instructionIdentity: work, workPayloadDigest: recoveryDigest(work), snapshotDigest: recoveryDigest(index),
+      createPage: true, dispatchProtocolComplete: true });
+    store.issueBatch(key, { scope }, { logicalWorkId: work, attempt: 0,
+      calls: [{ callId: `call-${index}`, operationId: `operation-${index}`, expectedResultType: "function_call_output" }] });
+    store.markDeliveryPossible(key, { scope }, [`call-${index}`]);
+    const ref = { directory: path, thread: key, logicalWorkId: work, attempt: 0 };
+    acceptRecoveryResults(ref, [{ type: "function_call_output", call_id: `call-${index}`, output: "x".repeat(1024 * 1024) }]);
+    refs.push(ref);
+  }
+  const bodyBytes = () => refs.reduce((sum, ref) => sum + Object.values(store.get(ref.thread)!.calls)
+    .reduce((subtotal, call) => subtotal + (call.resultBodyBytes ?? 0), 0), 0);
+  expect(bodyBytes()).toBeGreaterThan(12 * 1024 * 1024);
+  let reservations = 0;
+  for (const ref of refs.slice(0, 8)) {
+    try {
+      store.registerCompactionTarget(ref.thread, { scope }, { sourceLogicalWorkId: ref.logicalWorkId, sourceIdentity: ref.logicalWorkId });
+      reservations++;
+    } catch (error) {
+      expect(error).toMatchObject({ code: "continuity_resource_capacity" });
+      break;
+    }
+  }
+  expect(reservations).toBeLessThan(8);
+  expect(bodyBytes() + reservations * 2 * 1024 * 1024).toBeLessThan(24 * 1024 * 1024);
+  evictOptionalRecoveryResults(path);
+  expect(bodyBytes()).toBe(0);
+  for (const ref of refs.slice(0, 8)) {
+    store.registerCompactionTarget(ref.thread, { scope }, { sourceLogicalWorkId: ref.logicalWorkId, sourceIdentity: ref.logicalWorkId });
+    expect(Object.values(store.get(ref.thread)!.calls)[0]!.firstResultDigest).toBeDefined();
+  }
+  expect(() => recoveryContext(parseRequest({ model: "model", input: "Current work" }), refs[0]!))
+    .toThrow("real result body");
+});
+
+for (const shadow of [false, true]) for (const independentTurn of [false, true]) {
+  test(`durable stop includes unfinished compaction of a completed source shadow=${shadow} independentTurn=${independentTurn}`, () => {
+    const { path, store: registrations } = fixture();
+    registrations.initialize();
+    const store = new ContinuityRecoveryStore(path);
+    const nativeThread = `stop-compact-${shadow}-${independentTurn}`;
+    const key = continuityDigest(nativeThread);
+    const processOwner = continuityProcessInstance();
+    store.admitWork({ thread: key, scope, owner: processOwner, logicalWorkId: "source", instructionIdentity: "source-item",
+      nativeTurnId: "source-turn", workPayloadDigest: continuityDigest("source"), snapshotDigest: continuityDigest("snapshot"),
+      createPage: true, dispatchProtocolComplete: true });
+    store.completeWork(key, { scope }, "source", { receiptId: "answer", digest: continuityDigest("accepted answer") });
+    const source = store.get(key)!.works.source!;
+    const registered = store.registerCompactionTarget(key, { scope }, { sourceLogicalWorkId: "source", sourceIdentity: "source-item" });
+    store.admitWork({ thread: key, scope, owner: processOwner, logicalWorkId: "compact", instructionIdentity: "control",
+      nativeTurnId: independentTurn ? "compact-turn" : "source-turn", purpose: "compaction",
+      compactionTargetId: Object.keys(registered.compactionTargets)[0], activate: !shadow, createPage: false,
+      workPayloadDigest: continuityDigest("compact"), snapshotDigest: continuityDigest("control"), dispatchProtocolComplete: true });
+    expect(stopDurableContinuity(path, nativeThread, independentTurn ? "compact-turn" : undefined,
+      independentTurn ? "native-interrupt" : "mode-exit")).toBe(true);
+    const reloaded = new ContinuityRecoveryStore(path).get(key)!;
+    expect(reloaded.works.source).toEqual(source);
+    expect(reloaded.works.compact).toMatchObject({ state: "stopped", stopReason: independentTurn ? "native-interrupt" : "mode-exit" });
+    expect(reloaded.checkpoints).toEqual({});
+    expect(stopDurableContinuity(path, nativeThread, independentTurn ? "compact-turn" : undefined)).toBe(false);
+  });
+}

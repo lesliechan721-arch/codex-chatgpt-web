@@ -40,7 +40,7 @@ export function chatGptConversationKey(
     reasoning: parsed.options.reasoning,
     ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
     ...(parsed._conversationPolicy === "continuity-first"
-      ? { policy: "continuity-first" }
+      ? { policy: "continuity-first", epoch: parsed._continuityEpoch ?? 0 }
       : { compaction: compactionEpoch(raw?.input) }),
   })).digest("hex");
 }

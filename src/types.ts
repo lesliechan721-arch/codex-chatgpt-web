@@ -11,6 +11,10 @@ export interface CodexParsedRequest {
   _conversationPolicy?: "recoverable" | "continuity-first";
   /** Resolved only from the live continuity binding, never from request metadata. */
   _continuityHistoryRevision?: number;
+  /** Local recovery identity, never parsed from request JSON. */
+  _continuityEpoch?: number;
+  _continuityStateDirectory?: string;
+  _continuityAttempt?: number;
   /** Provider/model scope bound by the Adapter before resolving local checkpoint evidence. */
   _continuityScope?: string;
   /** Number of leading raw input items restored from local previous_response_id state. */

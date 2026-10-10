@@ -1,12 +1,16 @@
+import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { createRequire } from "node:module";
+import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { OPENAI_ACCESS } from "../src/api-access";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { cancelStructuredCompactionNativeTurn, existingStructuredCompactionRun } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
-import { CONTINUITY_FEATURE, type ContinuityClaim, type ContinuityLease } from "../src/adapters/chatgpt-web/continuity-contract";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityClaim, type ContinuityLease } from "../src/adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
 import { cancelAbandonedContinuityCreation, leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
@@ -15,30 +19,38 @@ import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZero
 import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
-import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { chatGptContinuityInstructionPayloadDigest, continuityInstructionIdentity, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, defaultConfig } from "../src/config";
 import * as configuration from "../src/config";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { COMPACT_PROMPT, decodeCompactionSummary, encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
-import { compactRequest, responseRequest, routeChatGptWebRequest } from "../src/server";
+import { compactRequest, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 
 const cleanups: Array<() => Promise<void>> = [];
+const require = createRequire(import.meta.url);
+const launcherRecovery = require("../launcher/electron/continuity-recovery.cjs");
+const launcherLease = require("../launcher/electron/continuity-lease.cjs");
 afterEach(async () => {
   chatGptTurnSessions.clear();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean } = {}) {
-  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
+function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string } = {}) {
+  const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
   const statePath = join(root, "continuity");
   const registrations = new ContinuityRegistrationStore(statePath);
   registrations.initialize();
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
   const submissions: Array<{ prompt: string; claim: ContinuityClaim; key: string; reused: boolean }> = [];
+  // Fixture identity has the protocol shape; it is not evidence of a real Launcher process.
+  const launcherInstance = { pid: process.pid, startIdentity: continuityProcessInstance().startIdentity === "unverified"
+    ? "darwin:Sat Oct 10 00:00:00 2026" : continuityProcessInstance().startIdentity, instanceId: "a".repeat(64) };
+  const recoveryHost = { continuityLauncherInstance: launcherInstance, turnTabs: new Map<string, any>(),
+    removeTurnTab: (tab: any) => { tab.destroyed = true; recoveryHost.turnTabs.delete(tab.id); } };
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
@@ -46,24 +58,46 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
         controls.onCapacityQuery?.();
         return Response.json({ ok: true, available: controls.capacityAvailable });
       }
-      const body = await request.json() as { conversationKey: string; expected: ContinuityLease };
+      const body = await request.json() as { conversationKey: string; expected: ContinuityLease; recovery?: ContinuityClaim["recovery"] };
+      if (new URL(request.url).pathname.startsWith("/v1/turn/continuity-") && body.recovery) {
+        if (controls.actualRecovery) {
+          try {
+            const path = new URL(request.url).pathname;
+            if (path.endsWith("prepare") && controls.prepareBeforeFailures-- > 0) return Response.json({ ok: false }, { status: 503 });
+            const receipt = path.endsWith("retire") ? await launcherRecovery.retireContinuityWriter(recoveryHost, body.recovery)
+              : path.endsWith("send-possible") ? launcherRecovery.markContinuitySendPossible(recoveryHost, body.recovery)
+              : path.endsWith("prepare") ? launcherRecovery.updateContinuityPreparation(recoveryHost, body.expected, body.recovery)
+              : launcherRecovery.queryContinuityTransaction(recoveryHost, body.recovery);
+            if (path.endsWith("prepare") && controls.prepareAfterFailures-- > 0) return Response.json({ ok: false }, { status: 503 });
+            return Response.json({ ok: true, ...receipt });
+          } catch (error) { return Response.json({ ok: false, code: (error as { code?: string }).code }, { status: 409 }); }
+        }
+        const retired = new URL(request.url).pathname.endsWith("retire");
+        const preparing = new URL(request.url).pathname.endsWith("prepare");
+        return Response.json({ ok: true, recovery: body.recovery, ...(preparing ? { preparationExpected: body.expected } : {}), launcherInstance, hostNoWriter: retired || controls.queryPhase === "missing", state: retired ? "retired" : preparing ? "prepared" : new URL(request.url).pathname.endsWith("query") ? controls.queryPhase : "send-possible", writerRetired: retired, toolsSettled: false, sendAuthorized: true });
+      }
+      if (controls.inspectFailures > 0 && new URL(request.url).pathname !== "/v1/turn/release") {
+        controls.inspectFailures--;
+        return Response.json({ ok: false, code: "continuity_unverified" }, { status: 503 });
+      }
       const page = pages.get(body.conversationKey);
       const matches = page && JSON.stringify(page.continuity) === JSON.stringify(body.expected);
       if (new URL(request.url).pathname === "/v1/turn/release") {
         if (matches) pages.delete(body.conversationKey);
         return Response.json({ ok: true, released: matches ? 1 : 0 });
       }
-      return matches ? Response.json({ ok: true, ...page }) : Response.json({ ok: false }, { status: 409 });
+      return matches ? Response.json({ ok: true, ...page }) : Response.json({ ok: false, code: "continuity_session_lost" }, { status: 409 });
     },
   });
   cleanups.push(async () => {
     await server.stop(true);
-    rmSync(root, { recursive: true, force: true });
+    if (!options.root) rmSync(root, { recursive: true, force: true });
   });
   const descriptorPath = join(root, "launcher.json");
   const descriptor = {
     version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development", pid: process.pid,
-    features: [CONTINUITY_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
+    launcherInstance,
+    features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
     control: { endpoint: `http://127.0.0.1:${server.port}`, token: "a".repeat(43) },
     helper: { executable: process.execPath, script: import.meta.path },
     partition: "persist:codex-web-gpt-dev-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL,
@@ -90,11 +124,15 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
   const originalAcceptTaskUpdate = broker.acceptTaskUpdate;
   if (manual && !options.taskUpdates) broker.acceptTaskUpdate = undefined as never;
   const controls = {
-    capacityAvailable: true,
+    capacityAvailable: true, inspectFailures: 0,
     emitReviewCommentary: false,
     reviewWireName: "exec_command",
     onCapacityQuery: undefined as (() => void) | undefined,
-    preLeaseFailures: 0,
+    preLeaseFailures: 0, failAfterSendOnce: false, failAfterToolsOnce: false,
+    acquisitionFailures: 0, actualRecovery: false, actualAcquisitions: 0,
+    prepareBeforeFailures: 0, prepareAfterFailures: 0,
+    command: "fixture-command-not-executed-by-this-test",
+    queryPhase: "send-possible" as "send-possible" | "prepared" | "missing",
     loseStartAcknowledgementOnce: false,
     failHandoffSettlement: false,
     endFailure: false, deferCompletion: false, safeToken: "", started: false,
@@ -114,7 +152,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
         const reply = await callTurnBroker<NativeOperationReply>(provider.chatgptWeb!.brokerSocketPath!, {
           method: "native_operation_start", token, contract: manual ? "safe" : "native", nativeWaitProtocol: 1,
           operationId: ++operationId, entry: "codex_exec",
-          nativeInput: { cmd: "fixture-command-not-executed-by-this-test" },
+          nativeInput: { cmd: controls.command },
         }, null);
         if (reply.kind !== "result") throw new Error("Fixture operation did not receive its Native result");
         return reply.result;
@@ -122,7 +160,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       return callTurnBroker<BrokerToolResult>(provider.chatgptWeb!.brokerSocketPath!, {
         method: "invoke", bindingId: claim.bindingId, wireName: controls.reviewWireName, freeform: false,
         registryGeneration: claim.environment.registryGeneration,
-        arguments: { cmd: "fixture-command-not-executed-by-this-test" },
+        arguments: { cmd: controls.command },
       }, null);
     };
     if (!manual && controls.parallelSourceTools && !controls.singleSourceTool) {
@@ -147,13 +185,32 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       expect(previous.continuity.traceId).toBe(traceId);
     }
     const continuity: ContinuityLease = {
-      owner: claim.owner, leaseId: previous?.continuity.leaseId ?? "1".repeat(32), traceId,
+      owner: claim.owner, leaseId: previous?.continuity.leaseId ?? "1".repeat(32), traceId, ...(claim.recovery ? { recovery: claim.recovery } : {}),
     };
     pages.set(key, { continuity, state: "running" });
     return continuity;
   };
   const automatic = spyOn(worker, "run").mockImplementation(async (turn: BrowserTurn) => {
     if (manual) throw new Error("Zero Risk must not use the automatic worker");
+    if (controls.actualRecovery) {
+      await launcherRecovery.acquireContinuityTransaction(recoveryHost, turn.continuity!, turn.traceId, process.pid,
+        turn.conversationKey!, "automatic", () => {
+          controls.actualAcquisitions++;
+          if (controls.acquisitionFailures > 0) {
+            controls.acquisitionFailures--;
+            throw continuityError("continuity_unverified", "Actual acquisition callback failed.");
+          }
+          const tab: any = { id: turn.traceId, traceId: turn.traceId, helperPid: process.pid, status: "running", destroyed: false,
+            continuityLeaseId: "1".repeat(32), view: { webContents: { isDestroyed: () => tab.destroyed } } };
+          launcherLease.bindContinuityTab(tab, turn.continuity!);
+          recoveryHost.turnTabs.set(tab.id, tab);
+          return { continuity: launcherLease.continuityLease(tab) };
+        });
+    }
+    if (controls.acquisitionFailures > 0) {
+      controls.acquisitionFailures--;
+      throw continuityError("continuity_unverified", "The attempted acquisition failed before its lease receipt.");
+    }
     if (controls.preLeaseFailures > 0) {
       controls.preLeaseFailures--;
       throw continuityError("continuity_resource_capacity", "Launcher rejected the turn before creating a page");
@@ -168,7 +225,9 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
     expect(compiled.multipart).toBeUndefined();
     submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
+    await turn.onSendActivated?.();
     if (turn.nativeConnector) {
+      await turn.onSubmitted?.();
       const token = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
       const handoffId = compiled.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
       expect(token).toBeDefined();
@@ -191,6 +250,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     }
     if (controls.emitReviewCommentary) turn.onCommentary?.("Checking the source before continuing.");
     await turn.onSubmitted?.();
+    if (controls.failAfterSendOnce) { controls.failAfterSendOnce = false; pages.delete(turn.conversationKey!); throw continuityError("continuity_session_lost"); }
     if (controls.deferCompletion) {
       controls.started = true;
       await new Promise<void>(resolve => { controls.releaseDeferredCompletion = resolve; });
@@ -209,6 +269,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       }
       await turn.externalProgress!.acknowledgeToolBatch(progress.lastToolBatchRevision);
       await calls;
+      if (controls.failAfterToolsOnce) { controls.failAfterToolsOnce = false; pages.delete(turn.conversationKey!); throw continuityError("continuity_session_lost"); }
       if (controls.pauseAfterToolResults) {
         await new Promise<void>(resolve => { controls.releaseAfterToolResults = resolve; });
         controls.releaseAfterToolResults = undefined;
@@ -294,7 +355,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     await current.runTurn!(parsed, { headers: new Headers() }, event => events.push(event));
     return events;
   };
-  return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker };
+  return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost };
 }
 
 for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "Automatic"} negotiated task updates allow successive ordinary turns on the same page`, async () => {
@@ -865,7 +926,7 @@ test("Zero Risk rejected current result can be explicitly cancelled before leavi
   await cancelled.settlement;
   await f.adapter().preflight!(legacy, { headers: new Headers() });
   expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("lost");
-  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_session_lost" });
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped", retryable: false });
   expect(f.pages.size).toBe(0);
   expect(f.submissions).toHaveLength(1);
 });
@@ -924,7 +985,7 @@ for (const format of ["local", "v1", "v2"] as const) test(`HTTP ${format} compac
     : format === "v1" ? text.slice(SUMMARY_PREFIX.length + 1) : text;
   expect(summary).toBe('Verified checkpoint.\n\nCODEX_LATEST_USER_PROMPT_JSON\n"First continuity instruction."');
   const retry = await f.send(compactBody, format === "v1");
-  expect(retry.status).toBe(200);
+  expect(retry.status, await retry.clone().text()).toBe(200);
   await retry.text();
   expect(f.submissions).toHaveLength(2);
   const input = format === "v1" ? compacted.output : [...originalInput, ...(format === "local"
@@ -1406,10 +1467,43 @@ test("HTTP streamed compaction failure preserves its deterministic code and neve
   expect(stream).toContain('"type":"response.failed"');
   expect(stream).toContain('"code":"continuity_source_unproven"');
   expect(stream).not.toContain('"type":"response.completed"');
+  const thread = continuityDigest(f.threadId);
+  const before = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  const initialWork = Object.values(before.works).find(work => work.purpose === "compaction")!;
+  expect(initialWork).toBeDefined();
+  const targetId = initialWork.compactionTargetId!;
+  expect(Object.keys(before.compactionTargets)).toEqual([targetId]);
+  expect(Object.keys(before.checkpoints)).toHaveLength(0);
+  expect(initialWork.attempts.at(-1)).toMatchObject({ stage: "interrupted-settled", writerRetired: true });
   const repeated = await f.send(body);
-  expect(repeated.status).toBe(409);
-  expect((await repeated.json()).error.code).toBe("continuity_session_lost");
-  expect(f.submissions).toHaveLength(2);
+  expect(repeated.status).toBe(200);
+  const repeatedStream = await repeated.text();
+  expect(repeatedStream).toContain('"type":"response.failed"');
+  expect(repeatedStream).toContain('"code":"continuity_source_unproven"');
+  expect(repeatedStream).not.toContain('"type":"response.completed"');
+  const after = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  const retriedWork = after.works[initialWork.logicalWorkId]!;
+  expect(Object.keys(after.compactionTargets)).toEqual([targetId]);
+  expect(retriedWork.compactionTargetId).toBe(targetId);
+  expect(retriedWork.workPayloadDigest).toBe(initialWork.workPayloadDigest);
+  expect(retriedWork.attempts).toHaveLength(initialWork.attempts.length + 1);
+  expect(retriedWork.attempts.at(-1)).toMatchObject({
+    attempt: initialWork.attempts.at(-1)!.attempt + 1, epoch: before.epoch + 1,
+    stage: "interrupted-settled", writerRetired: true,
+  });
+  expect(retriedWork.retryBudget!.attempts).toBe(initialWork.retryBudget!.attempts + 1);
+  expect(retriedWork.retryBudget!.startedAt).toBe(initialWork.retryBudget!.startedAt);
+  expect(retriedWork.retryBudget!.lastFailureAt).toBeGreaterThanOrEqual(initialWork.retryBudget!.lastFailureAt!);
+  expect(after.historyRevision).toBe(0);
+  expect(Object.keys(after.checkpoints)).toHaveLength(0);
+  expect(after.calls).toEqual(before.calls);
+  expect(f.controls.toolResults).toHaveLength(0);
+  expect(f.automatic.mock.calls.at(-1)![0]).toMatchObject({
+    compaction: true, nativeConnector: true, capabilities: { localToolsEnabled: false },
+  });
+  expect(f.submissions).toHaveLength(3);
+  expect(f.submissions[2]!.key).not.toBe(f.submissions[1]!.key);
+  expect(f.submissions[2]!.reused).toBe(false);
 });
 
 test("an ordinary Native route observes mode exit before forwarding upstream", async () => {
@@ -1431,7 +1525,13 @@ test("an ordinary Native route observes mode exit before forwarding upstream", a
     });
     expect({ httpStatus: response.status, ...await response.json() }).toMatchObject({ httpStatus: 200, status: "completed" });
     expect(forwarded).toBe(1);
-    expect((await f.send(f.body)).status).toBe(409);
+    const replay = await f.send(f.body);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({ status: "completed", output: [
+      { type: "message", content: [{ type: "output_text", text: "Completed response 1." }] },
+    ] });
+    expect(f.pages.size).toBe(0);
+    expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("ended");
     expect(f.submissions).toHaveLength(1);
   } finally { provider.mockRestore(); }
 });
@@ -1609,7 +1709,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(f.submissions).toHaveLength(2);
 });
 
-for (const manual of [false, true]) for (const terminal of ["interrupt", "mode-exit", "lost"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${terminal} releases the captured input of failed initial creation`, async () => {
+for (const manual of [false, true]) for (const terminal of ["interrupt", "mode-exit", "lost"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${terminal} ${terminal === "lost" ? "preserves" : "releases"} the captured input of failed initial creation`, async () => {
   const f = fixture(manual);
   f.controls.preLeaseFailures = 1;
   expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "error", code: "continuity_resource_capacity" });
@@ -1618,15 +1718,27 @@ for (const manual of [false, true]) for (const terminal of ["interrupt", "mode-e
   expect(binding.state).toBe("creating");
   expect(binding.initialAcceptedInput).toBeDefined();
   expect(binding.initialInstructionPayloadDigest).toBeDefined();
+  const acceptedInput = binding.initialAcceptedInput;
+  const acceptedPayloadDigest = binding.initialInstructionPayloadDigest;
   if (terminal === "interrupt") expect(cancelAbandonedContinuityCreation(f.statePath, f.threadId, "turn-first")).toBe(true);
   else if (terminal === "mode-exit") await leaveContinuityMode(f.statePath, f.threadId);
   else bindings.lose(binding, binding.executionKey);
   expect(binding.state).toBe(terminal === "lost" ? "lost" : "ended");
-  expect(binding.initialAcceptedInput).toBeUndefined();
-  expect(binding.initialInstructionPayloadDigest).toBeUndefined();
-  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_session_lost" });
-  expect(f.pages.size).toBe(0);
-  expect(f.submissions).toHaveLength(0);
+  if (terminal === "lost") {
+    expect(binding.initialAcceptedInput).toEqual(acceptedInput);
+    expect(binding.initialInstructionPayloadDigest).toBe(acceptedPayloadDigest);
+    const accepted = await f.run(f.request());
+    expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(await f.run(f.request())).toEqual(accepted);
+    expect(f.pages.size).toBe(1);
+    expect(f.submissions).toHaveLength(1);
+  } else {
+    expect(binding.initialAcceptedInput).toBeUndefined();
+    expect(binding.initialInstructionPayloadDigest).toBeUndefined();
+    await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped", retryable: false });
+    expect(f.pages.size).toBe(0);
+    expect(f.submissions).toHaveLength(0);
+  }
 });
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const tagged of [false, true]) for (const trailing of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ${checkpoint ? "checkpoint" : "ordinary"} increment keeps ${tagged ? "tagged" : "ID-only"} ${trailing ? "trailing" : "leading"} current system and developer constraints`, async () => {
@@ -2051,7 +2163,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   await f.adapter().preflight!(legacy, { headers: new Headers() });
   expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("ended");
   expect(f.pages.size).toBe(0);
-  await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_stopped", retryable: false });
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} pre-page creation failure can be abandoned by native interrupt`, async () => {
@@ -2068,7 +2180,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   const legacy = structuredClone(first);
   legacy._conversationPolicy = "recoverable";
   await f.adapter().preflight!(legacy, { headers: new Headers() });
-  await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_stopped", retryable: false });
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} lost initial start acknowledgement reconciles the exact provisional page`, async () => {
@@ -2081,15 +2193,23 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(f.submissions).toHaveLength(1);
 });
 
-test("a missing physical page permanently rejects the registered thread instead of creating a replacement", async () => {
+test("a missing physical page starts one replacement epoch and exact retries replay its result", async () => {
   const f = fixture();
   const first = f.request();
   await f.run(first);
+  const sourceEpoch = continuityBindingsFor(f.statePath).recoveryStore.get(continuityDigest(f.threadId))!.epoch;
+  const sourceKey = f.submissions[0]!.key;
   f.pages.clear();
-  await expect(f.run(f.next(first))).rejects.toMatchObject({ code: "continuity_session_lost", retryable: false });
-  await expect(f.run(f.next(first))).rejects.toMatchObject({ code: "continuity_session_lost" });
-  expect(f.submissions).toHaveLength(1);
-  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("lost");
+  const next = f.next(first);
+  const recovered = await f.run(next);
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(await f.run(structuredClone(next))).toEqual(recovered);
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).not.toBe(sourceKey);
+  expect(f.submissions[1]!.reused).toBe(false);
+  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
+  expect(f.pages.size).toBe(1);
+  expect(f.registrations.get(continuityDigest(f.threadId))).toMatchObject({ state: "entered", epoch: sourceEpoch + 1 });
 });
 
 test("disconnect during initial capacity preflight does not consume registration or start a page", async () => {
@@ -2452,14 +2572,28 @@ for (const invalid of ["incomplete", "duplicate", "wrong-type", "unknown"] as co
   });
 }
 
-test("a lost manual end acknowledgement preserves the accepted answer but ends continuity", async () => {
+test("a lost manual end acknowledgement preserves its accepted answer and reuses the verified page for new work", async () => {
   const f = fixture(true);
   f.controls.endFailure = true;
   const first = f.request();
-  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("lost");
-  await expect(f.run(f.next(first))).rejects.toMatchObject({ code: "continuity_session_lost" });
+  const accepted = await f.run(first);
+  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("entered");
+  const source = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  const sourceEpoch = source.epoch;
+  expect(source.state).toBe("ready");
+  expect(await f.run(structuredClone(first))).toEqual(accepted);
   expect(f.submissions).toHaveLength(1);
+  f.controls.endFailure = false;
+  const next = f.next(first);
+  const recovered = await f.run(next);
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(await f.run(structuredClone(next))).toEqual(recovered);
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
+  expect(f.submissions[1]!.reused).toBe(true);
+  expect(f.pages.size).toBe(1);
+  expect(continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!.epoch).toBe(sourceEpoch);
 });
 
 test("a manual HTTP observer disconnect does not cancel the retained execution", async () => {
@@ -2504,7 +2638,8 @@ test("Automatic completed compaction retains the exact page and concurrent retri
   expect(source?.settledOutcome()).toEqual({ type: "final", answer: "Completed response 1." });
   expect(source?.conversationKey()).toBeUndefined();
   f.pages.clear();
-  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  expect(await f.run(structuredClone(compact))).toEqual(replay);
+  expect(f.pages.size).toBe(0);
   expect(f.submissions).toHaveLength(2);
 });
 
@@ -2555,12 +2690,13 @@ test("completed compaction rejects canonical history with unowned execution reco
   expect(f.submissions).toHaveLength(1);
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} leaving continuity ends only the settled binding and prevents reentry`, async () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} leaving continuity releases the settled page, replays its answer, and permits a distinct new instruction`, async () => {
   const f = fixture(manual);
   const first = f.request();
-  await f.run(first);
+  const accepted = await f.run(first);
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
   const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const sourceEpoch = continuityBindingsFor(f.statePath).recoveryStore.get(binding.thread)!.epoch;
   const source = chatGptTurnSessions.find(binding.executionKey!)!;
   const legacy = f.next(first); legacy._conversationPolicy = "recoverable";
   await Promise.all([
@@ -2571,7 +2707,17 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(f.pages.size).toBe(0);
   expect(f.submissions).toHaveLength(1);
   expect(source.settledOutcome()).toEqual({ type: "final", answer: "Completed response 1." });
-  await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  expect(await f.run(structuredClone(first))).toEqual(accepted);
+  expect(f.pages.size).toBe(0);
+  expect(f.submissions).toHaveLength(1);
+  const next = f.next(first);
+  const restarted = await f.run(next);
+  expect(restarted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(await f.run(structuredClone(next))).toEqual(restarted);
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).not.toBe(f.submissions[0]!.key);
+  expect(f.registrations.get(continuityDigest(f.threadId))).toMatchObject({ state: "entered", epoch: sourceEpoch + 1 });
 });
 
 test("leaving after compaction releases the committed lease rather than the retired source lease", async () => {
@@ -2581,14 +2727,15 @@ test("leaving after compaction releases the committed lease rather than the reti
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
   const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
   const compact = structuredClone(first); compact._compactionRequest = true;
-  await f.run(compact);
+  const accepted = await f.run(compact);
   const committed = [...binding.checkpoints.values()][0]!;
   const legacy = f.next(first); legacy._conversationPolicy = "recoverable";
   await f.adapter().preflight!(legacy, { headers: new Headers() });
   expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("ended");
   expect(f.pages.size).toBe(0);
   expect([...binding.checkpoints.values()]).toEqual([committed]);
-  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  expect(await f.run(structuredClone(compact))).toEqual(accepted);
+  expect(f.pages.size).toBe(0);
   expect(f.submissions).toHaveLength(2);
 });
 
@@ -2629,19 +2776,67 @@ test("Zero Risk completed compaction stops without a second prompt and preserves
   expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("entered");
 });
 
-test("a rejected structured handoff never commits or falls back to another conversation", async () => {
+test("a rejected structured handoff retries its stable target without committing or replaying ordinary work", async () => {
   const f = fixture();
   const first = f.request();
   await f.run(first);
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
   f.controls.handoffSummary = 'Invalid checkpoint.\nCODEX_LATEST_USER_PROMPT_JSON\n"A different instruction"';
   const compact = structuredClone(first); compact._compactionRequest = true;
   await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
-  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
-  expect(f.submissions).toHaveLength(2);
-  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("lost");
+  const thread = continuityDigest(f.threadId);
+  const before = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  const initialWork = Object.values(before.works).find(work => work.purpose === "compaction")!;
+  expect(initialWork).toBeDefined();
+  const targetId = initialWork.compactionTargetId!;
+  const ordinaryWork = Object.values(before.works).find(work => work.purpose === "ordinary")!;
+  expect(initialWork.attempts.at(-1)).toMatchObject({ stage: "interrupted-settled", writerRetired: true });
+  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
+  const after = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  const retriedWork = after.works[initialWork.logicalWorkId]!;
+  expect(Object.keys(after.compactionTargets)).toEqual([targetId]);
+  expect(retriedWork.compactionTargetId).toBe(targetId);
+  expect(retriedWork.workPayloadDigest).toBe(initialWork.workPayloadDigest);
+  expect(retriedWork.attempts).toHaveLength(initialWork.attempts.length + 1);
+  expect(retriedWork.attempts.at(-1)).toMatchObject({
+    attempt: initialWork.attempts.at(-1)!.attempt + 1, epoch: before.epoch + 1,
+    stage: "interrupted-settled", writerRetired: true,
+  });
+  expect(retriedWork.retryBudget!.attempts).toBe(initialWork.retryBudget!.attempts + 1);
+  expect(retriedWork.retryBudget!.startedAt).toBe(initialWork.retryBudget!.startedAt);
+  expect(retriedWork.retryBudget!.lastFailureAt).toBeGreaterThanOrEqual(initialWork.retryBudget!.lastFailureAt!);
+  expect(after.works[ordinaryWork.logicalWorkId]).toEqual(ordinaryWork);
+  expect(after.historyRevision).toBe(0);
+  expect(Object.keys(after.checkpoints)).toHaveLength(0);
+  expect(after.calls).toEqual(before.calls);
+  expect(f.controls.toolResults).toHaveLength(0);
+  expect(f.automatic.mock.calls.at(-1)![0]).toMatchObject({
+    compaction: true, nativeConnector: true, capabilities: { localToolsEnabled: false },
+  });
+  expect(binding.revision).toBe(0);
+  expect(binding.checkpoints.size).toBe(0);
+  expect(f.submissions).toHaveLength(3);
+  expect(f.submissions[2]!.key).not.toBe(f.submissions[1]!.key);
+  expect(f.submissions[2]!.reused).toBe(false);
+  expect(f.registrations.get(thread)).toMatchObject({
+    state: "lost", epoch: after.epoch, transactionId: after.transaction!.transactionId,
+  });
+  expect(after.state).toBe("lost");
+  const changedSource = f.request("A changed source instruction.");
+  changedSource._compactionRequest = true;
+  await expect(f.run(changedSource)).rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
+  const changedControl = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "message", role: "user", content: `${COMPACT_PROMPT}\nChanged compaction control.` },
+  ]);
+  changedControl._compactionRequest = true;
+  changedControl._compactionOutput = "message";
+  await expect(f.run(changedControl)).rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
+  expect(new ContinuityRecoveryStore(f.statePath).get(thread)).toEqual(after);
+  expect(f.submissions).toHaveLength(3);
 });
 
-test("an accepted handoff survives failed physical settlement as evidence, not as replacement history", async () => {
+test("an accepted handoff survives failed physical settlement and commits that exact summary without resubmission", async () => {
   const f = fixture();
   const first = f.request();
   await f.run(first);
@@ -2655,7 +2850,14 @@ test("an accepted handoff survives failed physical settlement as evidence, not a
   expect(binding.revision).toBe(0);
   expect(binding.checkpoints.size).toBe(0);
   expect(source.settledOutcome()).toEqual({ type: "final", answer: "Completed response 1." });
-  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  const recovered = await f.run(structuredClone(compact));
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(recovered.find(event => event.type === "text_delta")).toMatchObject({ type: "text_delta", text: binding.acceptedHandoff!.summary });
+  expect(await f.run(structuredClone(compact))).toEqual(recovered);
+  const current = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  expect(current.revision).toBe(1);
+  expect(current.checkpoints.size).toBe(1);
+  expect([...current.checkpoints.values()][0]!.summary).toBe(binding.acceptedHandoff!.summary);
   expect(f.submissions).toHaveLength(2);
   expect(f.pages.size).toBe(0);
 });
@@ -2667,14 +2869,15 @@ test("a committed result is retained when the physical page disappears before a 
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
   const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
   const compact = structuredClone(first); compact._compactionRequest = true;
-  await f.run(compact);
+  const accepted = await f.run(compact);
   const committed = [...binding.checkpoints.values()][0]!;
   f.pages.clear();
-  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost", retryable: false });
+  expect(await f.run(structuredClone(compact))).toEqual(accepted);
   expect([...binding.checkpoints.values()]).toEqual([committed]);
   expect(committed.summary).toBe(`${f.controls.handoffSummary}\n\nCODEX_LATEST_USER_PROMPT_JSON\n"First continuity instruction."`);
   expect(binding.revision).toBe(1);
   expect(f.submissions).toHaveLength(2);
+  expect(f.pages.size).toBe(0);
 });
 
 for (const format of ["encrypted", "readable", "summary-only"] as const) test(`${format} checkpoint replays a completed ordinary answer without resubmission and then resumes new work`, async () => {
@@ -3229,7 +3432,7 @@ test("completed delegated compaction retry rejects changed source content under 
   expect(f.submissions).toHaveLength(2);
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active delegated source content conflict retires the source owner`, async () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active delegated source content conflict preserves the accepted source owner`, async () => {
   const f = fixture(manual);
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
@@ -3243,10 +3446,16 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   changed._compactionRequest = true;
   await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
   const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
-  expect(binding.state).toBe("lost");
-  await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+  expect(binding.state).toBe("running");
+  expect(source.isActive()).toBe(true);
+  expect(source.supersededError).toBeUndefined();
+  expect(source.outstanding()).toHaveLength(1);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.controls.toolResults).toHaveLength(0);
+  const claim = await callTurnBroker<{ bindingId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
     method: "claim", token, ...(manual ? { contract: "safe" } : {}),
-  })).rejects.toThrow();
+  });
+  expect(claim.bindingId).toBeDefined();
 });
 
 for (const manual of [false, true]) for (const reclamation of ["retained", "capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation} committed compaction replay rejects changed accepted tool-result payload`, async () => {
@@ -3298,7 +3507,7 @@ for (const manual of [false, true]) for (const reclamation of ["retained", "capa
   const changed = structuredClone(compact);
   const changedInput = (changed._rawBody as { input: Array<Record<string, unknown>> }).input;
   changedInput.find(item => item.type === "function_call_output")!.output = "Conflicting compact result B.";
-  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_result_conflict", retryable: false });
   expect(f.submissions).toHaveLength(submissions);
   expect(f.controls.toolResults).toHaveLength(results);
 });
@@ -4765,3 +4974,768 @@ for (const manual of [false, true]) test(`Round 10: cached compact codecs do not
   // A later codec replay can change its wire output, but it cannot enlarge committed evidence.
   expect(JSON.stringify(v1Output)).toContain("Older human text 1.");
 }, 30_000);
+
+test("recovery v3: an interrupted sent response resumes the same instruction on one new epoch", async () => {
+  const f = fixture();
+  f.controls.failAfterSendOnce = true;
+  const original = f.request();
+  const failed = await f.run(original);
+  expect(failed.at(-1)).toMatchObject({ type: "error", code: "continuity_session_lost" });
+  const retry = await f.run(f.request());
+  expect(retry.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.claim.recovery!.epoch).toBe(f.submissions[0]!.claim.recovery!.epoch + 1);
+  expect(f.submissions[1]!.claim.recovery!.logicalWorkId).toBe(f.submissions[0]!.claim.recovery!.logicalWorkId);
+  expect(f.submissions[1]!.prompt).toContain("First continuity instruction.");
+  expect(f.submissions[1]!.prompt).toContain("previous response was interrupted");
+  expect(retry.filter(event => event.type === "text_delta" && event.text.includes("new ChatGPT conversation"))).toHaveLength(1);
+});
+
+for (const manual of [false, true]) test(`recovery v3: Windows identity admits the first request manual=${manual}`, async () => {
+  const f = fixture(manual);
+  f.descriptor.launcherInstance.startIdentity = "win32:134045280001234567";
+  writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor), { mode: 0o600 });
+  f.controls.actualRecovery = !manual;
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.submissions[0]!.claim.recovery!.launcherInstance).toEqual(f.descriptor.launcherInstance);
+});
+
+for (const manual of [false, true]) for (const unavailable of ["descriptor", "helper"] as const) test(`recovery v3: completed replay needs no ${unavailable} manual=${manual}`, async () => {
+  const f = fixture(manual);
+  const original = await f.run(f.request());
+  const bindings = continuityBindingsFor(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const binding = bindings.observed(thread)!;
+  const before = bindings.recoveryStore.get(thread)!;
+  const registration = f.registrations.get(thread);
+  const lastUsedAt = binding.lastUsedAt;
+  const compatibleCalls = f.compatible.mock.calls.length;
+  if (unavailable === "descriptor") rmSync(f.descriptorPath);
+  f.compatible.mockRejectedValue(new Error("Helper unavailable"));
+  const replay = await f.run(f.request());
+  expect(replay.filter(event => event.type === "text_delta")).toEqual(original.filter(event => event.type === "text_delta"));
+  expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.compatible.mock.calls.length).toBe(compatibleCalls);
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(1);
+  expect(bindings.recoveryStore.get(thread)).toEqual(before);
+  expect(f.registrations.get(thread)).toEqual(registration);
+  expect(binding.lastUsedAt).toBe(lastUsedAt);
+  await expect(f.run(f.request("Edited current instruction."))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(bindings.recoveryStore.get(thread)).toEqual(before);
+});
+
+for (const manual of [false, true]) for (const unavailable of ["descriptor", "helper"] as const) test(`recovery v3: completed compaction replay needs no ${unavailable} manual=${manual}`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = manual;
+  f.controls.singleSourceTool = true;
+  const source = f.request();
+  const events = await f.run(source);
+  const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
+  const compact = call ? f.request("", "turn-first", [
+    ...(source._rawBody as { input: unknown[] }).input,
+    { type: "function_call_output", call_id: call.id, output: "Actual completed tool result." },
+  ]) : structuredClone(source);
+  compact._compactionRequest = true;
+  const original = await f.run(compact);
+  expect(original.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const bindings = continuityBindingsFor(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const binding = bindings.observed(thread)!;
+  const before = bindings.recoveryStore.get(thread)!;
+  const lastUsedAt = binding.lastUsedAt;
+  const registration = f.registrations.get(thread);
+  const submissions = f.submissions.length;
+  const compatibleCalls = f.compatible.mock.calls.length;
+  if (unavailable === "descriptor") rmSync(f.descriptorPath);
+  f.compatible.mockRejectedValue(new Error("Helper unavailable"));
+  const replay = await f.run(structuredClone(compact));
+  expect(replay.filter(event => event.type === "text_delta")).toEqual(original.filter(event => event.type === "text_delta"));
+  expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.compatible.mock.calls.length).toBe(compatibleCalls);
+  expect(f.submissions).toHaveLength(submissions);
+  expect(f.pages.size).toBe(1);
+  expect(binding.lastUsedAt).toBe(lastUsedAt);
+  expect(bindings.recoveryStore.get(thread)).toEqual(before);
+  expect(f.registrations.get(thread)).toEqual(registration);
+});
+
+for (const history of ["omitted", "edited"] as const) test(`recovery v3: ordinary checkpoint recovery accepts ${history} covered results across attempts`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  const sourceEvents = await f.run(first);
+  const call = sourceEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  const accepted = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, accepted]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  const bindings = continuityBindingsFor(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const before = bindings.recoveryStore.get(thread)!;
+  const checkpoint = Object.values(before.checkpoints)[0]!;
+  expect(checkpoint.coveredCallIds).toEqual([call.id]);
+  f.pages.clear(); bindings.lose(bindings.observed(thread)!);
+  f.controls.invokeSourceTools = false;
+  f.controls.failAfterSendOnce = true;
+  const request = () => f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    ...(history === "edited" ? [{ ...accepted, output: "Edited trusted historical result." }] : []),
+  ]);
+  expect((await f.run(request())).at(-1)).toMatchObject({ type: "error", code: "continuity_session_lost" });
+  const interrupted = bindings.recoveryStore.get(thread)!;
+  expect((await f.run(request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = bindings.recoveryStore.get(thread)!;
+  expect(after.calls[call.id]!.firstResultDigest).toBe(before.calls[call.id]!.firstResultDigest);
+  expect(after.checkpoints[checkpoint.commitId]!.continuation.consumerLogicalWorkId).toBe(interrupted.checkpoints[checkpoint.commitId]!.continuation.consumerLogicalWorkId);
+  expect(f.submissions).toHaveLength(4);
+});
+
+for (const history of ["omitted", "edited"] as const) test(`recovery v3: appended checkpoint work recovers with ${history} covered results and requires uncovered results`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  const issued = await f.run(first);
+  const call = issued.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  const covered = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, covered]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  f.controls.singleSourceTool = true;
+  const consumer = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, marker]);
+  const consumerEvents = await f.run(consumer);
+  const consumerCall = consumerEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  const uncovered = { type: "function_call_output", call_id: consumerCall.id, output: "Actual result before append." };
+  const task = { type: "message", role: "user", id: "append-checkpoint-B", content: "Accepted appended task B.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  const old = history === "edited" ? [{ ...covered, output: "Edited trusted historical result." }] : [];
+  const appended = f.request("", "turn-first", [marker, task, uncovered, ...old]);
+  const bindings = continuityBindingsFor(f.statePath);
+  const ref = bindings.observed(continuityDigest(f.threadId))!.recovery!;
+  const record = bindings.recoveryStore.get(ref.thread)!;
+  const logicalWorkId = recoveryDigest([record.scope, "turn-first", task.id, "ordinary"]);
+  // Inject loss after the production append admission commits, before its local route publishes.
+  recordRecoveryAppend(ref, { logicalWorkId, instructionIdentity: task.id, nativeTurnId: "turn-first",
+    workPayloadDigest: chatGptContinuityInstructionPayloadDigest(appended), snapshotDigest: recoveryDigest(appended.context),
+    localSessionId: "accepted-append-session", localTaskRevision: 1,
+    results: [{ callId: uncovered.call_id, resultType: uncovered.type, resultDigest: recoveryResultDigest(uncovered) }] });
+  f.pages.clear(); bindings.lose(bindings.observed(ref.thread)!);
+  f.controls.invokeSourceTools = false;
+  evictOptionalRecoveryResults(f.statePath);
+  const before = bindings.recoveryStore.get(ref.thread)!;
+  await expect(f.run(f.request("", "turn-first", [marker, task, ...old]))).rejects.toMatchObject({ code: "continuity_context_missing" });
+  await expect(f.run(f.request("", "turn-first", [marker, task, { ...uncovered, output: "Edited required result." }, ...old]))).rejects.toMatchObject({ code: "continuity_result_conflict" });
+  expect(bindings.recoveryStore.get(ref.thread)).toEqual(before);
+  expect((await f.run(appended)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = bindings.recoveryStore.get(ref.thread)!;
+  expect(after.currentWorkId).toBe(logicalWorkId);
+  expect(after.calls[call.id]!.firstResultDigest).toBe(before.calls[call.id]!.firstResultDigest);
+  expect(after.calls[uncovered.call_id]!.firstResultDigest).toBe(before.calls[uncovered.call_id]!.firstResultDigest);
+});
+
+for (const manual of [false, true]) for (const pageState of ["healthy", "lost"] as const) test(`recovery v3: ${manual ? "manual" : "automatic"} completed checkpoint consumer replays after later work with a ${pageState} page`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  const issued = await f.run(first);
+  const call = issued.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    { type: "function_call_output", call_id: call.id, output: "Actual covered result." }]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  f.controls.invokeSourceTools = false;
+  const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  const consumer = f.request("", "turn-first", [marker]);
+  const completed = await f.run(consumer);
+  expect(completed.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const originalText = completed.filter(event => event.type === "text_delta");
+  expect((await f.run(f.request("", "turn-first", [marker]))).filter(event => event.type === "text_delta")).toEqual(originalText);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(consumer)}`)!;
+  const answer = source.settledOutcome();
+  if (answer?.type !== "final") throw new Error("Missing consumer answer");
+  const bindings = continuityBindingsFor(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const consumerId = bindings.recoveryStore.get(thread)!.currentWorkId!;
+  expect((await f.run(f.next(consumer, "turn-later", answer.answer))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const binding = bindings.observed(thread)!;
+  expect(binding.recovery!.logicalWorkId).not.toBe(consumerId);
+  if (pageState === "lost") { f.pages.clear(); bindings.lose(binding); }
+  const before = bindings.recoveryStore.get(thread)!;
+  const pageBefore = structuredClone(binding);
+  const sends = f.submissions.length;
+  const replay = await f.run(f.request("", "turn-first", [marker]));
+  expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(replay.filter(event => event.type === "text_delta")).toEqual(originalText);
+  expect(f.submissions).toHaveLength(sends);
+  expect(bindings.recoveryStore.get(thread)).toEqual(before);
+  expect(bindings.observed(thread)).toBe(binding);
+  expect(binding).toEqual(pageBefore);
+});
+
+test("recovery v3: completed checkpoint consumer permits a new instruction after page loss", async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  const events = await f.run(first);
+  const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  const accepted = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, accepted]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  f.controls.invokeSourceTools = false;
+  const consumer = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+  ]);
+  expect((await f.run(consumer)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const bindings = continuityBindingsFor(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const before = bindings.recoveryStore.get(thread)!;
+  f.pages.clear(); bindings.lose(bindings.observed(thread)!);
+  expect((await f.run(f.next(consumer, "turn-new-after-completed-consumer", "Completed response 3."))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = bindings.recoveryStore.get(thread)!;
+  expect(after.works[after.currentWorkId!]!.workLineageId).not.toBe(before.works[before.currentWorkId!]!.workLineageId);
+  expect(after.calls[call.id]!.firstResultDigest).toBe(before.calls[call.id]!.firstResultDigest);
+  expect(f.submissions).toHaveLength(4);
+});
+
+for (const manual of [false, true]) test(`recovery v3: ${manual ? "manual" : "automatic"} completed work replays after page loss and a new instruction creates a new epoch`, async () => {
+  const f = fixture(manual);
+  const original = f.request();
+  await f.run(original);
+  f.pages.clear();
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(1);
+  expect((await f.run(f.next(original))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.reused).toBe(false);
+  expect(f.submissions[1]!.claim.recovery!.epoch).toBe(1);
+});
+
+test("recovery v3: a real harmless command runs once and its accepted result enters the replacement prompt", async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true; f.controls.singleSourceTool = true; f.controls.failAfterToolsOnce = true;
+  const counter = join(f.statePath, "safe-execution-count");
+  f.controls.command = `printf x >> '${counter}'; printf 'real recovery result'`;
+  const original = f.request();
+  const events = await f.run(original);
+  const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  expect(call).toBeDefined();
+  const processResult = Bun.spawn(["/bin/sh", "-c", f.controls.command], { stdout: "pipe", stderr: "pipe" });
+  const stdout = await new Response(processResult.stdout).text();
+  expect(await processResult.exited).toBe(0);
+  const raw = (original._rawBody as { input: unknown[] }).input;
+  const resultInput = [...raw, { type: "function_call_output", call_id: call.id, output: stdout }];
+  const interrupted = await f.run(f.request("", "turn-first", resultInput));
+  expect(interrupted.at(-1)).toMatchObject({ type: "error", code: "continuity_session_lost" });
+  f.controls.invokeSourceTools = false;
+  const recovered = await f.run(f.request("", "turn-first", resultInput));
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(readFileSync(counter, "utf8")).toBe("x");
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.prompt).toContain(stdout);
+  expect(recovered.some(event => event.type === "tool_call_start")).toBe(false);
+});
+
+for (const actualRecovery of [false, true]) for (const stage of ["prepared", "page-failed", "send-possible"] as const) test(`recovery v3: a real exited backend ${stage} attempt resumes from durable evidence actualLauncher=${actualRecovery}`, async () => {
+  const f = fixture();
+  f.controls.actualRecovery = actualRecovery;
+  const original = f.request();
+  bindContinuityRequestScope(original, chatGptWebExecutionNamespace(f.provider));
+  const thread = continuityDigest(f.threadId);
+  const logicalWorkId = recoveryDigest([original._continuityScope, "turn-first", continuityInstructionIdentity(original), "ordinary"]);
+  const seed = { thread, scope: original._continuityScope!, logicalWorkId,
+    instructionIdentity: continuityInstructionIdentity(original), nativeTurnId: "turn-first",
+    workPayloadDigest: chatGptContinuityInstructionPayloadDigest(original), snapshotDigest: recoveryDigest(original.context),
+    createPage: true, dispatchProtocolComplete: true };
+  const oldLauncher = actualRecovery && stage === "send-possible" ? Bun.spawn([process.execPath, "-e",
+    `import {continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))}; console.log(JSON.stringify(continuityProcessInstance())); setInterval(()=>{},1000);`],
+    { stdout: "pipe", stderr: "pipe" }) : undefined;
+  let oldLauncherIdentity: { pid: number; startIdentity: string; instanceId: string } | undefined;
+  if (oldLauncher) {
+    cleanups.push(async () => { oldLauncher.kill(); await oldLauncher.exited; });
+    const reader = oldLauncher.stdout.getReader();
+    const first = await reader.read(); reader.releaseLock();
+    const value = JSON.parse(new TextDecoder().decode(first.value));
+    oldLauncherIdentity = { pid: value.pid, startIdentity: value.startIdentity, instanceId: "b".repeat(64) };
+  }
+  const script = join(f.statePath, "crashed-backend.ts");
+  writeFileSync(script, `import {ContinuityRecoveryStore,continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+import {ContinuityRegistrationStore} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-registration.ts"))};
+const store = new ContinuityRecoveryStore(${JSON.stringify(f.statePath)});
+const owner = continuityProcessInstance();
+const input = ${JSON.stringify(seed)};
+store.admitWork({...input, owner});
+new ContinuityRegistrationStore(${JSON.stringify(f.statePath)}).claim(input.thread,input.scope,owner.id);
+${stage !== "prepared" ? `store.markAttempt(input.thread,{scope:input.scope},{logicalWorkId:input.logicalWorkId,attempt:0,stage:"page-possible",launcherInstance:${oldLauncherIdentity ? JSON.stringify(oldLauncherIdentity) : '{pid:owner.pid,startIdentity:owner.startIdentity,instanceId:"b".repeat(64)}'}});
+${stage === "page-failed" ? 'store.recordFailure(input.thread,{scope:input.scope},input.logicalWorkId);' : 'store.markAttempt(input.thread,{scope:input.scope},{logicalWorkId:input.logicalWorkId,attempt:0,stage:"send-possible"});'}` : ""}
+`);
+  const processResult = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "pipe" });
+  expect(await processResult.exited, await new Response(processResult.stderr).text()).toBe(0);
+  const before = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  f.controls.queryPhase = stage === "prepared" ? "missing" : "send-possible";
+  const changedHistory = f.request("", "turn-first", [
+    { type: "message", role: "assistant", content: "Edited completed history H2." },
+    ...(original._rawBody as { input: unknown[] }).input,
+  ]);
+  if (before.owner.startIdentity === "unverified") {
+    await expect(f.run(changedHistory)).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
+    expect(f.submissions).toHaveLength(0);
+    return;
+  }
+  if (oldLauncher) {
+    await expect(f.run(structuredClone(changedHistory))).rejects.toMatchObject({ code: "continuity_unverified" });
+    expect(f.controls.actualAcquisitions).toBe(0);
+    oldLauncher.kill(); await oldLauncher.exited;
+  }
+  expect((await f.run(changedHistory)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(1);
+  if (actualRecovery) expect(f.controls.actualAcquisitions).toBe(1);
+  expect(f.submissions[0]!.prompt).toContain("Edited completed history H2.");
+  const after = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  expect(after.works[logicalWorkId]!.attempts.at(-1)!.snapshotVersion).toBe(1);
+  expect(after.transaction!.transactionId).toBe(before.transaction!.transactionId);
+  expect(after.works[logicalWorkId]!.attempts.length).toBe(stage === "prepared" ? 1 : 2);
+});
+
+for (const withResult of [false, true]) for (const stage of ["prepared", "send-possible"] as const) test(`recovery v3: checkpoint-only consumer survives ${stage} failure without allocating another consumer result=${withResult}`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const original = f.request();
+  await f.run(original);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
+  const compact = f.request("", "turn-first", [
+    ...(original._rawBody as { input: unknown[] }).input,
+    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Actual source result before consumer." },
+  ]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  f.controls.invokeSourceTools = false;
+  if (stage === "prepared") f.controls.preLeaseFailures = 1;
+  else f.controls.failAfterSendOnce = true;
+  const request = () => f.request("", "turn-first", [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    ...(withResult ? [(compact._rawBody as { input: unknown[] }).input.at(-1)] : [])]);
+  const failed = await f.run(request());
+  expect(failed.at(-1)).toMatchObject({ type: "error" });
+  const store = new ContinuityRecoveryStore(f.statePath);
+  const before = store.get(continuityDigest(f.threadId))!;
+  const checkpoint = Object.values(before.checkpoints)[0]!;
+  const consumerId = checkpoint.continuation.consumerLogicalWorkId!;
+  expect(consumerId).toBeDefined();
+  const completed = await f.run(request());
+  expect(completed.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = store.get(before.thread)!;
+  expect(after.checkpoints[checkpoint.commitId]!.continuation.consumerLogicalWorkId).toBe(consumerId);
+  expect(Object.keys(after.works).sort()).toEqual(Object.keys(before.works).sort());
+  expect(after.works[consumerId]!.state).toBe("completed");
+  expect(f.submissions.at(-1)!.prompt).toContain("Verified checkpoint.");
+  expect(completed.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+});
+
+
+for (const manual of [false, true]) test(`recovery v3: ${manual ? "manual" : "automatic"} transient inspection retries the original page without consuming a recovery attempt`, async () => {
+  const f = fixture(manual);
+  const original = f.request();
+  await f.run(original);
+  const before = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  f.controls.inspectFailures = 1;
+  await expect(f.run(f.next(original))).rejects.toMatchObject({ code: "continuity_unverified", status: 503, retryable: true });
+  expect(f.submissions).toHaveLength(1);
+  expect(f.pages.size).toBe(1);
+  const failed = new ContinuityRecoveryStore(f.statePath).get(before.thread)!;
+  expect(failed.epoch).toBe(before.epoch);
+  expect(Object.keys(failed.works)).toEqual(Object.keys(before.works));
+  expect((await f.run(f.next(original))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
+  expect(f.submissions[1]!.reused).toBe(true);
+  expect(f.submissions[1]!.claim.recovery!.epoch).toBe(before.epoch);
+});
+
+test("recovery v3: a lost page cannot promote historical discovery into new tool authority", async () => {
+  const f = fixture();
+  const original = f.request();
+  await f.run(original);
+  f.pages.clear();
+  const next = f.next(original);
+  const body = next._rawBody as { input: unknown[] };
+  body.input.unshift({ type: "tool_search_output", call_id: "unowned-historical-search", status: "completed",
+    tools: [{ type: "function", name: "unapproved_recovery_tool", description: "Unowned history", parameters: { type: "object" } }] });
+  const replay = parseRequest({ ...next._rawBody as object });
+  replay._conversationPolicy = "continuity-first";
+  expect((await f.run(replay)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(replay.context.tools?.some(tool => tool.name === "unapproved_recovery_tool")).toBe(false);
+  expect(f.submissions).toHaveLength(2);
+});
+
+for (const localBody of [false, true]) test(`recovery v3: consumed continuation accepts uncovered result with bounded reconciliation local=${localBody}`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const original = f.request();
+  await f.run(original);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
+  const compact = f.request("", "turn-first", [...(original._rawBody as { input: unknown[] }).input,
+    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint");
+  const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  f.controls.singleSourceTool = true;
+  f.controls.failAfterToolsOnce = localBody;
+  const consumerRequest = f.request("", "turn-first", [marker]);
+  await f.run(consumerRequest);
+  const consumer = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(consumerRequest)}`)!;
+  const result = { type: "function_call_output", call_id: consumer.outstanding()[0]!.callId, output: "Actual uncovered consumer result." };
+  if (localBody) expect((await f.run(f.request("", "turn-first", [marker, result]))).at(-1)).toMatchObject({ type: "error" });
+  else {
+    f.pages.clear();
+    const bindings = continuityBindingsFor(f.statePath);
+    bindings.lose(bindings.observed(continuityDigest(f.threadId))!);
+  }
+  const store = new ContinuityRecoveryStore(f.statePath);
+  const before = store.get(continuityDigest(f.threadId))!;
+  f.controls.invokeSourceTools = false;
+  const recovered = await f.run(f.request("", "turn-first", [marker, ...localBody ? [] : [result]]));
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = store.get(before.thread)!;
+  expect(after.currentWorkId).toBe(before.currentWorkId);
+  expect(after.version - before.version).toBeLessThan(20);
+  expect(after.calls[result.call_id]!.state).toBe("settled");
+  expect(f.submissions.at(-1)!.prompt).toContain(result.output);
+});
+
+test("recovery v3: actual authenticated interrupt persists stopped before its HTTP receipt", async () => {
+  const f = fixture(false, { threadId: "thread_real_interrupt" });
+  f.controls.invokeSourceTools = true;
+  await f.run(f.request());
+  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const provider = spyOn(configuration, "providerConfig").mockReturnValue(f.provider);
+  cleanups.push(async () => { provider.mockRestore(); });
+  const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
+  cleanups.push(async () => { await server.stop(true); });
+  const response = await fetch(`http://127.0.0.1:${server.port}/admin/interrupt-turn`, {
+    method: "POST", headers: { authorization: `Bearer ${config.controlToken}`, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: f.threadId, turnId: "turn-first" }),
+  });
+  expect(response.status).toBe(200);
+  const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  expect(record.works[record.currentWorkId!]!.state).toBe("stopped");
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped" });
+});
+
+test("recovery v3: repeated failed acquisition consumes the persistent retry budget", async () => {
+  const f = fixture();
+  f.controls.actualRecovery = true;
+  f.controls.acquisitionFailures = 5;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "error", code: "continuity_unverified" });
+    const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+    expect(record.works[record.currentWorkId!]!.retryBudget?.attempts).toBe(attempt + 1);
+    expect(record.works[record.currentWorkId!]!.retryBudget?.lastFailureAt).toBeNumber();
+  }
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_retry_exhausted" });
+  expect(f.controls.acquisitionFailures).toBe(1);
+  expect(f.controls.actualAcquisitions).toBe(4);
+  expect(f.submissions).toHaveLength(0);
+});
+
+test("recovery v3: acquisition retry exhaustion survives an actual backend exit", async () => {
+  const f = fixture();
+  const original = f.request();
+  bindContinuityRequestScope(original, chatGptWebExecutionNamespace(f.provider));
+  const thread = continuityDigest(f.threadId);
+  const work = recoveryDigest([original._continuityScope, "turn-first", continuityInstructionIdentity(original), "ordinary"]);
+  const input = { thread, scope: original._continuityScope!, logicalWorkId: work,
+    instructionIdentity: continuityInstructionIdentity(original), nativeTurnId: "turn-first",
+    workPayloadDigest: chatGptContinuityInstructionPayloadDigest(original), snapshotDigest: recoveryDigest(original.context),
+    createPage: true, dispatchProtocolComplete: true };
+  const script = `import {ContinuityRecoveryStore,continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+import {recoveryIdentity} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-runtime.ts"))};
+import {createRequire} from 'node:module'; const require=createRequire(import.meta.url);
+const api=require(${JSON.stringify(resolve("launcher/electron/continuity-recovery.cjs"))});
+const store=new ContinuityRecoveryStore(${JSON.stringify(f.statePath)}), input=${JSON.stringify(input)}, owner=continuityProcessInstance();
+if(owner.startIdentity==='unverified'){console.log('unverified');process.exit(0);}
+const launcherInstance={pid:owner.pid,startIdentity:owner.startIdentity,instanceId:'b'.repeat(64)};
+const host={turnTabs:new Map(),continuityLauncherInstance:launcherInstance}; let count=0;
+let record=store.admitWork({...input,owner});
+for(let attempt=0;attempt<4;attempt++){
+ if(attempt) record=store.reserveRecovery(input.thread,{scope:input.scope},{logicalWorkId:input.logicalWorkId,owner,snapshotDigest:input.snapshotDigest});
+ record=store.markAttempt(input.thread,{scope:input.scope},{logicalWorkId:input.logicalWorkId,attempt,stage:'page-possible',launcherInstance});
+ const recovery=recoveryIdentity(record,store.installationId());
+ try{await api.acquireContinuityTransaction(host,{owner:owner.id,recovery},'trace'+attempt,owner.pid,'page'+attempt,'automatic',()=>{count++;throw Error('injected acquisition failure');});}catch{}
+ store.recordFailure(input.thread,{scope:input.scope},input.logicalWorkId);
+ await api.retireContinuityWriter(host,recovery); store.retireAttempt(input.thread,{scope:input.scope},input.logicalWorkId,attempt);
+} console.log(count);`;
+  const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+  expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+  const output = (await new Response(child.stdout).text()).trim();
+  if (output === "unverified") { expect(f.submissions).toHaveLength(0); return; }
+  expect(output).toBe("4");
+  const before = new ContinuityRecoveryStore(f.statePath).get(thread)!;
+  expect(before.works[work]!.retryBudget?.attempts).toBe(4);
+  await expect(f.run(original)).rejects.toMatchObject({ code: "continuity_retry_exhausted" });
+  expect(f.submissions).toHaveLength(0);
+});
+
+for (const stop of ["mode-exit", "native"] as const) test(`recovery v3: ${stop} persists stop after backend restart without a live binding`, async () => {
+  const f = fixture(false, { threadId: `thread_restart_stop_${stop}` });
+  const original = f.request();
+  bindContinuityRequestScope(original, chatGptWebExecutionNamespace(f.provider));
+  const thread = continuityDigest(f.threadId);
+  const work = recoveryDigest([original._continuityScope, "turn-first", continuityInstructionIdentity(original), "ordinary"]);
+  const input = { thread, scope: original._continuityScope!, logicalWorkId: work,
+    instructionIdentity: continuityInstructionIdentity(original), nativeTurnId: "turn-first",
+    workPayloadDigest: chatGptContinuityInstructionPayloadDigest(original), snapshotDigest: recoveryDigest(original.context),
+    createPage: true, dispatchProtocolComplete: true };
+  const child = Bun.spawn([process.execPath, "-e", `import {ContinuityRecoveryStore,continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+    new ContinuityRecoveryStore(${JSON.stringify(f.statePath)}).admitWork({...${JSON.stringify(input)},owner:continuityProcessInstance()});`], { stdout: "pipe", stderr: "pipe" });
+  expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+  expect(continuityBindingsFor(f.statePath).observed(thread)).toBeUndefined();
+  if (stop === "mode-exit") await leaveContinuityMode(f.statePath, f.threadId);
+  else {
+    const provider = spyOn(configuration, "providerConfig").mockReturnValue(f.provider);
+    const config = { ...defaultConfig("browser-only"), port: 0 };
+    const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/admin/interrupt-turn`, {
+        method: "POST", headers: { authorization: `Bearer ${config.controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ threadId: f.threadId, turnId: "turn-first" }),
+      });
+      expect(response.status).toBe(200);
+    } finally { await server.stop(true); provider.mockRestore(); }
+  }
+  const store = new ContinuityRecoveryStore(f.statePath);
+  const stopped = store.get(thread)!;
+  expect(stopped.works[work]!.state).toBe("stopped");
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped" });
+  expect((await f.run(f.next(original))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(store.get(thread)!.epoch).toBe(stopped.epoch + 1);
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped" });
+  expect(f.submissions).toHaveLength(1);
+});
+
+const crashBudgetRoot = process.env.CGW_RECOVERY_CRASH_BUDGET_ROOT;
+test.skipIf(!crashBudgetRoot)("recovery v3 worker: exit before acquisition failure receipt", async () => {
+  const f = fixture(false, { root: crashBudgetRoot! });
+  f.controls.actualRecovery = true;
+  f.controls.acquisitionFailures = 1;
+  const save = (code?: string) => {
+    const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+    writeFileSync(join(crashBudgetRoot!, "observed.json"), JSON.stringify({ calls: f.controls.actualAcquisitions,
+      attempts: record.works[record.currentWorkId!]!.attempts.length,
+      budget: record.works[record.currentWorkId!]!.retryBudget, code }));
+  };
+  spyOn(ContinuityRecoveryStore.prototype, "recordFailure").mockImplementation(() => { save(); process.exit(0); });
+  try { await f.run(f.request()); throw new Error("The acquisition should fail or exhaust its budget"); }
+  catch (error) { save((error as { code?: string }).code); process.exit(0); }
+});
+
+test.skipIf(continuityProcessInstance().startIdentity === "unverified")("recovery v3: five backend crashes before failure receipts permit only four actual acquisitions", async () => {
+  const root = mkdtempSync(join(tmpdir(), "recovery-budget-crash-"));
+  cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
+  const observations: Array<{ calls: number; attempts: number; budget: { attempts: number; startedAt: number; lastFailureAt?: number }; code?: string }> = [];
+  for (let index = 0; index < 5; index++) {
+    const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^recovery v3 worker: exit before acquisition failure receipt$"],
+      { env: { ...process.env, CGW_RECOVERY_CRASH_BUDGET_ROOT: root }, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+    observations.push(JSON.parse(readFileSync(join(root, "observed.json"), "utf8")));
+  }
+  expect(observations.map(value => value.calls)).toEqual([1, 1, 1, 1, 0]);
+  expect(observations.map(value => value.attempts)).toEqual([1, 2, 3, 4, 4]);
+  expect(observations.map(value => value.budget.attempts)).toEqual([1, 2, 3, 4, 4]);
+  expect(observations.every(value => value.budget.lastFailureAt === undefined)).toBe(true);
+  expect(observations.slice(1).map(value => value.budget.startedAt)).toEqual(Array(4).fill(observations[1]!.budget.startedAt));
+  expect(observations.at(-1)?.code).toBe("continuity_retry_exhausted");
+});
+
+async function preparedMigrationFixture(creating = false, launcherInstance?: { pid: number; startIdentity: string; instanceId: string }) {
+  const f = fixture();
+  if (launcherInstance) {
+    f.descriptor.pid = launcherInstance.pid;
+    f.descriptor.launcherInstance = launcherInstance;
+    f.recoveryHost.continuityLauncherInstance = launcherInstance;
+    writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor));
+  }
+  f.controls.actualRecovery = true;
+  const original = f.request();
+  const namespace = chatGptWebExecutionNamespace(f.provider);
+  bindContinuityRequestScope(original, namespace);
+  const thread = continuityDigest(f.threadId), scope = original._continuityScope!;
+  const logicalWorkId = recoveryDigest([scope, "turn-first", continuityInstructionIdentity(original), "ordinary"]);
+  const seed = { thread, scope, logicalWorkId, instructionIdentity: continuityInstructionIdentity(original), nativeTurnId: "turn-first",
+    workPayloadDigest: chatGptContinuityInstructionPayloadDigest(original), snapshotDigest: recoveryDigest(original.context), createPage: true, dispatchProtocolComplete: true };
+  const child = Bun.spawn([process.execPath, "-e", `import {ContinuityRecoveryStore,continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+const store=new ContinuityRecoveryStore(${JSON.stringify(f.statePath)}),input=${JSON.stringify(seed)};
+store.admitWork({...input,owner:continuityProcessInstance()});
+store.markAttempt(input.thread,{scope:input.scope},{logicalWorkId:input.logicalWorkId,attempt:0,stage:'page-possible',launcherInstance:${JSON.stringify(f.descriptor.launcherInstance)}});`], { stdout: "pipe", stderr: "pipe" });
+  expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+  const store = new ContinuityRecoveryStore(f.statePath), before = store.get(thread)!;
+  const { recoveryIdentity } = await import("../src/adapters/chatgpt-web/continuity-recovery-runtime");
+  const { chatGptConversationKey } = await import("../src/adapters/chatgpt-web/conversation-key");
+  const old = recoveryIdentity(before, store.installationId());
+  const claim = { owner: before.owner.id, recovery: old };
+  original._continuityEpoch = before.epoch;
+  const key = chatGptConversationKey(original, namespace)!;
+  let finish!: () => void;
+  const create = () => {
+    const tab: any = { id: "prepared-tab", traceId: "prepared-trace", helperPid: child.pid, status: "running", destroyed: false,
+      continuityLeaseId: "1".repeat(32), view: { webContents: { isDestroyed: () => tab.destroyed } } };
+    launcherLease.bindContinuityTab(tab, claim);
+    f.recoveryHost.turnTabs.set(tab.id, tab);
+    return { continuity: launcherLease.continuityLease(tab) };
+  };
+  const acquired = launcherRecovery.acquireContinuityTransaction(f.recoveryHost, claim, "prepared-trace", child.pid, key, "automatic",
+    () => creating ? new Promise(resolve => { finish = () => resolve(create()); }) : create());
+  return { f, store, before, old, original, acquired, finish: () => finish(), recoveryIdentity };
+}
+
+for (const fault of ["creating", "before-handler", "lost-receipt"] as const) {
+  test.skipIf(continuityProcessInstance().startIdentity === "unverified")(`recovery v3: prepared migration reconciles ${fault} without another acquisition`, async () => {
+    const { f, store, before, old, acquired, finish, recoveryIdentity } = await preparedMigrationFixture(fault === "creating");
+    if (fault === "before-handler") f.controls.prepareBeforeFailures = 1;
+    if (fault === "lost-receipt") f.controls.prepareAfterFailures = 1;
+    const sameRequest = f.request();
+    await expect(f.run(structuredClone(sameRequest))).rejects.toMatchObject({ code: "continuity_unverified" });
+    const pending = store.get(before.thread)!;
+    expect(pending.owner).toEqual(before.owner);
+    expect(pending.transaction).toEqual(before.transaction);
+    expect(f.submissions).toHaveLength(0);
+    expect(f.controls.actualAcquisitions).toBe(0);
+    if (fault === "creating") {
+      expect(pending).toEqual(before);
+      expect(launcherRecovery.queryContinuityTransaction(f.recoveryHost, old).state).toBe("creating");
+      finish(); await acquired;
+    } else {
+      expect(pending.pendingPreparation?.expected).toEqual({ owner: before.owner, transaction: before.transaction! });
+      await expect(f.run(f.request("Changed body under the accepted instruction ID."))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+      expect(store.get(before.thread)).toEqual(pending);
+      const { assertRecoveryWriter } = await import("../src/adapters/chatgpt-web/continuity-recovery-runtime");
+      expect(() => assertRecoveryWriter({ directory: f.statePath, thread: before.thread, logicalWorkId: before.currentWorkId!, attempt: 0 }))
+        .toThrow("still being coordinated");
+      const hostTag = fault === "lost-receipt" ? recoveryIdentity({ ...pending, ...pending.pendingPreparation!.target }, store.installationId()) : old;
+      expect(launcherRecovery.queryContinuityTransaction(f.recoveryHost, hostTag).state).toBe("prepared");
+    }
+    expect((await f.run(structuredClone(sameRequest))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    const after = store.get(before.thread)!;
+    expect(after.pendingPreparation).toBeUndefined();
+    expect(after.works[after.currentWorkId!]!.attempts).toHaveLength(1);
+    expect(after.works[after.currentWorkId!]!.retryBudget).toBeUndefined();
+    expect(after.transaction!.snapshotVersion).toBe(1);
+    expect(f.submissions).toHaveLength(1);
+    expect(f.controls.actualAcquisitions).toBe(0);
+    expect(f.recoveryHost.turnTabs.size).toBe(1);
+  });
+}
+
+for (const phase of ["before-rpc", "after-rpc", "after-complete", "second-backend-exit"] as const) {
+  test.skipIf(continuityProcessInstance().startIdentity === "unverified")(`recovery v3: persisted migration survives ${phase}`, async () => {
+    const { f, store, before } = await preparedMigrationFixture();
+    const migrate = async (apply: boolean) => {
+      const script = `import {ContinuityRecoveryStore,continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+import {recoveryIdentity} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-runtime.ts"))};
+import {updateLauncherContinuityPreparation} from ${JSON.stringify(resolve("src/launcher-browser-host.ts"))};
+const store=new ContinuityRecoveryStore(${JSON.stringify(f.statePath)}),thread=${JSON.stringify(before.thread)};let record=store.get(thread)!;
+if(record.pendingPreparation){const p=record.pendingPreparation;await updateLauncherContinuityPreparation(${JSON.stringify(f.descriptorPath)},{expected:recoveryIdentity({...record,...p.expected},store.installationId()),recovery:recoveryIdentity({...record,...p.target},store.installationId())});record=store.completePreparation(thread,{scope:record.scope,expectedVersion:record.version},p.preparationId);}
+record=store.beginPreparation(thread,{scope:record.scope,expectedVersion:record.version},{logicalWorkId:record.currentWorkId!,owner:continuityProcessInstance(),snapshotDigest:'9'.repeat(64),launcherInstance:${JSON.stringify(f.descriptor.launcherInstance)}});
+const p=record.pendingPreparation!;
+${apply ? `await updateLauncherContinuityPreparation(${JSON.stringify(f.descriptorPath)},{expected:recoveryIdentity({...record,...p.expected},store.installationId()),recovery:recoveryIdentity({...record,...p.target},store.installationId())});` : ""}
+${phase === "after-complete" ? 'store.completePreparation(thread,{scope:record.scope,expectedVersion:record.version},p.preparationId);' : ""}
+process.exit(0);`;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+    };
+    await migrate(phase !== "before-rpc");
+    if (phase === "second-backend-exit") await migrate(false);
+    if (phase === "after-complete") expect(store.get(before.thread)!.pendingPreparation).toBeUndefined();
+    else expect(store.get(before.thread)!.pendingPreparation).toBeDefined();
+    expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    const after = store.get(before.thread)!;
+    expect(after.pendingPreparation).toBeUndefined();
+    expect(after.transaction!.snapshotVersion).toBe(phase === "second-backend-exit" ? 3 : 2);
+    expect(after.works[after.currentWorkId!]!.attempts).toHaveLength(1);
+    expect(after.works[after.currentWorkId!]!.retryBudget).toBeUndefined();
+    expect(f.controls.actualAcquisitions).toBe(0);
+    expect(f.submissions).toHaveLength(1);
+  });
+}
+
+for (const applied of [false, true]) {
+  test.skipIf(continuityProcessInstance().startIdentity === "unverified")(`recovery v3: stopped preparation migration permits a new task applied=${applied}`, async () => {
+    const { f, store, before } = await preparedMigrationFixture();
+    if (applied) f.controls.prepareAfterFailures = 1;
+    else f.controls.prepareBeforeFailures = 1;
+    await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_unverified" });
+    expect(store.get(before.thread)!.pendingPreparation).toBeDefined();
+    await leaveContinuityMode(f.statePath, f.threadId);
+    expect(store.get(before.thread)!.works[before.currentWorkId!]!.state).toBe("stopped");
+    await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped" });
+    expect((await f.run(f.request("A different accepted task.", "turn-new"))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    const after = store.get(before.thread)!;
+    expect(after.pendingPreparation).toBeUndefined();
+    expect(after.retiredPreparation).toBeDefined();
+    expect(after.works[before.currentWorkId!]!.state).toBe("stopped");
+    expect(after.epoch).toBe(before.epoch + 1);
+    expect(f.controls.actualAcquisitions).toBe(1);
+    expect(f.submissions).toHaveLength(1);
+    await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_stopped" });
+  });
+}
+
+test.skipIf(continuityProcessInstance().startIdentity === "unverified")("recovery v3: an exactly retired pending target requires a new acquisition attempt", async () => {
+  const { f, store, before, recoveryIdentity } = await preparedMigrationFixture();
+  f.controls.prepareAfterFailures = 1;
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_unverified" });
+  const pending = store.get(before.thread)!;
+  const target = recoveryIdentity({ ...pending, ...pending.pendingPreparation!.target }, store.installationId());
+  const retired = await launcherRecovery.retireContinuityWriter(f.recoveryHost, target);
+  expect(retired.writerRetired).toBe(true);
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = store.get(before.thread)!;
+  expect(after.pendingPreparation).toBeUndefined();
+  expect(after.works[before.currentWorkId!]!.attempts).toHaveLength(2);
+  expect(after.epoch).toBe(before.epoch + 1);
+  expect(f.controls.actualAcquisitions).toBe(1);
+  expect(f.submissions).toHaveLength(1);
+});
+
+test.skipIf(continuityProcessInstance().startIdentity === "unverified")("recovery v3: pending migration survives a proved Launcher restart but rejects its live predecessor", async () => {
+  const launcher = Bun.spawn([process.execPath, "-e", `import {continuityProcessInstance} from ${JSON.stringify(resolve("src/adapters/chatgpt-web/continuity-recovery-store.ts"))}; console.log(JSON.stringify(continuityProcessInstance())); setInterval(()=>{},1000);`], { stdout: "pipe", stderr: "pipe" });
+  cleanups.push(async () => { launcher.kill(); await launcher.exited; });
+  const reader = launcher.stdout.getReader();
+  const output = await reader.read(); reader.releaseLock();
+  const processIdentity = JSON.parse(new TextDecoder().decode(output.value));
+  const oldInstance = { pid: processIdentity.pid, startIdentity: processIdentity.startIdentity, instanceId: "c".repeat(64) };
+  const { f, store, before } = await preparedMigrationFixture(false, oldInstance);
+  f.controls.prepareBeforeFailures = 1;
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_unverified" });
+  const pending = store.get(before.thread)!;
+  // A replacement host's empty table cannot prove that its live predecessor has
+  // no page. The child is a real process; browser surfaces remain test fixtures.
+  const host = f.recoveryHost as typeof f.recoveryHost & { continuityTransactions: Map<string, unknown>; continuityTransactionReceipts: Map<string, unknown> };
+  host.turnTabs.clear(); host.continuityTransactions.clear(); host.continuityTransactionReceipts.clear();
+  const current = continuityProcessInstance();
+  const newInstance = { pid: current.pid, startIdentity: current.startIdentity, instanceId: "d".repeat(64) };
+  f.descriptor.pid = newInstance.pid;
+  f.descriptor.launcherInstance = newInstance; host.continuityLauncherInstance = newInstance;
+  writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor));
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "continuity_unverified" });
+  expect(store.get(before.thread)).toEqual(pending);
+  expect(f.controls.actualAcquisitions).toBe(0);
+  launcher.kill(); await launcher.exited;
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const after = store.get(before.thread)!;
+  expect(after.pendingPreparation).toBeUndefined();
+  expect(after.works[before.currentWorkId!]!.attempts).toHaveLength(2);
+  expect(after.epoch).toBe(before.epoch + 1);
+  expect(f.controls.actualAcquisitions).toBe(1);
+  expect(f.submissions).toHaveLength(1);
+});
