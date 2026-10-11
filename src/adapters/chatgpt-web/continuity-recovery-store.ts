@@ -5,6 +5,8 @@ import { join, win32 } from "node:path";
 import { atomicWriteFile } from "../../config";
 import { continuityError } from "./continuity-errors";
 import { moveContinuityLockWithoutReplacement } from "./continuity-lock-windows";
+import { assertContextCoverageAdvance, validateContextCoverageJournal, validateContextCoverageReservations, type ContextCoverageJournalEntry, type ContextCoverageReservation } from "./context-coverage-journal";
+import { canonicalJson } from "./canonical-json";
 
 export const MAX_CONTINUITY_RECOVERY_BYTES = 24 * 1024 * 1024;
 export const MAX_CONTINUITY_RECOVERY_ITEM_BYTES = 2 * 1024 * 1024;
@@ -86,6 +88,8 @@ export interface RecoveryThreadRecord {
   works: Record<string, RecoveryWorkRecord>; lineages: Record<string, RecoveryLineageRecord>;
   calls: Record<string, RecoveryCallRecord>; compactionTargets: Record<string, RecoveryCompactionTarget>;
   checkpoints: Record<string, RecoveryCheckpointRecord>;
+  contextCoverage?: ContextCoverageJournalEntry[];
+  contextCoverageReservations?: ContextCoverageReservation[];
 }
 interface RecoveryDocument { version: 2; installation: string; threads: Record<string, RecoveryThreadRecord> }
 export interface RecoveryGuard { scope: string; expectedVersion?: number; expectedEpoch?: number; expectedOwner?: string }
@@ -321,7 +325,7 @@ function validatePreparation(value: unknown): asserts value is RecoveryPendingPr
     || target.writerRetired || !target.toolsSettled || target.pageReceiptId !== undefined || !sameLauncher(before.launcherInstance, target.launcherInstance)) throw invalid("Preparation must retain one exact previous authorization and one adjacent unsent target.");
 }
 function validateThread(value: unknown): asserts value is RecoveryThreadRecord {
-  exact(value, ["thread", "scope", "version", "epoch", "historyRevision", "owner", "state", "legacyUnproven", "works", "lineages", "calls", "compactionTargets", "checkpoints"], ["currentWorkId", "transaction", "pendingPreparation", "preparationReceipt", "retiredPreparation"]);
+  exact(value, ["thread", "scope", "version", "epoch", "historyRevision", "owner", "state", "legacyUnproven", "works", "lineages", "calls", "compactionTargets", "checkpoints"], ["currentWorkId", "transaction", "pendingPreparation", "preparationReceipt", "retiredPreparation", "contextCoverage", "contextCoverageReservations"]);
   hash(value.thread); hash(value.scope); validateProcess(value.owner); boolean(value.legacyUnproven);
   for (const key of ["version", "epoch", "historyRevision"]) integer(value[key]); optionalIdentity(value.currentWorkId);
   oneOf(value.state, ["creating", "running", "ready", "compacting", "unverified", "lost", "recovering", "stopped"]);
@@ -361,6 +365,24 @@ function validateThread(value: unknown): asserts value is RecoveryThreadRecord {
   for (const [key, checkpoint] of Object.entries(value.checkpoints as Record<string, unknown>)) { validateTarget(checkpoint, true); if ((checkpoint as unknown as RecoveryCheckpointRecord).commitId !== key) throw invalid("Continuity commit index does not match."); }
   if (value.transaction !== undefined) validateTransaction(value.transaction);
   const thread = value as unknown as RecoveryThreadRecord;
+  if (thread.contextCoverageReservations !== undefined) {
+    validateContextCoverageReservations(thread.contextCoverageReservations);
+    for (const reservation of thread.contextCoverageReservations) {
+      const attempt = thread.works[reservation.logicalWorkId]?.attempts[reservation.attempt];
+      if (!attempt || attempt.epoch !== reservation.epoch || attempt.historyRevision !== reservation.historyRevision) throw invalid("Context capacity reservation has no matching writer revision.");
+    }
+  }
+  if (thread.contextCoverage !== undefined) {
+    validateContextCoverageJournal(thread.contextCoverage);
+    for (const entry of thread.contextCoverage) {
+      const work = thread.works[entry.logicalWorkId]; const attempt = work?.attempts[entry.attempt];
+      if (!work || !attempt || work.workLineageId !== entry.workLineageId || attempt.epoch !== entry.epoch
+        || work.acceptedTaskRevision !== entry.acceptedTaskRevision || attempt.historyRevision !== entry.metadata.historyRevision
+        || entry.sourceTaskRevision < entry.acceptedTaskRevision || entry.sourceTaskRevision > thread.lineages[entry.workLineageId]!.acceptedTaskRevision) {
+        throw invalid("Context source coverage does not match its admitted work and revision.");
+      }
+    }
+  }
   for (const work of Object.values(thread.works)) {
     const lineage = thread.lineages[work.workLineageId];
     if (!lineage || !thread.works[lineage.rootLogicalWorkId] || !thread.works[lineage.headLogicalWorkId]
@@ -446,9 +468,53 @@ function proveCompactionActivation(record: RecoveryThreadRecord, work: RecoveryW
   }
   if (Object.values(record.calls).some(call => call.workLineageId === work.workLineageId && !["settled", "cancelled-before-delivery"].includes(call.state))) throw unproven("Compaction activation requires real settlement of every issued source tool call.");
 }
-function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord): void {
+function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
+  knownUnsentReservation?: { logicalWorkId: string; attempt: number }): void {
   if (previous.thread !== next.thread || previous.scope !== next.scope || next.epoch < previous.epoch || next.historyRevision < previous.historyRevision
     || previous.legacyUnproven && !next.legacyUnproven) throw unproven("Durable identity or unproved legacy evidence cannot be replaced.");
+  for (const reservation of previous.contextCoverageReservations ?? []) {
+    const after = next.contextCoverageReservations?.find(value => value.logicalWorkId === reservation.logicalWorkId && value.attempt === reservation.attempt);
+    if (after) {
+      if (canonicalJson(after) !== canonicalJson(reservation)) throw unproven("A possibly published source candidate reservation cannot be rebound.");
+    } else {
+      if (knownUnsentReservation?.logicalWorkId === reservation.logicalWorkId && knownUnsentReservation.attempt === reservation.attempt) continue;
+      const lineage = next.works[reservation.logicalWorkId]!.workLineageId;
+      const selectedDigest = createHash("sha256").update(canonicalJson((next.contextCoverage ?? []).filter(entry => entry.workLineageId === lineage).map(entry => entry.metadata))).digest("hex");
+      if (!reservation.candidateDigests.includes(selectedDigest)) throw unproven("Source capacity may be consumed only by the exact reserved selected candidate.");
+    }
+  }
+  for (const reservation of next.contextCoverageReservations ?? []) {
+    if (previous.contextCoverageReservations?.some(value => value.logicalWorkId === reservation.logicalWorkId && value.attempt === reservation.attempt)) continue;
+    const work = previous.works[reservation.logicalWorkId]; const attempt = work?.attempts[reservation.attempt];
+    if (previous.pendingPreparation || previous.currentWorkId !== reservation.logicalWorkId || !work || terminal(work)
+      || !attempt || attempt.writerRetired || attempt !== work.attempts.at(-1) || attempt.epoch !== previous.epoch
+      || reservation.ownerId !== previous.owner.id || reservation.historyRevision !== previous.historyRevision) throw unproven("Source candidate reservation requires the current writer and revision.");
+  }
+  for (const before of previous.contextCoverage ?? []) {
+    const after = next.contextCoverage?.find(entry => entry.metadata.planId === before.metadata.planId);
+    if (!after) {
+      if (!Object.values(next.checkpoints).some(commit => commit.workLineageId === before.workLineageId
+        && commit.sourceHistoryRevision >= before.metadata.historyRevision && commit.acceptedTaskRevision >= before.sourceTaskRevision)) {
+        throw unproven("Uncheckpointed context source evidence cannot be removed.");
+      }
+      continue;
+    }
+    if (JSON.stringify({ ...before, metadata: undefined, sourceTaskRevision: undefined }) !== JSON.stringify({ ...after, metadata: undefined, sourceTaskRevision: undefined })
+      || after.sourceTaskRevision < before.sourceTaskRevision) throw unproven("Context source ownership or accepted revision cannot be replaced.");
+    assertContextCoverageAdvance(before.metadata, after.metadata);
+  }
+  for (const entry of next.contextCoverage ?? []) {
+    const before = previous.contextCoverage?.find(value => value.metadata.planId === entry.metadata.planId);
+    if (JSON.stringify(before) === JSON.stringify(entry)) continue;
+    const current = previous.currentWorkId ? previous.works[previous.currentWorkId] : undefined;
+    const attempt = current?.attempts.at(-1);
+    if (previous.pendingPreparation || !current || terminal(current) || !attempt || attempt.writerRetired
+      || attempt.epoch !== previous.epoch || entry.ownerId !== previous.owner.id || entry.workLineageId !== current.workLineageId
+      || entry.metadata.historyRevision !== previous.historyRevision
+      || !before && (entry.logicalWorkId !== current.logicalWorkId || entry.attempt !== attempt.attempt)) {
+      throw unproven("Context coverage mutation requires the current owner, writer and history revision.");
+    }
+  }
   const pending = previous.pendingPreparation;
   if (pending) {
     if (next.pendingPreparation) {
@@ -690,6 +756,28 @@ export class ContinuityRecoveryStore {
       const result: unknown = mutate(record);
       if (result && typeof (result as unknown as { then?: unknown }).then === "function") throw invalid("Continuity recovery transactions must be synchronous.");
       record.version = previous.version + 1; validateThread(record); transition(previous, record); this.write(document);
+      return structuredClone(record);
+    });
+  }
+  /** Call only after the publisher independently proved no lease or prompt was published. */
+  releaseContextCoverageReservation(thread: string, guard: RecoveryGuard,
+    input: { logicalWorkId: string; attempt: number; ownerId: string }): RecoveryThreadRecord {
+    hash(thread); hash(guard.scope); identity(input.logicalWorkId); integer(input.attempt); hash(input.ownerId);
+    return this.exclusive(() => {
+      const document = this.read(); const record = document.threads[thread];
+      if (!record) throw unproven("The thread has no durable admission evidence."); this.guard(record, guard);
+      noPendingPreparation(record);
+      const work = record.works[input.logicalWorkId]; const attempt = work?.attempts[input.attempt];
+      if (record.owner.id !== input.ownerId || record.currentWorkId !== input.logicalWorkId || !work || terminal(work)
+        || !attempt || attempt.writerRetired || attempt !== work.attempts.at(-1) || attempt.epoch !== record.epoch) {
+        throw unproven("Only the current reservation owner and writer can release known-unsent source capacity.");
+      }
+      const reservation = record.contextCoverageReservations?.find(value => value.logicalWorkId === input.logicalWorkId && value.attempt === input.attempt);
+      if (!reservation) return structuredClone(record);
+      if (reservation.ownerId !== input.ownerId) throw unproven("The source reservation belongs to another owner.");
+      const previous = structuredClone(record);
+      record.contextCoverageReservations = record.contextCoverageReservations!.filter(value => value !== reservation);
+      record.version++; validateThread(record); transition(previous, record, input); this.write(document);
       return structuredClone(record);
     });
   }
@@ -969,9 +1057,18 @@ export class ContinuityRecoveryStore {
       this.requireSettled(record, target.workLineageId);
       const coveredCallIds = [...new Set(input.coveredCallIds)];
       if (coveredCallIds.some(id => record.calls[id]?.state !== "settled" || record.calls[id]?.workLineageId !== target.workLineageId || record.calls[id]!.batchSequence > target.sourceToolBatchHeadSequence)) throw unproven("Checkpoint coverage contains an unproved or unsettled tool result.");
+      for (const entry of record.contextCoverage ?? []) {
+        if (entry.workLineageId !== target.workLineageId) continue;
+        if (!entry.metadata.delivered || entry.metadata.historyRevision !== target.sourceHistoryRevision
+          || entry.sourceTaskRevision > target.acceptedTaskRevision) throw unproven("Checkpoint source coverage has an unresolved Send or a newer accepted source revision.");
+        const calls = [...entry.metadata.issuedCalls ?? [], ...entry.metadata.toolResults ?? []];
+        if (calls.some(call => !coveredCallIds.includes(call.callId))) throw unproven("Checkpoint cannot discard an uncovered source call or real result.");
+      }
       record.historyRevision++;
       record.checkpoints[input.commitId] = { ...structuredClone(target), commitId: input.commitId, targetHistoryRevision: record.historyRevision, summaryDigest: input.summaryDigest, coveredCallIds, retainedBodyBytes: input.retainedBodyBytes ?? 0,
         ...(input.ordinaryFinalReceiptId ? { ordinaryFinalReceiptId: input.ordinaryFinalReceiptId } : {}), continuation: { state: "available", ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}) } };
+      if (record.contextCoverage) record.contextCoverage = record.contextCoverage.filter(entry => entry.workLineageId !== target.workLineageId
+        || entry.metadata.historyRevision > target.sourceHistoryRevision || entry.sourceTaskRevision > target.acceptedTaskRevision);
       work.state = "completed"; work.terminalReceiptId = input.commitId; work.terminalDigest = input.summaryDigest; delete work.retryBudget;
       // An already retired attempt is immutable. The checkpoint is its logical terminal receipt.
       if (attempt.stage !== "interrupted-settled") { attempt.stage = "completed"; this.syncTransaction(record, work, attempt); }
@@ -1176,9 +1273,12 @@ export class ContinuityRecoveryStore {
         const preparationBytes = (record.pendingPreparation?.expected.transaction.logicalWorkId === work.logicalWorkId ? size(record.pendingPreparation) : 0)
           + (record.preparationReceipt?.target.transaction.logicalWorkId === work.logicalWorkId ? size(record.preparationReceipt) : 0)
           + (record.retiredPreparation?.expected.transaction.logicalWorkId === work.logicalWorkId ? size(record.retiredPreparation) : 0);
-        if (size({ work, calls }) + workReserve + callReserve + bodyBytes + preparationBytes > this.limits.itemBytes) throw capacity("Continuity recovery item capacity is 2 MiB including optional results and terminal reservations.");
+        const coverageBytes = record.contextCoverage?.filter(entry => entry.logicalWorkId === work.logicalWorkId).reduce((sum, entry) => sum + size(entry), 0) ?? 0;
+        const coverageReservation = record.contextCoverageReservations?.filter(entry => entry.logicalWorkId === work.logicalWorkId).reduce((sum, entry) => sum + size(entry) + entry.bytes, 0) ?? 0;
+        if (size({ work, calls }) + workReserve + callReserve + bodyBytes + preparationBytes + coverageBytes + coverageReservation > this.limits.itemBytes) throw capacity("Continuity recovery item capacity is 2 MiB including source coverage, optional results and terminal reservations.");
         if (new Set(calls.map(call => call.batchSequence)).size > this.limits.rounds) throw capacity("The current work has reached 512 tool rounds.");
         reserve += workReserve + callReserve + bodyBytes;
+        reserve += record.contextCoverageReservations?.filter(entry => entry.logicalWorkId === work.logicalWorkId).reduce((sum, entry) => sum + entry.bytes, 0) ?? 0;
       }
       for (const target of Object.values(record.compactionTargets)) {
         if (Object.values(record.checkpoints).some(checkpoint => checkpoint.compactionTargetId === target.compactionTargetId)) continue;

@@ -11,6 +11,7 @@ const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.c
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
 const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "NetworkProxySettings.tsx"), "utf8");
+const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("../electron/connector-identity.cjs");
 const apiAccessSettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "ApiAccessSettings.tsx"), "utf8");
 
 test("Bigger Context waits for startup and route recovery without invalidating healthy setup", async () => {
@@ -30,7 +31,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
     const logger = { info() {}, error() {} };
     const context = vm.createContext({
       runtimeStartup, finishRuntimeStartup: () => { startupSettled = true; finishRuntimeStartup(); },
-      startupAuthenticationRefresh, logger, stateStore, IS_DEV_PROFILE: false,
+      startupAuthenticationRefresh, logger, stateStore, IS_DEV_PROFILE: false, connectorSetupStatePatch,
       ipcMain: { on() {} }, registerLoggedIpc: (_ipc, _logger, channel, handler) => handlers.set(channel, handler),
       send() {}, publishOperation() {}, startCatalogVerificationMonitor() {},
       restoreCodexRouteAfterRuntimeFailure: async () => { calls.push("recovery"); return {}; },
@@ -669,7 +670,8 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     /page-title-updated[\s\S]*?browserInteractionModeFor\(this\) === "manual"\) return;/,
   );
   assert.doesNotMatch(modeSwitchHandler, /const pending = stateStore\.update|catch \(error\)/);
-  assert.match(electronMain, /browserInteractionMode === "manual"[\s\S]*?Local Zero Risk runtime is healthy/);
+  const verify = electronMain.slice(electronMain.indexOf('handle("launcher:mcp-verify"'), electronMain.indexOf('handle("launcher:doctor"'));
+  assert.match(verify, /browserInteractionMode !== "manual"[\s\S]*?await browserHost\.verifyConnector[\s\S]*?await runtimeHost\.verifyContextCapability/);
 
 });
 
@@ -875,6 +877,76 @@ test("MCP verification proves runtime health before checking the connector", () 
   );
   assert.match(handler, /publishOperation\(\{ name: operationName, status: "completed"/);
   assert.match(appSource, /operation\?\.name === "mcp-verification"/);
+});
+
+test("MCP verification refuses retired identities before marking either mode complete", async () => {
+  const vm = require("node:vm");
+  const identity = require("../electron/connector-identity.cjs");
+  const start = electronMain.indexOf('  handle("launcher:mcp-verify"');
+  const end = electronMain.indexOf('  handle("launcher:doctor"', start);
+  for (const development of [false, true]) for (const mode of ["automatic", "manual"]) {
+    for (const legacy of [false, true]) {
+      const handlers = new Map();
+      const state = { browserInteractionMode: mode, mcpSetupComplete: false };
+      const name = mode === "manual" ? legacy ? "Codex Zero Risk3" : identity.CURRENT_MANUAL_CONNECTOR_NAME
+        : legacy ? development ? "Codex Native4 DEV" : "Codex Native4"
+          : development ? identity.DEV_CONNECTOR_NAME : identity.CURRENT_CONNECTOR_NAME;
+      let browserChecks = 0;
+      let capabilityChecks = 0;
+      const localReport = { ok: true, checks: [{ id: "connector", status: "warning", message: "local health only" }] };
+      const context = vm.createContext({
+        handle: (channel, handler) => handlers.set(channel, handler), IS_DEV_PROFILE: development,
+        MCP_SETUP_CONTRACT, Error, mainWindow: null, logger: { info() {} }, send() {}, publishOperation() {},
+        stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+        browserHost: { activeTraceId: null, verifyConnector: async selected => { assert.equal(selected, name); browserChecks++; } },
+        runtimeHost: { doctor: async () => localReport, devDoctor: async () => localReport,
+          mcpConnectorName: () => identity.requireCurrentRuntimeConnectorName(name),
+          verifyContextCapability: async () => { capabilityChecks++; return { ok: true }; } },
+      });
+      vm.runInContext(electronMain.slice(start, end), context);
+      const result = await handlers.get("launcher:mcp-verify")({ sender: { isFocused: () => false } });
+      assert.equal(result.ok, !legacy);
+      assert.equal(state.mcpSetupComplete, !legacy);
+      assert.equal(browserChecks, !legacy && mode === "automatic" ? 1 : 0);
+      assert.equal(capabilityChecks, legacy ? 0 : 1);
+      if (legacy) {
+        assert.match(result.checks.at(-1).message, /create that connector as a new ChatGPT plugin.*do not rename or refresh/);
+        assert.equal(state.mcpSetupContract, undefined);
+      } else {
+        assert.equal(state.mcpSetupContract, MCP_SETUP_CONTRACT);
+        assert.equal(state.mcpSetupConnectorName, name);
+        assert.equal(result.checks.at(-1).status, "ok");
+        assert.match(result.checks.at(-1).message, /returned all six read-only context calls/);
+      }
+    }
+  }
+});
+
+test("MCP setup clears verification only after a successful runtime transaction", async () => {
+  const vm = require("node:vm");
+  const start = electronMain.indexOf('  handle("launcher:setup-mcp"');
+  const end = electronMain.indexOf('  handle("launcher:connector-name"', start);
+  for (const development of [false, true]) for (const fails of [false, true]) {
+    const handlers = new Map();
+    const state = { browserInteractionMode: "automatic", toolAuthorityMode: "verified-environment",
+      mcpSetupComplete: true, mcpSetupContract: "previous-ABI", mcpGuideStep: 0 };
+    const setup = async () => { if (fails) throw new Error("runtime commit failed"); return { stdout: "committed" }; };
+    const context = vm.createContext({
+      handle: (channel, handler) => handlers.set(channel, handler), IS_DEV_PROFILE: development,
+      stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
+      send() {}, startCatalogVerificationMonitor() {}, logger: {},
+      browserHost: { reveal: async () => {} },
+      runtimeHost: { setupMcp: setup, setupDevMcp: setup, toolAuthorityControl: () => ({ forced: false }),
+        runtimeConfigSnapshot: () => ({ configured: true, config: {} }) },
+    });
+    vm.runInContext(electronMain.slice(start, end), context);
+    const run = () => handlers.get("launcher:setup-mcp")({}, undefined);
+    if (fails) await assert.rejects(run, /runtime commit failed/);
+    else await run();
+    assert.equal(state.mcpSetupComplete, fails);
+    assert.equal(state.mcpGuideStep, fails ? 0 : 2);
+    assert.equal(state.mcpSetupContract, "previous-ABI", "an unverified setup cannot write a current verification marker");
+  }
 });
 
 test("saved ChatGPT authentication refresh does not gate local runtime startup", () => {

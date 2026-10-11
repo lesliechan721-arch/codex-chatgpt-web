@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
-import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
+import { createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import {
   callTurnBroker,
@@ -420,7 +420,7 @@ test("DEV chat attaches its broker to the launcher-owned tunnel without a Respon
     });
     expect(transport.config).toBe(config);
     expect(await callTurnBroker(transport.config.brokerSocketPath, { method: "owner_status" }))
-      .toMatchObject({ protocolVersion: 10, nativeWaitProtocol: 1, taskUpdateProtocol: 1 });
+      .toMatchObject({ protocolVersion: 11, nativeWaitProtocol: 1, taskUpdateProtocol: 1 });
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("normal Codex route");
   } finally {
     await transport?.close();
@@ -484,6 +484,9 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
     browserStarts += 1;
     const prepared = await turn.prepare();
     try {
+      if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
       if (!token) throw new Error("missing DEV broker token");
       turn.onReasoningSummary?.("Exercising the real broker round");

@@ -38,6 +38,7 @@ const {
   createNetworkProxyController,
 } = require("./network-proxy.cjs");
 const { RuntimeHost } = require("./runtime.cjs");
+const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("./connector-identity.cjs");
 const { createApiAccessSettings, readPolicyFile } = require("./api-access-settings.cjs");
 const { registerApiAccessIpc } = require("./api-access-ipc.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
@@ -826,8 +827,9 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:browser-zoom", (_event, action) => browserHost.zoom(action));
   handle("launcher:browser-tab-select", (_event, tabId) => browserHost.selectTab(tabId));
   handle("launcher:browser-tab-close", (_event, tabId) => browserHost.closeTab(tabId));
-  handle("launcher:manual-prompt-copy", (_event, tabId) => browserHost.copyManualPrompt(tabId));
-  handle("launcher:manual-prompt-sent", (_event, tabId) => browserHost.confirmManualSent(tabId));
+  handle("launcher:manual-prompt-copy", (_event, tabId, binding) => browserHost.copyManualPrompt(tabId, binding));
+  handle("launcher:manual-prompt-sent", (_event, tabId, binding) => browserHost.confirmManualSent(tabId, binding));
+  handle("launcher:manual-attachments-confirm", (_event, tabId, binding) => browserHost.confirmManualAttachments(tabId, binding));
   handle("launcher:browser-login", async () => {
     const browser = await browserHost.openLogin();
     if (browser.authenticated) {
@@ -901,31 +903,35 @@ function registerIpc({ logger, stateStore }) {
       publishOperation({ name: operationName, status: "failed", message });
       return report;
     }
-    if (stateStore.read().browserInteractionMode === "manual") {
-      const state = stateStore.update({ mcpSetupComplete: true });
+    let connectorName;
+    try {
+      connectorName = runtimeHost.mcpConnectorName();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const state = stateStore.update({ mcpSetupComplete: false });
       send("launcher:state-changed", state);
-      const successMessage = "Local Zero Risk runtime is healthy; connector selection remains a manual turn step";
-      publishOperation({ name: operationName, status: "completed", message: successMessage });
-      return {
-        ...report,
-        checks: [
-          ...report.checks.filter((check) => check.id !== "connector"),
-          {
-            id: "connector",
-            status: "warning",
-            message: `Select ChatGPT connector ${JSON.stringify(runtimeHost.mcpConnectorName())} manually for every Zero Risk turn`,
-          },
-        ],
-      };
+      publishOperation({ name: operationName, status: "failed", message });
+      return { ...report, ok: false, checks: [
+        ...report.checks.filter((check) => check.id !== "connector"),
+        { id: "connector", status: "error", message },
+      ] };
     }
     try {
-      publishOperation({ name: operationName, status: "running", message: "Checking ChatGPT connector" });
-      await browserHost.verifyConnector(runtimeHost.mcpConnectorName());
-      const state = stateStore.update({ mcpSetupComplete: true });
+      const checkingState = stateStore.update({ mcpSetupComplete: false });
+      send("launcher:state-changed", checkingState);
+      if (stateStore.read().browserInteractionMode !== "manual") {
+        publishOperation({ name: operationName, status: "running", message: "Checking ChatGPT connector" });
+        await browserHost.verifyConnector(connectorName);
+      }
+      publishOperation({ name: operationName, status: "running", message: "Checking six read-only context MCP calls" });
+      await runtimeHost.verifyContextCapability();
+      // These are UI flow markers. The separately bound six-call runtime evidence gates navigation.
+      const state = stateStore.update({ mcpSetupComplete: true,
+        mcpSetupContract: MCP_SETUP_CONTRACT, mcpSetupConnectorName: connectorName });
       send("launcher:state-changed", state);
       const successMessage = IS_DEV_PROFILE
-        ? "DEV harness and connector verified"
-        : "Runtime and connector verified";
+        ? "DEV runtime returned all six read-only context calls"
+        : "Runtime returned all six read-only context calls";
       publishOperation({ name: operationName, status: "completed", message: successMessage });
       return {
         ...report,
@@ -933,7 +939,7 @@ function registerIpc({ logger, stateStore }) {
           ? {
               id: "connector",
               status: "ok",
-              message: `ChatGPT connector ${JSON.stringify(runtimeHost.mcpConnectorName())} is available`,
+              message: `ChatGPT connector ${JSON.stringify(connectorName)} returned all six read-only context calls`,
             }
           : check),
       };
@@ -1625,7 +1631,7 @@ async function start() {
       coreSetupComplete: Boolean(config),
       codexCatalogVerified: Boolean(config),
       mcpRuntimeInstalled: config?.mode === "full",
-      ...(config?.mode !== "full" ? { mcpSetupComplete: false, mcpGuideStep: 0 } : {}),
+      ...connectorSetupStatePatch(config, stateStore.read()),
       codexRestartRequired: false,
       autoStart: false,
       toolAuthorityMode: config?.toolAuthorityMode ?? stateStore.read().toolAuthorityMode,
@@ -1743,10 +1749,7 @@ async function start() {
           codexCatalogVerified: false,
           codexRestartRequired: true,
         } : {}),
-        ...(config.mode === "browser-only" ? {
-          mcpSetupComplete: false,
-          mcpGuideStep: 0,
-        } : {}),
+        ...connectorSetupStatePatch(config, current),
       };
       if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
         const state = stateStore.update(patch);

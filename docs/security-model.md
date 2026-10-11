@@ -58,11 +58,55 @@ model. Every available effort uses the same MCP contract. An unavailable account
 connector, or missing outer tool fails explicitly instead of becoming an effort-specific exception.
 
 The direct turn-token MCP schema is attached only through the exact configured connector name
-(default `Codex Native4`; the part after `Codex ` can be changed). The older `Codex Native`,
-`Codex Native2`, `Codex Native2 DEV`, `Codex Native3`, and `Codex Native3 DEV` connectors are
-treated as legacy and are never selected as a fallback. Zero Risk uses `Codex Zero Risk3`, with
-`Codex Zero Risk` and `Codex Zero Risk2` retired. This
+(default `Codex Native5`; isolated DEV uses `Codex Native5 DEV`, and the part after `Codex ` can
+be changed). The older `Codex Native`, `Codex Native2`, `Codex Native2 DEV`, `Codex Native3`,
+`Codex Native3 DEV`, `Codex Native4`, and `Codex Native4 DEV` connectors are treated as legacy
+and are never selected as a fallback. Zero Risk uses `Codex Zero Risk4`, with `Codex Zero Risk`,
+`Codex Zero Risk2`, and `Codex Zero Risk3` retired. This
 prevents a cached legacy schema from being mistaken for the current capability contract.
+Create a new plugin instead of renaming or refreshing an old one. Setup preserves custom names
+that are not retired defaults, but a custom plugin's name alone cannot prove its schema is current.
+Local health, installed tool schemas, and the setup-flow marker do not authenticate cloud cache
+contents. Verify runtime requires six successful supported-transport context returns against a
+fixed small text source, with ordinary and independent compaction credentials. It does not trust
+model claims. Its private scope rejects business execution and compaction submission; manual
+verification retains the original user choice, Send, start, and Sent policy. The stored owner-only
+evidence contains no read credentials and is bound to profile/home, mode, exact plugin, tunnel,
+runtime command, and installed schema digest. Binding changes invalidate it; it has no time-based
+expiry. Navigation publication and new compaction admission require this evidence. It proves
+callability, not raw cloud schema contents or continued model reliability.
+
+### Context source capabilities
+
+`codex_context_list`, `codex_context_read`, and `codex_context_search` read an immutable snapshot of
+actual legal task sources. They do not execute Native tools, acknowledge task updates, or upgrade
+tool content into instructions. `_rawBody` is used only for verified visible source fields; it is
+not a navigable dump of authentication or hidden runtime state. Arbitrary file paths, URLs, digests,
+and unavailable file IDs grant no read authority. Source roles and completeness stay explicit;
+ambiguous tool-call relationships do not become evidence of success.
+
+Ordinary reads require the current mode credential, selected plan, context ID, delivered entry,
+and original start/Sent conditions. Snapshot IDs, references, and cursors are not credentials and
+cannot cross modes, unauthorized owners, physical executions, or retired scopes. Required-image readiness is
+separate from ACK and completion fences. A successful MCP image return records delivery to the
+supported transport, not model understanding. Zero Risk fallback confirmation is a scoped user
+statement, not programmatic attachment inspection. ChatGPT-owned tools have no server-side image
+readiness interception; their ordering remains a prompt requirement.
+
+Compaction's `compaction_token` is an independent read-only capability for the same three tools.
+It cannot start business work, list business tools, ACK, complete a turn, or submit a checkpoint.
+The original submission capability cannot substitute for it, and ordinary credentials cannot read
+its snapshot. Historical task instructions are summary evidence. The model chooses what to read;
+submission checks actual control delivery, source availability, failures, in-flight reads, and the
+original transaction protections rather than a claimed reading percentage.
+
+Snapshots are bounded active-task data. Completion, cancellation, expiry, and retirement revoke
+new access, and in-flight returns recheck revocation. Process restart invalidates old read
+credentials and references. Recovery needs actual verified source bytes and existing writer/Send
+admission; a digest or old page URL cannot restore content or authorize a second Send. Journals
+store bounded source-coverage metadata, not raw text, images, or read credentials. If access evidence
+is recorded, it contains references, ranges, sizes, routes, timing, and necessary identity summaries,
+not source bodies. See [context navigation](context-navigation.md) for the effective resource limits.
 
 ### Trusted user updates and owner writes
 
@@ -177,8 +221,10 @@ account traffic. Tool calls remain in the same ChatGPT response. The
 bounded local continuation cache is private, expires, and exists only to implement Codex
 `previous_response_id` replay. Full-mode context compaction accepts a checkpoint only through its
 one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
-fresh tool-free Temporary Chat receives the canonical Codex history; the bridge never parses ordinary
-assistant prose as a structured handoff.
+fresh read-only Temporary Chat uses actual canonical sources under the original recovery admission.
+Where navigation applies, its control exposes those sources through the independent read-only
+credential instead of replaying every body. The bridge never parses ordinary assistant prose as a
+structured handoff on the retained path.
 In delegated mode, retained compaction source proof comes only from the request-carried source turn ID,
 source message ID, source content, current native thread, model, and reasoning identity. Rollout aliases
 and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof retires the

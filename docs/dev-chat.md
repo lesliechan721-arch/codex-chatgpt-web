@@ -15,8 +15,27 @@ usable.
 - Run its browser smoke test and initialize the DEV profile. Complete MCP setup only when testing
   simulated tool rounds; browser, effort, context-limit, and compaction work in browser-only mode.
   The launcher stores any MCP credentials only in the DEV home and supervises only that isolated
-  tunnel. Create the ChatGPT connector as `Codex Native4 DEV`; keep `Codex Native4` unchanged. Preserve any old `Codex Native3 DEV` connector and create
-  `Codex Native4 DEV` as a new plugin; never rename or refresh the old DEV connector.
+  tunnel. Create `Codex Native5 DEV` as a new ChatGPT plugin; keep production `Codex Native5`
+  separate. Preserve `Codex Native4 DEV` and earlier retired connectors unchanged. Never rename
+  or refresh an old DEV connector. Setup preserves custom names that are not retired defaults;
+  a custom plugin with an old cached schema needs a newly named plugin. **Verify runtime** checks
+  the installed schema and requires six successful read-only context returns over fixed small text,
+  with ordinary and independent compaction credentials. Zero Risk keeps manual selection, Send,
+  start, and its Sent policy. This proves callability, not raw cloud schema or image understanding.
+
+The equivalent repository command is `bun run src/cli.ts verify-context --dev-profile` with the
+matching DEV Launcher signed in and its isolated tunnel running. Production verification uses
+`codex-chatgpt-web verify-context` and never shares its result with DEV. The historical long-wait
+probe contract does not expose the three context tools and cannot pass this check. Use the normal
+DEV MCP contract and a newly created identity for context navigation; verification does not change
+the configuration, rename a plugin, or refresh its remote cache. Evidence is invalidated by bound
+profile/mode/plugin/tunnel/runtime/schema changes and has no time-based expiry.
+If an existing DEV profile retains the long-wait probe flag on `Codex Native5 DEV`, select a new
+custom identity through normal DEV setup, for example
+`bun run src/cli.ts dev setup --full --automatic-browser-interaction --connector-name-suffix "Native5 DEV Context"`.
+Create `Codex Native5 DEV Context` as a new ChatGPT plugin on the configured DEV tunnel, then run
+Verify runtime. This custom name selects the normal native contract; the old probe plugin remains
+unchanged. Omitting the probe flag alone does not clear a previously stored probe configuration.
 
 Nothing is copied from the normal launcher. The DEV command fails closed if its own launcher,
 browser descriptor, credentials, or connector are not ready. It never falls back to the production
@@ -49,6 +68,34 @@ The direct DEV tool `mcp__dev_simulator__large_context_payload` accepts the expl
 inert prose through the real simulated MCP-result path so a live named chat can exercise retention
 and automatic compaction without embedding a giant fixture in the user prompt. It is advertised
 directly rather than through deferred tool search so the test can prove the requested call happened.
+
+The direct DEV tool `mcp__dev_simulator__image_probe` accepts only `image_id` (the integer 1, 2,
+or 3). It returns one inert PNG fixture through the actual Responses tool-result and MCP image
+path. Each fixed 720 × 240 image contains its own visual information. Repeated IDs return identical
+bytes. Descriptions do not reveal visual answers. Probe receipts and tool events contain image
+metadata only; canonical chat history retains the image. The tool reads no user files and needs no
+image attachment. Other outer tools retain
+their simulation behavior. This probe uses the existing connector ABI.
+
+Use a fresh Full/MCP named chat for each Automatic and Zero Risk A14 check:
+
+```text
+In this same response, call mcp__dev_simulator__image_probe in order with image_id 1, 2, 3, 1.
+After each call, read the complete number from the returned image itself. Do not infer it from
+metadata. After all four calls, list the four numbers in call order and state whether the first
+and fourth match. Do not use other tools.
+```
+
+Record the model and mode, connector and transport, effective input budget, PNG dimensions, byte
+counts and digests from receipts, call count, elapsed time, actual output, and observed attachment
+uploads. Keep evidence that all calls occur in one Web response. In Zero Risk, use the normal manual
+send process. Local tests verify the result chain; they do not prove live ChatGPT image consumption
+or increased attachment capacity.
+
+The recorded A14 checks used the preceding connector ABI. They establish only the limited image
+feasibility described in [release validation](release-validation.md#context-navigation-validation),
+not adoption of the new ABI or complete context-navigation acceptance. Current Full/MCP source
+delivery follows the [context navigation contract](context-navigation.md).
 
 Reusing the same name continues its canonical Responses history. Sequential native messages in the
 same compaction epoch lease one Temporary Chat, exactly like production. Every message receives a
@@ -118,15 +165,19 @@ uses the same model- and account-specific budget as the production catalog.
 
 Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
 must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.
-Images, the MCP connector, and the private `turn_token` are attached only to the final part.
+Actual fallback image attachments, the MCP connector, and the private `turn_token` belong only to
+the final part. MCP-routed images are read through the selected navigation entry after submission.
 In Full/MCP mode, compaction does not replay the expanded history into an unrelated summarizer. If
 the source Web response is still waiting on a tool boundary, its canonical tool results finish that
 response first without a compaction suffix. If those results are enough for an ordinary final
 answer, that committed answer remains owned by the logical Responses turn across the physical chat
 retirement. If the Web model instead requests another tool, the broker blocks that new execution
 and tells the response to stop; the compacted continuation then resumes the unfinished work. The
-exact retained chat receives one strict checkpoint message with only the one-shot MCP control
-capability and no ordinary work capability. The checkpoint never rides in the tail of a potentially
+exact retained chat receives one strict checkpoint message with the one-shot MCP submission
+capability and, when needed, an independent `compaction_token` for read-only sources. It grants no
+ordinary work capability. The model chooses which sources to read; no full-reading threshold is
+required. Source failures, remaining summary reserve, and in-flight reads still gate submission.
+The checkpoint never rides in the tail of a potentially
 huge tool result, and its wait is capped at five minutes independently of the normal turn timeout.
 After the structured handoff is accepted, the bridge explicitly ends that one-purpose browser turn
 and waits for its physical launcher settlement before closing the old surface; the next epoch then
@@ -154,7 +205,7 @@ Luna's later requests still include the accumulated transcript inside the same m
 28,000-token browser transport budget.
 
 Browser-only chats do not advertise outer tools and never claim simulated effects. Full setup keeps
-the launcher-owned DEV tunnel ready so ChatGPT can create and validate `Codex Native4 DEV` before a
+the launcher-owned DEV tunnel ready so ChatGPT can create and validate `Codex Native5 DEV` before a
 CLI chat starts. Each named chat attaches its broker to that tunnel, while every dispatched action
 still returns an explicit simulation receipt.
 
@@ -196,5 +247,6 @@ The DEV driver:
 - exposes ordinary structural tools, then returns a universal receipt containing
   `simulated: true` and `side_effects_performed: false` for every dispatched action.
 
-The simulator has no keyword-to-result table and never claims that a command, patch, image read,
-user interaction, or external mutation actually happened.
+The simulator has no keyword-to-result table and never claims that a command, patch, user-file read,
+user interaction, or external mutation actually happened. The dedicated image probe delivers inert
+fixture pixels through the real MCP result transport.

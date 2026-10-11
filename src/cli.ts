@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
+import { Console } from "node:console";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -22,6 +23,8 @@ import {
 } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
 import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
+import { runContextCapabilityVerification } from "./adapters/chatgpt-web/context-capability-verification";
+import { activateDevProfileEnvironment } from "./dev-chat/profile";
 import { runCommand } from "./process";
 import { startServer } from "./server";
 import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, stopService, uninstallService } from "./service";
@@ -46,6 +49,7 @@ Usage:
   codex-chatgpt-web api-key <status|disable|codex-config|cleanup|reconnect>
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
+  codex-chatgpt-web verify-context [--json] [--dev-profile]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web subagents <status|compatibility-v1|native>
   codex-chatgpt-web browser check
@@ -635,6 +639,35 @@ async function main(): Promise<void> {
   else if (command === "api-key") await runApiKeyCommand(args);
   else if (command === "login") await loginCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
+  else if (command === "verify-context") {
+    const json = takeFlag(args, "--json"); const dev = takeFlag(args, "--dev-profile");
+    const launcherControlled = takeFlag(args, "--launcher-controlled");
+    assertNoArgs(args);
+    if (launcherControlled) authorizeLauncherControl("context capability verification");
+    if (dev) {
+      if (home) throw new Error("--home does not apply to DEV verification; use CODEX_WEB_GPT_DEV_HOME");
+      activateDevProfileEnvironment();
+    }
+    const config = loadConfig();
+    if (dev !== (config.purpose === "dev-harness")) throw new Error("Capability verification profile does not match the configured runtime");
+    const controller = new AbortController();
+    const cancel = () => controller.abort(new Error("Context capability verification cancelled"));
+    process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+    const previousDiagnostics = { log: console.log, info: console.info, debug: console.debug };
+    // A verifier can own a new Broker; its lifecycle diagnostics must not enter the JSON result.
+    if (json) {
+      const diagnostics = new Console({ stdout: process.stderr, stderr: process.stderr });
+      console.log = diagnostics.log; console.info = diagnostics.info; console.debug = diagnostics.debug;
+    }
+    try {
+      const evidence = await runContextCapabilityVerification(config, { abortSignal: controller.signal });
+      stdout.write(json ? `${JSON.stringify({ ok: true, evidence })}\n`
+        : "All six read-only context MCP calls returned successfully. This proves callability for the selected profile, mode, plugin and tunnel; it is not a raw platform schema document.\n");
+    } finally {
+      Object.assign(console, previousDiagnostics);
+      process.off("SIGINT", cancel); process.off("SIGTERM", cancel);
+    }
+  }
   else if (command === "route") await routeCommand(args);
   else if (command === "subagents") await subagentsCommand(args);
   else if (command === "browser") {

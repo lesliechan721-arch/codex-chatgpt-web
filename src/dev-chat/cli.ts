@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { existsSync } from "node:fs";
 import { stdin, stdout } from "node:process";
-import { DEV_CHATGPT_CONNECTOR_NAME, DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, loadConfig } from "../config";
+import { DEV_CHATGPT_CONNECTOR_NAME, DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, loadConfig, type AppConfig } from "../config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -162,6 +162,16 @@ function printHeader(
     stdout.write(`${yellow("Bigger Context experimental")} · adaptive 1/2/3-message context · same-agent compaction handoff · elevated rate-limit/cooldown risk\n`);
   }
   stdout.write(`${dim("Codex route is untouched. No Responses port is bound, replaced, stopped, or restarted.")}\n`);
+}
+
+export function assertDevChatConnector(config: Pick<AppConfig, "mode" | "browserInteractionMode" | "appName">): void {
+  if (config.mode !== "full") return;
+  const accepted = config.browserInteractionMode === "manual"
+    ? config.appName === ZERO_RISK_CHATGPT_CONNECTOR_NAME
+    : config.appName === DEV_CHATGPT_CONNECTOR_NAME || config.appName === DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
+  if (!accepted) {
+    throw new Error("DEV connector identity is outdated or belongs to another interaction mode. Refresh the DEV profile in the launcher before starting a named chat");
+  }
 }
 
 async function assertLauncherReady(config: ReturnType<typeof loadConfig>): Promise<void> {
@@ -419,11 +429,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
     );
   }
   const config = loadConfig();
-  if (config.mode === "full"
-    && config.appName !== DEV_CHATGPT_CONNECTOR_NAME
-    && config.appName !== DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME) {
-    throw new Error("DEV connector identity is outdated. Refresh the DEV profile in the launcher before starting a named chat");
-  }
+  assertDevChatConnector(config);
   const runtimeStateRoot = paths.runtimePath;
   const features = readDevChatExperimentalFeatures(paths);
   await assertLauncherReady(config);

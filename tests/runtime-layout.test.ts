@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,9 +10,11 @@ import {
   defaultConfig,
   expandUserPath,
   isWindowsPipeEndpoint,
+  isLegacyChatGptConnectorIdentity,
   installedBunExecutable,
   loadConfig,
   loadConfigForSetup,
+  legacyChatGptConnectorMigrationMessage,
   providerConfig,
   resolveBrokerEndpoint,
   resolveInteractionConnectorIdentities,
@@ -181,7 +183,7 @@ test.each([
   }
   writeFileSync(join(root, "config.json"), `${JSON.stringify(legacy)}\n`);
 
-  expect(() => loadConfig()).toThrow("retired");
+  expect(loadConfig().appName).toBe(legacy.appName);
   const loaded = loadConfigForSetup();
   expect(loaded.mode).toBe(mode);
   expect(loaded.browserInteractionMode).toBe(interactionMode);
@@ -454,30 +456,30 @@ test("stored names survive config loading without an additional naming preferenc
 });
 
 
-test("task_updates-v1 retires previous default identities while preserving custom names", () => {
-  expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native4");
-  expect(DEV_CHATGPT_CONNECTOR_NAME).toBe("Codex Native4 DEV");
-  expect(ZERO_RISK_CHATGPT_CONNECTOR_NAME).toBe("Codex Zero Risk3");
-  for (const suffix of ["Native3", "Native3 DEV", "Zero Risk2"]) {
+test("context navigation retires previous default identities while preserving custom names", () => {
+  expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
+  expect(DEV_CHATGPT_CONNECTOR_NAME).toBe("Codex Native5 DEV");
+  expect(ZERO_RISK_CHATGPT_CONNECTOR_NAME).toBe("Codex Zero Risk4");
+  for (const suffix of ["Native3", "Native3 DEV", "Zero Risk2", "Native4", "Native4 DEV", "Zero Risk3"]) {
     expect(() => validateConnectorNameSuffix(suffix)).toThrow("retired");
   }
   for (const profile of ["production", "development"] as const) {
-    for (const automaticAppName of ["Codex Native3", "Codex Native3 DEV"]) {
+    for (const automaticAppName of ["Codex Native3", "Codex Native3 DEV", "Codex Native4", "Codex Native4 DEV"]) {
       const names = resolveInteractionConnectorIdentities("manual", profile, {
-        automaticAppName, manualAppName: "Codex Zero Risk2",
+        automaticAppName, manualAppName: "Codex Zero Risk3",
       });
       expect(names.automaticAppName).toBe(profile === "production" ? CHATGPT_CONNECTOR_NAME : DEV_CHATGPT_CONNECTOR_NAME);
       expect(names.appName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
     }
     const custom = resolveInteractionConnectorIdentities("automatic", profile, {
-      automaticAppName: "Codex Native3 - Work", manualAppName: "Codex Zero Risk2 - Work",
+      automaticAppName: "Codex Native4 - Work", manualAppName: "Codex Zero Risk3 - Work",
     });
-    expect(custom.automaticAppName).toBe("Codex Native3 - Work");
-    expect(custom.manualAppName).toBe("Codex Zero Risk2 - Work");
+    expect(custom.automaticAppName).toBe("Codex Native4 - Work");
+    expect(custom.manualAppName).toBe("Codex Zero Risk3 - Work");
   }
 });
 
-test("setup migrates Zero Risk2 but loading its stale active runtime fails closed", () => {
+test("setup reads a retired Zero Risk runtime without authorizing or writing it", () => {
   const root = join(tmpdir(), `cgw-abi-migration-${process.pid}-${Date.now()}`);
   roots.push(root);
   process.env.CODEX_CHATGPT_WEB_HOME = root;
@@ -485,16 +487,19 @@ test("setup migrates Zero Risk2 but loading its stale active runtime fails close
   const config = {
     ...defaultConfig("full"), browserHost: "launcher" as const,
     browserHostDescriptorPath: join(root, "launcher.json"), browserInteractionMode: "manual",
-    appName: "Codex Zero Risk2", manualAppName: "Codex Zero Risk2", automaticAppName: "Codex Native3",
+    appName: "Codex Zero Risk3", manualAppName: "Codex Zero Risk3", automaticAppName: "Codex Native4",
     tunnel: { binaryPath: join(root, "tunnel"), tunnelId: `tunnel_${"a".repeat(32)}`,
       runtimeKeyFile: join(root, "key"), profileDir: root, profileName: "test", alias: "test" },
   };
   writeFileSync(join(root, "config.json"), JSON.stringify(config));
-  expect(() => loadConfig()).toThrow("retired");
+  const original = readFileSync(join(root, "config.json"), "utf8");
+  expect(loadConfig().appName).toBe("Codex Zero Risk3");
   const migrated = loadConfigForSetup();
   expect(migrated.appName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
   expect(migrated.manualAppName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
-  expect(migrated.automaticAppName).toBe("Codex Native3");
+  expect(migrated.automaticAppName).toBe("Codex Native4");
+  expect(readFileSync(join(root, "config.json"), "utf8")).toBe(original);
+  expect(isLegacyChatGptConnectorIdentity(config.appName)).toBe(true);
 });
 
 
@@ -509,4 +514,33 @@ test("setup still repairs the previous release's collided Zero Risk2 automatic i
   expect(() => loadConfig()).toThrow("retired");
   expect(loadConfigForSetup()).toMatchObject({ appName: CHATGPT_CONNECTOR_NAME,
     automaticAppName: CHATGPT_CONNECTOR_NAME, manualAppName: ZERO_RISK_CHATGPT_CONNECTOR_NAME });
+});
+
+test("retired ABI diagnostics cover both modes and keep custom names exact", () => {
+  for (const [name, replacement] of [
+    ["Codex Native4", "Codex Native5"],
+    ["Codex Native4 DEV", "Codex Native5 DEV"],
+    ["Codex Zero Risk3", "Codex Zero Risk4"],
+  ]) {
+    expect(isLegacyChatGptConnectorIdentity(name!)).toBe(true);
+    const message = legacyChatGptConnectorMigrationMessage(name!);
+    expect(message).toContain(`newly created connector named ${JSON.stringify(replacement)}`);
+    expect(message).toContain(`do not rename or refresh ${JSON.stringify(name)}`);
+  }
+  for (const name of [CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME,
+    "Codex Native4 - Work", "Codex Zero Risk3 - Work"]) {
+    expect(isLegacyChatGptConnectorIdentity(name)).toBe(false);
+  }
+});
+
+test("browser-only configuration accepts old unused connector identities without setup", () => {
+  const root = join(tmpdir(), `cgw-browser-only-abi-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config = { ...defaultConfig("browser-only"), appName: "Codex Native4",
+    automaticAppName: "Codex Native4", manualAppName: "Codex Zero Risk3" };
+  writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(loadConfig()).toMatchObject({ mode: "browser-only", appName: "Codex Native4", manualAppName: "Codex Zero Risk3" });
+  expect(providerConfig(loadConfig()).chatgptWeb?.localToolsEnabled).toBe(false);
 });

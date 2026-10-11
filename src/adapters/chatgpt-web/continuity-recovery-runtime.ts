@@ -6,6 +6,9 @@ import { continuityError } from "./continuity-errors";
 import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryWorkRecord } from "./continuity-recovery-store";
 import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import type { BrokerToolRequest } from "./turn-broker";
+import { assertContextCoverageAdvance, validateContextCoverageMetadata, type ContextCoverageMetadata } from "./context-coverage-journal";
+import { CompactionSourceCoverage } from "./compaction-context";
+import type { ContextSnapshot } from "./context-snapshot";
 
 /** Passed only through authenticated local owner registration, never Native invocation input. */
 export interface RuntimeRecoveryReference {
@@ -57,10 +60,174 @@ export function assertRecoveryWriter(ref: RuntimeRecoveryReference): RecoveryThr
   }
   return record;
 }
+/** Merge complete in-memory evidence; missing entries are not proof of restored sources. */
+function applyRecoveryContextCoverage(record: RecoveryThreadRecord, ref: RuntimeRecoveryReference,
+  metadata: readonly Readonly<ContextCoverageMetadata>[], consumeReservation = true): void {
+  const work = record.works[ref.logicalWorkId]!;
+  const attempt = work.attempts[ref.attempt]!;
+  const incoming = new Map<string, Readonly<ContextCoverageMetadata>>();
+  for (const value of metadata) {
+    validateContextCoverageMetadata(value);
+    if (incoming.has(value.planId)) throw continuityError("continuity_source_unproven", "Source coverage contains duplicate plans.");
+    incoming.set(value.planId, value);
+  }
+  const retainedAll = record.contextCoverage ?? [];
+  const retained = retainedAll.filter(entry => entry.workLineageId === work.workLineageId);
+  for (const entry of retainedAll) {
+    if (entry.workLineageId === work.workLineageId || !incoming.has(entry.metadata.planId)) continue;
+    if (canonicalJson(entry.metadata) !== canonicalJson(incoming.get(entry.metadata.planId)!)) {
+      throw continuityError("continuity_source_unproven", "A source plan cannot change another instruction lineage's coverage.");
+    }
+  }
+  for (const entry of retained) {
+    if (!incoming.has(entry.metadata.planId)) throw continuityError("continuity_source_unproven",
+      "The retained digest journal has uncovered sources that were not independently restored; compaction source recovery is unavailable.");
+    const after = incoming.get(entry.metadata.planId)!;
+    assertContextCoverageAdvance(entry.metadata, after);
+    if (canonicalJson(entry.metadata) !== canonicalJson(after) && entry.ownerId !== record.owner.id) {
+      throw continuityError("continuity_source_unproven", "A source candidate cannot modify another owner's coverage.");
+    }
+  }
+  const entries = retained.map(entry => ({ ...entry,
+    sourceTaskRevision: canonicalJson(entry.metadata) === canonicalJson(incoming.get(entry.metadata.planId)!) ? entry.sourceTaskRevision
+      : Math.max(entry.sourceTaskRevision, work.acceptedTaskRevision),
+    metadata: structuredClone(incoming.get(entry.metadata.planId)!) }));
+  for (const value of metadata) {
+    if (retainedAll.some(entry => entry.metadata.planId === value.planId)) continue;
+    if (retainedAll.some(entry => !entry.metadata.delivered && (entry.workLineageId === work.workLineageId || incoming.has(entry.metadata.planId)))) {
+      throw continuityError("continuity_source_unproven", "An unresolved selected source Send prevents a replacement plan.");
+    }
+    // A post-checkpoint memory cleanup can still hold the just-covered entries.
+    if (Object.values(record.checkpoints).some(commit => commit.workLineageId === work.workLineageId
+      && commit.sourceHistoryRevision >= value.historyRevision && commit.acceptedTaskRevision >= work.acceptedTaskRevision)) continue;
+    if (value.historyRevision !== record.historyRevision || value.historyRevision !== attempt.historyRevision) {
+      throw continuityError("continuity_source_unproven", "Source coverage is bound to another history revision.");
+    }
+    entries.push({ ownerId: record.owner.id, logicalWorkId: work.logicalWorkId, workLineageId: work.workLineageId,
+      attempt: attempt.attempt, epoch: attempt.epoch, acceptedTaskRevision: work.acceptedTaskRevision,
+      sourceTaskRevision: work.acceptedTaskRevision, metadata: structuredClone(value) });
+  }
+  const byPlan = new Map(entries.map(entry => [entry.metadata.planId, entry]));
+  record.contextCoverage = [...retainedAll.map(entry => byPlan.get(entry.metadata.planId) ?? entry),
+    ...entries.filter(entry => !retainedAll.some(previous => previous.metadata.planId === entry.metadata.planId))];
+  const reservation = record.contextCoverageReservations?.find(value => value.logicalWorkId === ref.logicalWorkId && value.attempt === ref.attempt);
+  if (consumeReservation && reservation && canonicalJson(entries) !== canonicalJson(retained)) {
+    if (reservation.ownerId !== record.owner.id || !reservation.candidateDigests.includes(recoveryDigest(entries.map(entry => entry.metadata)))) {
+      throw continuityError("continuity_source_unproven", "The selected source plan does not match its reserved candidate.");
+    }
+    record.contextCoverageReservations = record.contextCoverageReservations!.filter(value => value !== reservation);
+  }
+}
+/** Reserve before a manual candidate can be copied or displayed. No candidate is delivered evidence. */
+export function reserveRecoveryContextCoverage(ref: RuntimeRecoveryReference,
+  candidates: readonly (readonly Readonly<ContextCoverageMetadata>[])[]): void {
+  if (!candidates.length || candidates.length > 2) throw continuityError("continuity_source_unproven", "Source admission requires one or two fixed candidates.");
+  const record = assertRecoveryWriter(ref);
+  const lineage = record.works[ref.logicalWorkId]!.workLineageId;
+  const candidateRecords = candidates.map(metadata => {
+    const candidate = structuredClone(record); applyRecoveryContextCoverage(candidate, ref, metadata, false);
+    return (candidate.contextCoverage ?? []).filter(entry => entry.workLineageId === lineage);
+  });
+  const candidateDigests = [...new Set(candidateRecords.map(entries => recoveryDigest(entries.map(entry => entry.metadata))))];
+  const existing = record.contextCoverageReservations?.find(value => value.logicalWorkId === ref.logicalWorkId && value.attempt === ref.attempt);
+  if (existing) {
+    if (existing.ownerId !== record.owner.id || canonicalJson(existing.candidateDigests) !== canonicalJson(candidateDigests)) {
+      throw continuityError("continuity_source_unproven", "The existing source candidate reservation cannot be rebound.");
+    }
+    recoveryStore(ref).confirmDurable(ref.thread, { scope: record.scope, expectedVersion: record.version, expectedOwner: record.owner.id });
+    return;
+  }
+  let bytes = 0;
+  for (const entries of candidateRecords) {
+    // Charge the complete candidate including owner bindings, not only the bare hashes.
+    bytes = Math.max(bytes, Buffer.byteLength(JSON.stringify(entries)) + 256);
+  }
+  recoveryStore(ref).transact(ref.thread, { scope: record.scope, expectedVersion: record.version, expectedOwner: record.owner.id }, draft => {
+    (draft.contextCoverageReservations ??= []).push({ ownerId: record.owner.id, logicalWorkId: ref.logicalWorkId,
+      attempt: ref.attempt, epoch: draft.epoch, historyRevision: draft.historyRevision, candidateDigests, bytes });
+  });
+}
+export interface RecoveryContextCoverage {
+  metadata(): readonly Readonly<ContextCoverageMetadata>[];
+  bindPersistence(persist: (metadata: readonly Readonly<ContextCoverageMetadata>[]) => void,
+    initialMetadata?: readonly Readonly<ContextCoverageMetadata>[]): void;
+}
+/** Verify real recovered bytes before recovering only the current lineage's digest ledger. */
+export function restoreRecoveryContextCoverage(ref: RuntimeRecoveryReference, snapshot: ContextSnapshot): CompactionSourceCoverage | undefined {
+  const record = assertRecoveryWriter(ref);
+  const work = record.works[ref.logicalWorkId]!;
+  const entries = (record.contextCoverage ?? []).filter(entry => entry.workLineageId === work.workLineageId);
+  if (!entries.length) return undefined;
+  const currentAttempt = work.attempts[ref.attempt]!;
+  for (const related of Object.values(record.works)) {
+    if (related.workLineageId !== work.workLineageId) continue;
+    if (related.attempts.some(attempt => !attempt.dispatchProtocolComplete || attempt !== currentAttempt && !attempt.writerRetired)) {
+      throw continuityError("continuity_source_unproven", "Source coverage recovery requires every prior writer to be proved retired.");
+    }
+  }
+  if (Object.values(record.calls).some(call => call.workLineageId === work.workLineageId
+    && !["settled", "cancelled-before-delivery"].includes(call.state))) {
+    throw continuityError("continuity_execution_unsettled", "Source coverage recovery requires all issued calls to have real settlement evidence.");
+  }
+  const checkpointed = new Set(Object.values(record.checkpoints).filter(checkpoint => checkpoint.workLineageId === work.workLineageId)
+    .flatMap(checkpoint => checkpoint.coveredCallIds));
+  for (const call of Object.values(record.calls)) {
+    if (call.workLineageId !== work.workLineageId || call.state !== "settled" || checkpointed.has(call.callId)) continue;
+    if (!snapshot.targets.some(target => target.call_id === call.callId && target.original_role === "toolResult")) {
+      throw continuityError("continuity_context_missing", "The recovered source snapshot omits an uncovered real tool result.");
+    }
+  }
+  if (entries.some(entry => entry.metadata.historyRevision !== record.historyRevision
+    || entry.sourceTaskRevision > work.acceptedTaskRevision)) {
+    throw continuityError("continuity_source_unproven", "The recovered source journal belongs to another history or accepted instruction revision.");
+  }
+  return CompactionSourceCoverage.restoreVerifiedSource(snapshot, entries.map(entry => entry.metadata), record.historyRevision);
+}
+/** Only an explicit pre-publication capacity rejection permits this cleanup. */
+export function releaseRecoveryContextCoverageReservation(ref: RuntimeRecoveryReference): void {
+  const record = assertRecoveryWriter(ref);
+  recoveryStore(ref).releaseContextCoverageReservation(ref.thread,
+    { scope: record.scope, expectedVersion: record.version, expectedOwner: record.owner.id },
+    { logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, ownerId: ref.ownerId ?? record.owner.id });
+}
+/** The callback must complete before the coverage object publishes a mutation. */
+export function bindRecoveryContextCoverage(ref: RuntimeRecoveryReference, coverage: RecoveryContextCoverage,
+  initialMetadata?: readonly Readonly<ContextCoverageMetadata>[]): void {
+  const ownerId = ref.ownerId ?? recoveryRecord(ref).owner.id;
+  if (initialMetadata) {
+    const record = assertRecoveryWriter({ ...ref, ownerId });
+    const lineage = record.works[ref.logicalWorkId]!.workLineageId;
+    const foreignPlans = new Set((record.contextCoverage ?? []).filter(entry => entry.workLineageId !== lineage).map(entry => entry.metadata.planId));
+    if (canonicalJson(initialMetadata.filter(value => !foreignPlans.has(value.planId)))
+      !== canonicalJson((record.contextCoverage ?? []).filter(entry => entry.workLineageId === lineage).map(entry => entry.metadata))) {
+      throw continuityError("continuity_source_unproven", "Rebinding source coverage requires the exact already committed append metadata.");
+    }
+  }
+  const persist = (metadata: readonly Readonly<ContextCoverageMetadata>[]): void => {
+    const record = recoveryRecord(ref);
+    if (record.owner.id !== ownerId) throw continuityError("continuity_source_unproven", "An obsolete owner cannot write source coverage.");
+    const candidate = structuredClone(record);
+    applyRecoveryContextCoverage(candidate, ref, metadata);
+    if (canonicalJson(candidate.contextCoverage ?? []) === canonicalJson(record.contextCoverage ?? [])
+      && canonicalJson(candidate.contextCoverageReservations ?? []) === canonicalJson(record.contextCoverageReservations ?? [])) {
+      if (record.contextCoverage?.length || record.contextCoverageReservations?.length) {
+        recoveryStore(ref).confirmDurable(ref.thread, { scope: record.scope, expectedVersion: record.version, expectedOwner: ownerId });
+      }
+      return;
+    }
+    assertRecoveryWriter({ ...ref, ownerId });
+    recoveryStore(ref).transact(ref.thread, { scope: record.scope, expectedVersion: record.version, expectedOwner: ownerId }, draft => {
+      applyRecoveryContextCoverage(draft, ref, metadata);
+    });
+  };
+  coverage.bindPersistence(persist, initialMetadata);
+}
 /** Every Broker entry uses this one boundary before returning calls to an outer executor. */
 export function recordRecoveryDelivery(ref: RuntimeRecoveryReference, requests: Array<BrokerToolRequest & { operationId?: number }>): void {
-  const record = assertRecoveryWriter(ref);
+  // An observer may drain an empty queue after the accepted final retired its writer.
+  // There is no dispatch authority or durable evidence to publish in that case.
   if (!requests.length) return;
+  const record = assertRecoveryWriter(ref);
   const store = recoveryStore(ref);
   // Publish identities and delivery-possible in one atomic write. An interrupted return is
   // deliberately unknown, never proof that the outer executor did not receive the call.
@@ -284,6 +451,7 @@ export interface RecoveryAppendAdmission {
   workPayloadDigest: string; snapshotDigest: string;
   localSessionId: string; localTaskRevision: number;
   results: Array<{ callId: string; resultType: string; resultDigest: string }>;
+  contextCoverage?: readonly Readonly<ContextCoverageMetadata>[];
 }
 /** Broker calls this after validation, immediately before publishing the new writer version. */
 export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: RecoveryAppendAdmission): void | { committed: boolean; confirm: () => void } {
@@ -294,6 +462,7 @@ export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: Recov
   let confirmation: { committed: boolean; confirm: () => void } | undefined;
   try { updated = store.transact(ref.thread, { scope: record.scope, expectedVersion: record.version }, draft => {
     candidate = draft;
+    if (input.contextCoverage) applyRecoveryContextCoverage(draft, ref, input.contextCoverage);
     const predecessor = draft.works[ref.logicalWorkId]!;
     const lineage = draft.lineages[predecessor.workLineageId]!;
     for (const result of input.results) {
@@ -308,6 +477,9 @@ export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: Recov
     const oldAttempt = predecessor.attempts[ref.attempt]!;
     oldAttempt.writerRetired = true;
     const taskRevision = ++lineage.acceptedTaskRevision;
+    if (input.contextCoverage) for (const entry of draft.contextCoverage ?? []) {
+      if (entry.workLineageId === predecessor.workLineageId) entry.sourceTaskRevision = taskRevision;
+    }
     lineage.headLogicalWorkId = input.logicalWorkId;
     lineage.taskMappings[recoveryDigest([input.localSessionId, input.localTaskRevision])] = taskRevision;
     const next = { attempt: 0, epoch: draft.epoch, historyRevision: draft.historyRevision,

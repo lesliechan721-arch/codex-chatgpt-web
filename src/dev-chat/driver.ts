@@ -22,6 +22,7 @@ import {
 import { parseRequest } from "../responses/parser";
 import { compactRequest, responseRequest, routeChatGptWebRequest } from "../server";
 import { namespacedToolName, type AdapterEvent, type CodexProviderConfig } from "../types";
+import { createDevImageProbe, DEV_IMAGE_PROBE_TOOL, DEV_IMAGE_PROBE_TOOL_NAME } from "./image-probe";
 import {
   createDevCoherentContextPayload,
   createDevContextFiller,
@@ -90,7 +91,8 @@ interface DevToolCall {
 export const DEV_CHAT_SYSTEM_INSTRUCTIONS = [
   "You are running inside the Codex Web GPT DEV outer-harness simulator.",
   "Behave like the normal Codex model backend and use the available Codex Native tools whenever they help answer the user's request.",
-  "Every outer tool result is an explicit simulation receipt. No command, file edit, image read, user prompt, or external side effect actually occurs.",
+  "Outer actions return explicit simulation receipts. No command, file edit, user prompt, or external side effect actually occurs.",
+  "Only mcp__dev_simulator__image_probe returns actual inert fixture pixels through the MCP image-result transport. Read these images when requested. All other outer tools, including view_image, remain simulated and do not read user files.",
   "Never describe a simulated receipt as a real-world effect. Continue reasoning from the receipt exactly as test evidence for the transport flow.",
 ].join(" ");
 
@@ -129,6 +131,7 @@ export const DEV_CHAT_TOOLS: readonly Record<string, unknown>[] = [
   simulatedFunction("view_image", "native image inspection"),
   simulatedFunction("request_user_input", "native user input"),
   largeContextPayloadTool,
+  DEV_IMAGE_PROBE_TOOL,
   {
     type: "namespace", name: "mcp__dev_simulator",
     description: "Synthetic deferred MCP tools for inventory and generic dispatch tests.",
@@ -299,7 +302,7 @@ function simulatedReceipt(state: DevChatState, turnId: string, call: DevToolCall
   };
 }
 
-function toolOutput(call: DevToolCall, receipt: Record<string, unknown>): Record<string, unknown> {
+function toolOutput(call: DevToolCall, receipt: Record<string, unknown>, image?: ReturnType<typeof createDevImageProbe>["image"]): Record<string, unknown> {
   const metadata = { turn_id: receipt.turn_id };
   if (call.kind === "custom") {
     return {
@@ -312,7 +315,7 @@ function toolOutput(call: DevToolCall, receipt: Record<string, unknown>): Record
   return {
     type: "function_call_output",
     call_id: call.callId,
-    output: JSON.stringify(receipt),
+    output: image ? [{ type: "input_text", text: JSON.stringify(receipt) }, image] : JSON.stringify(receipt),
     internal_chat_message_metadata_passthrough: metadata,
   };
 }
@@ -572,6 +575,24 @@ export class DevChatDriver {
 
       totalToolCalls += calls.length;
       for (const call of calls) {
+        if (call.name === DEV_IMAGE_PROBE_TOOL_NAME) {
+          if (call.kind !== "function") throw new Error("DEV image probe requires a function call");
+          const probe = createDevImageProbe(call.input);
+          const receipt = {
+            type: "codex_dev_image_probe_result",
+            simulated: true,
+            side_effects_performed: false,
+            chat: state.name,
+            turn_id: turnId,
+            call_id: call.callId,
+            tool: { name: call.name, kind: call.kind },
+            ...probe.metadata,
+          };
+          emit({ type: "tool_call", name: call.name, input: { image_id: probe.metadata.image_id } });
+          emit({ type: "tool_result", name: call.name, receipt });
+          workingInput.push(toolOutput(call, receipt, probe.image));
+          continue;
+        }
         emit({ type: "tool_call", name: call.name, input: call.input });
         if (call.name === DEV_NATIVE_LONG_WAIT_TOOL_NAME) {
           await new Promise(resolveWait => setTimeout(resolveWait, DEV_NATIVE_LONG_WAIT_DELAY_MS));

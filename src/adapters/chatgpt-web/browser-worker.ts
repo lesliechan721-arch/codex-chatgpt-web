@@ -1,4 +1,5 @@
 import { observedTaskAcknowledgement, observedTaskOutputVersion } from "./task-update-ack";
+import { validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -1377,6 +1378,8 @@ export interface BrowserTurn {
   continuity?: import("./continuity-contract").ContinuityClaim;
   onContinuityLease?: (lease: import("./continuity-contract").ContinuityLease) => void;
   onPreparedSelected?: (reused: boolean) => void | Promise<void>;
+  /** Confirm the exact prepared navigation plan before any attachment upload or Send. */
+  onContextPlanSelected?: (planId: string) => void | Promise<void>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
   /** Send activation is the ambiguity boundary after which a fresh surface must not replay this prompt. */
@@ -5263,7 +5266,9 @@ export class ChatGptBrowserWorker {
     const sourcePrompt = await prepare();
     const prepared = turn.nativeConnector ? {
       ...sourcePrompt,
-      text: `${sourcePrompt.text}\nUse codex_tool_call from the selected app ${JSON.stringify(this.config.appName)}. Do not use another Codex app or connector: it owns a different harness and cannot accept this token.`,
+      text: turn.compaction
+        ? `${sourcePrompt.text}\nUse only the compaction read-only context tools declared by the selected app ${JSON.stringify(this.config.appName)} and the submission entry specified in the current instructions. Do not call the business gateway. Do not use another Codex app or connector: it owns a different harness and cannot accept this token.`
+        : `${sourcePrompt.text}\nUse codex_tool_call from the selected app ${JSON.stringify(this.config.appName)}. Do not use another Codex app or connector: it owns a different harness and cannot accept this token.`,
     } : sourcePrompt;
     const diagnostics = new ChatGptBrowserDiagnostics(
       turn.traceId,
@@ -5282,6 +5287,16 @@ export class ChatGptBrowserWorker {
       : rejectionAbort.signal };
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      if (prepared.contextPlan) {
+        validateBrowserHelperContextPlan(prepared.contextPlan);
+        if (!turn.onContextPlanSelected) {
+          throw new ChatGptWebAdapterError("The prepared context plan has no selection acknowledgement", {
+            status: 503, errorType: "server_error", code: "codex_context_selection_required", retryable: false,
+          });
+        }
+        await turn.onContextPlanSelected(prepared.contextPlan.planId);
+        if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      }
       // Validate only the selected physical message, not canonical history used for usage estimates.
       assertChatGptPromptAttachments(prepared);
       const multipartTransactionId = prepared.multipart

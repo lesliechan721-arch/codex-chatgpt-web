@@ -6,7 +6,8 @@ import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } fr
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
-import { createBrowserHelperPromptSelection } from "./browser-helper-prompt-selection";
+import { createBrowserHelperPromptSelection, validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
+import { LAUNCHER_CONTEXT_DELIVERY_FEATURE } from "../../launcher-browser-host";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityClaim, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
@@ -39,6 +40,7 @@ interface RunMessage {
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
     taskUpdateProtocol?: 1;
+    submissionReceiptAcknowledgement?: boolean;
   };
 }
 
@@ -74,7 +76,9 @@ type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage | Limits
 type InputMessage = { recovery?: ContinuityRecoveryIdentity } & (RunMessage
   | MaintenanceMessage
   | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
+  | { type: "context_plan_selected_ack"; id: string; planId: string }
   | { type: "send_activation_ack"; id: string }
+  | { type: "submitted_ack"; id: string }
   | { type: "completion_fence_begin_ack"; id: string; requestId: number; revision: number | null }
   | { type: "completion_fence_commit_ack"; id: string; requestId: number; committed: boolean }
   | { type: "progress"; id: string; snapshot: ChatGptExternalTurnProgressSnapshot }
@@ -104,10 +108,30 @@ const turnRecoveryIdentities = new Map<string, ContinuityRecoveryIdentity>();
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
 const taskUpdateTurns = new Set<string>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
+const contextPlanSelections = new Map<string, { prepared: CompiledChatGptWebPrompt; timer: ReturnType<typeof setTimeout> }>();
+const acknowledgedContextPlanIds = new Map<string, string>();
+const CONTEXT_PLAN_ACK_TIMEOUT_MS = 15_000;
+function clearContextPlanSelection(id: string): void {
+  const pending = contextPlanSelections.get(id);
+  if (pending) clearTimeout(pending.timer);
+  contextPlanSelections.delete(id);
+}
 const sendActivationWaiters = new Map<string, {
   resolve: () => void;
   reject: (error: Error) => void;
 }>();
+const submissionReceiptWaiters = new Map<string, {
+  promise: Promise<void>;
+  timer: ReturnType<typeof setTimeout>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}>();
+function clearSubmissionReceiptWaiter(id: string): ReturnType<typeof submissionReceiptWaiters.get> {
+  const waiter = submissionReceiptWaiters.get(id);
+  if (waiter) clearTimeout(waiter.timer);
+  submissionReceiptWaiters.delete(id);
+  return waiter;
+}
 const completionFenceBeginWaiters = new Map<string, {
   requestId: number;
   resolve: (revision: number | undefined) => void;
@@ -134,10 +158,15 @@ function requestShutdown(): Promise<void> {
   for (const controller of abortControllers.values()) controller.abort();
   for (const selection of preparedSelections.values()) selection.cancel();
   preparedSelections.clear();
+  for (const id of contextPlanSelections.keys()) clearContextPlanSelection(id);
+  acknowledgedContextPlanIds.clear();
   for (const waiter of sendActivationWaiters.values()) {
     waiter.reject(new DOMException("Browser helper is shutting down", "AbortError"));
   }
   sendActivationWaiters.clear();
+  for (const id of submissionReceiptWaiters.keys()) {
+    clearSubmissionReceiptWaiter(id)?.reject(new DOMException("Browser helper is shutting down", "AbortError"));
+  }
   for (const waiter of completionFenceBeginWaiters.values()) {
     waiter.reject(new DOMException("Browser helper is shutting down", "AbortError"));
   }
@@ -197,6 +226,10 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.taskUpdateProtocol !== undefined
     && (message.turn.taskUpdateProtocol !== 1 || message.turn.externalProgress !== true)) {
     throw new Error("Browser helper task update protocol is invalid");
+  }
+  if (message.turn.submissionReceiptAcknowledgement !== undefined
+    && typeof message.turn.submissionReceiptAcknowledgement !== "boolean") {
+    throw new Error("Browser helper submission receipt acknowledgement flag is invalid");
   }
   const recovery = message.turn.continuity?.recovery;
   if (recovery) turnRecoveryIdentities.set(message.id, recovery);
@@ -295,6 +328,13 @@ async function run(message: RunMessage): Promise<void> {
       }
       return promptSelection.wait().then(() => undefined);
     },
+    onContextPlanSelected: planId => {
+      // The daemon already confirmed this plan through the two-way IPC handshake.
+      // A direct worker still executes its selection hook, without repeating that IPC.
+      if (acknowledgedContextPlanIds.get(message.id) !== planId) {
+        throw new Error("Browser helper worker prepared an unacknowledged context plan");
+      }
+    },
     onSendActivated: () => new Promise<void>((resolve, reject) => {
       if (sendActivationWaiters.has(message.id)) {
         reject(new Error("Browser helper Send activation already awaits acknowledgement"));
@@ -307,9 +347,30 @@ async function run(message: RunMessage): Promise<void> {
       }
     }),
     onSubmitted: () => {
-      if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
-        throw new Error("Browser helper could not persist ChatGPT submission evidence");
+      if (!message.turn.submissionReceiptAcknowledgement) {
+        if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
+          throw new Error("Browser helper could not persist ChatGPT submission evidence");
+        }
+        return;
       }
+      if (submissionReceiptWaiters.has(message.id)) {
+        throw new Error("Browser helper submission receipt already awaits acknowledgement");
+      }
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      const promise = new Promise<void>((accept, fail) => { resolve = accept; reject = fail; });
+      // The real worker awaits this callback. Also retain a handled promise if a substituted
+      // worker returns early, so run() can still enforce the terminal receipt barrier.
+      void promise.catch(() => {});
+      const timer = setTimeout(() => {
+        clearSubmissionReceiptWaiter(message.id)?.reject(new Error("Browser helper submission receipt acknowledgement timed out"));
+      }, 15_000);
+      timer.unref?.();
+      submissionReceiptWaiters.set(message.id, { promise, timer, resolve, reject });
+      if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
+        clearSubmissionReceiptWaiter(message.id)?.reject(new Error("Browser helper could not persist ChatGPT submission evidence"));
+      }
+      return promise;
     },
     onMultipartStageAcknowledged: stageIndex => {
       if (!writeTurnProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
@@ -338,6 +399,7 @@ async function run(message: RunMessage): Promise<void> {
   };
   try {
     const text = await ChatGptBrowserWorker.forProvider(provider).run(turn);
+    await submissionReceiptWaiters.get(message.id)?.promise;
     writeTurnProtocol({ type: "result", id: message.id, text });
   } catch (error) {
     writeTurnProtocol({
@@ -355,9 +417,12 @@ async function run(message: RunMessage): Promise<void> {
   } finally {
     preparedSelections.get(message.id)?.cancel();
     preparedSelections.delete(message.id);
+    clearContextPlanSelection(message.id);
+    acknowledgedContextPlanIds.delete(message.id);
     const sendWaiter = sendActivationWaiters.get(message.id);
     sendActivationWaiters.delete(message.id);
     sendWaiter?.reject(new DOMException("Browser helper turn ended before Send acknowledgement", "AbortError"));
+    clearSubmissionReceiptWaiter(message.id)?.reject(new DOMException("Browser helper turn ended before submission receipt acknowledgement", "AbortError"));
     const beginWaiter = completionFenceBeginWaiters.get(message.id);
     completionFenceBeginWaiters.delete(message.id);
     beginWaiter?.reject(new DOMException("Browser helper turn ended before completion-fence begin", "AbortError"));
@@ -443,12 +508,17 @@ input.on("line", line => {
     if (!prepared || typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper prompt selection is invalid" });
       abortControllers.get(message.id)?.abort();
+      preparedSelections.get(message.id)?.cancel();
       return;
     }
-    try { validateSkillFiles(prepared.skillFiles); }
+    try {
+      validateSkillFiles(prepared.skillFiles);
+      validateBrowserHelperContextPlan(prepared.contextPlan);
+    }
     catch (error) {
       writeProtocol({ type: "error", id: message.id, message: error instanceof Error ? error.message : String(error) });
       abortControllers.get(message.id)?.abort();
+      preparedSelections.get(message.id)?.cancel();
       return;
     }
     if (prepared.multipart !== undefined) {
@@ -459,6 +529,7 @@ input.on("line", line => {
         || typeof multipart.commit !== "string") {
         writeProtocol({ type: "error", id: message.id, message: "Browser helper multipart prompt is invalid" });
         abortControllers.get(message.id)?.abort();
+        preparedSelections.get(message.id)?.cancel();
         return;
       }
     }
@@ -467,6 +538,43 @@ input.on("line", line => {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
       return;
     }
+    if (prepared.contextPlan) {
+      if (contextPlanSelections.has(message.id)) {
+        writeProtocol({ type: "error", id: message.id, message: "Browser helper context plan selection is already pending" });
+        abortControllers.get(message.id)?.abort();
+        selection.cancel();
+        return;
+      }
+      const recovery = turnRecoveryIdentities.get(message.id);
+      const timer = setTimeout(() => {
+        clearContextPlanSelection(message.id);
+        writeProtocol({ type: "error", id: message.id, message: "Browser helper context plan acknowledgement timed out",
+          ...(recovery ? { recovery } : {}) });
+        abortControllers.get(message.id)?.abort();
+        selection.cancel();
+      }, CONTEXT_PLAN_ACK_TIMEOUT_MS);
+      timer.unref?.();
+      contextPlanSelections.set(message.id, { prepared, timer });
+      if (!writeProtocol({ type: "event", id: message.id, event: "context_plan_selected", planId: prepared.contextPlan.planId,
+        ...(recovery ? { recovery } : {}) })) {
+        clearContextPlanSelection(message.id);
+        abortControllers.get(message.id)?.abort();
+        selection.cancel();
+      }
+    } else {
+      selection.select(prepared);
+    }
+  } else if (message.type === "context_plan_selected_ack") {
+    const prepared = contextPlanSelections.get(message.id)?.prepared;
+    const selection = preparedSelections.get(message.id);
+    if (!prepared?.contextPlan || !selection || message.planId !== prepared.contextPlan.planId) {
+      writeProtocol({ type: "error", id: message.id, message: "Browser helper received a mismatched context plan acknowledgement" });
+      abortControllers.get(message.id)?.abort();
+      selection?.cancel();
+      return;
+    }
+    clearContextPlanSelection(message.id);
+    acknowledgedContextPlanIds.set(message.id, message.planId);
     selection.select(prepared);
   } else if (message.type === "send_activation_ack") {
     const waiter = sendActivationWaiters.get(message.id);
@@ -475,6 +583,13 @@ input.on("line", line => {
       return;
     }
     sendActivationWaiters.delete(message.id);
+    waiter.resolve();
+  } else if (message.type === "submitted_ack") {
+    const waiter = clearSubmissionReceiptWaiter(message.id);
+    if (!waiter) {
+      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending submission receipt" });
+      return;
+    }
     waiter.resolve();
   } else if (message.type === "completion_fence_begin_ack") {
     if (!Number.isSafeInteger(message.requestId) || message.requestId <= 0
@@ -527,9 +642,12 @@ input.on("line", line => {
       ? new ChatGptCompactionHandoffAccepted()
       : undefined);
     preparedSelections.get(message.id)?.cancel();
+    clearContextPlanSelection(message.id);
+    acknowledgedContextPlanIds.delete(message.id);
     const waiter = sendActivationWaiters.get(message.id);
     sendActivationWaiters.delete(message.id);
     waiter?.reject(new DOMException("Browser helper turn aborted before Send acknowledgement", "AbortError"));
+    clearSubmissionReceiptWaiter(message.id)?.reject(new DOMException("Browser helper turn aborted before submission receipt acknowledgement", "AbortError"));
     const beginWaiter = completionFenceBeginWaiters.get(message.id);
     completionFenceBeginWaiters.delete(message.id);
     beginWaiter?.reject(new DOMException("Browser helper turn aborted before completion-fence begin", "AbortError"));
@@ -577,4 +695,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });

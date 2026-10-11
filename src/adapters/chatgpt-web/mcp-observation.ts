@@ -16,6 +16,9 @@ export function observeMcpToolCalls(
   transport: Transport,
   knownTools: ReadonlySet<string>,
   write: (event: Record<string, unknown>) => void = event => console.error(`[chatgpt-web-mcp] transport=${JSON.stringify(event)}`),
+  settled?: (requestId: string | number, sent: boolean) => void | Promise<void>,
+  beforeSend?: (requestId: string | number) => void | Promise<void>,
+  protocolFailure?: (requestId: string | number) => { code: number; message: string } | undefined,
 ): Transport {
   let sequence = 0;
   const pending = new Map<string | number, { call: number; tool: string; started: number } | null>();
@@ -47,7 +50,19 @@ export function observeMcpToolCalls(
     const id = "id" in message ? message.id : undefined;
     const call = id !== undefined && id !== null && !("method" in message) ? pending.get(id) : undefined;
     try {
+      // McpServer wraps handler exceptions as tool content. A retired navigation
+      // capability uses the protocol refusal boundary while other scopes stay connected.
+      const refusal = id !== undefined && id !== null && !("method" in message) ? protocolFailure?.(id) : undefined;
+      if (refusal && id !== undefined && id !== null) message = { jsonrpc: "2.0", id, error: refusal };
+      // SDK validation runs before a tool handler. Keep those context errors bounded too;
+      // a strict-schema unknown-key error must not echo arbitrarily large caller input.
+      if (call?.tool.startsWith("codex_context_") && "result" in message && message.result?.isError === true
+        && Buffer.byteLength(JSON.stringify(message.result), "utf8") > 2048) {
+        message = { jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: "INVALID_ARGUMENT: context arguments exceed the bounded schema" }] } };
+      }
+      if (beforeSend && id !== undefined && id !== null && !("method" in message)) await beforeSend(id);
       await send(message, options);
+      if (settled && id !== undefined && id !== null && !("method" in message)) await settled(id, !("error" in message));
       if (call) {
         const result = "result" in message ? message.result : undefined;
         emit({
@@ -58,6 +73,7 @@ export function observeMcpToolCalls(
         });
       }
     } catch (error) {
+      if (settled && id !== undefined && id !== null && !("method" in message)) await settled(id, false);
       if (call) emit({ event: "reply_send_failed", call: call.call, tool: call.tool });
       throw error;
     } finally {
@@ -67,6 +83,7 @@ export function observeMcpToolCalls(
   const close = transport.onclose;
   transport.onclose = () => {
     if (pending.size) emit({ event: "transport_closed", tracked_calls: pending.size });
+    for (const id of pending.keys()) Promise.resolve(settled?.(id, false)).catch(() => {});
     pending.clear();
     close?.();
   };

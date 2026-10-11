@@ -2,7 +2,7 @@ import { afterAll, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
+import { createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";

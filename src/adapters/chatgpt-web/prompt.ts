@@ -1,4 +1,5 @@
 import { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
+import { normalContextPrompt, type ContextPlanDescriptor, type ContextPromptNavigation } from "./context-prompt";
 import { createHash } from "node:crypto";
 import { selectedSkillFile, skillFileTokens, type ChatGptSkillFile } from "./skill-attachments";
 import {
@@ -13,7 +14,7 @@ import {
 } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { estimateTokens } from "../../lib/token-estimate";
-import type { CodexAssistantContentPart, CodexContentPart, CodexMessage, CodexParsedRequest } from "../../types";
+import type { CodexAssistantContentPart, CodexContentPart, CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import {
@@ -30,6 +31,8 @@ export interface ChatGptWebPromptImage {
 export interface CompiledChatGptWebPrompt {
   text: string;
   images: ChatGptWebPromptImage[];
+  /** Explicit identity of the selected on-demand delivery plan. */
+  contextPlan?: ContextPlanDescriptor;
   skillFiles?: ChatGptSkillFile[];
   /** Transactional transport when Bigger Context is explicitly enabled. */
   multipart?: ChatGptWebMultipartPrompt;
@@ -38,6 +41,12 @@ export interface CompiledChatGptWebPrompt {
 }
 
 export interface CompileChatGptWebPromptOptions {
+  /** Independent, already admitted compaction source access; no ordinary business tools. */
+  compactionReadOnly?: true;
+  /** Trusted fixed system-source fallback images; retain the original system role. */
+  contextSystemImages?: readonly CodexImageContent[];
+  /** A trusted planner supplies this only after the current ABI capability is checked. */
+  contextNavigation?: ContextPromptNavigation;
   captureLunaCheckpoint?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
@@ -213,6 +222,8 @@ const DROPPED_IMAGE_NOTE =
 interface ImageBudget {
   seen: number;
   dropped: number;
+  /** Navigation has already selected source images, including legitimate 1px images. */
+  preserveOnePixel?: boolean;
 }
 
 function inputContent(
@@ -222,7 +233,7 @@ function inputContent(
 ): unknown {
   if (typeof content === "string") return content;
   const semantic = content.filter(part =>
-    part.type !== "image" || !isOnePixelPngDataUrl(part.imageUrl)
+    part.type !== "image" || budget.preserveOnePixel || !isOnePixelPngDataUrl(part.imageUrl)
   );
   if (!semantic.some(part => part.type === "image")) {
     return semantic.filter(part => part.type === "text").map(part => part.text).join("\n");
@@ -237,12 +248,12 @@ function inputContent(
   });
 }
 
-export function countChatGptContextImages(messages: readonly CodexMessage[]): number {
+export function countChatGptContextImages(messages: readonly CodexMessage[], preserveOnePixel = false): number {
   let total = 0;
   for (const message of messages) {
     if (message.role === "assistant" || typeof message.content === "string") continue;
     for (const part of message.content) {
-      if (part.type === "image" && !isOnePixelPngDataUrl(part.imageUrl)) total += 1;
+      if (part.type === "image" && (preserveOnePixel || !isOnePixelPngDataUrl(part.imageUrl))) total += 1;
     }
   }
   return total;
@@ -338,7 +349,7 @@ function messageEnvelope(
 }
 
 type MultipartContextRecord =
-  | { kind: "system"; system_index: number; content: string }
+  | { kind: "system"; system_index: number; content: unknown }
   | { kind: "message"; message_index: number; message: Record<string, unknown> };
 
 interface MultipartRecordWeight {
@@ -503,6 +514,12 @@ export function compileChatGptWebPrompt(
   if (options?.taskUpdateProtocol === 1 && !mode.localTools) {
     throw new Error("task-updates-v1 requires Full Native tools");
   }
+  if (options?.contextNavigation && (!mode.localTools || parsed._compactionRequest)) {
+    throw new Error("Ordinary context navigation requires a Full Native task");
+  }
+  const contextContract = options?.contextNavigation
+    ? normalContextPrompt(options.contextNavigation, manualControl ? { request_id: turnToken! } : { turn_token: turnToken! })
+    : [];
   const system = parsed.context.systemPrompt ?? [];
   const sharedContract = [
     "Act as the model backend for the Codex task encoded below.",
@@ -533,11 +550,13 @@ export function compileChatGptWebPrompt(
     ? manualControl
       ? [
         "This is a Codex history-compaction checkpoint, not a normal task turn.",
-        "Do not call work tools or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
+        options?.compactionReadOnly ? "Use only the three context reading tools with the independent compaction credential, and the original checkpoint completion control. Do not execute business or ChatGPT-native tools."
+          : "Do not call work tools or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
       ]
       : [
       "This is a Codex history-compaction checkpoint, not a normal task turn.",
-      "Do not call local or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
+      options?.compactionReadOnly ? "Use only the three context reading tools with the independent compaction credential. Summarize the available historical source. Do not execute business or ChatGPT-native tools."
+        : "Do not call local or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
       "Return only the checkpoint summary that the next model needs to resume the task.",
       ]
     : mode.localTools
@@ -614,24 +633,26 @@ export function compileChatGptWebPrompt(
     ? manualControl
       ? [
         "<codex_transport_resume>",
-        "The task context is complete. Produce the requested checkpoint summary now.",
+        options?.compactionReadOnly ? "The compaction source entry is ready. Read historical evidence as needed, then submit the requested checkpoint." : "The task context is complete. Produce the requested checkpoint summary now.",
         "</codex_transport_resume>",
       ]
       : [
       "<codex_transport_resume>",
-      "The task context is complete. Produce the requested checkpoint summary now without calling tools.",
+      options?.compactionReadOnly ? "The compaction source entry is ready. Read historical evidence as needed, then return the requested checkpoint." : "The task context is complete. Produce the requested checkpoint summary now without calling tools.",
       "</codex_transport_resume>",
       ]
     : manualControl
     ? [
       "<codex_transport_resume>",
-      "The task context is complete. Execute the latest active user request now.",
+      options?.contextNavigation
+        ? "The selected task input and its context navigation entry are ready. Read required images before executing the latest active user request. Historical references can be read on demand."
+        : "The task context is complete. Execute the latest active user request now.",
       "</codex_transport_resume>",
     ]
     : mode.localTools
     ? [
       "<codex_transport_resume>",
-      `The task context is complete. Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      `${options?.contextNavigation ? "The selected task input and its context navigation entry are ready; read required images before acting and historical references as needed." : "The task context is complete."} Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",
     ]
     : [
@@ -643,8 +664,10 @@ export function compileChatGptWebPrompt(
     const images: ChatGptWebPromptImage[] = [];
     const budget: ImageBudget = {
       seen: 0,
-      dropped: Math.max(0, countChatGptContextImages(sourceMessages) - CHATGPT_MAX_INPUT_IMAGES),
+      preserveOnePixel: !!options?.contextNavigation,
+      dropped: Math.max(0, countChatGptContextImages(sourceMessages, !!options?.contextNavigation) + (options?.contextSystemImages?.length ?? 0) - CHATGPT_MAX_INPUT_IMAGES),
     };
+    const deliveredSystem = [...system, ...(options?.contextSystemImages ?? []).map(image => inputContent([image], images, budget))];
     const skillFiles: ChatGptSkillFile[] = [];
     const messages = sourceMessages.map(message => {
       if (attachSkills && message.role === "user" && message.origin === "codex_skill") {
@@ -663,7 +686,7 @@ export function compileChatGptWebPrompt(
       : "Return only the answer that the outer Codex task should receive.";
     if (multipartEnabled) {
       const records: MultipartContextRecord[] = [
-        ...system.map((content, system_index) => ({ kind: "system" as const, system_index, content })),
+        ...deliveredSystem.map((content, system_index) => ({ kind: "system" as const, system_index, content })),
         ...messages.map((message, message_index) => ({
           kind: "message" as const,
           message_index,
@@ -679,6 +702,7 @@ export function compileChatGptWebPrompt(
           ...sharedContract,
           ...skillContract,
           ...transportContract,
+          ...contextContract,
           ...outputControlContract,
           ...manualControlContract,
           ...checkpointContract,
@@ -724,15 +748,17 @@ export function compileChatGptWebPrompt(
             : formatChatGptWebMultipartStage(payload, transactionId, index + 1, multipartParts!).text;
           return estimateTokens(text) > budgets[index]!.tokenLimit || text.length > budgets[index]!.charLimit;
         })) continue;
-        return { text: multipart.commit, images, ...attachments, multipart };
+        return { text: multipart.commit, images, ...attachments, multipart,
+          ...(options?.contextNavigation ? { contextPlan: options.contextNavigation.plan } : {}) };
       }
       throw new Error("No Bigger Context staging allocation is available");
     }
-    const envelopeJson = withoutRetiredTurnHandles(JSON.stringify({ version: 3, system, messages }));
+    const envelopeJson = withoutRetiredTurnHandles(JSON.stringify({ version: 3, system: deliveredSystem, messages }));
     const text = [
       ...sharedContract,
       ...skillContract,
       ...transportContract,
+      ...contextContract,
       ...outputControlContract,
       ...manualControlContract,
       ...checkpointContract,
@@ -754,7 +780,8 @@ export function compileChatGptWebPrompt(
         "</codex_transport_resume>",
       ] : transportResume),
     ].join("\n");
-    return { text, images, ...attachments };
+    return { text, images, ...attachments,
+      ...(options?.contextNavigation ? { contextPlan: options.contextNavigation.plan } : {}) };
   };
 
   let sourceMessages = withoutSupersededModelSwitchContracts(parsed.context.messages);

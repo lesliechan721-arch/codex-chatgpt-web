@@ -8,6 +8,7 @@ explanation. Start with the topic that owns the contract rather than a completed
 | Components, routing, browser ownership, and service lifecycle | [Architecture](architecture.md) |
 | Trust, tool authority, credentials, and isolation | [Security model](security-model.md) |
 | Native operation identity, waiting, results, and compaction | [Native tool protocol](native-tool-protocol.md) |
+| On-demand source reads, image delivery, and navigation limits | [Context navigation](context-navigation.md) |
 | API access, local keys, manual Codex configuration, and restart behavior | [API Key mode](api-key-mode.md) |
 | Upstream routing, explicit model selection, and Codex metadata | [Upstream provider](upstream-provider.md) |
 | Global HTTP/HTTPS proxy authentication and failure handling | [Network proxy](network-proxy.md) |

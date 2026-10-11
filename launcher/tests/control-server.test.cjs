@@ -3,6 +3,42 @@ const assert = require("node:assert/strict");
 const { BrowserHost } = require("../electron/browser-host.cjs");
 const { BrowserControlServer } = require("../electron/control-server.cjs");
 
+test("manual control forwards selected plans and exposes owner-bound media attestation separately from Sent", async () => {
+  const calls = [];
+  const plan = { planId: "selected-plan", contextId: "context", manifestDigest: "a".repeat(64), requiredAttachments: [{ id: "image", label: "图片 1" }] };
+  const owner = { traceId: "media_control", helperPid: process.pid, planId: plan.planId, manifestDigest: plan.manifestDigest };
+  let status = "pending";
+  const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+  const observed = () => ({ planId: plan.planId, manifestDigest: plan.manifestDigest, requiredCount: 1, status,
+    deadlineAt: status === "pending" ? deadlineAt : null, attestedAt: status === "user_attested" ? new Date().toISOString() : null });
+  const host = { browserInteractionMode: () => "manual", beginManualTurn: (...args) => {
+    calls.push(args); return { tabId: "media-tab", selectedPlanId: plan.planId, reused: false, deadlineAt, state: "awaiting-user", sentConfirmationRequired: false };
+  }, inspectManualAttachments: (...args) => { assert.deepEqual(args, [owner.traceId, owner.helperPid, owner.planId, owner.manifestDigest]); return observed(); },
+    waitManualAttachments: async (...args) => { assert.deepEqual(args.slice(0, 4), [owner.traceId, owner.helperPid, owner.planId, owner.manifestDigest]); return observed(); } };
+  const server = await new BrowserControlServer({ logger: { info() {}, warn() {}, error() {} }, getBrowserHost: () => host,
+    getPreferences: () => ({ zeroRiskRequireSentConfirmation: false }) }).start();
+  const { endpoint, token } = server.descriptor();
+  const request = (action, body) => fetch(`${endpoint}/v1/manual/${action}`, { method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    const start = await request("start", { ...owner, prompt: "full", sentConfirmationRequired: false, contextPlans: { full: plan } });
+    assert.equal(start.status, 200);
+    assert.equal((await start.json()).selectedPlanId, plan.planId);
+    assert.deepEqual(calls[0][10], { full: plan });
+    assert.equal((await request("inspect-attachments", owner)).status, 200);
+    assert.equal((await request("wait-attachments", owner)).status, 202);
+    status = "user_attested";
+    const attested = await request("wait-attachments", owner);
+    assert.equal(attested.status, 200);
+    assert.equal((await attested.json()).status, "user_attested");
+    assert.equal((await request("inspect-attachments", { ...owner, manifestDigest: "invalid" })).status, 400);
+    status = "timeout";
+    assert.equal((await request("wait-attachments", owner)).status, 408);
+    status = "cancelled";
+    assert.equal((await request("inspect-attachments", owner)).status, 409);
+  } finally { await server.close(); }
+});
+
 test("live task progress is owner-bound, preserves elapsed time, and clears on release", async () => {
   const tab = { id: "task-one", traceId: "trace-one", helperPid: process.pid, status: "running", interactionMode: "automatic" };
   const other = { ...tab, id: "task-two", traceId: "trace-two", helperPid: process.pid + 1 };

@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { assertLauncherContextDeliveryFeature, LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
@@ -25,7 +26,13 @@ interface PendingTurn {
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
+  selectedContextPlanId?: string;
+  preparing?: boolean;
+  submissionReceipt?: Promise<void>;
+  submissionReceiptAcknowledgement?: boolean;
 }
+
+const SUBMISSION_RECEIPT_ACK_FEATURE = "submission-receipt-ack-v1";
 
 type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "ready"; features?: string[] }
@@ -35,6 +42,7 @@ type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
+  | { type: "event"; id: string; event: "context_plan_selected"; planId: string }
   | { type: "event"; id: string; event: "continuity_lease"; lease: ContinuityLease }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
   | { type: "result"; id: string; text: string }
@@ -141,6 +149,12 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
         throw new Error("Launcher browser helper prompt selection is invalid");
       }
       return { type: "event", id: message.id, event, reused: message.reused };
+    }
+    if (event === "context_plan_selected") {
+      if (typeof message.planId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(message.planId)) {
+        throw new Error("Launcher browser helper context plan selection is invalid");
+      }
+      return { type: "event", id: message.id, event, planId: message.planId };
     }
     if (!["heartbeat", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
       throw new Error("Launcher browser helper emitted an unknown event");
@@ -276,7 +290,9 @@ export class LauncherBrowserHelperClient {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
         }
-        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult };
+        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult,
+          submissionReceiptAcknowledgement: Boolean(turn.onSubmitted && this.helperFeatures.has(SUBMISSION_RECEIPT_ACK_FEATURE)),
+        };
         this.pending.set(turn.traceId, pending);
         if (turn.abortSignal) {
           const abortListener = () => {
@@ -339,6 +355,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
             ...(turn.taskUpdateProtocol ? { taskUpdateProtocol: turn.taskUpdateProtocol } : {}),
+            ...(pending.submissionReceiptAcknowledgement ? { submissionReceiptAcknowledgement: true } : {}),
           },
         })
           // Only mirror once the run frame is on the wire, so the helper never sees progress for a
@@ -369,6 +386,16 @@ export class LauncherBrowserHelperClient {
     if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")
       || (recovery && !this.helperFeatures.has(CONTINUITY_RECOVERY_FEATURE))) {
       throw continuityError("continuity_configuration_conflict", "Update the runtime and browser helper before starting this mode.");
+    }
+  }
+
+  async assertContextDeliveryCompatible(): Promise<void> {
+    await this.ensureChild();
+    assertLauncherContextDeliveryFeature(readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!));
+    if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE)) {
+      throw new ChatGptWebAdapterError("Launcher browser helper does not support context delivery plans; update the runtime and helper before using context navigation", {
+        status: 503, errorType: "server_error", code: "codex_context_upgrade_required", retryable: false,
+      });
     }
   }
 
@@ -562,6 +589,10 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "send_activated") {
+        if (pending.prepared?.contextPlan && pending.selectedContextPlanId !== pending.prepared.contextPlan.planId) {
+          this.abortWithLocalFailure(message.id, new Error("Launcher browser helper has not acknowledged the selected context plan"), pending);
+          return;
+        }
         void Promise.resolve().then(() => pending.turn.onSendActivated?.()).then(() => {
           if (this.pending.get(message.id) !== pending) return;
           return this.send({ type: "send_activation_ack", id: message.id });
@@ -571,7 +602,24 @@ export class LauncherBrowserHelperClient {
           pending,
         ));
       }
-      else if (message.event === "submitted") pending.turn.onSubmitted?.();
+      else if (message.event === "submitted") {
+        if (pending.prepared?.contextPlan && pending.selectedContextPlanId !== pending.prepared.contextPlan.planId) {
+          this.abortWithLocalFailure(message.id, new Error("Launcher browser helper submitted without its selected context plan"), pending);
+          return;
+        }
+        pending.submissionReceipt = (pending.submissionReceipt ?? Promise.resolve())
+          .then(() => {
+            if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+            return pending.turn.onSubmitted?.();
+          })
+          .then(() => {
+            if (!pending.submissionReceiptAcknowledgement || this.pending.get(message.id) !== pending
+              || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+            return this.send({ type: "submitted_ack", id: message.id });
+          }).catch(error => this.abortWithLocalFailure(
+            message.id, error instanceof Error ? error : new Error(String(error)), pending,
+          ));
+      }
       else if (message.event === "multipart_stage_acknowledged") {
         const multipart = pending.prepared?.multipart;
         if (!multipart
@@ -606,6 +654,11 @@ export class LauncherBrowserHelperClient {
         }
       }
       else if (message.event === "prepared_selected") {
+        if (pending.preparing || pending.prepared) {
+          this.abortWithLocalFailure(message.id, new Error("Launcher browser helper selected the prompt more than once"), pending);
+          return;
+        }
+        pending.preparing = true;
         const prepare = message.reused ? pending.turn.prepareResume : pending.turn.prepare;
         void Promise.resolve().then(() => prepare?.()).then(prepared => {
           if (!prepared) throw new Error("Launcher browser helper selected an unavailable continuation prompt");
@@ -614,10 +667,12 @@ export class LauncherBrowserHelperClient {
             return;
           }
           pending.prepared = prepared;
+          validateBrowserHelperContextPlan(prepared.contextPlan);
           if (prepared.skillFiles?.length && !this.helperFeatures.has("skill-attachments")) {
             throw new Error("Launcher browser helper does not support skill attachments; update or restart the launcher");
           }
-          return Promise.resolve(pending.turn.onPreparedSelected?.(message.reused)).then(() => {
+          return Promise.resolve(prepared.contextPlan ? this.assertContextDeliveryCompatible() : undefined)
+            .then(() => pending.turn.onPreparedSelected?.(message.reused)).then(() => {
             if (this.pending.get(message.id) !== pending) return;
             return this.send({
               type: "prepared_selected_ack",
@@ -625,6 +680,7 @@ export class LauncherBrowserHelperClient {
               prepared: {
                 text: prepared.text,
                 images: prepared.images,
+                ...(prepared.contextPlan ? { contextPlan: prepared.contextPlan } : {}),
                 ...(prepared.skillFiles ? { skillFiles: prepared.skillFiles } : {}),
                 ...(prepared.multipart ? { multipart: prepared.multipart } : {}),
                 ...(prepared.trimmedCompactionMessages !== undefined
@@ -638,6 +694,19 @@ export class LauncherBrowserHelperClient {
           error instanceof Error ? error : new Error(String(error)),
           pending,
         ));
+      }
+      else if (message.event === "context_plan_selected") {
+        if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE)
+          || !pending.prepared?.contextPlan || message.planId !== pending.prepared.contextPlan.planId
+          || pending.selectedContextPlanId !== undefined) {
+          this.abortWithLocalFailure(message.id, new Error("Launcher browser helper selected an unknown or mismatched context plan"), pending);
+          return;
+        }
+        void Promise.resolve().then(() => pending.turn.onContextPlanSelected?.(message.planId)).then(() => {
+          if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+          pending.selectedContextPlanId = message.planId;
+          return this.send({ type: "context_plan_selected_ack", id: message.id, planId: message.planId });
+        }).catch(error => this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending));
       }
       else if (message.event === "luna_checkpoint") {
         if (!pending.turn.captureLunaCheckpoint || !pending.turn.onLunaCheckpoint) {
@@ -654,9 +723,14 @@ export class LauncherBrowserHelperClient {
       return;
     }
     if (message.type === "result") {
-      this.finish(message.id);
-      if (pending.localFailure) pending.reject(pending.localFailure);
-      else pending.resolve(message.text);
+      // An older helper can complete while the daemon is still persisting its receipt.
+      // Keep ownership and prepared resources until that receipt has settled too.
+      void (pending.submissionReceipt ?? Promise.resolve()).then(() => {
+        if (this.pending.get(message.id) !== pending) return;
+        this.finish(message.id);
+        if (pending.localFailure) pending.reject(pending.localFailure);
+        else pending.resolve(message.text);
+      });
     } else if (message.type === "error") {
       const error = message.status !== undefined
         ? new ChatGptWebAdapterError(message.message, {

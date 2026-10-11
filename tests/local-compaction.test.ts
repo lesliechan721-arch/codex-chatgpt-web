@@ -1,10 +1,13 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
 import { COMPACT_PROMPT, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { responseRequest } from "../src/server";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
+import type { AdapterEvent, CodexProviderConfig } from "../src/types";
 
 function fixture() {
   const metadata = {
@@ -29,6 +32,41 @@ function fixture() {
   };
   return { body, source, metadata };
 }
+
+test("Browser-only compaction prepares the complete input and completes without a Native connector", async () => {
+  const { body } = fixture();
+  body.model = "gpt-5.6-sol";
+  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `browser-only://${crypto.randomUUID()}`,
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true } };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const summary = "Verified Browser-only checkpoint";
+  let prepared = false;
+  const run = spyOn(worker, "run").mockImplementation(async turn => {
+    expect(turn.nativeConnector).not.toBe(true);
+    expect(turn.capabilities.localToolsEnabled).toBe(false);
+    expect(turn.compaction).toBe(true);
+    const prompt = await turn.prepare();
+    prepared = true;
+    try {
+      expect(prompt.text).toContain("Continue the real task");
+      expect(prompt.text).toContain("Task progress");
+      expect(prompt.text).not.toContain("<codex_context_navigation_json>");
+      await turn.onSubmitted?.();
+      turn.onTextDelta?.(summary);
+      return summary;
+    } finally { await prompt.release(); }
+  });
+  const events: AdapterEvent[] = [];
+  try {
+    await createChatGptWebAdapter(provider, { verifyContextCapability: async () => {
+      throw new Error("Browser-only compaction must not require MCP capability verification");
+    } }).runTurn!(parseRequest(body), { headers: new Headers() }, event => events.push(event));
+    expect(prepared).toBe(true);
+    expect(events.filter(event => event.type === "error")).toEqual([]);
+    expect(events).toContainEqual({ type: "text_delta", text: summary, phase: "final_answer" });
+    expect(events.find(event => event.type === "done")).toMatchObject({ stopReason: "stop", endTurn: true });
+  } finally { run.mockRestore(); }
+});
 
 for (const explicit of [true, false]) test(`native local compaction recognizes metadata and the control tail (explicit: ${explicit})`, () => {
   const { body, source } = fixture();

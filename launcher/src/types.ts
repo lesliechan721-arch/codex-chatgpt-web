@@ -5,6 +5,13 @@ import type { LimitsSnapshot } from "./limits-types";
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
+
+export interface ManualPlanConfirmation {
+  traceId: string;
+  nonce: string;
+  planId: string;
+  manifestDigest: string;
+}
 export type ToolAuthorityMode = "verified-environment" | "delegated";
 export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "settings";
 
@@ -80,6 +87,16 @@ export interface BrowserTabState {
   manualSentConfirmationRequired?: boolean;
   canCopyPrompt?: boolean;
   canConfirmSent?: boolean;
+  selectedPlanId?: string;
+  manualAttachments?: Omit<ManualPlanConfirmation, "nonce"> & {
+    nonce: string | null;
+    required: { id: string; label: string }[];
+    requiredCount: number;
+    status: "not-required" | "pending" | "user_attested" | "timed-out" | "cancelled" | "failed";
+    attestedAt: string | null;
+    deadlineAt: string | null;
+    canConfirm: boolean;
+  };
 }
 
 export interface LogRecord {
@@ -163,8 +180,9 @@ export interface LauncherApi extends ApiAccessApi {
   zoomBrowser(action: "in" | "out" | "reset"): Promise<BrowserState>;
   selectBrowserTab(tabId: string): Promise<BrowserState>;
   closeBrowserTab(tabId: string): Promise<BrowserState>;
-  copyManualPrompt(tabId: string): Promise<BrowserState>;
-  confirmManualSent(tabId: string): Promise<BrowserState>;
+  copyManualPrompt(tabId: string, binding?: ManualPlanConfirmation): Promise<BrowserState>;
+  confirmManualSent(tabId: string, binding?: ManualPlanConfirmation): Promise<BrowserState>;
+  confirmManualAttachments(tabId: string, binding: ManualPlanConfirmation): Promise<BrowserState>;
   openLogin(): Promise<BrowserState>;
   openPasskeyLogin(): Promise<BrowserState>;
   continuePasskeyLogin(): Promise<boolean>;

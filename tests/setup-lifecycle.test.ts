@@ -9,9 +9,127 @@ import * as tunnel from "../src/tunnel";
 import * as tunnelService from "../src/tunnel-service";
 import * as browserHost from "../src/launcher-browser-host";
 import * as browserLogin from "../src/browser-login";
+import * as apiAccessConfig from "../src/api-access-config";
+import { runDoctor } from "../src/doctor";
 import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "../src/native-tool-long-wait-probe";
 import { launcherCapabilityProbeRequired, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
+
+for (const development of [false, true]) for (const interaction of ["automatic", "manual"] as const) {
+  test(`${development ? "DEV" : "production"} ${interaction} upgrades the previous ABI only on setup commit`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "cgw-context-abi-setup-"));
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const configPath = join(root, "config.json");
+    const tunnelFor = (mode: "automatic" | "manual") => ({
+      binaryPath: join(root, "tunnel-client"), tunnelId: `tunnel_${(mode === "automatic" ? "a" : "b").repeat(32)}`,
+      runtimeKeyFile: join(root, `${mode}.key`), profileDir: root, profileName: mode, alias: mode,
+    });
+    const automaticTunnel = tunnelFor("automatic");
+    const manualTunnel = tunnelFor("manual");
+    for (const tunnelConfig of [automaticTunnel, manualTunnel]) writeFileSync(tunnelConfig.runtimeKeyFile, "fixture-key");
+    const existing = {
+      ...configModule.defaultConfig("full"),
+      ...(development ? { purpose: "dev-harness" as const, devNativeToolLongWaitProbe: interaction === "automatic" } : {}),
+      browserHost: "launcher" as const, browserHostDescriptorPath: join(root, "launcher.json"),
+      browserInteractionMode: interaction, automaticAppName: development ? "Codex Native4 DEV" : "Codex Native4",
+      manualAppName: "Codex Zero Risk3", appName: interaction === "manual" ? "Codex Zero Risk3"
+        : development ? "Codex Native4 DEV" : "Codex Native4",
+      tunnel: interaction === "manual" ? manualTunnel : automaticTunnel, automaticTunnel, manualTunnel,
+      useSavedChats: true, zeroRiskRequireSentConfirmation: false,
+      solAvailable: true, extraHighAvailable: true, proAvailable: true,
+      acknowledgedUnofficialAt: "2026-10-01T00:00:00.000Z",
+    };
+    const original = JSON.stringify(existing);
+    writeFileSync(configPath, original);
+    let rejectCommit = false;
+    const save = spyOn(configModule, "saveConfig").mockImplementation(value => {
+      if (rejectCommit) throw new Error("fixture commit failed");
+      writeFileSync(configPath, JSON.stringify(value));
+    });
+    const integrate = spyOn(integration, "installCodexIntegration").mockImplementation(() => ({} as never));
+    const inspect = spyOn(browserHost, "inspectLauncherBrowserHost").mockRejectedValue(new Error("fixture must not inspect a live account"));
+    const mocks = [save, integrate, inspect,
+      spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {}),
+      spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+      spyOn(service, "removeLegacyRuntimeArtifacts").mockImplementation(() => {}),
+      spyOn(tunnelService, "getTunnelServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+      spyOn(tunnel, "managedRuntimeKeyPath").mockImplementation(mode => mode === "manual" ? manualTunnel.runtimeKeyFile : automaticTunnel.runtimeKeyFile),
+      spyOn(tunnel, "installTunnelClient").mockResolvedValue(join(root, "tunnel-client")),
+      spyOn(tunnel, "connectTunnel").mockImplementation(() => { throw new Error("fixture must not connect a tunnel"); }),
+    ];
+    try {
+      const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+      const port = listener.port!;
+      await listener.stop(true);
+      const options = { mode: "full" as const, browserHostDescriptorPath: existing.browserHostDescriptorPath,
+        browserInteractionMode: interaction, subagentProtocol: "native" as const, port };
+      const configure = development ? setupDevProfile : setup;
+      const result = await configure(options);
+      const committed = JSON.parse(readFileSync(configPath, "utf8"));
+      expect(result.connectorSetupRequired).toBe(true);
+      expect(committed.automaticAppName).toBe(development ? "Codex Native5 DEV" : "Codex Native5");
+      expect(committed.manualAppName).toBe("Codex Zero Risk4");
+      expect(committed.appName).toBe(interaction === "manual" ? "Codex Zero Risk4" : committed.automaticAppName);
+      expect(committed.automaticTunnel.tunnelId).toBe(automaticTunnel.tunnelId);
+      expect(committed.manualTunnel.tunnelId).toBe(manualTunnel.tunnelId);
+      expect(committed.useSavedChats).toBe(true);
+      expect(committed.zeroRiskRequireSentConfirmation).toBe(false);
+      expect(inspect).not.toHaveBeenCalled();
+      writeFileSync(configPath, original);
+      rejectCommit = true;
+      const integrationCount = integrate.mock.calls.length;
+      await expect(configure(options)).rejects.toThrow("fixture commit failed");
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+      expect(integrate.mock.calls.length).toBe(integrationCount);
+    } finally {
+      for (const mock of mocks.reverse()) mock.mockRestore();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("doctor rejects both retired MCP modes before browser verification and skips non-MCP access", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-context-abi-doctor-"));
+  let runtimeConfig = { ...configModule.defaultConfig("full"), browserHost: "launcher" as const,
+    browserHostDescriptorPath: join(root, "missing-launcher.json"), appName: "Codex Native4" };
+  let policy = { version: 1, mode: "loopback" };
+  const inspect = spyOn(browserHost, "inspectLauncherBrowserHost").mockRejectedValue(new Error("fixture browser unavailable"));
+  const mocks = [inspect,
+    spyOn(configModule, "loadConfig").mockImplementation(() => runtimeConfig),
+    spyOn(apiAccessConfig, "loadApiAccessPolicy").mockImplementation(() => policy as never),
+    spyOn(globalThis, "fetch").mockRejectedValue(new Error("fixture proxy unavailable")),
+    spyOn(integration, "inspectCodexIntegration").mockReturnValue({ installed: false, errors: [] } as never),
+    spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+    spyOn(tunnelService, "getTunnelServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+    spyOn(tunnel, "tunnelStatus").mockReturnValue({ ok: false, detail: "fixture tunnel unavailable" } as never),
+  ];
+  try {
+    for (const [name, replacement] of [["Codex Native4", "Codex Native5"], ["Codex Native4 DEV", "Codex Native5 DEV"],
+      ["Codex Zero Risk3", "Codex Zero Risk4"]]) {
+      runtimeConfig.appName = name!;
+      const report = await runDoctor();
+      expect(report.ok).toBe(false);
+      expect(report.checks).toHaveLength(2);
+      expect(report.checks[1]).toMatchObject({ id: "connector", status: "error" });
+      expect(report.checks[1]!.detail).toContain(replacement!);
+      expect(report.checks[1]!.detail).toContain("do not rename or refresh");
+    }
+    expect(inspect).not.toHaveBeenCalled();
+    runtimeConfig.mode = "browser-only";
+    expect((await runDoctor()).checks.some(check => check.message.includes("ABI upgrade"))).toBe(false);
+    runtimeConfig.mode = "full";
+    runtimeConfig.tunnel = { binaryPath: join(root, "missing-client"), tunnelId: `tunnel_${"a".repeat(32)}`,
+      runtimeKeyFile: join(root, "missing-key"), profileDir: root, profileName: "fixture", alias: "fixture" };
+    policy = { version: 1, mode: "api-key" };
+    expect((await runDoctor()).checks.some(check => check.message.includes("ABI upgrade"))).toBe(false);
+  } finally {
+    for (const mock of mocks.reverse()) mock.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 const config = {
   mode: "browser-only" as const,

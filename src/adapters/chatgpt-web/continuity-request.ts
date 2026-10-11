@@ -10,7 +10,7 @@ import {
   readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
 } from "../../launcher-browser-host";
 import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
-import { parseRequest } from "../../responses/parser";
+import { contextCandidateCanonicalSource, continuityAcceptedContextCandidate, continuityContextCandidate, continuityRecoveredContextCandidate } from "./context-candidate-mapping";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import {
   continuityBindingsFor, continuityCheckpoint, continuityDigest,
@@ -22,7 +22,7 @@ import { taskUpdateSourceError } from "./task-update-source";
 import { continuityToolRegistry } from "./continuity-tools";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
 import { existingStructuredCompactionRun } from "./compaction-handoff";
-import { preflightContinuityInput } from "./continuity-input";
+import { preflightContinuityInput, preflightFullRecoveryContinuityInput } from "./continuity-input";
 import { chatGptConversationKey } from "./conversation-key";
 import {
   chatGptCurrentInstructionIndex, chatGptInstructionContent, chatGptInstructionEnvelope,
@@ -97,17 +97,13 @@ function ordinaryResumeInput(
   if (suffix.length === 0) {
     throw continuityError("continuity_source_unproven", "The request has no uniquely located current native instruction.");
   }
-  const selectedContext = parseRequest({
-    model: parsed.modelId,
-    instructions: (parsed._rawBody as { instructions?: unknown }).instructions,
-    input: [...continuityCurrentEnvironmentInput(parsed, suffix), ...suffix],
-  }).context;
-  const messages = selectedContext.messages;
+  const input = continuityContextCandidate(parsed, [...continuityCurrentEnvironmentInput(parsed, suffix), ...suffix]);
+  const messages = input.context.messages;
   if (messages.some(message => message.role === "assistant"
     || (message.role === "toolResult" && message.toolCallId !== undefined))) {
     throw continuityError("continuity_source_unproven", "The current instruction selection contains execution output.");
   }
-  return { input: { ...parsed, context: { ...parsed.context, systemPrompt: selectedContext.systemPrompt, messages } }, instructionPrevious };
+  return { input, instructionPrevious };
 }
 
 function assertNoUnownedTerminalResults(parsed: CodexParsedRequest, checkpointIndex: number): void {
@@ -151,17 +147,12 @@ function checkpointResumeInput(
     throw continuityError("continuity_source_unproven", "The checkpoint continuation does not identify its committed source instruction.");
   }
   const inputItems = [...continuityCurrentEnvironmentInput(parsed, suffix), ...suffix];
-  const selectedContext = parseRequest({
-    model: parsed.modelId,
-    instructions: (parsed._rawBody as { instructions?: unknown }).instructions,
-    input: inputItems,
-  }).context;
-  const messages = selectedContext.messages;
+  const input = continuityContextCandidate(parsed, inputItems);
+  const messages = input.context.messages;
   if (messages.some(message => message.role === "assistant"
     || (message.role === "toolResult" && message.toolCallId !== undefined))) {
     throw continuityError("continuity_source_unproven", "The checkpoint continuation contains execution output.");
   }
-  const input = { ...parsed, context: { ...parsed.context, systemPrompt: selectedContext.systemPrompt, messages } };
   if (!checkpoint.preserveFinalResponse || hasNewInstruction) {
     return { input, instructionPrevious, allowRetainedSourceInstructionPayload: !hasNewInstruction };
   }
@@ -227,6 +218,7 @@ export async function prepareContinuityRequest(
   capabilities: ChatGptWebCapabilities,
   worker: ChatGptBrowserWorker,
   abortSignal?: AbortSignal,
+  verifyContextCapability?: () => Promise<void>,
 ): Promise<PreparedContinuityRequest> {
   abortSignal?.throwIfAborted();
   const config = provider.chatgptWeb;
@@ -261,7 +253,7 @@ export async function prepareContinuityRequest(
   };
   if (parsed._compactionRequest) {
     const { prepareRecoveryCompaction } = await import("./continuity-recovery-compaction");
-    const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     if (prepared) return prepared;
   }
   const initialLocalOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
@@ -469,7 +461,7 @@ export async function prepareContinuityRequest(
       if (chatGptContinuityInstructionPayloadDigest(parsed) !== binding.initialInstructionPayloadDigest) {
         throw continuityError("continuity_source_unproven", "The accepted native instruction identity now carries a different current payload.");
       }
-      input = structuredClone(binding.initialAcceptedInput);
+      input = continuityAcceptedContextCandidate(parsed, binding.initialAcceptedInput);
     } else input = parsed;
     if (!finalReplaySource) preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, Boolean(expected));
   } else if (binding?.state === "compacting" && !parsed._compactionRequest
@@ -490,7 +482,7 @@ export async function prepareContinuityRequest(
       if (binding.initialInstructionPayloadDigest !== payloadDigest) {
         throw continuityError("continuity_source_unproven", "The accepted native instruction identity now carries a different current payload.");
       }
-      input = structuredClone(binding.initialAcceptedInput);
+      input = continuityAcceptedContextCandidate(parsed, binding.initialAcceptedInput);
     } else {
       binding.initialAcceptedInput = structuredClone(input!);
       binding.initialInstructionPayloadDigest = payloadDigest;
@@ -627,8 +619,18 @@ async function prepareDurableOrdinary(
     && checkpoint.targetHistoryRevision === previous.attempts.at(-1)!.historyRevision);
   if (checkpoints.length > 1) throw continuityError("continuity_source_unproven", "The recovery input cannot distinguish its accepted checkpoint.");
   const recoveryCheckpoint = checkpoints[0];
-  if (work || previous.state !== "completed") input = recoveryContext(parsed, ref, recoveryCheckpoint?.commitId);
-  if (work && binding?.initialAcceptedInput && ["prepared", "page-possible", "page-acquired"].includes(work.attempts.at(-1)!.stage)) input = structuredClone(binding.initialAcceptedInput);
+  let recoveredInput: CodexParsedRequest | undefined;
+  const recoverySource = existing ?? (binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined);
+  if (work || previous.state !== "completed") input = recoveredInput = recoveryContext(parsed, ref, recoveryCheckpoint?.commitId);
+  if (work && binding?.initialAcceptedInput && ["prepared", "page-possible", "page-acquired"].includes(work.attempts.at(-1)!.stage)) {
+    input = continuityAcceptedContextCandidate(parsed, binding.initialAcceptedInput);
+  }
+  if (input === recoveredInput) {
+    continuityRecoveredContextCandidate(parsed, input, recoverySource?.restoreCompactionIssuedCalls(
+      (input._rawBody as { input: unknown[] }).input), recoverySource?.canonicalInput(),
+      recoverySource?.compactionObjectArgumentCallIds());
+  }
+  preflightFullRecoveryContinuityInput(input, capabilities, attachments);
   preflightContinuityInput(input, capabilities, attachments, false);
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
@@ -733,10 +735,16 @@ async function prepareDurableOrdinary(
   input._continuityAttempt = parsed._continuityAttempt;
   input._continuityEpoch = record.epoch;
   input._continuityHistoryRevision = record.historyRevision;
+  if (input === recoveredInput) {
+    const source = contextCandidateCanonicalSource(parsed, input)!;
+    source._continuityAttempt = input._continuityAttempt;
+    source._continuityEpoch = input._continuityEpoch;
+    source._continuityHistoryRevision = input._continuityHistoryRevision;
+  }
   const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
   const checkpoint = continuityCheckpoint(parsed);
   const restored = bindings.installRecovered(record, executionKey, checkpoint.digest, identity.turnId);
-  restored.initialAcceptedInput = structuredClone(input);
+  restored.initialAcceptedInput = continuityAcceptedContextCandidate(parsed, input);
   restored.initialInstructionPayloadDigest = payload;
   const conversationKey = chatGptConversationKey(parsed, namespace)!;
   restored.conversation = { key: conversationKey, descriptor };
@@ -810,6 +818,8 @@ async function prepareDurableContinuation(
   }
   let input = recoveryContext(parsed, { directory: bindings.registrations.directory, thread: record.thread,
     logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt }, checkpoint.commitId);
+  const recoveredInput = input;
+  const recoverySource = existing ?? (binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined);
   // recoveryContext can accept a first real result synchronously. Observe that write
   // before waiting on the page; later version changes still require reconciliation.
   record = store.get(record.thread)!;
@@ -830,6 +840,12 @@ async function prepareDurableContinuation(
   if (expected && binding && localCheckpoint) input = checkpointResumeInput(parsed, binding, localCheckpoint, proof).input;
   parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
   input.context.tools = parsed.context.tools;
+  if (input === recoveredInput) {
+    continuityRecoveredContextCandidate(parsed, input, recoverySource?.restoreCompactionIssuedCalls(
+      (input._rawBody as { input: unknown[] }).input), recoverySource?.canonicalInput(),
+      recoverySource?.compactionObjectArgumentCallIds());
+  }
+  if (!expected) preflightFullRecoveryContinuityInput(input, capabilities, attachments);
   preflightContinuityInput(input, capabilities, attachments, Boolean(expected));
   if (!expected) {
     await assertLauncherContinuityCapacity(descriptor);
@@ -861,7 +877,15 @@ async function prepareDurableContinuation(
   parsed._continuityHistoryRevision = record.historyRevision;
   parsed._continuityEpoch = record.epoch;
   parsed._continuityAttempt = consumer.attempts.at(-1)!.attempt;
-  input = { ...input, _continuityHistoryRevision: record.historyRevision, _continuityEpoch: record.epoch, _continuityAttempt: parsed._continuityAttempt };
+  input._continuityHistoryRevision = record.historyRevision;
+  input._continuityEpoch = record.epoch;
+  input._continuityAttempt = parsed._continuityAttempt;
+  if (input === recoveredInput) {
+    const source = contextCandidateCanonicalSource(parsed, input)!;
+    source._continuityAttempt = input._continuityAttempt;
+    source._continuityEpoch = input._continuityEpoch;
+    source._continuityHistoryRevision = input._continuityHistoryRevision;
+  }
   executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
   const sourceExecutionKey = binding?.executionKey;
   if (!expected) binding = bindings.installRecovered(record, executionKey, checkpoint.summaryDigest, identity.turnId);

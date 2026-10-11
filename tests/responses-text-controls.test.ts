@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
-import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { createChatGptStructuredOutputValidator } from "../src/adapters/chatgpt-web/output-validation";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";

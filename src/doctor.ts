@@ -2,7 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { apiAccessRevision, type ApiAccessPolicy } from "./api-access";
 import { loadApiAccessPolicy } from "./api-access-config";
 import type { AppConfig } from "./config";
-import { getConfigDir, getConfigPath, loadConfig } from "./config";
+import { getConfigDir, getConfigPath, isLegacyChatGptConnectorIdentity, legacyChatGptConnectorMigrationMessage, loadConfig } from "./config";
 import { join } from "node:path";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
@@ -138,6 +138,15 @@ export async function runDoctor(): Promise<DoctorReport> {
       status: "error",
       message: "API access configuration is invalid",
       detail: error instanceof Error ? error.message : String(error),
+    });
+    return { ok: false, mode: config.mode, checks };
+  }
+  if (config.mode === "full" && accessPolicy.mode !== "api-key" && isLegacyChatGptConnectorIdentity(config.appName)) {
+    checks.push({
+      id: "connector",
+      status: "error",
+      message: "ChatGPT connector requires an ABI upgrade",
+      detail: legacyChatGptConnectorMigrationMessage(config.appName),
     });
     return { ok: false, mode: config.mode, checks };
   }

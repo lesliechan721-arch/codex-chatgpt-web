@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 import { mock } from "node:test";
 import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { $ } from "bun";
 import { harmlessContinuityCommand } from "./helpers/continuity-command";
 import { OPENAI_ACCESS } from "../src/api-access";
@@ -18,12 +20,12 @@ import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
 import { cancelAbandonedContinuityCreation, leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
-import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "../src/adapters/chatgpt-web/index";
+import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import { chatGptContinuityInstructionPayloadDigest, continuityInstructionIdentity, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
-import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, TurnBroker, type BrokerToolResult, type BrokerToolRequest } from "../src/adapters/chatgpt-web/turn-broker";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, defaultConfig } from "../src/config";
 import * as configuration from "../src/config";
@@ -41,6 +43,21 @@ afterEach(async () => {
   chatGptTurnSessions.clear();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
+
+function recordedCall(call: BrokerToolRequest): Record<string, unknown> {
+  return call.freeform
+    ? { type: "custom_tool_call", call_id: call.callId, name: call.wireName, input: call.input }
+    : { type: "function_call", call_id: call.callId, name: call.wireName, arguments: JSON.stringify(call.arguments) };
+}
+
+function currentRecordedCall(provider: CodexProviderConfig, request: CodexParsedRequest): Record<string, unknown> {
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`)!;
+  return recordedCall(source.outstanding()[0]!);
+}
+
+function taskEnvelope(prompt: string): unknown {
+  return JSON.parse(/<codex_context_json>\n([^\n]+)/.exec(prompt)![1]!);
+}
 
 function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string } = {}) {
   const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
@@ -120,6 +137,16 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     },
   };
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
+  let modelMcp: Client | undefined;
+  const manualMcp = async () => {
+    if (!modelMcp) {
+      modelMcp = new Client({ name: "continuity-manual-model-fixture", version: "1" });
+      await modelMcp.connect(new StdioClientTransport({ command: process.execPath,
+        args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", provider.chatgptWeb!.brokerSocketPath!],
+        cwd: process.cwd(), stderr: "pipe" }));
+    }
+    return modelMcp;
+  };
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
   // Legacy lifecycle cases do not negotiate task updates. Regression cases opt in explicitly.
@@ -135,6 +162,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     acquisitionFailures: 0, actualRecovery: false, actualAcquisitions: 0,
     prepareBeforeFailures: 0, prepareAfterFailures: 0,
     command: "fixture-command-not-executed-by-this-test",
+    sourceArguments: undefined as Record<string, unknown> | undefined,
     queryPhase: "send-possible" as "send-possible" | "prepared" | "missing",
     loseStartAcknowledgementOnce: false,
     failHandoffSettlement: false,
@@ -151,11 +179,25 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
     let operationId = 0;
     const invoke = async (): Promise<BrokerToolResult> => {
+      if (manual) {
+        const client = await manualMcp();
+        const reference = { request_id: token, operation_id: ++operationId, task_revision: 0 };
+        let result = await client.callTool({ name: controls.nativeSourceTools ? "codex_exec" : "codex_tool_call",
+          arguments: { ...reference, ...(controls.nativeSourceTools ? controls.sourceArguments ?? { cmd: controls.command }
+            : { wire_name: controls.reviewWireName, arguments: controls.sourceArguments ?? { cmd: controls.command } }) } });
+        while ((result.structuredContent as { kind?: string } | undefined)?.kind === "codex_native_pending") {
+          result = await client.callTool({ name: "codex_tool_wait", arguments: { request_id: token, operation_id: operationId } });
+        }
+        const text = (result.content as Array<{ type: string; text?: string }>).filter(block => block.type === "text").map(block => block.text).join("\n");
+        const contextEntry = /<codex_context_navigation_json>\n([^\n]+)/.exec(text);
+        if (contextEntry) expect((await client.callTool(JSON.parse(contextEntry[1]!).first_call)).isError).not.toBe(true);
+        return result as BrokerToolResult;
+      }
       if (controls.nativeSourceTools) {
         const reply = await callTurnBroker<NativeOperationReply>(provider.chatgptWeb!.brokerSocketPath!, {
           method: "native_operation_start", token, contract: manual ? "safe" : "native", nativeWaitProtocol: 1,
           operationId: ++operationId, entry: "codex_exec",
-          nativeInput: { cmd: controls.command },
+          nativeInput: controls.sourceArguments ?? { cmd: controls.command },
         }, null);
         if (reply.kind !== "result") throw new Error("Fixture operation did not receive its Native result");
         return reply.result;
@@ -163,7 +205,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       return callTurnBroker<BrokerToolResult>(provider.chatgptWeb!.brokerSocketPath!, {
         method: "invoke", bindingId: claim.bindingId, wireName: controls.reviewWireName, freeform: false,
         registryGeneration: claim.environment.registryGeneration,
-        arguments: { cmd: controls.command },
+        arguments: controls.sourceArguments ?? { cmd: controls.command },
       }, null);
     };
     if (!manual && controls.parallelSourceTools && !controls.singleSourceTool) {
@@ -226,6 +268,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     }
     turn.onContinuityLease!(lease);
     const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
+    if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
     expect(compiled.multipart).toBeUndefined();
     submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
     await turn.onSendActivated?.();
@@ -303,7 +346,9 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
         controls.loseStartAcknowledgementOnce = false;
         expect(accept(activity.conversationKey!, activity.continuity!, activity.traceId, activity.requireRetainedConversation)).toEqual(continuity);
       }
-      return { continuity };
+      const selectedPlan = activity.requireRetainedConversation ? activity.contextPlans?.resume : activity.contextPlans?.full;
+      return { continuity, reused: Boolean(activity.requireRetainedConversation),
+        ...(selectedPlan ? { selectedPlanId: selectedPlan.planId } : {}) };
     },
     async waitSent() { broker.startSafeTurn(controls.safeToken); },
     waitTerminal: () => new Promise<never>(() => {}),
@@ -311,7 +356,11 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       controls.started = true;
       if (controls.invokeSourceTools) {
         const token = controls.safeToken;
-        controls.modelTask = sourceTools(token).then(() => { broker.completeSafeTurn(token, controls.handoffSummary); });
+        controls.modelTask = sourceTools(token).then(async () => {
+          const result = await (await manualMcp()).callTool({ name: "codex_turn_complete", arguments: {
+            request_id: token, task_revision: 0, final_answer: controls.handoffSummary } });
+          expect(result.isError).not.toBe(true);
+        });
         void controls.modelTask.catch(() => {});
       } else if (!controls.deferCompletion) broker.completeSafeTurn(controls.safeToken, `Completed response ${submissions.length}.`);
     },
@@ -328,6 +377,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     broker.acceptTaskUpdate = originalAcceptTaskUpdate;
     await broker.close();
     await controls.modelTask?.catch(() => {});
+    await modelMcp?.close();
   });
   const threadId = options.threadId ?? `thread-${root}`;
   const request = (text = "First continuity instruction.", turnId = "turn-first", input?: unknown[]): CodexParsedRequest => {
@@ -1793,7 +1843,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
     const compact = f.request("", "turn-first", [
       ...(first._rawBody as { input: unknown[] }).input,
-      { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Actual checkpoint source result." },
+      recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Actual checkpoint source result." },
     ]);
     compact._compactionRequest = true;
     const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -1858,7 +1908,7 @@ for (const manual of [false, true]) for (const retainSource of [false, true]) fo
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const compact = f.request("", "turn-first", [
     ...(first._rawBody as { input: unknown[] }).input,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint source result." },
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint source result." },
   ]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -1900,7 +1950,7 @@ for (const manual of [false, true]) for (const entry of ["initial", "ordinary", 
       const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
       const compact = f.request("", "turn-first", [
         ...(first._rawBody as { input: unknown[] }).input,
-        { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." },
+        recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." },
       ]);
       compact._compactionRequest = true;
       const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -1968,7 +2018,7 @@ for (const manual of [false, true]) for (const parentFirst of [false, true]) for
   if (checkpointOnly) {
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
     const compact = parseRequest({ ...raw, input: [firstItem,
-      { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." }] });
+      recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." }] });
     compact._conversationPolicy = "continuity-first";
     compact._compactionRequest = true;
     const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -1996,7 +2046,7 @@ for (const manual of [false, true]) for (const entry of ["initial", "ordinary", 
       const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
       const compact = f.request("", "turn-first", [
         ...(first._rawBody as { input: unknown[] }).input,
-        { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." },
+        recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Real checkpoint result." },
       ]);
       compact._compactionRequest = true;
       const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -2326,7 +2376,7 @@ test("ordinary resume ignores completed foreign history before a clear new instr
   expect(f.submissions).toHaveLength(2);
   expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
   expect(f.submissions[1]!.prompt).not.toContain("Foreign execution record.");
-  expect(f.submissions[1]!.prompt).not.toContain("Foreign tool result.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Foreign tool result.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ordinary resume keeps every new current-turn instruction item`, async () => {
@@ -2971,7 +3021,7 @@ for (const format of ["encrypted", "readable", "summary-only"] as const) test(`$
   expect(f.submissions).toHaveLength(3);
   expect(f.submissions[2]!.prompt).toContain("New work after checkpoint.");
   expect(f.submissions[2]!.prompt).not.toContain("Foreign execution record.");
-  expect(f.submissions[2]!.prompt).not.toContain("Foreign tool result.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[2]!.prompt))).not.toContain("Foreign tool result.");
 });
 
 for (const manual of [false, true]) for (const reclamation of ["capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation}-reclaimed old ordinary replay stays bound to its stale repeated-summary revision`, async () => {
@@ -3246,9 +3296,13 @@ test("Automatic stale compaction CAS failure preserves an active running source"
     await source.runtime.externalProgress.acknowledgeToolBatch(nextBatchRevision);
   }
   expect((await newerRun).at(-1)).toMatchObject({ type: "done", endTurn: false });
-  expect(source.canonicalInput()).toEqual((newerCanonical._rawBody as { input: unknown[] }).input);
   expect(source.outstanding()).toHaveLength(1);
   expect(source.outstanding()[0]?.callId).not.toBe(firstCall.callId);
+  const acceptedCanonical = structuredClone(source.canonicalInput());
+  expect(acceptedCanonical).toEqual([
+    ...(newerCanonical._rawBody as { input: unknown[] }).input,
+    recordedCall(source.outstanding()[0]!),
+  ]);
 
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
   const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
@@ -3261,6 +3315,7 @@ test("Automatic stale compaction CAS failure preserves an active running source"
   expect(binding.checkpoints.size).toBe(0);
   expect(binding.acceptedHandoff).toBeUndefined();
   expect(source.outstanding()).toHaveLength(1);
+  expect(source.canonicalInput()).toEqual(acceptedCanonical);
   expect(f.submissions).toHaveLength(submissions);
   source.cancel(continuityError("continuity_session_lost"));
 });
@@ -3654,6 +3709,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     const call = source.outstanding()[0]!;
     const compact = f.request("", "turn-first", [
       ...(ordinary._rawBody as { input: unknown[] }).input,
+      recordedCall(call),
       { type: "function_call_output", call_id: call.callId, output: "Accepted exact source result." },
     ]);
     compact._compactionRequest = true;
@@ -3735,6 +3791,7 @@ test("real Codex captured active and completed checkpoint-only requests reuse pr
   const activeContinuation = captured.captured.find(record => record.label === "ordinary"
     && record.body.input.some(item => item.type === "compaction"))!;
   f.controls.invokeSourceTools = true;
+  f.controls.sourceArguments = JSON.parse(activeCompact.body.input.find(item => item.type === "function_call")!.arguments as string);
   const first = load(ordinary);
   const initial = await f.run(first);
   expect(initial.at(-1)).toMatchObject({ type: "done", endTurn: false });
@@ -3795,6 +3852,7 @@ test("Automatic repeated-summary continuation replays the old result round for t
     const call = source.outstanding()[0]!;
     const compact = f.request("", "turn-first", [
       ...(ordinary._rawBody as { input: unknown[] }).input,
+      recordedCall(call),
       { type: "function_call_output", call_id: call.callId, output },
     ]);
     compact._compactionRequest = true;
@@ -3810,6 +3868,7 @@ test("Automatic repeated-summary continuation replays the old result round for t
   const call = source.outstanding()[0]!;
   const result = f.request("", "turn-first", [
     ...(continuation._rawBody as { input: unknown[] }).input,
+    recordedCall(call),
     { type: "function_call_output", call_id: call.callId, output: "Accepted continuation result." },
   ]);
   if (source.runtime.mode !== "tools") throw new Error("Missing fixture tool runtime");
@@ -4277,6 +4336,7 @@ for (const manual of [false, true]) test(`Round 7: current native cross-task ins
   const call = source.outstanding()[0]!;
   const compact = f.request("", "turn-checkpoint", [
     ...(first._rawBody as { input: unknown[] }).input,
+    recordedCall(call),
     { type: "function_call_output", call_id: call.callId, output: "Completed source result." },
   ]);
   compact._compactionRequest = true;
@@ -4329,6 +4389,7 @@ for (const manual of [false, true]) test(`Round 7: conflicting queued compaction
   const make = (turnId: string, output: string) => {
     const parsed = f.request("", turnId, [
       ...(first._rawBody as { input: unknown[] }).input,
+      recordedCall(call),
       { type: "function_call_output", call_id: call.callId, output },
     ]);
     parsed._compactionRequest = true;
@@ -4413,7 +4474,7 @@ for (const manual of [false, true]) test(`Round 7: approved discovery survives c
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const call = source.outstanding()[0]!;
   const search = { type: "tool_search_output", call_id: call.callId, status: "completed", tools: [spec] };
-  const compact = parseRequest({ ...raw, input: [...raw.input, search],
+  const compact = parseRequest({ ...raw, input: [...raw.input, recordedCall(call), search],
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-search-compact" }) } });
   compact._conversationPolicy = "continuity-first";
   compact._compactionRequest = true;
@@ -4490,6 +4551,7 @@ for (const manual of [false, true]) for (const content of ["New task B.", "Sourc
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const call = source.outstanding()[0]!;
   const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    recordedCall(call),
     { type: "function_call_output", call_id: call.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(e => e.type === "text_delta");
@@ -4539,12 +4601,12 @@ for (const manual of [false, true]) test(`Round 8: older accepted discovery cann
   }
   expect((await resultRun).at(-1)).toMatchObject({ type: "done", endTurn: false });
   const secondCall = source.outstanding()[0]!;
-  expect((await f.run(parse({ ...raw, tools: [], input: [...raw.input,
-    { type: "tool_search_output", call_id: secondCall.callId, status: "completed", tools: [] }],
-  }))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const removal = { type: "tool_search_output", call_id: secondCall.callId, status: "completed", tools: [] };
+  const acceptedHistory = [...raw.input, recordedCall(firstCall), search, recordedCall(secondCall), removal];
+  expect((await f.run(parse({ ...raw, tools: [], input: [...raw.input, removal] }))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   const binding = source.runtime.continuityBinding!;
   expect(binding.discoveredTools).toEqual([]);
-  const compact = parse({ ...raw, tools: [], input: [...raw.input, search] });
+  const compact = parse({ ...raw, tools: [], input: acceptedHistory });
   compact._compactionRequest = true;
   let marker: unknown;
   if (manual) {
@@ -4619,7 +4681,7 @@ for (const manual of [false, true]) for (const aliasedSource of (manual ? [false
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const call = source.outstanding()[0]!;
   if (aliasedSource) expect(first._chatGptMessageIdAliases).toEqual({ "msg-initial-alias": sourceItem.id });
-  const compact = request([nativeSource, { type: "function_call_output", call_id: call.callId, output: "Accepted source result." }]);
+  const compact = request([nativeSource, recordedCall(call), { type: "function_call_output", call_id: call.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4649,7 +4711,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
   if (checkpoint) {
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
     const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
-      { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+      recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
     compact._compactionRequest = true;
     const summary = (await f.run(compact)).find(event => event.type === "text_delta");
     if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4702,7 +4764,7 @@ for (const manual of [false, true]) test(`Round 9: first checkpoint transition a
   await f.run(first);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const compact = f.request("", "turn-first", [original,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4743,7 +4805,7 @@ for (const manual of [false, true]) for (const parentFirst of [false, true]) for
   const first = parse([firstItem]);
   await f.run(first);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
-  const compact = parse([firstItem, { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+  const compact = parse([firstItem, recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4776,7 +4838,7 @@ for (const manual of [false, true]) for (const field of ["author", "recipient"] 
   const first = parse([parent]);
   await f.run(first);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
-  const compact = parse([parent, { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+  const compact = parse([parent, recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4820,7 +4882,7 @@ for (const manual of [false, true]) for (const retainSource of [false, true]) te
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const sourceInput = (first._rawBody as { input: unknown[] }).input;
   const compact = f.request("", "turn-first", [...sourceInput,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
@@ -4858,7 +4920,7 @@ for (const manual of [false, true]) test(`Round 9: committed compaction replay r
   const call = source.outstanding()[0]!;
   const prefix = (first._rawBody as { input: unknown[] }).input;
   const result = { type: "function_call_output", call_id: call.callId, output: "Accepted source result." };
-  const compact = f.request("", "turn-first", [...prefix, result]);
+  const compact = f.request("", "turn-first", [...prefix, recordedCall(call), result]);
   compact._compactionRequest = true;
   const accepted = await f.run(compact);
   const submissions = f.submissions.length;
@@ -4887,7 +4949,7 @@ for (const manual of [false, true]) for (const retained of [false, true]) for (c
   await f.run(first);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
   const compact = f.request("", "turn-first", [oldUser, oldAnswer, sourceItem,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
@@ -4967,7 +5029,7 @@ for (const manual of [false, true]) test(`Round 10: cached compact codecs do not
     client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
   const first = await (await f.send(body)).json() as { output: Array<Record<string, unknown>> };
   const call = first.output.find(item => item.type === "function_call");
-  const result = call ? [{ type: "function_call_output", call_id: call.call_id, output: "Accepted parent source result." }] : [];
+  const result = call ? [call, { type: "function_call_output", call_id: call.call_id, output: "Accepted parent source result." }] : [];
   let checkpoint: unknown;
   let v1Output: unknown[] = [];
   for (let index = 0; index < 600; index += 1) {
@@ -5068,6 +5130,7 @@ for (const manual of [false, true]) for (const unavailable of ["descriptor", "he
   const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
   const compact = call ? f.request("", "turn-first", [
     ...(source._rawBody as { input: unknown[] }).input,
+    currentRecordedCall(f.provider, source),
     { type: "function_call_output", call_id: call.id, output: "Actual completed tool result." },
   ]) : structuredClone(source);
   compact._compactionRequest = true;
@@ -5101,7 +5164,8 @@ for (const history of ["omitted", "edited"] as const) test(`recovery v3: ordinar
   const sourceEvents = await f.run(first);
   const call = sourceEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
   const accepted = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
-  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, accepted]);
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    currentRecordedCall(f.provider, first), accepted]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
@@ -5134,7 +5198,8 @@ for (const history of ["omitted", "edited"] as const) test(`recovery v3: appende
   const issued = await f.run(first);
   const call = issued.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
   const covered = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
-  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, covered]);
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    currentRecordedCall(f.provider, first), covered]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
@@ -5165,6 +5230,9 @@ for (const history of ["omitted", "edited"] as const) test(`recovery v3: appende
   await expect(f.run(f.request("", "turn-first", [marker, task, { ...uncovered, output: "Edited required result." }, ...old]))).rejects.toMatchObject({ code: "continuity_result_conflict" });
   expect(bindings.recoveryStore.get(ref.thread)).toEqual(before);
   expect((await f.run(appended)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const restoredTask = taskEnvelope(f.submissions.at(-1)!.prompt) as { messages: Array<{ role: string; content: unknown }> };
+  expect(restoredTask.messages).toContainEqual({ role: "user", content: "First continuity instruction." });
+  expect(restoredTask.messages).toContainEqual({ role: "user", content: task.content });
   const after = bindings.recoveryStore.get(ref.thread)!;
   expect(after.currentWorkId).toBe(logicalWorkId);
   expect(after.calls[call.id]!.firstResultDigest).toBe(before.calls[call.id]!.firstResultDigest);
@@ -5178,6 +5246,7 @@ for (const manual of [false, true]) for (const pageState of ["healthy", "lost"] 
   const issued = await f.run(first);
   const call = issued.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
   const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    currentRecordedCall(f.provider, first),
     { type: "function_call_output", call_id: call.id, output: "Actual covered result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -5218,7 +5287,8 @@ test("recovery v3: completed checkpoint consumer permits a new instruction after
   const events = await f.run(first);
   const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
   const accepted = { type: "function_call_output", call_id: call.id, output: "Actual covered result." };
-  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input, accepted]);
+  const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+    currentRecordedCall(f.provider, first), accepted]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
@@ -5268,10 +5338,20 @@ test("recovery v3: a real harmless command runs once and its accepted result ent
   const stdout = processResult.stdout.toString();
   expect(processResult.exitCode, processResult.stderr.toString()).toBe(0);
   const raw = (original._rawBody as { input: unknown[] }).input;
-  const resultInput = [...raw, { type: "function_call_output", call_id: call.id, output: stdout }];
+  const result = { type: "function_call_output", call_id: call.id, output: stdout };
+  const resultInput = [...raw, result];
   const interrupted = await f.run(f.request("", "turn-first", resultInput));
   expect(interrupted.at(-1)).toMatchObject({ type: "error", code: "continuity_session_lost" });
   f.controls.invokeSourceTools = false;
+  await expect(f.run(f.request("", "turn-first", [...raw, { ...result, output: "Conflicting command result." }]))).
+    rejects.toMatchObject({ code: "continuity_source_unproven" });
+  for (const content of ["Changed source instruction.", ""]) {
+    const unproven = structuredClone(raw) as Array<Record<string, unknown>>;
+    unproven.find(item => item.role === "user")!.content = content;
+    await expect(f.run(f.request("", "turn-first", [...unproven, result]))).
+      rejects.toMatchObject({ code: "continuity_source_unproven" });
+  }
+  expect(f.submissions).toHaveLength(1);
   const recovered = await f.run(f.request("", "turn-first", resultInput));
   expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(readFileSync(counter, "utf8")).toBe("x");
@@ -5349,7 +5429,7 @@ for (const withResult of [false, true]) for (const stage of ["prepared", "send-p
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
   const compact = f.request("", "turn-first", [
     ...(original._rawBody as { input: unknown[] }).input,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Actual source result before consumer." },
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Actual source result before consumer." },
   ]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
@@ -5419,7 +5499,7 @@ for (const localBody of [false, true]) test(`recovery v3: consumed continuation 
   await f.run(original);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
   const compact = f.request("", "turn-first", [...(original._rawBody as { input: unknown[] }).input,
-    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+    recordedCall(source.outstanding()[0]!), { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing checkpoint");
@@ -5429,8 +5509,9 @@ for (const localBody of [false, true]) test(`recovery v3: consumed continuation 
   const consumerRequest = f.request("", "turn-first", [marker]);
   await f.run(consumerRequest);
   const consumer = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(consumerRequest)}`)!;
+  const consumerCall = recordedCall(consumer.outstanding()[0]!);
   const result = { type: "function_call_output", call_id: consumer.outstanding()[0]!.callId, output: "Actual uncovered consumer result." };
-  if (localBody) expect((await f.run(f.request("", "turn-first", [marker, result]))).at(-1)).toMatchObject({ type: "error" });
+  if (localBody) expect((await f.run(f.request("", "turn-first", [marker, consumerCall, result]))).at(-1)).toMatchObject({ type: "error" });
   else {
     f.pages.clear();
     const bindings = continuityBindingsFor(f.statePath);
@@ -5439,7 +5520,7 @@ for (const localBody of [false, true]) test(`recovery v3: consumed continuation 
   const store = new ContinuityRecoveryStore(f.statePath);
   const before = store.get(continuityDigest(f.threadId))!;
   f.controls.invokeSourceTools = false;
-  const recovered = await f.run(f.request("", "turn-first", [marker, ...localBody ? [] : [result]]));
+  const recovered = await f.run(f.request("", "turn-first", [marker, consumerCall, ...localBody ? [] : [result]]));
   expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
   const after = store.get(before.thread)!;
   expect(after.currentWorkId).toBe(before.currentWorkId);

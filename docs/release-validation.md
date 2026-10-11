@@ -46,7 +46,97 @@ GitHub documents this contract in [Get the latest release](https://docs.github.c
 
 Record the release version, operating-system version, install path (`clean` or `upgrade`), ChatGPT
 plan, Codex version, result of each check, and a redacted Activity log for every failure. Never
-capture cookies, tunnel IDs, API keys, bearer tokens, or prompt contents.
+capture cookies, tunnel IDs, API keys, bearer tokens, or private task prompt contents.
+For controlled synthetic fixtures, retain only the fixture input and output needed to assess the
+result, with credentials redacted.
+
+## Context navigation validation
+
+The [context navigation contract](context-navigation.md) requires new plugins named `Codex Native5`,
+`Codex Native5 DEV`, and `Codex Zero Risk4`, or current custom identities that are not retired defaults.
+Keep old plugins unchanged; create new plugins rather than renaming or refreshing them. A local
+health result, installed MCP `tools/list`, or completed setup marker is not cloud cached-schema
+verification. **Verify runtime** requires six real successful read-only context transport returns
+against fixed small text, using ordinary and independent compaction credentials. Retain redacted
+evidence for each selected new plugin and both manual Sent policies. Missing calls, model-only
+success claims, failed transport sends, and profile/mode/plugin/tunnel/runtime/schema mismatches
+must refuse navigation publication and compaction admission. Evidence has no time-based expiry;
+binding changes invalidate it. A successful six-call check proves callability, not raw cloud schema,
+image consumption, model understanding, or the remaining acceptance cases below.
+
+Complete acceptance and release validation are still pending. The initial live image checks,
+dated 2026-10-11, used the preceding `Codex Native4 DEV` Automatic and `Codex Zero Risk3` manual
+identities. They exercised official Tunnel → stdio MCP image returns in one response, with image
+IDs `1, 2, 3, 1` and no composer image uploads.
+
+| Live fixture and mode | Observed result | Supported conclusion |
+| --- | --- | --- |
+| Geometry, Automatic GPT-6 Sol High | Correct red circle, two blue squares, three green triangles, then the original red circle | One successful four-return response with fixed 640 × 360 PNG images |
+| Geometry, Zero Risk with user-selected High | All four colors, shapes, and counts correct | One successful manual response on the same MCP path |
+| Instant, Automatic and Zero Risk | Calls settled, but outputs reported missing or unreliable visual information | This mode did not pass the image-consumption check |
+| Medium comparisons | Number errors and geometry visibility failures remained | Repeated transport success did not establish reliable image use |
+| Numbers, Automatic High | The second number was read as `915465` instead of `915406` | High geometry success does not establish reliable number recognition |
+
+Those initial checks are limited feasibility evidence for the tested High geometry sequence. They do not establish
+new-ABI cloud schema adoption, all-model stability, exact visual token cost, larger single-image
+limits, or increased image capacity. The four-return sequence never measured the composer boundary.
+Keep the failed outputs alongside successful evidence; do not replace them with local contract tests.
+
+Subsequent isolated DEV checks on 2026-10-11 used newly created `Codex Native5 DEV` and
+`Codex Zero Risk4` plugins. Both completed all six ordinary/compaction context calls with real
+transport receipts. Automatic initially failed before sending because the verifier supplied an
+invalid helper conversation key; the corrected key passed a real helper protocol regression and
+the live six-call check. This proves callability, not a raw platform schema export.
+
+| New-ABI live check | Observed result | Limit |
+| --- | --- | --- |
+| Zero Risk High geometry | All reported colors, shapes and counts correct; the user confirmed High, no uploads, and four reports in one ChatGPT reply | Actual image returns were `1, 1, 1, 1, 2, 3, 1`; the strict sequence test failed and remains recorded |
+| Automatic High geometry | All reported colors, shapes and counts correct; one physical browser run, with user-confirmed zero uploads and four reports in one reply | Actual image returns were `1, 1, 2, 3, 1`; the strict sequence test failed and remains recorded |
+| Zero Risk two-turn text | The first turn read only the first log fragment; a new second-turn context found and read the previously unread unique tail value | One representative retained conversation |
+| Automatic two-turn text | A new second-turn context searched and read the previously unread unique tail value after the first turn read only the first fragment | One representative retained conversation |
+| Zero Risk compaction after source completion | A bounded prompt exposed the independent read entry; 1,336 bytes of selected source reads supported an accepted summary of the 233,177-byte log | Explicit manual compaction; does not prove an active-turn handoff or capacity limits |
+| Automatic retained compaction | The actual retained compaction entry supported search and a 427-byte tail read, followed by an accepted summary | One representative retained handoff; not a capacity-limit test |
+
+The geometry checks support consumption of three distinct MCP images in one reply in the tested
+High configurations. The additional exact-four-call assertion failed; neither the failure records
+nor the models' inaccurate claims about exact call order are discarded. These observations do not
+prove stable call counts, all-model reliability, or increased image capacity.
+
+Both representative summaries preserved the unique tail value, decision, rollback threshold
+of more than three mismatches, next action, historical source, and distinction between completed
+observations and pending work. Read coverage alone was not used as a semantic-quality verdict.
+
+Before treating the feature as release-ready, exercise both Automatic and Zero Risk:
+
+1. Read the current navigation entry from actual ordinary, retained, and continuity inputs. Across
+   two sends, discover and read an earlier unconsumed source using the new entry; old references
+   must fail. Check exact reconstruction, source roles, ambiguous call IDs, filter boundaries, and
+   UTF-8 pagination through the public tools, without injecting internal credentials into a test model.
+2. Compare a short input, a large tool log read only in part, and that log read in full. Record original
+   and projected prompt bytes, entry and directory overhead, complete MCP response bytes, unique and
+   repeated reads, calls, image uploads, image bytes, estimated tokens, and total elapsed time.
+   A shorter prompt alone is not a delivery-cost result.
+3. Check current required images, optional history images, unavailable sources, and fixed routes.
+   Confirm no upload for MCP images. Exercise mixed fallback images with Sent enabled and disabled;
+   only the selected required fallback subset receives independent confirmation. Confirmation from
+   an old request or manifest must fail. Record real model use, not only HTTP success.
+4. Attempt business work and completion before image readiness. Check deterministic rejection and
+   a new operation ID after correction, while existing waits, replay, results, and ACKs still work.
+   Observe ChatGPT-owned tool ordering separately; it has no hard server interception point.
+5. Exercise no-progress, total readiness, attachment-confirmation, return-settlement, resource,
+   cancellation, and in-flight completion boundaries. A legitimate Native long wait after readiness
+   must retain its snapshot without a new navigation task timeout. Check task-update and owner-transfer
+   races without adding a composer message or implicit ACK.
+6. End ordinary work with an unread externalized source, then compact through the actual retained
+   control entry. Search or read its unique information and submit once. Also submit after reading
+   only part or none. Check separate credentials, bounded summary reserve, correctable budget errors,
+   permanent source failures, unavailable bytes, in-flight reads, expiry, and revoked access.
+   Failed attempts must preserve accepted ordinary results and must not create a successful checkpoint.
+7. Cover restart, lost-page recovery, unknown Send, stop, both active and ended manual compaction,
+   and new/retired/custom identities. Rebuild only from real verified sources under existing recovery
+   admission. Keep browser-only, API Key, production, and DEV regression coverage. Repeat the live
+   image check through the final new-ABI path; measure actual attachment limits and a higher count
+   before making any capacity claim.
 
 ## Session continuity validation
 
@@ -65,7 +155,7 @@ For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, r
    checkpoint and continue on the same page with new tool authority. Zero Risk active compaction
    uses the delivered control path; a response that ended before control delivery preserves its
    ordinary result and requires manual handoff without a second automatic prompt. Automatic lost
-   compaction can generate a tool-free summary in one new page if not committed; a valid existing
+   compaction can generate a read-only summary in one new page if not committed; a valid existing
    handoff commits once and committed results only replay.
 3. The published 1,000,000-token history window and 900,000-token automatic-compaction target do
    not increase the existing single-browser-input limits. Test a large canonical history with a
@@ -217,8 +307,8 @@ historical implementation/review rounds as public specifications.
 ## Inflight user update validation
 
 The [task update contract](native-tool-protocol.md#user-updates-during-tool-work) requires both
-Automatic Full (`Codex Native4`, or `Codex Native4 DEV`) and Zero Risk (`Codex Zero Risk3`).
-Refresh the new connector identity and verify the ACK tool and `task_revision` start schema before
+Automatic Full (`Codex Native5`, or `Codex Native5 DEV`) and Zero Risk (`Codex Zero Risk4`).
+Create the new connector identity and verify the ACK tool and `task_revision` start schema before
 testing. Existing active tasks keep their original protocol; start a new compatible task.
 
 1. Have real Codex execute a harmless tool with a visible delay. While it runs, append one plain
@@ -313,7 +403,7 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
 3. Install the Codex model route, restart Codex, and prove that every account-available ChatGPT Web
    effort appears exactly once without removing native models.
 4. Complete one Browser-only turn and verify streamed commentary plus the final answer.
-5. Configure the `Codex Native4` connector, run **Verify runtime**, and complete one Full-mode local
+5. Create the `Codex Native5` connector, run **Verify runtime**, and complete one Full-mode local
    tool turn. Repeat with Pro when the account exposes Pro.
 6. Drive a chat past the compaction threshold and prove that it continues after compaction without
    a duplicate or orphaned browser turn.

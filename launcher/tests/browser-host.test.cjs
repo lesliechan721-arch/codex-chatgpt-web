@@ -3160,6 +3160,156 @@ function manualTurnFixture() {
   return { fixture, clipboardWrites };
 }
 
+function manualPlan(planId, attachments = [{ id: "image_1", label: "用户消息 2，图片 1" }]) {
+  return { planId, contextId: "context_test", manifestDigest: "f".repeat(64), requiredAttachments: attachments };
+}
+
+function beginPlannedManual(fixture, trace, plans, { key, resume, sent = true } = {}) {
+  return fixture.beginManualTurn(trace, process.pid, "full text", key, resume, false, sent, sent, undefined, false, plans);
+}
+
+function manualPlanBinding(fixture, lease) {
+  const media = fixture.tabSnapshot(fixture.turnTabs.get(lease.tabId)).manualAttachments;
+  return { traceId: media.traceId, nonce: media.nonce, planId: media.planId, manifestDigest: media.manifestDigest };
+}
+
+test("manual plans select before clipboard exposure and retries return their explicit original plan", () => {
+  const { fixture, clipboardWrites } = manualTurnFixture();
+  assert.throws(() => beginPlannedManual(fixture, "missing_selected", { resume: manualPlan("resume") }), /selected.*missing or invalid/);
+  assert.equal(clipboardWrites.length, 0);
+  assert.equal(fixture.turnTabs.size, 0);
+  const full = manualPlan("full");
+  const lease = beginPlannedManual(fixture, "selected_trace", { full, resume: manualPlan("resume", []) }, { resume: "resume text" });
+  assert.equal(lease.selectedPlanId, "full");
+  const retry = beginPlannedManual(fixture, "selected_trace", { full, resume: manualPlan("other", []) }, { resume: "resume text" });
+  assert.equal(retry.reused, true);
+  assert.equal(retry.selectedPlanId, "full", "a retry is not evidence that resume was selected");
+  assert.equal(clipboardWrites.length, 1);
+  assert.throws(() => beginPlannedManual(fixture, "selected_trace", { full: manualPlan("replacement") }), /different selected context plan/);
+  fixture.cancelManualTurn("selected_trace", process.pid);
+});
+
+test("a full fast candidate has a receipt descriptor when its resume candidate uses navigation", () => {
+  const { fixture, clipboardWrites } = manualTurnFixture();
+  const full = manualPlan("full_fast", []);
+  const resume = manualPlan("resume_navigation");
+  const lease = beginPlannedManual(fixture, "fast_full_navigation_resume", { full, resume }, { resume: "navigation resume text" });
+  assert.equal(lease.selectedPlanId, "full_fast");
+  assert.equal(clipboardWrites.at(-1), "full text");
+  assert.deepEqual(fixture.inspectManualAttachments("fast_full_navigation_resume", process.pid, full.planId, full.manifestDigest), {
+    planId: full.planId, manifestDigest: full.manifestDigest, requiredCount: 0,
+    status: "not-required", attestedAt: null, deadlineAt: null,
+  });
+  assert.throws(() => fixture.inspectManualAttachments("fast_full_navigation_resume", process.pid, resume.planId, resume.manifestDigest), /does not match/);
+  fixture.cancelManualTurn("fast_full_navigation_resume", process.pid);
+});
+
+test("Sent and connector start never attest the fallback images, in both Sent policies", async () => {
+  for (const sent of [true, false]) {
+    const { fixture } = manualTurnFixture();
+    const lease = beginPlannedManual(fixture, "media_policy", { full: manualPlan("full") }, { sent });
+    const binding = manualPlanBinding(fixture, lease);
+    const tab = fixture.turnTabs.get(lease.tabId);
+    const mediaDeadline = tab.manualAttachmentsDeadlineAt;
+    const waiting = fixture.waitManualAttachments("media_policy", process.pid, binding.planId, binding.manifestDigest, 1_000);
+    if (sent) fixture.confirmManualSent(lease.tabId, binding);
+    else assert.throws(() => fixture.confirmManualSent(lease.tabId, binding), /disabled/);
+    fixture.markManualTurnStarted("media_policy", process.pid);
+    assert.equal(tab.manualAttachmentsStatus, "pending");
+    assert.equal(tab.manualAttachmentsDeadlineAt, mediaDeadline);
+    assert.equal(tab.manualDeadlineAt, null);
+    assert.throws(() => fixture.endManualTurn("media_policy", process.pid, "completed", true), /required attachment confirmation/);
+    fixture.confirmManualAttachments(lease.tabId, binding);
+    const result = await waiting;
+    assert.equal(result.status, "user_attested");
+    assert.equal(result.requiredCount, 1);
+    assert.equal(result.deadlineAt, null);
+    assert.ok(Number.isFinite(Date.parse(result.attestedAt)));
+    assert.equal("verified" in result, false);
+    fixture.endManualTurn("media_policy", process.pid, "completed");
+  }
+});
+
+test("all-MCP plans need no human media step and fallback confirmations are bound to the surface and manifest", () => {
+  const { fixture } = manualTurnFixture();
+  const mcp = beginPlannedManual(fixture, "mcp_trace", { full: manualPlan("mcp", []) });
+  const result = fixture.inspectManualAttachments("mcp_trace", process.pid, "mcp", "f".repeat(64));
+  assert.deepEqual(result, { planId: "mcp", manifestDigest: "f".repeat(64), requiredCount: 0,
+    status: "not-required", attestedAt: null, deadlineAt: null });
+  assert.equal(fixture.turnTabs.get(mcp.tabId).manualAttachmentsDeadlineTimer, null);
+  fixture.cancelManualTurn("mcp_trace", process.pid);
+  const lease = beginPlannedManual(fixture, "mixed_trace", { full: manualPlan("mixed") });
+  const binding = manualPlanBinding(fixture, lease);
+  for (const change of [{ traceId: "old_trace" }, { nonce: "old_nonce" }, { planId: "unselected" }, { manifestDigest: "a".repeat(64) }]) {
+    assert.throws(() => fixture.confirmManualAttachments(lease.tabId, { ...binding, ...change }), /no longer belongs/);
+  }
+  assert.throws(() => fixture.confirmManualSent(lease.tabId), /no longer belongs/);
+  assert.throws(() => fixture.inspectManualAttachments("mixed_trace", process.pid, "unselected", binding.manifestDigest), /does not match/);
+  assert.throws(() => fixture.inspectManualAttachments("mixed_trace", 1, binding.planId, binding.manifestDigest), /ownership/);
+  fixture.cancelManualTurn("mixed_trace", process.pid);
+});
+
+test("retained manual plans clear prior attestations and independently validate only their selected candidate", () => {
+  const { fixture, clipboardWrites } = manualTurnFixture();
+  const key = "a".repeat(64);
+  const first = beginPlannedManual(fixture, "media_first", { full: manualPlan("first") }, { key });
+  const oldBinding = manualPlanBinding(fixture, first);
+  fixture.confirmManualAttachments(first.tabId, oldBinding);
+  fixture.confirmManualSent(first.tabId, oldBinding);
+  fixture.endManualTurn("media_first", process.pid, "completed", true);
+  const second = fixture.beginManualTurn("media_second", process.pid, "", key, "resume text", false, true, true, undefined, false,
+    { full: null, resume: manualPlan("second") });
+  assert.equal(second.selectedPlanId, "second");
+  assert.equal(second.reused, true);
+  assert.equal(second.tabId, first.tabId);
+  assert.equal(clipboardWrites.at(-1), "resume text");
+  assert.equal(fixture.turnTabs.get(second.tabId).manualAttachmentsStatus, "pending");
+  assert.throws(() => fixture.confirmManualAttachments(second.tabId, oldBinding), /no longer belongs/);
+  const binding = manualPlanBinding(fixture, second);
+  fixture.confirmManualAttachments(second.tabId, binding);
+  fixture.cancelManualTurn("media_second", process.pid);
+});
+
+test("manual media waiting has its own finite deadline and supports cancellation after Sent", async () => {
+  const { fixture } = manualTurnFixture();
+  const lease = beginPlannedManual(fixture, "media_timeout", { full: manualPlan("full") });
+  const binding = manualPlanBinding(fixture, lease);
+  const tab = fixture.turnTabs.get(lease.tabId);
+  const deadline = tab.manualAttachmentsDeadlineAt;
+  fixture.copyManualPrompt(tab.id, binding);
+  assert.equal(tab.manualAttachmentsDeadlineAt, deadline, "Copy cannot renew the media deadline");
+  fixture.confirmManualSent(tab.id, binding);
+  tab.manualAttachmentsDeadlineAt = Date.now();
+  fixture.armManualAttachmentsDeadline(tab);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal((await fixture.waitManualAttachments("media_timeout", process.pid, binding.planId, binding.manifestDigest)).status, "timeout");
+  assert.throws(() => fixture.confirmManualAttachments(tab.id, binding), /no longer belongs/);
+  fixture.removeTurnTab(tab);
+  const next = beginPlannedManual(fixture, "media_cancel", { full: manualPlan("next") });
+  const nextBinding = manualPlanBinding(fixture, next);
+  fixture.confirmManualSent(next.tabId, nextBinding);
+  const waiting = fixture.waitManualAttachments("media_cancel", process.pid, nextBinding.planId, nextBinding.manifestDigest);
+  fixture.cancelManualTurn("media_cancel", process.pid);
+  assert.deepEqual(await waiting, { status: "cancelled" });
+});
+
+test("a native document refresh revokes a manual plan and all old media confirmations without DOM operations", () => {
+  const { fixture } = manualTurnFixture();
+  const lease = beginPlannedManual(fixture, "media_refresh", { full: manualPlan("refresh") });
+  const binding = manualPlanBinding(fixture, lease);
+  const tab = fixture.turnTabs.get(lease.tabId);
+  const events = new Map();
+  tab.bootstrapReady = true;
+  tab.url = "https://chatgpt.com/";
+  tab.view = { webContents: { on: (name, fn) => events.set(name, fn), setWindowOpenHandler() {},
+    executeJavaScript() { throw new Error("DOM reads are forbidden"); }, insertCSS() { throw new Error("DOM writes are forbidden"); } } };
+  fixture.bindManualTurnContents(tab);
+  events.get("did-start-navigation")({}, tab.url, false, true);
+  assert.equal(tab.manualState, "failed");
+  assert.throws(() => fixture.confirmManualAttachments(tab.id, binding), /no longer belongs/);
+  fixture.removeTurnTab(tab);
+});
+
 test("manual start is idempotent and never exposes its private prompt in snapshots", () => {
   const { fixture, clipboardWrites } = manualTurnFixture();
   const first = fixture.beginManualTurn("manual_trace_1", process.pid, "private prompt", "a".repeat(64));

@@ -28,6 +28,7 @@ import type {
   LauncherSnapshot,
   LauncherState,
   LogRecord,
+  ManualPlanConfirmation,
   OperationState,
   Surface,
   ToolAuthorityMode,
@@ -975,22 +976,35 @@ function BrowserSurface({
       setError(messageOf(cause));
     }
   };
-  const copyManualPrompt = async (tabId: string) => {
+  const manualPlanBinding = (tab: BrowserState["tabs"][number]): ManualPlanConfirmation | undefined => {
+    const media = tab.manualAttachments;
+    return media?.nonce ? { traceId: media.traceId, nonce: media.nonce, planId: media.planId, manifestDigest: media.manifestDigest } : undefined;
+  };
+  const copyManualPrompt = async (tabId: string, binding?: ManualPlanConfirmation) => {
     try {
-      await api!.copyManualPrompt(tabId);
+      await api!.copyManualPrompt(tabId, binding);
       return true;
     } catch (cause) {
       setError(messageOf(cause));
       return false;
     }
   };
-  const confirmManualSent = async (tabId: string) => {
+  const confirmManualSent = async (tabId: string, binding?: ManualPlanConfirmation) => {
     try {
-      await api!.confirmManualSent(tabId);
+      await api!.confirmManualSent(tabId, binding);
     } catch (cause) {
       setError(messageOf(cause));
     }
   };
+  const confirmManualAttachments = async (tabId: string, binding?: ManualPlanConfirmation) => {
+    if (!binding) return;
+    try {
+      await api!.confirmManualAttachments(tabId, binding);
+    } catch (cause) {
+      setError(messageOf(cause));
+    }
+  };
+  const selectedManualPlanBinding = selectedManualTab ? manualPlanBinding(selectedManualTab) : undefined;
 
   return (
     <section className="browser-surface">
@@ -1076,13 +1090,17 @@ function BrowserSurface({
         {browser?.loading ? <i className="browser-loading-line" /> : null}
       </div>
       {selectedManualTab
-        && ["awaiting-user", "sent"].includes(selectedManualTab.manualState ?? "") ? (
+        && (["awaiting-user", "sent"].includes(selectedManualTab.manualState ?? "")
+          || (selectedManualTab.manualState === "running" && selectedManualTab.manualAttachments?.status === "pending")) ? (
         <ManualTurnGuide
           copy={copy}
-          key={selectedManualTab.id}
+          key={selectedManualTab.manualAttachments
+            ? `${selectedManualTab.id}:${selectedManualTab.traceId}:${selectedManualTab.manualAttachments.nonce ?? ""}`
+            : selectedManualTab.id}
           onCancel={() => void closeTab(selectedManualTab.id)}
-          onCopy={() => copyManualPrompt(selectedManualTab.id)}
-          onSent={() => void confirmManualSent(selectedManualTab.id)}
+          onCopy={() => copyManualPrompt(selectedManualTab.id, selectedManualPlanBinding)}
+          onSent={() => void confirmManualSent(selectedManualTab.id, selectedManualPlanBinding)}
+          onAttachments={() => void confirmManualAttachments(selectedManualTab.id, selectedManualPlanBinding)}
           tab={selectedManualTab}
         />
       ) : null}
@@ -1129,23 +1147,25 @@ function ManualTurnGuide({
   onCancel,
   onCopy,
   onSent,
+  onAttachments,
   tab,
 }: {
   copy: Copy;
   onCancel: () => void;
   onCopy: () => Promise<boolean>;
   onSent: () => void;
+  onAttachments: () => void;
   tab: BrowserState["tabs"][number];
 }) {
   const [now, setNow] = useState(Date.now());
   const [cancelPending, setCancelPending] = useState(false);
   const [copied, setCopied] = useState(false);
   useEffect(() => {
-    if (tab.manualState !== "awaiting-user" || !tab.manualDeadlineAt) return;
+    if (!tab.manualDeadlineAt && !tab.manualAttachments?.deadlineAt) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
-  }, [tab.manualDeadlineAt, tab.manualState]);
+  }, [tab.manualDeadlineAt, tab.manualState, tab.manualAttachments?.deadlineAt]);
   useEffect(() => {
     if (!cancelPending) return;
     const timer = window.setTimeout(() => setCancelPending(false), 3_000);
@@ -1160,6 +1180,10 @@ function ManualTurnGuide({
   const seconds = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - now) / 1_000)) : 0;
   const waiting = tab.manualState === "awaiting-user";
   const requireSentConfirmation = tab.manualSentConfirmationRequired !== false;
+  const attachments = tab.manualAttachments;
+  const attachmentsPending = attachments?.status === "pending";
+  const mediaSeconds = attachments?.deadlineAt
+    ? Math.max(0, Math.ceil((Date.parse(attachments.deadlineAt) - now) / 1_000)) : 0;
   const cancel = () => {
     if (!cancelPending) {
       setCancelPending(true);
@@ -1199,6 +1223,17 @@ function ManualTurnGuide({
           ? <PrimaryButton disabled={!tab.canConfirmSent} onClick={onSent}>{copy.manualPromptSent}</PrimaryButton>
           : null}
       </div>
+      {attachments && attachments.requiredCount > 0 ? (
+        <div className="manual-attachments-guide">
+          <strong>{copy.manualAttachmentsTitle.replace("{count}", String(attachments.requiredCount))}</strong>
+          <ul>{attachments.required.map(item => <li key={item.id}>{item.label}</li>)}</ul>
+          <p>{copy.manualAttachmentsInstruction}</p>
+          {attachmentsPending ? <div className="manual-attachments-actions">
+            <PrimaryButton disabled={!attachments.canConfirm} onClick={onAttachments}>{copy.manualAttachmentsConfirm}</PrimaryButton>
+            <span>{mediaSeconds} {copy.manualPromptSeconds}</span>
+          </div> : <p>{copy.manualAttachmentsAttested}</p>}
+        </div>
+      ) : null}
     </div>
   );
 }

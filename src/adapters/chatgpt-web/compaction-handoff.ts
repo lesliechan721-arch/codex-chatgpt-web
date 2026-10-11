@@ -1,3 +1,4 @@
+import type { ContextSnapshot } from "./context-snapshot";
 import { parseDataUrl } from "../image";
 import type {
   CodexContentPart,
@@ -21,6 +22,7 @@ import type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
+import { captureRetainedCompactionSource, compactionAvailableTokens, registerCompactionSource } from "./compaction-context";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -146,6 +148,7 @@ function currentToolResults(
     }
     results.set(message.toolCallId, message);
   }
+  session.prepareCompactionToolResults(parsed, [...results.keys()]);
   return results;
 }
 
@@ -283,8 +286,10 @@ export async function settleActiveZeroRiskCompactionSource(
   onProgress?: () => void,
   onAcceptedHandoff?: (summary: string) => void,
   alreadyExclusive = false,
+  capabilities?: ChatGptWebCapabilities,
+  sourceSnapshot?: ContextSnapshot,
 ): Promise<string | undefined> {
-  const compactPrompt = compactionPrompt(parsed);
+  let compactPrompt = compactionPrompt(parsed);
   const settle = async (): Promise<string | undefined> => {
     if (signal?.aborted) {
       source.cancel(abortReason(signal));
@@ -313,9 +318,21 @@ export async function settleActiveZeroRiskCompactionSource(
       );
     }
     let token: string | undefined;
+    let sourceToken: string | undefined;
     let compactionAccepted = false;
     try {
       token = await source.runtime.token;
+      await source.runtime.syncContextUsage?.();
+      const coverage = source.runtime.compactionSourceCoverage;
+      if (!coverage || !capabilities) throw continuityError("continuity_source_unproven", "Zero Risk compaction requires verified source coverage and page capacity.");
+      const snapshot = sourceSnapshot ?? captureRetainedCompactionSource(parsed, source);
+      const latest = coverage.latest()!;
+      const registered = await registerCompactionSource(broker, { snapshot, contract: "safe", turnToken: token,
+        handoffId: `safe:${source.traceId ?? token}`, historyRevision: latest.historyRevision,
+        ownerGeneration: latest.pageGeneration, expiresAt: Date.now() + MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
+        availableTokens: compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) }, compactPrompt, driverContext);
+      compactPrompt = registered.instruction;
+      sourceToken = registered.token;
       const interruptedQueued = await broker.requestCompaction(
         token,
         interruptedByZeroRiskCompaction(compactPrompt),
@@ -354,6 +371,7 @@ export async function settleActiveZeroRiskCompactionSource(
       if (signal?.aborted) source.cancel(abortReason(signal));
       throw error;
     } finally {
+      if (sourceToken) await broker.revokeCompactionContext?.(sourceToken);
       if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext);
     }
   };
@@ -365,13 +383,14 @@ export async function requestRetainedCompactionHandoff(
   parsed: CodexParsedRequest,
   source: ChatGptTurnSession,
   broker: TurnBroker,
-  capabilities: ChatGptWebCapabilities,
+  capabilities: ChatGptWebCapabilities & { experimentalBiggerContext?: boolean },
   traceId: string,
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   onProgress?: () => void,
   continuity?: {
     claim: ContinuityClaim;
+    sourceSnapshot?: ContextSnapshot;
     onLease: (lease: ContinuityLease) => void;
     onPhysicalSettlement: (settlement: Promise<void>) => void;
     onAcceptedHandoff: (summary: string) => void;
@@ -395,6 +414,7 @@ export async function requestRetainedCompactionHandoff(
   const browserAbort = new AbortController();
   const abortBrowser = () => browserAbort.abort(operationSignal.reason);
   let transaction: CompactionTransactionHandle | undefined;
+  let sourceToken: string | undefined;
   let browser: Promise<string> | undefined;
   if (operationSignal.aborted) abortBrowser();
   else operationSignal.addEventListener("abort", abortBrowser, { once: true });
@@ -406,7 +426,18 @@ export async function requestRetainedCompactionHandoff(
       }
     }, () => {});
     transaction = await withCompactionAbort(transactionPromise, operationSignal);
-    const instruction = structuredCompactionHandoffInstruction(transaction, compactionPrompt(parsed));
+    await source.runtime.syncContextUsage?.();
+    const coverage = source.runtime.compactionSourceCoverage;
+    if (!coverage) throw continuityError("continuity_source_unproven", "Retained compaction requires accepted source coverage evidence.");
+    const snapshot = continuity?.sourceSnapshot ?? captureRetainedCompactionSource(parsed, source);
+    const latest = coverage.latest()!;
+    const registered = await registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
+      handoffId: transaction.handoffId, historyRevision: latest.historyRevision, ownerGeneration: latest.pageGeneration,
+      expiresAt: Date.now() + operationTimeoutMs,
+      availableTokens: compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) },
+    structuredCompactionHandoffInstruction(transaction, compactionPrompt(parsed)));
+    sourceToken = registered.token;
+    const instruction = registered.instruction;
     if (continuity) assertContinuityCompiledInput({ text: instruction, images: [] }, {
       ...parsed, context: { ...parsed.context, messages: [] },
     }, capabilities);
@@ -422,9 +453,12 @@ export async function requestRetainedCompactionHandoff(
         continuity: continuityClaim!,
         onContinuityLease: continuity.onLease,
         onSendActivated: continuity.onSendActivated,
-        onSubmitted: continuity.onSubmitted,
         retainConversation: true,
       } : {}),
+      onSubmitted: () => {
+        continuity?.onSubmitted?.();
+        broker.markCompactionContextDelivered(sourceToken!);
+      },
       // The retained connector exposes only the one-shot control token embedded above. It does
       // not receive an ordinary Codex tool environment for this checkpoint message.
       capabilities: { ...capabilities, localToolsEnabled: false },
@@ -467,6 +501,7 @@ export async function requestRetainedCompactionHandoff(
     return summary;
   } finally {
     browserAbort.abort();
+    if (sourceToken) broker.revokeCompactionContext(sourceToken);
     if (transaction) broker.abortCompactionTransaction(transaction.token);
     if (browser) {
       // Logical cancellation is not physical retirement. The retained-session owner tracks

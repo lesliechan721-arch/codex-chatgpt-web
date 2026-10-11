@@ -75,7 +75,7 @@ export function structuredCompactionHandoffInstruction(
     "The required local action is to store a checkpoint in the Codex harness through the attached codex_tool_call tool. Printing a summary in chat does not store it and cannot complete this request.",
     compactPrompt,
     ...compactionControlBinding(transaction),
-    "Use only the control token above for this request. Omit operation_id: this reserved control call is not an ordinary Native operation. Do not include tokens or handoff IDs in the summary or chat text.",
+    "Use the control token above only for checkpoint submission. A separate compaction_token, when supplied, permits only codex_context_list, codex_context_search and codex_context_read. Omit operation_id from the reserved control call. Do not include tokens or handoff IDs in the summary or chat text.",
     "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
     "If the call is rejected or fails, stop and report its actual error. Do not retry through another tool or claim the summary was submitted without submitted=true.",
   ].join("\n");

@@ -73,7 +73,7 @@ Automatic modes offer Luna/Think when the account has no reasoning selector; oth
 | **Full harness (With Automation)** | Automatic | Yes, through MCP |
 | **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk3` connector yourself, then paste and send the prepared prompt. By default, confirm **Sent** in the launcher after sending. You can disable that second confirmation in Launcher settings or with `--zero-risk-no-sent-confirmation`; in that mode the Sent button is hidden and the connector binding confirms the turn automatically. Use `--zero-risk-sent-confirmation` to enable the default behavior explicitly. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
+Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk4` connector yourself, then paste and send the prepared prompt. By default, confirm **Sent** in the launcher after sending. You can disable that second confirmation in Launcher settings or with `--zero-risk-no-sent-confirmation`; in that mode the Sent button is hidden and the connector binding confirms the turn automatically. Required fallback images still need their separate attachment confirmation. Use `--zero-risk-sent-confirmation` to enable the default behavior explicitly. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
 
 <a id="full-harness"></a>
 
@@ -101,10 +101,33 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
    **Connect harness**.
 2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
-   **Codex Native4**, with **Authentication: None** and **Allow all actions**.
-3. Run **Verify runtime** to confirm that **Codex Native4** is attached and available.
+   **Codex Native5**, with **Authentication: None** and **Allow all actions**.
+3. Run **Verify runtime** for the configured identity. It checks the installed schema, then requires
+   six successful read-only MCP returns: list, search, and read with ordinary and independent
+   compaction credentials. Zero Risk keeps manual plugin selection, Send, and its Sent policy.
+   This proves callability for the selected setup, not the platform's raw cached schema.
 
-The Native long-wait protocol uses **Codex Native4** for Automatic mode, **Codex Zero Risk3** for Zero Risk, and **Codex Native4 DEV** for repository development. Leave older production connectors unchanged and create the current named connectors. When upgrading from **Codex Native3**, **Codex Native3 DEV**, or **Codex Zero Risk2**, keep the old connector unchanged and create the corresponding new connector; never rename or refresh an old connector. The `task_updates-v1` start revision and ACK tool require the new public ABI identity. Setup preserves custom nonlegacy names; if a custom plugin still caches the old contract, choose a new name and create a new plugin. Confirm that the current tool list includes `codex_tool_wait` and `codex_task_update_ack`, the start contract advertises `task_updates-v1`, and Native entry schemas include `operation_id`; update the runtime and browser helper together. The connector assigns a new positive integer ID before each logical Native call, reuses that ID for retries and waits, and keeps its counter across reconnects. A pending receipt is not task completion and must not cause the original operation to be executed again.
+The current MCP ABI uses **Codex Native5** for Automatic, **Codex Zero Risk4** for Zero Risk, and
+**Codex Native5 DEV** for repository development. Preserve **Codex Native4**, **Codex Native4 DEV**,
+and **Codex Zero Risk3** and create the corresponding new plugin; never rename or refresh an old
+connector. Earlier retired defaults remain retired. Setup preserves custom names that are not
+retired defaults. If a custom plugin caches an old schema, choose a new name and create a new
+plugin. Production and DEV connectors can remain installed together.
+
+The new ABI adds `codex_context_list`, `codex_context_read`, and `codex_context_search`, including
+their independent read-only compaction credential. It retains `codex_tool_wait`,
+`codex_task_update_ack`, `task_updates-v1`, and Native `operation_id`; update the runtime and browser
+helper together. A new logical Native call uses a new positive integer ID; retries and waits reuse
+that ID across reconnects. A pending receipt is not task completion and must not execute the
+original operation again.
+
+[Context navigation](docs/context-navigation.md) keeps ordinary task text intact while selected
+tool history is read on demand. Images prefer MCP; only required attachment fallbacks need the
+extra Zero Risk confirmation. Compaction can inspect a separate read-only source directory without
+reading every source. These paths retain existing context limits. Complete release validation is
+still pending: limited High-mode multi-image evidence does not establish higher capacity, reliable
+number recognition, or stability across all models. See the
+[validation scope](docs/release-validation.md#context-navigation-validation).
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See

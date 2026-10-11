@@ -1,6 +1,8 @@
+import { CONTEXT_PROTOCOL_VERSION, contextFailure, type ContextPreparedReply } from "./context-runtime";
 import { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 import { createHash, randomBytes } from "node:crypto";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -108,11 +110,77 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
     : NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS;
   const server = new McpServer({ name: contract === "safe" ? "codex-safe" : "codex-native", version: VERSION }, { instructions });
 
+  const contextProtocolFailures = new Map<string | number, { code: number; message: string }>();
+  const takeContextProtocolFailure = (id: string | number) => { const error = contextProtocolFailures.get(id); contextProtocolFailures.delete(id); return error; };
+  const contextReturns = new Map<string | number, { token: string; receiptId: string; credentialKind: "ordinary" | "compaction"; control?: true; signal?: AbortSignal }>();
+  const settleContextReturn = async (requestId: string | number, sent: boolean) => {
+    const pending = contextReturns.get(requestId);
+    if (!pending) return;
+    contextReturns.delete(requestId);
+    await callTurnBroker(options.brokerSocketPath, { method: pending.control ? "context_control_return" : "context_return", token: pending.token,
+      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId,
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, sent: sent && !pending.signal?.aborted }, 5_000)
+      .catch(() => console.error("[chatgpt-web-mcp] context return receipt unavailable"));
+  };
+  const checkContextReturn = async (requestId: string | number) => {
+    const pending = contextReturns.get(requestId);
+    if (!pending) return;
+    if (pending.signal?.aborted) throw new DOMException("Context return aborted", "AbortError");
+    await callTurnBroker(options.brokerSocketPath, { method: "context_return_check", token: pending.token,
+      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId, contextProtocol: CONTEXT_PROTOCOL_VERSION }, 5_000, pending.signal);
+  };
+  const contextFilters = {
+    kind: z.enum(["message_text", "tool_arguments", "tool_result", "image"]).optional(),
+    tool_name: z.string().max(256).optional(), namespace: z.string().max(256).nullable().optional(),
+    call_id: z.string().max(256).optional(),
+    source_range: z.object({ start: z.number().int().min(1), end_exclusive: z.number().int().min(2) }).strict().optional(),
+  };
+  for (const method of ["list", "read", "search"] as const) {
+    const ordinaryKey = contract === "safe" ? "request_id" : "turn_token";
+    const operationInput = method === "list" ? { ...contextFilters, view: z.enum(["overview", "entries"]), cursor: z.string().max(4096).optional() }
+      : method === "read" ? { read_ref: z.string().min(1).max(256), cursor: z.string().max(4096).optional() }
+      : { ...contextFilters, query: z.string().min(1).max(512), read_ref: z.string().min(1).max(256).optional(), cursor: z.string().max(4096).optional() };
+    const inputSchema = z.object({
+      [ordinaryKey]: turnTokenSchema.optional(), compaction_token: turnTokenSchema.optional(),
+      context_id: z.string().min(1).max(256), ...operationInput,
+    }).strict().refine(input => (typeof (input as Record<string, unknown>)[ordinaryKey] === "string") !== (typeof input.compaction_token === "string"), "Exactly one context credential is required")
+      .meta({ oneOf: [{ required: [ordinaryKey], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [ordinaryKey] } }] });
+    server.registerTool(`codex_context_${method}`, {
+      title: `Read existing Codex context: ${method}`,
+      description: "Read fixed sources already supplied to this task. No operation_id. Use exactly the current mode credential or the independent compaction_token, plus context_id. Listing and previews are not full source reads; reading never executes an old tool or acknowledges task updates.",
+      inputSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, async (input, extra) => {
+      const { compaction_token, turn_token, request_id, ...contextArgs } = input as Record<string, unknown>;
+      const token = (compaction_token ?? turn_token ?? request_id) as string;
+      const credentialKind = compaction_token ? "compaction" as const : "ordinary" as const;
+      try {
+        const reply = await callTurnBroker<ContextPreparedReply>(options.brokerSocketPath, {
+          method: "context_query", token, contract, credentialKind, contextProtocol: CONTEXT_PROTOCOL_VERSION,
+          contextMethod: method, contextArgs: contextArgs as never,
+        }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
+        if (!reply || typeof reply.receiptId !== "string" || !Array.isArray(reply.result?.content)) throw new Error("Invalid context response");
+        contextReturns.set(extra.requestId, { token, receiptId: reply.receiptId, credentialKind, signal: extra.signal });
+        if (extra.signal.aborted) { await settleContextReturn(extra.requestId, false); throw new DOMException("Context read aborted", "AbortError"); }
+        return asMcpResult(reply.result);
+      } catch (error) {
+        if (extra.signal.aborted) throw error;
+        if (error instanceof NativeOperationError && error.code === "CONTEXT_NAVIGATION_STOPPED") {
+          const refusal = { code: ErrorCode.InvalidRequest, message: "CONTEXT_NAVIGATION_STOPPED: this scope no longer authorizes source queries; its original completion path remains available" };
+          contextProtocolFailures.set(extra.requestId, refusal);
+          throw new McpError(refusal.code, refusal.message);
+        }
+        return asMcpResult(contextFailure(error instanceof NativeOperationError ? error.code : "CONTEXT_UNAVAILABLE",
+          error instanceof NativeOperationError ? error.message.slice(0, 1600) : "Context access is unavailable; do not repeat a business operation to replace missing evidence"));
+      }
+    });
+  }
+
   if (contract === "safe") {
     server.registerTool(
       "codex_turn_start",
       {
-        title: "Connect a Codex Zero Risk3 request",
+        title: "Connect a Codex Zero Risk4 request",
         description: "Connect the request_id included in the pasted Codex Web GPT request so its Codex tools can be used.",
         inputSchema: {
           request_id: turnTokenSchema,
@@ -145,7 +213,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
       if (status.nativeWaitProtocol !== NATIVE_WAIT_PROTOCOL_VERSION) {
         throw new NativeOperationError("codex_tool_upgrade_required", "Update the runtime and helper, then refresh the current connector before invoking Native tools");
       }
-      const reply = await callTurnBroker<NativeOperationReply>(options.brokerSocketPath, {
+      const reply = await callTurnBroker<NativeOperationReply & { contextControlReceipt?: string }>(options.brokerSocketPath, {
         method: entry === "codex_tool_wait" ? "native_operation_wait" : "native_operation_start",
         token: turnReference(contract, input), contract, nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         operationId: operation_id as number,
@@ -153,6 +221,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
           entry, nativeInput, taskRevision: task_revision as number | undefined, taskUpdateProtocol: 1,
         }),
       }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
+      if (reply.contextControlReceipt) contextReturns.set(extra.requestId, { token: turnReference(contract, input),
+        receiptId: reply.contextControlReceipt, credentialKind: "ordinary", control: true, signal: extra.signal });
       if (reply.kind === "pending" && reply.operation_id === operation_id) return asMcpResult(encodeTaskUpdateMcpResult(nativePendingResult(reply.operation_id), reply.taskUpdate));
       if (reply.kind === "result" && Array.isArray(reply.result?.content)) return asMcpResult(encodeTaskUpdateMcpResult(reply.result, reply.taskUpdate));
       throw new NativeOperationError("codex_tool_infrastructure_failure", "The Native waiting channel returned an invalid reply; preserve the original operation_id");
@@ -301,5 +371,5 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
     );
   }
 
-  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES));
+  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES, undefined, settleContextReturn, checkContextReturn, takeContextProtocolFailure));
 }

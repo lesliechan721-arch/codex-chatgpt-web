@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
+import type { CodexMessage, CodexParsedRequest, CodexProviderConfig } from "../../types";
 import { buildCompactV1Output, COMPACT_PROMPT, extractCompactUserMessages } from "../../responses/compaction";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { assertLauncherContinuityCapacity, inspectLauncherContinuityConversation,
@@ -22,6 +22,8 @@ import { chatGptCurrentInstructionIndex, extractChatGptCompactionSourceRevision,
   extractChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
 import type { ChatGptWebCapabilities } from "./model";
 import { structuredCompactionHandoffInstruction } from "./native-compaction-control";
+import { CompactionSourceCoverage, compactionAvailableTokens, registerCompactionSource } from "./compaction-context";
+import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
 import { compileChatGptWebPrompt, type CompiledChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type TurnBrokerOwner } from "./turn-broker";
 import { assertContinuityToolResultReplayEvidence, chatGptContinuityInstructionPayloadDigest, chatGptTurnSessions } from "./turn-execution";
@@ -35,6 +37,7 @@ interface CompactionSelection {
 interface RecoveryCompactionPlan extends CompactionSelection {
   mode: "replay" | "recover";
   input?: CodexParsedRequest;
+  sourceSnapshot?: ContextSnapshot;
   summary?: string;
   acceptedHandoff?: string;
   sourceExecutionKey?: string;
@@ -230,7 +233,8 @@ export function compileRecoveryCompactionInput(parsed: CodexParsedRequest, capab
 export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, provider: CodexProviderConfig,
   namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
   bindings: ContinuityBindings, record: RecoveryThreadRecord | undefined, descriptor: string,
-  abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>): Promise<PreparedContinuityRequest | undefined> {
+  abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
+  verifyContextCapability?: () => Promise<void>): Promise<PreparedContinuityRequest | undefined> {
   if (!parsed._compactionRequest) return undefined;
   if (!record) throw continuityError("continuity_source_unproven", "A standalone compaction cannot activate a continuity thread.");
   if (record.legacyUnproven) throw continuityError("continuity_legacy_unproven");
@@ -264,7 +268,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     const afterCompatibility = store.get(record.thread)!;
     if (afterCompatibility.version !== record.version) {
       return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
-        descriptor, abortSignal, assertExecutionCompatible);
+        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     }
     record = registerTarget(store, bindings.registrations.directory, record, {
       sourceLogicalWorkId: source.logicalWorkId, sourceIdentity: sourceIdentity(parsed, sourceRevision),
@@ -326,7 +330,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   const afterCompatibility = store.get(record.thread)!;
   if (afterCompatibility.version !== record.version) {
     return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
-      descriptor, abortSignal, assertExecutionCompatible);
+      descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
   }
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) throw continuityError("continuity_manual_handoff_required");
   const sourceAttempt = selection.source.attempts.at(-1);
@@ -341,10 +345,46 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     && checkpoint.workLineageId === selection!.target.workLineageId);
   const input = retainedInput ?? recoveryContext(parsed, { directory: bindings.registrations.directory,
     thread: record.thread, logicalWorkId: selection.source.logicalWorkId, attempt: sourceAttempt.attempt }, coveredCheckpoint?.commitId);
+  let sourceSnapshot: ContextSnapshot | undefined;
+  if (!acceptedHandoff) {
+    const coveredCalls = new Set(coveredCheckpoint?.coveredCallIds ?? []);
+    const sourceInput = structuredClone(input);
+    sourceInput.context.messages = sourceInput.context.messages.flatMap<CodexMessage>(message => {
+      if (message.role === "toolResult" && coveredCalls.has(message.toolCallId)) return [];
+      if (message.role !== "assistant") return [message];
+      return [{ ...message, content: message.content.filter(part => part.type !== "toolCall" || !coveredCalls.has(part.id)) }];
+    });
+    const raw = sourceInput._rawBody as { input: unknown[] };
+    raw.input = raw.input.filter(item => !item || typeof item !== "object"
+      || !("call_id" in item) || !coveredCalls.has(String(item.call_id)));
+    sourceSnapshot = createContextSnapshot(sourceInput);
+    const current = store.get(record.thread)!;
+    const coverage = (current.contextCoverage ?? []).filter(entry => entry.workLineageId === selection!.target.workLineageId);
+    if (coverage.some(entry => entry.metadata.historyRevision !== selection!.target.sourceHistoryRevision
+      || entry.sourceTaskRevision > selection!.target.acceptedTaskRevision)) {
+      throw continuityError("continuity_source_unproven", "The compaction target omits a newer accepted source boundary.");
+    }
+    const fullyCovered = coveredCheckpoint && coveredCheckpoint.acceptedTaskRevision === selection.target.acceptedTaskRevision
+      && coveredCheckpoint.sourceToolBatchHeadSequence === selection.target.sourceToolBatchHeadSequence;
+    // A committed checkpoint can represent its exact already-covered range. It does not
+    // authorize unknown source material after that accepted revision/tool-batch boundary.
+    if (coverage.length || !fullyCovered) {
+      CompactionSourceCoverage.assertRecordedSource(sourceSnapshot, coverage.map(entry => entry.metadata), selection.target.sourceHistoryRevision);
+    }
+  }
   // Check the complete control envelope before acquiring a new page or admission transaction.
   if (!acceptedHandoff) compileRecoveryCompactionInput(input, capabilities,
     { token: `control_${"0".repeat(32)}`, handoffId: `handoff_${"0".repeat(32)}` });
   record = store.get(record.thread)!;
+  if (!acceptedHandoff) {
+    await verifyContextCapability?.();
+    abortSignal?.throwIfAborted();
+    const afterCapability = store.get(record.thread)!;
+    if (afterCapability.version !== record.version) {
+      return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCapability,
+        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+    }
+  }
   // This coordinator verifies the target thread's retired authority, not merely a live PID.
   const { retireRecoveryWriter } = await import("./continuity-recovery-runtime");
   record = await retireRecoveryWriter(bindings, record, descriptor);
@@ -361,7 +401,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   const prepared: PreparedContinuityRequest = { bindings, binding, descriptor, executionKey,
     conversationKey: chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
     revision: selection.target.sourceHistoryRevision, sourceExecutionKey: observed?.executionKey };
-  preparedPlans.set(prepared, { ...selection, mode: "recover", input, acceptedHandoff,
+  preparedPlans.set(prepared, { ...selection, mode: "recover", input, sourceSnapshot, acceptedHandoff,
     sourceExecutionKey: observed?.executionKey, sourceBinding: observed,
     preserveFinalResponse: selection.source.state === "completed" });
   return prepared;
@@ -594,7 +634,8 @@ function checkAttempt(prepared: PreparedContinuityRequest, workId: string, attem
 
 export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
   worker: ChatGptBrowserWorker, owner: TurnBrokerOwner, capabilities: ChatGptWebCapabilities, namespace: string,
-  configuredTimeout?: number, onProgress?: () => void, onRecovered?: () => void): Promise<string> {
+  configuredTimeout?: number, onProgress?: () => void, onRecovered?: () => void,
+  verifyContextCapability?: () => Promise<void>): Promise<string> {
   const plan = preparedPlans.get(prepared);
   if (!plan) throw continuityError("continuity_source_unproven");
   if (plan.mode === "replay") {
@@ -637,6 +678,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
     signal.addEventListener("abort", abortBrowser, { once: true });
     const store = prepared.bindings.recoveryStore;
     let transaction: Awaited<ReturnType<TurnBroker["beginCompactionTransaction"]>> | undefined;
+    let sourceToken: string | undefined;
     let browser: Promise<string> | undefined;
     let logicalWorkId: string | undefined;
     let attemptNumber: number | undefined;
@@ -647,12 +689,26 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       logicalWorkId = `compaction:${plan.target.compactionTargetId}`;
       let compiled: CompiledChatGptWebPrompt | undefined;
       if (!plan.acceptedHandoff) {
+        await withCompactionAbort(Promise.resolve().then(() => verifyContextCapability?.()), signal);
+        signal.throwIfAborted();
         const pendingTransaction = owner.beginCompactionTransaction(traceId, timeoutMs);
         void pendingTransaction.then(lateTransaction => {
           if (signal.aborted && transaction !== lateTransaction) owner.abortCompactionTransaction(lateTransaction.token);
         }, () => {});
         transaction = await withCompactionAbort(pendingTransaction, signal);
-        compiled = compileRecoveryCompactionInput(plan.input!, capabilities, transaction);
+        // Preserve the original full-history admission even though actual publication uses
+        // a bounded read-only entry. recoveryContext already verified the complete lineage.
+        compileRecoveryCompactionInput(plan.input!, capabilities, transaction);
+        const registered = await registerCompactionSource(owner, {
+          snapshot: plan.sourceSnapshot!, contract: "native", transactionToken: transaction.token,
+          handoffId: transaction.handoffId, historyRevision: plan.target.sourceHistoryRevision,
+          ownerGeneration: `${prepared.bindings.owner}:${oldRecord.epoch}:${oldRecord.version}`,
+          expiresAt: Date.now() + timeoutMs,
+          availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
+        }, structuredCompactionHandoffInstruction(transaction, compactPrompt(parsed)));
+        sourceToken = registered.token;
+        compiled = { text: registered.instruction, images: [] };
+        assertContinuityCompiledInput(compiled, { ...plan.input!, context: { ...plan.input!.context, messages: [] } }, capabilities);
       }
       const snapshotDigest = continuityDigest(compiled ?? { summaryDigest: continuityDigest(plan.acceptedHandoff!) });
       const existing = oldRecord.works[logicalWorkId];
@@ -720,6 +776,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
             const current = check();
             store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
               logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "accepted" });
+            owner.markCompactionContextDelivered(sourceToken!);
           }, abortSignal: browserAbort.signal, onTextDelta() { onProgress?.(); },
         });
         retainOwnershipUntil(browser.then(() => undefined, () => undefined));
@@ -781,6 +838,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       throw error;
     } finally {
       clearTimeout(timer); signal.removeEventListener("abort", abortBrowser);
+      if (sourceToken) owner.revokeCompactionContext(sourceToken);
       if (transaction) owner.abortCompactionTransaction(transaction.token);
     }
   });

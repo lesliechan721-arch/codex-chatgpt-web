@@ -73,7 +73,7 @@ irm https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest/down
 | **Full harness (With Automation)** | 自動 | MCP 経由で利用可能 |
 | **Zero Risk** | 手動で貼り付けて送信 | 専用 MCP コネクタ経由で利用可能 |
 
-Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk3` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信し、ランチャーで **Sent** を確認してください。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
+Zero Risk は ChatGPT ページを読み取ったり操作したりしません。モデルと `Codex Zero Risk4` コネクタを自分で選び、用意されたプロンプトを貼り付けて送信してください。既定では、送信後にランチャーで **Sent** を確認します。ランチャーの設定または `--zero-risk-no-sent-confirmation` でこの追加確認を無効にすると、Sent ボタンは非表示になり、コネクタの接続でターンが自動的に確認されます。必須の代替画像には、添付済みであることの別の確認が必要です。`--zero-risk-sent-confirmation` で既定の動作を明示的に有効にできます。名前の末尾が **(Web)** の自動モデルでは、対応する Effort を Codex で選択できます。コンテキスト上限を維持するため、Instant と各 Pro バージョンは別の項目になります。既存のタスクに保存された旧モデル項目は、従来の固定モードを維持します。
 
 <a id="full-harness"></a>
 
@@ -101,13 +101,35 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
    Tunnel と通常の API キーを作成します。キーの作成は無料で、モデル API クレジットを消費しません。
 3. Tunnel ID と API キーを貼り付け、**ハーネスを接続**を押します。
 4. ChatGPT の設定で **Developer Mode** を有効にします。**Tunnel** を使う**新しい**コネクタを作成し、
-   対象の Tunnel を選択して、**Authentication** を **None**、名前を正確に **Codex Native4** に設定します。
-5. **Codex Native4** の **Permissions** で **Allow all actions** を選択します。
+   対象の Tunnel を選択して、**Authentication** を **None**、名前を正確に **Codex Native5** に設定します。
+5. **Codex Native5** の **Permissions** で **Allow all actions** を選択します。
    **Allow low-risk actions** では、コマンドとパッチがこのランタイムへ到達する前にブロックされます。
    外側の Codex ハーネスでは、引き続きサンドボックスと承認が適用されます。
-6. **ランタイムを検証**を実行し、**Codex Native4** が接続済みで利用可能であることを確認します。
+6. 設定した識別子に対して**ランタイムを検証**を実行します。インストール済み schema を確認し、
+   通常の資格情報と独立した圧縮資格情報で list、search、read を各 1 回、合計 6 回の読み取り専用
+   MCP 応答を要求します。Zero Risk は手動のプラグイン選択、送信、元の Sent ポリシーを保ちます。
+   これは選択した設定での呼び出しを証明しますが、プラットフォームの生のキャッシュ schema は証明しません。
 
-`task_updates-v1` の開始スキーマと ACK ツールには新しい識別子が必要です。Automatic は **Codex Native4**、Zero Risk は **Codex Zero Risk3**、開発環境は **Codex Native4 DEV** を使います。**Codex Native3**、**Codex Native3 DEV**、**Codex Zero Risk2** はそのまま残し、新しいコネクタを作成してください。旧コネクタの名前変更や更新は行わないでください。独自の非旧版名は保持されますが、古いキャッシュを使うプラグインには新しい名前が必要です。
+現在の MCP ABI は Automatic に **Codex Native5**、Zero Risk に **Codex Zero Risk4**、
+リポジトリの開発環境に **Codex Native5 DEV** を使います。**Codex Native4**、
+**Codex Native4 DEV**、**Codex Zero Risk3** はそのまま残し、対応する新しいプラグインを作成します。
+旧コネクタの名前変更や更新は行わないでください。それ以前の廃止済みの既定識別子も使用できません。
+セットアップは、廃止済みの既定識別子ではない独自名を保持します。独自のプラグインに古い schema が
+キャッシュされている場合は、新しい名前を選び、新しいプラグインを作成します。通常環境と DEV の
+コネクタは同時に残せます。
+
+新しい ABI には `codex_context_list`、`codex_context_read`、`codex_context_search` と、
+圧縮用の独立した読み取り専用認証情報が追加されます。`codex_tool_wait`、`codex_task_update_ack`、
+`task_updates-v1`、Native の `operation_id` は従来の契約を維持します。ランタイムとブラウザー helper を
+一緒に更新してください。新しい論理 Native 呼び出しには新しい正整数 ID を使い、再試行と待機では
+再接続後も同じ ID を使います。pending の受領通知はタスク完了ではなく、元の操作を再実行してはいけません。
+
+[コンテキストナビゲーション](docs/context-navigation.md) は通常のタスク本文を保持し、選択した
+ツール履歴を必要に応じて読み取れるようにします。画像は MCP を優先し、必須の添付への代替経路だけが
+Zero Risk の追加確認を必要とします。圧縮では独立した読み取り専用のソース一覧を使えますが、
+全ソースを読む必要はありません。既存のコンテキスト上限は変わりません。完全なリリース検証は
+未完了です。High モードでの限定的な複数画像の成功は、容量増加、正確な数字認識、全モデルでの
+安定性を証明しません。[検証範囲](docs/release-validation.md#context-navigation-validation)を参照してください。
 
 書き込み／変更操作には、ChatGPT ワークスペースと管理者ポリシー側での許可も必要です。
 [Developer Mode と MCP アプリ](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)を参照してください。

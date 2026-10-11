@@ -1796,6 +1796,9 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
     browserStarts += 1;
     const prepared = await turn.prepare();
     try {
+      if (prepared.contextPlan) await turn.onContextPlanSelected!(prepared.contextPlan.planId);
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
       if (!token) throw new Error("remote replay fixture has no turn token");
       const claimed = await callTurnBroker<{ bindingId: string }>(

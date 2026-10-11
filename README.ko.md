@@ -73,7 +73,7 @@ irm https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest/down
 | **Full harness (With Automation)** | 자동 | MCP를 통해 사용 |
 | **Zero Risk** | 직접 붙여넣고 전송 | 별도 MCP 커넥터를 통해 사용 |
 
-Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk3` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
+Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk4` 커넥터를 직접 선택하고 준비된 프롬프트를 붙여넣어 전송하세요. 기본적으로 전송 후 런처에서 **Sent**를 확인합니다. 런처 설정이나 `--zero-risk-no-sent-confirmation`으로 이 추가 확인을 끄면 Sent 버튼이 숨겨지고 커넥터 연결로 턴이 자동 확인됩니다. 필수 대체 이미지는 여전히 별도의 첨부 확인이 필요합니다. `--zero-risk-sent-confirmation`으로 기본 동작을 명시적으로 켤 수 있습니다. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
 
 <a id="full-harness"></a>
 
@@ -103,10 +103,31 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.
 2. ChatGPT **Developer Mode**를 활성화하고, **Tunnel** 방식의 새 커넥터를 만들고 이름을 정확히
-   **Codex Native4**로 지정합니다. **Authentication: None**과 **Allow all actions**를 사용합니다.
-3. **런타임 검증**을 실행해 **Codex Native4**가 연결되어 사용 가능한지 확인합니다.
+   **Codex Native5**로 지정합니다. **Authentication: None**과 **Allow all actions**를 사용합니다.
+3. 설정한 ID에 대해 **런타임 검증**을 실행합니다. 설치된 schema를 확인한 다음 일반 자격 증명과
+   독립 압축 자격 증명으로 list, search, read를 각각 호출하여 읽기 전용 MCP 반환 6개가 성공해야 합니다.
+   Zero Risk는 수동 플러그인 선택, 전송 및 기존 Sent 정책을 유지합니다. 선택한 설정의 호출 가능성을
+   증명하지만 플랫폼의 원본 캐시 schema를 증명하지는 않습니다.
 
-`task_updates-v1` 시작 스키마와 ACK 도구에는 새 ID가 필요합니다. Automatic은 **Codex Native4**, Zero Risk는 **Codex Zero Risk3**, 개발 환경은 **Codex Native4 DEV**를 사용합니다. **Codex Native3**, **Codex Native3 DEV**, **Codex Zero Risk2**는 그대로 유지하고 새 커넥터를 만드세요. 기존 이름을 변경하거나 새로고침하지 마세요. 사용자 지정 비레거시 이름은 유지되지만 이전 캐시가 있는 플러그인은 새 이름으로 만들어야 합니다.
+현재 MCP ABI는 Automatic에 **Codex Native5**, Zero Risk에 **Codex Zero Risk4**, 저장소 개발 환경에
+**Codex Native5 DEV**를 사용합니다. **Codex Native4**, **Codex Native4 DEV**, **Codex Zero Risk3**는
+그대로 두고 해당하는 새 플러그인을 만드세요. 이전 커넥터의 이름을 바꾸거나 새로고침하지 마세요.
+더 오래된 폐기된 기본 ID도 사용할 수 없습니다. 설정은 폐기된 기본 ID가 아닌 사용자 지정 이름을
+유지합니다. 사용자 지정 플러그인에 이전 schema가 캐시되어 있으면 새 이름을 선택하고 새 플러그인을
+만드세요. 운영 환경과 DEV 커넥터는 함께 유지할 수 있습니다.
+
+새 ABI는 `codex_context_list`, `codex_context_read`, `codex_context_search`와 압축용 독립 읽기 전용
+인증 정보를 추가합니다. `codex_tool_wait`, `codex_task_update_ack`, `task_updates-v1`, Native의
+`operation_id` 계약은 유지됩니다. 런타임과 브라우저 helper를 함께 업데이트하세요. 새 논리 Native
+호출은 새 양의 정수 ID를 사용하며 재시도와 대기는 재연결 후에도 같은 ID를 사용합니다. pending
+수신 확인은 작업 완료가 아니며 원래 작업을 다시 실행해서는 안 됩니다.
+
+[컨텍스트 탐색](docs/context-navigation.md)은 일반 작업 본문을 유지하면서 선택한 도구 이력을 필요할 때
+읽게 합니다. 이미지는 MCP를 우선 사용하고 필수 첨부 대체 경로만 Zero Risk의 추가 확인을 요구합니다.
+압축은 별도의 읽기 전용 소스 목록을 사용할 수 있으며 모든 소스를 읽을 필요는 없습니다. 기존 컨텍스트
+한도는 유지됩니다. 전체 릴리스 검증은 아직 끝나지 않았습니다. High 모드의 제한된 다중 이미지 성공은
+용량 증가, 정확한 숫자 인식, 모든 모델의 안정성을 증명하지 않습니다.
+[검증 범위](docs/release-validation.md#context-navigation-validation)를 참고하세요.
 
 쓰기/수정 작업은 ChatGPT 작업 공간과 관리자 정책에서도 허용되어야 합니다.
 [Developer Mode와 MCP 앱](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)을

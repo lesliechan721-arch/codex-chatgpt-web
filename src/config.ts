@@ -19,26 +19,32 @@ export type BrowserInteractionMode = "automatic" | "manual";
 export type SubagentProtocol = "compatibility-v1" | "native";
 
 /**
- * ChatGPT caches a connector's public MCP contract by connector identity. The task_updates-v1
- * start revision and ACK tool require new identities rather than stale cached tool lists.
+ * ChatGPT caches a connector's public MCP contract by connector identity. Context navigation
+ * adds three public tools and requires new identities rather than stale cached tool lists.
  */
-export const CHATGPT_CONNECTOR_NAME = "Codex Native4";
+export const CHATGPT_CONNECTOR_NAME = "Codex Native5";
 export const DEV_CHATGPT_CONNECTOR_NAME = `${CHATGPT_CONNECTOR_NAME} DEV`;
 export { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME };
-export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk3";
-const LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAMES = ["Codex Zero Risk", "Codex Zero Risk2"] as const;
+export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk4";
+const LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAMES = ["Codex Zero Risk", "Codex Zero Risk2", "Codex Zero Risk3"] as const;
 
 function isLegacyZeroRiskConnectorName(value: unknown): boolean {
   return typeof value === "string" && (LEGACY_ZERO_RISK_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
 }
-export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV"] as const;
+export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV", "Codex Native4", "Codex Native4 DEV"] as const;
 
 export function isLegacyChatGptConnectorName(value: string): boolean {
   return (LEGACY_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
 }
 
+/** Exact retired defaults only; a custom name does not prove or disprove schema compatibility. */
+export function isLegacyChatGptConnectorIdentity(value: string): boolean {
+  return isLegacyChatGptConnectorName(value) || isLegacyZeroRiskConnectorName(value);
+}
+
 export function legacyChatGptConnectorMigrationMessage(legacyName: string): string {
-  const currentName = legacyName.endsWith(" DEV") ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
+  const currentName = isLegacyZeroRiskConnectorName(legacyName) ? ZERO_RISK_CHATGPT_CONNECTOR_NAME
+    : legacyName.endsWith(" DEV") ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
   return `Legacy ChatGPT connector ${JSON.stringify(legacyName)} was found, but this release requires`
     + ` a newly created connector named ${JSON.stringify(currentName)}. Create`
     + ` ${JSON.stringify(currentName)} against the same tunnel with Authentication set to None;`
@@ -52,7 +58,7 @@ export function validateConnectorNameSuffix(value: unknown): string {
     throw new Error("The part after Codex must contain 1–74 letters, numbers, spaces, hyphens or underscores");
   }
   const fullName = `Codex ${value}`;
-  if (isLegacyChatGptConnectorName(fullName) || isLegacyZeroRiskConnectorName(fullName)) {
+  if (isLegacyChatGptConnectorIdentity(fullName)) {
     throw new Error(`${fullName} is retired; choose another plugin name`);
   }
   return value;
@@ -177,6 +183,11 @@ export function getConfigDir(): string {
 
 export function getConfigPath(): string {
   return join(getConfigDir(), "config.json");
+}
+
+/** Capability evidence is runtime state, not a user preference or a setup UI marker. */
+export function getContextCapabilityEvidencePath(home = getConfigDir()): string {
+  return join(resolve(home), "runtime", "context-capability-verification.json");
 }
 
 export function isWindowsPipeEndpoint(value: string): boolean {
@@ -398,6 +409,11 @@ export function defaultChromeExecutable(
 
 export function loadConfig(): AppConfig {
   const path = getConfigPath();
+  return loadConfigFromPath(path);
+}
+
+/** Read a recorded runtime profile without changing this process's active profile. */
+export function loadConfigFromPath(path: string): AppConfig {
   if (!existsSync(path)) throw new Error(`Configuration is missing: ${path}. Run codex-chatgpt-web setup first.`);
   return parseConfig(JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))), path);
 }
@@ -490,7 +506,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
     throw new Error(`Invalid automaticAppName in ${path}`);
   }
   if (!isLegacyChatGptConnectorName(automaticAppName)) validateCurrentConnectorName(automaticAppName);
-  validateCurrentConnectorName(manualAppName);
+  // Reading a saved configuration does not authorize its connector. Setup can migrate it;
+  // an applicable MCP consumer must reject retired identities before opening a turn.
+  if (!isLegacyZeroRiskConnectorName(manualAppName)) validateCurrentConnectorName(manualAppName);
   if (automaticAppName === manualAppName) {
     throw new Error(`Automatic and Zero Risk connector names must differ in ${path}; rerun setup`);
   }

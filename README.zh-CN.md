@@ -73,7 +73,7 @@ irm https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest/down
 | **Full harness (With Automation)** | 自动 | 支持，通过 MCP |
 | **Zero Risk** | 手动粘贴并发送 | 支持，通过独立 MCP 连接器 |
 
-Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk3` 连接器，粘贴并发送准备好的提示词，再在启动器中确认 **Sent**。名称以 **(Web)** 结尾的自动模型会在 Codex 中提供其支持的 Effort 选项。Instant 和各个 Pro 版本使用独立条目，以保留各自的上下文额度；旧任务中保存的模型条目仍使用原来的固定模式。
+Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk4` 连接器，粘贴并发送准备好的提示词。默认在发送后于启动器确认 **Sent**。可在启动器设置中或用 `--zero-risk-no-sent-confirmation` 关闭第二次确认；此时 Sent 按钮隐藏，连接器绑定会自动确认该轮。必需的回退图片仍需单独确认已附加。用 `--zero-risk-sent-confirmation` 可明确启用默认行为。名称以 **(Web)** 结尾的自动模型会在 Codex 中提供其支持的 Effort 选项。Instant 和各个 Pro 版本使用独立条目，以保留各自的上下文额度；旧任务中保存的模型条目仍使用原来的固定模式。
 
 <a id="full-harness"></a>
 
@@ -100,12 +100,29 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
    和普通 API 密钥；创建密钥本身免费，也不会消耗模型 API 额度。
 3. 粘贴 Tunnel ID 和 API 密钥，然后点击 **连接 Harness**。
 4. 在 ChatGPT 设置中启用 **开发者模式**。新建连接器时选择 **Tunnel**，选择刚创建的
-   Tunnel，将 **身份验证** 设为 **无**，并将名称准确设置为 **Codex Native4**。
-5. 在 **Codex Native4** 的 **权限** 中选择 **允许所有操作**；**允许低风险操作** 会在命令和
+   Tunnel，将 **身份验证** 设为 **无**，并将名称准确设置为 **Codex Native5**。
+5. 在 **Codex Native5** 的 **权限** 中选择 **允许所有操作**；**允许低风险操作** 会在命令和
    补丁到达本地运行时前将其拦截。外层 Codex harness 仍会执行沙箱和审批规则。
-6. 运行 **验证运行时**，确认 **Codex Native4** 已连接并可用。
+6. 对所配置的身份运行 **验证运行时**。它检查已安装的 schema，然后要求普通凭据和独立压缩
+   凭据各完成 list、search、read，共六次成功的只读 MCP 返回。Zero Risk 保留手工选择插件、
+   发送和原有 Sent 策略。这证明所选配置可调用，不提供平台原始缓存 schema 的证明。
 
-`task_updates-v1` 的启动结构和 ACK 工具要求新连接器身份：Automatic 使用 **Codex Native4**，Zero Risk 使用 **Codex Zero Risk3**，开发环境使用 **Codex Native4 DEV**。从 **Codex Native3**、**Codex Native3 DEV** 或 **Codex Zero Risk2** 升级时，保留旧连接器并新建对应连接器，不要重命名或刷新旧连接器。自定义非旧版名称会保留；若缓存结构仍旧，请使用新名称创建插件。
+当前 MCP ABI 使用 **Codex Native5**（Automatic）、**Codex Zero Risk4**（Zero Risk）和
+**Codex Native5 DEV**（仓库开发）。保留 **Codex Native4**、**Codex Native4 DEV** 和
+**Codex Zero Risk3**，新建对应插件；不要重命名或刷新旧连接器。更早的退役默认身份仍不可用。
+设置会保留不属于退役默认身份的自定义名称。若自定义插件仍缓存旧 schema，请选择新名称并
+新建插件。生产和 DEV 连接器可以同时保留。
+
+新 ABI 增加 `codex_context_list`、`codex_context_read` 和 `codex_context_search`，包括独立的
+压缩只读凭据。现有 `codex_tool_wait`、`codex_task_update_ack`、`task_updates-v1` 和 Native
+`operation_id` 合同保持不变；请同时更新运行时和浏览器 helper。新的逻辑 Native 调用使用新的
+正整数 ID，重试和等待在重连后仍复用该 ID。pending 收据不表示任务完成，也不能使原操作再次执行。
+
+[上下文导航](docs/context-navigation.md) 保留普通任务文字，允许按需读取所选工具历史。图片优先
+通过 MCP 投递；只有必需的附件回退才需要额外的 Zero Risk 确认。压缩可以查看独立的只读来源目录，
+不要求读取全部来源。现有上下文限额保持不变。完整发布验收仍未完成；High 模式下有限的多图成功
+不能证明容量增加、数字识别可靠或所有模型稳定。请参阅
+[验收范围](docs/release-validation.md#context-navigation-validation)。
 
 写入/修改操作还需要 ChatGPT 工作区及其管理员政策允许。请参阅
 [开发者模式和 MCP 应用](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt)。

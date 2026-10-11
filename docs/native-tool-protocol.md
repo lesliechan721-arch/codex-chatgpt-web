@@ -22,6 +22,8 @@ The Native-capable entries are `codex_exec`, `codex_write_stdin`, `codex_apply_p
 gateway. `operation_id` is bridge control and is removed before constructing Native arguments.
 The control-only `codex.control.compaction_handoff` branch does not create a Native operation and
 does not require this ID; its isolated control capability does not grant ordinary tool authority.
+The read-only `codex_context_list`, `codex_context_read`, and `codex_context_search` entries also
+require no operation ID. They read fixed sources without business dispatch or task-update ACK.
 
 On first arrival, the Broker atomically binds the ID to a normalized start description: bridge
 entry, requested logical target, freeform intent, and execution parameters. Authentication and
@@ -42,6 +44,35 @@ freeze admission: a new invoke checks the current registry before creating its c
 admitted, removal of that tool from a later registry does not by itself prevent the original result
 from completing. A same-ID retry is not a second admission. The Adapter's independent batch check
 against the current outer request remains in place.
+
+## Context sources and image readiness
+
+The three context tools use the current `context_id` and exactly one credential: `turn_token` in
+Automatic, `request_id` in Zero Risk, or the independent `compaction_token` for compaction reads.
+The public schema exposes mutually exclusive ordinary and compaction branches. Credentials and
+references cannot cross these scopes. List discovers bounded entries, search returns literal text
+matches, and read returns an exact UTF-8 page or one complete image. Directory labels and snippets
+are not the full result. Reading an old result never repeats its action.
+
+Ordinary `context_ready` records delivery of required images through MCP return receipts, verified
+Automatic uploads, or Zero Risk's separate confirmation of its selected fallback-image manifest.
+Sent, start, and task-update ACK do not supply image-delivery evidence. Text reads have no mandatory
+coverage. Until ready, new business execution and successful completion are blocked with
+`CONTEXT_NOT_READY`; existing operations can still wait, replay, and settle. A rejected new start
+keeps its deterministic terminal, so corrected new work uses a new `operation_id`.
+
+Compaction uses a separate legal-source snapshot. Its read credential grants only the three context
+tools, while the original handoff or completion credential submits the checkpoint. The model can
+choose a subset of sources or submit without reading. There is no all-source or image-coverage gate.
+Actual control delivery, available sources, no permanent read failure, settled in-flight reads, and
+the original owner, revision, ACK, Send, and real-result checks still gate submission. Business tools
+remain disabled. The [context navigation contract](context-navigation.md) defines input filters,
+pagination, image fallback, effective budgets, and lifecycle limits.
+The finite corrective-reply reserve is three replies at 128 tokens and 512 wire bytes each.
+After the third corrective reply, or when no budgeted reply can be returned, source-query
+permission stops and further queries receive JSON-RPC rejection;
+it does not close the shared MCP transport or revoke ordinary business or checkpoint-submission
+authority. Those operations retain their original readiness and transaction checks.
 
 ## Waiting and public results
 
@@ -258,7 +289,7 @@ for cleanup before saving inherited candidates. If that storage exhausts the jou
 and capability revocation still occur; a rejected non-owning or older-generation round cannot
 gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 10, Native waiting protocol is 1, and task update protocol is 1.
+The implemented Broker protocol is 11. Native waiting, task update, and context protocols are each 1.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
 directory before returning an ACK. The same directory carries an atomically published revision /
@@ -272,15 +303,26 @@ transport or a delayed Broker check. Publications contain only version counters,
 are released with the bounded retired-turn cache or Broker shutdown. Missing or invalid sources
 fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
-Check for `codex_tool_wait`,
-`operation_id`, `task_revision`, and `codex_task_update_ack` on the selected connector before
-any side-effecting dispatch. An incompatible connector or helper fails before execution; it must
+Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
+context tools with their mutually exclusive credential schemas on the selected connector before
+using navigation or dispatching work. The private owner must advertise `contextProtocol: 1`.
+An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
+Verify runtime also requires six successful context transport returns over fixed small text, one
+list/search/read sequence per ordinary and independent compaction credential. The verification
+pair has no business or compaction-submission authority. A model's final reply cannot substitute
+for receipts. Bound owner-only evidence gates navigation publication and compaction admission;
+configuration/runtime/schema changes invalidate it, with no time-based expiry. Manual verification
+keeps the original start and Sent rules and never automates Send.
+An incompatible connector or helper fails before execution; it must
 not silently fall back to the former timeout behavior. Production connector defaults are
-`Codex Native4` and `Codex Zero Risk3`; Automatic DEV uses `Codex Native4 DEV`. Old active runtimes
+`Codex Native5` and `Codex Zero Risk4`; Automatic DEV uses `Codex Native5 DEV`. Old active runtimes
 are not upgraded in place; a negotiated runtime fails explicitly on a later protocol downgrade.
 Connector identity
 and cached-schema migration follow the [architecture](architecture.md), not an in-place rename of
-an old production connector.
+an old production connector. Keep `Codex Native4`, `Codex Native4 DEV`, and `Codex Zero Risk3`
+unchanged and create the corresponding new plugin. Earlier retired defaults also remain unusable.
+Custom names that are not retired defaults remain configured; a custom plugin with stale schema
+needs a newly named plugin. Never refresh an old identity to claim the new contract.
 
 ## Decision basis and implementation
 

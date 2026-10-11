@@ -840,6 +840,30 @@ class RuntimeHost {
     }
   }
 
+  async verifyContextCapability() {
+    const result = await this.run("mcp-verification", ["verify-context", "--json", "--launcher-controlled",
+      ...(this.launcherProfile === "development" ? ["--dev-profile"] : [])], {
+      message: this.getBrowserInteractionMode() === "manual"
+        ? "Copy the read-only verification prompt, select the shown plugin, send it and confirm Sent"
+        : "Checking six read-only context MCP calls",
+      timeoutMs: 320_000,
+      sensitiveOutput: true,
+      env: this.launcherControlEnvironment(),
+      ...(this.launcherProfile === "development" ? { environment: this.devSetupEnvironment() } : {}),
+    });
+    const report = JSON.parse(result.stdout);
+    const evidence = report?.evidence;
+    const receiptsComplete = ["ordinary", "compaction"].every((kind) =>
+      ["list", "search", "read"].every((method) => evidence?.receipts?.[kind]?.[method] === true));
+    if (report?.ok !== true || evidence?.version !== 1 || !receiptsComplete
+      || evidence.binding?.profile !== this.launcherProfile
+      || evidence.binding?.mode !== this.getBrowserInteractionMode()
+      || evidence.binding?.appName !== this.mcpConnectorName()) {
+      throw new Error("The runtime did not return successful read-only capability evidence");
+    }
+    return report;
+  }
+
   async devDoctor() {
     if (this.launcherProfile !== "development") {
       throw new Error("DEV harness diagnostics require the isolated DEV launcher profile");
@@ -861,6 +885,13 @@ class RuntimeHost {
         status: "error",
         message: error instanceof Error ? error.message : String(error),
       });
+    }
+    if (config?.mode === "full") {
+      try {
+        this.mcpConnectorName();
+      } catch (error) {
+        checks.push({ id: "connector", status: "error", message: error instanceof Error ? error.message : String(error) });
+      }
     }
     const full = config?.mode === "full" && config?.tunnel;
     checks.push({
@@ -984,9 +1015,8 @@ class RuntimeHost {
     if (!current.configured || current.mode !== "full") {
       throw new Error("The native MCP runtime is not configured");
     }
-    return this.launcherProfile === "development" && !current.config?.automaticAppName
-      ? connectorNameForDevSetup(current.config?.appName)
-      : requireCurrentRuntimeConnectorName(current.config?.appName);
+    // Setup may propose a new identity. Runtime verification must use the saved exact name.
+    return requireCurrentRuntimeConnectorName(current.config?.appName);
   }
 
   browserConnectorName() {

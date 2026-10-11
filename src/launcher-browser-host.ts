@@ -12,6 +12,7 @@ import {
 import { continuityError } from "./adapters/chatgpt-web/continuity-errors";
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
+export const LAUNCHER_CONTEXT_DELIVERY_FEATURE = "context-delivery-plan-v1";
 export const LAUNCHER_BROWSER_IDLE_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Cmeta%20charset%3D%22utf-8%22%3E%3Ctitle%3ECodex%20Web%20GPT%3C%2Ftitle%3E%3C%2Fhead%3E%3Cbody%3E%3C%2Fbody%3E%3C%2Fhtml%3E#codex-web-gpt-browser-host";
 export type LauncherBrowserHostProfile = "production" | "development";
 
@@ -445,11 +446,34 @@ export interface LauncherManualTurnStart extends LauncherManualTurnOwner {
   sentConfirmationRequired: boolean;
   /** Used only when the exact retained ChatGPT conversation already owns the accumulated history. */
   resumePrompt?: string;
+  /** Each candidate owns its attachment confirmation. Only Launcher selects the published plan. */
+  contextPlans?: { full?: LauncherContextDeliveryPlan; resume?: LauncherContextDeliveryPlan };
   conversationKey?: string;
   requireRetainedConversation?: boolean;
   continuity?: ContinuityClaim;
   /** Gives a manual context handoff enough time without widening ordinary Zero Risk turns. */
   compaction?: true;
+}
+
+export interface LauncherContextDeliveryPlan {
+  planId: string;
+  contextId: string;
+  manifestDigest: string;
+  requiredAttachments: { id: string; label: string }[];
+}
+
+export interface LauncherManualAttachmentsOwner extends LauncherManualTurnOwner {
+  planId: string;
+  manifestDigest: string;
+}
+
+export interface LauncherManualAttachmentsResult {
+  planId: string;
+  manifestDigest: string;
+  requiredCount: number;
+  status: "not-required" | "pending" | "user_attested";
+  attestedAt: string | null;
+  deadlineAt: string | null;
 }
 
 export interface LauncherManualTurnLease {
@@ -459,6 +483,7 @@ export interface LauncherManualTurnLease {
   deadlineAt: string | null;
   state: "awaiting-user" | "sent" | "running" | "completed";
   sentConfirmationRequired: boolean;
+  selectedPlanId?: string;
 }
 
 export interface LauncherManualTurnEnd extends LauncherManualTurnOwner {
@@ -472,17 +497,19 @@ export interface LauncherManualTurnTerminal {
 
 export const LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS = 10_000;
 export const LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS = 40_000;
+export const LAUNCHER_MANUAL_ATTACHMENTS_TIMEOUT_MS = 5 * 60_000;
 export const LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS = 15_000;
 
 async function launcherManualRequest(
   descriptor: LauncherBrowserHostDescriptor,
-  action: "start" | "wait-sent" | "wait-terminal" | "started" | "end" | "cancel",
-  body: LauncherManualTurnStart | LauncherManualTurnOwner | LauncherManualTurnEnd,
+  action: "start" | "wait-sent" | "wait-terminal" | "started" | "end" | "cancel" | "inspect-attachments" | "wait-attachments",
+  body: LauncherManualTurnStart | LauncherManualTurnOwner | LauncherManualTurnEnd | LauncherManualAttachmentsOwner,
   timeoutMs: number,
   abortSignal?: AbortSignal,
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   const controller = new AbortController();
   const abort = () => controller.abort();
+  if (abortSignal?.aborted) abort();
   abortSignal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(abort, timeoutMs);
   try {
@@ -571,6 +598,13 @@ export async function startLauncherManualTurn(
   timeoutMs = LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS,
 ): Promise<LauncherManualTurnLease> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  if (activity.contextPlans) {
+    assertLauncherContextDeliveryFeature(descriptor);
+    if (activity.contextPlans.full?.planId !== undefined
+      && activity.contextPlans.full.planId === activity.contextPlans.resume?.planId) {
+      throw new LauncherManualTurnFailedError("Manual context candidates must have independent plan identities");
+    }
+  }
   if (activity.continuity) assertLauncherContinuityFeature(descriptor, Boolean(activity.continuity.recovery));
   if (activity.continuity?.recovery && !sameContinuityLauncherInstance(activity.continuity.recovery.launcherInstance, descriptor.launcherInstance)) {
     throw continuityError("continuity_configuration_conflict", "Acquire the exact durably recorded Launcher instance.");
@@ -580,7 +614,10 @@ export async function startLauncherManualTurn(
     "start",
     activity,
     timeoutMs,
-    body => isLauncherManualTurnLease(body) && (!activity.continuity || validContinuityAcknowledgement(body.continuity, activity.continuity, activity.traceId)),
+    body => isLauncherManualTurnLease(body)
+      && (!activity.contextPlans || [activity.contextPlans.full?.planId, activity.contextPlans.resume?.planId]
+        .some(planId => typeof planId === "string" && planId === body.selectedPlanId))
+      && (!activity.continuity || validContinuityAcknowledgement(body.continuity, activity.continuity, activity.traceId)),
     "Launcher returned an invalid manual turn lease",
     async () => {
       try {
@@ -614,7 +651,77 @@ export async function startLauncherManualTurn(
     deadlineAt: body.deadlineAt as string | null,
     state: body.state as LauncherManualTurnLease["state"],
     sentConfirmationRequired: body.sentConfirmationRequired as boolean,
+    ...(activity.contextPlans ? { selectedPlanId: body.selectedPlanId as string } : {}),
   };
+}
+
+export function assertLauncherContextDeliveryFeature(descriptor: LauncherBrowserHostDescriptor): void {
+  if (!descriptor.features?.includes(LAUNCHER_CONTEXT_DELIVERY_FEATURE)) {
+    throw new LauncherManualTurnFailedError("Launcher does not support context delivery plans; update and restart Launcher before exposing this prompt");
+  }
+}
+
+/** Reads Launcher's human attestation only. It does not inspect ChatGPT attachments. */
+export async function inspectLauncherManualAttachments(
+  descriptorPath: string,
+  owner: LauncherManualAttachmentsOwner,
+  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<LauncherManualAttachmentsResult> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  assertLauncherContextDeliveryFeature(descriptor);
+  const { response, body } = await launcherManualRequest(descriptor, "inspect-attachments", owner,
+    options.timeoutMs ?? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS, options.abortSignal);
+  if (!response.ok) throwManualControlError(response, body);
+  return parseLauncherAttachmentsResult(body, owner);
+}
+
+function parseLauncherAttachmentsResult(body: Record<string, unknown>, owner: LauncherManualAttachmentsOwner): LauncherManualAttachmentsResult {
+  const validDate = (value: unknown) => typeof value === "string" && !Number.isNaN(Date.parse(value));
+  if (body.ok !== true || body.planId !== owner.planId || body.manifestDigest !== owner.manifestDigest
+    || !Number.isSafeInteger(body.requiredCount) || Number(body.requiredCount) < 0
+    || !["not-required", "pending", "user_attested"].includes(String(body.status))
+    || (body.status === "not-required" && (body.requiredCount !== 0 || body.attestedAt !== null || body.deadlineAt !== null))
+    || (body.status === "pending" && (Number(body.requiredCount) < 1 || body.attestedAt !== null || !validDate(body.deadlineAt)))
+    || (body.status === "user_attested" && (Number(body.requiredCount) < 1 || !validDate(body.attestedAt) || body.deadlineAt !== null))) {
+    throw new LauncherManualTurnFailedError("Launcher returned an invalid attachment attestation for the selected plan");
+  }
+  return { planId: owner.planId, manifestDigest: owner.manifestDigest, requiredCount: Number(body.requiredCount),
+    status: body.status as LauncherManualAttachmentsResult["status"], attestedAt: body.attestedAt as string | null,
+    deadlineAt: body.deadlineAt as string | null };
+}
+
+export async function waitForLauncherManualAttachments(
+  descriptorPath: string,
+  owner: LauncherManualAttachmentsOwner,
+  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<LauncherManualAttachmentsResult> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  assertLauncherContextDeliveryFeature(descriptor);
+  // The host also enforces this phase deadline. A broken observer cannot extend human waiting.
+  const initial = await inspectLauncherManualAttachments(descriptorPath, owner, options);
+  if (initial.status !== "pending") return initial;
+  const deadline = Math.min(Date.parse(initial.deadlineAt!), Date.now() + LAUNCHER_MANUAL_ATTACHMENTS_TIMEOUT_MS);
+  for (;;) {
+    if (options.abortSignal?.aborted) throw new DOMException("Manual attachments wait aborted", "AbortError");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new LauncherManualTurnTimedOutError("Required attachment confirmation timed out");
+    let result: Awaited<ReturnType<typeof launcherManualRequest>>;
+    try {
+      result = await launcherManualRequest(descriptor, "wait-attachments", owner,
+        Math.min(options.timeoutMs ?? LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS, remaining), options.abortSignal);
+    } catch (error) {
+      if (options.abortSignal?.aborted) throw new DOMException("Manual attachments wait aborted", "AbortError");
+      if (Date.now() >= deadline) throw new LauncherManualTurnTimedOutError("Required attachment confirmation timed out");
+      throw error;
+    }
+    const { response, body } = result;
+    if (!response.ok && response.status !== 202) throwManualControlError(response, body);
+    const observed = parseLauncherAttachmentsResult(body, owner);
+    if (observed.status !== "pending") return observed;
+    if (observed.deadlineAt !== initial.deadlineAt) {
+      throw new LauncherManualTurnFailedError("Launcher changed the attachment confirmation deadline");
+    }
+  }
 }
 
 export async function waitForLauncherManualSent(

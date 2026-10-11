@@ -16,6 +16,9 @@ import { cancelStructuredCompactionNativeTurn, canonicalizeCompactionHandoff } f
 import { chatGptBrowserTabClosedError } from "../src/adapters/chatgpt-web/adapter-error";
 import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { chatGptContinuityInstructionPayloadDigest } from "../src/adapters/chatgpt-web/turn-execution";
+import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
+import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
+import { bindRecoveryContextCoverage } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { acceptRecoveryResults, recoveryIdentity, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
@@ -87,7 +90,15 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     record = store.issueBatch(thread, { scope }, { logicalWorkId: sourceWorkId, attempt: 0,
       calls: [{ callId: "real-call", operationId: "real-operation", expectedResultType: "function_call_output" }] });
     record = store.markDeliveryPossible(thread, { scope }, ["real-call"]);
+    const call = { type: "function_call", call_id: "real-call", name: "exec_command", arguments: '{"cmd":"actual command"}' };
+    (request._rawBody as { input: unknown[] }).input.push(call);
+    request.context.messages.push(...parseRequest({ model: request.modelId, input: [call] }).context.messages);
   }
+  const coverage = new CompactionSourceCoverage();
+  coverage.prepare(createContextSnapshot(request), { historyRevision: 0, pageGeneration: "source-page", planId: "source-plan",
+    bodyDigest: continuityDigest("source body"), manifestDigest: continuityDigest("source images"), pageTokens: 2_000, externalizedTargetIds: [] });
+  coverage.markDelivered("source-plan");
+  bindRecoveryContextCoverage(binding.recovery!, coverage);
   record = store.retireAttempt(thread, { scope }, sourceWorkId, 0);
   bindings.lose(binding);
   request._compactionRequest = true;
@@ -142,6 +153,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
   const starts: BrowserTurn[] = [];
   const prompts: string[] = [];
+  const sources: string[] = [];
   let failBeforeSend = false;
   let failSettlement = false;
   const run = spyOn(worker, "run").mockImplementation(async turn => {
@@ -155,8 +167,8 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     expect(turn.nativeConnector).toBe(true);
     expect(turn.capabilities.localToolsEnabled).toBe(false);
     expect(compiled.text).not.toContain("turn_token turn_");
-    expect(compiled.text).toContain("Continue the accepted task");
-    expect(compiled.text).toContain("system instructions");
+    expect(compiled.text).toContain("codex_context_navigation_json");
+    expect(compiled.text).not.toContain("system instructions");
     if (failBeforeSend) { failBeforeSend = false; throw new Error("Injected prepare failure before Send"); }
     const lease: ContinuityLease = { owner: turn.continuity!.owner, leaseId: "1".repeat(32), traceId: turn.traceId,
       recovery: turn.continuity!.recovery };
@@ -164,6 +176,32 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     turn.onContinuityLease?.(lease);
     await turn.onSendActivated?.();
     await turn.onSubmitted?.();
+    const entry = JSON.parse(compiled.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+    const credential = entry.first_call.arguments;
+    const query = async (method: "list" | "read", args: Record<string, unknown>) => {
+      const reply = await callTurnBroker<{ result: { structuredContent: any }; receiptId: string }>(provider.chatgptWeb!.brokerSocketPath!, {
+        method: "context_query", token: credential.compaction_token, contract: "native", credentialKind: "compaction",
+        contextProtocol: 1, contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
+      });
+      await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.compaction_token,
+        contract: "native", credentialKind: "compaction", contextProtocol: 1, receiptId: reply.receiptId, sent: true });
+      return reply.result.structuredContent;
+    };
+    let source = "", cursor: string | undefined;
+    do {
+      const page = await query("list", { view: "entries", ...(cursor ? { cursor } : {}) });
+      for (const target of page.entries) {
+        let readCursor: string | undefined;
+        do {
+          const read = await query("read", { read_ref: target.read_ref, ...(readCursor ? { cursor: readCursor } : {}) });
+          source += read.content ?? ""; readCursor = read.next_cursor ?? undefined;
+        } while (readCursor);
+      }
+      cursor = page.next_cursor ?? undefined;
+    } while (cursor);
+    sources.push(source);
+    expect(source).toContain("Continue the accepted task");
+    expect(source).toContain("system instructions");
     const token = compiled.text.match(/turn_token (control_[A-Za-z0-9_-]+)/)![1]!;
     const handoffId = compiled.text.match(/handoff_id (handoff_[A-Za-z0-9_-]+)/)![1]!;
     await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "submit_compaction_handoff", token, handoffId,
@@ -177,12 +215,12 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     return "Checkpoint submitted";
   });
   cleanup.push(async () => { run.mockRestore(); await broker.close(); await server.stop(true); rmSync(directory, { recursive: true, force: true }); });
-  const prepare = (parsed = request) => prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings,
-    store.get(thread), descriptor);
+  const prepare = (parsed = request, verifyContextCapability?: () => Promise<void>) => prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings,
+    store.get(thread), descriptor, undefined, undefined, verifyContextCapability);
   return { directory, state, bindings, binding, store, thread, threadId, scope, sourceWorkId, namespace, request, provider, worker, broker, starts,
     descriptor, launcherInstance,
     actualRetirement: () => { actualRetirement = true; },
-    prepare, pages, prompts, sends: () => sends, inspectCalls: () => inspectCalls,
+    prepare, pages, prompts, sources, sends: () => sends, inspectCalls: () => inspectCalls,
     failBeforeSend: () => { failBeforeSend = true; }, failSettlement: () => { failSettlement = true; } };
 }
 
@@ -223,16 +261,30 @@ async function interruptCompaction(f: ReturnType<typeof fixture>, turnId: string
     body: JSON.stringify({ threadId: f.threadId, turnId }) });
 }
 
+test("connector capability rejection precedes recovery writer transfer and source publication", async () => {
+  const f = fixture();
+  const before = f.store.get(f.thread)!;
+  const rejected = new Error("Connector navigation schema is not verified");
+  await expect(f.prepare(f.request, async () => { throw rejected; })).rejects.toBe(rejected);
+  const after = f.store.get(f.thread)!;
+  expect(after.epoch).toBe(before.epoch);
+  expect(after.currentWorkId).toBe(before.currentWorkId);
+  expect(after.works[f.sourceWorkId]!.attempts).toEqual(before.works[f.sourceWorkId]!.attempts);
+  expect(f.starts).toHaveLength(0);
+  expect(f.sends()).toBe(0);
+});
+
 test("Automatic lost compaction creates one tool-free page, commits, and replays after page loss", async () => {
   const f = fixture();
   const prepared = (await f.prepare())!;
-  let recoveries = 0;
+  let recoveries = 0; let capabilityChecks = 0;
   const summary = await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace,
-    undefined, undefined, () => { recoveries++; });
+    undefined, undefined, () => { recoveries++; }, async () => { capabilityChecks++; });
   await assertContinuityCompactionResult(prepared);
   expect(f.starts).toHaveLength(1);
   expect(f.sends()).toBe(1);
   expect(recoveries).toBe(1);
+  expect(capabilityChecks).toBe(1);
   const record = f.store.get(f.thread)!;
   expect(record.epoch).toBe(1);
   expect(record.historyRevision).toBe(1);
@@ -246,7 +298,7 @@ test("Automatic lost compaction creates one tool-free page, commits, and replays
   (wrapped._rawBody as { stream?: boolean }).stream = true;
   const replay = (await f.prepare(wrapped))!;
   expect(await runContinuityCompaction(wrapped, replay, f.worker, f.broker, capabilities, f.namespace,
-    undefined, undefined, () => { recoveries++; })).toBe(summary);
+    undefined, undefined, () => { recoveries++; }, async () => { throw new Error("Replay must not probe connector capability"); })).toBe(summary);
   await assertContinuityCompactionResult(replay);
   expect(f.starts).toHaveLength(1);
   expect(recoveries).toBe(1);
@@ -274,7 +326,7 @@ test("lost compaction accepts the actual first result and records durable call c
   const record = f.store.get(f.thread)!;
   expect(record.calls["real-call"]!.firstResultDigest).toBe(recoveryResultDigest(result));
   expect(Object.values(record.checkpoints)[0]!.coveredCallIds).toEqual(["real-call"]);
-  expect(f.prompts[0]).toContain("session ID 42");
+  expect(f.sources[0]).toContain("session ID 42");
 });
 
 test("Zero Risk lost compaction keeps the ended-response manual handoff boundary", async () => {
@@ -298,8 +350,10 @@ test("a complete retained handoff commits once without creating a page or invent
   const summary = canonicalizeCompactionHandoff(f.request, "The existing valid handoff.");
   f.binding.acceptedHandoff = { key: "old-compaction", sourceRevision: 0, sourceExecutionKey: "source-execution",
     summary, bytes: Buffer.byteLength(summary), lease: { owner: f.bindings.owner, leaseId: "2".repeat(32), traceId: "old-handoff" } };
-  const prepared = (await f.prepare())!;
-  expect(await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace)).toBe(summary);
+  const noProbe = async () => { throw new Error("Accepted handoff must not probe connector capability"); };
+  const prepared = (await f.prepare(f.request, noProbe))!;
+  expect(await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace,
+    undefined, undefined, undefined, noProbe)).toBe(summary);
   expect(f.starts).toHaveLength(0);
   expect(prepared.binding.lease).toBeUndefined();
   expect(prepared.binding.state).toBe("creating");
@@ -389,7 +443,7 @@ test("durable grouped source selection preserves every accepted current instruct
   const f = fixture({ grouped: true });
   const prepared = (await f.prepare())!;
   const summary = await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace);
-  expect(f.prompts[0]).toContain("Keep the accepted current constraint.");
+  expect(f.sources[0]).toContain("Keep the accepted current constraint.");
   f.pages.clear();
   const changed = structuredClone(f.request);
   (changed._rawBody as { input: Array<Record<string, unknown>> }).input[1]!.content = "Discard the accepted current constraint.";
@@ -760,7 +814,7 @@ test("checkpoint capacity retry releases optional bodies after preserving the re
   expect(f.store.get(f.thread)!.calls["real-call"]!.resultBodyBytes ?? 0).toBe(0);
   expect(prepared).toBeDefined();
   await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace);
-  expect(f.prompts[0]).toContain(result.output);
+  expect(f.sources[0]).toContain(result.output);
   expect(f.store.get(f.thread)!.historyRevision).toBe(1);
   expect(f.store.get(f.thread)!.calls["real-call"]!.firstResultDigest).toBe(recoveryResultDigest(result));
 });
@@ -937,7 +991,7 @@ for (const history of ["omitted", "edited"] as const) test(`a selected durable c
   const prepared = (await f.prepare(next))!;
   const nextSummary = await runContinuityCompaction(next, prepared, f.worker, f.broker, capabilities, f.namespace);
   expect(f.starts).toHaveLength(2);
-  expect(f.prompts[1]).not.toContain("The original actual result.");
+  expect(f.sources[1]).not.toContain("The original actual result.");
   expect(f.store.get(f.thread)!.historyRevision).toBe(2);
   const checkpoint = Object.values(f.store.get(f.thread)!.checkpoints).find(value => value.targetHistoryRevision === 2)!;
   expect(checkpoint.coveredCallIds).toEqual(["real-call"]);

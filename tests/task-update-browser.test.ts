@@ -14,6 +14,7 @@ import type { TaskUpdateState } from "../src/adapters/chatgpt-web/task-update-pr
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { CHATGPT_CONNECTOR_NAME } from "../src/config";
 
 // Helper startup can take 15 seconds; IPC and process cleanup also use the test budget.
 const REAL_HELPER_TIMEOUT_MS = 30_000;
@@ -76,7 +77,7 @@ function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
     createdAt: new Date().toISOString(),
   }), { mode: 0o600 });
   return new LauncherBrowserHelperClient({
-    appName: "Codex Native4", browserHost: "launcher", browserHostDescriptorPath: descriptor,
+    appName: CHATGPT_CONNECTOR_NAME, browserHost: "launcher", browserHostDescriptorPath: descriptor,
     browserHelperScriptPath: helper, browserDiagnosticsPath: root,
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
     turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
@@ -88,7 +89,7 @@ function directBrowserFixture(readText: () => Promise<string>, onSourceBoundary?
   roots.push(root);
   const worker = ChatGptBrowserWorker.forProvider({
     adapter: "chatgpt-web", baseUrl: `browser://${root}`,
-    chatgptWeb: { appName: "Codex Native4", browserDiagnosticsPath: root },
+    chatgptWeb: { appName: CHATGPT_CONNECTOR_NAME, browserDiagnosticsPath: root },
   }) as any;
   const hidden: any = {
     last: () => hidden, filter: () => hidden, getByText: () => hidden, getByTestId: () => hidden,

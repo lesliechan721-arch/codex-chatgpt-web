@@ -27,6 +27,8 @@ function opaqueId(prefix: "control" | "handoff"): string {
 export class CompactionTransactionStore {
   private readonly transactions = new Map<string, CompactionTransaction>();
 
+  constructor(private readonly onRetired?: (token: string) => void) {}
+
   begin(traceId: string, ttlMs: number): CompactionTransactionHandle {
     if (!traceId.trim()) throw new Error("compaction transaction trace id is required");
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
@@ -43,6 +45,12 @@ export class CompactionTransactionStore {
     transaction.timer.unref?.();
     this.transactions.set(transaction.token, transaction);
     return { token: transaction.token, handoffId: transaction.handoffId };
+  }
+
+  /** Owner-side read authority is separate from this one-shot submission token. */
+  isActive(token: string, handoffId: string): boolean {
+    const transaction = this.transactions.get(token);
+    return !!transaction && transaction.handoffId === handoffId && transaction.summary === undefined;
   }
 
   submit(token: string, handoffId: string, summary: string): void {
@@ -89,6 +97,7 @@ export class CompactionTransactionStore {
     if (!transaction) return;
     if (transaction.summary !== undefined) {
       this.transactions.delete(token);
+      this.onRetired?.(token);
       if (transaction.timer) clearTimeout(transaction.timer);
       transaction.timer = undefined;
       this.detachWaiter(transaction);
@@ -117,6 +126,7 @@ export class CompactionTransactionStore {
     const summary = transaction.summary;
     const waiter = transaction.waiter;
     this.transactions.delete(transaction.token);
+    this.onRetired?.(transaction.token);
     this.detachWaiter(transaction);
     transaction.waiter = undefined;
     waiter?.resolve(summary);
@@ -125,6 +135,7 @@ export class CompactionTransactionStore {
 
   private finishError(transaction: CompactionTransaction, error: Error): void {
     if (!this.transactions.delete(transaction.token)) return;
+    this.onRetired?.(transaction.token);
     if (transaction.timer) clearTimeout(transaction.timer);
     transaction.timer = undefined;
     const waiter = transaction.waiter;

@@ -3,8 +3,31 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME, DEV_LONG_WAIT_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
+const { CURRENT_CONNECTOR_NAME, CURRENT_MANUAL_CONNECTOR_NAME, DEV_CONNECTOR_NAME, DEV_LONG_WAIT_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { RuntimeHost, resolveToolAuthorityControl } = require("../electron/runtime.cjs");
+
+test("Verify runtime invokes a bounded sensitive six-call transaction for each profile and mode", async () => {
+  for (const development of [false, true]) for (const mode of ["automatic", "manual"]) {
+    const name = mode === "manual" ? CURRENT_MANUAL_CONNECTOR_NAME : development ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
+    const fixture = development ? devHostFor({ mode: "full", appName: name }, mode) : hostFor({ mode: "full", appName: name }, mode);
+    fixture.host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "private-control" });
+    let invocation;
+    const evidence = { version: 1, binding: { profile: development ? "development" : "production", mode, appName: name },
+      receipts: { ordinary: { list: true, search: true, read: true }, compaction: { list: true, search: true, read: true } } };
+    fixture.host.run = async (operation, args, options) => { invocation = { operation, args, options }; return { stdout: JSON.stringify({ ok: true, evidence }) }; };
+    assert.deepEqual(await fixture.host.verifyContextCapability(), { ok: true, evidence });
+    assert.equal(invocation.operation, "mcp-verification");
+    assert.deepEqual(invocation.args, ["verify-context", "--json", "--launcher-controlled", ...(development ? ["--dev-profile"] : [])]);
+    assert.equal(invocation.options.sensitiveOutput, true);
+    assert.equal(invocation.options.timeoutMs, 320_000);
+    if (development) {
+      assert.equal(invocation.options.environment.CODEX_WEB_GPT_DEV_HOME, "/dev");
+      assert.equal(invocation.options.environment.CODEX_CHATGPT_WEB_HOME, undefined);
+    }
+    evidence.receipts.compaction.read = false;
+    await assert.rejects(fixture.host.verifyContextCapability(), /did not return successful/);
+  }
+});
 
 test("tool authority control reports the effective forced mode and its source", () => {
   assert.deepEqual(
@@ -457,7 +480,7 @@ test("DEV doctor requires live tunnel readiness without probing a Responses list
   const fixture = devHostFor({
     purpose: "dev-harness",
     mode: "full",
-    appName: "Codex Native4 DEV",
+    appName: DEV_CONNECTOR_NAME,
     tunnel: { runtimeKeyFile },
   });
   fixture.host.supervisor.readTunnelHealth = async () => ({
@@ -511,7 +534,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
   const fixture = hostFor({
     mode: "full",
     browserHost: "launcher",
-    appName: "Codex Native4",
+    appName: CURRENT_CONNECTOR_NAME,
     releaseVersion: "1.1.1",
     solAvailable: true,
     extraHighAvailable: false, proAvailable: false,
@@ -641,7 +664,7 @@ test("launcher update transaction leaves current and externally owned runtimes u
   const currentFull = hostFor({
     mode: "full",
     browserHost: "launcher",
-    appName: "Codex Native4",
+    appName: CURRENT_CONNECTOR_NAME,
     releaseVersion: "1.1.3",
   });
   const external = hostFor({ mode: "browser-only", browserHost: "managed-chrome", releaseVersion: "1.1.1" });
@@ -940,13 +963,13 @@ test("integration removal rejects a command that leaves an inactive journal behi
 });
 
 test("connector verification uses the current identity and rejects a legacy local runtime", () => {
-  const full = hostFor({ mode: "full", appName: "Codex Native4" });
-  assert.equal(full.host.mcpConnectorName(), "Codex Native4");
-  assert.equal(full.host.browserConnectorName(), "Codex Native4");
+  const full = hostFor({ mode: "full", appName: CURRENT_CONNECTOR_NAME });
+  assert.equal(full.host.mcpConnectorName(), CURRENT_CONNECTOR_NAME);
+  assert.equal(full.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
   const defaultName = hostFor(null);
   assert.equal(defaultName.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
   const legacyFull = hostFor({ mode: "full", appName: "Codex Native" });
-  assert.equal(legacyFull.host.browserConnectorName(), "Codex Native4");
+  assert.equal(legacyFull.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
   assert.throws(
     () => legacyFull.host.mcpConnectorName(),
     /still targets legacy ChatGPT connector.*create that connector as a new ChatGPT plugin/,
@@ -955,11 +978,17 @@ test("connector verification uses the current identity and rejects a legacy loca
   assert.throws(() => invalidFull.host.mcpConnectorName(), /Connector name is invalid/);
   assert.throws(() => invalidFull.host.browserConnectorName(), /Connector name is invalid/);
   const browserOnly = hostFor({ mode: "browser-only", appName: "Codex Native" });
-  assert.equal(browserOnly.host.browserConnectorName(), "Codex Native4");
+  assert.equal(browserOnly.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
   assert.throws(() => browserOnly.host.mcpConnectorName(), /MCP runtime is not configured/);
-  const dev = devHostFor({ mode: "full", appName: "Codex Native4" });
+  const dev = devHostFor({ mode: "full", appName: DEV_CONNECTOR_NAME });
   assert.equal(dev.host.browserConnectorName(), DEV_CONNECTOR_NAME);
   assert.equal(dev.host.mcpConnectorName(), DEV_CONNECTOR_NAME);
+  for (const makeHost of [hostFor, devHostFor]) for (const appName of ["Codex Native4", "Codex Native4 DEV", "Codex Zero Risk3"]) {
+    const legacy = makeHost({ mode: "full", appName });
+    assert.throws(() => legacy.host.mcpConnectorName(), /legacy ChatGPT connector.*do not rename or refresh/);
+  }
+  const exactDev = devHostFor({ mode: "full", appName: CURRENT_CONNECTOR_NAME });
+  assert.equal(exactDev.host.mcpConnectorName(), CURRENT_CONNECTOR_NAME, "runtime cannot map a saved production name to a DEV connector");
 });
 
 test("launcher-controlled CLI operations use the live descriptor token", () => {
@@ -1583,8 +1612,8 @@ test("fresh-conversation preference uses production and DEV setup without forcin
 
 for (const development of [false, true]) test(`plugin renaming uses transactional ${development ? "DEV" : "production"} setup without changing credentials or refreshing models`, async () => {
   const factory = development ? devHostFor : hostFor;
-  const fixture = factory({ mode: "full", appName: "Codex Work", automaticAppName: "Codex Work", manualAppName: "Codex Zero Risk3" });
-  assert.equal(fixture.host.setupConnectorName("manual"), "Codex Zero Risk3");
+  const fixture = factory({ mode: "full", appName: "Codex Work", automaticAppName: "Codex Work", manualAppName: CURRENT_MANUAL_CONNECTOR_NAME });
+  assert.equal(fixture.host.setupConnectorName("manual"), CURRENT_MANUAL_CONNECTOR_NAME);
   assert.equal(fixture.host.setupConnectorName("automatic"), "Codex Work");
   assert.equal(fixture.host.browserConnectorName(), "Codex Work");
   assert.equal(fixture.host.mcpConnectorName(), "Codex Work");

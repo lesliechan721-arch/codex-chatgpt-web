@@ -12,7 +12,7 @@ import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptDelegatedTurnCapability, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
-import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
@@ -24,7 +24,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessi
 import { callTurnBroker, TurnBroker, RemoteTurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
-import { defaultBrokerEndpoint } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
@@ -2574,6 +2574,9 @@ describe("ChatGPT outer-native harness v4", () => {
       browserStarts += 1;
       const prepared = await turn.prepare();
       try {
+        if (prepared.contextPlan) await turn.onContextPlanSelected!(prepared.contextPlan.planId);
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
         const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
         if (!token) throw new Error("turn token missing from compiled prompt");
         const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
@@ -2682,6 +2685,8 @@ describe("ChatGPT outer-native harness v4", () => {
         retainedCompactionMessages += 1;
         const prepared = await turn.prepareResume!();
         try {
+          await turn.onSendActivated?.();
+          await turn.onSubmitted?.();
           const controlToken = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
           const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
           if (!controlToken || !handoffId) throw new Error("structured compaction binding missing");
@@ -2699,6 +2704,9 @@ describe("ChatGPT outer-native harness v4", () => {
       }
       const prepared = await turn.prepare();
       try {
+        if (prepared.contextPlan) await turn.onContextPlanSelected!(prepared.contextPlan.planId);
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
         const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
         if (!token) throw new Error("turn token missing from compiled prompt");
         const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
@@ -2877,6 +2885,9 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(turn.capabilities.localToolsEnabled).toBe(true);
       const prepared = await turn.prepare();
       try {
+        if (prepared.contextPlan) await turn.onContextPlanSelected!(prepared.contextPlan.planId);
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
         expect(prepared.text).toContain("For local work required by the task, use the attached Codex Native tools directly");
         expect(prepared.text).not.toContain("with no Codex Native bridge");
         const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
@@ -3032,6 +3043,9 @@ describe("ChatGPT outer-native harness v4", () => {
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
+        "codex_context_list",
+        "codex_context_read",
+        "codex_context_search",
         "codex_exec",
         "codex_task_update_ack",
         "codex_tool_call",
@@ -3050,8 +3064,9 @@ describe("ChatGPT outer-native harness v4", () => {
       }));
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector identity migration.
+      expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("d7cf9aa7b2a5cf6ed1f4fbe3041e70cbd22f6906b843068455023ef407f6cf72");
+        .toBe("6363b4246f8a94c8f7a5a360c55f329b72de7509d75dc292d240ab786c63714a");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {
@@ -3059,6 +3074,17 @@ describe("ChatGPT outer-native harness v4", () => {
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
         expect(properties).not.toHaveProperty("binding_id");
         expect(tool.outputSchema).toBeUndefined();
+        if (tool.name.startsWith("codex_context_")) {
+          expect(properties).not.toHaveProperty("operation_id");
+          expect(properties.compaction_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
+          expect(tool.inputSchema.oneOf).toEqual([
+            { required: ["turn_token"], not: { required: ["compaction_token"] } },
+            { required: ["compaction_token"], not: { required: ["turn_token"] } },
+          ]);
+          expect(tool.annotations).toMatchObject({
+            readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+          });
+        }
       }
       expect(listed.tools.find(tool => tool.name === "codex_exec")?.annotations).toMatchObject({
         readOnlyHint: false,

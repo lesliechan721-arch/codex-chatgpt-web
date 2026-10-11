@@ -47,8 +47,9 @@ routing and metadata are defined in the [upstream provider guide](upstream-provi
 - Exposes the same models and attaches the turn-bound connector capability to every available
   effort, from Luna through Pro. There are no effort-specific MCP exclusions.
 - ChatGPT uses a custom MCP connector backed by `openai/tunnel-client`.
-- Every connector call presents one outer Codex turn capability; the MCP server keeps the derived
-  binding private and dispatches the requested action immediately.
+- Ordinary connector calls present the current outer Codex turn capability. The Broker keeps its
+  derived binding private and admits business dispatch under operation, revision, and image-readiness
+  checks. Context calls read fixed sources instead; compaction reads use a separate read-only capability.
 - When Codex exposes tools behind its code-mode `exec` gateway, the connector discovers their
   runtime registry and can invoke an exact listed name through bridge-owned code. Full mode also
   preserves Codex's native freeform `exec`; its tool registry enforces the same bounded
@@ -66,9 +67,9 @@ DEV launchers can therefore run at the same time with different ChatGPT accounts
 
 The working-tree adapter attaches to a tab leased only from that DEV launcher. In Full mode the DEV
 launcher owns one persistent, isolated tunnel runtime; a named CLI chat owns only the private turn
-broker attached to that tunnel for the command's lifetime. The distinct `Codex Native4 DEV`
+broker attached to that tunnel for the command's lifetime. The distinct `Codex Native5 DEV`
 connector reaches the same MCP server and turn-token contract without requiring any Responses
-daemon or colliding with the production `Codex Native4` connector.
+daemon or colliding with the production `Codex Native5` connector.
 
 Only the responsibilities normally owned by native Codex are synthetic: named history storage,
 turn metadata, tool-result execution, context-threshold scheduling, and installation of compacted
@@ -84,29 +85,41 @@ probe. The DEV launcher supervisor owns only the isolated MCP tunnel. Browser di
 state, thread authority, checkpoints, and named chat state live
 under `~/.codex-chatgpt-web-dev` by default.
 
-The ChatGPT connector name is also the public MCP ABI identity. The `task_updates-v1` start
-revision and ACK tool require new identities: `Codex Native4` in Automatic and `Codex Zero Risk3`
-in Zero Risk; Settings can change the part after `Codex ` for the selected mode. The retired
-`Codex Native`, `Codex Native2`, `Codex Native2 DEV`, `Codex Native3`, `Codex Native3 DEV`,
-`Codex Zero Risk`, and `Codex Zero Risk2` identities are never selected or refreshed in
-place. Setup migrates known legacy local configuration to the current identity, clears prior verification state, and
-requires the user to create the new connector. Browser verification accepts the exact new identity,
-reports a specific migration error when only the legacy identity is visible, and never falls back to
-the legacy connector. Future public schema changes require another explicit connector identity.
-Repository DEV mode uses `Codex Native4 DEV` so the same ChatGPT account can keep both production
-and development connectors installed without renaming, refreshing, or deleting either one.
+The ChatGPT connector name is also the public MCP ABI identity. Context navigation uses
+`Codex Native5` in Automatic, `Codex Zero Risk4` in Zero Risk, and `Codex Native5 DEV` in isolated
+DEV. Its three public tools include mutually exclusive ordinary and compaction-read credentials.
+Existing Native operations, waiting, task revisions, and ACKs retain their contracts. Settings can
+change the part after `Codex ` for the selected mode. The retired `Codex Native`, `Codex Native2`,
+`Codex Native2 DEV`, `Codex Native3`, `Codex Native3 DEV`, `Codex Native4`, `Codex Native4 DEV`,
+`Codex Zero Risk`, `Codex Zero Risk2`, and `Codex Zero Risk3` are never selected or refreshed in
+place. Setup migrates known legacy local configuration transactionally and clears prior verification.
+The user creates a new remote plugin. Exact browser selection never falls back to a retired
+identity. Production and DEV plugins can remain installed together. Future public schema changes
+require another explicit connector identity.
 
-Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native4`
-by default in Automatic, `Zero Risk3` in manual mode, and `Native4 DEV` in Automatic DEV. Mode names
+Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native5`
+by default in Automatic, `Zero Risk4` in manual mode, and `Native5 DEV` in Automatic DEV. Mode names
 are stored independently and must differ. Setup preserves custom nonlegacy names across upgrades
 and mode changes. When upgrading from
-`Codex Native3`, `Codex Native3 DEV`, or `Codex Zero Risk2`, preserve the old remote connector and
+`Codex Native4`, `Codex Native4 DEV`, or `Codex Zero Risk3`, preserve the old remote connector and
 create the corresponding new connector; never rename or refresh an old identity.
 A name change uses the existing setup transaction, rejects active work, and clears MCP verification
 only after success. The user must create a new plugin with that exact name. Renaming a display
 label does not itself replace a remote connector's cached schema; retired connector identities cannot
 be selected as new names and legacy connectors are still never reused. If a preserved custom name
 still caches an older public contract, choose a new name and create a new plugin.
+An old setup-flow marker or saved-name mismatch clears local verification without changing the
+configured custom name. The marker records UI flow version only. Local health, installed
+`tools/list`, and browser connector selection cannot prove the remote cached schema. Verify runtime
+also registers a bounded private read-only pair over fixed small text, then requires six successful
+transport returns: list/search/read with ordinary and independent compaction credentials. The pair
+has no business or compaction-submission authority. Automatic uses real submission evidence;
+manual uses the original user selection, Send, start, and Sent policy. The owner-only sidecar binds
+the result to profile/home, mode, exact plugin, tunnel, runtime command, and installed schema digest,
+with no time-based expiry. A retry clears that mode's old result; a binding change invalidates it.
+Context projection and new compaction admission check this result before publishing source access.
+It proves callability, not the platform's raw cached schema. Image and model acceptance remain part
+of [release validation](release-validation.md#context-navigation-validation).
 
 ## Browser lifecycle
 
@@ -137,10 +150,14 @@ server-authenticated session and the Temporary Chat composer in the primary owne
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
-The current compiled Codex task context is inserted as one inline JSON envelope. Image bytes stay
-out of the JSON and are attached natively with stable references. The runtime does not create a
-context JSONL file, upload a synthetic context document, include prompt hashes, or silently truncate
-the envelope. Attachment acceptance and send readiness are verified before the turn begins.
+The selected Codex input retains its task-text contract. In Full/MCP mode, eligible tool-history
+fields can become references into an immutable legal-source snapshot, with a bounded entry in the
+actual browser input. Retained and continuity inputs also receive a fresh entry when they omit
+readable history. The canonical request and real tool results used for settlement stay intact.
+Images prefer fixed inline MCP image blocks; required fallback images use the existing attachment
+path. Image bytes stay out of the prompt JSON. No context JSONL file, synthetic context document,
+or intermediate summary is created. The [context navigation contract](context-navigation.md)
+defines source provenance, net-savings selection, effective budgets, and failure boundaries.
 
 Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
 same choice remains available in Settings; changing it uses the transactional setup path, replaces
@@ -152,6 +169,12 @@ the selected text to the system clipboard. The Launcher captures the Sent-confir
 each manual turn. The adapter sends its expected policy with `/v1/manual/start`; if that expectation
 does not match the Launcher's captured policy, the start fails before the prompt is exposed. The
 captured policy does not change if the global setting changes while the turn is active.
+When navigation is active, the Launcher selects and validates the exact full/resume plan before
+display or copy and returns its plan receipt. Required fallback images have a separate bounded
+manifest and explicit user confirmation. That confirmation is independent of Sent and connector
+start, remains necessary with Sent disabled, and records a user statement rather than inspected
+attachments. All-MCP plans need no attachment confirmation. Readiness gates new bridge business
+work and successful completion; it does not replace task-update ACK or real-result settlement.
 
 With Sent confirmation enabled, an ordinary manual handoff allows one minute to paste, select the
 visible ChatGPT model, effort, and Zero Risk connector, send, and confirm Sent; a manual compaction
@@ -190,7 +213,7 @@ connector access on retained follow-ups, at the cost of resending more context. 
 preserved but inactive in Zero Risk mode.
 
 Bigger Context partitions complete ordered records against each message's available token and
-composer budgets. Inert stages carry text; the final message also carries all retained attachments,
+composer budgets. Inert stages carry text; the final message also carries actual fallback attachments,
 the execution contract and any output schema. Their reserves are deducted before partitioning,
 then preflight checks the actual compiled messages and total transaction. The selected execution
 effort and attachment references remain unchanged. Large transactions use up to six messages;
@@ -204,7 +227,12 @@ ignores this preference and does not use multipart staging; its separate
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
-environment. Zero Risk always advertises a fixed three-times compaction interval without enabling
+environment. When required, the same control message also supplies an independent
+`compaction_token` and a bounded entry into complete legal sources. The model chooses its reads;
+submission does not require full reading or image coverage. Reading grants no submission or business
+authority. Source availability, remaining summary allowance, in-flight reads, and original ownership
+and settlement checks still gate acceptance. A permanent source failure prevents a checkpoint.
+Zero Risk always advertises a fixed three-times compaction interval without enabling
 Bigger Context multipart transport. At that boundary its active ChatGPT response receives the
 checkpoint instruction as an MCP result, returns the compacted context through its bound completion
 control, and ends. The old manual chat is retired; the next compacted Codex request owns a fresh
@@ -301,11 +329,14 @@ across retries and versions; late receipts cannot take over a later generation. 
 preferred, and a transient inspect failure pauses submission rather than declaring permanent loss.
 A new explicit instruction can restart after stop or mode exit; stopped retries cannot revive.
 
-Automatic can finish an uncommitted lost compaction in a new tool-free page, or commit an existing
+Automatic can finish an uncommitted lost compaction in a new read-only page, or commit an existing
 valid handoff once. Committed results only replay. Checkpoints keep durable call coverage and one
 consumer relationship; that consumer's later attempts reuse the relationship without consuming it
 again. Completed-source checkpoint-only requests replay the original answer. Zero Risk ended
 compaction still needs manual handoff, and all new ordinary Zero Risk prompts need actual sending.
+When source navigation is needed, the new page receives its bounded read-only entry only after the
+original full-source recovery admission. Navigation does not permit missing-source recovery or
+resending an unknown Send.
 
 ## Local ChatGPT Limits
 

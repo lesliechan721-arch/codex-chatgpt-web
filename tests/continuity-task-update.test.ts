@@ -11,7 +11,7 @@ import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessIn
 import { recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, sameContinuityRecoveryIdentity, type ContinuityLease, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
-import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "../src/adapters/chatgpt-web/index";
+import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnExecutionKey, chatGptTurnSessions, TASK_UPDATE_SESSION_JOURNAL_BYTES } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
@@ -40,6 +40,7 @@ function user(id: string, content = id): Record<string, unknown> {
   return { type: "message", role: "user", id, content,
     internal_chat_message_metadata_passthrough: { turn_id: "turn", content_item_kinds: ["user.text"] } };
 }
+const issuedCall = (id: string, cmd = "simulated only") => ({ type: "function_call", call_id: id, name: "exec_command", arguments: JSON.stringify({ cmd }) });
 const output = (id: string, text = "first result") => ({ type: "function_call_output", call_id: id, output: text });
 function callEvidence(calls: Record<string, RecoveryCallRecord>) {
   // Body cache ownership can change after a real backend exit. Issuer, attempt, batch,
@@ -597,10 +598,12 @@ test("continuity budgets undelivered first results atomically and releases capac
   expect(() => { session.acceptContinuityToolResults(oversized); }).toThrow("capacity");
   expect(storage.continuityReceivedResults.size).toBe(0);
   const before = storage.taskUpdateStorageBytes();
+  const beforeCanonicalBytes = Buffer.byteLength(JSON.stringify(session.canonicalInput()));
   session.acceptContinuityToolResults(f.request(calls.slice(0, 2).map(call => largeOutput(call.id))));
   expect(storage.continuityReceivedResults.size).toBe(2);
   expect(storage.continuityReceivedResultBytes).toBeGreaterThan(24 * 1024 * 1024);
-  expect(storage.taskUpdateStorageBytes() - before).toBe(storage.continuityReceivedResultBytes);
+  expect(storage.taskUpdateStorageBytes() - before).toBe(storage.continuityReceivedResultBytes
+    + Buffer.byteLength(JSON.stringify(session.canonicalInput())) - beforeCanonicalBytes);
   const acceptedBytes = storage.continuityReceivedResultBytes;
   expect(() => { session.acceptContinuityToolResults(f.request([largeOutput(calls[2]!.id)])); }).toThrow("capacity");
   expect(storage.continuityReceivedResultBytes).toBe(acceptedBytes);
@@ -876,7 +879,7 @@ test("Review R0 ordinary revision zero keeps current payload and complete result
   await expect(f.run(partial)).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(f.session().outstanding()).toHaveLength(2);
   expect(f.session().taskRevision()).toBe(0);
-  const complete = f.request([user("initial-user", "Inspect the project."), ...calls.map(call => output(call.id))]);
+  const complete = f.request([user("initial-user", "Inspect the project."), ...calls.flatMap(call => [issuedCall(call.id), output(call.id)])]);
   const running = f.run(complete);
   for (const id of [1, 2]) {
     let reply = await f.wait(id);
@@ -890,7 +893,7 @@ test("Review R0 ordinary revision zero keeps current payload and complete result
 });
 
 type BackendChainEvidence = {
-  sourceLogicalWorkId: string; headLogicalWorkId: string; lineageId: string; callId: string;
+  sourceLogicalWorkId: string; headLogicalWorkId: string; lineageId: string; callId: string; argumentsText: string;
   originalInput: unknown[]; appendInput: unknown[]; firstResult?: ReturnType<typeof output>;
   sends: number; dispatches: number; pageKey: string; summary?: string; checkpointId?: string;
   failedTransfer?: Pick<TaskUpdateTransfer, "transferId" | "payloadDigest" | "batchFingerprint">;
@@ -959,7 +962,7 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
       expect(f.record().currentWorkId).toBe(headLogicalWorkId);
       expect(f.submissions()).toBe(1);
       writeFileSync(join(root, "backend-chain-evidence.json"), JSON.stringify({ sourceLogicalWorkId,
-        headLogicalWorkId, lineageId: head.workLineageId, callId: call.id, originalInput, appendInput, firstResult,
+        headLogicalWorkId, lineageId: head.workLineageId, callId: call.id, argumentsText, originalInput, appendInput, firstResult,
         sends: f.sends(), dispatches: calls.length, pageKey: f.browserRuns[0]!.key,
         failedTransfer: { transferId: transfers[0]!.transferId, payloadDigest: transfers[0]!.payloadDigest,
           batchFingerprint: transfers[0]!.batchFingerprint },
@@ -968,7 +971,8 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
     } finally { unblock(); }
     return;
   }
-  const appendInput = [...originalInput, user("append", "Continue with the predecessor result.")];
+  const appendInput = [...originalInput, ...(backendScenario === "checkpoint" ? [issuedCall(call.id, command)] : []),
+    user("append", "Continue with the predecessor result.")];
   await f.run(f.request(appendInput));
   const delivery = await f.wait(1);
   expect(delivery.kind).toBe("pending");
@@ -1044,7 +1048,7 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
       expect(f.submissions()).toBe(2);
       f.dropPages();
       writeFileSync(join(root, "backend-chain-evidence.json"), JSON.stringify({ sourceLogicalWorkId,
-        headLogicalWorkId, lineageId, callId: call.id, originalInput, appendInput, firstResult,
+        headLogicalWorkId, lineageId, callId: call.id, argumentsText, originalInput, appendInput, firstResult,
         summary: delta.text, checkpointId: checkpoint.commitId, sends: f.sends(), dispatches: calls.length,
         pageKey: f.browserRuns[0]!.key } satisfies BackendChainEvidence));
       return;
@@ -1063,7 +1067,7 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
   }
   expect(f.submissions()).toBe(1);
   writeFileSync(join(root, "backend-chain-evidence.json"), JSON.stringify({ sourceLogicalWorkId,
-    headLogicalWorkId, lineageId, callId: call.id, originalInput, appendInput, firstResult,
+    headLogicalWorkId, lineageId, callId: call.id, argumentsText, originalInput, appendInput, firstResult,
     sends: f.sends(), dispatches: calls.length, pageKey: f.browserRuns[0]!.key } satisfies BackendChainEvidence));
 }, 15_000);
 
@@ -1090,6 +1094,27 @@ async function exitedBackendChain(scenario: "recover" | "stop" | "checkpoint" | 
   return { f, evidence, ownerStatus };
 }
 
+function recoveredCallInput(evidence: BackendChainEvidence): unknown[] {
+  // The child captured these bytes from the actual emitted tool_call_delta events.
+  // Journal digests only verify this body; they never reconstruct it.
+  return [...evidence.originalInput,
+    { type: "function_call", call_id: evidence.callId, name: "exec_command", arguments: evidence.argumentsText },
+    ...evidence.appendInput.slice(evidence.originalInput.length)];
+}
+
+for (const scenario of ["recover", "publication-exit"] as const) test(`recovery refuses missing issued arguments after actual backend exit: ${scenario}`, async () => {
+  const { f, evidence: e, ownerStatus } = await exitedBackendChain(scenario);
+  const input = scenario === "recover" ? [...e.appendInput, e.firstResult!] : e.appendInput;
+  const before = f.record();
+  await expect(f.run(f.request(input))).rejects.toMatchObject({ code: ownerStatus === "unverified"
+    ? "continuity_execution_unsettled" : "continuity_source_unproven" });
+  expect(f.submissions()).toBe(0);
+  expect(f.sends()).toBe(0);
+  expect(Object.keys(f.record().calls)).toEqual([e.callId]);
+  expect(callEvidence(f.record().calls)).toEqual(callEvidence(before.calls));
+  if (scenario === "recover") expect(readFileSync(join(f.root, "harmless-command-count"), "utf8")).toBe("x");
+}, 30_000);
+
 test("recovery v3: B retains A's real first result and source chain after the backend exits", async () => {
   const { f, evidence: e, ownerStatus } = await exitedBackendChain("recover");
   const before = f.record();
@@ -1115,7 +1140,7 @@ test("recovery v3: B retains A's real first result and source chain after the ba
   }
 
   const recoveredEvents: AdapterEvent[] = [];
-  const recovered = f.run(f.request([...e.appendInput, e.firstResult!]), recoveredEvents);
+  const recovered = f.run(f.request([...recoveredCallInput(e), e.firstResult!]), recoveredEvents);
   await f.waitSubmission(1);
   const active = f.record();
   const head = active.works[e.headLogicalWorkId]!;
@@ -1179,7 +1204,7 @@ test("recovery E3: backend exit after durable B acceptance recovers B without re
     return;
   }
   const events: AdapterEvent[] = [];
-  const recovered = f.run(f.request(e.appendInput), events);
+  const recovered = f.run(f.request(recoveredCallInput(e)), events);
   await f.waitSubmission(1);
   const active = f.record();
   expect(active.currentWorkId).toBe(e.headLogicalWorkId);

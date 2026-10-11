@@ -1,9 +1,10 @@
-import { acceptRecoveryResults, stopRecoveryWork, recoveryRecord, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
+import { bindRecoveryContextCoverage, acceptRecoveryResults, stopRecoveryWork, recoveryRecord, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { createHash } from "node:crypto";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest, type CodexToolResultMessage } from "../../types";
 import { COMPACT_PROMPT, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
+import { createContextSnapshot } from "./context-snapshot";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
@@ -187,6 +188,10 @@ export class ChatGptTextFeed {
 }
 
 interface ChatGptTurnRuntimeBase {
+  /** Digest-only selected/delivered source evidence survives ordinary capability retirement. */
+  compactionSourceCoverage?: import("./compaction-context").CompactionSourceCoverage;
+  /** Synchronize actual cumulative navigation cost before page capacity or source capture. */
+  syncContextUsage?: () => Promise<void>;
   browser: Promise<string>;
   /** Physical helper/Playwright settlement, including the launcher end/release acknowledgement. */
   physicalSettlement: Promise<void>;
@@ -707,6 +712,7 @@ export type ChatGptTaskUpdateProof =
 type EligibleTaskUpdateProof = Extract<ChatGptTaskUpdateProof, { status: "eligible" }>;
 
 export interface ChatGptPreparedTaskUpdate {
+  readonly contextCoverage?: ReturnType<import("./compaction-context").CompactionSourceCoverage["metadata"]>;
   readonly transferId: string;
   readonly payloadDigest: string;
   readonly expectedDriverGeneration: number;
@@ -780,7 +786,8 @@ export class ChatGptTurnSession {
   private taskUpdateOutputRoundKey?: string;
   private taskUpdateOutputRoundBound = false;
   private preparedTaskUpdate?: { record: ChatGptPreparedTaskUpdate; proof: EligibleTaskUpdateProof;
-    sourceBytes: number; handoffBytes: number; newErrorRound: boolean };
+    sourceBytes: number; canonicalInput: unknown[]; handoffBytes: number; newErrorRound: boolean;
+    compactionCoverage?: import("./compaction-context").CompactionSourceCoverage };
   private readonly taskUpdateTransferConclusions = new Map<string, TaskUpdateTransferOutcome>();
   private readonly taskUpdateFinalizations = new Map<string, "committed" | "restored" | "closed">();
   private readonly driverChangeObservers = new Set<() => void>();
@@ -807,6 +814,19 @@ export class ChatGptTurnSession {
     readonly instruction?: string,
   ) {
     this.attachedConversationKey = runtime.conversationKey;
+    const initialInput = rawRecord(runtime.usageInput?._rawBody)?.input;
+    if (runtime.compactionSourceCoverage && Array.isArray(initialInput)) {
+      this.canonicalInputValue = structuredClone(initialInput);
+      this.taskUpdateSourceBytes = Buffer.byteLength(canonicalJson(initialInput));
+      if (this.taskUpdateStorageBytes() > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+        throw taskUpdateSourceError("task_update_capacity", "The retained source exceeds its evidence capacity.");
+      }
+    }
+    if (!runtime.continuityBinding) runtime.compactionSourceCoverage?.bindAdmission(metadata => {
+      if (this.taskUpdateStorageBytes(Buffer.byteLength(JSON.stringify(metadata))) > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+        throw taskUpdateSourceError("task_update_capacity", "The session source coverage exceeds its evidence capacity.");
+      }
+    });
     this.physicalSettlement = runtime.physicalSettlement.then(
       () => { this.settledPhysical = true; },
       error => {
@@ -873,7 +893,7 @@ export class ChatGptTurnSession {
     const sourceBytes = Buffer.byteLength(canonicalJson(source.input));
     const existingJournalBytes = [...this.rounds.values()].reduce((bytes, round) => bytes
       + Buffer.byteLength(canonicalJson(round.events)) + Buffer.byteLength(canonicalJson(round.reasoning)), 0);
-    if (sourceBytes + existingJournalBytes + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+    if (sourceBytes + existingJournalBytes + this.compactionCoverageBytes() + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
       throw taskUpdateSourceError("task_update_capacity", "Task update source history capacity is exhausted.");
     }
     this.taskUpdateSource = { ...structuredClone(source), input: [] };
@@ -1249,7 +1269,60 @@ export class ChatGptTurnSession {
     batch.observationRevision = observationRevision;
   }
 
+  private mergeCompactionInput(additions: readonly unknown[]): unknown[] {
+    const input = structuredClone(this.canonicalInputValue ?? []);
+    const key = (value: unknown): string => {
+      const item = rawRecord(value);
+      return typeof item?.call_id === "string" ? `call:${String(item.type)}:${item.call_id}`
+        : typeof item?.id === "string" ? `id:${item.id}` : `value:${canonicalJson(value)}`;
+    };
+    const existing = new Map<string, number>();
+    for (const value of input) { const id = key(value); existing.set(id, (existing.get(id) ?? 0) + 1); }
+    const seen = new Map<string, number>();
+    for (const value of additions) {
+      const item = rawRecord(value);
+      // Transport-only result metadata retains its original delivery ownership and is
+      // not a model-readable compaction source. All actual content blocks remain exact.
+      const accepted = item && isTaskUpdateRawResult(item) ? Object.fromEntries(Object.entries(item).filter(([name]) => name !== "_meta")) : value;
+      const id = key(accepted); const count = (seen.get(id) ?? 0) + 1; seen.set(id, count);
+      if (count > (existing.get(id) ?? 0)) input.push(structuredClone(accepted));
+    }
+    return input;
+  }
+
+  private compactionAppendInput(proof: EligibleTaskUpdateProof): unknown[] {
+    if (!this.runtime.compactionSourceCoverage) return structuredClone([...proof.source.input]);
+    const added = new Set(proof.updates.map(update => update.sourceMessageId));
+    const instructions = proof.source.input.filter(value => {
+      const item = rawRecord(value); return typeof item?.id === "string" && added.has(item.id);
+    });
+    return this.mergeCompactionInput([...proof.batch.rawResults, ...instructions]);
+  }
+
+  private admitCompactionSource(input: readonly unknown[], coverage: import("./compaction-context").CompactionSourceCoverage): number {
+    const bytes = Buffer.byteLength(canonicalJson(input));
+    const metadataBytes = this.runtime.continuityBinding ? 0 : Buffer.byteLength(JSON.stringify(coverage.metadata()));
+    if (this.taskUpdateStorageBytes(metadataBytes) - this.taskUpdateSourceBytes + bytes > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
+      throw taskUpdateSourceError("task_update_capacity", "The retained source exceeds its evidence capacity.");
+    }
+    return bytes;
+  }
+
   /** Broker must reserve transfer/receipt space first. No await and no browser/model wait here. */
+  previewTaskUpdateContextCoverage(proof: EligibleTaskUpdateProof): import("./compaction-context").CompactionSourceCoverage | undefined {
+    const coverage = this.runtime.compactionSourceCoverage?.fork();
+    if (coverage) {
+      const acceptedIds = new Set(proof.updates.map(update => update.sourceMessageId));
+      const accepted = parseRequest({ model: this.runtime.usageInput?.modelId,
+        input: proof.source.input.filter(value => { const item = rawRecord(value); return typeof item?.id === "string" && acceptedIds.has(item.id); }) });
+      coverage.recordTaskUpdate(createContextSnapshot(accepted));
+      const returned = parseRequest({ model: this.runtime.usageInput?.modelId, input: proof.batch.rawResults });
+      coverage.prepareToolResults(returned, proof.batch.rawResults.map(item => String(item.call_id)));
+      for (const item of proof.batch.rawResults) coverage.markToolResultDelivered(String(item.call_id));
+    }
+    return coverage;
+  }
+
   prepareTaskUpdate(proof: EligibleTaskUpdateProof, transferId: string, payloadDigest: string): ChatGptPreparedTaskUpdate {
     const conclusion = this.taskUpdateTransferConclusions.get(transferId);
     if (conclusion && conclusion.status !== "unknown") throw taskUpdateSourceError("task_update_transfer_conflict", "This transfer already has an immutable conclusion.");
@@ -1277,23 +1350,30 @@ export class ChatGptTurnSession {
     const previous = this.activeTaskUpdateRound;
     const previousRoundKey = previous && previous.generation === proof.expectedDriverGeneration
       && !this.roundHasTerminalEvent(previous.key) && !this.roundCompleted(previous.key) ? previous.key : undefined;
-    const sourceBytes = Buffer.byteLength(canonicalJson(proof.source.input));
+    const compactionCoverage = this.previewTaskUpdateContextCoverage(proof);
+    const canonicalInput = this.compactionAppendInput(proof);
+    const sourceBytes = Buffer.byteLength(canonicalJson(canonicalInput));
+    const coverageIncrement = this.runtime.continuityBinding || !compactionCoverage ? 0 : Math.max(0,
+      Buffer.byteLength(JSON.stringify(compactionCoverage?.metadata() ?? [])) - this.compactionCoverageBytes());
     const handoffBytes = previousRoundKey ? TASK_UPDATE_HANDOFF_TERMINAL_BYTES : 0;
     const newErrorRound = !this.taskUpdateErrorRoundReserves.has(proof.route.roundKey)
       && !this.roundCompleted(proof.route.roundKey);
     if (this.taskUpdateRequests.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT
       || this.taskUpdateTransferConclusions.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT
       || this.rounds.size >= 512
-      || this.taskUpdateStorageBytes() + sourceBytes + handoffBytes
+      || this.taskUpdateStorageBytes() + sourceBytes + handoffBytes + coverageIncrement
         + (newErrorRound ? TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES : 0) > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
       throw taskUpdateSourceError("task_update_capacity", "Task update route or round journal capacity is exhausted.");
     }
+    // Only this unpublished clone records prospective delivery. The live ledger changes
+    // after the immutable Broker receipt and its atomic journal write.
     this.reserveTaskUpdateRoundError(proof.route.roundKey);
     const record: ChatGptPreparedTaskUpdate = Object.freeze({ transferId, payloadDigest,
       expectedDriverGeneration: proof.expectedDriverGeneration, expectedRevision: proof.expectedRevision,
       requestFingerprint: proof.source.requestFingerprint,
+      ...(compactionCoverage ? { contextCoverage: compactionCoverage.metadata() } : {}),
       ...(previousRoundKey ? { previousRoundKey } : {}) });
-    this.preparedTaskUpdate = { record, proof: structuredClone(proof), sourceBytes, handoffBytes, newErrorRound };
+    this.preparedTaskUpdate = { record, proof: structuredClone(proof), sourceBytes, canonicalInput, handoffBytes, newErrorRound, compactionCoverage };
     this.taskUpdateTransferConclusions.set(transferId, { status: "unknown", transferId });
     this.notifyTaskUpdateDriverChange();
     this.scheduleCapabilityRetirement();
@@ -1330,12 +1410,24 @@ export class ChatGptTurnSession {
         || outcome.batchFingerprint !== proof.batch.batchFingerprint) {
         throw taskUpdateSourceError("task_update_transfer_conflict", "The commit receipt does not match the reserved transfer.");
       }
+      const coverage = this.runtime.compactionSourceCoverage;
+      const recovery = proof.mode === "continuity" ? this.runtime.continuityBinding?.recovery : undefined;
+      if (recovery) {
+        // Only the validated immutable receipt above permits moving to the atomically
+        // accepted work. Rebind the hook before publishing the prepared metadata.
+        recovery.logicalWorkId = recoveryRecord(recovery).currentWorkId!;
+        recovery.attempt = 0;
+        if (coverage && prepared.compactionCoverage) {
+          bindRecoveryContextCoverage(recovery, coverage, prepared.compactionCoverage.metadata());
+        }
+      }
+      if (prepared.compactionCoverage) coverage?.acceptPreparedCoverage(prepared.compactionCoverage);
       this.taskUpdateDriverGeneration = outcome.state.driverGeneration;
       this.taskUpdateRevision = outcome.state.acceptedRevision;
       this.taskUpdateDriverOpen = !this.taskUpdateCancelled;
       this.taskUpdateSource = { ...structuredClone(proof.source), input: [] };
-      this.taskUpdateSourceBytes = Buffer.byteLength(canonicalJson(proof.source.input));
-      this.canonicalInputValue = structuredClone(proof.source.input) as unknown[];
+      this.taskUpdateSourceBytes = prepared.sourceBytes;
+      this.canonicalInputValue = structuredClone(prepared.canonicalInput);
       const latestMessage = proof.source.messages.at(-1);
       const sourceItem = proof.source.input.map(rawRecord).find(item => item?.id === latestMessage?.sourceMessageId);
       if (latestMessage && sourceItem) this.taskUpdateFinalSource = {
@@ -1351,8 +1443,6 @@ export class ChatGptTurnSession {
         this.continuityGeneration += 1;
         const binding = this.runtime.continuityBinding!;
         if (binding.recovery) {
-          binding.recovery.logicalWorkId = recoveryRecord(binding.recovery).currentWorkId!;
-          binding.recovery.attempt = 0;
           acceptRecoveryResults(binding.recovery, proof.batch.rawResults);
         }
         const physical = binding.executionKey!;
@@ -1702,10 +1792,12 @@ export class ChatGptTurnSession {
     const proof = this.proveOrdinaryTaskUpdateBatch(parsed);
     if (!proof) return [];
     const batch = this.ordinaryTaskUpdateBatches.get(proof.batchId)!;
+    const messages = proof.messages.filter(message => this.outstandingById.has(message.toolCallId));
+    this.prepareCompactionToolResults(parsed, messages.map(message => message.toolCallId));
     if (!batch.acceptedRawResults) {
       batch.acceptedRawResults = new Map(proof.rawResults.map(item => [String(item.call_id), taskUpdateRawResultDigest(item)]));
     }
-    return proof.messages.filter(message => this.outstandingById.has(message.toolCallId));
+    return messages;
   }
 
   private notifyTaskUpdateDriverChange(): void { for (const observer of [...this.driverChangeObservers]) observer(); }
@@ -1767,7 +1859,11 @@ export class ChatGptTurnSession {
       this.continuityOrdinaryRoundKey = chatGptTurnRoundKey(parsed);
       this.continuityGeneration += 1;
     }
-    this.canonicalInputValue = structuredClone(input);
+    if (this.runtime.compactionSourceCoverage) {
+      const retained = this.mergeCompactionInput(input);
+      const bytes = this.admitCompactionSource(retained, this.runtime.compactionSourceCoverage);
+      this.canonicalInputValue = retained; this.taskUpdateSourceBytes = bytes;
+    } else this.canonicalInputValue = structuredClone(input);
   }
 
   assertCanonicalReplayInput(parsed: CodexParsedRequest): void {
@@ -1910,8 +2006,47 @@ export class ChatGptTurnSession {
     return this.canonicalInputValue ? structuredClone(this.canonicalInputValue) : undefined;
   }
 
+  /** These live-issued calls were retained from argument objects, not raw HTTP strings. */
+  compactionObjectArgumentCallIds(): ReadonlySet<string> {
+    return new Set(this.runtime.compactionSourceCoverage?.metadata()
+      .flatMap(record => record.issuedCalls?.filter(call => !call.freeform).map(call => call.callId) ?? []) ?? []);
+  }
+
+  /** Add only parameters still held by the actual issuing session. This is source
+   * evidence for compaction, never a new request or authority to execute a call. */
+  restoreCompactionIssuedCalls(input: readonly unknown[]): unknown[] {
+    const source = structuredClone([...input]);
+    const present = new Set(source.flatMap(value => {
+      const item = rawRecord(value);
+      return item && typeof item.call_id === "string" && ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type))
+        ? [item.call_id] : [];
+    }));
+    const uncovered = new Set(this.runtime.compactionSourceCoverage?.metadata().flatMap(record =>
+      record.issuedCalls?.map(call => call.callId) ?? []) ?? []);
+    const requests = new Map<string, BrokerToolRequest>();
+    for (const batch of [...this.toolBatches.values(), ...this.ordinaryTaskUpdateBatches.values()]) {
+      for (const request of batch.requests) if (uncovered.has(request.callId)) requests.set(request.callId, request);
+    }
+    for (const request of requests.values()) {
+      if (present.has(request.callId)) continue;
+      const item = request.freeform
+        ? { type: "custom_tool_call", call_id: request.callId, name: request.wireName, input: request.input ?? "" }
+        : { type: "function_call", call_id: request.callId, name: request.wireName, arguments: JSON.stringify(request.arguments ?? {}) };
+      const index = source.findIndex(value => {
+        const result = rawRecord(value); return result && result.call_id === request.callId && isTaskUpdateRawResult(result);
+      });
+      source.splice(index < 0 ? source.length : index, 0, item);
+      present.add(request.callId);
+    }
+    return source;
+  }
+
   acceptContinuityToolResults(parsed: CodexParsedRequest): CodexToolResultMessage[] {
-    if (this.taskUpdateSource?.continuity && this.taskUpdateRevision > 0) return this.acceptLightContinuityToolResults(parsed);
+    if (this.taskUpdateSource?.continuity && this.taskUpdateRevision > 0) {
+      const messages = this.acceptLightContinuityToolResults(parsed);
+      this.prepareCompactionToolResults(parsed, messages.map(message => message.toolCallId));
+      return messages;
+    }
     const resolved = this.resolveContinuityToolBatch(parsed);
     if (!resolved) return [];
     const { batch, rawResults, messages } = resolved;
@@ -1927,9 +2062,11 @@ export class ChatGptTurnSession {
       batch.acceptedResultDigests = digests;
       this.continuityGeneration += 1;
     }
-    return batch.requests.flatMap(request => batch.delivered.has(request.callId)
+    const accepted = batch.requests.flatMap(request => batch.delivered.has(request.callId)
       ? []
       : [messages.get(request.callId)!]);
+    this.prepareCompactionToolResults(parsed, accepted.map(message => message.toolCallId));
+    return accepted;
   }
 
   private resolveContinuityToolBatch(parsed: CodexParsedRequest): {
@@ -2041,12 +2178,27 @@ export class ChatGptTurnSession {
 
   setOutstanding(requests: BrokerToolRequest[], reasoning: string[] = [], prelude: AdapterEvent[] = []): void {
     if (this.outstandingById.size > 0) throw new Error("cannot emit a new ChatGPT tool batch while the previous batch is unresolved");
+    if (new Set(requests.map(request => request.callId)).size !== requests.length
+      || requests.some(request => this.toolBatchByCallId.has(request.callId) || this.outstandingById.has(request.callId))) {
+      throw new Error("duplicate ChatGPT bridge tool call id");
+    }
     if (this.taskUpdateSource) {
       if (this.ordinaryTaskUpdateBatches.size >= TASK_UPDATE_SESSION_ROUTE_LIMIT) throw taskUpdateSourceError("task_update_capacity", "Task update batch proof capacity is exhausted.");
       if (requests.length === 0 || new Set(requests.map(request => request.callId)).size !== requests.length
         || requests.some(request => this.ordinaryTaskUpdateBatchByCallId.has(request.callId))) {
         throw taskUpdateSourceError("task_update_source_conflict", "Tool batch call identities must be new and unique.");
       }
+    }
+    if (this.runtime.compactionSourceCoverage) {
+      const coverage = this.runtime.compactionSourceCoverage.fork(); coverage.recordIssuedCalls(requests);
+      const input = this.mergeCompactionInput(requests.map(request => request.freeform
+        ? { type: "custom_tool_call", call_id: request.callId, name: request.wireName, input: request.input ?? "" }
+        : { type: "function_call", call_id: request.callId, name: request.wireName, arguments: JSON.stringify(request.arguments ?? {}) }));
+      const bytes = this.admitCompactionSource(input, coverage);
+      this.runtime.compactionSourceCoverage.acceptPreparedCoverage(coverage);
+      this.canonicalInputValue = input; this.taskUpdateSourceBytes = bytes;
+    }
+    if (this.taskUpdateSource) {
       const batch: OrdinaryTaskUpdateBatch = { id: this.nextToolBatchId++, requests: structuredClone(requests) };
       this.ordinaryTaskUpdateBatches.set(batch.id, batch);
       for (const request of requests) this.ordinaryTaskUpdateBatchByCallId.set(request.callId, batch);
@@ -2084,6 +2236,8 @@ export class ChatGptTurnSession {
   }
 
   markResultDelivered(callId: string): void {
+    if (!this.outstandingById.has(callId)) throw new Error(`ChatGPT bridge tool result does not match an outstanding call: ${callId}`);
+    this.runtime.compactionSourceCoverage?.markToolResultDelivered(callId);
     if (!this.outstandingById.delete(callId)) throw new Error(`ChatGPT bridge tool result does not match an outstanding call: ${callId}`);
     const batch = this.toolBatchByCallId.get(callId);
     if (batch) batch.delivered.add(callId);
@@ -2097,6 +2251,28 @@ export class ChatGptTurnSession {
       this.outstandingReasoning = [];
       this.outstandingPrelude = [];
     }
+  }
+
+  prepareCompactionToolResults(parsed: CodexParsedRequest, callIds: readonly string[]): void {
+    if (!this.runtime.compactionSourceCoverage || !callIds.length) return;
+    // Continuity replays retain the first actual return. A later client echo may
+    // differ and must not replace that accepted result's source metadata.
+    const input = rawRecord(parsed._rawBody)?.input;
+    const accepted = Array.isArray(input) && callIds.some(id => this.continuityReceivedResults.has(id))
+      ? parseRequest({ model: parsed.modelId, input: input.map(value => {
+        const item = rawRecord(value); const id = item?.call_id;
+        return typeof id === "string" && isTaskUpdateRawResult(item!)
+          ? this.continuityReceivedResults.get(id)?.item ?? value : value;
+      }) }) : parsed;
+    const coverage = this.runtime.compactionSourceCoverage.fork(); coverage.prepareToolResults(accepted, callIds);
+    const ids = new Set(callIds);
+    const acceptedInput = rawRecord(accepted._rawBody)?.input;
+    const additions = Array.isArray(acceptedInput) ? acceptedInput.filter(value => {
+      const item = rawRecord(value); return item && typeof item.call_id === "string" && ids.has(item.call_id) && isTaskUpdateRawResult(item);
+    }) : [];
+    const retained = this.mergeCompactionInput(additions); const bytes = this.admitCompactionSource(retained, coverage);
+    this.runtime.compactionSourceCoverage.acceptPreparedCoverage(coverage);
+    this.canonicalInputValue = retained; this.taskUpdateSourceBytes = bytes;
   }
 
   reasoningForOutstandingReplay(): string[] {
@@ -2312,8 +2488,15 @@ export class ChatGptTurnSession {
     return round;
   }
 
-  private taskUpdateStorageBytes(): number {
-    return this.taskUpdateSourceBytes + this.taskUpdateJournalBytes + this.continuityReceivedResultBytes
+  private compactionCoverageBytes(): number {
+    return this.runtime.continuityBinding || !this.runtime.compactionSourceCoverage ? 0
+      : Buffer.byteLength(JSON.stringify(this.runtime.compactionSourceCoverage.metadata()));
+  }
+
+  private taskUpdateStorageBytes(coverageBytes = this.compactionCoverageBytes()): number {
+    const preparedCoverageBytes = this.runtime.continuityBinding || !this.preparedTaskUpdate?.compactionCoverage ? 0
+      : Buffer.byteLength(JSON.stringify(this.preparedTaskUpdate.compactionCoverage.metadata()));
+    return Math.max(coverageBytes, preparedCoverageBytes) + this.taskUpdateSourceBytes + this.taskUpdateJournalBytes + this.continuityReceivedResultBytes
       + this.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES
       + (this.preparedTaskUpdate?.sourceBytes ?? 0) + (this.preparedTaskUpdate?.handoffBytes ?? 0);
   }

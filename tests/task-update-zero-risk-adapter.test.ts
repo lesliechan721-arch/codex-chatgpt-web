@@ -3,19 +3,20 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "../src/adapters/chatgpt-web/index";
+import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnExecutionKey, chatGptTurnRoundKey, chatGptTurnSessions,
-  TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES, TASK_UPDATE_SESSION_JOURNAL_BYTES } from "../src/adapters/chatgpt-web/turn-execution";
-import { callTurnBroker, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+  TASK_UPDATE_SESSION_JOURNAL_BYTES } from "../src/adapters/chatgpt-web/turn-execution";
+import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolRequest } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import type { TaskUpdateAckResult, UpdateDelivery } from "../src/adapters/chatgpt-web/task-update-protocol";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
-import { defaultBrokerEndpoint } from "../src/config";
+import { defaultBrokerEndpoint, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
 
 const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-safe-updates-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 let sequence = 0;
+const issuedCalls = new Map<string, BrokerToolRequest>();
 const nativeResult = "  unchanged Native result\n";
 const tools: CodexTool[] = [{ name: "exec_command", description: "An inert outer command fixture", parameters: { type: "object" } }];
 
@@ -23,6 +24,10 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
+}
+
+function sessionStorageBytes(session: object): number {
+  return (session as { taskUpdateStorageBytes(): number }).taskUpdateStorageBytes();
 }
 
 function request(scope: string): CodexParsedRequest {
@@ -44,6 +49,13 @@ function append(original: CodexParsedRequest, update: { id: string; text: string
   const raw = next._rawBody as { input: Record<string, unknown>[] };
   const turnId = (raw.input[0]!.internal_chat_message_metadata_passthrough as { turn_id: string }).turn_id;
   if (callId && !raw.input.some(item => item.type === "function_call_output" && item.call_id === callId)) {
+    const issued = issuedCalls.get(callId);
+    if (issued) {
+      raw.input.push({ type: "function_call", call_id: callId, name: issued.wireName,
+        arguments: JSON.stringify(issued.arguments ?? {}) });
+      next.context.messages.push({ role: "assistant", content: [{ type: "toolCall", id: callId,
+        name: issued.wireName, arguments: structuredClone(issued.arguments ?? {}) }], timestamp: 2 });
+    }
     raw.input.push({ type: "function_call_output", call_id: callId, output: nativeResult });
     next.context.messages.push({ role: "toolResult", toolCallId: callId, toolName: "exec_command", content: nativeResult, isError: false, timestamp: 2 });
   }
@@ -81,13 +93,19 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web", baseUrl: `manual://${scope}`,
     chatgptWeb: {
-      appName: "Codex Zero Risk3", browserInteractionMode: "manual", browserHost: "launcher",
+      appName: ZERO_RISK_CHATGPT_CONNECTOR_NAME, browserInteractionMode: "manual", browserHost: "launcher",
       browserHostDescriptorPath: join(root, `${scope}-launcher.json`), brokerSocketPath: socket,
       localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: false,
       extraHighAvailable: false, proAvailable: false, experimentalBiggerContext: false,
     },
   };
   const broker = TurnBroker.forSocket(socket);
+  const nextToolBatch = broker.nextToolBatch.bind(broker);
+  broker.nextToolBatch = async (...args) => {
+    const requests = await nextToolBatch(...args);
+    for (const request of requests) issuedCalls.set(request.callId, structuredClone(request));
+    return requests;
+  };
   if (options.remote) await broker.listen();
   const owner = options.remote ? new RemoteTurnBroker(socket) : broker;
   const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -104,6 +122,7 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
       const start = { traceId: activity.traceId, requestId: binding(activity.prompt), prompt: activity.prompt, sent: deferred<void>() };
       starts.push(start);
       if (!options.awaitingSent) start.sent.resolve();
+      return { reused: false, ...(activity.contextPlans?.full ? { selectedPlanId: activity.contextPlans.full.planId } : {}) };
     },
     async waitSent(_descriptor, activity, settings) {
       const start = starts.find(value => value.traceId === activity.traceId)!;
@@ -282,18 +301,11 @@ describe("Zero Risk Adapter task updates", () => {
       const session = f.session();
       const roundKey = chatGptTurnRoundKey(next);
       expect(session.hasPendingTaskUpdate()).toBe(false);
-      const budget = session as unknown as {
-        readonly taskUpdateSourceBytes: number;
-        readonly taskUpdateJournalBytes: number;
-        readonly taskUpdateErrorRoundReserves: ReadonlySet<string>;
-      };
-      const remaining = TASK_UPDATE_SESSION_JOURNAL_BYTES - budget.taskUpdateSourceBytes - budget.taskUpdateJournalBytes
-        - budget.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES;
+      const remaining = TASK_UPDATE_SESSION_JOURNAL_BYTES - sessionStorageBytes(session);
       const padding: AdapterEvent = { type: "text_delta", text: "", phase: "commentary" };
       padding.text = "x".repeat(remaining - Buffer.byteLength(JSON.stringify([padding])));
       session.appendRoundEvents(roundKey, [padding]);
-      expect(budget.taskUpdateSourceBytes + budget.taskUpdateJournalBytes
-        + budget.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES).toBe(TASK_UPDATE_SESSION_JOURNAL_BYTES);
+      expect(sessionStorageBytes(session)).toBe(TASK_UPDATE_SESSION_JOURNAL_BYTES);
 
       expect(await f.complete(requestId, 1, "Complete answer including validation.")).toMatchObject({ completed: true });
       await round;
@@ -303,7 +315,7 @@ describe("Zero Risk Adapter task updates", () => {
       expect(events.some(event => event.type === "done" && event.endTurn)).toBe(false);
       expect(session.roundCompleted(roundKey)).toBe(true);
       expect(session.isTaskUpdateCancelled()).toBe(true);
-      expect(budget.taskUpdateSourceBytes + budget.taskUpdateJournalBytes).toBeLessThanOrEqual(TASK_UPDATE_SESSION_JOURNAL_BYTES);
+      expect(sessionStorageBytes(session)).toBeLessThanOrEqual(TASK_UPDATE_SESSION_JOURNAL_BYTES);
       await session.browserOutcome;
       await session.physicalSettlement;
       await f.broker.waitForRetirement(requestId, AbortSignal.timeout(1_000));

@@ -183,12 +183,33 @@ create another summary transaction. Deliver any valid current results first, the
 generation and acquire the single-writer transaction before control delivery. A preflight that
 became stale must not retire a newer owner. Once control delivery starts or is uncertain, coordinate its original attempt before admitting
 recovery. An accepted handoff with unconfirmed physical settlement is not a successful checkpoint.
-Automatic can generate a tool-free summary on a new page for an uncommitted lost compaction after
+Automatic can generate a read-only summary on a new page for an uncommitted lost compaction after
 the old writer and delivered tools settle. If a complete valid handoff body is already available,
 commit it once instead of generating another summary. A successful commit only replays its own
 result; a missing replay body does not authorize regeneration. A logical checkpoint committed
 without a live page is initialized by its subsequent ordinary continuation. Zero Risk retains its
 manual handoff boundary after an ended response.
+
+Full/MCP compaction can supply a bounded navigation entry into a separate snapshot of complete
+legal sources. An independent `compaction_token` permits only `codex_context_list`,
+`codex_context_read`, and `codex_context_search`; the original handoff or completion credential
+still submits the checkpoint. Historical instructions are summary evidence, not new business work.
+The model chooses which sources to inspect, with no minimum read count or full-coverage requirement.
+New compaction admission first requires the selected profile's six-call read-only capability
+verification; replay keeps its original receipts and authorization. This setup check does not
+require production compaction to read every source or alter its original writer and Send rules.
+Control delivery, actual source availability, summary reserve, settled in-flight reads, and the
+existing writer, revision, ACK, Send, and real-result checks still gate acceptance.
+
+Healthy retained compaction need not resend all source bodies or read every source within the
+cumulative allowance. A fresh recovery page still requires the complete compiled input to pass
+the original full-capacity admission below before navigation can be published. Missing source bytes,
+permanent read failure, cancellation, or expiry prevent a successful checkpoint and preserve
+accepted ordinary results for their original replay path. Correctable budget errors can let the
+model stop reading and submit; exhausting the source-query reply allowance stops reads with a
+JSON-RPC rejection without closing the shared MCP transport or original submission path. Unknown
+Send is never resent to rebuild a directory. Restart invalidates old read credentials and references;
+new sources require actual verified content. See [context navigation](context-navigation.md).
 
 ## Retention and recovery evidence
 

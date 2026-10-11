@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { apiAccessRevision, apiKeyMatches, apiKeyPolicy, MODEL_CATALOG_STATUS_HEADER } from "../src/api-access";
 import { loadApiAccessPolicy, openAiRoutingPendingPath } from "../src/api-access-config";
-import { defaultConfig } from "../src/config";
+import { defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { buildStandaloneModelCatalog } from "../src/standalone-model-catalog";
 import { upstreamProviderRevision } from "../src/upstream-provider";
 import modelCatalogCommandLock from "../launcher/electron/model-catalog-command-lock.cjs";
@@ -376,7 +376,7 @@ test("CLI refresh-models includes the Zero Risk Pro row after the profile is ena
   const localKey = "cgw_" + "p".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   const config = defaultConfig("full");
-  config.appName = "Codex Zero Risk3";
+  config.appName = ZERO_RISK_CHATGPT_CONNECTOR_NAME;
   config.browserHost = "launcher";
   config.browserInteractionMode = "manual";
   config.browserHostDescriptorPath = join(home, "launcher-browser.json");

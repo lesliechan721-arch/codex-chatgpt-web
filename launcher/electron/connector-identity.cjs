@@ -1,9 +1,21 @@
-const CURRENT_CONNECTOR_NAME = "Codex Native4";
+const CURRENT_CONNECTOR_NAME = "Codex Native5";
 const DEV_CONNECTOR_NAME = `${CURRENT_CONNECTOR_NAME} DEV`;
-const DEV_LONG_WAIT_CONNECTOR_NAME = "Codex Native4 DEV";
-const CURRENT_MANUAL_CONNECTOR_NAME = "Codex Zero Risk3";
-const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV"]);
-const LEGACY_MANUAL_CONNECTOR_NAMES = Object.freeze(["Codex Zero Risk", "Codex Zero Risk2"]);
+const DEV_LONG_WAIT_CONNECTOR_NAME = DEV_CONNECTOR_NAME;
+const CURRENT_MANUAL_CONNECTOR_NAME = "Codex Zero Risk4";
+const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV", "Codex Native4", "Codex Native4 DEV"]);
+const LEGACY_MANUAL_CONNECTOR_NAMES = Object.freeze(["Codex Zero Risk", "Codex Zero Risk2", "Codex Zero Risk3"]);
+// This versions the Launcher setup check, not proof of ChatGPT's cached remote schema.
+const MCP_SETUP_CONTRACT = "context-navigation-v1";
+
+function connectorSetupStatePatch(config, state) {
+  if (config?.mode !== "full") return { mcpSetupComplete: false, mcpGuideStep: 0 };
+  if (isLegacyConnectorName(config.appName)
+    || state.mcpSetupContract !== MCP_SETUP_CONTRACT
+    || state.mcpSetupConnectorName !== config.appName) {
+    return { mcpSetupComplete: false, mcpGuideStep: 2 };
+  }
+  return {};
+}
 
 function validateConnectorNameSuffix(value) {
   if (typeof value !== "string" || value.length > 74
@@ -65,6 +77,7 @@ function requireCurrentRuntimeConnectorName(value) {
 }
 
 module.exports = {
+  connectorSetupStatePatch,
   connectorNameForSetup,
   connectorNameForDevSetup,
   CURRENT_CONNECTOR_NAME,
@@ -73,6 +86,7 @@ module.exports = {
   DEV_LONG_WAIT_CONNECTOR_NAME,
   isLegacyConnectorName,
   LEGACY_CONNECTOR_NAMES,
+  MCP_SETUP_CONTRACT,
   requireCurrentRuntimeConnectorName,
   validateConnectorName,
   validateConnectorNameSuffix,

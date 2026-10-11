@@ -6,8 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, createConnection, type Socket } from "node:net";
 import { ChatGptBrowserWorker, ChatGptCompletionTracker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { canonicalJson } from "../src/adapters/chatgpt-web/canonical-json";
 import { buildResponseJSON } from "../src/bridge";
-import { chatGptWebExecutionNamespace, createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { chatGptWebExecutionNamespace, createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { chatGptTurnExecutionKey, chatGptTurnRoundKey, chatGptTurnSessions,
@@ -17,18 +18,23 @@ import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environm
 import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolRequest } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import type { TaskUpdateOwnerContext, UpdateDelivery } from "../src/adapters/chatgpt-web/task-update-protocol";
-import { defaultBrokerEndpoint } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint } from "../src/config";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
 
 const testRoot = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-task-update-adapter-"));
 afterAll(() => rmSync(testRoot, { recursive: true, force: true }));
 let sequence = 0;
+const issuedCalls = new Map<string, BrokerToolRequest>();
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
+}
+
+function sessionStorageBytes(session: object): number {
+  return (session as { taskUpdateStorageBytes(): number }).taskUpdateStorageBytes();
 }
 
 const tools: CodexTool[] = [{
@@ -57,6 +63,13 @@ function append(original: CodexParsedRequest, callId: string | undefined, update
   const turnId = extractChatGptTurnIdentity(original).turnId;
   if (!turnId) throw new Error("The fixture lost its native turn identity");
   if (callId && !raw.input.some(item => item.type === "function_call_output" && item.call_id === callId)) {
+    const issued = issuedCalls.get(callId);
+    if (issued) {
+      raw.input.push({ type: "function_call", call_id: callId, name: issued.wireName,
+        arguments: JSON.stringify(issued.arguments ?? {}) });
+      next.context.messages.push({ role: "assistant", content: [{ type: "toolCall", id: callId,
+        name: issued.wireName, arguments: structuredClone(issued.arguments ?? {}) }], timestamp: 2 });
+    }
     raw.input.push({ type: "function_call_output", call_id: callId, output: "  exact Native result\n" });
     next.context.messages.push({ role: "toolResult", toolCallId: callId, toolName: "exec_command", content: "  exact Native result\n", isError: false, timestamp: 2 });
   }
@@ -89,25 +102,31 @@ async function fixture(options: { remote?: boolean; structured?: boolean } = {})
   const originalRun = worker.run;
   const ready = deferred<{ token: string; turn: BrowserTurn }>();
   const answer = deferred<string>();
-  const runs: { token: string; turn: BrowserTurn; answer: ReturnType<typeof deferred<string>> }[] = [];
+  const runs: { token: string; turn: BrowserTurn; compiled: Awaited<ReturnType<BrowserTurn["prepare"]>>;
+    answer: ReturnType<typeof deferred<string>> }[] = [];
   const runWaiters = new Map<number, ReturnType<typeof deferred<{ token: string; turn: BrowserTurn }>>>();
   const observed = new Map<number, ReturnType<typeof deferred<void>>>();
   const originalNext = broker.nextToolBatch.bind(broker);
-  broker.nextToolBatch = (token, signal, context) => {
+  broker.nextToolBatch = async (token, signal, context) => {
     const generation = context?.expectedDriverGeneration ?? -1;
     if (!observed.has(generation)) observed.set(generation, deferred<void>());
     observed.get(generation)!.resolve();
-    return originalNext(token, signal, context);
+    const requests = await originalNext(token, signal, context);
+    for (const request of requests) issuedCalls.set(request.callId, structuredClone(request));
+    return requests;
   };
   let submissions = 0;
   worker.run = async turn => {
     submissions += 1;
     const compiled = await turn.prepare();
+    if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
+    await turn.onSendActivated?.();
+    await turn.onSubmitted?.();
     const token = compiled.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
     if (!token) throw new Error("Missing Native capability in test prompt");
     expect(compiled.text).toContain("task-updates-v1");
     const runAnswer = submissions === 1 ? answer : deferred<string>();
-    runs.push({ token, turn, answer: runAnswer });
+    runs.push({ token, turn, compiled, answer: runAnswer });
     runWaiters.get(submissions - 1)?.resolve({ token, turn });
     void (async () => {
       let revision = 0;
@@ -145,6 +164,7 @@ async function fixture(options: { remote?: boolean; structured?: boolean } = {})
   }, 5_000);
   return {
     broker, owner, socket, ready: ready.promise, answer, run, start, wait, initial, submissions: () => submissions,
+    prepared: (token: string) => runs.find(run => run.token === token)!.compiled,
     session: () => chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(initial)}`)!,
     observing: (generation: number) => {
       if (!observed.has(generation)) observed.set(generation, deferred<void>());
@@ -535,7 +555,7 @@ describe("Automatic Adapter task updates", () => {
         { type: "resource", resource: { uri: "fixture://result", mimeType: "text/plain", text: "exact resource" } }],
         structuredContent: { task_update: "untrusted Native field", detail: 7 }, isError: true,
         _meta: { provider: "original", task_update: { acceptedRevision: 999 } } };
-      (next._rawBody as { input: Record<string, unknown>[] }).input.find(item => item.call_id === callId)!.output = result;
+      (next._rawBody as { input: Record<string, unknown>[] }).input.find(item => item.type === "function_call_output" && item.call_id === callId)!.output = result;
       const round = f.run(next);
       const reply = await f.wait(token, 1);
       expect(reply).toMatchObject({ kind: "result", taskUpdate: { throughRevision: 1 } });
@@ -621,10 +641,7 @@ describe("Automatic Adapter task updates", () => {
       const session = f.session();
       const roundKey = chatGptTurnRoundKey(next);
       expect(session.hasPendingTaskUpdate()).toBe(false);
-      const budget = session as unknown as { taskUpdateSourceBytes: number; taskUpdateJournalBytes: number;
-        taskUpdateErrorRoundReserves: Set<string> };
-      const remaining = TASK_UPDATE_SESSION_JOURNAL_BYTES - budget.taskUpdateSourceBytes - budget.taskUpdateJournalBytes
-        - budget.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES;
+      const remaining = TASK_UPDATE_SESSION_JOURNAL_BYTES - sessionStorageBytes(session);
       const padding: AdapterEvent = { type: "text_delta", text: "", phase: "commentary" };
       const overhead = Buffer.byteLength(JSON.stringify([padding]));
       padding.text = "x".repeat(remaining - overhead - 1);
@@ -636,7 +653,7 @@ describe("Automatic Adapter task updates", () => {
       expect(events.some(event => event.type === "done" && event.endTurn)).toBe(false);
       expect(session.roundCompleted(roundKey)).toBe(true);
       expect(session.isTaskUpdateCancelled()).toBe(true);
-      expect(budget.taskUpdateSourceBytes + budget.taskUpdateJournalBytes).toBeLessThanOrEqual(TASK_UPDATE_SESSION_JOURNAL_BYTES);
+      expect(sessionStorageBytes(session)).toBeLessThanOrEqual(TASK_UPDATE_SESSION_JOURNAL_BYTES);
       await session.browserOutcome;
       await session.physicalSettlement;
       await f.owner.waitForRetirement(token);
@@ -671,10 +688,7 @@ describe("Automatic Adapter task updates", () => {
         turn.onTextDelta('{"answer":"Before tool', candidate);
         await consumed.promise;
         const session = f.session();
-        const budget = session as unknown as { taskUpdateSourceBytes: number; taskUpdateJournalBytes: number;
-          taskUpdateErrorRoundReserves: Set<string> };
-        const available = () => TASK_UPDATE_SESSION_JOURNAL_BYTES - budget.taskUpdateSourceBytes
-          - budget.taskUpdateJournalBytes - budget.taskUpdateErrorRoundReserves.size * TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES;
+        const available = () => TASK_UPDATE_SESSION_JOURNAL_BYTES - sessionStorageBytes(session);
         // Fill the journal directly and leave 8 KiB for browser commentary and tool events.
         // Counting tokens for large commentary in the ACK callback can block pending broker IPC.
         const journalPadding: AdapterEvent = { type: "text_delta", text: "", phase: "commentary" };
@@ -688,7 +702,21 @@ describe("Automatic Adapter task updates", () => {
           if (!filled) {
             filled = true;
             expect(requests.length).toBe(1);
-            const room = available();
+            // Session retains the issued call after this browser ACK boundary. Reserve
+            // its exact source representation and metadata within the same limit.
+            const coverage = session.runtime.compactionSourceCoverage!;
+            const issuedCoverage = coverage.fork();
+            issuedCoverage.recordIssuedCalls(requests);
+            const issuedBytes = Buffer.byteLength(JSON.stringify(issuedCoverage.metadata()))
+              - Buffer.byteLength(JSON.stringify(coverage.metadata()));
+            const sourceInput = session.canonicalInput()!;
+            const issuedInput = requests.map(request => request.freeform
+              ? { type: "custom_tool_call", call_id: request.callId, name: request.wireName, input: request.input ?? "" }
+              : { type: "function_call", call_id: request.callId, name: request.wireName,
+                arguments: JSON.stringify(request.arguments ?? {}) });
+            const sourceBytes = Buffer.byteLength(canonicalJson([...sourceInput, ...issuedInput]))
+              - Buffer.byteLength(canonicalJson(sourceInput));
+            const room = available() - issuedBytes - sourceBytes;
             const traceOverhead = Buffer.byteLength(JSON.stringify([""]))
               + Buffer.byteLength(JSON.stringify([{ type: "text_delta", text: "", phase: "commentary" }]));
             // Fill the remaining space through normal browser commentary, leaving room for
@@ -924,7 +952,7 @@ describe("Automatic Adapter task updates", () => {
         expect((await f.run(next)).filter(event => event.type !== "heartbeat")).toEqual(events.filter(event => event.type !== "heartbeat"));
         expect((await f.run(f.initial)).filter(event => event.type !== "heartbeat")).toEqual(sourceEvents.filter(event => event.type !== "heartbeat"));
         const conflicting = structuredClone(next);
-        (conflicting._rawBody as { input: Record<string, unknown>[] }).input.find(item => item.call_id === callId)!.output = "Changed result.";
+        (conflicting._rawBody as { input: Record<string, unknown>[] }).input.find(item => item.type === "function_call_output" && item.call_id === callId)!.output = "Changed result.";
         await expect(f.run(conflicting)).rejects.toMatchObject({ code: "task_update_driver_stale" });
         expect(f.submissions()).toBe(1);
       } finally { await f.close(); }
@@ -1342,7 +1370,7 @@ function directBrowserFixture(readText: () => Promise<string>, onSourceBoundary?
 
   const worker = ChatGptBrowserWorker.forProvider({
     adapter: "chatgpt-web", baseUrl: `browser://${root}`,
-    chatgptWeb: { appName: "Codex Native4", browserDiagnosticsPath: root },
+    chatgptWeb: { appName: CHATGPT_CONNECTOR_NAME, browserDiagnosticsPath: root },
   }) as any;
   const hidden: any = {
     last: () => hidden, filter: () => hidden, getByText: () => hidden, getByTestId: () => hidden,
@@ -1482,7 +1510,8 @@ function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       if (turn.taskUpdateProtocol !== 1) throw new Error("Task update protocol lost in IPC");
       await turn.onPreparedSelected(false);
-      await turn.prepare();
+      const prepared = await turn.prepare();
+      if (prepared.contextPlan) await turn.onContextPlanSelected(prepared.contextPlan.planId);
       await turn.onSendActivated();
       ${browserFixture}
     };
@@ -1500,7 +1529,7 @@ function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
     createdAt: new Date().toISOString(),
   }), { mode: 0o600 });
   return new LauncherBrowserHelperClient({
-    appName: "Codex Native4", browserHost: "launcher", browserHostDescriptorPath: descriptor,
+    appName: CHATGPT_CONNECTOR_NAME, browserHost: "launcher", browserHostDescriptorPath: descriptor,
     browserHelperScriptPath: helper, browserDiagnosticsPath: root,
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
     turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
@@ -1518,7 +1547,7 @@ test("Remote strict answer after ACK succeeds when the real helper receives its 
     let snapshot = turn.externalProgress.snapshot();
     if (!snapshot.taskUpdates) snapshot = await turn.externalProgress.waitForChange(snapshot.revision, turn.abortSignal);
     if (snapshot.taskUpdates.acceptedRevision !== 0 || snapshot.taskUpdates.driverGeneration !== 0) throw new Error("Need actual initial progress");
-    turn.onSubmitted();
+    await turn.onSubmitted();
     while (!fs.existsSync(${JSON.stringify(gatePath)})) await new Promise(resolve => setTimeout(resolve, 10));
     snapshot = turn.externalProgress.snapshot();
     if (snapshot.taskUpdates.acceptedRevision !== 0 || snapshot.taskUpdates.driverGeneration !== 0) throw new Error("Delayed whole progress frame unexpectedly arrived");
@@ -1555,7 +1584,9 @@ test("Remote strict answer after ACK succeeds when the real helper receives its 
     const seen: unknown[] = [];
     helperResult = helper.run({ ...turn,
       traceId: "actual_helper_delayed_full_revision",
-      onSubmitted: () => { turn.onSubmitted?.(); helperReady.resolve(); },
+      // This helper observes the existing physical send and its delayed progress frame.
+      prepare: async () => f.prepared(token),
+      onSubmitted: async () => { await turn.onSubmitted?.(); helperReady.resolve(); },
       onTextDelta: (text, candidate) => { seen.push(candidate); turn.onTextDelta(text, candidate); release.resolve(); },
     }).catch(error => error);
     void helperResult.then(outcome => { if (outcome instanceof Error) f.answer.reject(outcome); else f.answer.resolve(outcome as string); });

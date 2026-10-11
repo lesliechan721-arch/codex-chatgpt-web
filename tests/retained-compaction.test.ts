@@ -18,6 +18,9 @@ import {
   settleActiveZeroRiskCompactionSource,
   withCompactionAbort,
 } from "../src/adapters/chatgpt-web/compaction-handoff";
+import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
+import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
+import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { CompactionTransactionStore } from "../src/adapters/chatgpt-web/compaction-transaction";
 import { rememberCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
 import {
@@ -27,7 +30,7 @@ import {
 import {
   chatGptWebExecutionNamespace,
   createChatGptWebAdapter,
-} from "../src/adapters/chatgpt-web/index";
+} from "./helpers/chatgpt-web-adapter";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { extractChatGptTurnIdentity, extractChatGptCompactionSourceRevision } from "../src/adapters/chatgpt-web/environment";
 import {
@@ -77,7 +80,8 @@ function request(compaction = false): CodexParsedRequest {
     options: { reasoning: "high" },
     _compactionRequest: compaction,
     _rawBody: {
-      input: [{
+      input: [{ type: "message", role: "user", content: "Original task" },
+      { type: "message", role: "assistant", content: "Work completed" }, {
         type: "message",
         role: "user",
         content: [{ type: "input_text", text: "Continue with the next step" }],
@@ -92,6 +96,24 @@ function request(compaction = false): CodexParsedRequest {
     },
   };
 }
+
+function deliveredCoverage(parsed: CodexParsedRequest): CompactionSourceCoverage {
+  const value = new CompactionSourceCoverage();
+  value.prepare(createContextSnapshot(parsed), { historyRevision: parsed._continuityHistoryRevision ?? 0,
+    pageGeneration: "test-page", planId: "test-selected", bodyDigest: "test-body", manifestDigest: "test-images",
+    pageTokens: 2_000, externalizedTargetIds: [] });
+  value.markDelivered("test-selected");
+  return value;
+}
+const mockSourceCapability = {
+  registerCompactionContext: ({ snapshot }: { snapshot: { context_id: string } }) => ({
+    contextId: snapshot.context_id, compactionToken: "compaction_test_source",
+  }),
+  markCompactionContextDelivered() {},
+  guardCompactionContextCommit() {},
+  revokeCompactionContext() {},
+};
+const compactionCapabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
 
 function controlBinding(instruction: string): { token: string; handoffId: string } {
   const token = instruction.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
@@ -345,7 +367,7 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey,
     cancel() {},
   });
@@ -354,6 +376,7 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
   let transactionAborted = false;
   let transactionTtl = 0;
   const broker = {
+    ...mockSourceCapability,
     beginCompactionTransaction: async (_traceId: string, ttlMs: number) => {
       transactionTtl = ttlMs;
       return {
@@ -412,11 +435,12 @@ test("completed retained compaction never treats ordinary assistant text as a ha
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey: chatGptConversationKey(sourceRequest, "provider")!,
     cancel() {},
   });
   const broker = {
+    ...mockSourceCapability,
     beginCompactionTransaction: async () => ({
       token: "control_11111111111111111111111111111111",
       handoffId: "handoff_22222222222222222222222222222222",
@@ -445,7 +469,7 @@ test("a settled browser response without a checkpoint reports the missing handof
   const source = new ChatGptTurnSession({
     mode: "read-only", browser: Promise.resolve("source complete"),
     physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
-    usageInput: sourceRequest, conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest), conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
   });
   const abort = new AbortController();
   const guard = setTimeout(() => abort.abort(new Error("test observation guard")), 1000);
@@ -470,7 +494,7 @@ test("a checkpoint submitted before browser completion wins the terminal respons
   const source = new ChatGptTurnSession({
     mode: "read-only", browser: Promise.resolve("source complete"),
     physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
-    usageInput: sourceRequest, conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest), conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
   });
   try {
     await expect(requestRetainedCompactionHandoff(
@@ -478,6 +502,7 @@ test("a checkpoint submitted before browser completion wins the terminal respons
         const prepared = await turn.prepare();
         const token = prepared.text.match(/turn_token (control_\w+)/)![1]!;
         const handoffId = prepared.text.match(/handoff_id (handoff_\w+)/)![1]!;
+        turn.onSubmitted?.();
         await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId, summary: "Exact summary" });
         prepared.release();
         return "Checkpoint submitted.";
@@ -500,12 +525,13 @@ test("retained compaction deadline bounds browser settlement after the control h
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey: chatGptConversationKey(sourceRequest, "provider")!,
     cancel() {},
   });
   let transactionAborted = false;
   const broker = {
+    ...mockSourceCapability,
     beginCompactionTransaction: async () => ({
       token: "control_11111111111111111111111111111111",
       handoffId: "handoff_22222222222222222222222222222222",
@@ -1002,6 +1028,7 @@ test.each([false, true])(
       physicalSettlement: browser.then(() => undefined),
       trace,
       text,
+      usageInput: request(false), compactionSourceCoverage: deliveredCoverage(request(false)),
       cancel() {},
     });
     source.setOutstanding([{ callId: "call_progress", wireName: "exec_command", freeform: false }]);
@@ -1014,7 +1041,9 @@ test.each([false, true])(
       isError: false,
       timestamp: 4,
     });
+    (parsed._rawBody as { input: unknown[] }).input.push({ type: "function_call_output", call_id: "call_progress", output: "canonical result" });
     const broker = {
+      ...mockSourceCapability,
       requestCompaction: () => 0,
       compactionDeliveryCount: () => 0,
       completeTool: async () => {
@@ -1027,13 +1056,14 @@ test.each([false, true])(
     let progress = 0;
 
     if (zeroRisk) {
-      await expect(settleActiveZeroRiskCompactionSource(
+      expect(await settleActiveZeroRiskCompactionSource(
         parsed,
         source,
         broker,
         undefined,
         () => { progress += 1; },
-      )).resolves.toBe("Zero Risk checkpoint");
+        undefined, false, compactionCapabilities,
+      )).toBe("Zero Risk checkpoint");
     } else {
       await expect(settleActiveCompactionSource(
         parsed,
@@ -1053,6 +1083,7 @@ test.each([false, true])(
 test("Zero Risk active compaction returns through its explicit completion control", async () => {
   const completed: BrokerToolResult[] = [];
   const broker = {
+    ...mockSourceCapability,
     requestCompaction: () => 0,
     compactionDeliveryCount: () => 0,
     completeTool: async (_token: string, _callId: string, result: BrokerToolResult) => {
@@ -1069,6 +1100,7 @@ test("Zero Risk active compaction returns through its explicit completion contro
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
+    usageInput: request(false), compactionSourceCoverage: deliveredCoverage(request(false)),
     cancel() {},
   });
   source.setOutstanding([{ callId: "call_one", wireName: "exec_command", freeform: false }]);
@@ -1082,8 +1114,9 @@ test("Zero Risk active compaction returns through its explicit completion contro
     timestamp: 4,
   });
 
-  await expect(settleActiveZeroRiskCompactionSource(parsed, source, broker))
-    .resolves.toBe("Zero Risk checkpoint");
+  (parsed._rawBody as { input: unknown[] }).input.push({ type: "function_call_output", call_id: "call_one", output: "one" });
+  expect(await settleActiveZeroRiskCompactionSource(parsed, source, broker, undefined, undefined, undefined, false, compactionCapabilities))
+    .toBe("Zero Risk checkpoint");
   expect(JSON.stringify(completed)).toContain("Return only the complete checkpoint summary to Codex with codex_turn_complete");
   expect(JSON.stringify(completed)).not.toContain("CODEX_ACTIVE_COMPACTION_CHECKPOINT_");
 });
@@ -1313,7 +1346,7 @@ test("retained compaction can close its browser epoch while preserving an ordina
   sessions.clear();
 });
 
-test("adapter compact returns one same-agent handoff and preserves a pre-existing ordinary final", async () => {
+test.each([false, true])("adapter retained checkpoint preserves the ordinary final (Bigger Context=%s)", async experimentalBiggerContext => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-adapter-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1326,12 +1359,21 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
       localToolsEnabled: true,
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
+      experimentalBiggerContext,
     },
   };
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run.bind(worker);
   const sourceRequest = request(false);
+  sourceRequest._chatgptModelFamily = "6";
+  const sourceCoverage = deliveredCoverage(sourceRequest);
+  if (experimentalBiggerContext) {
+    sourceCoverage.prepare(createContextSnapshot(sourceRequest), { historyRevision: 0,
+      pageGeneration: "bigger-page", planId: "bigger-selected", bodyDigest: "bigger-body", manifestDigest: "bigger-images",
+      pageTokens: 150_000, externalizedTargetIds: [] });
+    sourceCoverage.markDelivered("bigger-selected");
+  }
   const namespace = chatGptWebExecutionNamespace(provider);
   const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
   const conversationKey = chatGptConversationKey(sourceRequest, namespace)!;
@@ -1342,7 +1384,7 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: sourceCoverage,
     conversationKey,
     releaseRetainedConversation: async () => { releases += 1; },
     cancel() {},
@@ -1352,6 +1394,12 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
+    if (experimentalBiggerContext) {
+      const entry = JSON.parse(prepared.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+      expect(entry.overview.remaining_tokens).toBeGreaterThan(80_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
+      expect(entry.overview.remaining_tokens).toBeLessThan(90_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
+    }
+    turn.onSubmitted?.();
     expect(turn.nativeConnector).toBeTrue();
     expect(turn.capabilities.localToolsEnabled).toBeFalse();
     prepared.release();
@@ -1367,7 +1415,7 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
   compact._compactionRequest = true;
   const compactSourceMessage = (compact._rawBody as { input: Array<{
     content: Array<{ type: string; text: string }>;
-  }> }).input[0]!;
+  }> }).input.at(-1)!;
   compactSourceMessage.content = [{
     type: "input_text",
     text: "Provider-normalized current task revision",
@@ -1472,12 +1520,16 @@ test("real adapter active-source compaction keeps a 1s idle lease alive with 300
     physicalSettlement: browser.then(() => undefined),
     trace,
     text,
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey,
     cancel() {},
   }));
   source.setOutstanding(outstanding);
   const compact = request(true);
+  compact.context.messages.push({ role: "assistant", content: [{ type: "toolCall", id: outstanding[0]!.callId,
+    name: "exec_command", arguments: { cmd: "synthetic" } }], timestamp: 4 });
+  (compact._rawBody as { input: unknown[] }).input.push({ type: "function_call", call_id: outstanding[0]!.callId,
+    name: "exec_command", arguments: '{"cmd":"synthetic"}' });
   compact.context.messages.push({
     role: "toolResult",
     toolCallId: outstanding[0]!.callId,
@@ -1486,9 +1538,11 @@ test("real adapter active-source compaction keeps a 1s idle lease alive with 300
     isError: false,
     timestamp: 4,
   });
+  (compact._rawBody as { input: unknown[] }).input.push({ type: "function_call_output", call_id: outstanding[0]!.callId, output: "canonical result" });
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
+    turn.onSubmitted?.();
     prepared.release();
     await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, {
       method: "submit_compaction_handoff",
@@ -1557,7 +1611,7 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey,
     releaseRetainedConversation: async () => { releases += 1; },
     cancel() {},
@@ -1573,6 +1627,7 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
     browserMessages += 1;
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
+    turn.onSubmitted?.();
     prepared.release();
     messageStarted();
     await finish;
@@ -1625,7 +1680,7 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
   }
 });
 
-test.each([false, true])("structured compact rebuilds canonical context when its retained source is absent (Bigger Context=%s)", async experimentalBiggerContext => {
+test.each([false, true])("structured compact rejects missing source coverage before sending (Bigger Context=%s)", async experimentalBiggerContext => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-missing-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1670,12 +1725,9 @@ test.each([false, true])("structured compact rebuilds canonical context when its
       { headers: new Headers() },
       event => events.push(event),
     );
-    expect(browserStarts).toBe(1);
-    expect(events.some(event => event.type === "text_delta"
-      && event.text.includes("Fallback checkpoint from canonical Codex context"))).toBeTrue();
-    expect(events.some(event => event.type === "text_delta"
-      && event.text.includes("CODEX_LATEST_USER_PROMPT_JSON"))).toBeTrue();
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    expect(browserStarts).toBeLessThanOrEqual(1);
+    expect(events.some(event => event.type === "text_delta")).toBeFalse();
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "continuity_source_unproven", retryable: false });
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
@@ -1700,6 +1752,7 @@ test.each([false, true])("configured fresh compaction waits for cleanup and pres
   const source = chatGptTurnSessions.getOrCreate(sourceKey, () => ({
     mode: "read-only", browser: new Promise<string>(resolve => { finishSource = resolve; }),
     physicalSettlement: cleanup, trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: request(false), compactionSourceCoverage: deliveredCoverage(request(false)),
     cancel: () => { cancelled = true; finishSource("retired source"); },
   }));
   if (committed) {
@@ -1709,7 +1762,7 @@ test.each([false, true])("configured fresh compaction waits for cleanup and pres
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run;
   let starts = 0;
-  worker.run = async () => { starts += 1; return "Fresh checkpoint"; };
+  worker.run = async turn => { starts += 1; const prepared = await turn.prepare(); turn.onSubmitted?.(); prepared.release(); return "Fresh checkpoint"; };
   const events: AdapterEvent[] = [];
   let pending: Promise<void> | undefined;
   try {
@@ -1733,7 +1786,7 @@ test.each([false, true])("configured fresh compaction waits for cleanup and pres
   }
 });
 
-test.each([false, true])("fresh multipart compaction preserves phase budgets with fresh mode=%s", async freshConversation => {
+test.each([false, true])("fresh compaction sends one bounded entry within the original phase budget with fresh mode=%s", async freshConversation => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-phased-fallback-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1745,7 +1798,7 @@ test.each([false, true])("fresh multipart compaction preserves phase budgets wit
       localToolsEnabled: true,
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
-      turnTimeoutMs: 40,
+      turnTimeoutMs: 400,
       experimentalFreshConversationPerTurn: freshConversation,
     },
   };
@@ -1753,20 +1806,21 @@ test.each([false, true])("fresh multipart compaction preserves phase budgets wit
   const originalRun = worker.run.bind(worker);
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     expect(turn.traceId.endsWith(freshConversation ? "_fresh" : "_fallback")).toBeTrue();
-    expect(turn.onMultipartStageAcknowledged).toBeDefined();
-    expect(turn.onSubmitted).toBeDefined();
-    for (let part = 1; part <= 5; part++) {
-      mock.timers.tick(25);
-      expect(turn.abortSignal?.aborted).toBeFalse();
-      await turn.onMultipartStageAcknowledged!(part);
-    }
-    mock.timers.tick(25);
-    expect(turn.abortSignal?.aborted).toBeFalse();
+    const prepared = await turn.prepare();
+    expect(prepared.multipart).toBeUndefined();
+    expect(prepared.text).toContain("codex_context_navigation_json");
     turn.onSubmitted!();
-    mock.timers.tick(25);
+    mock.timers.tick(250);
     expect(turn.abortSignal?.aborted).toBeFalse();
+    prepared.release();
     return "Fallback checkpoint after separately bounded phases";
   };
+  const sourceRequest = request(false);
+  const sourceKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(sourceRequest)}`;
+  chatGptTurnSessions.getOrCreate(sourceKey, () => ({ mode: "read-only", browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest), cancel() {} }));
+  await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
   const events: AdapterEvent[] = [];
   mock.timers.enable({ apis: ["setTimeout"] });
   try {
@@ -1780,6 +1834,7 @@ test.each([false, true])("fresh multipart compaction preserves phase budgets wit
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     mock.timers.reset();
+    chatGptTurnSessions.clear();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
@@ -1901,7 +1956,9 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
     expect(events.some(event => event.type === "done")).toBeFalse();
     await observe();
     expect(browserStarts).toBe(2);
-    expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    // This worker deliberately skipped prepare/Send; a later plain answer cannot turn
+    // the cancelled attempt into a checkpoint without a delivered source entry.
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "continuity_source_unproven" });
   } finally {
     releasePhysical();
     await Promise.allSettled(runs);
@@ -1937,7 +1994,7 @@ test.each([false, true])("structured compact rebuild after retained browser loss
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
     cancel() {},
   }));
@@ -1948,7 +2005,9 @@ test.each([false, true])("structured compact rebuild after retained browser loss
     browserStarts += 1;
     if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
     const prepared = await turn.prepare();
-    expect(prepared.text).toContain("Original task");
+    expect(prepared.text).toContain("codex_context_navigation_json");
+    expect(prepared.text).not.toContain("Original task");
+    turn.onSubmitted?.();
     prepared.release();
     if (rateLimited) throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests.", {
       status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false,
@@ -2008,7 +2067,7 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    usageInput: sourceRequest,
+    usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey: chatGptConversationKey(sourceRequest, namespace)!,
     cancel() {},
   }));
@@ -2081,7 +2140,7 @@ test("finishing the previous response does not consume the retained checkpoint's
     adapter: "chatgpt-web", baseUrl: `browser://retained-phases-${root}`,
     chatgptWeb: { browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
       brokerSocketPath: defaultBrokerEndpoint(root), localToolsEnabled: true,
-      solAvailable: true, extraHighAvailable: true, proAvailable: true, turnTimeoutMs: 40 },
+      solAvailable: true, extraHighAvailable: true, proAvailable: true, turnTimeoutMs: 400 },
   };
   const sourceRequest = request(false);
   const namespace = chatGptWebExecutionNamespace(provider);
@@ -2089,7 +2148,7 @@ test("finishing the previous response does not consume the retained checkpoint's
   const browser = new Promise<string>(resolve => { finishSource = resolve; });
   chatGptTurnSessions.getOrCreate(`${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`, () => ({
     mode: "read-only", browser, physicalSettlement: browser.then(() => {}),
-    trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), usageInput: sourceRequest,
+    trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest),
     conversationKey: chatGptConversationKey(sourceRequest, namespace), cancel: () => finishSource("cancelled"),
   }));
   const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -2097,10 +2156,11 @@ test("finishing the previous response does not consume the retained checkpoint's
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
   await broker.listen();
   worker.run = async turn => {
-    mock.timers.tick(25);
+    mock.timers.tick(250);
     expect(turn.abortSignal?.aborted).toBeFalse();
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
+    turn.onSubmitted?.();
     prepared.release();
     await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, {
       method: "submit_compaction_handoff", token: binding.token,
@@ -2114,7 +2174,7 @@ test("finishing the previous response does not consume the retained checkpoint's
   try {
     run = createChatGptWebAdapter(provider).runTurn!(request(true), { headers: new Headers() }, event => events.push(event));
     await new Promise<void>(resolve => setImmediate(resolve));
-    mock.timers.tick(25);
+    mock.timers.tick(250);
     finishSource("Previous response finished");
     await run;
     expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });

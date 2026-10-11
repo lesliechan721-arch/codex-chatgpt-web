@@ -13,6 +13,7 @@ import {
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
+import { assertCompactionReadable, captureRetainedCompactionSource, compactionAvailableTokens } from "./compaction-context";
 import {
   acceptHealthyRecoveryCompactionLease, admitHealthyRecoveryCompaction, assertHealthyRecoveryCompactionAuthority, assertRecoveryCompactionResult,
   beginHealthyRecoveryCompaction, commitRecoveryCompaction, failHealthyRecoveryCompaction,
@@ -20,6 +21,7 @@ import {
   prepareHealthyRecoveryCompactionControl, recoveryCompactionTarget, runRecoveryCompaction,
 } from "./continuity-recovery-compaction";
 import { continuityToolRegistry } from "./continuity-tools";
+import type { ContextSnapshot } from "./context-snapshot";
 import type { PreparedContinuityRequest } from "./continuity-request";
 import { extractChatGptCompactionSourceRevision, extractChatGptCompactV1SourceRevision, extractChatGptTurnIdentity } from "./environment";
 import type { ChatGptWebCapabilities } from "./model";
@@ -55,9 +57,10 @@ export function runContinuityCompaction(
   configuredTimeout?: number,
   onProgress?: () => void,
   onRecovered?: () => void,
+  verifyContextCapability?: () => Promise<void>,
 ): Promise<string> {
   if (isRecoveryCompaction(prepared)) {
-    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered);
+    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered, verifyContextCapability);
   }
   const { binding, bindings, executionKey } = prepared;
   const checkpoint = binding.checkpoints.get(executionKey);
@@ -115,6 +118,7 @@ export function runContinuityCompaction(
     if (sourceRevision.itemId) sourceRevision.itemId = parsed._chatGptMessageIdAliases?.[sourceRevision.itemId] ?? sourceRevision.itemId;
     const sourceInstructionReplay = source.continuitySourceInstructionReplayEvidence();
     let sourceResultReplay: ContinuityToolResultReplayEvidence | undefined;
+    let sourceSnapshot: ContextSnapshot | undefined;
     let begun = false;
     let durableCompactionWorkId: string | undefined;
     let noControlDelivered = false;
@@ -155,6 +159,20 @@ export function runContinuityCompaction(
         source.assertContinuityCompactionResultBatch(parsed);
         const resultReplay = source.continuityToolResultReplayEvidence(parsed);
         source.assertContinuityGeneration(prepared.verifiedSourceGeneration);
+        if ((!manual || source.isActive()) && verifyContextCapability) {
+          await withCompactionAbort(verifyContextCapability(), signal);
+        }
+        signal.throwIfAborted();
+        await source.runtime.syncContextUsage?.();
+        signal.throwIfAborted();
+        if (!manual || source.isActive()) {
+          const coverage = source.runtime.compactionSourceCoverage;
+          if (!coverage) throw continuityError("continuity_source_unproven", "Compaction has no accepted source coverage evidence.");
+          source.prepareCompactionToolResults(parsed, source.outstanding().map(request => request.callId));
+          sourceSnapshot = captureRetainedCompactionSource(parsed, source);
+          await assertCompactionReadable(sourceSnapshot, compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) - 8_192);
+          signal.throwIfAborted();
+        }
         // The checkpoint budget retains one exact source plus bounded local result comparison data.
         const sourceEvidenceBytes = Buffer.byteLength(JSON.stringify(sourceRevision))
           + Buffer.byteLength(JSON.stringify(resultReplay))
@@ -184,7 +202,7 @@ export function runContinuityCompaction(
           rawSummary = await source.runExclusive(async () => {
             await begin();
             return withCompactionAbort(
-              settleActiveZeroRiskCompactionSource(parsed, source, broker, signal, reportProgress, acceptHandoff, true),
+              settleActiveZeroRiskCompactionSource(parsed, source, broker, signal, reportProgress, acceptHandoff, true, capabilities, sourceSnapshot),
               signal,
             );
           });
@@ -225,7 +243,7 @@ export function runContinuityCompaction(
         reportProgress();
         rawSummary = await requestRetainedCompactionHandoff(worker, parsed, source, broker as TurnBroker,
           capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
-            claim,
+            claim, sourceSnapshot,
             ...(durableCompactionWorkId ? {
               onPrepared: (instruction: string) => prepareHealthyRecoveryCompactionControl(prepared, instruction),
               onSendActivated: () => markHealthyRecoveryCompactionSend(prepared),
@@ -269,6 +287,7 @@ export function runContinuityCompaction(
           .map(revision => continuitySourceRepresentationDigest(parsed, revision)))],
         identity.turnId,
       );
+      source.runtime.compactionSourceCoverage?.checkpointCommitted(prepared.revision);
       return summary;
     } catch (error) {
       try { assertRecoveryCompactionNotStopped(parsed, prepared); }

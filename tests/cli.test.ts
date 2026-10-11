@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { apiAccessRevision, apiKeyPolicy } from "../src/api-access";
 import { saveApiAccessPolicy } from "../src/api-access-config";
-import { defaultBrokerEndpoint, defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
+import { defaultBrokerEndpoint, defaultConfig, DEV_CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { VERSION } from "../src/version";
 
@@ -714,7 +714,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       version: 3,
       purpose: "dev-harness",
       mode: "browser-only",
-      appName: "Codex Native4 DEV",
+      appName: DEV_CHATGPT_CONNECTOR_NAME,
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
       toolAuthorityMode: "delegated",

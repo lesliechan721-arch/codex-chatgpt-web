@@ -7,6 +7,7 @@ import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { continuityError } from "./continuity-errors";
 import { canonicalJson } from "./canonical-json";
+import { bindContextEnvironmentInputSource, bindContextInstructionInputSource } from "./context-candidate-mapping";
 
 export type ChatGptSandboxPolicy =
   | { type: "dangerFullAccess" }
@@ -668,10 +669,15 @@ export function continuityCurrentInstructionInput(
   const selectionKey = JSON.stringify([previous?.instructionIdentity ?? null, previous?.nativeTurnId ?? null,
     previous?.trustedLowerBound ?? null, includeRetainedSource]);
   const cached = selection?.inputs.get(selectionKey);
-  if (cached) return cached.map(candidate => structuredClone(input[candidate]));
+  const clone = (candidate: number): unknown => {
+    const item = structuredClone(input[candidate]);
+    bindContextInstructionInputSource(parsed, item, candidate, isDelegatedInstruction(record(input[candidate])));
+    return item;
+  };
+  if (cached) return cached.map(clone);
   const remember = (indices: number[]): unknown[] => {
     selection?.inputs.set(selectionKey, indices);
-    return indices.map(candidate => structuredClone(input[candidate]));
+    return indices.map(clone);
   };
   const retainCurrentSource = includeRetainedSource && isRetainedCompactionSourceInstruction(parsed, input[index]);
   const identity = extractChatGptTurnIdentity(parsed);
@@ -842,14 +848,18 @@ export function hasInitialChatGptTurnInstruction(parsed: CodexParsedRequest): bo
 /** Reintroduce only the current operational envelope, never historical task messages. */
 export function continuityCurrentEnvironmentInput(parsed: CodexParsedRequest, selectedInstructions: unknown[] = []): unknown[] {
   const selected = new Set(selectedInstructions.map(canonicalJson));
-  return currentChatGptEnvironmentParts(parsed).filter(part => !selected.has(canonicalJson(part.item))).map(part => ({
-    ...part.item,
-    content: [{ type: "input_text", text: part.text }],
-    internal_chat_message_metadata_passthrough: {
-      ...record(part.item.internal_chat_message_metadata_passthrough),
-      content_item_kinds: ["environments.environment_context"],
-    },
-  }));
+  return currentChatGptEnvironmentParts(parsed).filter(part => !selected.has(canonicalJson(part.item))).map(part => {
+    const item = {
+      ...part.item,
+      content: [{ type: "input_text", text: part.text }],
+      internal_chat_message_metadata_passthrough: {
+        ...record(part.item.internal_chat_message_metadata_passthrough),
+        content_item_kinds: ["environments.environment_context"],
+      },
+    };
+    bindContextEnvironmentInputSource(parsed, item);
+    return item;
+  });
 }
 
 /** A retained source copied by the checkpoint codec is not a new instruction to execute. */

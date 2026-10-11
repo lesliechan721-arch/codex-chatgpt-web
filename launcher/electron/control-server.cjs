@@ -121,6 +121,8 @@ class BrowserControlServer {
       ["/v1/manual/started", "started"],
       ["/v1/manual/end", "end"],
       ["/v1/manual/cancel", "cancel"],
+      ["/v1/manual/inspect-attachments", "inspect-attachments"],
+      ["/v1/manual/wait-attachments", "wait-attachments"],
     ]).get(request.url);
     if (request.method !== "POST" || (!isTurn && !isTurnRelease && !isContinuityInspect && !isContinuityCapacity && !isSessionInspect && !isProxyResolution && !manualAction && !recoveryAction)) {
       writeJson(response, 404, { error: "not_found" });
@@ -246,10 +248,10 @@ class BrowserControlServer {
           if (typeof body.sentConfirmationRequired !== "boolean") {
             throw new Error("sentConfirmationRequired is required for manual turn start");
           }
-          if (typeof body.prompt !== "string" || body.prompt.length < 1) {
+          if (body.contextPlans === undefined && (typeof body.prompt !== "string" || body.prompt.length < 1)) {
             throw new Error("manual prompt is invalid");
           }
-          if (body.resumePrompt !== undefined
+          if (body.contextPlans === undefined && body.resumePrompt !== undefined
             && (typeof body.resumePrompt !== "string" || body.resumePrompt.length < 1)) {
             throw new Error("manual resume prompt is invalid");
           }
@@ -265,14 +267,41 @@ class BrowserControlServer {
             body.compaction === true,
             preferences.zeroRiskRequireSentConfirmation !== false,
             body.sentConfirmationRequired,
-            ...(body.continuity || body.requireRetainedConversation
-              ? [body.continuity, body.requireRetainedConversation === true] : []),
+            ...(body.contextPlans !== undefined
+              ? [body.continuity, body.requireRetainedConversation === true, body.contextPlans]
+              : body.continuity || body.requireRetainedConversation
+                ? [body.continuity, body.requireRetainedConversation === true] : []),
           );
           this.logger.info("browser.manual_control_started", {
             traceId: body.traceId,
             reused: lease.reused,
           });
           writeJson(response, 200, { ok: true, ...lease });
+          return;
+        }
+        if (manualAction === "inspect-attachments" || manualAction === "wait-attachments") {
+          if (typeof body.planId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.planId)
+            || typeof body.manifestDigest !== "string" || !/^[a-f0-9]{64}$/.test(body.manifestDigest)) {
+            throw new Error("manual attachment plan identity is invalid");
+          }
+          const observed = manualAction === "wait-attachments"
+            ? await host.waitManualAttachments(body.traceId, body.helperPid, body.planId, body.manifestDigest, MANUAL_SENT_OBSERVER_TIMEOUT_MS)
+            : host.inspectManualAttachments(body.traceId, body.helperPid, body.planId, body.manifestDigest);
+          if (observed.status === "timeout") {
+            writeJson(response, 408, { error: "Required images were not confirmed within the allowed time", code: "manual_turn_timed_out" });
+            return;
+          }
+          if (observed.status === "cancelled") {
+            writeJson(response, 409, { error: "Zero Risk turn was cancelled", code: "turn_cancelled" });
+            return;
+          }
+          if (!["pending", "not-required", "user_attested"].includes(observed.status)) {
+            writeJson(response, 409, { error: "Zero Risk attachment confirmation is no longer available", code: "manual_turn_failed" });
+            return;
+          }
+          assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+          writeJson(response, manualAction === "wait-attachments" && observed.status === "pending" ? 202 : 200,
+            { ok: true, ...observed, ...recoveryAcknowledgement });
           return;
         }
         if (manualAction === "wait-sent") {

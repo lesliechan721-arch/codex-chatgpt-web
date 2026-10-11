@@ -100,6 +100,7 @@ export async function tryTaskUpdateHandoff(options: {
       if (proof.mode === "replay" && state.acknowledgedRevision === state.acceptedRevision) return undefined;
       const transferId = `update_${taskUpdateDigest({ namespace: options.namespace,
         physical: session.traceId, request: continuity ? proof.route.requestIdentity : proof.source.requestIdentity })}`;
+      const contextCoverage = session.previewTaskUpdateContextCoverage(proof)?.metadata();
       const payload = {
         transferId, expectedDriverGeneration: proof.expectedDriverGeneration,
         expectedRevision: proof.expectedRevision, environment: options.environment,
@@ -113,6 +114,7 @@ export async function tryTaskUpdateHandoff(options: {
           workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed), snapshotDigest: recoveryDigest(parsed.context),
           localSessionId: session.traceId ?? session.runtime.continuityBinding!.recovery!.logicalWorkId, localTaskRevision: proof.expectedRevision + proof.updates.length,
           results: proof.batch.rawResults.map(item => ({ callId: String(item.call_id), resultType: String(item.type), resultDigest: recoveryResultDigest(item) })),
+          ...(contextCoverage ? { contextCoverage } : {}),
         } } : {}),
       };
       attempt = { proof, transfer: { ...payload, payloadDigest: taskUpdateDigest(payload) }, reserved: false, prepared: false,

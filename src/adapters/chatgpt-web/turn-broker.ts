@@ -1,3 +1,5 @@
+import { ContextScope, CONTEXT_PROTOCOL_VERSION, contextError, contextFailure, type ContextPlanRegistration, type ContextAttachmentConfirmation, type ContextStatus, type ContextUsageEvidence, type ContextVerificationRegistration, type ContextVerificationHandle, type ContextVerificationStatus, type CompactionContextRegistration, type CompactionContextHandle, type ContextMethod, type ContextArgs, type ContextPreparedReply } from "./context-runtime";
+import { serializeContextSnapshot, restoreContextSnapshot, type ContextSnapshotWire } from "./context-snapshot";
 import { assertRecoveryWriter, recordRecoveryDelivery, recordRecoveryAppend, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, lstatSync, mkdirSync, openSync, readlinkSync, rmSync, statSync, symlinkSync, type Stats, unlinkSync } from "node:fs";
@@ -153,6 +155,10 @@ interface SafeTurnControl {
 }
 
 interface TurnChannel {
+  verificationPair?: string;
+  contextPlans?: Map<string, ContextPlanRegistration>;
+  contextScope?: ContextScope;
+  contextSent?: boolean;
   recovery?: RuntimeRecoveryReference;
   traceId: string;
   externalOwner: boolean;
@@ -187,6 +193,11 @@ interface TurnChannel {
 interface BrokerRequest {
   id: string;
   method:
+    | "context_query" | "context_return" | "context_return_check" | "context_control_return"
+    | "owner_context_register" | "owner_context_select" | "owner_context_discard_unselected" | "owner_context_sent" | "owner_context_attachments" | "owner_context_status" | "owner_context_usage" | "owner_context_usage_release"
+    | "owner_context_verification_arm" | "owner_context_verification_delivered" | "owner_context_verification_status" | "owner_context_verification_revoke"
+    | "owner_compaction_transaction_begin" | "owner_compaction_transaction_abort"
+    | "owner_compaction_context_register" | "owner_compaction_context_delivered" | "owner_compaction_context_guard" | "owner_compaction_context_commit" | "owner_compaction_context_revoke"
     | "claim"
     | "resolve"
     | "release"
@@ -227,6 +238,17 @@ interface BrokerRequest {
     | "owner_output_receipt"
     | "owner_revoke_trusted"
     | "task_update_ack";
+  contextProtocol?: number;
+  verificationRegistration?: Omit<ContextVerificationRegistration, "normal" | "compactionSnapshot"> & { normal: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire }; compactionSnapshot: ContextSnapshotWire };
+  contextRegistration?: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
+  compactionRegistration?: Omit<CompactionContextRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
+  contextMethod?: ContextMethod;
+  contextArgs?: ContextArgs;
+  credentialKind?: "ordinary" | "compaction";
+  planId?: string;
+  manifestDigest?: string;
+  receiptId?: string;
+  sent?: boolean;
   ownerContext?: TaskUpdateOwnerContext;
   taskUpdateProtocol?: number;
   recovery?: RuntimeRecoveryReference;
@@ -283,7 +305,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 10;
+const TURN_BROKER_PROTOCOL_VERSION = 11;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -468,6 +490,25 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
+  armContextVerification?(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): ContextVerificationHandle | Promise<ContextVerificationHandle>;
+  markContextVerificationDelivered?(pairToken: string): void | Promise<void>;
+  contextVerificationStatus?(pairToken: string): ContextVerificationStatus | undefined | Promise<ContextVerificationStatus | undefined>;
+  revokeContextVerification?(pairToken: string): void | Promise<void>;
+  beginCompactionTransaction?(traceId: string, ttlMs?: number): Promise<CompactionTransactionHandle>;
+  abortCompactionTransaction?(token: string): void | Promise<void>;
+  registerContextPlan?(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  selectContextPlan?(token: string, planId: string, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  discardUnselectedContextPlans?(token: string, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  markContextPlanSent?(token: string, planId: string, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  confirmContextAttachments?(token: string, confirmation: ContextAttachmentConfirmation, context?: TaskUpdateOwnerContext): void | Promise<void>;
+  contextStatus?(token: string): ContextStatus | undefined | Promise<ContextStatus | undefined>;
+  contextUsage?(token: string): ContextUsageEvidence | undefined | Promise<ContextUsageEvidence | undefined>;
+  releaseContextUsage?(token: string): void | Promise<void>;
+  registerCompactionContext?(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): CompactionContextHandle | Promise<CompactionContextHandle>;
+  markCompactionContextDelivered?(token: string): void | Promise<void>;
+  guardCompactionContextCommit?(token: string): void | Promise<void>;
+  commitCompactionContext?(token: string): void | Promise<void>;
+  revokeCompactionContext?(token: string): void | Promise<void>;
   retireRecoveryWriter?(reference: RuntimeRecoveryReference): Promise<boolean>;
   waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot>;
   register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string, options?: TaskUpdateRegistrationOptions): Promise<string>;
@@ -533,9 +574,19 @@ export class TurnBroker implements TurnBrokerOwner {
     return broker;
   }
 
+  private readonly verificationPairs = new Map<string, { handle: ContextVerificationHandle; turnToken: string; scope: ContextScope;
+    contract: "native" | "safe"; ownerContext?: TaskUpdateOwnerContext; expiresAt: number; timer: ReturnType<typeof setTimeout>;
+    ordinary: Set<ContextMethod>; compaction: Set<ContextMethod> }>();
   private readonly channels = new Map<string, TurnChannel>();
+  private readonly retiredContextUsage = new Map<string, { evidence: ContextUsageEvidence; expiresAt: number }>();
   private readonly pending = new Map<string, TurnChannel>();
-  private readonly compactionTransactions = new CompactionTransactionStore();
+  private readonly compactionTransactions = new CompactionTransactionStore(token => {
+    const binding = this.compactionContextBindings.get(token);
+    if (binding) this.revokeCompactionContext(binding.readToken);
+    this.compactionContextBindings.delete(token);
+  });
+  private readonly compactionContextBindings = new Map<string, { readToken: string; handoffId: string; contract: "native" | "safe" }>();
+  private readonly compactionContexts = new Map<string, { scope: ContextScope; registration: CompactionContextRegistration; ownerContext?: TaskUpdateOwnerContext; deliveryReceiptId: string; timer: ReturnType<typeof setTimeout> }>();
   private readonly bindings = new Map<string, { token: string; channel: TurnChannel }>();
   // The Codex context replayed into ChatGPT still carries the handles of finished turns, so a model
   // can present one. Remembering which turn retired a handle is what separates "you are holding a
@@ -690,6 +741,303 @@ export class TurnBroker implements TurnBrokerOwner {
     return token;
   }
 
+  private contextOwner(token: string, context?: TaskUpdateOwnerContext): TurnChannel {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel || channel.completionCommitted || channel.safe?.state === "completed") throw contextError("CONTEXT_RETIRED", "Context owner is no longer active");
+    this.assertDriver(channel, context);
+    if (channel.recovery) assertRecoveryWriter(channel.recovery);
+    return channel;
+  }
+
+  private assertContextStorage(additionalBytes: number): void {
+    let bytes = additionalBytes;
+    for (const current of this.channels.values()) {
+      for (const plan of current.contextPlans?.values() ?? []) bytes += plan.snapshot.storage_bytes;
+      if (current.contextScope) bytes += current.contextScope.registration.snapshot.storage_bytes;
+    }
+    for (const record of this.compactionContexts.values()) bytes += record.registration.snapshot.storage_bytes;
+    for (const record of this.verificationPairs.values()) bytes += record.scope.registration.snapshot.storage_bytes;
+    if (!Number.isSafeInteger(bytes) || bytes > 128 * 1024 * 1024) throw contextError("CONTEXT_BUDGET_EXCEEDED", "Active context storage is full");
+  }
+
+  registerContextPlan(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): void {
+    const channel = this.contextOwner(token, context);
+    if (channel.contextScope) throw contextError("CONTEXT_INVALID", "The context plan is already selected");
+    const plans = channel.contextPlans ??= new Map();
+    this.assertContextStorage(registration.snapshot.storage_bytes);
+    if (plans.has(registration.planId)) throw contextError("CONTEXT_INVALID", "The context plan identity is already registered");
+    if (plans.size >= 4) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded candidate plan limit was reached");
+    // The wire round-trip validates a Remote owner's data and prevents later owner mutation.
+    const snapshot = restoreContextSnapshot(serializeContextSnapshot(registration.snapshot));
+    plans.set(registration.planId, { ...structuredClone({ ...registration, snapshot: undefined }), snapshot });
+  }
+
+  discardUnselectedContextPlans(token: string, context?: TaskUpdateOwnerContext): void {
+    const channel = this.contextOwner(token, context);
+    if (channel.contextScope || channel.contextSent || channel.safe?.launcherSent) throw contextError("CONTEXT_INVALID", "Selected or sent context plans cannot be discarded");
+    channel.contextPlans?.clear();
+    channel.activityRevision += 1;
+  }
+
+  selectContextPlan(token: string, planId: string, context?: TaskUpdateOwnerContext): void {
+    const channel = this.contextOwner(token, context);
+    if (channel.contextScope) {
+      if (channel.contextScope.registration.planId !== planId) throw contextError("CONTEXT_INVALID", "A selected context plan cannot be replaced");
+      return;
+    }
+    const registration = channel.contextPlans?.get(planId);
+    if (!registration) throw contextError("CONTEXT_INVALID", "Select a registered context plan");
+    channel.contextScope = new ContextScope(token, registration, "normal", () => { channel.activityRevision += 1; }, error => this.revokeTrusted(token, error));
+    channel.contextPlans!.clear();
+    channel.contextScope.presentAttachments();
+    this.activateContextReads(channel);
+  }
+
+  markContextPlanSent(token: string, planId: string, context?: TaskUpdateOwnerContext): void {
+    const channel = this.contextOwner(token, context);
+    if (channel.contextScope?.registration.planId !== planId) throw contextError("CONTEXT_INVALID", "Send evidence must match the selected context plan");
+    channel.contextSent = true;
+    this.activateContextReads(channel);
+  }
+
+  confirmContextAttachments(token: string, confirmation: ContextAttachmentConfirmation, context?: TaskUpdateOwnerContext): void {
+    const channel = this.contextOwner(token, context);
+    if (!channel.contextScope) throw contextError("CONTEXT_INVALID", "No context plan is selected");
+    channel.contextScope.confirmAttachments(confirmation);
+  }
+
+  contextStatus(token: string): ContextStatus | undefined { return this.channels.get(token)?.contextScope?.status(); }
+  armContextVerification(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): ContextVerificationHandle {
+    const channel = this.contextOwner(token, context);
+    try {
+      if (channel.verificationPair || channel.contextScope || channel.contextPlans?.size || channel.contextSent || channel.safe?.connectorStarted || channel.safe?.launcherSent
+        || channel.compactionRequested || channel.activityRevision !== 0 || channel.invocations.size || channel.nativeQueryCount || channel.nativeOperations.hasOutstanding()
+        || this.verificationPairs.size >= 8 || !Number.isSafeInteger(registration.expiresAt) || registration.expiresAt <= Date.now() || registration.expiresAt > Date.now() + 300_000) {
+        throw contextError("CONTEXT_INVALID", "Verification must bind a fresh unpublished turn with a bounded deadline");
+      }
+      const pairToken = opaqueId("context_verification");
+      // Mark the turn before creating either scope. Any failure retires the complete
+      // capability so a partially armed verifier cannot acquire ordinary business rights.
+      channel.verificationPair = pairToken;
+      this.assertContextStorage(registration.normal.snapshot.storage_bytes + registration.compactionSnapshot.storage_bytes);
+      this.registerContextPlan(token, registration.normal, context);
+      this.selectContextPlan(token, registration.normal.planId, context);
+      const snapshot = restoreContextSnapshot(serializeContextSnapshot(registration.compactionSnapshot));
+      const compactionToken = opaqueId("compaction");
+      const handle = { pairToken, compactionToken, normalContextId: channel.contextScope!.registration.snapshot.context_id, compactionContextId: snapshot.context_id };
+      const scope = new ContextScope(compactionToken, { snapshot, planId: registration.normal.planId, manifestDigest: registration.normal.manifestDigest,
+        deliveryByTarget: Object.fromEntries(snapshot.targets.map(target => [target.target_id, { delivery: "on_demand_source", required: false, ...(target.kind === "image" ? { media_route: "mcp" as const } : {}) }])) },
+      "compaction", () => { channel.activityRevision += 1; }, () => this.revokeContextVerification(pairToken), registration.expiresAt);
+      const timer = setTimeout(() => this.revokeContextVerification(pairToken), registration.expiresAt - Date.now()); timer.unref?.();
+      this.verificationPairs.set(pairToken, { handle, turnToken: token, scope, contract: channel.safe ? "safe" : "native", ownerContext: context ? structuredClone(context) : undefined,
+        expiresAt: registration.expiresAt, timer, ordinary: new Set(), compaction: new Set() });
+      return { ...handle };
+    } catch (error) { this.revokeTrusted(token, error instanceof Error ? error : new Error("Context verification failed")); throw error; }
+  }
+  private verificationForToken(token: string) {
+    const pair = this.channels.get(token)?.verificationPair;
+    return pair ? this.verificationPairs.get(pair) : [...this.verificationPairs.values()].find(record => record.handle.compactionToken === token);
+  }
+  private verificationSource(token: string) {
+    const record = this.verificationForToken(token);
+    if (!record || record.expiresAt <= Date.now()) throw contextError("CONTEXT_RETIRED", "Connector verification is no longer active");
+    const channel = this.contextOwner(record.turnToken, record.ownerContext);
+    if (channel.verificationPair !== record.handle.pairToken) throw contextError("CONTEXT_RETIRED", "Connector verification binding is no longer active");
+    this.assertSafeHarnessRunning(channel, true);
+    if (!channel.safe && !channel.contextSent) throw contextError("CONTEXT_NOT_READY", "The verification entry has not been delivered");
+    return record;
+  }
+  markContextVerificationDelivered(pairToken: string): void {
+    const record = this.verificationPairs.get(pairToken);
+    if (!record) throw contextError("CONTEXT_RETIRED", "Connector verification is no longer active");
+    const channel = this.contextOwner(record.turnToken, record.ownerContext);
+    if (channel.safe && !(channel.safe.requireSentConfirmation ? channel.safe.launcherSent : channel.safe.connectorStarted)) {
+      throw contextError("CONTEXT_NOT_READY", "Use the original Sent confirmation or connector start before delivering verification sources");
+    }
+    this.markContextPlanSent(record.turnToken, channel.contextScope!.registration.planId, record.ownerContext);
+    record.scope.markEntryDelivered();
+  }
+  contextVerificationStatus(pairToken: string): ContextVerificationStatus | undefined {
+    const record = this.verificationPairs.get(pairToken);
+    if (!record || record.expiresAt <= Date.now()) return undefined;
+    const channel = this.contextOwner(record.turnToken, record.ownerContext);
+    const methods = (received: Set<ContextMethod>) => ({ list: received.has("list"), read: received.has("read"), search: received.has("search") });
+    return { ...record.handle, planId: channel.contextScope!.registration.planId, ordinary: methods(record.ordinary), compaction: methods(record.compaction),
+      completed: record.ordinary.size === 3 && record.compaction.size === 3, expiresAt: record.expiresAt };
+  }
+  private retireContextVerification(pairToken: string): void {
+    const record = this.verificationPairs.get(pairToken);
+    if (!record) return;
+    clearTimeout(record.timer); record.scope.retire(); this.verificationPairs.delete(pairToken);
+  }
+  revokeContextVerification(pairToken: string): void {
+    const record = this.verificationPairs.get(pairToken);
+    if (!record) return;
+    this.revokeTrusted(record.turnToken, contextError("CONTEXT_RETIRED", "Connector verification ended"));
+  }
+  contextUsage(token: string): ContextUsageEvidence | undefined {
+    const scope = this.channels.get(token)?.contextScope ?? this.compactionContexts.get(token)?.scope;
+    const retired = this.retiredContextUsage.get(token);
+    if (retired && retired.expiresAt <= Date.now()) this.retiredContextUsage.delete(token);
+    const evidence = scope?.usageEvidence() ?? (retired && retired.expiresAt > Date.now() ? retired.evidence : undefined);
+    return evidence ? structuredClone(evidence) : undefined;
+  }
+  releaseContextUsage(token: string): void { this.retiredContextUsage.delete(token); }
+  private retainContextUsage(token: string, scope: ContextScope): void {
+    this.retiredContextUsage.set(token, { evidence: scope.usageEvidence(true), expiresAt: Date.now() + 300_000 });
+    while (this.retiredContextUsage.size > MAX_RETIRED_TURN_HANDLES) this.retiredContextUsage.delete(this.retiredContextUsage.keys().next().value!);
+  }
+  private retireTurnContext(token: string, channel: TurnChannel): void {
+    if (channel.contextScope) { this.retainContextUsage(token, channel.contextScope); channel.contextScope.retire(); }
+    channel.contextScope = undefined; channel.contextPlans?.clear();
+  }
+
+  private activateContextReads(channel: TurnChannel): void {
+    const scope = channel.contextScope;
+    if (!scope) return;
+    const delivered = channel.safe ? channel.safe.state === "running" : channel.contextSent === true;
+    if (delivered) { scope.markEntryDelivered(); scope.openReads(); }
+  }
+
+  private assertContextReady(channel: TurnChannel): void {
+    if (channel.verificationPair) throw contextError("CONTEXT_VERIFICATION_ONLY", "Connector verification permits only context source navigation");
+    if (channel.contextPlans?.size && !channel.contextScope) throw contextError("CONTEXT_NOT_READY", "Select and deliver the context plan before new work");
+    if (channel.contextScope && !channel.safe && !channel.contextSent) throw contextError("CONTEXT_NOT_READY", "Deliver the selected context plan before final output");
+    channel.contextScope?.assertReady();
+    if (channel.contextScope?.inFlight) throw contextError("CONTEXT_BUSY", "Wait for in-flight context returns before final output");
+  }
+
+  registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): CompactionContextHandle {
+    for (const [submissionToken, binding] of this.compactionContextBindings) if (binding.contract === "native" && !this.compactionTransactions.isActive(submissionToken, binding.handoffId)) {
+      this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
+    }
+    if (this.compactionContexts.size >= 16 || this.compactionContextBindings.size >= 64) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded compaction source limit was reached");
+    if (!Number.isSafeInteger(registration.historyRevision) || registration.historyRevision < 0 || typeof registration.ownerGeneration !== "string" || !registration.ownerGeneration || registration.ownerGeneration.length > 256
+      || !Number.isFinite(registration.expiresAt) || registration.expiresAt <= Date.now() || registration.expiresAt > Date.now() + 300_000) throw contextError("CONTEXT_INVALID", "Invalid compaction source binding or deadline");
+    if (registration.contract === "native") {
+      if (registration.explicitManual !== undefined) throw contextError("CONTEXT_INVALID", "Manual preparation requires the Zero Risk contract");
+      if (registration.turnToken || !registration.transactionToken || !this.compactionTransactions.isActive(registration.transactionToken, registration.handoffId)) throw contextError("CONTEXT_INVALID", "A live compaction transaction is required");
+    } else if (registration.contract === "safe") {
+      if (registration.transactionToken || !registration.turnToken) throw contextError("CONTEXT_INVALID", "A live Zero Risk handoff is required");
+      const channel = this.contextOwner(registration.turnToken, context);
+      if (registration.explicitManual !== undefined && registration.explicitManual !== true) throw contextError("CONTEXT_INVALID", "Invalid manual compaction binding");
+      if (registration.explicitManual) {
+        if (channel.safe?.state !== "awaiting_start" || channel.safe.connectorStarted || channel.compactionRequested
+          || channel.invocations.size || channel.nativeQueryCount || channel.nativeOperations.hasOutstanding() || channel.contextScope || channel.contextPlans?.size) {
+          throw contextError("CONTEXT_INVALID", "Manual compaction must bind a fresh prepared Zero Risk request before its original start");
+        }
+      } else if (channel.safe?.state !== "running") throw contextError("CONTEXT_INVALID", "The Zero Risk reply must already be active");
+    } else throw contextError("CONTEXT_INVALID", "Invalid compaction mode");
+    for (const record of this.compactionContexts.values()) if ((registration.transactionToken && record.registration.transactionToken === registration.transactionToken)
+      || (registration.turnToken && record.registration.turnToken === registration.turnToken)) throw contextError("CONTEXT_INVALID", "The compaction attempt already has a source binding");
+    this.assertContextStorage(registration.snapshot.storage_bytes);
+    const submissionToken = registration.transactionToken ?? registration.turnToken!;
+    if (this.compactionContextBindings.has(submissionToken)) throw contextError("CONTEXT_INVALID", "The compaction source binding cannot be replaced");
+    const snapshot = restoreContextSnapshot(serializeContextSnapshot(registration.snapshot));
+    if (snapshot.targets.some(target => !target.read_ref)) throw contextError("CONTEXT_SOURCE_UNAVAILABLE", "Every compaction source target must remain readable");
+    const token = opaqueId("compaction");
+    const deliveryByTarget = Object.fromEntries(snapshot.targets.map(target => [target.target_id, { delivery: "on_demand_source", required: false, ...(target.kind === "image" ? { media_route: "mcp" as const } : {}) }]));
+    const scope = new ContextScope(token, { snapshot, planId: registration.handoffId, manifestDigest: registration.handoffId, deliveryByTarget,
+      limits: registration.limits, remainingBudget: registration.remainingBudget }, "compaction", () => {
+        if (registration.turnToken) { const channel = this.channels.get(registration.turnToken); if (channel) channel.activityRevision += 1; }
+      }, () => this.revokeCompactionContext(token), registration.expiresAt);
+    const timer = setTimeout(() => this.revokeCompactionContext(token), registration.expiresAt - Date.now()); timer.unref?.();
+    this.compactionContextBindings.set(submissionToken, { readToken: token, handoffId: registration.handoffId, contract: registration.contract });
+    this.compactionContexts.set(token, { scope, registration: { ...registration, snapshot }, ownerContext: context ? structuredClone(context) : undefined, deliveryReceiptId: opaqueId("context_control"), timer });
+    if (registration.explicitManual) {
+      const channel = this.channels.get(registration.turnToken!)!;
+      channel.compactionRequested = true;
+      channel.compactionResult = contextFailure("CONTEXT_COMPACTION_READ_ONLY", "This explicit manual compaction request allows only source navigation and its original summary completion");
+    }
+    return { compactionToken: token, contextId: snapshot.context_id };
+  }
+
+  private compactionContext(token: string) {
+    const record = this.compactionContexts.get(token);
+    if (!record || !record.scope.isLive) throw contextError("CONTEXT_RETIRED", "Context access is invalid or no longer active");
+    const registration = record.registration;
+    if (registration.transactionToken) {
+      if (!this.compactionTransactions.isActive(registration.transactionToken, registration.handoffId)) throw contextError("CONTEXT_RETIRED", "The compaction transaction is no longer active");
+    } else {
+      const channel = this.contextOwner(registration.turnToken!, record.ownerContext);
+      if (registration.explicitManual && channel.safe?.state === "awaiting_start") throw contextError("CONTEXT_NOT_READY", "Complete the original Zero Risk start and applicable Sent confirmation before reading compaction sources");
+      if (channel.safe?.state !== "running" || !channel.compactionRequested) throw contextError("CONTEXT_RETIRED", "The Zero Risk compaction handoff is not active");
+    }
+    return record;
+  }
+  markCompactionContextDelivered(token: string): void { this.compactionContext(token).scope.markEntryDelivered(); }
+  guardCompactionContextCommit(token: string): void { this.compactionContext(token).scope.guardCommit(); }
+  /** No await between validation and retirement: a query either precedes this
+   * operation and makes it busy, or follows it and sees a retired source. */
+  commitCompactionContext(token: string): void {
+    this.guardCompactionContextCommit(token);
+    this.revokeCompactionContext(token);
+  }
+  revokeCompactionContext(token: string): void {
+    const record = this.compactionContexts.get(token);
+    if (!record) return;
+    this.retainContextUsage(token, record.scope);
+    clearTimeout(record.timer); record.scope.retire(); this.compactionContexts.delete(token);
+  }
+
+  private compactionScopeForSubmission(token: string): [string, ContextScope] | undefined {
+    const readToken = this.compactionContextBindings.get(token)?.readToken;
+    if (!readToken) return undefined;
+    this.guardCompactionContextCommit(readToken);
+    return [readToken, this.compactionContexts.get(readToken)!.scope];
+  }
+
+  private contextQuery(request: BrokerRequest): ContextPreparedReply {
+    if (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION || !request.contextArgs || !["list", "read", "search"].includes(request.contextMethod!)) throw contextError("CONTEXT_INVALID", "Refresh the connector context protocol");
+    if (!request.token || !["native", "safe"].includes(request.contract!)) throw contextError("CONTEXT_INVALID", "Invalid context credential");
+    let scope: ContextScope;
+    if (request.credentialKind === "compaction") {
+      const verification = this.verificationForToken(request.token);
+      if (verification) {
+        const record = this.verificationSource(request.token);
+        if (record.contract !== request.contract || record.handle.compactionToken !== request.token) throw contextError("CONTEXT_INVALID", "Invalid verification credential");
+        return record.scope.prepare(request.contextMethod!, request.contextArgs);
+      }
+      const record = this.compactionContext(request.token);
+      if (record.registration.contract !== request.contract) throw contextError("CONTEXT_INVALID", "Invalid context credential");
+      scope = record.scope;
+    } else if (request.credentialKind === "ordinary") {
+      const channel = this.channels.get(request.token);
+      if (!channel || channel.completionCommitted || channel.safe?.state === "completed" || channel.taskUpdates?.state.finalOutputRevision != null || request.contract !== (channel.safe ? "safe" : "native")) throw contextError("CONTEXT_RETIRED", "Context access is invalid or no longer active");
+      if (channel.recovery) assertRecoveryWriter(channel.recovery);
+      if (channel.verificationPair) this.verificationSource(request.token);
+      if (channel.safe) this.assertSafeHarnessRunning(channel, true);
+      if (!channel.contextScope || (!channel.safe && !channel.contextSent)) throw contextError("CONTEXT_NOT_READY", "Select and send the current context plan before reading");
+      this.activateContextReads(channel); scope = channel.contextScope;
+    } else throw contextError("CONTEXT_INVALID", "Invalid context credential");
+    return scope.prepare(request.contextMethod!, request.contextArgs);
+  }
+
+  private finishContextReturn(request: BrokerRequest): void {
+    if (!request.token || !request.receiptId || request.contextProtocol !== CONTEXT_PROTOCOL_VERSION) throw contextError("CONTEXT_INVALID", "Invalid context return receipt");
+    const verification = this.verificationForToken(request.token);
+    if (verification) {
+      const ordinary = request.credentialKind === "ordinary" && request.token === verification.turnToken;
+      const compaction = request.credentialKind === "compaction" && request.token === verification.handle.compactionToken;
+      if ((!ordinary && !compaction) || request.contract !== verification.contract) throw contextError("CONTEXT_INVALID", "Invalid verification receipt binding");
+      let sent = request.sent === true;
+      try { this.verificationSource(request.token); } catch { sent = false; }
+      const scope = ordinary ? this.channels.get(verification.turnToken)?.contextScope : verification.scope;
+      const method = scope?.finish(request.receiptId, sent);
+      if (method) (ordinary ? verification.ordinary : verification.compaction).add(method);
+      return;
+    }
+    const record = request.credentialKind === "compaction" ? this.compactionContexts.get(request.token) : undefined;
+    const channel = request.credentialKind === "ordinary" ? this.channels.get(request.token) : undefined;
+    const scope = record?.scope ?? channel?.contextScope;
+    if ((record && record.registration.contract !== request.contract) || (channel && request.contract !== (channel.safe ? "safe" : "native"))) throw contextError("CONTEXT_INVALID", "Invalid context return mode");
+    // Revalidate revocation and the actual writer before crediting a successful transfer.
+    let sent = request.sent === true;
+    try { if (record) this.compactionContext(request.token); if (channel?.recovery) assertRecoveryWriter(channel.recovery); } catch { sent = false; }
+    scope?.finish(request.receiptId, sent);
+  }
+
   async beginCompactionTransaction(
     traceId: string,
     ttlMs = 120_000,
@@ -703,11 +1051,16 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   abortCompactionTransaction(token: string): void {
+    for (const [readToken, record] of this.compactionContexts) if (record.registration.transactionToken === token) this.revokeCompactionContext(readToken);
+    this.compactionContextBindings.delete(token);
     this.compactionTransactions.abort(token);
   }
 
   revokeCompactionTransactions(traceId: string): void {
     this.compactionTransactions.abortTrace(traceId);
+    for (const [submissionToken, binding] of this.compactionContextBindings) if (binding.contract === "native" && !this.compactionTransactions.isActive(submissionToken, binding.handoffId)) {
+      this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
+    }
   }
 
   updateEnvironment(token: string, environment: ChatGptTurnCapability, context?: TaskUpdateOwnerContext): void {
@@ -1122,6 +1475,7 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private assertOutputCandidate(channel: TurnChannel, context?: TaskUpdateOwnerContext): void {
     this.assertDriver(channel, context);
+    if (!channel.compactionRequested) this.assertContextReady(channel);
     if (!channel.taskUpdates) return;
     const updates = channel.taskUpdates;
     if (context!.acknowledgedRevision !== undefined && context!.acknowledgedRevision !== context!.taskRevision) {
@@ -1134,7 +1488,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private outputIdle(channel: TurnChannel): boolean {
-    return channel.activities.size === 0 && channel.invocations.size === 0 && channel.nativeQueryCount === 0
+    return !channel.contextScope?.inFlight && channel.activities.size === 0 && channel.invocations.size === 0 && channel.nativeQueryCount === 0
       && !channel.nativeOperations.hasOutstanding() && ![...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered);
   }
 
@@ -1216,6 +1570,7 @@ export class TurnBroker implements TurnBrokerOwner {
       || channel.nativeQueryCount > 0
       || channel.nativeOperations.hasOutstanding()
       || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return false;
+    this.retireTurnContext(token, channel);
     channel.completionCommitted = true;
     channel.completionRevision = revision;
     if (channel.taskUpdates) {
@@ -1282,6 +1637,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.compactionRequested) {
       throw new Error("Codex context compaction was already requested for this turn");
     }
+    this.retireTurnContext(token, channel);
     channel.compactionRequested = true;
     channel.compactionResult = structuredClone(queuedResult);
     if (channel.batchTimer) {
@@ -1323,6 +1679,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (safe.connectorStarted) return { started: true, duplicate: true };
     safe.connectorStarted = true;
     this.activateSafeTurn(channel, safe);
+    this.activateContextReads(channel);
     return { started: true, duplicate: false };
   }
 
@@ -1341,6 +1698,7 @@ export class TurnBroker implements TurnBrokerOwner {
     safe.launcherSent = true;
     this.resolveSafeWaiters(safe.sentWaiters, undefined);
     this.activateSafeTurn(channel, safe);
+    this.activateContextReads(channel);
     return { confirmed: true, duplicate: false };
   }
 
@@ -1370,6 +1728,8 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (safe.state === "revoked") throw new Error("Zero Risk turn is already terminal");
     if (safe.state !== "running") throw new Error("Zero Risk turn has not started");
+    const compactionScope = channel.compactionRequested ? this.compactionScopeForSubmission(requestId) : undefined;
+    if (!channel.compactionRequested) this.assertContextReady(channel);
     if (channel.invocations.size > 0) {
       throw new Error(`Zero Risk turn cannot complete with ${channel.invocations.size} pending Codex tool invocation(s)`);
     }
@@ -1380,6 +1740,8 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error("Zero Risk turn cannot complete before all Native operation results have been delivered");
     }
     if (updates && [...updates.transfers.values()].some(record => record.outcome.status === "unknown" || record.synchronize)) throw taskUpdateError("task_update_transfer_pending", "Resolve the task update transfer before completing the turn");
+    if (compactionScope) { this.revokeCompactionContext(compactionScope[0]); this.compactionContextBindings.delete(requestId); }
+    this.retireTurnContext(requestId, channel);
     safe.state = "completed";
     if (updates) {
       updates.state.finalOutputRevision = taskRevision ?? 0;
@@ -1436,6 +1798,10 @@ export class TurnBroker implements TurnBrokerOwner {
   revokeTrusted(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure): void {
     const channel = this.channels.get(token);
     if (!channel) return;
+    if (channel.verificationPair) this.retireContextVerification(channel.verificationPair);
+    this.retireTurnContext(token, channel);
+    for (const [readToken, record] of this.compactionContexts) if (record.registration.turnToken === token) this.revokeCompactionContext(readToken);
+    this.compactionContextBindings.delete(token);
     console.info(`[chatgpt-web] broker_retired ${JSON.stringify({
       traceId: channel.traceId,
       pendingTools: channel.invocations.size,
@@ -1543,6 +1909,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private assertSafeHarnessRunning(channel: TurnChannel, allowCompaction = false): void {
+    if (channel.verificationPair && !allowCompaction) throw contextError("CONTEXT_VERIFICATION_ONLY", "Connector verification permits only context source navigation");
     const safe = channel.safe;
     if (!safe) return;
     if (safe.state === "awaiting_start") {
@@ -1621,6 +1988,8 @@ export class TurnBroker implements TurnBrokerOwner {
       // A pending listen must settle before closing its server. Otherwise its callback can
       // recreate a live endpoint after close has already returned.
       await this.startPromise?.catch(() => {});
+      for (const token of this.compactionContexts.keys()) this.revokeCompactionContext(token);
+      this.compactionContextBindings.clear();
       this.compactionTransactions.close();
       for (const token of [...this.channels.keys()]) this.revokeTrusted(token, this.endpointFailure);
       for (const updates of this.retiredTaskUpdates.values()) {
@@ -1768,6 +2137,8 @@ export class TurnBroker implements TurnBrokerOwner {
       this.endpointMonitor = undefined;
       this.acceptingExternalOwners = false;
       this.lifecycle("endpoint_unavailable", { reason: error.message, ownedSocket: this.ownedSocket });
+      for (const token of this.compactionContexts.keys()) this.revokeCompactionContext(token);
+      this.compactionContextBindings.clear();
       this.compactionTransactions.close();
       for (const token of [...this.channels.keys()]) this.revokeTrusted(token, error);
       for (const socket of this.sockets) socket.destroy();
@@ -2071,7 +2442,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
+    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -2081,6 +2452,97 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error("ChatGPT web turn broker is closed");
     }
     this.prune();
+    const verification = request.token ? this.verificationForToken(request.token) : undefined;
+    const verificationBinding = request.bindingId ? this.bindings.get(request.bindingId)?.channel.verificationPair : undefined;
+    if ((verification || verificationBinding) && !request.method.startsWith("owner_context_")
+      && !["context_query", "context_return", "context_return_check", "safe_start", "owner_safe_sent", "owner_safe_wait_start", "owner_wait_retirement", "owner_revoke", "owner_revoke_trusted"].includes(request.method)) {
+      throw contextError("CONTEXT_VERIFICATION_ONLY", "Connector verification allows only its original start and context navigation");
+    }
+    if (request.method === "owner_compaction_transaction_begin" || request.method === "owner_compaction_transaction_abort") {
+      if (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION) throw contextError("CONTEXT_INVALID", "Unsupported private context-owner protocol");
+      if (request.method === "owner_compaction_transaction_abort") {
+        if (!request.token) throw contextError("CONTEXT_INVALID", "Missing compaction transaction owner");
+        this.abortCompactionTransaction(request.token); return { accepted: true };
+      }
+      if (typeof request.traceId !== "string" || !request.traceId || request.traceId.length > 256
+        || request.ttlMs !== undefined && (!Number.isSafeInteger(request.ttlMs) || request.ttlMs < 1 || request.ttlMs > 300_000)) throw contextError("CONTEXT_INVALID", "Invalid compaction transaction binding or deadline");
+      return this.beginCompactionTransaction(request.traceId, request.ttlMs);
+    }
+    if (request.method.startsWith("owner_context_") || request.method.startsWith("owner_compaction_context_")) {
+      if (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION) throw contextError("CONTEXT_INVALID", "Unsupported private context-owner protocol");
+      if (request.method === "owner_context_verification_arm") {
+        if (!request.token || !request.verificationRegistration) throw contextError("CONTEXT_INVALID", "Missing verification registration");
+        this.contextOwner(request.token, request.ownerContext);
+        const registration = request.verificationRegistration;
+        try {
+          return this.armContextVerification(request.token, { ...registration,
+            normal: { ...registration.normal, snapshot: restoreContextSnapshot(registration.normal.snapshot) },
+            compactionSnapshot: restoreContextSnapshot(registration.compactionSnapshot) }, request.ownerContext);
+        } catch (error) { this.revokeTrusted(request.token); throw error; }
+      }
+      if (request.method === "owner_compaction_context_register") {
+        if (!request.compactionRegistration) throw contextError("CONTEXT_INVALID", "Missing compaction source registration");
+        return this.registerCompactionContext({ ...request.compactionRegistration, snapshot: restoreContextSnapshot(request.compactionRegistration.snapshot) }, request.ownerContext);
+      }
+      if (!request.token) throw contextError("CONTEXT_INVALID", "Missing context owner");
+      switch (request.method) {
+        case "owner_context_verification_delivered": this.markContextVerificationDelivered(request.token); break;
+        case "owner_context_verification_status": return { status: this.contextVerificationStatus(request.token) ?? null };
+        case "owner_context_verification_revoke": this.revokeContextVerification(request.token); break;
+        case "owner_context_register":
+          if (!request.contextRegistration) throw contextError("CONTEXT_INVALID", "Missing context registration");
+          this.registerContextPlan(request.token, { ...request.contextRegistration, snapshot: restoreContextSnapshot(request.contextRegistration.snapshot) }, request.ownerContext); break;
+        case "owner_context_select": this.selectContextPlan(request.token, request.planId!, request.ownerContext); break;
+        case "owner_context_discard_unselected": this.discardUnselectedContextPlans(request.token, request.ownerContext); break;
+        case "owner_context_sent": this.markContextPlanSent(request.token, request.planId!, request.ownerContext); break;
+        case "owner_context_attachments": this.confirmContextAttachments(request.token, { planId: request.planId!, manifestDigest: request.manifestDigest! }, request.ownerContext); break;
+        case "owner_context_status": return { status: this.contextStatus(request.token) ?? null };
+        case "owner_context_usage": return { usage: this.contextUsage(request.token) ?? null };
+        case "owner_context_usage_release": this.releaseContextUsage(request.token); break;
+        case "owner_compaction_context_delivered": this.markCompactionContextDelivered(request.token); break;
+        case "owner_compaction_context_guard": this.guardCompactionContextCommit(request.token); break;
+        case "owner_compaction_context_commit": this.commitCompactionContext(request.token); break;
+        case "owner_compaction_context_revoke": this.revokeCompactionContext(request.token); break;
+      }
+      return { accepted: true };
+    }
+    if (request.method === "context_return_check") {
+      if (!request.token || !request.receiptId || request.contextProtocol !== CONTEXT_PROTOCOL_VERSION) throw contextError("CONTEXT_INVALID", "Invalid context return receipt");
+      const verification = this.verificationForToken(request.token);
+      if (verification) {
+        this.verificationSource(request.token);
+        if (request.contract !== verification.contract) throw contextError("CONTEXT_INVALID", "Invalid verification mode");
+        const scope = request.credentialKind === "ordinary" && request.token === verification.turnToken ? this.channels.get(verification.turnToken)?.contextScope
+          : request.credentialKind === "compaction" && request.token === verification.handle.compactionToken ? verification.scope : undefined;
+        if (!scope) throw contextError("CONTEXT_INVALID", "Invalid verification credential");
+        scope.assertPending(request.receiptId); return { active: true };
+      }
+      const safeControl = request.credentialKind === "ordinary" && this.compactionContextBindings.get(request.token);
+      if (safeControl && request.contract === "safe") {
+        const record = this.compactionContext(safeControl.readToken);
+        if (record.deliveryReceiptId === request.receiptId) return { active: true };
+      }
+      if (request.credentialKind === "compaction") {
+        const record = this.compactionContext(request.token);
+        if (record.registration.contract !== request.contract) throw contextError("CONTEXT_INVALID", "Invalid context return mode");
+        record.scope.assertPending(request.receiptId);
+      } else {
+        const channel = this.channels.get(request.token);
+        if (!channel || request.contract !== (channel.safe ? "safe" : "native") || channel.completionCommitted || channel.safe?.state === "completed" || !channel.contextScope) throw contextError("CONTEXT_RETIRED", "Context access is no longer active");
+        if (channel.recovery) assertRecoveryWriter(channel.recovery);
+        channel.contextScope.assertPending(request.receiptId);
+      }
+      return { active: true };
+    }
+    if (request.method === "context_control_return") {
+      if (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION || request.contract !== "safe" || !request.token || !request.receiptId) throw contextError("CONTEXT_INVALID", "Invalid context control receipt");
+      const readToken = this.compactionContextBindings.get(request.token)?.readToken;
+      const record = readToken ? this.compactionContexts.get(readToken) : undefined;
+      if (record && record.registration.contract === "safe" && record.deliveryReceiptId === request.receiptId && request.sent === true) this.markCompactionContextDelivered(readToken!);
+      return { accepted: true };
+    }
+    if (request.method === "context_query") return this.contextQuery(request);
+    if (request.method === "context_return") { this.finishContextReturn(request); return { accepted: true }; }
     if (request.method === "owner_task_update_state") {
       if (!request.token) throw new Error("turn owner token is required");
       return { state: this.taskUpdateState(request.token) ?? null };
@@ -2175,7 +2637,9 @@ export class TurnBroker implements TurnBrokerOwner {
       if (typeof request.summary !== "string") {
         throw new Error("compaction handoff summary is required");
       }
+      const contextScope = this.compactionScopeForSubmission(request.token);
       this.compactionTransactions.submit(request.token, request.handoffId, request.summary);
+      if (contextScope) { this.revokeCompactionContext(contextScope[0]); this.compactionContextBindings.delete(request.token); }
       return { submitted: true };
     }
     if (request.method === "owner_status") {
@@ -2183,6 +2647,7 @@ export class TurnBroker implements TurnBrokerOwner {
         protocolVersion: TURN_BROKER_PROTOCOL_VERSION,
         nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         taskUpdateProtocol: TASK_UPDATE_PROTOCOL_VERSION,
+        contextProtocol: CONTEXT_PROTOCOL_VERSION,
         acceptingExternalOwners: this.acceptingExternalOwners,
         owner: this.ownerId,
       };
@@ -2429,6 +2894,7 @@ export class TurnBroker implements TurnBrokerOwner {
             throw new Error("DEV long-wait probe operation_id is already bound to another request");
           }
         } else {
+          this.assertContextReady(binding.channel);
           const tool = currentTool(binding.channel, DEV_NATIVE_LONG_WAIT_TOOL_NAME);
           if (!tool || tool.freeform) {
             throw new TurnBrokerAdmissionError("DEV long-wait probe tool is unavailable in this turn");
@@ -2469,6 +2935,7 @@ export class TurnBroker implements TurnBrokerOwner {
       return { kind: "result", operation_id: operationId, result: structuredClone(probeResult) };
     }
 
+    this.assertContextReady(binding.channel);
     const wireName = request.wireName?.trim();
     if (!wireName) throw new TurnBrokerAdmissionError("wire tool name is required");
     const tool = currentTool(binding.channel, wireName);
@@ -2522,6 +2989,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (request.contract !== (channel.safe ? "safe" : "native")) {
       throw new NativeOperationError("codex_tool_operation_unknown", "The operation does not belong to this MCP contract");
     }
+    if (channel.verificationPair) throw contextError("CONTEXT_VERIFICATION_ONLY", "Connector verification cannot start or wait for business operations");
     if (channel.nativeQueryCount >= 64) throw new NativeOperationError("codex_tool_resource_limit", "The Native query limit was reached; existing operations remain available");
     // A query owns this count, not an MCP process or a Responses round. Socket cancellation and
     // every return path release it. No per-query activity tombstones accumulate during long waits.
@@ -2549,6 +3017,10 @@ export class TurnBroker implements TurnBrokerOwner {
             if (!channel.compactionResult) throw new Error("Compaction control result is unavailable");
             return { result: structuredClone(channel.compactionResult), control: "compaction" };
           }
+          if (channel.contextPlans?.size && !channel.contextScope) return { result: contextFailure("CONTEXT_NOT_READY", "Select and deliver the current context plan") };
+          if (channel.contextScope && !channel.safe && !channel.contextSent) return { result: contextFailure("CONTEXT_NOT_READY", "Deliver the selected context plan before new work") };
+          const notReady = channel.contextScope?.notReady();
+          if (notReady) return { result: notReady };
           const plan = planNativeTool(request.entry!, normalized, turnSnapshot(channel), request.contract!);
           if ("result" in plan) return plan;
           const wireName = namespacedToolName(plan.tool.namespace, plan.tool.name);
@@ -2589,7 +3061,15 @@ export class TurnBroker implements TurnBrokerOwner {
       this.prune();
       if (!this.channels.has(token)) throw new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached");
       const taskUpdate = this.deliverTaskUpdate(channel);
-      return { ...reply, ...(taskUpdate ? { taskUpdate } : {}) };
+      // Only the actual control-containing return can acknowledge delivery of this entry.
+      // The MCP transport confirms the private receipt after its complete result is sent.
+      const compactionReadToken = this.compactionContextBindings.get(token)?.readToken;
+      const compactionSource = compactionReadToken ? this.compactionContexts.get(compactionReadToken) : undefined;
+      const contextControlReceipt = channel.safe && channel.compactionRequested && compactionSource && reply.kind === "result"
+        && reply.result.content.some(block => !!block && typeof block === "object" && (block as { type?: unknown }).type === "text"
+          && typeof (block as { text?: unknown }).text === "string" && (block as { text: string }).text.includes(compactionReadToken!))
+        ? compactionSource.deliveryReceiptId : undefined;
+      return { ...reply, ...(taskUpdate ? { taskUpdate } : {}), ...(contextControlReceipt ? { contextControlReceipt } : {}) };
     } finally {
       channel.nativeQueryCount -= 1;
       channel.activityRevision += 1;
@@ -2847,6 +3327,71 @@ export async function callTurnBroker<T>(
  */
 export class RemoteTurnBroker implements TurnBrokerOwner {
   constructor(readonly socketPath: string) {}
+
+  armContextVerification(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): Promise<ContextVerificationHandle> {
+    return callTurnBroker(this.socketPath, { method: "owner_context_verification_arm", token, contextProtocol: CONTEXT_PROTOCOL_VERSION,
+      verificationRegistration: { ...registration, normal: { ...registration.normal, snapshot: serializeContextSnapshot(registration.normal.snapshot) },
+        compactionSnapshot: serializeContextSnapshot(registration.compactionSnapshot) }, ownerContext: context });
+  }
+  async markContextVerificationDelivered(pairToken: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_verification_delivered", token: pairToken, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  async contextVerificationStatus(pairToken: string): Promise<ContextVerificationStatus | undefined> {
+    const result = await callTurnBroker<{ status: ContextVerificationStatus | null }>(this.socketPath, { method: "owner_context_verification_status", token: pairToken, contextProtocol: CONTEXT_PROTOCOL_VERSION }); return result.status ?? undefined;
+  }
+  async revokeContextVerification(pairToken: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_verification_revoke", token: pairToken, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+
+  beginCompactionTransaction(traceId: string, ttlMs?: number): Promise<CompactionTransactionHandle> {
+    return callTurnBroker(this.socketPath, { method: "owner_compaction_transaction_begin", traceId, ttlMs, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  async abortCompactionTransaction(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_compaction_transaction_abort", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+
+  async registerContextPlan(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_register", token, contextProtocol: CONTEXT_PROTOCOL_VERSION,
+      contextRegistration: { ...registration, snapshot: serializeContextSnapshot(registration.snapshot) }, ownerContext: context });
+  }
+  async discardUnselectedContextPlans(token: string, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_discard_unselected", token, contextProtocol: CONTEXT_PROTOCOL_VERSION, ownerContext: context });
+  }
+  async selectContextPlan(token: string, planId: string, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_select", token, planId, contextProtocol: CONTEXT_PROTOCOL_VERSION, ownerContext: context });
+  }
+  async markContextPlanSent(token: string, planId: string, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_sent", token, planId, contextProtocol: CONTEXT_PROTOCOL_VERSION, ownerContext: context });
+  }
+  async confirmContextAttachments(token: string, confirmation: ContextAttachmentConfirmation, context?: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_attachments", token, ...confirmation, contextProtocol: CONTEXT_PROTOCOL_VERSION, ownerContext: context });
+  }
+  async contextStatus(token: string): Promise<ContextStatus | undefined> {
+    const result = await callTurnBroker<{ status: ContextStatus | null }>(this.socketPath, { method: "owner_context_status", token, contextProtocol: CONTEXT_PROTOCOL_VERSION }); return result.status ?? undefined;
+  }
+  async contextUsage(token: string): Promise<ContextUsageEvidence | undefined> {
+    const result = await callTurnBroker<{ usage: ContextUsageEvidence | null }>(this.socketPath, { method: "owner_context_usage", token, contextProtocol: CONTEXT_PROTOCOL_VERSION }); return result.usage ?? undefined;
+  }
+  async releaseContextUsage(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_usage_release", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): Promise<CompactionContextHandle> {
+    return callTurnBroker(this.socketPath, { method: "owner_compaction_context_register", contextProtocol: CONTEXT_PROTOCOL_VERSION,
+      compactionRegistration: { ...registration, snapshot: serializeContextSnapshot(registration.snapshot) }, ownerContext: context });
+  }
+  async markCompactionContextDelivered(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_compaction_context_delivered", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  async guardCompactionContextCommit(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_compaction_context_guard", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  async commitCompactionContext(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_compaction_context_commit", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+  async revokeCompactionContext(token: string): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_compaction_context_revoke", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  }
+
 
   waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot> {
     return callTurnBroker(this.socketPath, { method: "owner_native_waiting", token, revision: afterRevision }, null, signal);

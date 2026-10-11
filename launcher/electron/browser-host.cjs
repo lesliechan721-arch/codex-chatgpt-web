@@ -44,6 +44,10 @@ const MAX_CANCELLED_TURN_TRACES = 256;
 const MANUAL_SUBMIT_TIMEOUT_MS = 60_000;
 const MANUAL_COMPACTION_SUBMIT_TIMEOUT_MS = 120_000;
 const MANUAL_CONNECTOR_BIND_TIMEOUT_MS = 5 * 60_000;
+const MANUAL_ATTACHMENT_CONFIRM_TIMEOUT_MS = 5 * 60_000;
+const CONTEXT_DELIVERY_FEATURE = "context-delivery-plan-v1";
+const MAX_MANUAL_ATTACHMENT_LABEL_CHARS = 200;
+const MAX_MANUAL_REQUIRED_ATTACHMENTS = 100;
 const MAX_MANUAL_TERMINAL_SIGNALS = 256;
 const MAX_MANUAL_PROMPT_CHARS = 1_000_000;
 const INTERACTION_MODE_CHANGE_OPERATION = "browser interaction mode change";
@@ -55,6 +59,30 @@ const TURN_HEARTBEAT_SWEEP_MS = 5_000;
 const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
 const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
 const RETAINED_TURN_TAB_TTL_MS = 30 * 60 * 1000;
+
+function selectedManualContextPlan(contextPlans, resumed) {
+  if (contextPlans === undefined) return undefined;
+  const plan = contextPlans?.[resumed ? "resume" : "full"];
+  const validId = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+  if (!contextPlans || typeof contextPlans !== "object" || Array.isArray(contextPlans)
+    || (contextPlans.full?.planId !== undefined && contextPlans.full.planId === contextPlans.resume?.planId)
+    || !plan || typeof plan !== "object" || Array.isArray(plan)
+    || !validId(plan.planId) || !validId(plan.contextId)
+    || typeof plan.manifestDigest !== "string" || !/^[a-f0-9]{64}$/.test(plan.manifestDigest)
+    || !Array.isArray(plan.requiredAttachments) || plan.requiredAttachments.length > MAX_MANUAL_REQUIRED_ATTACHMENTS
+    || plan.requiredAttachments.some(item => !item || !validId(item.id)
+      || typeof item.label !== "string" || !item.label.trim()
+      || Array.from(item.label).length > MAX_MANUAL_ATTACHMENT_LABEL_CHARS || /[\u0000-\u001f\u007f]/.test(item.label))
+    || new Set(plan.requiredAttachments.map(item => item.id)).size !== plan.requiredAttachments.length) {
+    throw new Error("The selected Zero Risk context delivery plan is missing or invalid");
+  }
+  return { planId: plan.planId, contextId: plan.contextId, manifestDigest: plan.manifestDigest,
+    requiredAttachments: plan.requiredAttachments.map(item => ({ id: item.id, label: item.label })) };
+}
+
+function manualContextPlanDigest(plan) {
+  return plan ? createHash("sha256").update(JSON.stringify(plan)).digest("hex") : null;
+}
 
 function recordTurnActivity(tab, now = Date.now()) {
   const state = tab.approvalPending ? "approval"
@@ -598,6 +626,22 @@ class BrowserHost {
         canCopyPrompt: typeof tab.prompt === "string" && tab.prompt.length > 0,
         canConfirmSent: tab.manualSentConfirmationRequired !== false
           && tab.manualState === "awaiting-user",
+        ...(tab.manualContextPlan ? {
+          selectedPlanId: tab.manualContextPlan.planId,
+          manualAttachments: {
+            traceId: tab.traceId,
+            nonce: tab.manualAttachmentsNonce,
+            planId: tab.manualContextPlan.planId,
+            manifestDigest: tab.manualContextPlan.manifestDigest,
+            required: tab.manualContextPlan.requiredAttachments.map(item => ({ ...item })),
+            requiredCount: tab.manualContextPlan.requiredAttachments.length,
+            status: tab.manualAttachmentsStatus,
+            attestedAt: tab.manualAttachmentsAttestedAt,
+            deadlineAt: tab.manualAttachmentsDeadlineAt ? new Date(tab.manualAttachmentsDeadlineAt).toISOString() : null,
+            canConfirm: tab.manualAttachmentsStatus === "pending"
+              && ["awaiting-user", "sent", "running"].includes(tab.manualState),
+          },
+        } : {}),
       });
     }
     return snapshot;
@@ -1101,6 +1145,13 @@ class BrowserHost {
     });
     contents.on("did-start-navigation", (_event, url, inPlace, mainFrame) => {
       if (!mainFrame) return;
+      if (tab.manualContextPlan && tab.bootstrapReady && !inPlace
+        && ["awaiting-user", "sent", "running"].includes(tab.manualState)) {
+        tab.manualAttachmentsNonce = randomBytes(24).toString("base64url");
+        tab.status = "error";
+        tab.message = "ChatGPT page reloaded during this Zero Risk plan. Start a new Codex turn.";
+        this.signalManualTerminal(tab, "failed");
+      }
       invalidateConversation(url, inPlace, "did-start-navigation");
       tab.url = url;
       tab.loading = true;
@@ -1885,6 +1936,10 @@ class BrowserHost {
     this.turnTabs.delete(tab.id);
     if (tab.interactionMode === "manual") {
       if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
+      if (tab.manualAttachmentsDeadlineTimer) clearTimeout(tab.manualAttachmentsDeadlineTimer);
+      tab.manualAttachmentsDeadlineTimer = null;
+      for (const resolve of tab.manualAttachmentsWaiters || []) resolve({ status: "cancelled" });
+      tab.manualAttachmentsWaiters?.clear();
       tab.manualDeadlineTimer = null;
       tab.manualDeadlineAt = null;
       tab.prompt = null;
@@ -2243,6 +2298,14 @@ class BrowserHost {
     tab.lastHeartbeatAt = Date.now();
     tab.prompt = null;
     tab.promptDigest = null;
+    if (tab.manualAttachmentsDeadlineTimer) clearTimeout(tab.manualAttachmentsDeadlineTimer);
+    tab.manualAttachmentsDeadlineTimer = null;
+    tab.manualAttachmentsDeadlineAt = null;
+    tab.manualAttachmentsStatus = status === "timeout" ? "timed-out" : status;
+    tab.manualAttachmentsAttestedAt = null;
+    tab.manualAttachmentsNonce = null;
+    for (const resolve of tab.manualAttachmentsWaiters || []) resolve({ status });
+    tab.manualAttachmentsWaiters?.clear();
     this.rememberManualTerminal(tab.traceId, tab.helperPid, status);
     for (const resolve of tab.manualWaiters || []) resolve({ status });
     tab.manualWaiters?.clear();
@@ -2284,9 +2347,9 @@ class BrowserHost {
 
   beginManualTurn(traceId, helperPid, prompt, conversationKey, resumePrompt, compaction = false,
     manualSentConfirmationRequired = true, expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
-    continuity, requireRetainedConversation = false) {
+    continuity, requireRetainedConversation = false, contextPlans) {
     const create = () => (this.beginManualTurnAcquisition ?? BrowserHost.prototype.beginManualTurnAcquisition).call(this, traceId, helperPid, prompt, conversationKey, resumePrompt,
-      compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation);
+      compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation, contextPlans);
     return continuity?.recovery
       ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create)
       : create();
@@ -2303,15 +2366,16 @@ class BrowserHost {
     expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
     continuity,
     requireRetainedConversation = false,
+    contextPlans,
   ) {
     if (this.manualOperation) {
       if (continuity && !continuity.expected) throw continuityFailure("continuity_resource_capacity");
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
-    if (typeof prompt !== "string" || prompt.length < 1 || prompt.length > MAX_MANUAL_PROMPT_CHARS) {
+    if (contextPlans === undefined && (typeof prompt !== "string" || prompt.length < 1 || prompt.length > MAX_MANUAL_PROMPT_CHARS)) {
       throw new Error(`Manual prompt must contain between 1 and ${MAX_MANUAL_PROMPT_CHARS} characters`);
     }
-    if (resumePrompt !== undefined
+    if (contextPlans === undefined && resumePrompt !== undefined
       && (typeof resumePrompt !== "string"
         || resumePrompt.length < 1
         || resumePrompt.length > MAX_MANUAL_PROMPT_CHARS)) {
@@ -2376,6 +2440,10 @@ class BrowserHost {
         || sameTrace.promptDigest !== manualPromptDigest(retryPrompt)) {
         throw new Error(`Zero Risk turn ${traceId} was retried with a different prompt`);
       }
+      const retryPlan = selectedManualContextPlan(contextPlans, sameTrace.manualConversationReused);
+      if (manualContextPlanDigest(retryPlan) !== manualContextPlanDigest(sameTrace.manualContextPlan)) {
+        throw new Error(`Zero Risk turn ${traceId} was retried with a different selected context plan or attachment manifest`);
+      }
       sameTrace.helperPid = helperPid;
       this.selectedTabId = sameTrace.id;
       this.showWindow();
@@ -2388,6 +2456,7 @@ class BrowserHost {
         deadlineAt: sameTrace.manualDeadlineAt ? new Date(sameTrace.manualDeadlineAt).toISOString() : null,
         state: sameTrace.manualState,
         sentConfirmationRequired: sameTrace.manualSentConfirmationRequired,
+        ...(sameTrace.manualContextPlan ? { selectedPlanId: sameTrace.manualContextPlan.planId } : {}),
       };
     }
     if (manualSentConfirmationRequired !== expectedManualSentConfirmationRequired) {
@@ -2411,6 +2480,13 @@ class BrowserHost {
       throw new Error(`Manual ChatGPT conversation ${conversationKey} owns multiple browser tabs`);
     }
     let tab = retained[0];
+    // Validate the actual branch before its prompt is copied or displayed. The other branch
+    // cannot contribute an attestation and may independently be unavailable.
+    const selectedPlan = selectedManualContextPlan(contextPlans, Boolean(tab));
+    const selectedPrompt = tab ? resumePrompt : prompt;
+    if (typeof selectedPrompt !== "string" || selectedPrompt.length < 1 || selectedPrompt.length > MAX_MANUAL_PROMPT_CHARS) {
+      throw new Error(`The selected manual prompt must contain between 1 and ${MAX_MANUAL_PROMPT_CHARS} characters`);
+    }
     if (tab) {
       if (typeof resumePrompt !== "string" || !resumePrompt) {
         throw new Error("A retained Zero Risk conversation requires an incremental resume prompt");
@@ -2453,6 +2529,7 @@ class BrowserHost {
         throw error;
       }
     }
+    this.bindManualContextPlan(tab, selectedPlan);
     this.armManualTurnDeadline(tab);
     this.selectedTabId = tab.id;
     this.showWindow();
@@ -2471,7 +2548,110 @@ class BrowserHost {
       deadlineAt: new Date(tab.manualDeadlineAt).toISOString(),
       state: tab.manualState,
       sentConfirmationRequired: tab.manualSentConfirmationRequired,
+      ...(selectedPlan ? { selectedPlanId: selectedPlan.planId } : {}),
     };
+  }
+
+  bindManualContextPlan(tab, plan) {
+    if (tab.manualAttachmentsDeadlineTimer) clearTimeout(tab.manualAttachmentsDeadlineTimer);
+    tab.manualContextPlan = plan;
+    tab.manualAttachmentsNonce = plan ? randomBytes(24).toString("base64url") : null;
+    tab.manualAttachmentsStatus = plan?.requiredAttachments.length ? "pending" : "not-required";
+    tab.manualAttachmentsAttestedAt = null;
+    tab.manualAttachmentsWaiters = new Set();
+    tab.manualAttachmentsDeadlineAt = plan?.requiredAttachments.length ? Date.now() + MANUAL_ATTACHMENT_CONFIRM_TIMEOUT_MS : null;
+    tab.manualAttachmentsDeadlineTimer = null;
+    this.armManualAttachmentsDeadline(tab);
+  }
+
+  armManualAttachmentsDeadline(tab) {
+    if (tab.manualAttachmentsStatus !== "pending" || !tab.manualAttachmentsDeadlineAt) return;
+    if (tab.manualAttachmentsDeadlineTimer) clearTimeout(tab.manualAttachmentsDeadlineTimer);
+    tab.manualAttachmentsDeadlineTimer = setTimeout(() => {
+      if (this.turnTabs.get(tab.id) !== tab || tab.manualAttachmentsStatus !== "pending") return;
+      tab.status = "error";
+      tab.message = "Required images were not confirmed within five minutes";
+      this.signalManualTerminal(tab, "timeout");
+      this.publishState?.(this.snapshot());
+      this.logger.warn("browser.manual_attachments_timed_out", { tabId: tab.id, traceId: tab.traceId });
+    }, Math.max(0, tab.manualAttachmentsDeadlineAt - Date.now()));
+    tab.manualAttachmentsDeadlineTimer.unref?.();
+  }
+
+  assertManualPlanBinding(tab, binding) {
+    if (!tab.manualContextPlan) return;
+    if (!binding || binding.traceId !== tab.traceId || binding.nonce !== tab.manualAttachmentsNonce
+      || binding.planId !== tab.manualContextPlan.planId || binding.manifestDigest !== tab.manualContextPlan.manifestDigest
+      || !tab.manualAttachmentsNonce || !["awaiting-user", "sent", "running"].includes(tab.manualState)) {
+      throw new Error("This confirmation no longer belongs to the current Zero Risk plan");
+    }
+  }
+
+  inspectManualAttachments(traceId, helperPid, planId, manifestDigest) {
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
+    if (!tab || tab.interactionMode !== "manual" || tab.helperPid !== helperPid) {
+      const terminal = this.manualTerminalSignals.get(traceId);
+      if (terminal?.helperPid === helperPid) return { status: terminal.status };
+      throw new Error("Zero Risk attachment confirmation ownership is invalid");
+    }
+    if (!tab.manualContextPlan || tab.manualContextPlan.planId !== planId || tab.manualContextPlan.manifestDigest !== manifestDigest) {
+      throw new Error("Zero Risk attachment confirmation does not match the selected plan and manifest");
+    }
+    if (!["awaiting-user", "sent", "running"].includes(tab.manualState)) {
+      return { status: tab.manualState === "timed-out" ? "timeout" : tab.manualState };
+    }
+    if (tab.manualAttachmentsStatus === "pending" && Date.now() >= tab.manualAttachmentsDeadlineAt) {
+      this.signalManualTerminal(tab, "timeout");
+      return { status: "timeout" };
+    }
+    return { planId, manifestDigest, requiredCount: tab.manualContextPlan.requiredAttachments.length,
+      status: tab.manualAttachmentsStatus, attestedAt: tab.manualAttachmentsAttestedAt,
+      deadlineAt: tab.manualAttachmentsDeadlineAt ? new Date(tab.manualAttachmentsDeadlineAt).toISOString() : null };
+  }
+
+  async waitManualAttachments(traceId, helperPid, planId, manifestDigest, observerTimeoutMs = 35_000) {
+    const observed = this.inspectManualAttachments(traceId, helperPid, planId, manifestDigest);
+    if (observed.status !== "pending") return observed;
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
+    return await new Promise(resolve => {
+      let settled = false;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(observerTimer);
+        tab.manualAttachmentsWaiters.delete(finish);
+        resolve(result);
+      };
+      const observerTimer = setTimeout(() => finish(this.inspectManualAttachments(traceId, helperPid, planId, manifestDigest)), observerTimeoutMs);
+      observerTimer.unref?.();
+      tab.manualAttachmentsWaiters.add(finish);
+    });
+  }
+
+  confirmManualAttachments(tabId, binding) {
+    const tab = this.turnTabs.get(tabId);
+    if (!tab || tab.interactionMode !== "manual" || !tab.manualContextPlan) throw new Error("Zero Risk attachment plan does not exist");
+    this.assertManualPlanBinding(tab, binding);
+    if (tab.manualAttachmentsStatus === "user_attested") return this.snapshot();
+    if (tab.manualAttachmentsStatus !== "pending" || !tab.manualContextPlan.requiredAttachments.length) {
+      throw new Error("This Zero Risk plan has no required attachment confirmation");
+    }
+    if (Date.now() >= tab.manualAttachmentsDeadlineAt) {
+      this.signalManualTerminal(tab, "timeout");
+      this.publishState?.(this.snapshot());
+      throw new Error("Required attachment confirmation timed out");
+    }
+    clearTimeout(tab.manualAttachmentsDeadlineTimer);
+    tab.manualAttachmentsDeadlineTimer = null;
+    tab.manualAttachmentsDeadlineAt = null;
+    tab.manualAttachmentsStatus = "user_attested";
+    tab.manualAttachmentsAttestedAt = new Date().toISOString();
+    const result = this.inspectManualAttachments(tab.traceId, tab.helperPid, binding.planId, binding.manifestDigest);
+    for (const resolve of tab.manualAttachmentsWaiters) resolve(result);
+    tab.manualAttachmentsWaiters.clear();
+    this.publishState?.(this.snapshot());
+    this.logger.info("browser.manual_attachments_attested", { tabId: tab.id, traceId: tab.traceId, count: result.requiredCount });
+    return this.snapshot();
   }
 
   async waitManualSent(traceId, helperPid, observerTimeoutMs = 35_000) {
@@ -2527,11 +2707,12 @@ class BrowserHost {
     });
   }
 
-  copyManualPrompt(tabId) {
+  copyManualPrompt(tabId, binding) {
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual" || typeof tab.prompt !== "string") {
       throw new Error("Manual prompt is no longer available");
     }
+    this.assertManualPlanBinding(tab, binding);
     this.writeManualPrompt(tab.prompt);
     if (tab.manualState === "awaiting-user") {
       tab.manualDeadlineAt = Date.now() + tab.manualSubmitTimeoutMs;
@@ -2542,9 +2723,10 @@ class BrowserHost {
     return this.snapshot();
   }
 
-  confirmManualSent(tabId) {
+  confirmManualSent(tabId, binding) {
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual") throw new Error("Zero Risk tab does not exist");
+    this.assertManualPlanBinding(tab, binding);
     if (tab.manualSentConfirmationRequired === false) {
       throw new Error("Sent confirmation is disabled for this Zero Risk turn");
     }
@@ -2608,6 +2790,9 @@ class BrowserHost {
     }
     if (status === "completed" && tab.manualState !== "sent" && tab.manualState !== "running") {
       throw new Error(`Zero Risk turn ${traceId} cannot complete before Sent confirmation`);
+    }
+    if (status === "completed" && tab.manualAttachmentsStatus === "pending") {
+      throw new Error(`Zero Risk turn ${traceId} cannot complete before required attachment confirmation`);
     }
     if (status === "completed" && retain && tab.conversationKey) {
       completeContinuityTransaction(this, tab, true);
@@ -3368,7 +3553,7 @@ class BrowserHost {
     }
     const descriptor = {
       version: 3,
-      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE],
+      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE, CONTEXT_DELIVERY_FEATURE],
       kind: "codex-web-gpt-launcher",
       profile: this.profile,
       pid: process.pid,
@@ -3423,6 +3608,9 @@ class BrowserHost {
     for (const tab of this.turnTabs.values()) {
       if (tab.interactionMode === "manual") {
         if (tab.manualDeadlineTimer) clearTimeout(tab.manualDeadlineTimer);
+        if (tab.manualAttachmentsDeadlineTimer) clearTimeout(tab.manualAttachmentsDeadlineTimer);
+        for (const resolve of tab.manualAttachmentsWaiters || []) resolve({ status: "cancelled" });
+        tab.manualAttachmentsWaiters?.clear();
         tab.prompt = null;
         tab.promptDigest = null;
         for (const resolve of tab.manualWaiters || []) resolve({ status: "cancelled" });

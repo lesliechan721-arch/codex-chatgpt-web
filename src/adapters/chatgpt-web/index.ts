@@ -1,10 +1,16 @@
 import { continuityBindingsFor } from "./continuity-binding";
-import { assertRecoveryWriter, completeRecoveryWork, recoveryIdentity, recoveryStore, stopRecoveryWork, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
+import { assertRecoveryWriter, bindRecoveryContextCoverage, restoreRecoveryContextCoverage, reserveRecoveryContextCoverage, releaseRecoveryContextCoverageReservation, completeRecoveryWork, recoveryIdentity, recoveryStore, stopRecoveryWork, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { observedTaskAcknowledgement } from "./task-update-ack";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
-import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
+import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint, isLegacyChatGptConnectorIdentity, legacyChatGptConnectorMigrationMessage } from "../../config";
+import { ContextSend } from "./context-send";
+import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, contextCandidateMessageIndices, contextCandidateRawInputIndices } from "./context-candidate-mapping";
+import { createContextSnapshot, contextSnapshotPriorityImageLocators, type ContextSnapshot } from "./context-snapshot";
+import { prepareFreshCompactionSource, captureRetainedCompactionSource, type CompactionSourceCoverage } from "./compaction-context";
+import { assertProviderContextCapabilityVerified } from "./context-capability-verification";
+import { estimateTokens } from "../../lib/token-estimate";
 import {
   cancelLauncherManualTurn,
   endLauncherManualTurn,
@@ -18,6 +24,7 @@ import {
   startLauncherManualTurn,
   waitForLauncherManualSent,
   waitForLauncherManualTerminal,
+  waitForLauncherManualAttachments,
   type LauncherManualTurnEnd,
   type LauncherManualTurnOwner,
   type LauncherManualTurnStart,
@@ -158,6 +165,7 @@ function cancellableBrowserTurn(
 }
 
 export interface ChatGptZeroRiskManualControl {
+  waitAttachments?: typeof waitForLauncherManualAttachments;
   start(descriptorPath: string, activity: LauncherManualTurnStart): Promise<unknown>;
   waitSent(
     descriptorPath: string,
@@ -178,6 +186,7 @@ export interface ChatGptZeroRiskManualControl {
 }
 
 const launcherZeroRiskManualControl: ChatGptZeroRiskManualControl = {
+  waitAttachments: waitForLauncherManualAttachments,
   start: startLauncherManualTurn,
   waitSent: waitForLauncherManualSent,
   waitTerminal: waitForLauncherManualTerminal,
@@ -431,10 +440,15 @@ export function createChatGptWebAdapter(
     broker?: TurnBrokerOwner;
     zeroRiskManualControl?: ChatGptZeroRiskManualControl;
     codexHome?: string;
+    /** Private host dependency; never populated from Responses input. */
+    verifyContextCapability?: () => Promise<void>;
   } = {},
 ): ProviderAdapter {
   if (provider.chatgptWeb?.continuityStateDirectory) continuityBindingsFor(resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory)));
   const worker = ChatGptBrowserWorker.forProvider(provider);
+  const verifyContextCapability = dependencies.verifyContextCapability ?? (async () => {
+    await assertProviderContextCapabilityVerified(provider);
+  });
   const preparedContinuity = new WeakMap<CodexParsedRequest, PreparedContinuityRequest>();
   const negotiatedTaskUpdates = new WeakSet<CodexParsedRequest>();
   const broker = dependencies.broker ?? TurnBroker.forSocket(brokerSocketPath(provider));
@@ -556,6 +570,9 @@ export function createChatGptWebAdapter(
     const mode = manualRequest
       ? { localTools: true }
       : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
+    if (mode.localTools && provider.chatgptWeb?.appName && isLegacyChatGptConnectorIdentity(provider.chatgptWeb.appName)) {
+      throw new Error(legacyChatGptConnectorMigrationMessage(provider.chatgptWeb.appName));
+    }
     // Preserve runTurn's deterministic validation order before accepting trusted authority.
     if (!parsed._compactionRequest) createChatGptStructuredOutputValidator(parsed.options.outputFormat);
     const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
@@ -568,9 +585,13 @@ export function createChatGptWebAdapter(
     environment: ChatGptTurnCapability | undefined,
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
-    hooks: { onCompactionProgress?: () => void } = {},
+    hooks: { onCompactionProgress?: () => void; sourceCoverage?: CompactionSourceCoverage; sourceSnapshot?: ContextSnapshot } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
+    // Automatic compaction closes business tools. Its source navigation still
+    // depends on the configured Full Native path, as in structured handoff admission.
+    const nativeCompaction = Boolean(parsed._compactionRequest && configuredCapabilities.localToolsEnabled
+      && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID);
     if (manualRequest !== manualInteraction) {
       throw new Error(
         manualInteraction
@@ -663,6 +684,61 @@ export function createChatGptWebAdapter(
       ? retainedConversationResumeRequest(checkpointInput.parsed)
       : undefined;
     const retainConversation = conversationKey !== undefined;
+    const previousSource = conversationKey ? chatGptTurnSessions.findConversationHead(conversationKey) : undefined;
+    let previousCoverage = previousSource?.runtime.compactionSourceCoverage;
+    const contextCanonical = contextCandidateCanonicalSource(checkpointInput.parsed, promptInput) ?? checkpointInput.parsed;
+    const imagePriorities = (candidate: CodexParsedRequest) => contextSnapshotPriorityImageLocators(contextCanonical, {
+      // Ordinary retained suffixes share the original message objects. Re-parsed
+      // continuity candidates instead carry their producer-proven canonical map.
+      messageIndices: (contextCandidateMessageIndices(contextCanonical, candidate)
+        ?? candidate.context.messages.map(message => {
+          const index = contextCanonical.context.messages.indexOf(message);
+          return index >= 0 && contextCanonical.context.messages.lastIndexOf(message) === index ? index : null;
+        })).filter((index): index is number => index !== null),
+      rawInputIndices: contextCandidateRawInputIndices(contextCanonical, candidate),
+    });
+    const sourceSnapshot = mode.localTools && !parsed._compactionRequest && !continuity?.finalReplaySource ? createContextSnapshot(contextCanonical, {
+      provenanceByMessage: contextCandidateSourceProvenance(contextCanonical, promptInput),
+      imageStoragePolicy: "bounded",
+      // The retained candidate must reserve its instruction images before full
+      // history occupies the shared cache. Full still has its own media plan.
+      priorityImageLocators: [...(resumeInput ? imagePriorities(resumeInput) : []), ...imagePriorities(promptInput)],
+    }) : undefined;
+    if (sourceSnapshot && !previousCoverage && continuity?.binding.recovery) {
+      previousCoverage = restoreRecoveryContextCoverage(continuity.binding.recovery, sourceSnapshot);
+    }
+    const previousOutcome = previousSource?.settledOutcome();
+    const retainedTokens = (previousCoverage?.latest()?.pageTokens ?? 0)
+      + (previousOutcome?.type === "final" ? estimateTokens(previousOutcome.answer) : 0);
+    const contextSend = mode.localTools && !parsed._compactionRequest && !continuity?.finalReplaySource
+      ? new ContextSend(contextCanonical,
+        broker, turnCapabilities, traceId, previousCoverage,
+        taskUpdates ? { expectedDriverGeneration: 0, taskRevision: 0 } : undefined, sourceSnapshot, verifyContextCapability) : undefined;
+    if (contextSend && continuity?.binding.recovery) bindRecoveryContextCoverage(continuity.binding.recovery, contextSend.coverage);
+    const finalizeContextSend = async (browser: Promise<string>): Promise<string> => {
+      try { return await browser; }
+      finally {
+        try { await contextSend?.syncUsage(); }
+        finally { contextSend?.retire(); }
+      }
+    };
+    let freshCompaction: Awaited<ReturnType<typeof prepareFreshCompactionSource>> | undefined;
+    const prepareFresh = async (turnToken?: string) => {
+      freshCompaction = await prepareFreshCompactionSource(parsed, broker, turnCapabilities, {
+        historyRevision: parsed._continuityHistoryRevision ?? 0, ownerGeneration: traceId, traceId,
+        timeoutMs, signal: browserAbort.signal, sourceCoverage: hooks.sourceCoverage, sourceSnapshot: hooks.sourceSnapshot,
+        ...(turnToken ? { turnToken } : {}),
+      });
+      return { ...parsed, context: { ...parsed.context, systemPrompt: [], tools: [],
+        messages: [{ role: "user" as const, content: freshCompaction.instruction, timestamp: Date.now() }] } };
+    };
+    const finishFresh = async (browser: Promise<string>): Promise<string> => {
+      try {
+        const answer = await browser;
+        if (nativeCompaction && !freshCompaction) throw continuityError("continuity_source_unproven", "The compaction source entry was not prepared or delivered.");
+        return freshCompaction ? await freshCompaction.acceptSummary(answer) : answer;
+      } finally { await freshCompaction?.cleanup(); }
+    };
     const releaseRetainedConversation = conversationKey && retainedLauncherDescriptor
       ? async () => {
         if (continuity && !continuityLease) return;
@@ -852,7 +928,9 @@ export function createChatGptWebAdapter(
           submission.phase = "send_activated" as const;
         },
       } : {}),
-      onSubmitted: () => {
+      onSubmitted: async () => {
+        await contextSend?.sent();
+        await freshCompaction?.markDelivered();
         if (continuity?.binding.recovery) {
           const ref = continuity.binding.recovery;
           const record = assertRecoveryWriter(ref);
@@ -897,23 +975,27 @@ export function createChatGptWebAdapter(
               ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}) },
           );
           observeCapabilityRetirement(activeToken, externalProgress);
-          const compiled = compileChatGptWebPrompt(
-            promptInput,
-            turnCapabilities,
-            activeToken,
-            { manualControl: true, ...(taskUpdates ? { taskUpdateProtocol: 1 } : {}),
-              ...(continuityClaim?.expected ? { retainedContinuity: true } : {}) },
-          );
-          const resumeCompiled = resumeInput
-            ? compileChatGptWebPrompt(
-              resumeInput,
-              turnCapabilities,
-              activeToken,
-              { manualControl: true, ...(taskUpdates ? { taskUpdateProtocol: 1 } : {}),
-                ...(continuityClaim?.expected ? { retainedContinuity: true } : {}) },
-            )
-            : undefined;
-          if (continuity) assertContinuityCompiledInput(compiled, promptInput, turnCapabilities);
+          const manualInput = parsed._compactionRequest ? await prepareFresh(activeToken) : promptInput;
+          const options = { manualControl: true as const, ...(parsed._compactionRequest ? { compactionReadOnly: true as const } : {}),
+            ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}),
+            ...(continuityClaim?.expected ? { retainedContinuity: true as const } : {}) };
+          const prepareManual = async (input: CodexParsedRequest, resume: boolean) => {
+            const plan = contextSend ? await contextSend.prepare(input, activeToken!, options,
+              resume || continuityClaim?.expected ? retainedTokens : 0) : undefined;
+            const compiled = plan?.compiled ?? compileChatGptWebPrompt(input, turnCapabilities, activeToken, options);
+            if (continuity) assertContinuityCompiledInput(compiled, plan?.projected ?? input, turnCapabilities);
+            return { plan, compiled };
+          };
+          const full = await prepareManual(manualInput, false).then(value => ({ value, error: undefined }),
+            error => ({ value: undefined, error }));
+          const resume = resumeInput ? await prepareManual(resumeInput, true).then(value => ({ value, error: undefined }),
+            error => ({ value: undefined, error })) : undefined;
+          if (!full.value && !resume?.value) throw full.error ?? resume?.error;
+          const compiled = full.value?.compiled;
+          const resumeCompiled = resume?.value?.compiled;
+          const hasNavigationPlan = !!(compiled?.contextPlan || resumeCompiled?.contextPlan);
+          const fullDescriptor = hasNavigationPlan && full.value?.plan ? contextSend!.descriptor(full.value.plan) : undefined;
+          const resumeDescriptor = hasNavigationPlan && resume?.value?.plan ? contextSend!.descriptor(resume.value.plan) : undefined;
           for (const candidate of [compiled, resumeCompiled]) {
             if (!candidate) continue;
             if (candidate.multipart) {
@@ -925,6 +1007,9 @@ export function createChatGptWebAdapter(
               });
             }
           }
+          const candidateCoverage = contextSend ? [full.value?.plan, resume?.value?.plan]
+            .filter(plan => plan !== undefined).map(plan => contextSend.candidateCoverage(plan)) : [];
+          if (contextSend && continuity?.binding.recovery) reserveRecoveryContextCoverage(continuity.binding.recovery, candidateCoverage);
           if (continuity?.binding.recovery) {
             const ref = continuity.binding.recovery;
             const record = assertRecoveryWriter(ref);
@@ -933,7 +1018,11 @@ export function createChatGptWebAdapter(
           }
           const manualLease = await zeroRiskManualControl.start(retainedLauncherDescriptor, {
             ...owner,
-            prompt: compiled.text,
+            prompt: compiled?.text ?? "",
+            ...(hasNavigationPlan ? { contextPlans: {
+              ...(fullDescriptor ? { full: fullDescriptor } : {}),
+              ...(resumeDescriptor ? { resume: resumeDescriptor } : {}),
+            } } : {}),
             sentConfirmationRequired: zeroRiskRequireSentConfirmation,
             ...(resumeCompiled ? { resumePrompt: resumeCompiled.text } : {}),
             ...(conversationKey ? { conversationKey } : {}),
@@ -944,6 +1033,15 @@ export function createChatGptWebAdapter(
             ...(parsed._compactionRequest ? { compaction: true as const } : {}),
           });
           launcherStarted = true;
+          const selectedId = (manualLease as { selectedPlanId?: string } | undefined)?.selectedPlanId;
+          const chosen = selectedId ? [full.value, resume?.value].find(value => value?.plan && contextSend!.descriptor(value.plan).planId === selectedId)
+            : (manualLease as { reused?: boolean } | undefined)?.reused ? resume?.value : full.value;
+          if (contextSend) {
+            if (!chosen?.plan || hasNavigationPlan && !selectedId) {
+              throw new Error("Launcher did not confirm the selected context delivery plan");
+            }
+            await contextSend.select(activeToken, chosen.plan);
+          }
           if (continuity) acceptContinuityLease((manualLease as { continuity?: unknown } | undefined)?.continuity);
           // Do not expose the broker request id to the outer harness until Launcher has captured
           // and accepted the same per-turn Sent policy used by the broker.
@@ -953,8 +1051,8 @@ export function createChatGptWebAdapter(
             trace.push({
               kind: "commentary",
               text: zeroRiskRequireSentConfirmation
-                ? "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the plugin shown in the launcher and the model you want, send the prompt, then confirm it was sent in the launcher."
-                : "> **Action required in Zero Risk**\n>\n> Open the launcher, copy and paste the prompt into ChatGPT, add any images yourself because Zero Risk cannot transfer them, select the plugin shown in the launcher and the model you want, then send the prompt. The connector will confirm this turn automatically.",
+                ? "> **Action required in Zero Risk**\n>\n> Copy the launcher prompt into ChatGPT. Add and confirm only the fallback images listed in the launcher, if any. Select the shown plugin and your model, send the prompt, then confirm Sent."
+                : "> **Action required in Zero Risk**\n>\n> Copy the launcher prompt into ChatGPT. Add and confirm only the fallback images listed in the launcher, if any. Select the shown plugin and your model, then send the prompt. The connector confirms this turn automatically.",
             });
           }
           if (zeroRiskRequireSentConfirmation) {
@@ -962,6 +1060,7 @@ export function createChatGptWebAdapter(
               abortSignal: browserAbort.signal,
             });
             await broker.confirmSafeTurnSent(activeToken, surfaceNonce);
+            await contextSend?.sent();
             submission.phase = "accepted";
             if (!parsed._compactionRequest) trace.push({
               kind: "commentary",
@@ -986,15 +1085,27 @@ export function createChatGptWebAdapter(
               terminalFailure,
             ]);
             submission.phase = "accepted";
+            if (!zeroRiskRequireSentConfirmation) await contextSend?.sent();
+            await freshCompaction?.markDelivered();
             await zeroRiskManualControl.markStarted(retainedLauncherDescriptor, owner);
+            const mediaPlan = chosen?.compiled.contextPlan;
+            const mediaReady = mediaPlan?.requiredAttachments.length ? (async () => {
+              if (!zeroRiskManualControl.waitAttachments) throw new Error("Update Launcher to confirm required image attachments");
+              const evidence = await zeroRiskManualControl.waitAttachments(retainedLauncherDescriptor,
+                { ...owner, planId: mediaPlan.planId, manifestDigest: mediaPlan.manifestDigest }, { abortSignal: terminalAbort.signal });
+              if (evidence.status !== "user_attested") throw new Error("Required image attachments were not confirmed");
+              await broker.confirmContextAttachments!(activeToken!, { planId: mediaPlan.planId, manifestDigest: mediaPlan.manifestDigest },
+                taskUpdates ? { expectedDriverGeneration: 0, taskRevision: 0 } : undefined);
+            })() : Promise.resolve();
             if (!parsed._compactionRequest) trace.push({
               kind: "commentary",
               text: "> **Zero Risk connected**\n>\n> The Zero Risk plugin is connected. ChatGPT is now working through the native Codex harness; progress remains visible in the launcher.",
             });
             answer = await Promise.race([
-              broker.waitForSafeCompletion(activeToken, browserAbort.signal),
+              Promise.all([broker.waitForSafeCompletion(activeToken, browserAbort.signal), mediaReady]).then(([result]) => result),
               terminalFailure,
             ]);
+            if (freshCompaction) answer = await freshCompaction.acceptSummary(answer);
           } finally {
             terminalAbort.abort();
             browserAbort.signal.removeEventListener("abort", abortTerminal);
@@ -1021,7 +1132,10 @@ export function createChatGptWebAdapter(
           const normalized = safeManualAdapterError(error);
           // Launcher capacity rejection occurs before prompt publication. Keep the local
           // captured input, while the durable marker remains conservatively send-possible.
-          if (!launcherStarted && !continuityLease && (normalized as { code?: string }).code === "continuity_resource_capacity") submission.phase = "prepared";
+          if (!launcherStarted && !continuityLease && (normalized as { code?: string }).code === "continuity_resource_capacity") {
+            submission.phase = "prepared";
+            if (continuity?.binding.recovery) releaseRecoveryContextCoverageReservation(continuity.binding.recovery);
+          }
           // Capture the causal state before our own cleanup revokes the broker capability. The
           // retirement observer also aborts browserAbort, but that self-induced abort must not turn
           // an ordinary launcher/runtime failure into a user cancellation.
@@ -1041,6 +1155,10 @@ export function createChatGptWebAdapter(
             );
           }
           throw normalized;
+        } finally {
+          await freshCompaction?.cleanup();
+          try { await contextSend?.syncUsage(); }
+          finally { contextSend?.retire(); }
         }
       };
       const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeContinuity(runManual())), browserAbort);
@@ -1059,6 +1177,7 @@ export function createChatGptWebAdapter(
         trace,
         text,
         usageInput: checkpointInput.parsed,
+        ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage() } : {}),
         manualControl: { surfaceNonce },
         ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
         get recoveryFinal() { return recoveryFinal; },
@@ -1066,9 +1185,11 @@ export function createChatGptWebAdapter(
         ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
         retireCapability: async () => {
           if (activeToken) await (broker.revokeTrusted ?? broker.revoke).call(broker, activeToken);
+          await contextSend?.syncUsage();
         },
         submission,
         cancel: (reason?: Error) => {
+          contextSend?.retire();
           loseContinuity();
           browserTurn.cancel(reason);
           if (continuity) void browserTurn.physicalSettlement.then(() => releaseRetainedConversation?.()).catch(() => {});
@@ -1081,18 +1202,19 @@ export function createChatGptWebAdapter(
       };
     }
     if (!mode.localTools) {
-      const browserTurn = cancellableBrowserTurn(finalizeCheckpoint(worker.run({
+      const browserTurn = cancellableBrowserTurn(finishFresh(finalizeCheckpoint(worker.run({
         traceId,
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
         capabilities: turnCapabilities,
+        ...(nativeCompaction ? { nativeConnector: true } : {}),
         prepare: async () => ({
           ...compileChatGptWebPrompt(
-            checkpointInput.parsed,
+            nativeCompaction ? await prepareFresh() : checkpointInput.parsed,
             turnCapabilities,
             undefined,
-            compileOptionsFor(checkpointInput.parsed),
+            { ...compileOptionsFor(checkpointInput.parsed), ...(nativeCompaction ? { compactionReadOnly: true } : {}) },
           ),
           release: () => {},
         }),
@@ -1107,7 +1229,7 @@ export function createChatGptWebAdapter(
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
         } : {}),
-      })), browserAbort);
+      }))), browserAbort);
       return {
         mode: "read-only",
         browser: browserTurn.browser,
@@ -1177,13 +1299,11 @@ export function createChatGptWebAdapter(
       );
       activeToken = turnToken;
       try {
-        const compiled = compileChatGptWebPrompt(
-          input,
-          turnCapabilities,
-          turnToken,
-          compileOptionsFor(input),
-        );
-        if (continuity) assertContinuityCompiledInput(compiled, input, turnCapabilities);
+        const plan = contextSend ? await contextSend.prepare(input, turnToken, compileOptionsFor(input),
+          input === resumeInput || continuityClaim?.expected ? retainedTokens : 0) : undefined;
+        const compiled = plan?.compiled ?? compileChatGptWebPrompt(input, turnCapabilities, turnToken, compileOptionsFor(input));
+        if (continuity) assertContinuityCompiledInput(compiled, plan?.projected ?? input, turnCapabilities);
+        if (contextSend && plan && !plan.navigationEnabled) await contextSend.select(turnToken, plan);
         // Publish only after preparation succeeds: otherwise its failure revokes the token
         // before the response observer uses it and masks the cause as an expired capability.
         observeCapabilityRetirement(turnToken, externalProgress);
@@ -1198,7 +1318,7 @@ export function createChatGptWebAdapter(
         throw error;
       }
     };
-    const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeContinuity(finalizeCheckpoint(worker.run({
+    const browserTurn = cancellableBrowserTurn(trackBrowserOwner(finalizeContinuity(finalizeCheckpoint(finalizeContextSend(worker.run({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
@@ -1206,6 +1326,10 @@ export function createChatGptWebAdapter(
       capabilities: turnCapabilities,
       prepare: () => prepareWith(promptInput),
       ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
+      ...(contextSend ? { onContextPlanSelected: async (planId: string) => {
+        if (!activeToken) throw new Error("No active owner for selected context plan");
+        await contextSend.select(activeToken, planId);
+      } } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
       ...(continuityClaim ? {
         continuity: continuityClaim,
@@ -1244,7 +1368,7 @@ export function createChatGptWebAdapter(
         captureLunaCheckpoint: true,
         onLunaCheckpoint: captureCheckpoint,
       } : {}),
-    })))), browserAbort);
+    }))))), browserAbort);
     void browserTurn.browser.catch(error => {
       if (!tokenSettled) {
         tokenSettled = true;
@@ -1261,15 +1385,18 @@ export function createChatGptWebAdapter(
       trace,
       text,
       usageInput: checkpointInput.parsed,
+      ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage() } : {}),
       ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
       get recoveryFinal() { return recoveryFinal; },
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
       retireCapability: async () => {
         if (activeToken) await (broker.revokeTrusted ?? broker.revoke).call(broker, activeToken);
+          await contextSend?.syncUsage();
       },
       submission,
       cancel: (reason?: Error) => {
+        contextSend?.retire();
         loseContinuity();
         browserTurn.cancel(reason);
         if (continuity) void browserTurn.physicalSettlement.then(() => releaseRetainedConversation?.()).catch(() => {});
@@ -1287,7 +1414,7 @@ export function createChatGptWebAdapter(
     async preflight(parsed, incoming) {
       await prepareTrustedEnvironment(parsed, incoming.abortSignal);
       if (parsed._conversationPolicy === "continuity-first") {
-        preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal));
+        preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal, verifyContextCapability));
       } else if (isChatGptWebZeroRiskBackendModel(parsed.modelId) === manualInteraction) {
         incoming.abortSignal?.throwIfAborted();
         await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, extractChatGptTurnIdentity(parsed).threadId);
@@ -1363,7 +1490,7 @@ export function createChatGptWebAdapter(
           }
         }
         if (parsed._conversationPolicy === "continuity-first" && !preparedContinuity.has(parsed)) {
-          preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal));
+          preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal, verifyContextCapability));
         }
         if (parsed._conversationPolicy === "continuity-first" && environment) {
           environment = { ...environment, tools: parsed.context.tools ?? [] };
@@ -1390,7 +1517,7 @@ export function createChatGptWebAdapter(
           const shared = runContinuityCompaction(parsed, prepared, worker, broker, configuredCapabilities,
             executionNamespace, timeoutMs, incoming.onProgress, () => {
               emit({ type: "text_delta", text: "A new ChatGPT conversation was created with the current context.", phase: "commentary" });
-            });
+            }, verifyContextCapability);
           const summary = await withAbort(shared, incoming.abortSignal);
           await assertContinuityCompactionResult(prepared);
           emit({ type: "text_delta", text: summary, phase: "final_answer" });
@@ -1461,6 +1588,7 @@ export function createChatGptWebAdapter(
                     : {}),
                 },
                 async (operatorSignal, retainOwnershipUntil) => {
+                  await verifyContextCapability();
                   const handoffTimeoutMs = Math.min(
                     timeoutMs ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
                     MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
@@ -1498,6 +1626,9 @@ export function createChatGptWebAdapter(
                   armHandoffDeadline();
                   const operationSignal = AbortSignal.any([operatorSignal, handoffDeadline.signal]);
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
+                  const freshSourceCoverage = (compactedSourceExecutionKey
+                    ? chatGptTurnSessions.findTaskUpdateSource(compactedSourceExecutionKey)
+                    : sourceConversationKey ? chatGptTurnSessions.findConversationHead(sourceConversationKey) : undefined)?.runtime.compactionSourceCoverage;
                   let fallbackReason: string | undefined;
                   const runFreshCompaction = async (reason: string): Promise<string> => {
                     handoffPhase = "fresh_compaction";
@@ -1510,18 +1641,23 @@ export function createChatGptWebAdapter(
                     // and the final accepted compact prompt re-arms the five-minute liveness budget;
                     // transport time cannot consume the model-generation window.
                     armHandoffDeadline();
+                    await source?.runtime.syncContextUsage?.();
+                    const sourceSnapshot = source ? captureRetainedCompactionSource(parsed, source) : undefined;
                     const fallbackRuntime = startRuntime(
                       parsed,
                       manualRequest ? environment : undefined,
                       freshCompactionTraceId,
                       turnCapabilities,
-                      { onCompactionProgress: reportCompactionProgress },
+                      { onCompactionProgress: reportCompactionProgress, sourceCoverage: source?.runtime.compactionSourceCoverage ?? freshSourceCoverage,
+                        sourceSnapshot },
                     );
                     retainOwnershipUntil(fallbackRuntime.physicalSettlement);
                     try {
                       const rawSummary = await withAbort(fallbackRuntime.browser, operationSignal);
                       await withAbort(fallbackRuntime.physicalSettlement, operationSignal);
-                      return canonicalizeCompactionHandoff(parsed, rawSummary);
+                      const summary = canonicalizeCompactionHandoff(parsed, rawSummary);
+                      (source?.runtime.compactionSourceCoverage ?? freshSourceCoverage)?.checkpointCommitted(parsed._continuityHistoryRevision ?? 0);
+                      return summary;
                     } catch (error) {
                       fallbackRuntime.cancel(error instanceof Error ? error : new Error(String(error)));
                       // The shared owner retains physical settlement independently of this error.
@@ -1601,6 +1737,7 @@ export function createChatGptWebAdapter(
                         broker,
                         operationSignal,
                         incoming.onProgress,
+                        undefined, false, turnCapabilities,
                       );
                       if (zeroRiskSummary === undefined) {
                         preserveFinalResponse = true;
@@ -1634,7 +1771,7 @@ export function createChatGptWebAdapter(
                         parsed,
                         source,
                         structuredBroker!,
-                        configuredCapabilities,
+                        { ...configuredCapabilities, experimentalBiggerContext },
                         handoffTraceId,
                         operationSignal,
                         handoffTimeoutMs,
@@ -1654,7 +1791,7 @@ export function createChatGptWebAdapter(
                         parsed,
                         source,
                         structuredBroker!,
-                        configuredCapabilities,
+                        { ...configuredCapabilities, experimentalBiggerContext },
                         handoffTraceId,
                         operationSignal,
                         handoffTimeoutMs,
@@ -1672,6 +1809,7 @@ export function createChatGptWebAdapter(
                         : chatGptTurnSessions.retireConversationAndWait(retainedKey),
                       operationSignal,
                     );
+                    source.runtime.compactionSourceCoverage?.checkpointCommitted(parsed._continuityHistoryRevision ?? 0);
                     return {
                       summary,
                       path: fallbackReason ? "fresh" : "retained",
@@ -2133,6 +2271,7 @@ export function createChatGptWebAdapter(
                 if (results.length !== outstanding.length && !session.runtime.continuityBinding) {
                   throw new Error(`Codex returned ${results.length} of ${outstanding.length} results for a parallel ChatGPT tool batch`);
                 }
+                session.prepareCompactionToolResults(parsed, results.map(message => message.toolCallId));
                 for (const message of results) {
                   await ensureDriver();
                   await broker.completeTool(turnToken, message.toolCallId, brokerResult(message,
