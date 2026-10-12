@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseRequest } from "../src/responses/parser";
 import type { CodexMessage, CodexParsedRequest } from "../src/types";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -11,6 +14,10 @@ import { planContextDelivery, type ContextDeliveryPlan, type ContextDeliveryPlan
 import { ContextDeliveryPlanningError, contextAttachmentImage } from "../src/adapters/chatgpt-web/context-media-plan";
 import { assertContinuityCompiledInput, preflightContinuityInput, preflightFullRecoveryContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
+import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+import { estimateWebContextFieldCost } from "../src/adapters/chatgpt-web/context-renderer";
+import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
+import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
 const token = `turn_${"a".repeat(32)}`;
@@ -84,9 +91,10 @@ test("large history fields use the real compiler and exact pagination without ch
     expect(response.isError).not.toBe(true);
     const body = response.structuredContent as Record<string, any>;
     expect(body.range.start).toBe(end);
-    expect(body.content).not.toContain("�");
+    const textPage = parseContextTextReadResult(response).body;
+    expect(textPage).not.toContain("�");
     expect(body.range.end_exclusive).toBeGreaterThan(end);
-    read += body.content; end = body.range.end_exclusive; cursor = body.next_cursor ?? undefined;
+    read += textPage; end = body.range.end_exclusive; cursor = body.next_cursor ?? undefined;
   } while (cursor);
   expect(read).toBe(text);
   expect(end).toBe(Buffer.byteLength(text));
@@ -105,9 +113,115 @@ test("short fields and a negative full-prompt benefit keep the original fast pat
   }
 });
 
+for (const manual of [false, true]) for (const length of [6000, 10000]) {
+  test(`${manual ? "Zero Risk" : "Automatic"} keeps low-token logs inline after full navigation costs`, () => {
+    const canonical = logRequest("A".repeat(length)), snapshot = createContextSnapshot(canonical);
+    const compileOptions = manual ? { manualControl: true as const } : {};
+    const inline = plan(canonical, { snapshot, compileOptions, contextToolsAvailable: false });
+    const result = plan(canonical, { snapshot, compileOptions });
+    expect(result.navigationEnabled).toBe(false);
+    expect(result.externalizedTargetIds).toHaveLength(0);
+    expect(result.compiled).toEqual(inline.compiled);
+    expect(result.costs.requiredTotalTokens).toBe(inline.costs.requiredTotalTokens);
+    expect(result.costs.discoveryReserveTokens).toBe(0);
+    expect(result.costs.errorReserveTokens).toBe(0);
+  });
+}
+
+test("retained history keeps the inline candidate that fits the default window", async () => {
+  const canonical = logRequest("A".repeat(6000)), snapshot = createContextSnapshot(canonical);
+  const inline = plan(canonical, { snapshot, contextToolsAvailable: false, budget: { retainedTokens: 75412 } });
+  expect(inline.costs.contextWindowTokens).toBe(90_000);
+  expect(inline.costs.requiredTotalTokens).toBe(89_980);
+  const result = plan(canonical, { snapshot, budget: { retainedTokens: 75412 } });
+  expect(result.navigationEnabled).toBe(false);
+  expect(result.compiled).toEqual(inline.compiled);
+  expect(plan(canonical, { snapshot, budget: { retainedTokens: 75432 } }).costs.requiredTotalTokens).toBe(90_000);
+  expect(() => plan(canonical, { snapshot, budget: { retainedTokens: 75433 } })).toThrow("exceed the context budget");
+  const limits = { listTokens: 128 };
+  expect(plan(canonical, { snapshot, limits, budget: { retainedTokens: 75432 } }).costs.requiredTotalTokens).toBe(90_000);
+  expect(() => plan(canonical, { snapshot, limits, budget: { retainedTokens: 75433 } })).toThrow("exceed the context budget");
+  const broker = TurnBroker.forSocket(join(tmpdir(), `context-cost-${randomUUID()}.sock`));
+  const send = new ContextSend(canonical, broker, capabilities, "cost-boundary", undefined, undefined, snapshot);
+  try {
+    const prepared = await send.prepare(canonical, token, {}, 75412);
+    expect(prepared.navigationEnabled).toBe(false);
+    expect(prepared.compiled).toEqual(inline.compiled);
+    await send.select(token, prepared);
+    await send.sent();
+    expect(send.coverage.latest()?.delivered).toBe(true);
+  } finally { send.retire(); await broker.close(); }
+});
+
+test("a complete externalized candidate can fit when the inline candidate exceeds capacity", () => {
+  const canonical = logRequest("recorded result line\n".repeat(3000)), snapshot = createContextSnapshot(canonical);
+  const inline = plan(canonical, { snapshot, contextToolsAvailable: false });
+  const budget = { contextWindowTokens: inline.costs.requiredTotalTokens - 1 };
+  const result = plan(canonical, { snapshot, budget });
+  expect(result.navigationEnabled).toBe(true);
+  expect(result.externalizedTargetIds).toHaveLength(1);
+  expect(result.costs.requiredTotalTokens).toBeLessThanOrEqual(budget.contextWindowTokens);
+  // The same admission rule applies when omitted history makes navigation mandatory.
+  canonical.context.messages.unshift({ role: "toolResult", toolCallId: "older", toolName: "exec_command",
+    content: "omitted result", isError: false, timestamp: 0 });
+  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(1) } };
+  const mandatory = plan(canonical, { candidate, budget });
+  expect(mandatory.navigationEnabled).toBe(true);
+  expect(mandatory.externalizedTargetIds).toHaveLength(1);
+  expect(mandatory.costs.requiredTotalTokens).toBeLessThanOrEqual(budget.contextWindowTokens);
+});
+
+test("mandatory history navigation keeps low-token selected logs inline and still enforces capacity", () => {
+  const canonical = logRequest(" ".repeat(6000));
+  canonical.context.messages.unshift({ role: "toolResult", toolCallId: "older-call", toolName: "exec_command",
+    content: "omitted readable result", isError: false, timestamp: 0 });
+  const snapshot = createContextSnapshot(canonical);
+  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(1) } };
+  const result = plan(canonical, { snapshot, candidate });
+  expect(result.navigationEnabled).toBe(true);
+  expect(result.externalizedTargetIds).toHaveLength(0);
+  expect(result.projected.context.messages[2]!.content).toBe(" ".repeat(6000));
+  expect(result.costs.discoveryReserveTokens).toBeGreaterThan(0);
+  expect(result.costs.errorReserveTokens).toBeGreaterThan(0);
+  expect(entries(result).find(value => value.call_id === "older-call")!.delivery).toBe("source_on_demand");
+  const retainedTokens = result.costs.contextWindowTokens - result.costs.requiredTotalTokens + 256;
+  expect(() => plan(canonical, { snapshot, candidate, budget: { retainedTokens } })).toThrow("exceed the context budget");
+});
+
+test("plan costs and body identity use the chosen presentation of the same selected input", () => {
+  const canonical = request([{ role: "user", content: JSON.stringify(Array.from({ length: 400 }, (_, i) => ({
+    id: i, value: '"quoted"', path: `C:\\source\\${i}.ts`,
+  }))), timestamp: 1 }]);
+  const snapshot = createContextSnapshot(canonical), before = structuredClone(canonical);
+  const legacy = plan(canonical, { snapshot, contextToolsAvailable: false, compileOptions: { contextRendering: "legacy-json" } });
+  const chosen = plan(canonical, { snapshot, contextToolsAvailable: false });
+  expect(chosen.compiled.contextFormat).toBe("codex-context-text-v1");
+  expect(chosen.costs.contextFormat).toBe(chosen.compiled.contextFormat!);
+  expect(chosen.costs.promptTokens).toBeLessThan(legacy.costs.promptTokens);
+  expect(chosen.costs.promptJsonBytes).toBeLessThanOrEqual(legacy.costs.promptJsonBytes);
+  expect(chosen.costs.promptJsonBytes).toBe(Buffer.byteLength(JSON.stringify(chosen.compiled.text)));
+  expect(chosen.costs.promptCharacters).toBe(chosen.compiled.text.length);
+  expect(chosen.bodyDigest).not.toBe(legacy.bodyDigest);
+  expect(chosen.navigationEnabled).toBe(false);
+  expect(canonical).toEqual(before);
+});
+
+test("externalization threshold uses mixed field cost instead of escaped JSON savings", () => {
+  const text = '"'.repeat(600);
+  const raw = estimateWebContextFieldCost(text, { contextFormat: "codex-context-text-v1", path: ["message", "content"] });
+  const json = estimateWebContextFieldCost(text, { contextFormat: "legacy-json", path: ["message", "content"] });
+  expect(raw.jsonBytes).toBeLessThan(json.jsonBytes);
+  const canonical = logRequest(text);
+  canonical.context.systemPrompt = [JSON.stringify(Array.from({ length: 500 }, (_, i) => ({ id: i, value: '"quoted"' })))];
+  const result = plan(canonical);
+  expect(result.compiled.contextFormat).toBe("codex-context-text-v1");
+  expect(result.externalizedTargetIds).toHaveLength(0);
+  expect(result.navigationEnabled).toBe(false);
+});
+
 test("multiple medium fields can jointly repay the complete entry cost", () => {
   const canonical = request(Array.from({ length: 6 }, (_, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
-    toolName: "exec_command", content: `result ${index}: ${"x".repeat(1800)}`, isError: false, timestamp: index })));
+    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(200)}`, isError: false, timestamp: index })));
   const result = plan(canonical);
   expect(result.navigationEnabled).toBe(true);
   expect(result.externalizedTargetIds).toHaveLength(6);
@@ -129,7 +243,7 @@ test("resume and short second-round inputs publish a new visible entry for omitt
   const field = entries(resume).find(value => value.kind === "tool_result")!;
   expect(field.delivery).toBe("source_on_demand");
   const read = navigator(resume).read({ context_id: entry(resume).context_id, read_ref: field.read_ref });
-  expect((read.structuredContent as any).content).toContain("unique unread suffix");
+  expect(parseContextTextReadResult(read).body).toContain("unique unread suffix");
 });
 
 test("re-parsed candidates require an explicit map and do not infer repeated call identities", () => {
@@ -186,7 +300,7 @@ test("raw invalid JSON, freeform input and multi-block outputs remain exact and 
 
 test("externalization processes serialized savings in descending order and source order for ties", () => {
   const canonical = request([3000, 9000, 3000].map((length, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
-    toolName: "exec_command", content: "x".repeat(length), isError: false, timestamp: index })));
+    toolName: "exec_command", content: "log line\n".repeat(length / 10), isError: false, timestamp: index })));
   const snapshot = createContextSnapshot(canonical), result = plan(canonical, { snapshot });
   const fields = snapshot.targets.filter(value => value.kind === "tool_result");
   expect(result.externalizedTargetIds).toEqual([fields[1]!.target_id, fields[0]!.target_id, fields[2]!.target_id]);

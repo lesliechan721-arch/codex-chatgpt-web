@@ -18,6 +18,7 @@ import { CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, defaultBroker
 import { parseRequest } from "../src/responses/parser";
 import { estimateTokens } from "../src/lib/token-estimate";
 import type { AdapterEvent, CodexProviderConfig } from "../src/types";
+import { CONTEXT_TEXT_READ_FORMAT, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
 const tailMarker = "unread-tail-evidence-七三九";
@@ -35,7 +36,11 @@ function navigation(prompt: string): Entry {
   if (!match) throw new Error("The actual submitted prompt has no context entry");
   return JSON.parse(match[1]!);
 }
-function data(result: any): any { return result.structuredContent; }
+function data(result: any): any {
+  if (result.structuredContent?.format !== CONTEXT_TEXT_READ_FORMAT) return result.structuredContent;
+  const { metadata, body } = parseContextTextReadResult(result);
+  return { ...metadata, content: body };
+}
 
 function paddedPng(size: number): string {
   const original = Buffer.from(png, "base64");

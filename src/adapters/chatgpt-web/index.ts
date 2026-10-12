@@ -45,7 +45,7 @@ import {
   type ChatGptTurnCapability,
 } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
-import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
+import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, type CompileChatGptWebPromptOptions } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
@@ -442,10 +442,16 @@ export function createChatGptWebAdapter(
     codexHome?: string;
     /** Private host dependency; never populated from Responses input. */
     verifyContextCapability?: () => Promise<void>;
+    /** Private acceptance dependency. Never read from user input or provider configuration. */
+    contextPresentation?: Pick<CompileChatGptWebPromptOptions, "contextRendering" | "contextRawTextPolicy">;
   } = {},
 ): ProviderAdapter {
   if (provider.chatgptWeb?.continuityStateDirectory) continuityBindingsFor(resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory)));
   const worker = ChatGptBrowserWorker.forProvider(provider);
+  const contextPresentation = {
+    contextRendering: dependencies.contextPresentation?.contextRendering,
+    contextRawTextPolicy: dependencies.contextPresentation?.contextRawTextPolicy,
+  };
   const verifyContextCapability = dependencies.verifyContextCapability ?? (async () => {
     await assertProviderContextCapabilityVerified(provider);
   });
@@ -727,6 +733,7 @@ export function createChatGptWebAdapter(
       freshCompaction = await prepareFreshCompactionSource(parsed, broker, turnCapabilities, {
         historyRevision: parsed._continuityHistoryRevision ?? 0, ownerGeneration: traceId, traceId,
         timeoutMs, signal: browserAbort.signal, sourceCoverage: hooks.sourceCoverage, sourceSnapshot: hooks.sourceSnapshot,
+        contextPresentation,
         ...(turnToken ? { turnToken } : {}),
       });
       return { ...parsed, context: { ...parsed.context, systemPrompt: [], tools: [],
@@ -747,11 +754,12 @@ export function createChatGptWebAdapter(
       }
       : undefined;
     const compileOptionsFor = (input: CodexParsedRequest) => {
-      if (manualRequest) return {};
+      if (manualRequest) return contextPresentation;
       const experimentalMultipartParts = experimentalBiggerContext
         ? resolveBiggerContextMultipartParts(input, turnCapabilities, experimentalSkillAttachments)
         : undefined;
       return {
+        ...contextPresentation,
         captureLunaCheckpoint,
         experimentalSkillAttachments,
         ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}),
@@ -976,7 +984,7 @@ export function createChatGptWebAdapter(
           );
           observeCapabilityRetirement(activeToken, externalProgress);
           const manualInput = parsed._compactionRequest ? await prepareFresh(activeToken) : promptInput;
-          const options = { manualControl: true as const, ...(parsed._compactionRequest ? { compactionReadOnly: true as const } : {}),
+          const options = { ...contextPresentation, manualControl: true as const, ...(parsed._compactionRequest ? { compactionReadOnly: true as const } : {}),
             ...(taskUpdates ? { taskUpdateProtocol: 1 as const } : {}),
             ...(continuityClaim?.expected ? { retainedContinuity: true as const } : {}) };
           const prepareManual = async (input: CodexParsedRequest, resume: boolean) => {

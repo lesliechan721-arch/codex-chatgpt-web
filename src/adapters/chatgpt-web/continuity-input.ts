@@ -10,7 +10,8 @@ import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model
 import { planContextDelivery } from "./context-planner";
 import { createContextSnapshot } from "./context-snapshot";
 import {
-  CHATGPT_MAX_INPUT_IMAGES, compileChatGptWebPrompt, countChatGptContextImages,
+  CHATGPT_MAX_INPUT_IMAGES, CHATGPT_ZERO_RISK_CONTINUITY_INPUT_CHAR_LIMIT,
+  compileChatGptWebPrompt, countChatGptContextImages,
   type CompiledChatGptWebPrompt,
 } from "./prompt";
 
@@ -28,7 +29,7 @@ export function assertContinuityCompiledInput(
     const inputTokens = estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId) + capabilityReserveTokens;
     if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
       const { contextWindow } = resolveChatGptWebContextLimits(parsed.modelId, "low", capabilities);
-      if (compiled.text.length > 1_000_000 || inputTokens >= contextWindow) throw continuityError("continuity_input_limit");
+      if (compiled.text.length > CHATGPT_ZERO_RISK_CONTINUITY_INPUT_CHAR_LIMIT || inputTokens >= contextWindow) throw continuityError("continuity_input_limit");
       return;
     }
     // Use the existing byte/count checks as well as the original model/composer boundaries.

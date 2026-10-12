@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import type { BrokerToolResult } from "./turn-broker";
 import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
 import { ContextSnapshot, deterministicContextJson } from "./context-snapshot";
+import { createContextTextReadResult } from "./context-text-result";
 import type { ContextDelivery, ContextFilter, ContextListArgs, ContextLiveOverview, ContextPurpose, ContextReadArgs,
   ContextRemainingBudget, ContextSearchArgs, ContextTarget } from "./context-types";
 
@@ -168,15 +169,20 @@ export class ContextNavigator {
       // Keep the core page fixed when remaining budgets change. This allowance is measured
       // with maximal safe integers, covering the optional bounded compaction hint as well.
       const hint = this.#purpose === "compaction" ? this.#budgetHint() : undefined;
-      const make = (end: number, conservative = false): BrokerToolResult => response({
-        context_id: this.#snapshot.context_id, purpose: this.#purpose, read_ref: target.read_ref, source: this.#source(target),
-        encoding: target.encoding, source_completeness: target.source_completeness, utf8_bytes: bytes.length,
-        content: bytes.subarray(start, end).toString("utf8"), range: { start, end_exclusive: end },
+      const make = (end: number, conservative = false): BrokerToolResult => createContextTextReadResult({
+        context_id: this.#snapshot.context_id, purpose: this.#purpose, read_ref: target.read_ref!, source: this.#source(target),
+        encoding: target.encoding!, source_completeness: target.source_completeness, utf8_bytes: bytes.length,
+        range: { start, end_exclusive: end },
         has_more: end < bytes.length, next_cursor: end < bytes.length ? this.#encode("read", q, target.target_id, end) : null,
         ...(hint ? { remaining_budget: conservative ? { tokens: Number.MAX_SAFE_INTEGER, wire_bytes: Number.MAX_SAFE_INTEGER, reserved_tokens: Number.MAX_SAFE_INTEGER, reserved_wire_bytes: Number.MAX_SAFE_INTEGER, stop_hint: "Stop reading before consuming the summary and submission reserve" } : hint } : {}),
-      });
+      }, bytes.subarray(start, end).toString("utf8"));
       void liveOverview; // Live image readiness belongs only to overview/runtime gate errors.
-      if (start === bytes.length) return { result: make(start), target };
+      if (start === bytes.length) {
+        // EOF still returns a metadata block and an empty body block. Check that
+        // complete v2 result against the same page limits as non-empty pages.
+        if (!this.#fits(make(start, true), "read")) throw new NavigationError("BUDGET_EXCEEDED");
+        return { result: make(start), target };
+      }
       // A terminal page has no cursor and can fit even when every nonterminal page
       // exceeds the metadata ceiling. Test it before the monotone partial-page search.
       if (bytes.length - start <= this.#limits.readBytes && this.#fits(make(bytes.length, true), "read")) return { result: make(bytes.length), target };

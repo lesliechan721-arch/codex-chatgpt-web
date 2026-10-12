@@ -1,4 +1,5 @@
 import { skillFileTokens } from "./skill-attachments";
+import { ChatGptWebAdapterError } from "./adapter-error";
 import { estimateTokens } from "../../lib/token-estimate";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
@@ -123,7 +124,16 @@ export function resolveBiggerContextMultipartParts(
       < Math.min(expandedContextWindow, contextWindow * messages.length);
   };
   if (initialParts === undefined && fits(inline)) return undefined;
-  return fits(compile(2)) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;
+  let twoPartCandidate: CompiledChatGptWebPrompt;
+  try {
+    twoPartCandidate = compile(2);
+  } catch (error) {
+    if (error instanceof ChatGptWebAdapterError && error.code === "context_length_exceeded") {
+      return CHATGPT_BIGGER_CONTEXT_PARTS;
+    }
+    throw error;
+  }
+  return fits(twoPartCandidate) ? 2 : CHATGPT_BIGGER_CONTEXT_PARTS;
 }
 
 export function biggerContextPartCount(

@@ -6,14 +6,27 @@ const path = require("node:path");
 const { CURRENT_CONNECTOR_NAME, CURRENT_MANUAL_CONNECTOR_NAME, DEV_CONNECTOR_NAME, DEV_LONG_WAIT_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { RuntimeHost, resolveToolAuthorityControl } = require("../electron/runtime.cjs");
 
-test("Verify runtime invokes a bounded sensitive six-call transaction for each profile and mode", async () => {
-  for (const development of [false, true]) for (const mode of ["automatic", "manual"]) {
+function contextVerificationEvidence(profile, mode, appName) {
+  const textRead = (digest) => ({ format: "context-text-read-v2", content_blocks: 2, body_content_index: 1,
+    metadata_consistent: true, utf8_bytes: 12, range: { start: 0, end_exclusive: 12 }, body_utf8_bytes: 12,
+    result_digest: digest.repeat(64) });
+  return { version: 2, binding: { profile, mode, appName, home: "/fixture/runtime", tunnelId: "fixture-tunnel",
+    tunnelProfile: "c".repeat(64), brokerSocketPath: "/fixture/runtime/turn-broker.sock",
+    runtimeCommand: ["/fixture/bun", "/fixture/cli.ts"], runtimeFingerprint: "d".repeat(64), schemaDigest: "e".repeat(64),
+    sentConfirmationRequired: mode === "manual", contextProtocol: 2, textReadFormat: "context-text-read-v2" },
+    verifiedAt: "2026-10-11T00:00:00.000Z",
+    receipts: { ordinary: { list: true, search: true, read: true, text_read: textRead("a") },
+      compaction: { list: true, search: true, read: true, text_read: textRead("b") } } };
+}
+
+for (const development of [false, true]) for (const mode of ["automatic", "manual"]) {
+  const profile = development ? "development" : "production";
+  test(`Verify runtime accepts v2 evidence through the bounded sensitive ${profile}/${mode} transaction`, async () => {
     const name = mode === "manual" ? CURRENT_MANUAL_CONNECTOR_NAME : development ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
     const fixture = development ? devHostFor({ mode: "full", appName: name }, mode) : hostFor({ mode: "full", appName: name }, mode);
     fixture.host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "private-control" });
     let invocation;
-    const evidence = { version: 1, binding: { profile: development ? "development" : "production", mode, appName: name },
-      receipts: { ordinary: { list: true, search: true, read: true }, compaction: { list: true, search: true, read: true } } };
+    const evidence = contextVerificationEvidence(profile, mode, name);
     fixture.host.run = async (operation, args, options) => { invocation = { operation, args, options }; return { stdout: JSON.stringify({ ok: true, evidence }) }; };
     assert.deepEqual(await fixture.host.verifyContextCapability(), { ok: true, evidence });
     assert.equal(invocation.operation, "mcp-verification");
@@ -24,9 +37,40 @@ test("Verify runtime invokes a bounded sensitive six-call transaction for each p
       assert.equal(invocation.options.environment.CODEX_WEB_GPT_DEV_HOME, "/dev");
       assert.equal(invocation.options.environment.CODEX_CHATGPT_WEB_HOME, undefined);
     }
-    evidence.receipts.compaction.read = false;
+  });
+}
+
+test("Verify runtime rejects old or unknown evidence, missing successful calls and another profile, mode or connector", async () => {
+  const fixture = hostFor({ mode: "full", appName: CURRENT_CONNECTOR_NAME });
+  fixture.host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "private-control" });
+  const valid = contextVerificationEvidence("production", "automatic", CURRENT_CONNECTOR_NAME);
+  let report;
+  fixture.host.run = async () => ({ stdout: JSON.stringify(report) });
+  const rejected = async (change) => {
+    report = { ok: true, evidence: structuredClone(valid) };
+    change(report);
     await assert.rejects(fixture.host.verifyContextCapability(), /did not return successful/);
+  };
+  for (const version of [1, 3, undefined]) await rejected((value) => { value.evidence.version = version; });
+  for (const kind of ["ordinary", "compaction"]) for (const method of ["list", "search", "read"]) {
+    await rejected((value) => { delete value.evidence.receipts[kind][method]; });
   }
+  await rejected((value) => { value.evidence.receipts.compaction.read = false; });
+  await rejected((value) => { delete value.evidence.receipts; });
+  await rejected((value) => { value.evidence.binding.profile = "development"; });
+  await rejected((value) => { value.evidence.binding.mode = "manual"; });
+  await rejected((value) => { value.evidence.binding.appName = "Codex Different"; });
+  await rejected((value) => { delete value.evidence.binding; });
+  await rejected((value) => { value.ok = false; });
+});
+
+test("Verify runtime preserves CLI failures and rejects invalid CLI output", async () => {
+  const fixture = hostFor({ mode: "full", appName: CURRENT_CONNECTOR_NAME });
+  fixture.host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "private-control" });
+  fixture.host.run = async () => { throw new Error("verify-context exited with code 1"); };
+  await assert.rejects(fixture.host.verifyContextCapability(), /exited with code 1/);
+  fixture.host.run = async () => ({ stdout: "invalid CLI JSON" });
+  await assert.rejects(fixture.host.verifyContextCapability(), SyntaxError);
 });
 
 test("tool authority control reports the effective forced mode and its source", () => {

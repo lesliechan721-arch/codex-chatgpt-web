@@ -12,8 +12,9 @@ import { deterministicContextJson, type ContextSnapshot } from "./context-snapsh
 import type { ContextDelivery, ContextTarget } from "./context-types";
 import { skillFileTokens } from "./skill-attachments";
 import { ContextNavigator } from "./context-navigator";
+import { estimateWebContextFieldCost, type WebContextFormat } from "./context-renderer";
 
-/** A field must save at least this many serialized bytes before full-prompt comparison. */
+/** A field must save this many estimated encoded bytes in its current presentation before full compilation. */
 export const CONTEXT_MIN_EXTERNALIZE_BYTES = 1_024;
 export const CONTEXT_WORK_RESERVE_TOKENS = 4_096;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -40,8 +41,17 @@ export interface ContextDeliveryCosts {
   originalPromptTransport: "candidate" | "ordinary_capacity_baseline";
   originalPromptBytes: number;
   promptBytes: number;
+  originalContextFormat: WebContextFormat;
+  contextFormat: WebContextFormat;
+  /** JSON-encoded transport text, distinct from the visible UTF-8 byte count above. */
+  originalPromptJsonBytes: number;
+  promptJsonBytes: number;
+  /** Sum of the actual editor input lengths, before JSON transport encoding. */
+  promptCharacters: number;
   netSavedPromptBytes: number;
   promptTokens: number;
+  /** Fixed replies retained before the final multipart commit; already included in promptTokens. */
+  acknowledgementTokens: number;
   navigationPromptBytes: number;
   requiredMcpWireBytes: number;
   requiredMcpTokens: number;
@@ -86,7 +96,17 @@ function promptBytes(compiled: CompiledChatGptWebPrompt): number {
     + (compiled.skillFiles ?? []).reduce((sum, file) => sum + Buffer.byteLength(file.text, "utf8"), 0);
 }
 function promptTokens(compiled: CompiledChatGptWebPrompt): number {
-  return transportTexts(compiled).reduce((sum, text) => sum + estimateTokens(text), 0) + skillFileTokens(compiled.skillFiles);
+  return transportTexts(compiled).reduce((sum, text) => sum + estimateTokens(text), 0)
+    + skillFileTokens(compiled.skillFiles) + acknowledgementTokens(compiled);
+}
+function acknowledgementTokens(compiled: CompiledChatGptWebPrompt): number {
+  if (!compiled.multipart) return 0;
+  const transactionId = `ctx_${"0".repeat(32)}`;
+  return compiled.multipart.parts.slice(0, -1).reduce((sum, payload, index) => sum + estimateTokens(
+    formatChatGptWebMultipartStage(payload, transactionId, index + 1, compiled.multipart!.parts.length).acknowledgement), 0);
+}
+function promptJsonBytes(compiled: CompiledChatGptWebPrompt): number {
+  return transportTexts(compiled).reduce((sum, text) => sum + Buffer.byteLength(JSON.stringify(text), "utf8"), 0);
 }
 function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits, requiredImages: number,
   deliveryByTarget?: Readonly<Record<string, ContextDelivery>>, started = performance.now()): ContextResponseCost {
@@ -297,9 +317,9 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
   for (const [key, value] of Object.entries({ contextWindow, retained, work })) {
     if (!Number.isSafeInteger(value) || value < 0 || key === "contextWindow" && value === 0) throw new Error(`Invalid context planning budget: ${key}`);
   }
-  let discovery: ContextResponseCost | undefined;
   const errorReserve = contextErrorReserve(limits);
-  const baseCosts = (compiled: CompiledChatGptWebPrompt, media?: ContextMediaPlan, navigationPromptBytes = 0): ContextDeliveryCosts => {
+  const baseCosts = (compiled: CompiledChatGptWebPrompt, media?: ContextMediaPlan, navigationPromptBytes = 0,
+    discovery?: ContextResponseCost): ContextDeliveryCosts => {
     const tokens = promptTokens(compiled);
     const discoveryTokens = media ? discovery!.total_tokens : 0;
     const discoveryWire = media ? discovery!.wire_bytes : 0;
@@ -309,6 +329,10 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
     const attachmentVision = media?.attachmentVisualTokens ?? 0;
     return { originalPromptTransport: originalCompileFailure ? "ordinary_capacity_baseline" : "candidate", originalPromptBytes: originalBytes,
       promptBytes: promptBytes(compiled), netSavedPromptBytes: originalBytes - promptBytes(compiled), promptTokens: tokens,
+      acknowledgementTokens: acknowledgementTokens(compiled),
+      originalContextFormat: original.contextFormat ?? "legacy-json", contextFormat: compiled.contextFormat ?? "legacy-json",
+      originalPromptJsonBytes: promptJsonBytes(original), promptJsonBytes: promptJsonBytes(compiled),
+      promptCharacters: transportTexts(compiled).reduce((sum, text) => sum + text.length, 0),
       navigationPromptBytes, requiredMcpWireBytes: Object.entries(media?.imageResponseCosts ?? {}).filter(([id]) => media?.deliveryByTarget[id]?.required).reduce((sum, [, cost]) => sum + cost.wire_bytes, 0),
       requiredMcpTokens: requiredMcp, attachmentBytes: media?.attachmentBytes ?? 0, attachmentVisualTokens: attachmentVision,
       retainedTokens: retained, workReserveTokens: work, platformReserveTokens: CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
@@ -316,6 +340,28 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
       requiredNavigationWireBytes: Object.values(media?.requiredImageWireReserves ?? {}).reduce((sum, value) => sum + value, 0) + discoveryWire + errorWire,
       requiredTotalTokens: tokens + retained + work + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + requiredMcp + attachmentVision + discoveryTokens + errorTokens,
       contextWindowTokens: contextWindow, remainingNavigationTokens: Math.max(0, contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - retained - tokens - attachmentVision) };
+  };
+  const assertCandidateCapacity = (compiled: CompiledChatGptWebPrompt, costs: ContextDeliveryCosts): void => {
+    if (costs.requiredTotalTokens > contextWindow) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The selected prompt, required media, retained context and work reserve exceed the context budget", { costs });
+  const transportLimits = resolveChatGptWebTransportLimits(input.candidate.modelId as Parameters<typeof resolveChatGptWebTransportLimits>[0],
+    input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities);
+  if (!compiled.multipart && (compiled.text.length > (transportLimits.browserComposerCharLimit ?? Infinity)
+    || promptTokens(compiled) > (transportLimits.browserMessageTokenLimit ?? Infinity))) {
+    throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The selected prompt and navigation entry exceed the browser message budget", { costs });
+  }
+  if (compiled.multipart) {
+    const texts = transportTexts(compiled);
+    for (const [index, text] of texts.entries()) {
+      const final = index === texts.length - 1;
+      const effort = final ? mode.effort : input.capabilities.proAvailable ? "max" : "medium";
+      const stageLimits = resolveChatGptWebTransportLimits(CHATGPT_WEB_MODEL_ID, effort, input.capabilities);
+      const tokenBudget = resolveChatGptWebMessageTokenBudget(CHATGPT_WEB_MODEL_ID, effort, input.capabilities,
+        final ? costs.attachmentVisualTokens + skillFileTokens(compiled.skillFiles) : 0);
+      if (text.length > (stageLimits.browserComposerCharLimit ?? Infinity) || estimateTokens(text) > tokenBudget) {
+        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A complete Bigger Context message exceeds its stage budget", { part_index: index + 1, costs });
+      }
+    }
+  }
   };
   const fast = (): ContextDeliveryPlan => {
     if (originalCompileFailure) throw originalCompileFailure;
@@ -358,63 +404,72 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
   const currentImages = imageParts.size > 0;
   const eligible = input.snapshot.targets.filter(t => selected.has(t.target_id) && t.read_ref
     && (t.kind === "tool_arguments" && t.source_kind === "assistant" || t.kind === "tool_result" && t.source_kind === "tool"))
-    .map(target => ({ target, saving: Buffer.byteLength(JSON.stringify(selectedField(input, target, messages)), "utf8")
-      - Buffer.byteLength(JSON.stringify(replacement(input.snapshot, target)), "utf8") }))
+    .map(target => {
+      // Mirror the renderer's scalar eligibility and wrapper cost without recompiling
+      // the entire history per field. Object arguments keep their structured form.
+      const path = target.kind === "tool_arguments"
+        ? ["message", "content", target.locator.content_index ?? 0, "arguments"]
+        : target.locator.content_index === undefined ? ["message", "content"]
+          : ["message", "content", target.locator.content_index, "text"];
+      const options = { contextFormat: original.contextFormat ?? "legacy-json", path,
+        rawTextPolicy: input.compileOptions?.contextRawTextPolicy };
+      return { target, saving: estimateWebContextFieldCost(selectedField(input, target, messages), options).jsonBytes
+        - estimateWebContextFieldCost(replacement(input.snapshot, target), options).jsonBytes };
+    })
     .filter(({ saving }) => saving >= CONTEXT_MIN_EXTERNALIZE_BYTES)
     .sort((a, b) => b.saving - a.saving || a.target.source_index - b.target.source_index || a.target.target_index - b.target.target_index);
   if (!omittedHistory && !currentImages && eligible.length === 0) return fast();
   const mandatoryNavigation = omittedHistory || currentImages;
   const requiredImages = input.snapshot.targets.filter(t => t.kind === "image" && selected.has(t.target_id)
     && ["system", "developer", "user", "skill", "delegation", "agent_message"].includes(t.source_kind)).length;
-  try { discovery = discoveryResponseCost(input.snapshot, limits, requiredImages, undefined, started); }
-  catch (error) { if (!mandatoryNavigation) return fast(); throw error; }
-  const planId = `plan_${randomBytes(16).toString("hex")}`;
-  const available = contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - retained - work - discovery.total_tokens - errorReserve.tokens;
-  const mediaInput = () => ({ snapshot: input.snapshot, selectedTargetIds: selected, selectedImageParts: imageParts, limits,
-    reservedNavigationTokens: discovery!.total_tokens + errorReserve.tokens, reservedNavigationWireBytes: discovery!.wire_bytes + errorReserve.wire_bytes,
-    attachmentSlotsReserved: original.skillFiles?.length ?? 0, attachmentBytesReserved: (original.skillFiles ?? []).reduce((sum, file) => sum + Buffer.byteLength(file.text), 0) });
-  let media = planContextMedia({ ...mediaInput(), availableTokens: Math.max(0, available) });
-  let externalized = new Set<string>();
-  let manifestDigest = "";
-  const compileProjected = (ids: ReadonlySet<string>, navigation: boolean): { projected: CodexParsedRequest; compiled: CompiledChatGptWebPrompt } => {
-    const projected = projection(input, messages, media, ids);
-    const contextSystemImages = input.snapshot.targets.filter(t => t.kind === "image" && t.source_kind === "system"
-      && selected.has(t.target_id) && media.deliveryByTarget[t.target_id]?.media_route === "attachment")
-      .map(t => ({ ...imageParts.get(t.target_id)!, imageUrl: media.attachmentUrls.get(t.target_id)! }));
-    const options = { ...input.compileOptions, ...(contextSystemImages.length ? { contextSystemImages } : {}) };
-    if (!navigation) return { projected, compiled: compile(projected, options) };
-    manifestDigest = hash(deterministicContextJson(input.snapshot.targets.filter(t => t.kind === "image").map(target => ({
-      target_id: target.target_id, content_digest: target.content_digest, ...media.deliveryByTarget[target.target_id] }))));
-    const recent = input.snapshot.targets.filter(t => t.kind === "tool_arguments" || t.kind === "tool_result").slice(-3).map(t => ({
-      target_id: t.target_id, kind: t.kind, tool_name: t.tool_name, call_id: t.call_id, label: Array.from(t.label).slice(0, 60).join("") }));
-    return { projected, compiled: compile(projected, { ...options, contextNavigation: {
-      plan: { planId, contextId: input.snapshot.context_id, manifestDigest, requiredAttachments: media.requiredAttachments },
-      overview: { sources: input.snapshot.sources.length, targets: input.snapshot.targets.length, source_cutoff: input.snapshot.sources.length,
-        externalized_targets: ids.size, images: input.snapshot.targets.filter(t => t.kind === "image").length, recent_tools: recent }, requiredImages: media.requiredImages,
-    } }) };
-  };
-  let chosen = mandatoryNavigation ? compileProjected(externalized, true) : { projected: input.candidate, compiled: original };
-  // Every eligible replacement saves at least the fixed threshold. Apply the ordered
-  // fields together, then compare complete compiler output once; repeated prefix
-  // compilations would make preparation quadratic for many large history fields.
-  if (eligible.length) {
-    const pending = new Set(eligible.map(({ target }) => target.target_id));
-    const trial = compileProjected(pending, true);
-    if (promptBytes(trial.compiled) < promptBytes(chosen.compiled)) { externalized = pending; chosen = trial; }
+  let initialDiscovery: ContextResponseCost;
+  try { initialDiscovery = discoveryResponseCost(input.snapshot, limits, requiredImages, undefined, started); }
+  catch (error) {
+    if (mandatoryNavigation) throw error;
+    const inline = fast();
+    assertCandidateCapacity(inline.compiled, inline.costs);
+    return inline;
   }
-  if (!mandatoryNavigation && externalized.size === 0) return fast();
-  const deliveryMap = (): Record<string, ContextDelivery> => {
-    const result: Record<string, ContextDelivery> = { ...media.deliveryByTarget };
-    for (const target of input.snapshot.targets) if (target.kind !== "image") result[target.target_id] = {
-      delivery: externalized.has(target.target_id) ? "source_on_demand" : selected.has(target.target_id) ? "inline" : "source_on_demand", required: false };
-    return result;
-  };
-  // Route changes alter directory metadata. Reserve complete discovery pages and
-  // narrow routes until the final body, discovery and required media all fit.
-  // Reserves never decrease, so at most one narrowing per image can occur.
-  const routeAttempts = input.snapshot.targets.filter(target => target.kind === "image").length + 2;
-  for (let attempt = 0; attempt < routeAttempts; attempt++) {
-    try {
+  const planId = `plan_${randomBytes(16).toString("hex")}`;
+  const navigationCandidate = (externalized: ReadonlySet<string>): ContextDeliveryPlan => {
+    // Each candidate owns its route and discovery reserves. A trial must not make
+    // the inline candidate pay for routes or metadata that it does not publish.
+    let discovery = initialDiscovery;
+    const available = contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - retained - work - discovery.total_tokens - errorReserve.tokens;
+    const mediaInput = () => ({ snapshot: input.snapshot, selectedTargetIds: selected, selectedImageParts: imageParts, limits,
+      reservedNavigationTokens: discovery.total_tokens + errorReserve.tokens, reservedNavigationWireBytes: discovery.wire_bytes + errorReserve.wire_bytes,
+      attachmentSlotsReserved: original.skillFiles?.length ?? 0, attachmentBytesReserved: (original.skillFiles ?? []).reduce((sum, file) => sum + Buffer.byteLength(file.text), 0) });
+    let media = planContextMedia({ ...mediaInput(), availableTokens: Math.max(0, available) });
+    let manifestDigest = "";
+    const compileProjected = (ids: ReadonlySet<string>, navigation: boolean): { projected: CodexParsedRequest; compiled: CompiledChatGptWebPrompt } => {
+      const projected = projection(input, messages, media, ids);
+      const contextSystemImages = input.snapshot.targets.filter(t => t.kind === "image" && t.source_kind === "system"
+        && selected.has(t.target_id) && media.deliveryByTarget[t.target_id]?.media_route === "attachment")
+        .map(t => ({ ...imageParts.get(t.target_id)!, imageUrl: media.attachmentUrls.get(t.target_id)! }));
+      const options = { ...input.compileOptions, ...(contextSystemImages.length ? { contextSystemImages } : {}) };
+      if (!navigation) return { projected, compiled: compile(projected, options) };
+      manifestDigest = hash(deterministicContextJson(input.snapshot.targets.filter(t => t.kind === "image").map(target => ({
+        target_id: target.target_id, content_digest: target.content_digest, ...media.deliveryByTarget[target.target_id] }))));
+      const recent = input.snapshot.targets.filter(t => t.kind === "tool_arguments" || t.kind === "tool_result").slice(-3).map(t => ({
+        target_id: t.target_id, kind: t.kind, tool_name: t.tool_name, call_id: t.call_id, label: Array.from(t.label).slice(0, 60).join("") }));
+      return { projected, compiled: compile(projected, { ...options, contextNavigation: {
+        plan: { planId, contextId: input.snapshot.context_id, manifestDigest, requiredAttachments: media.requiredAttachments },
+        overview: { sources: input.snapshot.sources.length, targets: input.snapshot.targets.length, source_cutoff: input.snapshot.sources.length,
+          externalized_targets: ids.size, images: input.snapshot.targets.filter(t => t.kind === "image").length, recent_tools: recent }, requiredImages: media.requiredImages,
+      } }) };
+    };
+    let chosen = compileProjected(externalized, true);
+    const deliveryMap = (): Record<string, ContextDelivery> => {
+      const result: Record<string, ContextDelivery> = { ...media.deliveryByTarget };
+      for (const target of input.snapshot.targets) if (target.kind !== "image") result[target.target_id] = {
+        delivery: externalized.has(target.target_id) ? "source_on_demand" : selected.has(target.target_id) ? "inline" : "source_on_demand", required: false };
+      return result;
+    };
+    // Route changes alter directory metadata. Reserve complete discovery pages and
+    // narrow routes until the final body, discovery and required media all fit.
+    // Reserves never decrease, so at most one narrowing per image can occur.
+    const routeAttempts = input.snapshot.targets.filter(target => target.kind === "image").length + 2;
+    for (let attempt = 0; attempt < routeAttempts; attempt++) {
       const measured = discoveryResponseCost(input.snapshot, limits, requiredImages, deliveryMap(), started);
       discovery = { wire_bytes: Math.max(discovery.wire_bytes, measured.wire_bytes),
         text_tokens: Math.max(discovery.text_tokens, measured.text_tokens), visual_tokens: 0,
@@ -428,40 +483,44 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
       if (deterministicContextJson(routed.deliveryByTarget) === deterministicContextJson(media.deliveryByTarget)) break;
       media = routed; chosen = compileProjected(externalized, true);
       if (attempt === routeAttempts - 1) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The context media and discovery budgets did not converge");
-    } catch (error) { if (!mandatoryNavigation) return fast(); throw error; }
+    }
+    const withoutEntry = compileProjected(externalized, false).compiled;
+    const costs = baseCosts(chosen.compiled, media, promptBytes(chosen.compiled) - promptBytes(withoutEntry), discovery);
+    assertCandidateCapacity(chosen.compiled, costs);
+    if (costs.requiredNavigationWireBytes > limits.maxTotalWireBytes || media.requiredMcpTokens + discovery.total_tokens + errorReserve.tokens > limits.maxTotalTokens) {
+      throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The required context responses and bounded error reserve exceed the navigation budget", { costs });
+    }
+    if (chosen.compiled.images.length !== media.attachmentCount || chosen.compiled.images.length + (chosen.compiled.skillFiles?.length ?? 0) > 10) {
+      throw new ContextDeliveryPlanningError("CONTEXT_IMAGE_UNAVAILABLE", "The compiled attachment list does not preserve the selected image routes");
+    }
+    const deliveryByTarget = deliveryMap();
+    const registration: ContextPlanRegistration = { snapshot: input.snapshot, planId, manifestDigest,
+      deliveryByTarget, limits, remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: limits.maxTotalWireBytes, reserved_wire_bytes: 0 },
+      requiredImageTokenReserves: media.requiredImageTokenReserves, requiredImageWireReserves: media.requiredImageWireReserves };
+    return { ...chosen, navigationEnabled: true, externalizedTargetIds: [...externalized], registration, planId, manifestDigest,
+      bodyDigest: hash(transportTexts(chosen.compiled).join("\n")), costs, limits };
+  };
+  let inline: ContextDeliveryPlan | undefined;
+  let inlineFailure: unknown;
+  try {
+    inline = mandatoryNavigation ? navigationCandidate(new Set()) : fast();
+    assertCandidateCapacity(inline.compiled, inline.costs);
+  } catch (error) {
+    if (!(error instanceof ContextDeliveryPlanningError) && (error as { code?: string }).code !== "context_length_exceeded") throw error;
+    inline = undefined; inlineFailure = error;
   }
-  const withoutEntry = compileProjected(externalized, false).compiled;
-  const costs = baseCosts(chosen.compiled, media, promptBytes(chosen.compiled) - promptBytes(withoutEntry));
-  if (costs.requiredTotalTokens > contextWindow) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The selected prompt, required media, retained context and work reserve exceed the context budget", { costs });
-  if (costs.requiredNavigationWireBytes > limits.maxTotalWireBytes || media.requiredMcpTokens + discovery.total_tokens + errorReserve.tokens > limits.maxTotalTokens) {
-    throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The required context responses and bounded error reserve exceed the navigation budget", { costs });
-  }
-  const transportLimits = resolveChatGptWebTransportLimits(input.candidate.modelId as Parameters<typeof resolveChatGptWebTransportLimits>[0],
-    input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities);
-  if (!chosen.compiled.multipart && (chosen.compiled.text.length > (transportLimits.browserComposerCharLimit ?? Infinity)
-    || promptTokens(chosen.compiled) > (transportLimits.browserMessageTokenLimit ?? Infinity))) {
-    throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The selected prompt and navigation entry exceed the browser message budget", { costs });
-  }
-  if (chosen.compiled.multipart) {
-    const texts = transportTexts(chosen.compiled);
-    for (const [index, text] of texts.entries()) {
-      const final = index === texts.length - 1;
-      const effort = final ? mode.effort : input.capabilities.proAvailable ? "max" : "medium";
-      const stageLimits = resolveChatGptWebTransportLimits(CHATGPT_WEB_MODEL_ID, effort, input.capabilities);
-      const tokenBudget = resolveChatGptWebMessageTokenBudget(CHATGPT_WEB_MODEL_ID, effort, input.capabilities,
-        final ? media.attachmentVisualTokens + skillFileTokens(chosen.compiled.skillFiles) : 0);
-      if (text.length > (stageLimits.browserComposerCharLimit ?? Infinity) || estimateTokens(text) > tokenBudget) {
-        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A complete Bigger Context message exceeds its stage budget", { part_index: index + 1, costs });
-      }
+  // Apply eligible fields together so preparation does not recompile every prefix.
+  // Compare complete admitted candidates, including fixed protocol, directory,
+  // required media and error reserves, rather than visible prompt bytes alone.
+  if (eligible.length) {
+    try {
+      const trial = navigationCandidate(new Set(eligible.map(({ target }) => target.target_id)));
+      if (!inline || trial.costs.requiredTotalTokens < inline.costs.requiredTotalTokens) return trial;
+    } catch (error) {
+      if (!(error instanceof ContextDeliveryPlanningError) && (error as { code?: string }).code !== "context_length_exceeded") throw error;
+      if (!inline) throw error;
     }
   }
-  if (chosen.compiled.images.length !== media.attachmentCount || chosen.compiled.images.length + (chosen.compiled.skillFiles?.length ?? 0) > 10) {
-    throw new ContextDeliveryPlanningError("CONTEXT_IMAGE_UNAVAILABLE", "The compiled attachment list does not preserve the selected image routes");
-  }
-  const deliveryByTarget = deliveryMap();
-  const registration: ContextPlanRegistration = { snapshot: input.snapshot, planId, manifestDigest,
-    deliveryByTarget, limits, remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: limits.maxTotalWireBytes, reserved_wire_bytes: 0 },
-    requiredImageTokenReserves: media.requiredImageTokenReserves, requiredImageWireReserves: media.requiredImageWireReserves };
-  return { ...chosen, navigationEnabled: true, externalizedTargetIds: [...externalized], registration, planId, manifestDigest,
-    bodyDigest: hash(transportTexts(chosen.compiled).join("\n")), costs, limits };
+  if (inline) return inline;
+  throw inlineFailure;
 }

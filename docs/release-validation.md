@@ -138,6 +138,50 @@ Before treating the feature as release-ready, exercise both Automatic and Zero R
    image check through the final new-ABI path; measure actual attachment limits and a higher count
    before making any capacity claim.
 
+## Context rendering validation
+
+The browser renderer and MCP text-read-v2 require separate evidence from the earlier context
+navigation observations above. Local round-trip, pagination, protocol, receipt, and control tests
+do not establish release readiness. Current connector names remain unchanged for this unreleased
+update; reconnect/refresh the same connector and obtain version-2 Verify runtime evidence.
+
+For Automatic and Zero Risk, record the actual runtime, model, effort, client path, source fixture,
+selected format, and observation limits:
+
+1. Compare compiled input with the readable editor/submission representation and exact model
+   extraction. Cover long code, links, nested/long fences, LF, tabs, and trailing whitespace. Zero
+   Risk keeps manual paste/Send/Sent. Only actual evidence for a path can enable its whitespace
+   allowances; default production policy retains these fields in JSON.
+2. Confirm two text blocks reach the real MCP client: matching metadata in the first block and
+   structured content, and the unique exact body in the second. Cover empty and paginated sources.
+   The new verifier's ordinary and compaction shape/transport receipts must pass; they do not prove
+   the model used the body.
+3. In separate real ordinary tasks and compaction transactions, extract a unique body-only fragment
+   and its UTF-8 range through each mode's existing answer/checkpoint path. The entry, list labels,
+   search snippets, and expected-answer hints must not reveal the fragment. Keep the verifier's
+   private scope read-only and unable to complete tasks.
+4. Before model runs, fix paired baseline/new fixtures, the same model/mode/effort, order, and
+   judging rules. Interleave formats and repeat each task at least three pairs. Check exact
+   extraction, source priority, call pairing, long-history constraints, paging, and forged
+   boundaries. These are minimum smoke observations, not statistical significance. Permission
+   leaks, duplicate actions, early execution, or body corruption block the stage separately.
+5. Report full prompt token estimates, visible bytes, editor length, JSON-encoded bytes, attachment
+   and image reserves, complete MCP bytes, conservative and diagnostic token estimates, calls,
+   unique/repeated bytes, errors/retries, and elapsed time. Include long code, Markdown, JSON text,
+   short results, partial reading, and complete reading. Preserve negative-savings cases. Mark
+   actual model input counts unknown unless directly observed.
+
+Missing editor evidence blocks that browser allowance. Missing any required real ordinary or
+compaction body-use evidence blocks stage-two release. A client that cannot update under the
+current identity stops v2 enablement; it does not authorize a new connector name or weaker budget.
+
+`bun run scripts/measure-context-rendering.ts` produces the offline cost replay with forced legacy,
+forced new, and automatic candidates; all use MCP v2. `bun run scripts/validate-context-rendering.ts
+check` checks the default DEV setup, and `plan` prints the fixed live matrix without sending a task.
+Its explicit `run` action creates a real model task and records observed evidence. Use the project
+development Launcher so its supervised MCP process loads the checkout; a source path in a copied
+configuration does not prove that an installed Launcher uses that runtime.
+
 ## Session continuity validation
 
 `chatgpt-web-continuity/` has additional validation because it retains conversations and can

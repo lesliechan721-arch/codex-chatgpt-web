@@ -1,10 +1,13 @@
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
+import type { WebContextFormat } from "./context-renderer";
 
 /** Persisted identities and digests only. This is never a source restoration format. */
 export interface ContextCoverageMetadata {
   historyRevision: number; pageGeneration: string; planId: string;
   bodyDigest: string; manifestDigest: string; pageTokens: number;
+  /** Missing only in historical journals, whose inputs used legacy-json. */
+  contextFormat?: WebContextFormat;
   navigationReservedTokens?: number;
   navigationUsage?: { tokens: number; wireBytes: number; reservedTokensUsed: number; chargedTokens: number };
   versions: string[]; externalizedVersions: string[];
@@ -37,9 +40,10 @@ function boolean(value: unknown): void { if (typeof value !== "boolean") invalid
 function array(value: unknown): asserts value is unknown[] { if (!Array.isArray(value)) invalid(); }
 function hashes(value: unknown): void { array(value); value.forEach(hash); }
 export function validateContextCoverageMetadata(value: unknown): asserts value is ContextCoverageMetadata {
-  object(value, ["historyRevision", "pageGeneration", "planId", "bodyDigest", "manifestDigest", "pageTokens", "versions", "externalizedVersions", "routes", "delivered"], ["toolResults", "acceptedUpdates", "issuedCalls", "navigationReservedTokens", "navigationUsage"]);
+  object(value, ["historyRevision", "pageGeneration", "planId", "bodyDigest", "manifestDigest", "pageTokens", "versions", "externalizedVersions", "routes", "delivered"], ["toolResults", "acceptedUpdates", "issuedCalls", "navigationReservedTokens", "navigationUsage", "contextFormat"]);
   integer(value.historyRevision); integer(value.pageTokens); identity(value.pageGeneration); identity(value.planId);
   hash(value.bodyDigest); hash(value.manifestDigest); hashes(value.versions); hashes(value.externalizedVersions); boolean(value.delivered);
+  if (value.contextFormat !== undefined && value.contextFormat !== "legacy-json" && value.contextFormat !== "codex-context-text-v1") invalid();
   const navigationReserved = value.navigationReservedTokens ?? 0;
   integer(navigationReserved);
   if (Number(navigationReserved) > Number(value.pageTokens)) invalid();

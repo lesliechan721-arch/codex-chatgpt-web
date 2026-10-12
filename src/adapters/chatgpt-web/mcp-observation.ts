@@ -16,8 +16,8 @@ export function observeMcpToolCalls(
   transport: Transport,
   knownTools: ReadonlySet<string>,
   write: (event: Record<string, unknown>) => void = event => console.error(`[chatgpt-web-mcp] transport=${JSON.stringify(event)}`),
-  settled?: (requestId: string | number, sent: boolean) => void | Promise<void>,
-  beforeSend?: (requestId: string | number) => void | Promise<void>,
+  settled?: (requestId: string | number, sent: boolean, result?: unknown) => void | Promise<void>,
+  beforeSend?: (requestId: string | number, result?: unknown) => void | Promise<void>,
   protocolFailure?: (requestId: string | number) => { code: number; message: string } | undefined,
 ): Transport {
   let sequence = 0;
@@ -60,9 +60,9 @@ export function observeMcpToolCalls(
         && Buffer.byteLength(JSON.stringify(message.result), "utf8") > 2048) {
         message = { jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: "INVALID_ARGUMENT: context arguments exceed the bounded schema" }] } };
       }
-      if (beforeSend && id !== undefined && id !== null && !("method" in message)) await beforeSend(id);
+      if (beforeSend && id !== undefined && id !== null && !("method" in message)) await beforeSend(id, "result" in message ? message.result : undefined);
       await send(message, options);
-      if (settled && id !== undefined && id !== null && !("method" in message)) await settled(id, !("error" in message));
+      if (settled && id !== undefined && id !== null && !("method" in message)) await settled(id, !("error" in message), "result" in message ? message.result : undefined);
       if (call) {
         const result = "result" in message ? message.result : undefined;
         emit({

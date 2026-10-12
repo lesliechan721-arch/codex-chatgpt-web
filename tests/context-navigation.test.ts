@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseRequest } from "../src/responses/parser";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
+import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import type { BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 
 const body = (result: BrokerToolResult): any => result.structuredContent;
@@ -16,18 +17,18 @@ describe("context navigation", () => {
     do {
       const args = { context_id: snapshot.context_id, read_ref: target.read_ref!, ...(cursor ? { cursor } : {}) };
       const result = navigator.read(args); expect(result.isError).not.toBe(true);
-      const page = body(result); expect(page.range.start).toBe(byteEnd);
-      expect(page.range.end_exclusive).toBe(byteEnd + Buffer.byteLength(page.content));
-      expect(page.content).not.toContain("�"); expect(page.content.length).toBeGreaterThan(0);
+      const { metadata: page, body: text } = parseContextTextReadResult(result); expect(page.range.start).toBe(byteEnd);
+      expect(page.range.end_exclusive).toBe(byteEnd + Buffer.byteLength(text));
+      expect(text).not.toContain("�"); expect(text.length).toBeGreaterThan(0);
       // Stable retry: repeated transmission costs resources but does not alter page bytes/cursor.
       if (pages === 0) expect(body(navigator.read(args))).toEqual(page);
-      recovered += page.content; byteEnd = page.range.end_exclusive;
+      recovered += text; byteEnd = page.range.end_exclusive;
       cursor = page.next_cursor ?? undefined; pages++;
       expect(pages).toBeLessThan(200);
     } while (cursor);
     expect(recovered).toBe(original); expect(byteEnd).toBe(Buffer.byteLength(original)); expect(pages).toBeGreaterThan(1);
-    const empty = body(navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[1]!.read_ref! }));
-    expect(empty).toMatchObject({ content: "", range: { start: 0, end_exclusive: 0 }, has_more: false, next_cursor: null });
+    const empty = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[1]!.read_ref! }));
+    expect(empty).toMatchObject({ body: "", metadata: { range: { start: 0, end_exclusive: 0 }, has_more: false, next_cursor: null } });
   });
 
   test("filters are intersections; namespace null and strict source range do not leak another source", () => {
@@ -51,7 +52,7 @@ describe("context navigation", () => {
     expect(navigator.list({ context_id: snapshot.context_id, view: "entries", source_range: { start: 0, end_exclusive: 2 } }).isError).toBe(true);
     expect(navigator.list({ context_id: snapshot.context_id, view: "entries", source_range: { start: 1, end_exclusive: snapshot.sources.length + 2 } }).isError).toBe(true);
     // Range is a query boundary, not a restriction on a later authorized query.
-    expect(body(navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets.find(t => t.call_id === "b" && t.kind === "tool_result")!.read_ref! })).content).toBe("outside-secret");
+    expect(parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets.find(t => t.call_id === "b" && t.kind === "tool_result")!.read_ref! })).body).toBe("outside-secret");
   });
 
   test("literal case-sensitive search returns stable hit order and a dedicated read cursor", () => {
@@ -62,8 +63,8 @@ describe("context navigation", () => {
     const first = body(navigator.search(args)); expect(first.hits).toHaveLength(1); expect(first.has_more).toBe(true);
     expect(body(navigator.search(args))).toEqual(first);
     expect(first.hits[0].range.start).toBe(Buffer.byteLength("头😀 "));
-    const read = body(navigator.read({ context_id: snapshot.context_id, read_ref: first.hits[0].read_ref, cursor: first.hits[0].read_cursor }));
-    expect(read.content).toBe(Buffer.from(original).subarray(first.hits[0].snippet.start).toString("utf8"));
+    const read = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, read_ref: first.hits[0].read_ref, cursor: first.hits[0].read_cursor }));
+    expect(read.body).toBe(Buffer.from(original).subarray(first.hits[0].snippet.start).toString("utf8"));
     const offsets = [first.hits[0].range.start]; let cursor = first.next_cursor;
     while (cursor) { const page = body(navigator.search({ ...args, cursor })); offsets.push(...page.hits.map((h: any) => h.range.start)); cursor = page.next_cursor; }
     expect(offsets).toHaveLength(3); expect(offsets).toEqual([...offsets].sort((a, b) => a - b));

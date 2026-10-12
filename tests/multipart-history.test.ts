@@ -4,6 +4,8 @@ import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker
 import { formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
 
 const escape = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const part = (index: number, total: number, text: string) => JSON.stringify({ version: 1, part_index: index,
+  total_parts: total, records: [{ kind: "message", message_index: index - 1, message: { role: "user", content: text } }] });
 const group = (key: string, text: string | undefined, answer: string, complete = true) =>
   `<div data-turn-key="${key}">${text === undefined ? "" : `<div data-user-message-bubble><div data-search-result-target style="white-space:pre-wrap">${escape(text)}</div></div>`}
     <div data-content-search-unit-key="${key}:assistant"><div data-conversation-role="assistant"></div><div data-markdown-text-style="assistant-message"><p>${escape(answer)}</p></div></div>
@@ -15,7 +17,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a new multipart user message
     const page = await browser.newPage();
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
     const stage = {
-      ...formatChatGptWebMultipartStage('{"context":"earlier"}', `ctx_${"c".repeat(32)}`, 1, 2),
+      ...formatChatGptWebMultipartStage(part(1, 2, "earlier"), `ctx_${"c".repeat(32)}`, 1, 2),
       identities: ["group:assistant:stage"],
     };
     await page.setContent(`<main>${group("stage", stage.text, stage.acknowledgement)}</main>`);
@@ -29,7 +31,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a new multipart user message
       node.append(pending);
     }, prompt);
     expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
-    expect(await worker.currentSubmissionAnswerText(page, baseline)).toBe("");
+    expect(await worker.currentSubmissionAnswerSnapshot(page, baseline)).toBeUndefined();
     expect(baseline.acceptedUserIdentity).toBe("group:user:final");
     await page.locator('[data-turn-key="final"]').evaluate((node, html) => { node.outerHTML = html; }, group("final", prompt, "Answer"));
     expect((await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 1000)).identity).toBe("group:assistant:final");
@@ -45,7 +47,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("acknowledged multipart histo
         const page = await browser.newPage();
         try {
           const stages = Array.from({ length: total - 1 }, (_, index) => ({
-            ...formatChatGptWebMultipartStage(JSON.stringify({ context: `part ${index + 1}` }), `ctx_${"a".repeat(32)}`, index + 1, total),
+            ...formatChatGptWebMultipartStage(part(index + 1, total, `part ${index + 1}`), `ctx_${"a".repeat(32)}`, index + 1, total),
             identities: [`group:assistant:stage-${index}`],
           }));
           const history = (persisted: boolean) => stages.map((stage, index) => group(
@@ -58,7 +60,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("acknowledged multipart histo
           if (when === "before-send") {
             await render(history(true));
             expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
-            expect(await worker.currentSubmissionAnswerText(page, baseline)).toBe("");
+            expect(await worker.currentSubmissionAnswerSnapshot(page, baseline)).toBeUndefined();
           }
           await render(history(when === "before-baseline" || when === "before-send") + group("final", prompt, "Answer"));
           expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
@@ -77,7 +79,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("acknowledged multipart histo
             binding = await worker.reconcileAssistantTurnBinding(page, baseline, binding);
             expect(binding.identity).toBe("group:assistant:final");
           }
-          expect(await worker.currentSubmissionAnswerText(page, baseline)).toBe("Answer");
+          expect((await worker.currentSubmissionAnswerSnapshot(page, baseline))?.visibleText).toBe("Answer");
         } finally { await page.close(); }
       }
     }
@@ -92,7 +94,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("multipart history does not a
       const page = await browser.newPage();
       try {
         const stage = {
-          ...formatChatGptWebMultipartStage('{"context":"earlier"}', `ctx_${"b".repeat(32)}`, 1, 2),
+          ...formatChatGptWebMultipartStage(part(1, 2, "earlier"), `ctx_${"b".repeat(32)}`, 1, 2),
           identities: ["group:assistant:stage"],
         };
         const old = group("stage", undefined, stage.acknowledgement);

@@ -123,7 +123,11 @@ test.each([
       clearChatGptComposerState: async () => { connectorSelected = false; },
     });
   }
-  const prepare = async () => ({ text: "Summarize the context", images: [], multipart: multipart ? { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "Summarize" } : undefined, release: () => { released = true; } });
+  const prepare = async () => ({ text: "Summarize the context", images: [], multipart: multipart ? {
+    parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ version: 1, part_index: index + 1, total_parts: 6,
+      records: [{ kind: "message", message_index: index, message: { role: "user", content: `Source ${index + 1}` } }] })),
+    commit: "Summarize",
+  } : undefined, release: () => { released = true; } });
   try {
     const run = worker.runBrowserTurn({
       traceId: "compaction_recovery_fixture",

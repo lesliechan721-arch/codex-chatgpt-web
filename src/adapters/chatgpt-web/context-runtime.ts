@@ -5,8 +5,9 @@ import { assertContextNavigationBudget, contextLimits, measureContextResponse, t
 import type { ContextDelivery, ContextListArgs, ContextReadArgs, ContextSearchArgs, ContextRemainingBudget } from "./context-types";
 import type { BrokerToolResult } from "./turn-broker";
 import { NativeOperationError } from "./native-tool-operations";
+import { contextTextReadReceipt, contextTextReadReceiptsEqual, parseContextTextReadResult, type ContextTextReadReceipt } from "./context-text-result";
 
-export const CONTEXT_PROTOCOL_VERSION = 1;
+export const CONTEXT_PROTOCOL_VERSION = 2;
 export const CONTEXT_READY_TIMEOUT_MS = 120_000;
 export const CONTEXT_PROGRESS_TIMEOUT_MS = 45_000;
 export const CONTEXT_ATTACHMENT_TIMEOUT_MS = 300_000;
@@ -71,10 +72,12 @@ export interface ContextVerificationHandle {
 export interface ContextVerificationStatus extends ContextVerificationHandle {
   planId: string;
   completed: boolean;
-  ordinary: Record<ContextMethod, boolean>;
-  compaction: Record<ContextMethod, boolean>;
+  ordinary: ContextVerificationReceipts;
+  compaction: ContextVerificationReceipts;
   expiresAt: number;
 }
+export type ContextVerificationReceipts = Record<ContextMethod, boolean> & { text_read?: ContextTextReadReceipt };
+export interface ContextSuccessfulReturn { method: ContextMethod; textRead?: ContextTextReadReceipt }
 
 export function contextFailure(code: string, message: string, detail: Record<string, unknown> = {}): BrokerToolResult {
   const value = { code, message, ...detail };
@@ -94,7 +97,7 @@ export class ContextScope {
   private readonly delivered = new Set<string>();
   private readonly generatedRequiredImages = new Set<string>();
   private reservedTokensUsed = 0;
-  private readonly pending = new Map<string, { targetId?: string; method: ContextMethod; successful: boolean; timer: ReturnType<typeof setTimeout> }>();
+  private readonly pending = new Map<string, { targetId?: string; method: ContextMethod; successful: boolean; textRead?: ContextTextReadReceipt; timer: ReturnType<typeof setTimeout> }>();
   private live = true;
   private deliveredEntry = false;
   private permanentFailure = false;
@@ -171,9 +174,11 @@ export class ContextScope {
       deliveryByTarget: registration.deliveryByTarget, limits: registration.limits, remainingBudget });
   }
 
-  assertPending(receiptId: string): void {
+  assertPending(receiptId: string, textRead?: ContextTextReadReceipt): void {
     this.assertLive();
-    if (!this.pending.has(receiptId)) throw contextError("CONTEXT_RETIRED", "The context return is no longer active");
+    const pending = this.pending.get(receiptId);
+    if (!pending) throw contextError("CONTEXT_RETIRED", "The context return is no longer active");
+    if (pending.textRead && !contextTextReadReceiptsEqual(pending.textRead, textRead)) throw contextError("CONTEXT_INVALID", "The transported text result does not match the fixed v2 page");
   }
   get inFlight(): number { return this.pending.size; }
   get isLive(): boolean { return this.live && (this.expiresAt === undefined || Date.now() < this.expiresAt); }
@@ -251,6 +256,19 @@ export class ContextScope {
     if (target?.kind === "image" && !result.isError && !validImage) {
       this.permanentFailure = true; throw contextError("CONTEXT_IMAGE_UNAVAILABLE", "The fixed image return is invalid");
     }
+    let textRead: ContextTextReadReceipt | undefined;
+    if (method === "read" && target?.kind !== "image" && !result.isError) {
+      try {
+        const { metadata } = parseContextTextReadResult(result);
+        if (!target || metadata.context_id !== this.registration.snapshot.context_id || metadata.purpose !== this.purpose
+          || metadata.read_ref !== target.read_ref || metadata.utf8_bytes !== target.utf8_bytes
+          || metadata.source.target_id !== target.target_id || metadata.source.source_id !== target.source_id) throw new Error("Mismatched fixed text page");
+        textRead = contextTextReadReceipt(result);
+      } catch {
+        this.permanentFailure = true;
+        throw contextError("CONTEXT_SOURCE_UNAVAILABLE", "The fixed text return has an invalid v2 shape");
+      }
+    }
     if (validImage && this.purpose === "normal" && this.registration.deliveryByTarget[target!.target_id]?.required
       && !this.generatedRequiredImages.has(target!.target_id)) {
       this.generatedRequiredImages.add(target!.target_id);
@@ -270,11 +288,11 @@ export class ContextScope {
     }
     const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
     const timer = setTimeout(() => this.finish(receiptId, false), CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
-    this.pending.set(receiptId, { ...(validImage ? { targetId: target!.target_id } : {}), method, successful: !result.isError, timer });
+    this.pending.set(receiptId, { ...(validImage ? { targetId: target!.target_id } : {}), method, successful: !result.isError, textRead, timer });
     this.changed();
     return { result, receiptId };
   }
-  finish(receiptId: string, sent: boolean): ContextMethod | undefined {
+  finish(receiptId: string, sent: boolean, textRead?: ContextTextReadReceipt): ContextSuccessfulReturn | undefined {
     const pending = this.pending.get(receiptId);
     if (!pending) return;
     clearTimeout(pending.timer); this.pending.delete(receiptId);
@@ -282,7 +300,8 @@ export class ContextScope {
       this.delivered.add(pending.targetId); this.lastProgress = Date.now();
     }
     this.changed(); this.scheduleReadiness();
-    return sent && this.isLive && pending.successful ? pending.method : undefined;
+    return sent && this.isLive && pending.successful && (!pending.textRead || contextTextReadReceiptsEqual(pending.textRead, textRead))
+      ? { method: pending.method, ...(pending.textRead ? { textRead: pending.textRead } : {}) } : undefined;
   }
   guardCommit(): void {
     this.assertLive();

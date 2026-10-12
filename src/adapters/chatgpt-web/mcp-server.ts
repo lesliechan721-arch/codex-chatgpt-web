@@ -1,4 +1,5 @@
 import { CONTEXT_PROTOCOL_VERSION, contextFailure, type ContextPreparedReply } from "./context-runtime";
+import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt, type ContextTextReadReceipt } from "./context-text-result";
 import { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 import { createHash, randomBytes } from "node:crypto";
@@ -112,22 +113,27 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
 
   const contextProtocolFailures = new Map<string | number, { code: number; message: string }>();
   const takeContextProtocolFailure = (id: string | number) => { const error = contextProtocolFailures.get(id); contextProtocolFailures.delete(id); return error; };
-  const contextReturns = new Map<string | number, { token: string; receiptId: string; credentialKind: "ordinary" | "compaction"; control?: true; signal?: AbortSignal }>();
-  const settleContextReturn = async (requestId: string | number, sent: boolean) => {
+  const contextReturns = new Map<string | number, { token: string; receiptId: string; credentialKind: "ordinary" | "compaction"; control?: true; textRead?: true; signal?: AbortSignal }>();
+  const transportedTextReceipt = (pending: { textRead?: true }, value: unknown): ContextTextReadReceipt | undefined =>
+    pending.textRead ? contextTextReadReceipt(value) : undefined;
+  const settleContextReturn = async (requestId: string | number, sent: boolean, result?: unknown) => {
     const pending = contextReturns.get(requestId);
     if (!pending) return;
     contextReturns.delete(requestId);
+    let textReadReceipt: ContextTextReadReceipt | undefined;
+    try { if (sent) textReadReceipt = transportedTextReceipt(pending, result); } catch { sent = false; }
     await callTurnBroker(options.brokerSocketPath, { method: pending.control ? "context_control_return" : "context_return", token: pending.token,
       contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId,
-      contextProtocol: CONTEXT_PROTOCOL_VERSION, sent: sent && !pending.signal?.aborted }, 5_000)
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt, sent: sent && !pending.signal?.aborted }, 5_000)
       .catch(() => console.error("[chatgpt-web-mcp] context return receipt unavailable"));
   };
-  const checkContextReturn = async (requestId: string | number) => {
+  const checkContextReturn = async (requestId: string | number, result?: unknown) => {
     const pending = contextReturns.get(requestId);
     if (!pending) return;
     if (pending.signal?.aborted) throw new DOMException("Context return aborted", "AbortError");
+    const textReadReceipt = transportedTextReceipt(pending, result);
     await callTurnBroker(options.brokerSocketPath, { method: "context_return_check", token: pending.token,
-      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId, contextProtocol: CONTEXT_PROTOCOL_VERSION }, 5_000, pending.signal);
+      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId, contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt }, 5_000, pending.signal);
   };
   const contextFilters = {
     kind: z.enum(["message_text", "tool_arguments", "tool_result", "image"]).optional(),
@@ -147,7 +153,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
       .meta({ oneOf: [{ required: [ordinaryKey], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [ordinaryKey] } }] });
     server.registerTool(`codex_context_${method}`, {
       title: `Read existing Codex context: ${method}`,
-      description: "Read fixed sources already supplied to this task. No operation_id. Use exactly the current mode credential or the independent compaction_token, plus context_id. Listing and previews are not full source reads; reading never executes an old tool or acknowledges task updates.",
+      description: "Read fixed sources already supplied to this task. No operation_id. Use exactly the current mode credential or the independent compaction_token, plus context_id. Listing and previews are not full source reads; reading never executes an old tool or acknowledges task updates."
+        + (method === "read" ? ` Successful text pages use ${CONTEXT_TEXT_READ_FORMAT}: content[0] is JSON metadata, content[1] is the sole exact body, and structuredContent repeats only metadata. Check format and body_content_index=1. Read only that body block; never join the text blocks, parse the body as JSON, trim, or unescape it. utf8_bytes is the full source length; range is this page's UTF-8 interval. Empty pages include an empty body block. Images and errors keep their existing shape.` : ""),
       inputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }, async (input, extra) => {
@@ -160,7 +167,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
           contextMethod: method, contextArgs: contextArgs as never,
         }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
         if (!reply || typeof reply.receiptId !== "string" || !Array.isArray(reply.result?.content)) throw new Error("Invalid context response");
-        contextReturns.set(extra.requestId, { token, receiptId: reply.receiptId, credentialKind, signal: extra.signal });
+        const textRead = method === "read" && !reply.result.isError && !reply.result.content.some(block => (block as { type?: unknown })?.type === "image");
+        contextReturns.set(extra.requestId, { token, receiptId: reply.receiptId, credentialKind, ...(textRead ? { textRead: true } : {}), signal: extra.signal });
         if (extra.signal.aborted) { await settleContextReturn(extra.requestId, false); throw new DOMException("Context read aborted", "AbortError"); }
         return asMcpResult(reply.result);
       } catch (error) {

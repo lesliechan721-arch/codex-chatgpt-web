@@ -1,4 +1,5 @@
 import { ContextScope, CONTEXT_PROTOCOL_VERSION, contextError, contextFailure, type ContextPlanRegistration, type ContextAttachmentConfirmation, type ContextStatus, type ContextUsageEvidence, type ContextVerificationRegistration, type ContextVerificationHandle, type ContextVerificationStatus, type CompactionContextRegistration, type CompactionContextHandle, type ContextMethod, type ContextArgs, type ContextPreparedReply } from "./context-runtime";
+import type { ContextTextReadReceipt } from "./context-text-result";
 import { serializeContextSnapshot, restoreContextSnapshot, type ContextSnapshotWire } from "./context-snapshot";
 import { assertRecoveryWriter, recordRecoveryDelivery, recordRecoveryAppend, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
@@ -248,6 +249,7 @@ interface BrokerRequest {
   planId?: string;
   manifestDigest?: string;
   receiptId?: string;
+  textReadReceipt?: ContextTextReadReceipt;
   sent?: boolean;
   ownerContext?: TaskUpdateOwnerContext;
   taskUpdateProtocol?: number;
@@ -305,7 +307,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 11;
+const TURN_BROKER_PROTOCOL_VERSION = 12;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -576,7 +578,7 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private readonly verificationPairs = new Map<string, { handle: ContextVerificationHandle; turnToken: string; scope: ContextScope;
     contract: "native" | "safe"; ownerContext?: TaskUpdateOwnerContext; expiresAt: number; timer: ReturnType<typeof setTimeout>;
-    ordinary: Set<ContextMethod>; compaction: Set<ContextMethod> }>();
+    ordinary: Set<ContextMethod>; compaction: Set<ContextMethod>; ordinaryTextRead?: ContextTextReadReceipt; compactionTextRead?: ContextTextReadReceipt }>();
   private readonly channels = new Map<string, TurnChannel>();
   private readonly retiredContextUsage = new Map<string, { evidence: ContextUsageEvidence; expiresAt: number }>();
   private readonly pending = new Map<string, TurnChannel>();
@@ -862,9 +864,10 @@ export class TurnBroker implements TurnBrokerOwner {
     const record = this.verificationPairs.get(pairToken);
     if (!record || record.expiresAt <= Date.now()) return undefined;
     const channel = this.contextOwner(record.turnToken, record.ownerContext);
-    const methods = (received: Set<ContextMethod>) => ({ list: received.has("list"), read: received.has("read"), search: received.has("search") });
-    return { ...record.handle, planId: channel.contextScope!.registration.planId, ordinary: methods(record.ordinary), compaction: methods(record.compaction),
-      completed: record.ordinary.size === 3 && record.compaction.size === 3, expiresAt: record.expiresAt };
+    const methods = (received: Set<ContextMethod>, textRead?: ContextTextReadReceipt) => ({ list: received.has("list"), read: received.has("read"), search: received.has("search"),
+      ...(textRead ? { text_read: structuredClone(textRead) } : {}) });
+    return { ...record.handle, planId: channel.contextScope!.registration.planId, ordinary: methods(record.ordinary, record.ordinaryTextRead), compaction: methods(record.compaction, record.compactionTextRead),
+      completed: record.ordinary.size === 3 && record.compaction.size === 3 && !!record.ordinaryTextRead && !!record.compactionTextRead, expiresAt: record.expiresAt };
   }
   private retireContextVerification(pairToken: string): void {
     const record = this.verificationPairs.get(pairToken);
@@ -1024,8 +1027,14 @@ export class TurnBroker implements TurnBrokerOwner {
       let sent = request.sent === true;
       try { this.verificationSource(request.token); } catch { sent = false; }
       const scope = ordinary ? this.channels.get(verification.turnToken)?.contextScope : verification.scope;
-      const method = scope?.finish(request.receiptId, sent);
-      if (method) (ordinary ? verification.ordinary : verification.compaction).add(method);
+      const returned = scope?.finish(request.receiptId, sent, request.textReadReceipt);
+      if (returned && (returned.method !== "read" || returned.textRead)) {
+        (ordinary ? verification.ordinary : verification.compaction).add(returned.method);
+        if (returned.textRead) {
+          if (ordinary) verification.ordinaryTextRead = returned.textRead;
+          else verification.compactionTextRead = returned.textRead;
+        }
+      }
       return;
     }
     const record = request.credentialKind === "compaction" ? this.compactionContexts.get(request.token) : undefined;
@@ -1035,7 +1044,7 @@ export class TurnBroker implements TurnBrokerOwner {
     // Revalidate revocation and the actual writer before crediting a successful transfer.
     let sent = request.sent === true;
     try { if (record) this.compactionContext(request.token); if (channel?.recovery) assertRecoveryWriter(channel.recovery); } catch { sent = false; }
-    scope?.finish(request.receiptId, sent);
+    scope?.finish(request.receiptId, sent, request.textReadReceipt);
   }
 
   async beginCompactionTransaction(
@@ -2515,7 +2524,7 @@ export class TurnBroker implements TurnBrokerOwner {
         const scope = request.credentialKind === "ordinary" && request.token === verification.turnToken ? this.channels.get(verification.turnToken)?.contextScope
           : request.credentialKind === "compaction" && request.token === verification.handle.compactionToken ? verification.scope : undefined;
         if (!scope) throw contextError("CONTEXT_INVALID", "Invalid verification credential");
-        scope.assertPending(request.receiptId); return { active: true };
+        scope.assertPending(request.receiptId, request.textReadReceipt); return { active: true };
       }
       const safeControl = request.credentialKind === "ordinary" && this.compactionContextBindings.get(request.token);
       if (safeControl && request.contract === "safe") {
@@ -2525,12 +2534,12 @@ export class TurnBroker implements TurnBrokerOwner {
       if (request.credentialKind === "compaction") {
         const record = this.compactionContext(request.token);
         if (record.registration.contract !== request.contract) throw contextError("CONTEXT_INVALID", "Invalid context return mode");
-        record.scope.assertPending(request.receiptId);
+        record.scope.assertPending(request.receiptId, request.textReadReceipt);
       } else {
         const channel = this.channels.get(request.token);
         if (!channel || request.contract !== (channel.safe ? "safe" : "native") || channel.completionCommitted || channel.safe?.state === "completed" || !channel.contextScope) throw contextError("CONTEXT_RETIRED", "Context access is no longer active");
         if (channel.recovery) assertRecoveryWriter(channel.recovery);
-        channel.contextScope.assertPending(request.receiptId);
+        channel.contextScope.assertPending(request.receiptId, request.textReadReceipt);
       }
       return { active: true };
     }

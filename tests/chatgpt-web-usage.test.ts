@@ -1,6 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { estimateChatGptWebInputTokens, estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
+import * as promptModule from "../src/adapters/chatgpt-web/prompt";
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
 import { estimateTokens } from "../src/lib/token-estimate";
@@ -25,23 +27,52 @@ test.each([
   expect(estimateChatGptWebInputTokens(request(text), capabilities)).toBeLessThan(100_000);
 }, 15_000);
 
-test("multipart selection accounts for whole-record and composer fit before submission", () => {
+test.each([
+  ["small inline input", ["small task"], undefined],
+  ["whole-record token pressure", [50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
+  ["whole-record composer pressure", Array.from({ length: 3 }, () => " ".repeat(450_000)), 6],
+] as const)("%s multipart selection accounts for whole-record and composer fit before submission", (_label, contents, expected) => {
   const plus = { ...capabilities, extraHighAvailable: false, proAvailable: false };
-  for (const [contents, expected] of [
-    [["small task"], undefined],
-    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
-    [Array.from({ length: 3 }, () => " ".repeat(450_000)), 6],
-  ] as const) {
-    const parsed = request("");
-    parsed.context.messages = contents.map((content, index) => ({ role: "user", content, timestamp: index + 1 }));
-    const parts = resolveBiggerContextMultipartParts(parsed, plus);
-    expect(parts).toBe(expected);
-    const compiled = compileChatGptWebPrompt(parsed, plus, undefined, { experimentalMultipartParts: parts });
-    if (parts) {
-      expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
-        .toEqual([...contents]);
+  const parsed = request("");
+  parsed.context.messages = contents.map((content, index) => ({ role: "user", content, timestamp: index + 1 }));
+  const originalCompile = promptModule.compileChatGptWebPrompt;
+  let twoPartFailure: unknown;
+  const probe = spyOn(promptModule, "compileChatGptWebPrompt").mockImplementation((input, caps, token, options) => {
+    try { return originalCompile(input, caps, token, options); }
+    catch (error) {
+      if (options?.experimentalMultipartParts === 2) twoPartFailure = error;
+      throw error;
     }
+  });
+  let parts: 2 | 6 | undefined;
+  try { parts = resolveBiggerContextMultipartParts(parsed, plus); }
+  finally { probe.mockRestore(); }
+  expect(parts).toBe(expected);
+  if (expected === 6) {
+    expect(twoPartFailure).toBeInstanceOf(ChatGptWebAdapterError);
+    expect((twoPartFailure as ChatGptWebAdapterError).code).toBe("context_length_exceeded");
   }
+  const compiled = compileChatGptWebPrompt(parsed, plus, undefined, { experimentalMultipartParts: parts });
+  if (parts) {
+    expect(compiled.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
+      .toEqual([...contents]);
+    const messages = compiledChatGptWebMessages(compiled);
+    const tokens = messages.map(text => estimateTokens(text, parsed.modelId));
+    const chars = messages.map(text => text.length);
+    const maxStageMessageTokens = Math.max(...tokens.slice(0, -1));
+    const maxStageChars = Math.max(...chars.slice(0, -1));
+    const staging = resolveChatGptWebMultipartStagingMode(parsed.modelId, plus, maxStageMessageTokens, maxStageChars);
+    expect(() => assertChatGptWebMultipartInputWithinLimits(
+      estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId), Math.max(...tokens), parsed.modelId,
+      "high", plus, Math.max(...chars), parts,
+      { stagingEffort: staging.effort, maxStageMessageTokens, maxStageChars,
+        finalMessageTokens: tokens.at(-1)!, finalMessageChars: chars.at(-1)!,
+        finalImageTokens: estimateChatGptWebImageTokens(compiled) },
+    )).not.toThrow();
+  }
+}, 60_000);
+
+test("multipart selection stages sparse Pro input without dropping its complete record", () => {
   // Low-token text can still exceed the reasoning model's server character ceiling.
   // Stage the complete record instead of sending it inline or dropping its contents.
   const sparsePro = request("x".repeat(600_000));
@@ -54,7 +85,34 @@ test("multipart selection accounts for whole-record and composer fit before subm
   expect(resolveChatGptWebMultipartStagingMode(
     "gpt-5.6-sol", capabilities, estimateTokens(proMessages[0]!), proMessages[0]!.length,
   ).effort).toBe("max");
-}, 60_000);
+}, 30_000);
+
+test("multipart selection propagates non-capacity errors from the two-part probe", () => {
+  const parsed = request("x".repeat(600_000));
+  const originalCompile = promptModule.compileChatGptWebPrompt;
+  for (const failure of [
+    new Error("Context preparation failed"),
+    new ChatGptWebAdapterError("Invalid context format", {
+      status: 400, errorType: "invalid_request_error", code: "invalid_context_format", retryable: false,
+    }),
+    Object.assign(new Error("Unrelated error with a capacity-like code"), { code: "context_length_exceeded" }),
+  ]) {
+    const compile = spyOn(promptModule, "compileChatGptWebPrompt").mockImplementation((input, caps, token, options) => {
+      if (options?.experimentalMultipartParts === 2) throw failure;
+      return originalCompile(input, caps, token, options);
+    });
+    try {
+      let observed: unknown;
+      try { resolveBiggerContextMultipartParts(parsed, capabilities); }
+      catch (error) { observed = error; }
+      expect(observed).toBe(failure);
+      expect(compile.mock.calls.some(([, , , options]) => options?.experimentalMultipartParts === 2)).toBe(true);
+      expect(compile.mock.calls.some(([, , , options]) => options?.experimentalMultipartParts === 6)).toBe(false);
+    } finally {
+      compile.mockRestore();
+    }
+  }
+}, 30_000);
 
 test("Bigger Context compaction selects six parts before the legacy inline byte budget", () => {
   const parsed = request("x".repeat(160_000));

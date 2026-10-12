@@ -13,16 +13,17 @@ import { parseRequest } from "../../responses/parser";
 import { ChatGptBrowserWorker, type BrowserTurn } from "./browser-worker";
 import { createContextSnapshot } from "./context-snapshot";
 import { callTurnBroker, RemoteTurnBroker, TurnBroker, type TurnBrokerOwner } from "./turn-broker";
-import type { ContextVerificationHandle } from "./context-runtime";
+import { CONTEXT_PROTOCOL_VERSION, type ContextVerificationHandle, type ContextVerificationReceipts } from "./context-runtime";
+import { CONTEXT_TEXT_READ_FORMAT, isContextTextReadReceipt } from "./context-text-result";
 
-export const CONTEXT_CAPABILITY_VERIFICATION_VERSION = 1;
+export const CONTEXT_CAPABILITY_VERIFICATION_VERSION = 2;
 export const CONTEXT_CAPABILITY_VERIFICATION_TIMEOUT_MS = 300_000;
 export const CONTEXT_CAPABILITY_METHODS = ["list", "search", "read"] as const;
 export type ContextCapabilityMethod = typeof CONTEXT_CAPABILITY_METHODS[number];
 export type ContextCapabilityCredential = "ordinary" | "compaction";
 export interface ContextCapabilityReceipts {
-  ordinary: Record<ContextCapabilityMethod, boolean>;
-  compaction: Record<ContextCapabilityMethod, boolean>;
+  ordinary: ContextVerificationReceipts;
+  compaction: ContextVerificationReceipts;
 }
 export interface ContextCapabilityBinding {
   profile: "production" | "development";
@@ -36,6 +37,8 @@ export interface ContextCapabilityBinding {
   runtimeFingerprint: string;
   schemaDigest: string;
   sentConfirmationRequired: boolean;
+  contextProtocol: typeof CONTEXT_PROTOCOL_VERSION;
+  textReadFormat: typeof CONTEXT_TEXT_READ_FORMAT;
 }
 export interface ContextCapabilityEvidence {
   version: typeof CONTEXT_CAPABILITY_VERIFICATION_VERSION;
@@ -76,7 +79,14 @@ export function contextCapabilitySchemaDigest(tools: readonly unknown[], mode: "
       || schema.required.includes(ordinaryKey) || schema.required.includes("compaction_token")) {
       throw new Error(`Installed MCP lacks exclusive ordinary/compaction credentials for codex_context_${method}`);
     }
-    return { name: tool.name, inputSchema: schema, annotations: tool.annotations };
+    if (typeof tool.description !== "string" || !tool.description
+      || method === "read" && !tool.description.includes(CONTEXT_TEXT_READ_FORMAT)
+      || tool.outputSchema !== undefined && !object(tool.outputSchema)) {
+      throw new Error(`Installed MCP has an incompatible codex_context_${method} output contract; update the existing connector and run Verify runtime again`);
+    }
+    return { name: tool.name, inputSchema: schema, annotations: tool.annotations, description: tool.description,
+      ...(method === "read" ? { textReadFormat: CONTEXT_TEXT_READ_FORMAT } : {}),
+      ...(tool.outputSchema !== undefined ? { outputSchema: tool.outputSchema } : {}) };
   });
   return digest(selected);
 }
@@ -86,7 +96,8 @@ const SCHEMA_CACHE_MS = 5_000;
 function schemaCacheKey(config: AppConfig): string {
   const files = config.runtimeCommand.filter(value => existsSync(value));
   const entry = config.runtimeCommand[1];
-  if (entry?.endsWith(".ts")) files.push(join(dirname(resolve(entry)), "adapters", "chatgpt-web", "mcp-server.ts"));
+  if (entry?.endsWith(".ts")) files.push(...["mcp-server.ts", "mcp-observation.ts", "context-text-result.ts", "context-runtime.ts",
+    "context-navigator.ts", "context-capability-verification.ts", "turn-broker.ts"].map(file => join(dirname(resolve(entry)), "adapters", "chatgpt-web", file)));
   const fingerprint = files.map(path => {
     try { const stat = statSync(path); return [resolve(path), stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]; }
     catch { return [resolve(path), "missing"]; }
@@ -132,29 +143,33 @@ export function contextCapabilityBinding(config: AppConfig, schemaDigest: string
     appName, tunnelId: tunnel.tunnelId, tunnelProfile: digest({ binary: tunnel.binaryPath, runtimeKeyFile: resolve(tunnel.runtimeKeyFile),
       directory: resolve(tunnel.profileDir), name: tunnel.profileName, alias: tunnel.alias }),
     brokerSocketPath: config.brokerSocketPath, runtimeCommand: [...config.runtimeCommand], runtimeFingerprint: schemaCacheKey(config), schemaDigest,
-    sentConfirmationRequired: config.browserInteractionMode === "manual" && config.zeroRiskRequireSentConfirmation };
+    sentConfirmationRequired: config.browserInteractionMode === "manual" && config.zeroRiskRequireSentConfirmation,
+    contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadFormat: CONTEXT_TEXT_READ_FORMAT };
 }
 
 export function contextCapabilityReceiptsComplete(value: unknown): value is ContextCapabilityReceipts {
-  return object(value) && ["ordinary", "compaction"].every(kind => object(value[kind])
-    && CONTEXT_CAPABILITY_METHODS.every(method => (value[kind] as JsonObject)[method] === true));
+  return object(value) && Object.keys(value).every(key => ["ordinary", "compaction"].includes(key))
+    && ["ordinary", "compaction"].every(kind => object(value[kind])
+    && Object.keys(value[kind]).every(key => ["list", "search", "read", "text_read"].includes(key))
+    && CONTEXT_CAPABILITY_METHODS.every(method => (value[kind] as JsonObject)[method] === true)
+    && isContextTextReadReceipt((value[kind] as JsonObject).text_read));
 }
 function readEvidenceStore(home: string): Partial<Record<"automatic" | "manual", ContextCapabilityEvidence>> {
   try {
     const store = JSON.parse(readFileSync(getContextCapabilityEvidencePath(home), "utf8"));
-    return object(store) && store.version === 1 && object(store.modes) ? store.modes : {};
+    return object(store) && store.version === CONTEXT_CAPABILITY_VERIFICATION_VERSION && object(store.modes) ? store.modes : {};
   } catch { return {}; }
 }
 export function invalidateContextCapabilityEvidence(config: AppConfig, home = getConfigDir()): void {
   const modes = readEvidenceStore(home); delete modes[config.browserInteractionMode];
-  atomicWriteFile(getContextCapabilityEvidencePath(home), `${JSON.stringify({ version: 1, modes }, null, 2)}\n`, { durable: true });
+  atomicWriteFile(getContextCapabilityEvidencePath(home), `${JSON.stringify({ version: CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes }, null, 2)}\n`, { durable: true });
 }
 export function saveContextCapabilityEvidence(config: AppConfig, schemaDigest: string, receipts: ContextCapabilityReceipts, home = getConfigDir()): ContextCapabilityEvidence {
   if (!contextCapabilityReceiptsComplete(receipts)) throw new Error("All six successful context transport receipts are required");
   const evidence: ContextCapabilityEvidence = { version: CONTEXT_CAPABILITY_VERIFICATION_VERSION,
     binding: contextCapabilityBinding(config, schemaDigest, home), verifiedAt: new Date().toISOString(), receipts: structuredClone(receipts) };
   const modes = readEvidenceStore(home); modes[config.browserInteractionMode] = evidence;
-  atomicWriteFile(getContextCapabilityEvidencePath(home), `${JSON.stringify({ version: 1, modes }, null, 2)}\n`, { durable: true });
+  atomicWriteFile(getContextCapabilityEvidencePath(home), `${JSON.stringify({ version: CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes }, null, 2)}\n`, { durable: true });
   return evidence;
 }
 export function readContextCapabilityEvidence(config: AppConfig, schemaDigest: string, home = getConfigDir()): ContextCapabilityEvidence | undefined {
@@ -167,7 +182,7 @@ export function readContextCapabilityEvidence(config: AppConfig, schemaDigest: s
 export async function assertContextCapabilityVerified(config: AppConfig, options: { home?: string; schemaDigest?: string } = {}): Promise<ContextCapabilityEvidence> {
   const schemaDigest = options.schemaDigest ?? await installedContextCapabilitySchemaDigest(config);
   const evidence = readContextCapabilityEvidence(config, schemaDigest, options.home);
-  if (!evidence) throw new Error("Context navigation is not verified for this profile, mode, plugin and tunnel. Run Verify runtime and complete its six read-only MCP calls before using projected context or compaction. Create a new plugin if its cached contract is old; do not rename or refresh the old plugin.");
+  if (!evidence) throw new Error("Context navigation is not verified for this profile, mode, plugin and tunnel. Run Verify runtime and complete its six read-only MCP calls, including both context-text-read-v2 transport returns, before using projected context or compaction. Update or reconnect the existing Codex Native5, Codex Native5 DEV, Codex Zero Risk4, or custom non-retired connector when its cached contract is old, then verify again. If the client cannot update that contract, context navigation remains unavailable.");
   return evidence;
 }
 
@@ -231,7 +246,8 @@ function assertVerificationBroker(broker: TurnBrokerOwner): asserts broker is Tu
 function verificationPrompt(config: AppConfig, turnToken: string, pair: ContextVerificationHandle, normalReadRef: string, compactionReadRef: string): string {
   const key = config.browserInteractionMode === "manual" ? "request_id" : "turn_token";
   const lines = ["This is an explicit read-only runtime capability check. It contains no Codex task data.",
-    "Use the selected connector for exactly the six context calls below, in order. Each call must succeed. Do not use inventory, business tools, waits, completion or compaction submission. Do not reproduce credentials in your final answer."];
+    "Use the selected connector for exactly the six context calls below, in order. Each call must succeed. Do not use inventory, business tools, waits, completion or compaction submission. Do not reproduce credentials in your final answer.",
+    "Successful text reads use context-text-read-v2: content[0] is metadata JSON; content[1], identified by body_content_index=1, is the sole exact body. structuredContent contains metadata only. Do not join both text blocks or parse, trim, or unescape the body. These receipts verify result shape and supported transport only; they do not prove that a model used the body."];
   if (config.browserInteractionMode === "manual") lines.push(`First call codex_turn_start with ${JSON.stringify({ request_id: turnToken })}. Keep the original manual start and Sent rules.`);
   for (const [credential, contextId, readRef] of [[{ [key]: turnToken }, pair.normalContextId, normalReadRef],
     [{ compaction_token: pair.compactionToken }, pair.compactionContextId, compactionReadRef]] as const) {

@@ -30,10 +30,10 @@ async function fixture(remote: boolean, safe = false, sent = false) {
     : await owner.register(environment, undefined, "context-test", { taskUpdateProtocol: 1 });
   const contract = safe ? "safe" as const : "native" as const;
   const query = (registration: ContextPlanRegistration, read = true, options: Record<string, unknown> = {}) => callTurnBroker<ContextPreparedReply>(socket, {
-    method: "context_query", token, contract, credentialKind: "ordinary", contextProtocol: 1,
+    method: "context_query", token, contract, credentialKind: "ordinary", contextProtocol: 2,
     contextMethod: read ? "read" : "list", contextArgs: read ? { context_id: registration.snapshot.context_id, read_ref: registration.snapshot.targets.find(t => t.kind === "image")!.read_ref! } : { context_id: registration.snapshot.context_id, view: "entries" }, ...options,
   });
-  const finish = (reply: ContextPreparedReply, sent = true) => callTurnBroker(socket, { method: "context_return", token, contract, credentialKind: "ordinary", contextProtocol: 1, receiptId: reply.receiptId, sent });
+  const finish = (reply: ContextPreparedReply, sent = true) => callTurnBroker(socket, { method: "context_return", token, contract, credentialKind: "ordinary", contextProtocol: 2, receiptId: reply.receiptId, sent });
   const start = (id: number, cmd = "echo test") => callTurnBroker<NativeOperationReply>(socket, { method: "native_operation_start", token, contract, nativeWaitProtocol: 1, taskUpdateProtocol: 1, operationId: id, taskRevision: 0, entry: "codex_exec", nativeInput: { cmd }, waitMs: 1 });
   return { root, socket, broker, owner, token, contract, query, finish, start,
     close: async () => { await broker.close(); rmSync(root, { recursive: true, force: true }); } };
@@ -124,7 +124,7 @@ test("compaction submission rejects pending, undelivered, revoked and cross-purp
     await expect(f.query(a, false, { token: tx.token, credentialKind: "compaction" })).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
     await expect(f.query(a, false, { token: h.compactionToken })).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
     const reading = await query(); await expect(submit()).rejects.toMatchObject({ code: "CONTEXT_BUSY" });
-    await callTurnBroker(f.socket, { method: "context_return", token: h.compactionToken, contract: "native", credentialKind: "compaction", contextProtocol: 1, receiptId: reading.receiptId, sent: true });
+    await callTurnBroker(f.socket, { method: "context_return", token: h.compactionToken, contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: reading.receiptId, sent: true });
     await submit(); expect(await f.broker.waitForCompactionHandoff(tx.token)).toBe("summary without all reads");
     await expect(query()).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
     const revoked = await f.owner.beginCompactionTransaction("context-compaction-revoked");
@@ -374,7 +374,7 @@ test("verification expiry retires both source credentials", async () => {
     await new Promise(resolve => setTimeout(resolve, 130));
     expect(await f.owner.contextVerificationStatus(pair.pairToken)).toBeUndefined();
     await expect(f.query(normal)).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
-    await expect(callTurnBroker(f.socket, { method: "context_query", token: pair.compactionToken, contract: "native", credentialKind: "compaction", contextProtocol: 1,
+    await expect(callTurnBroker(f.socket, { method: "context_query", token: pair.compactionToken, contract: "native", credentialKind: "compaction", contextProtocol: 2,
       contextMethod: "list", contextArgs: { context_id: pair.compactionContextId, view: "overview" } })).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
   } finally { await f.close(); }
 });

@@ -73,6 +73,7 @@ export class ContextSend {
     const routes = plan.registration?.deliveryByTarget ?? {};
     return { historyRevision: this.canonical._continuityHistoryRevision ?? 0,
       pageGeneration: this.pageGeneration, planId: id, bodyDigest: plan.bodyDigest,
+      contextFormat: plan.compiled.contextFormat ?? "legacy-json",
       manifestDigest: plan.manifestDigest ?? plan.bodyDigest,
       pageTokens: plan.costs.retainedTokens + plan.costs.promptTokens + plan.costs.requiredMcpTokens
         + plan.costs.attachmentVisualTokens + plan.costs.workReserveTokens,

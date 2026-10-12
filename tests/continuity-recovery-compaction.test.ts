@@ -19,7 +19,8 @@ import { chatGptContinuityInstructionPayloadDigest } from "../src/adapters/chatg
 import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { bindRecoveryContextCoverage } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
-import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
+import { contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { acceptRecoveryResults, recoveryIdentity, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { defaultBrokerEndpoint, defaultConfig } from "../src/config";
@@ -178,14 +179,16 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     await turn.onSubmitted?.();
     const entry = JSON.parse(compiled.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
     const credential = entry.first_call.arguments;
-    const query = async (method: "list" | "read", args: Record<string, unknown>) => {
-      const reply = await callTurnBroker<{ result: { structuredContent: any }; receiptId: string }>(provider.chatgptWeb!.brokerSocketPath!, {
+    const query = async (method: "list" | "read", args: Record<string, unknown>): Promise<any> => {
+      const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(provider.chatgptWeb!.brokerSocketPath!, {
         method: "context_query", token: credential.compaction_token, contract: "native", credentialKind: "compaction",
-        contextProtocol: 1, contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
+        contextProtocol: 2, contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.compaction_token,
-        contract: "native", credentialKind: "compaction", contextProtocol: 1, receiptId: reply.receiptId, sent: true });
-      return reply.result.structuredContent;
+        contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: reply.receiptId, sent: true,
+        ...(method === "read" && !reply.result.isError ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
+      return method === "read" && !reply.result.isError ? { ...(reply.result.structuredContent as Record<string, unknown>), content: parseContextTextReadResult(reply.result).body }
+        : reply.result.structuredContent;
     };
     let source = "", cursor: string | undefined;
     do {
@@ -194,6 +197,12 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
         let readCursor: string | undefined;
         do {
           const read = await query("read", { read_ref: target.read_ref, ...(readCursor ? { cursor: readCursor } : {}) });
+          if (read.error) {
+            // This fixture only needs the source prefix for its fixed summary.
+            // A long source can exhaust navigation while preserving the summary reserve.
+            expect(read.error.code).toBe("BUDGET_EXCEEDED");
+            break;
+          }
           source += read.content ?? ""; readCursor = read.next_cursor ?? undefined;
         } while (readCursor);
       }

@@ -14,7 +14,7 @@ import type { TurnBrokerOwner, BrokerToolRequest } from "./turn-broker";
 import type { ChatGptWebCapabilities } from "./model";
 import type { ContextDelivery, ContextSourceEvidence } from "./context-types";
 import { COMPACT_PROMPT } from "../../responses/compaction";
-import { compileChatGptWebPrompt, type CompiledChatGptWebPrompt } from "./prompt";
+import { compileChatGptWebPrompt, type CompiledChatGptWebPrompt, type CompileChatGptWebPromptOptions } from "./prompt";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import { validateContextCoverageMetadata, type ContextCoverageMetadata } from "./context-coverage-journal";
 
@@ -26,6 +26,8 @@ export interface CompactionSourcePlan {
   planId: string;
   bodyDigest: string;
   manifestDigest: string;
+  /** Fixed with the selected input; absent only for legacy coverage. */
+  contextFormat?: ContextCoverageMetadata["contextFormat"];
   /** Actual retained page estimate, including selected input and reserved output,
    * excluding the platform reserve shared by the whole context window. */
   pageTokens: number;
@@ -101,6 +103,7 @@ export class CompactionSourceCoverage {
   prepare(snapshot: ContextSnapshot, plan: CompactionSourcePlan): void {
     if (!Number.isSafeInteger(plan.historyRevision) || plan.historyRevision < 0
       || !Number.isSafeInteger(plan.pageTokens) || plan.pageTokens < 0
+      || plan.contextFormat !== undefined && plan.contextFormat !== "legacy-json" && plan.contextFormat !== "codex-context-text-v1"
       || plan.navigationReservedTokens !== undefined && (!Number.isSafeInteger(plan.navigationReservedTokens) || plan.navigationReservedTokens < 0 || plan.navigationReservedTokens > plan.pageTokens)
       || [plan.pageGeneration, plan.planId, plan.bodyDigest, plan.manifestDigest].some(v => !v || v.length > 256)) {
       unavailable("The selected source plan has invalid coverage metadata.");
@@ -420,6 +423,8 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
     /** Retains an existing path's multipart/full-capacity admission, without history trimming. */
     assertFullInput?: (compiled: CompiledChatGptWebPrompt, input: CodexParsedRequest) => void | Promise<void>;
     turnToken?: string;
+    /** Trusted acceptance path; cannot change source, authority or send policy. */
+    contextPresentation?: Pick<CompileChatGptWebPromptOptions, "contextRendering" | "contextRawTextPolicy">;
   }): Promise<{ instruction: string; markDelivered(): Promise<void>; acceptSummary(summary: string): Promise<string>; cleanup(): Promise<void> }> {
   options.signal?.throwIfAborted();
   const snapshot = options.sourceSnapshot ?? (options.sourceCoverage ? captureCompactionSource(parsed, options.sourceCoverage) : createContextSnapshot(parsed));
@@ -435,7 +440,7 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
   const fullInput: CodexParsedRequest = { ...parsed, _compactionRequest: false,
     options: { ...parsed.options, outputFormat: undefined }, context: { ...parsed.context, tools: [] } };
   const full = compileChatGptWebPrompt(fullInput, { ...capabilities, localToolsEnabled: Boolean(options.turnToken) }, options.turnToken,
-    options.turnToken ? { manualControl: true } : {});
+    { ...options.contextPresentation, ...(options.turnToken ? { manualControl: true } : {}) });
   if (options.assertFullInput) await options.assertFullInput(full, fullInput);
   else assertContinuityCompiledInput(full, fullInput, capabilities);
   options.signal?.throwIfAborted();

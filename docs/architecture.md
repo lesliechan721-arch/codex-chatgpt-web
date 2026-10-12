@@ -94,8 +94,10 @@ change the part after `Codex ` for the selected mode. The retired `Codex Native`
 `Codex Zero Risk`, `Codex Zero Risk2`, and `Codex Zero Risk3` are never selected or refreshed in
 place. Setup migrates known legacy local configuration transactionally and clears prior verification.
 The user creates a new remote plugin. Exact browser selection never falls back to a retired
-identity. Production and DEV plugins can remain installed together. Future public schema changes
-require another explicit connector identity.
+identity. Production and DEV plugins can remain installed together. Future released public schema
+changes require another explicit connector identity. The current context-rendering/text-read-v2
+work is an update to an unreleased feature and retains Native5 / Native5 DEV / Zero Risk4 and
+non-retired custom names. It upgrades the internal context protocol and capability evidence instead.
 
 Settings fixes only the `Codex ` prefix and edits the rest of the selected mode's name: `Native5`
 by default in Automatic, `Zero Risk4` in manual mode, and `Native5 DEV` in Automatic DEV. Mode names
@@ -107,18 +109,25 @@ A name change uses the existing setup transaction, rejects active work, and clea
 only after success. The user must create a new plugin with that exact name. Renaming a display
 label does not itself replace a remote connector's cached schema; retired connector identities cannot
 be selected as new names and legacy connectors are still never reused. If a preserved custom name
-still caches an older public contract, choose a new name and create a new plugin.
+still caches a pre-navigation public contract, use the original new-name migration. For the
+unreleased text-v2 update, refresh/reconnect the same current connector and verify again. If that
+cannot establish v2 support, stop its use without selecting another or retired identity.
 An old setup-flow marker or saved-name mismatch clears local verification without changing the
 configured custom name. The marker records UI flow version only. Local health, installed
 `tools/list`, and browser connector selection cannot prove the remote cached schema. Verify runtime
 also registers a bounded private read-only pair over fixed small text, then requires six successful
-transport returns: list/search/read with ordinary and independent compaction credentials. The pair
+transport returns: list/search/read with ordinary and independent compaction credentials. Capability
+evidence 2 additionally binds each read to the actual v2 result shape and supported-transport digest.
+The contract fingerprint includes tool descriptions, the text-read version, and any output schema.
+Old evidence is invalid. The pair
 has no business or compaction-submission authority. Automatic uses real submission evidence;
 manual uses the original user selection, Send, start, and Sent policy. The owner-only sidecar binds
 the result to profile/home, mode, exact plugin, tunnel, runtime command, and installed schema digest,
 with no time-based expiry. A retry clears that mode's old result; a binding change invalidates it.
 Context projection and new compaction admission check this result before publishing source access.
-It proves callability, not the platform's raw cached schema. Image and model acceptance remain part
+It proves shape and callability, not model body use or the platform's raw cached schema. Separate real
+ordinary tasks and compaction transactions check body use through their existing answer/checkpoint
+exits; the private verifier still cannot complete a task. Image and model acceptance remain part
 of [release validation](release-validation.md#context-navigation-validation).
 
 ## Browser lifecycle
@@ -158,6 +167,15 @@ Images prefer fixed inline MCP image blocks; required fallback images use the ex
 path. Image bytes stay out of the prompt JSON. No context JSONL file, synthetic context document,
 or intermediate summary is created. The [context navigation contract](context-navigation.md)
 defines source provenance, net-savings selection, effective budgets, and failure boundaries.
+
+After the existing selected-input mapping and cleanup, a deterministic presentation layer compares
+legacy JSON with `codex-context-text-v1`. The new representation keeps structural JSON and places
+eligible long strings in length-bound raw blocks. It preserves the delivered value tree and uses
+dynamic outer fences. Short/no-benefit fields stay JSON; unverified editor whitespace stays JSON.
+The [byte contract](context-rendering.md) defines decoding and collision checks. Selection measures
+complete inputs, fixes the actual format and bytes before Send, and records the format with coverage
+and costs. It does not change source choice, permissions, or retry policy. MCP text pages use a
+separate `context-text-read-v2` result with two metadata representations and one body block.
 
 Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
 same choice remains available in Settings; changing it uses the transactional setup path, replaces

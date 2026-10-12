@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultBrokerEndpoint, defaultConfig, getContextCapabilityEvidencePath, providerConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { assertContextCapabilityVerified, contextCapabilitySchemaDigest, invalidateContextCapabilityEvidence,
+  contextCapabilityReceiptsComplete,
   installedContextCapabilitySchemaDigest, readContextCapabilityEvidence, readProviderContextCapabilityEvidence, runContextCapabilityVerification, saveContextCapabilityEvidence,
   type ContextCapabilityReceipts } from "../src/adapters/chatgpt-web/context-capability-verification";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,6 +16,9 @@ import { parseRequest } from "../src/responses/parser";
 import { CHATGPT_WEB_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
+import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
+import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
 
 const roots: string[] = [];
 afterEach(() => { chatGptTurnSessions.clear(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -27,10 +31,16 @@ function fixture() {
     profileDir: join(home, "tunnel"), profileName: "automatic", alias: "automatic" };
   return { home, config };
 }
-const receipts = (): ContextCapabilityReceipts => ({ ordinary: { list: true, search: true, read: true }, compaction: { list: true, search: true, read: true } });
+const successMethods = { ordinary: { list: true, search: true, read: true }, compaction: { list: true, search: true, read: true } };
+const receipts = (): ContextCapabilityReceipts => {
+  const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: "test receipt source" }));
+  const read = (purpose: "normal" | "compaction") => contextTextReadReceipt(new ContextNavigator({ scopeId: "receipt-fixture", snapshot, purpose })
+    .read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }));
+  return { ordinary: { ...successMethods.ordinary, text_read: read("normal") }, compaction: { ...successMethods.compaction, text_read: read("compaction") } };
+};
 function tools(mode: "automatic" | "manual" = "automatic") {
   const key = mode === "manual" ? "request_id" : "turn_token";
-  return ["list", "search", "read"].map(method => ({ name: `codex_context_${method}`, annotations: { readOnlyHint: true }, inputSchema: {
+  return ["list", "search", "read"].map(method => ({ name: `codex_context_${method}`, description: `Read-only ${method} ${method === "read" ? CONTEXT_TEXT_READ_FORMAT : "directory"}`, annotations: { readOnlyHint: true }, inputSchema: {
     type: "object", additionalProperties: false, properties: { [key]: { type: "string" }, compaction_token: { type: "string" }, context_id: { type: "string" } },
     required: ["context_id"], oneOf: [{ required: [key], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [key] } }],
   } }));
@@ -52,6 +62,31 @@ describe("context capability evidence", () => {
     const operation = tools(); (operation[0]!.inputSchema.properties as Record<string, unknown>).operation_id = { type: "integer" };
     expect(() => contextCapabilitySchemaDigest(operation, "automatic")).toThrow("incompatible");
     expect(() => contextCapabilitySchemaDigest(tools(), "manual")).toThrow("incompatible");
+  });
+  test("fingerprint binds descriptions, actual read format and optional output schema", () => {
+    const current = contextCapabilitySchemaDigest(tools(), "automatic");
+    const old = tools(); old[2]!.description = "Old read format, duplicated structured body";
+    expect(() => contextCapabilitySchemaDigest(old, "automatic")).toThrow("output contract");
+    const description = tools(); description[0]!.description += " Updated discovery instructions";
+    expect(contextCapabilitySchemaDigest(description, "automatic")).not.toBe(current);
+    const output = tools().map(tool => ({ ...tool, outputSchema: { type: "object", properties: { format: { const: CONTEXT_TEXT_READ_FORMAT } } } }));
+    expect(contextCapabilitySchemaDigest(output, "automatic")).not.toBe(current);
+  });
+  test("v1 stores and Boolean-only read receipts cannot authorize the new contract", () => {
+    const f = fixture(), schema = contextCapabilitySchemaDigest(tools(), "automatic");
+    const saved = saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+    expect(contextCapabilityReceiptsComplete(successMethods)).toBe(false);
+    expect(() => saveContextCapabilityEvidence(f.config, schema, successMethods, f.home)).toThrow("six");
+    const malformed = receipts(); malformed.compaction.text_read!.body_content_index = 0 as 1;
+    expect(contextCapabilityReceiptsComplete(malformed)).toBe(false);
+    for (const store of [
+      { version: 1, modes: { automatic: { ...saved, version: 1, receipts: successMethods } } },
+      { version: 2, modes: { automatic: { ...saved, receipts: successMethods } } },
+      { version: 2, modes: { automatic: { ...saved, binding: { ...saved.binding, textReadFormat: "context-text-read-v1" } } } },
+    ]) {
+      writeFileSync(getContextCapabilityEvidencePath(f.home), JSON.stringify(store));
+      expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+    }
   });
   test("all six receipts are required and persisted evidence contains no credentials or source", async () => {
     const f = fixture(); const schema = contextCapabilitySchemaDigest(tools(), "automatic");
@@ -130,7 +165,7 @@ describe("context capability evidence", () => {
         }
         return "A model's final prose is not used as evidence";
       } });
-      expect(evidence.receipts).toEqual(receipts());
+      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true);
       expect(readContextCapabilityEvidence(f.config, evidence.binding.schemaDigest, f.home)).toEqual(evidence);
     } finally { await client.close(); }
   });
@@ -182,7 +217,7 @@ describe("context capability evidence", () => {
     expect(observed.nativeConnector).toBe(true); expect(observed.preSubmitReadRejected).toBe(true);
     expect(observed.successful).toEqual(["codex_context_list", "codex_context_search", "codex_context_read",
       "codex_context_list", "codex_context_search", "codex_context_read"]);
-    expect(evidence.receipts).toEqual(receipts());
+    expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true);
     expect(readContextCapabilityEvidence(f.config, evidence.binding.schemaDigest, f.home)).toEqual(evidence);
   }, 30_000);
   test("a typed success reply does not verify and a failed retry clears the previous proof", async () => {
@@ -190,6 +225,14 @@ describe("context capability evidence", () => {
     saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
     await expect(runContextCapabilityVerification(f.config, { home: f.home, timeoutMs: 2_000,
       automaticRun: async turn => { await turn.onSubmitted?.(); return "All six tools succeeded"; } })).rejects.toThrow("without all six");
+    expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+  });
+  test("cancelled verification clears old evidence and cannot save partial transport success", async () => {
+    const f = fixture(), schema = await installedContextCapabilitySchemaDigest(f.config);
+    saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+    const controller = new AbortController();
+    await expect(runContextCapabilityVerification(f.config, { home: f.home, timeoutMs: 2_000, abortSignal: controller.signal,
+      automaticRun: async turn => { await turn.onSubmitted?.(); controller.abort(new Error("User cancelled verification")); return "Cancelled"; } })).rejects.toThrow("cancelled");
     expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
   });
   test("verify-context --json keeps a self-owned Broker's diagnostics outside its single JSON stdout", async () => {
@@ -252,7 +295,8 @@ describe("context capability evidence", () => {
       expect(modelFailure).toBeUndefined(); expect(exitCode).toBe(0);
       expect(calls).toEqual(["codex_context_list", "codex_context_search", "codex_context_read", "codex_context_list", "codex_context_search", "codex_context_read"]);
       const result = JSON.parse(out);
-      expect(result.ok).toBe(true); expect(result.evidence.receipts).toEqual(receipts());
+      expect(result.ok).toBe(true); expect(result.evidence.receipts).toMatchObject(successMethods);
+      expect(contextCapabilityReceiptsComplete(result.evidence.receipts)).toBe(true);
       expect(out.trim().split("\n")).toHaveLength(1);
       expect(err).toContain("broker lifecycle"); expect(err).toContain('"event":"start_requested"');
       expect(err).toContain('"event":"close_complete"');
@@ -300,7 +344,7 @@ describe("context capability evidence", () => {
           async end(_descriptor, activity) { endStatus = activity.status; return { cancelledByUser: false }; },
         } });
       await userCalls;
-      expect(evidence.receipts).toEqual(receipts()); expect(sentChecks).toBe(requireSent ? 1 : 0); expect(endStatus).toBe("completed");
+      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true); expect(sentChecks).toBe(requireSent ? 1 : 0); expect(endStatus).toBe("completed");
     } finally { allowReads(); await userCalls?.catch(() => {}); await client.close(); }
   });
   test("actual adapter factory blocks navigation publication without bound proof, accepts six-call evidence", async () => {

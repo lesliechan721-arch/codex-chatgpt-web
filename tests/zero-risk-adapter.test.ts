@@ -744,10 +744,10 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
       const query = async (method: ContextMethod, args: Record<string, unknown>) => {
         const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(config.chatgptWeb!.brokerSocketPath!, {
           method: "context_query", token: entry.first_call.arguments.request_id, contract: "safe", credentialKind: "ordinary",
-          contextProtocol: 1, contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as ContextArgs,
+          contextProtocol: 2, contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as ContextArgs,
         });
         await callTurnBroker(config.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: entry.first_call.arguments.request_id,
-          contract: "safe", credentialKind: "ordinary", contextProtocol: 1, receiptId: reply.receiptId, sent: true });
+          contract: "safe", credentialKind: "ordinary", contextProtocol: 2, receiptId: reply.receiptId, sent: true });
         return reply.result;
       };
       const list = await query("list", { view: "entries", kind: "image" });

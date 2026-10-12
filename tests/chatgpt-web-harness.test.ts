@@ -1823,9 +1823,11 @@ describe("ChatGPT outer-native harness v4", () => {
       request.context.messages = [{ role: "user", content, timestamp: 1 }];
       request._compactionRequest = compaction;
       const compiled = compileChatGptWebPrompt(request, toolCapabilities, "turn_123456789012345678901234");
-      const envelope = compiled.text.match(/^```text\n<codex_context_json>\n([^\n]+)\n<\/codex_context_json>\n```$/m);
+      const envelope = compiled.text.match(/^(`{3,})text\n<codex_context_json>\n([^\n]+)\n<\/codex_context_json>\n\1$/m);
       expect(envelope).not.toBeNull();
-      const context = JSON.parse(envelope![1]!);
+      const longestPayloadRun = Math.max(0, ...[...envelope![2]!.matchAll(/`+/g)].map(match => match[0].length));
+      expect(envelope![1]!.length).toBeGreaterThan(longestPayloadRun);
+      const context = JSON.parse(envelope![2]!);
       expect(context.system).toEqual(request.context.systemPrompt);
       expect(context.messages).toHaveLength(1);
       expect(context.messages[0].content).toBe(content);
@@ -3062,11 +3064,11 @@ describe("ChatGPT outer-native harness v4", () => {
         outputSchema: tool.outputSchema ?? null,
         annotations: tool.annotations ?? null,
       }));
-      // ChatGPT caches the complete tools/list contract under a connector identity.
-      // An intentional hash change therefore requires an explicit connector identity migration.
+      // This unreleased v2 upgrade keeps the approved connector identity. Its changed
+      // tools/list contract requires same-name refresh and new runtime capability evidence.
       expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("6363b4246f8a94c8f7a5a360c55f329b72de7509d75dc292d240ab786c63714a");
+        .toBe("2358c27e933113aea6cffd37e3ff0ab95974ce9d2d88455f5b30c2e741f1a101");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {

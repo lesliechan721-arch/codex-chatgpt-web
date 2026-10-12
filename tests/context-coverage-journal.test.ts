@@ -66,6 +66,26 @@ test("journal enforces exact digest schema and owner, revision, retirement, and 
   expect(coverage.metadata()).toHaveLength(1);
 });
 
+test("selected context format survives restart and cannot change after source preparation", () => {
+  const { directory, store, ref } = fixture();
+  const coverage = new CompactionSourceCoverage();
+  bindRecoveryContextCoverage(ref, coverage);
+  const source = createContextSnapshot(parsed());
+  coverage.prepare(source, { ...plan(), contextFormat: "codex-context-text-v1" });
+  expect(coverage.latest()?.contextFormat).toBe("codex-context-text-v1");
+  expect(() => coverage.prepare(source, { ...plan(), contextFormat: "legacy-json" })).toThrow("changed after preparation");
+  coverage.markDelivered("plan-A");
+  const saved = new ContinuityRecoveryStore(directory).get(thread)!.contextCoverage![0]!.metadata;
+  expect(saved.contextFormat).toBe("codex-context-text-v1");
+  expect(() => validateContextCoverageMetadata({ ...saved, contextFormat: "unknown-format" })).toThrow("schema");
+  expect(() => store.transact(thread, { scope }, draft => { draft.contextCoverage![0]!.metadata.contextFormat = "legacy-json"; })).toThrow();
+  expect(() => store.transact(thread, { scope }, draft => { delete draft.contextCoverage![0]!.metadata.contextFormat; })).toThrow();
+  const { contextFormat: _format, ...historical } = saved;
+  expect(() => validateContextCoverageMetadata(historical)).not.toThrow();
+  const restored = CompactionSourceCoverage.restoreVerifiedSource(source, [saved], 0);
+  expect(restored.latest()?.contextFormat).toBe("codex-context-text-v1");
+});
+
 for (const limit of ["itemBytes", "totalBytes"] as const) test(`journal ${limit} failure retains both durable and in-memory pending evidence`, () => {
   const { store } = fixture({ limits: { [limit]: 6_000 } });
   const coverage = new CompactionSourceCoverage();

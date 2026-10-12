@@ -289,7 +289,8 @@ for cleanup before saving inherited candidates. If that storage exhausts the jou
 and capability revocation still occur; a rejected non-owning or older-generation round cannot
 gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 11. Native waiting, task update, and context protocols are each 1.
+The implemented Broker protocol is 12. Native waiting and task update protocols are 1; the context
+protocol is 2 and requires `context-text-read-v2` for successful text pages.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
 directory before returning an ACK. The same directory carries an atomically published revision /
@@ -305,10 +306,13 @@ fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
 Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
 context tools with their mutually exclusive credential schemas on the selected connector before
-using navigation or dispatching work. The private owner must advertise `contextProtocol: 1`.
+using navigation or dispatching work. The private owner must advertise `contextProtocol: 2`.
 An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
 Verify runtime also requires six successful context transport returns over fixed small text, one
-list/search/read sequence per ordinary and independent compaction credential. The verification
+list/search/read sequence per ordinary and independent compaction credential. Evidence version 2
+also binds both reads to the actual result digest, two text blocks, matching metadata, body index 1,
+and UTF-8 page range. The body exists only in `content[1].text`; `content[0].text` and
+`structuredContent` carry metadata. Empty bodies still have a second block. The verification
 pair has no business or compaction-submission authority. A model's final reply cannot substitute
 for receipts. Bound owner-only evidence gates navigation publication and compaction admission;
 configuration/runtime/schema changes invalidate it, with no time-based expiry. Manual verification
@@ -321,8 +325,11 @@ Connector identity
 and cached-schema migration follow the [architecture](architecture.md), not an in-place rename of
 an old production connector. Keep `Codex Native4`, `Codex Native4 DEV`, and `Codex Zero Risk3`
 unchanged and create the corresponding new plugin. Earlier retired defaults also remain unusable.
-Custom names that are not retired defaults remain configured; a custom plugin with stale schema
-needs a newly named plugin. Never refresh an old identity to claim the new contract.
+For the still-unreleased context text v2 update, keep the current Native5 / Native5 DEV / Zero Risk4
+and non-retired custom names. Update or reconnect the same connector and verify again; stale
+evidence and old runtimes do not authorize v2. If the client cannot update or use the new shape,
+stop v2 enablement. This exception does not restore any retired connector identity. The verification
+scope still forbids completion; body-use evidence comes from separate real tasks and compaction.
 
 ## Decision basis and implementation
 

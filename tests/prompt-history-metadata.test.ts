@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
+import { decodeWebContextPayload, decodeWebContextTransaction } from "../src/adapters/chatgpt-web/context-renderer";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import type { CodexParsedRequest } from "../src/types";
 
@@ -87,4 +88,32 @@ test("multipart Web context preserves the same history metadata", () => {
   expect((messages[0]?.content as Array<Record<string, unknown>>)[1]?.namespace).toBe("mcp__inventory");
   expect(messages[1]?.tool_namespace).toBe("mcp__inventory");
   expect(messages[2]?.phase).toBe("final_answer");
+});
+
+test("mixed inline and multipart context preserve metadata, false, absent fields and content-block order", () => {
+  const input = parsed();
+  const source = '"long\\code";'.repeat(400);
+  const assistant = input.context.messages[0]!;
+  if (assistant.role !== "assistant") throw new Error("assistant fixture required");
+  assistant.content.push({ type: "text", text: source }, { type: "thinking", thinking: source });
+  input.context.messages.push({ role: "agentMessage", author: "writer", recipient: "coordinator", content: source, timestamp: 5 });
+  const legacy = compileChatGptWebPrompt(input, capabilities, turnToken, { contextRendering: "legacy-json" });
+  const expected = decodeWebContextPayload(legacy.contextPayload!).records;
+  for (const parts of [undefined, 2, 6] as const) {
+    const compiled = compileChatGptWebPrompt(input, capabilities, turnToken, {
+      contextRendering: "codex-context-text-v1", experimentalMultipartParts: parts,
+    });
+    const actual = compiled.multipart ? decodeWebContextTransaction(compiled.multipart.parts)
+      : decodeWebContextPayload(compiled.contextPayload!).records;
+    expect(actual).toEqual(expected);
+    const messages = actual.filter(record => record.kind === "message").map(record => record.message);
+    expect(messages[0]!.phase).toBe("commentary");
+    expect(messages[1]!.is_error).toBe(false);
+    expect(messages[3]).not.toHaveProperty("phase");
+    expect(messages[4]!.author).toBe("writer");
+    expect(messages[4]!.recipient).toBe("coordinator");
+    expect((messages[0]!.content as Array<Record<string, unknown>>).map(part => part.type)).toEqual([
+      "text", "tool_call", "text", "thinking_summary",
+    ]);
+  }
 });

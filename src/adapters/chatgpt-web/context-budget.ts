@@ -73,6 +73,15 @@ export function assertContextNavigationBudget(budget: ContextRemainingBudget, ov
 }
 
 export interface ContextResponseCost { wire_bytes: number; text_tokens: number; visual_tokens: number; total_tokens: number }
+/** Diagnostic visible-field estimates only. Hard admission continues to measure the
+ * full serialized result, including metadata copies and framing reserves. */
+export function measureContextVisibleResponse(result: BrokerToolResult): { content_text_tokens: number; structured_tokens: number; total_tokens: number } {
+  const contentTextTokens = result.content.reduce<number>((sum, block) => sum + (block && typeof block === "object"
+    && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string"
+    ? estimateTokens((block as { text: string }).text) : 0), 0);
+  const structuredTokens = result.structuredContent === undefined ? 0 : estimateTokens(JSON.stringify(result.structuredContent));
+  return { content_text_tokens: contentTextTokens, structured_tokens: structuredTokens, total_tokens: contentTextTokens + structuredTokens };
+}
 export function measureContextResponse(result: BrokerToolResult, options: {
   wireReserveBytes?: number; tokenReserve?: number; visualTokens?: number;
   /** Trusted directory admission: cover a future scope binding and cursor signature. */

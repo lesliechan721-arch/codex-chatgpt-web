@@ -32,7 +32,7 @@ for (const remote of [false, true]) test(`fresh Native summary closes reads atom
     const entry = JSON.parse(fresh.instruction.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
     const credential = entry.first_call.arguments;
     const query = () => callTurnBroker<ContextPreparedReply>(broker.socketPath, { method: "context_query",
-      token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: 1,
+      token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: 2,
       contextMethod: "search", contextArgs: { context_id: credential.context_id, query: "UNIQUE_DATABASE_MARKER" } });
     await expect(fresh.acceptSummary("undelivered summary")).rejects.toMatchObject({ code: "CONTEXT_NOT_READY" });
     await fresh.markDelivered();
@@ -40,7 +40,7 @@ for (const remote of [false, true]) test(`fresh Native summary closes reads atom
     await expect(fresh.acceptSummary("read still pending")).rejects.toMatchObject({ code: "CONTEXT_BUSY" });
     // A rejected commit leaves the source available for correction and receipt settlement.
     await callTurnBroker(broker.socketPath, { method: "context_return", token: credential.compaction_token,
-      contract: "native", credentialKind: "compaction", contextProtocol: 1, receiptId: pending.receiptId, sent: true });
+      contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: pending.receiptId, sent: true });
     await expect(fresh.acceptSummary("supported fresh checkpoint")).resolves.toBe("supported fresh checkpoint");
     await expect(query()).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
   } finally { await fresh?.cleanup(); await broker.close(); rmSync(directory, { recursive: true, force: true }); }
@@ -64,7 +64,7 @@ test("fresh Native summary does not admit a read between owner validation and cl
       await originalGuard(token);
       const entry = JSON.parse(fresh!.instruction.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
       await callTurnBroker(broker.socketPath, { method: "context_query", token, contract: "native",
-        credentialKind: "compaction", contextProtocol: 1, contextMethod: "list",
+        credentialKind: "compaction", contextProtocol: 2, contextMethod: "list",
         contextArgs: { context_id: entry.first_call.arguments.context_id, view: "overview" } });
       admittedBetweenGuardAndClosure = true;
     };
@@ -75,7 +75,7 @@ test("fresh Native summary does not admit a read between owner validation and cl
       // its successful response. Closure must already be effective.
       const entry = JSON.parse(fresh!.instruction.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
       await expect(callTurnBroker(broker.socketPath, { method: "context_query", token, contract: "native",
-        credentialKind: "compaction", contextProtocol: 1, contextMethod: "list",
+        credentialKind: "compaction", contextProtocol: 2, contextMethod: "list",
         contextArgs: { context_id: entry.first_call.arguments.context_id, view: "overview" } }))
         .rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
       readRejectedBeforeSummaryReturned = true;
@@ -369,14 +369,14 @@ test("Zero Risk delivers the source entry beside the unchanged real result and c
     const args = entry.first_call.arguments;
     await expect(callTurnBroker(broker.socketPath, { method: "safe_complete", token, finalAnswer: "early", taskRevision: 0, taskUpdateProtocol: 1 }))
       .rejects.toMatchObject({ code: "CONTEXT_NOT_READY" });
-    await callTurnBroker(broker.socketPath, { method: "context_control_return", token, contract: "safe", contextProtocol: 1,
+    await callTurnBroker(broker.socketPath, { method: "context_control_return", token, contract: "safe", contextProtocol: 2,
       receiptId: reply.contextControlReceipt, sent: true });
     const found = await callTurnBroker<ContextPreparedReply>(broker.socketPath, { method: "context_query", token: args.compaction_token,
-      contract: "safe", credentialKind: "compaction", contextProtocol: 1, contextMethod: "search",
+      contract: "safe", credentialKind: "compaction", contextProtocol: 2, contextMethod: "search",
       contextArgs: { context_id: args.context_id, query: "UNIQUE_SAFE_MARKER" } });
     expect(JSON.stringify(found.result)).toContain("UNIQUE_SAFE_MARKER");
     await callTurnBroker(broker.socketPath, { method: "context_return", token: args.compaction_token, contract: "safe",
-      credentialKind: "compaction", contextProtocol: 1, receiptId: found.receiptId, sent: true });
+      credentialKind: "compaction", contextProtocol: 2, receiptId: found.receiptId, sent: true });
     await callTurnBroker(broker.socketPath, { method: "safe_complete", token, finalAnswer: "same reply checkpoint", taskRevision: 0, taskUpdateProtocol: 1 });
     expect(await settled).toBe("same reply checkpoint");
   } finally { await broker.close(); rmSync(directory, { recursive: true, force: true }); }
@@ -407,13 +407,13 @@ for (const read of [false, true]) test(`retained control exposes an independent 
       turn.onSubmitted?.();
       if (read) {
         const reply = await callTurnBroker<ContextPreparedReply>(broker.socketPath, { method: "context_query",
-          token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: 1,
+          token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: 2,
           contextMethod: "search", contextArgs: { context_id: credential.context_id, query: "UNIQUE_DATABASE_MARKER" } });
         expect(JSON.stringify(reply.result)).toContain("UNIQUE_DATABASE_MARKER");
         await expect(callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token: control, handoffId, summary: "raced read" }))
           .rejects.toMatchObject({ code: "CONTEXT_BUSY" });
         await callTurnBroker(broker.socketPath, { method: "context_return", token: credential.compaction_token,
-          contract: "native", credentialKind: "compaction", contextProtocol: 1, receiptId: reply.receiptId, sent: true });
+          contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: reply.receiptId, sent: true });
       }
       await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token: control, handoffId, summary: "supported checkpoint" });
       prepared.release();
@@ -423,7 +423,7 @@ for (const read of [false, true]) test(`retained control exposes an independent 
       .resolves.toBe("supported checkpoint");
     expect(source.settledOutcome()).toEqual({ type: "final", answer: "accepted ordinary answer" });
     await expect(callTurnBroker(broker.socketPath, { method: "context_query", token: entry!.first_call.arguments.compaction_token,
-      contract: "native", credentialKind: "compaction", contextProtocol: 1, contextMethod: "list",
+      contract: "native", credentialKind: "compaction", contextProtocol: 2, contextMethod: "list",
       contextArgs: { context_id: entry!.first_call.arguments.context_id, view: "overview" } })).rejects.toMatchObject({ code: "CONTEXT_RETIRED" });
   } finally { await broker.close(); rmSync(directory, { recursive: true, force: true }); }
 });

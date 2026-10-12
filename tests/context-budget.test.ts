@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseRequest } from "../src/responses/parser";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ContextNavigationStoppedError, ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
+import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { assertContextNavigationBudget, CONTEXT_LIMITS, contextErrorReserve, contextLimits, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
@@ -18,7 +19,7 @@ describe("complete context response budgets", () => {
       const cost = measureContextResponse(result);
       expect(cost.wire_bytes).toBe(Buffer.byteLength(JSON.stringify(result)) + CONTEXT_LIMITS.wireReserveBytes);
       expect(cost.wire_bytes).toBeLessThanOrEqual(limits.readBytes); expect(cost.text_tokens).toBeLessThanOrEqual(limits.readTokens);
-      const page = result.structuredContent as any; restored += page.content; cursor = page.next_cursor ?? undefined;
+      const page = parseContextTextReadResult(result); restored += page.body; cursor = page.metadata.next_cursor ?? undefined;
       expect(++count).toBeLessThan(200);
     } while (cursor);
     expect(restored).toBe(snapshot.getText(snapshot.targets[0]!.read_ref!)!);
@@ -110,7 +111,7 @@ describe("complete context response budgets", () => {
     expect(measureContextResponse(result).wire_bytes).toBeLessThanOrEqual(CONTEXT_LIMITS.errorResponseBytes);
     const agent = snapshotOf([{ type: "agent_message", author: "author".repeat(100), recipient: "recipient".repeat(100), content: "short" }]);
     const read = new ContextNavigator({ scopeId: "agent", snapshot: agent, purpose: "normal" }).read({ context_id: agent.context_id, read_ref: agent.targets[0]!.read_ref! });
-    expect(read.isError).not.toBe(true); expect((read.structuredContent as any).content).toBe("short");
+    expect(read.isError).not.toBe(true); expect(parseContextTextReadResult(read).body).toBe("short");
   });
 
   test("corrective replies are finite, fully measured and do not consume summary reserves", () => {
@@ -214,7 +215,7 @@ describe("complete context response budgets", () => {
     expect(first.isError).not.toBe(true); expect(measureContextResponse(first).wire_bytes).toBeLessThanOrEqual(3000);
     expect(navigator.preflightRead(args)).toEqual(first);
     expect(navigator.usage()).toEqual(before);
-    expect((first.structuredContent as any).content).not.toContain("�");
+    expect(parseContextTextReadResult(first).body).not.toContain("�");
     const tooSmall = new ContextNavigator({ scopeId: "small", snapshot, purpose: "compaction", limits: { readBytes: 512 } });
     expect(tooSmall.preflightRead(args).isError).toBe(true); expect(tooSmall.usage().error_responses).toBe(0);
   });
