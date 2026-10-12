@@ -124,6 +124,7 @@ function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits,
     const response = nav.list({ context_id: snapshot.context_id, view: "overview" }, {
       context_ready: deliveredImages === requiredImages, required_images: requiredImages, delivered_images: deliveredImages,
     });
+    checkDeadline();
     if (response.isError) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The context budget cannot carry its directory overview and bounded error reserve");
     return measureContextResponse(response, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve });
   });
@@ -138,6 +139,7 @@ function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits,
   do {
     checkDeadline();
     const response = nav.preflightList({ context_id: snapshot.context_id, view: "entries", ...(required.size ? { kind: "image" } : {}), ...(cursor ? { cursor } : {}) });
+    checkDeadline();
     if (response.isError) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The context budget cannot carry a useful directory entries page");
     const page = response.structuredContent as { entries: Array<{ target_id: string; read_ref: string | null }>; next_cursor: string | null };
     const cost = measureContextResponse(response, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
@@ -151,6 +153,7 @@ function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits,
   for (const index of snapshot.targets.keys()) {
     checkDeadline();
     const response = nav.preflightListEntry(index);
+    checkDeadline();
     if (response.isError) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A context source cannot be discovered within a bounded directory page");
     const cost = measureContextResponse(response, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
     result.wire_bytes = Math.max(result.wire_bytes, overviewCost.wire_bytes + cost.wire_bytes);

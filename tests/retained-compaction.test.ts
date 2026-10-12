@@ -2094,13 +2094,14 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
     const setup = await broker.beginCompactionTransaction("deadline-test-setup");
     broker.abortCompactionTransaction(setup.token);
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // Keep credential expiry on the same controlled clock as the deadline timer.
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     pending = createChatGptWebAdapter(provider).runTurn!(
       request(true),
       { headers: new Headers() },
       event => events.push(event),
     );
-    await fallbackReady;
+    await Promise.race([fallbackReady, pending.then(() => { throw new Error("Compaction ended before its fallback started"); })]);
     expect(browserStarts).toBe(2);
     mock.timers.tick(24);
     expect(fallbackSignal?.aborted).toBeFalse();
@@ -2116,9 +2117,9 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     });
   } finally {
     releaseBrowser?.();
+    mock.timers.reset();
     await cancelStructuredCompactionTrace(fallbackTrace, new Error("test cleanup"));
     await pending;
-    mock.timers.reset();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();

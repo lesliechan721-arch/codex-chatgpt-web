@@ -23,6 +23,7 @@ import type { CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 async function sourceWiringHarness(run: (fixture: {
@@ -32,7 +33,7 @@ async function sourceWiringHarness(run: (fixture: {
   source: () => { parsed: CodexParsedRequest; provider: CodexProviderConfig };
   setBrowser: (implementation: (turn: BrowserTurn) => Promise<string>) => void;
 }) => Promise<void>) {
-  const root = mkdtempSync("/private/tmp/cgw-live-source-");
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-live-source-"));
   const host = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request =>
     new URL(request.url).pathname === "/v1/turn/release" ? Response.json({ released: 1 }) : Response.json({}, { status: 404 }) });
   const descriptor = join(root, "launcher.json");
@@ -313,7 +314,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("original assert plus observe
 }, 20_000);
 
 test("actual live request helper resolves native DEV environment and instruction for ordinary and explicit compaction", () => {
-  const cwd = "/private/tmp/context-rendering-fixture/a&b<c>";
+  const cwd = resolve(tmpdir(), "context-rendering-fixture", "a&b<c>");
   for (const name of LIVE_CASES) for (const purpose of ["ordinary", "compaction"] as const) {
     const fixture = createLiveFixture(name), threadId = `dev_thread_${name}_${purpose}`, turnId = `dev_turn_${name}_${purpose}`;
     const body = createLiveRequestBody(fixture, { purpose, model: "chatgpt-web/gpt-6-sol-instant", cwd, threadId, turnId });

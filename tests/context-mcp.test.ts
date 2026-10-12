@@ -22,6 +22,8 @@ async function fixture(contract: "native" | "safe", publishOrdinary = true, requ
   const token = contract === "safe" ? await broker.registerSafe(env, "mcp-context-surface-12345678", undefined, "context-mcp-test", { requireSentConfirmation }) : await broker.register(env);
   const client = new Client({ name: "context-mcp-test", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath, args: ["src/cli.ts", "mcp", "--contract", contract, "--broker-socket", socket], cwd: process.cwd(), stderr: "pipe" });
+  // Drain diagnostic output so a full pipe cannot block protocol replies.
+  transport.stderr?.on("data", () => {});
   await client.connect(transport);
   const snapshot = createContextSnapshot(parseRequest({ model: "gpt-5", input: [{ role: "user", content: [{ type: "input_text", text: "独有片段 marker-zeta" }, { type: "input_image", image_url: `data:image/png;base64,${png}` }] }] }));
   if (publishOrdinary) { broker.registerContextPlan(token, { snapshot, planId: "selected", manifestDigest: "manifest-selected", deliveryByTarget: Object.fromEntries(snapshot.targets.map(t => [t.target_id, t.kind === "image" ? { delivery: "mcp", media_route: "mcp", required: true } : { delivery: "inline", required: false }])) });

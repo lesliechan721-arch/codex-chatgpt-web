@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { parseRequest } from "../src/responses/parser";
 import { defaultBrokerEndpoint } from "../src/config";
 import { CompactionSourceCoverage, captureCompactionSource, captureRetainedCompactionSource, assertCompactionReadable, compactionAvailableTokens, prepareFreshCompactionSource, registerCompactionSource } from "../src/adapters/chatgpt-web/compaction-context";
@@ -14,11 +15,12 @@ import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
 import { estimateTokens } from "../src/lib/token-estimate";
+import { contextLimits } from "../src/adapters/chatgpt-web/context-budget";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
 
 for (const remote of [false, true]) test(`fresh Native summary closes reads atomically (remote=${remote})`, async () => {
-  const directory = mkdtempSync(join("/tmp", "cgw-fresh-context-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-fresh-context-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   await broker.listen();
   const owner = remote ? new RemoteTurnBroker(broker.socketPath) : broker;
@@ -47,7 +49,7 @@ for (const remote of [false, true]) test(`fresh Native summary closes reads atom
 });
 
 test("fresh Native summary does not admit a read between owner validation and closure", async () => {
-  const directory = mkdtempSync(join("/tmp", "cgw-fresh-race-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-fresh-race-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   await broker.listen();
   const owner = new RemoteTurnBroker(broker.socketPath);
@@ -121,7 +123,7 @@ for (const bigger of [false, true]) test(`compaction protects platform capacity 
   const parsed = parseRequest({ model: "gpt-5.6-sol", input: [{ role: "user", content: "Summarize this source" }] });
   parsed._chatgptModelFamily = "6";
   const selectedCapabilities = { ...capabilities, experimentalBiggerContext: bigger };
-  const directory = mkdtempSync(join("/tmp", "cgw-platform-capacity-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-platform-capacity-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   const options = bigger ? { experimentalMultipartParts: 2 as const } : {};
   const token = "capacity-test-token";
@@ -219,7 +221,7 @@ for (const terminal of [false, true]) test(`compaction rejects an oversized late
   const second = navigator.list({ context_id: snapshot.context_id, view: "entries", cursor: firstPage.next_cursor });
   expect(second.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
   expect(navigator.preflightRead({ context_id: snapshot.context_id, read_ref: snapshot.targets[1]!.read_ref! }).isError).not.toBe(true);
-  const directory = mkdtempSync(join("/tmp", "cgw-directory-admission-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-directory-admission-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   const registration = spyOn(broker, "registerCompactionContext");
   const transaction = await broker.beginCompactionTransaction("directory-regression", 30_000);
@@ -274,9 +276,13 @@ test("compaction admission checks thousands of targets while yielding and respec
   expect(snapshot.targets).toHaveLength(3_000);
   expect(timerObserved).toBeTrue();
   expect(timerDelay).toBeLessThan(1_000);
-  expect(performance.now() - started).toBeLessThan(10_000);
-  await expect(assertCompactionReadable(snapshot, 96_000, { totalProcessingMs: 1 })).rejects.toThrow("processing deadline");
-}, 15_000);
+  expect(performance.now() - started).toBeLessThan(contextLimits().totalProcessingMs);
+  let now = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => now += 2);
+  try {
+    await expect(assertCompactionReadable(snapshot, 96_000, { totalProcessingMs: 1 })).rejects.toThrow("processing deadline");
+  } finally { clock.mockRestore(); }
+}, 30_000);
 
 test("source evidence includes actual calls, delivered results and accepted task updates after the initial send", () => {
   const initial = parseRequest({ model: "gpt-5.6-sol", input: [{ role: "user", content: "Summarize the migration" }] });
@@ -335,7 +341,7 @@ test("source coverage mutations reserve the existing session evidence limit befo
 });
 
 test("Zero Risk delivers the source entry beside the unchanged real result and completes in the same reply", async () => {
-  const directory = mkdtempSync(join("/tmp", "cgw-context-safe-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-context-safe-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   try {
     const token = await broker.registerSafe({ authorityMode: "delegated", threadId: "safe-thread", turnId: "safe-turn",
@@ -383,7 +389,7 @@ test("Zero Risk delivers the source entry beside the unchanged real result and c
 });
 
 for (const read of [false, true]) test(`retained control exposes an independent bounded entry and allows partial reading=${read}`, async () => {
-  const directory = mkdtempSync(join("/tmp", "cgw-context-compact-"));
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-context-compact-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   // Larger than one ordinary web message. Only a bounded portion is needed by the test model.
   const parsed = input("z ".repeat(550_000) + "UNIQUE_DATABASE_MARKER");

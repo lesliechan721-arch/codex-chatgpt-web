@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -753,7 +753,11 @@ test("normal directory admission checks each target without reserving full trave
   const result = plan(canonical, { snapshot, candidate, limits });
   expect(result.navigationEnabled).toBe(true);
   expect(result.costs.discoveryReserveTokens).toBeLessThan(limits.maxTotalTokens);
-  expect(() => plan(canonical, { snapshot, candidate, limits: { ...limits, totalProcessingMs: 1 } })).toThrow("processing deadline");
+  let now = 0;
+  const clock = spyOn(performance, "now").mockImplementation(() => now += 2);
+  try {
+    expect(() => plan(canonical, { snapshot, candidate, limits: { ...limits, totalProcessingMs: 1 } })).toThrow("processing deadline");
+  } finally { clock.mockRestore(); }
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} keeps full input when an optional directory has an oversized later target`, () => {
