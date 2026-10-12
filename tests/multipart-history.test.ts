@@ -80,6 +80,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("acknowledged multipart histo
             expect(binding.identity).toBe("group:assistant:final");
           }
           expect((await worker.currentSubmissionAnswerSnapshot(page, baseline))?.visibleText).toBe("Answer");
+          expect((await worker.responseDomSnapshot(binding.locator, {})).visibleText).toBe("Answer");
         } finally { await page.close(); }
       }
     }

@@ -37,6 +37,84 @@ test.skipIf(process.platform === "win32")("closing a rejected broker leaves the 
   }
 });
 
+test.skipIf(process.platform === "win32")("a broker whose endpoint was busy at startup recovers once it is released", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-retry-"));
+  const endpoint = join(root, "broker.sock");
+  const previousOwner = createServer(socket => socket.destroy());
+  const broker = TurnBroker.forSocket(endpoint);
+  try {
+    await new Promise<void>(resolve => previousOwner.listen(endpoint, resolve));
+    chmodSync(endpoint, 0o600);
+    // The daemon only logs this startup failure and keeps serving; later turns must not inherit it.
+    await expect(broker.listen()).rejects.toThrow("already owned by another process");
+    expect(existsSync(`${endpoint}.lock`)).toBeFalse();
+    expect(TurnBroker.forSocket(endpoint)).toBe(broker);
+    await expect(broker.listen()).rejects.toThrow("already owned by another process");
+    expect(existsSync(`${endpoint}.lock`)).toBeFalse();
+    await new Promise<void>(resolve => previousOwner.close(() => resolve()));
+    const token = await broker.register({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: [],
+    }, 10_000);
+    await expect(callTurnBroker<{ bindingId: string }>(endpoint, { method: "claim", token }))
+      .resolves.toMatchObject({ bindingId: expect.any(String) });
+  } finally {
+    await broker.close();
+    if (previousOwner.listening) await new Promise<void>(resolve => previousOwner.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(process.platform === "win32")("explicit close prevents a rejected startup from restarting the broker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-retry-closed-"));
+  const endpoint = join(root, "broker.sock");
+  const previousOwner = createServer(socket => socket.destroy());
+  const broker = TurnBroker.forSocket(endpoint);
+  try {
+    await new Promise<void>(resolve => previousOwner.listen(endpoint, resolve));
+    chmodSync(endpoint, 0o600);
+    await expect(broker.listen()).rejects.toThrow("already owned by another process");
+    await broker.close();
+    await new Promise<void>(resolve => previousOwner.close(() => resolve()));
+    await expect(broker.listen()).rejects.toThrow("broker is closed");
+    expect(existsSync(`${endpoint}.lock`)).toBeFalse();
+    const replacement = TurnBroker.forSocket(endpoint);
+    try {
+      expect(replacement).not.toBe(broker);
+      await replacement.listen();
+      await expect(callTurnBroker(endpoint, { method: "owner_status" }))
+        .resolves.toMatchObject({ acceptingExternalOwners: true });
+    } finally {
+      await replacement.close();
+    }
+  } finally {
+    await broker.close();
+    if (previousOwner.listening) await new Promise<void>(resolve => previousOwner.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit close during startup prevents a new endpoint after close settles", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-close-starting-"));
+  const endpoint = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(endpoint);
+  try {
+    const startup = broker.listen();
+    const closing = broker.close();
+    await expect(startup).rejects.toThrow("broker is closed");
+    await closing;
+    await expect(broker.listen()).rejects.toThrow("broker is closed");
+    await expect(callTurnBroker(endpoint, { method: "owner_status" })).rejects.toThrow("unavailable");
+    if (!isWindowsPipeEndpoint(endpoint)) expect(existsSync(`${endpoint}.lock`)).toBeFalse();
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("explicit browser-turn cancellation aborts and removes every registered session", async () => {
   const sessions = new ChatGptTurnSessions();
   let cancelled = 0;

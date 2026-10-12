@@ -10,9 +10,11 @@ import * as tunnelService from "../src/tunnel-service";
 import * as browserHost from "../src/launcher-browser-host";
 import * as browserLogin from "../src/browser-login";
 import * as apiAccessConfig from "../src/api-access-config";
+import * as apiKeyIntegration from "../src/api-key-integration";
+import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { runDoctor } from "../src/doctor";
 import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "../src/native-tool-long-wait-probe";
-import { launcherCapabilityProbeRequired, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
+import { launcherCapabilityProbeRequired, portBindFailureMessage, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 
 for (const development of [false, true]) for (const interaction of ["automatic", "manual"] as const) {
@@ -135,6 +137,74 @@ const config = {
   mode: "browser-only" as const,
   releaseVersion: "0.2.0",
 };
+
+for (const ownership of ["managed", "manual-config", "api-key"] as const) {
+  test(`setup preserves a disconnected route only under ${ownership} configuration ownership`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "cgw-disconnected-route-"));
+    const configPath = join(root, "config.json");
+    const previousManual = process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    if (ownership === "manual-config") process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = "1";
+    else delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+    const existing = {
+      ...configModule.defaultConfig("browser-only"), browserHost: "launcher" as const,
+      solAvailable: true, extraHighAvailable: false, proAvailable: false,
+      acknowledgedUnofficialAt: "2026-10-01T00:00:00.000Z",
+    };
+    writeFileSync(configPath, JSON.stringify(existing));
+    const integrate = spyOn(integration, "installCodexIntegration").mockImplementation(() => ({} as never));
+    const preflight = spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {});
+    const cleanup = spyOn(apiKeyIntegration, "cleanupApiKeyCodexIntegration").mockReturnValue({ changed: false });
+    const mocks = [integrate, preflight, cleanup,
+      spyOn(configModule, "getConfigPath").mockReturnValue(configPath),
+      spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(existing)),
+      spyOn(configModule, "saveConfig").mockImplementation(() => {}),
+      spyOn(apiAccessConfig, "loadApiAccessPolicy").mockReturnValue(ownership === "api-key"
+        ? apiKeyPolicy(`cgw_${"a".repeat(43)}`) : OPENAI_ACCESS),
+      spyOn(apiAccessConfig, "clearOpenAiRoutingPending").mockImplementation(() => {}),
+      spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+      spyOn(service, "removeLegacyRuntimeArtifacts").mockImplementation(() => {}),
+    ];
+    try {
+      const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+      const port = listener.port!;
+      await listener.stop(true);
+      await setup({ mode: "browser-only", port, subagentProtocol: "native",
+        browserHostDescriptorPath: join(root, "launcher.json"), preserveDisconnectedRoute: true });
+      if (ownership === "managed") {
+        expect(integrate).toHaveBeenCalledTimes(1);
+        expect(integrate.mock.calls[0]![1]).toMatchObject({ preserveDisconnectedRoute: true });
+        expect(preflight).toHaveBeenCalled();
+        expect(cleanup).not.toHaveBeenCalled();
+      } else {
+        expect(integrate).not.toHaveBeenCalled();
+        expect(preflight).not.toHaveBeenCalled();
+        if (ownership === "api-key") expect(cleanup.mock.calls.some(args => args.length === 0)).toBeTrue();
+        else expect(cleanup).not.toHaveBeenCalled();
+      }
+    } finally {
+      for (const mock of mocks.reverse()) mock.mockRestore();
+      if (previousManual === undefined) delete process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG;
+      else process.env.CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG = previousManual;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// #712: after a restart Windows can reserve the bridge port; Node reports that as EACCES.
+test("Windows EACCES suggests checks without claiming a port reservation is proven", () => {
+  const reserved = Object.assign(new Error("listen EACCES: permission denied 127.0.0.1:17841"), { code: "EACCES" });
+  const busy = Object.assign(new Error("listen EADDRINUSE: address already in use 127.0.0.1:17841"), { code: "EADDRINUSE" });
+  const plain = "Cannot bind 127.0.0.1:17841: listen EACCES: permission denied 127.0.0.1:17841";
+
+  const explained = portBindFailureMessage("127.0.0.1", 17841, reserved, "win32");
+  expect(explained.startsWith(`${plain}. Windows may have reserved this port`)).toBeTrue();
+  expect(explained).toContain("another service may hold it exclusively");
+  expect(explained).toContain("TROUBLESHOOTING.md");
+  // Elsewhere EACCES is a real permission error, and a busy port has its own owner to find.
+  expect(portBindFailureMessage("127.0.0.1", 17841, reserved, "linux")).toBe(plain);
+  expect(portBindFailureMessage("127.0.0.1", 17841, busy, "win32"))
+    .toBe("Cannot bind 127.0.0.1:17841: listen EADDRINUSE: address already in use 127.0.0.1:17841");
+});
 
 test("setup accepts only a matching daemon that is ready for new Codex turns", () => {
   const ready = {
@@ -317,7 +387,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
 }
 
 for (const development of [false, true]) {
-  test(`${development ? "DEV" : "production"} rejects Luna Bigger Context without changing config and accepts explicitly disabling it`, async () => {
+  test(`${development ? "DEV" : "production"} allows Luna Bigger Context and preserves it across account refresh`, async () => {
     const root = mkdtempSync(join(tmpdir(), "codex-web-luna-setup-"));
     const configPath = join(root, "config.json");
     const existing = {
@@ -348,13 +418,14 @@ for (const development of [false, true]) {
       const options = { mode: "browser-only" as const, subagentProtocol: "native" as const, port,
         browserHostDescriptorPath: join(root, "launcher-browser.json"), acknowledgedUnofficial: true };
       const configure = development ? setupDevProfile : setup;
-      await expect(configure(options)).rejects.toThrow("Turn it off in launcher Settings");
-      await expect(configure({ ...options, experimentalBiggerContext: true })).rejects.toThrow("unavailable for Luna and Think");
-      // Refreshing a previously paid account must validate the newly observed capability.
+      await configure(options);
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
+      await configure({ ...options, experimentalBiggerContext: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
+      // Refreshing a previously paid account preserves the explicitly enabled feature on Free.
       existing.solAvailable = true;
-      await expect(configure({ ...options, refreshAccountCapabilities: true })).rejects.toThrow("--standard-context");
-      expect(save).not.toHaveBeenCalled();
-      expect(integrate).not.toHaveBeenCalled();
+      await configure({ ...options, refreshAccountCapabilities: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
       existing.solAvailable = false;
       await configure({ ...options, experimentalBiggerContext: false });
       expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: false });

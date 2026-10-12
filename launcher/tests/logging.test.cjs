@@ -10,6 +10,7 @@ const {
   installProcessDiagnosticGuards,
   redactText,
   registerSensitiveProxyUrl,
+  redactExportText,
   registerLoggedIpc,
   sanitize,
 } = require("../electron/logging.cjs");
@@ -178,6 +179,21 @@ test("exported launcher logs remove local usernames, private ChatGPT titles, and
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("exported paths hide the username in WSL, UNC and lowercased Windows home forms", () => {
+  for (const [input, expected] of [
+    ["cwd \\\\wsl.localhost\\Ubuntu\\home\\private.user\\proj", "cwd \\\\wsl.localhost\\Ubuntu[user-home]\\proj"],
+    ["cwd \\\\\\\\wsl$\\\\Ubuntu\\\\home\\\\private.user\\\\proj", "cwd \\\\\\\\wsl$\\\\Ubuntu[user-home]\\\\proj"],
+    ["cwd \\\\server\\share\\Users\\private.user\\proj", "cwd \\\\server\\share[user-home]\\proj"],
+    ["cwd c:/users/private.user/proj", "cwd c:[user-home]/proj"],
+    ["cwd \\\\?\\C:\\Users\\private.user\\proj", "cwd \\\\?\\[user-home]\\proj"],
+    ["cwd C:\\Users\\Private User\\proj", "cwd [user-home]\\proj"],
+  ]) {
+    assert.equal(redactExportText(input), expected);
+  }
+  // Paths outside a home directory carry no username and stay readable for diagnosis.
+  assert.equal(redactExportText("D:\\work\\repo and /opt/codex/bin"), "D:\\work\\repo and /opt/codex/bin");
 });
 
 test("Activity restores the last 300 valid events across rotation and incomplete writes", () => {

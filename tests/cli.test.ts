@@ -503,6 +503,48 @@ test("generic --home cannot collapse DEV mode into another runtime home", async 
   }
 });
 
+for (const mode of ["manual", "api-key"] as const) {
+  test(`route recover preserves ${mode} configuration ownership with a pending recovery journal`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-recover-owner-"));
+    const appHome = join(root, "app");
+    const codexHome = join(root, "codex");
+    const codexConfig = join(codexHome, "config.toml");
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(codexConfig, 'model = "gpt-6-sol"\n');
+    const env = {
+      ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: codexHome,
+      CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: undefined,
+      CODEX_CHATGPT_WEB_LAUNCHER: process.execPath,
+    };
+    try {
+      const prepare = Bun.spawn([process.execPath, "-e", `
+        import { installCodexIntegration, deactivateCodexIntegration, inspectCodexIntegration }
+          from ${JSON.stringify(resolve(import.meta.dir, "../src/codex-integration.ts"))};
+        import { defaultConfig } from ${JSON.stringify(resolve(import.meta.dir, "../src/config.ts"))};
+        process.argv[1] = ${JSON.stringify(resolve(import.meta.dir, "../src/cli.ts"))};
+        installCodexIntegration(defaultConfig("browser-only"));
+        deactivateCodexIntegration({ forRuntimeRecovery: true });
+        console.log(JSON.stringify(inspectCodexIntegration()));
+      `], { env, stdout: "pipe", stderr: "pipe" });
+      const [prepared, errors, code] = await Promise.all([
+        new Response(prepare.stdout).text(), new Response(prepare.stderr).text(), prepare.exited,
+      ]);
+      expect({ code, errors }).toEqual({ code: 0, errors: "" });
+      expect(JSON.parse(prepared).journal.reconnectOnStartup).toBe(true);
+      const before = readFileSync(codexConfig, "utf8");
+      const protectedEnv = { ...env, CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG: mode === "manual" ? "1" : undefined };
+      if (mode === "api-key") saveApiAccessPolicy(apiKeyPolicy(`cgw_${"r".repeat(43)}`), appHome);
+      const recovered = await runCli(["route", "recover"], protectedEnv);
+      expect(recovered.exitCode).toBe(0);
+      expect(JSON.parse(recovered.stdout)).toMatchObject({
+        active: false, installed: false, manualConfigurationRequired: true, errors: [],
+      });
+      expect(readFileSync(codexConfig, "utf8")).toBe(before);
+      if (mode === "manual") expect(JSON.parse(recovered.stdout).changed).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
 test("API key mode route, subagents and serve never inject Codex configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-api-mode-"));
   const appHome = join(root, "app");

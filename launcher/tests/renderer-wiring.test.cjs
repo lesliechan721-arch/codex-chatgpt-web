@@ -34,6 +34,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
       startupAuthenticationRefresh, logger, stateStore, IS_DEV_PROFILE: false, connectorSetupStatePatch,
       ipcMain: { on() {} }, registerLoggedIpc: (_ipc, _logger, channel, handler) => handlers.set(channel, handler),
       send() {}, publishOperation() {}, startCatalogVerificationMonitor() {},
+      releaseRetainedConversation() {},
       restoreCodexRouteAfterRuntimeFailure: async () => { calls.push("recovery"); return {}; },
       limitsController: { snapshot: () => ({ enabled: false }) },
       runtimeSupervisor: {
@@ -46,12 +47,13 @@ test("Bigger Context waits for startup and route recovery without invalidating h
           return { status: "ready" };
         },
       },
-      CORE_HOME: "/tmp/codex-home", browserHost: {}, clipboard: {}, path,
+      CORE_HOME: "/tmp/codex-home", browserHost: { turnTabs: new Map() }, clipboard: {}, path,
       readPolicyFile: () => ({ policy: { mode: "openai" } }),
       createApiAccessSettings: () => ({ daemonEnvironment: () => ({}) }),
       registerApiAccessIpc: () => () => {}, rendererNavigationAllowed: () => true,
       app: { once() {} },
       runtimeHost: {
+        currentOperation: () => null,
         upgradeManagedRuntime: async () => ({ updated: false }),
         runtimeConfigSnapshot: () => ({ configured: true, config }),
         connectBridgeRoute: async () => { calls.push("route"); return { changed: false }; },
@@ -63,7 +65,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
         },
       },
     });
-    vm.runInContext(electronMain.slice(electronMain.indexOf("function registerIpc("), electronMain.indexOf("async function requestQuit("))
+    vm.runInContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("async function requestQuit("))
       + "\nregisterIpc({ logger, stateStore });", context);
     const start = electronMain.indexOf("} else void (async () => {");
     vm.runInContext(electronMain.slice(start + "} else ".length, electronMain.indexOf('  app.on("before-quit"', start)), context);
@@ -610,14 +612,75 @@ test("macOS passkey sign-in is additive to the unchanged embedded login action",
   assert.match(appSource, /onAction=\{openLogin\}/);
   assert.match(appSource, /<BrowserSurface[\s\S]*?operation=\{operation\}[\s\S]*?platform=\{snapshot\.platform\}/);
   assert.match(appSource, /const passkeyAvailable = !manualInteraction[\s\S]*?platform === "darwin"[\s\S]*?browser\?\.authenticated !== true/);
-  assert.match(appSource, /\{passkeyAvailable \? \([\s\S]*?className="toolbar-text-button"[\s\S]*?copy\.passkeySignIn/);
-  assert.match(appSource, /className="browser-empty-actions"[\s\S]*?copy\.passkeySignIn/);
+  assert.match(appSource, /\{passkeyAvailable \? \([\s\S]*?className="toolbar-text-button"[\s\S]*?passkeyLabel/);
+  assert.match(appSource, /className="browser-empty-actions"[\s\S]*?passkeyLabel/);
   assert.match(appSource, /passkeyWaiting \? continuePasskeyLogin : openPasskeyLogin/);
   assert.match(preloadSource, /openPasskeyLogin:[\s\S]*?launcher:browser-passkey-login/);
   assert.match(preloadSource, /continuePasskeyLogin:[\s\S]*?launcher:browser-passkey-login-continue/);
   assert.match(electronMain, /launcher:browser-passkey-login[\s\S]*?browserHost\.openPasskeyLogin\(\)/);
-  assert.match(electronMain, /loginWithPasskey: \(\) => runtimeHost\.capturePasskeyLogin\(\)/);
+  assert.match(electronMain, /loginWithPasskey: onProgress => runtimeHost\.capturePasskeyLogin\(onProgress\)/);
   assert.match(browserHostSource, /await this\.waitForAuthenticated\(60_000\)[\s\S]*?runSessionInspection\(false\)/);
+});
+
+test("passkey buttons show launch progress, wait for Chrome, and preserve import progress after remount", async () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const surface = appSource.slice(appSource.indexOf("function BrowserSurface("), appSource.indexOf("function ManualTurnGuide("));
+  const transpile = (source, fileName) => ts.transpileModule(source, { fileName, compilerOptions: {
+    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React, jsxFactory: "element",
+  } }).outputText;
+  const translated = { exports: {} };
+  vm.runInNewContext(transpile(fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"), "i18n.ts"), translated);
+  let state = [], cursor = 0, finishLogin, opens = 0, continues = 0;
+  const sandbox = {
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState: value => { const index = cursor++; if (!(index in state)) state[index] = value;
+      return [state[index], next => { state[index] = next; }]; },
+    useEffect() {}, messageOf: String, formatBrowserAddress: () => "chatgpt.com",
+    api: {
+      openPasskeyLogin: () => { opens++; return new Promise(resolve => { finishLogin = resolve; }); },
+      continuePasskeyLogin: async () => { continues++; },
+    },
+  };
+  for (const name of ["BrandMark", "Icon", "IconButton", "PrimaryButton", "SecondaryButton", "ManualTurnGuide"]) sandbox[name] = name;
+  vm.runInNewContext(transpile(surface, "surface.tsx") + "\nrender = BrowserSurface;", sandbox);
+  const copy = translated.exports.copyFor("en");
+  const props = { browser: { authenticated: false, visible: false, tabs: [] }, copy, operation: null,
+    platform: "darwin", interactionMode: "automatic", browserSlotRef() {}, setError(error) { if (error) throw new Error(error); } };
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  const render = () => { cursor = 0; return visit(sandbox.render(props)); };
+  const action = () => render().find(node => node.type === "SecondaryButton");
+  props.operation = { status: "running", name: "doctor", message: "Checking runtime" };
+  assert.equal(action().props.disabled, true);
+  props.operation = null;
+  const started = action().props.onClick();
+  assert.equal(opens, 1);
+  assert.deepEqual(action().children, [copy.passkeyOpening]);
+  assert.equal(action().props.disabled, true);
+  props.browser.passkeyPhase = "waiting";
+  assert.deepEqual(action().children, [copy.passkeyContinue]);
+  assert.equal(action().props.disabled, false);
+  await action().props.onClick();
+  assert.equal(continues, 1);
+  assert.deepEqual(action().children, [copy.passkeyImporting]);
+  props.browser.passkeyPhase = "importing";
+  state = []; // Changing launcher sections must not reset a running import to Continue.
+  assert.deepEqual(action().children, [copy.passkeyImporting]);
+  assert.equal(action().props.disabled, true);
+  props.browser.visible = true;
+  assert.ok(render().some(node => node.props.className === "passkey-login-guide"));
+  props.browser.authenticated = true;
+  props.browser.passkeyPhase = null;
+  finishLogin();
+  await started;
+  assert.equal(action(), undefined);
+  for (const language of Object.keys(require("../electron/languages.json"))) {
+    const localized = translated.exports.copyFor(language);
+    for (const key of ["passkeyContinue", "passkeyContinueBody", "passkeyOpening", "passkeyOpeningBody", "passkeyWaitingTitle", "passkeyImportingBody"]) {
+      assert.ok(localized[key].length > 5);
+    }
+  }
 });
 
 test("Bigger Context startup recommendation reuses the persisted setting and setup transaction", () => {
@@ -955,7 +1018,7 @@ test("saved ChatGPT authentication refresh does not gate local runtime startup",
   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
   const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
+  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute({ recoveryOnly: true })", runtimeStart);
   assert.equal(refreshBarrier, -1, "the bridge must start while ChatGPT is signed out or unavailable");
   assert.ok(upgrade > productionStartup);
   assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
@@ -982,7 +1045,7 @@ test("catalog verification reports a failed request instead of requesting anothe
   const events = [];
   let tick;
   let payload = { pid: 10, successful_model_catalog_requests: 0, model_catalog_requests: 0, last_model_catalog_result: null };
-  vm.runInNewContext(source + "\nstartCatalogVerificationMonitor({ logger, stateStore });", {
+  vm.runInNewContext(source + "\nconst publishOperation = op => { lastOperation = op; recordOperation(op); };\nstartCatalogVerificationMonitor({ logger, stateStore });", {
     catalogVerificationInFlight: false, catalogVerificationTimer: null, catalogVerificationGeneration: 0, lastOperation: null,
     codexCatalogRequiredForState: () => true,
     currentApiAccessMode: () => "openai",
@@ -992,8 +1055,8 @@ test("catalog verification reports a failed request instead of requesting anothe
     stateStore: { read: () => state, update: patch => Object.assign(state, patch) },
     setInterval: callback => { tick = callback; return { unref() {} }; },
     logger: { info: (...args) => events.push(args), warn: (...args) => events.push(args), debug() {} },
-    send() {}, publishOperation: op => operations.push(op),
-    nativeCopyFor: () => ({ catalogFailure: "Catalog failed (HTTP {status}; {reason})." }),
+    send() {}, recordOperation: op => operations.push(op),
+    nativeCopyFor: () => ({ catalogFailure: "Catalog failed (HTTP {status}; {reason}).", catalogReady: "Loaded." }),
   });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(operations.length, 0);
@@ -1016,6 +1079,7 @@ test("catalog verification reports a failed request instead of requesting anothe
   assert.equal(state.codexCatalogVerified, true);
   assert.equal(state.codexRestartRequired, false);
   assert.ok(events.some(([event]) => event === "codex.model_catalog_verified"));
+  assert.equal(operations.at(-1)?.status, "completed");
 });
 
 test("catalog verification ignores an in-flight result after its generation is invalidated", async () => {
@@ -1213,7 +1277,76 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   config.solAvailable = true;
   assert.equal((await snapshot()).state.biggerContextAvailable, true);
   config.solAvailable = false;
-  assert.equal((await snapshot()).state.biggerContextAvailable, false);
+  assert.equal((await snapshot()).state.biggerContextAvailable, true);
+});
+
+test("changing Bigger Context retires ordinary chats and preserves the continuity page and lease", () => {
+  const vm = require("node:vm");
+  const { continuityLease } = require("../electron/continuity-lease.cjs");
+  const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
+    useSavedChats: false, autoApproveToolCalls: false, biggerContextAvailable: true };
+  const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
+    traceId: "continuity-trace", continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32),
+    continuityLastSuccessAt: Date.now(), view: { webContents: { isDestroyed: () => false } } };
+  const lease = continuityLease(continuity);
+  const tabs = new Map([
+    ["old", { id: "old", status: "ready", conversationKey: "old-luna", interactionMode: "automatic" }],
+    [continuity.id, continuity],
+    ["active", { status: "running", conversationKey: "running", interactionMode: "automatic" }],
+    ["manual", { status: "ready", conversationKey: "manual", interactionMode: "manual" }],
+  ]);
+  const released = [];
+  const events = [];
+  const context = vm.createContext({
+    runtimeHost: { currentOperation: () => null }, browserHost: { turnTabs: tabs, logger: { info() {} },
+      removeTurnTab(tab, abortRunning) {
+        assert.equal(abortRunning, false);
+        released.push(tab.conversationKey);
+        tabs.delete(tab.id);
+      } },
+    releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
+    send: (channel, value) => events.push({ channel, value: { ...value } }),
+  });
+  vm.runInContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("function registerIpc(")), context);
+  const store = { read: () => state, update: patch => Object.assign(state, patch) };
+  for (const enabled of [true, false]) {
+    if (!enabled) tabs.set("old", { id: "old", status: "ready", conversationKey: "old-luna", interactionMode: "automatic" });
+    const config = { solAvailable: false, experimentalBiggerContext: enabled };
+    assert.doesNotThrow(() => context.syncBrowserPreferences(store, config));
+    assert.equal(state.experimentalBiggerContext, enabled);
+    assert.equal(tabs.has("old"), false);
+    assert.equal(tabs.get("continuity"), continuity);
+    assert.deepEqual(continuityLease(continuity), lease);
+    assert.equal(continuity.continuityInvalidated, undefined);
+    assert.equal(tabs.has("active"), true);
+    assert.equal(tabs.has("manual"), true);
+    assert.doesNotThrow(() => context.syncBrowserPreferences(store, config));
+  }
+  assert.deepEqual(released, ["old-luna", "old-luna"]);
+  assert.equal(events.length, 2, "repeated synchronization must settle without another update");
+});
+
+test("broader persistence changes still require the continuity lease before releasing its page", () => {
+  const vm = require("node:vm");
+  for (const property of ["useSavedChats", "experimentalFreshConversationPerTurn"]) {
+    const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
+      useSavedChats: false, autoApproveToolCalls: false, biggerContextAvailable: true };
+    const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
+      continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32), view: { webContents: { isDestroyed: () => false } } };
+    const tabs = new Map([[continuity.id, continuity]]);
+    const context = vm.createContext({
+      runtimeHost: { currentOperation: () => null }, browserHost: { turnTabs: tabs,
+        removeTurnTab() { assert.fail("a key-only release must not retire the continuity owner"); } },
+      releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
+      send() { assert.fail("failed lease validation must not publish a changed preference"); },
+    });
+    vm.runInContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("function registerIpc(")), context);
+    const store = { read: () => state, update: patch => Object.assign(state, patch) };
+    assert.throws(() => context.syncBrowserPreferences(store, { solAvailable: false, [property]: true }),
+      error => error.code === "continuity_session_lost");
+    assert.equal(state[property], false);
+    assert.equal(tabs.get("continuity"), continuity);
+  }
 });
 
 test("browser preference controls are translated, disabled in Zero Risk, and invoke their settings", async () => {
@@ -1262,8 +1395,7 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
         });
         const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy[label]);
         assert.ok(row);
-        assert.equal(row.props.body, mode === "manual" ? copy[unavailable]
-          : property === "experimentalBiggerContext" && !available ? copy.lunaBiggerContextUnavailable : copy[body]);
+        assert.equal(row.props.body, mode === "manual" ? copy[unavailable] : copy[body]);
         const control = visit(row).find(node => node.type === "Switch");
         assert.equal(control.props.checked, property === "autoApproveToolCalls" && mode === "manual" ? false : enabled);
         assert.equal(control.props.disabled, mode === "manual" || !configured
@@ -1418,4 +1550,24 @@ test("plugin name editor fixes Codex and edits Native4 before asking to reconfig
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(submitted, "Work");
   assert.equal(configureMode, "automatic");
+});
+
+
+test("catalog recovery clears its error banner but preserves a newer unrelated failure", () => {
+  const vm = require("node:vm");
+  const source = appSource.slice(appSource.indexOf("const unsubscribeOperation = api.onOperation"), appSource.indexOf("const unsubscribeLog ="));
+  let callback, error = null;
+  vm.runInNewContext(source, {
+    api: { onOperation: fn => { callback = fn; } },
+    setOperation() {}, catalogError: { current: null },
+    setError: value => { error = typeof value === "function" ? value(error) : value; },
+  });
+  callback({ name: "catalog-verification", status: "failed", message: "Catalog error" });
+  assert.equal(error, "Catalog error");
+  callback({ name: "catalog-verification", status: "completed", message: "Loaded" });
+  assert.equal(error, null);
+  callback({ name: "catalog-verification", status: "failed", message: "Catalog error" });
+  callback({ name: "setup", status: "failed", message: "Setup error" });
+  callback({ name: "catalog-verification", status: "completed", message: "Loaded" });
+  assert.equal(error, "Setup error");
 });

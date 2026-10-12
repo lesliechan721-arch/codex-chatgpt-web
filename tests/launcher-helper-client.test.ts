@@ -41,6 +41,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
       // An old run can share a trace. Its late Send observation must not invoke the new hook.
       process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "send_activated",
         recovery: { ...turn.continuity.recovery, snapshotVersion: 1 } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "generation_progress",
+        recovery: { ...turn.continuity.recovery, snapshotVersion: 1 } }) + "\\n");
       await turn.onSendActivated();
       const initial = turn.externalProgress.snapshot();
       if (initial.nativeWaiting?.activeOperations !== 1) throw new Error("Initial Native lease lost in IPC");
@@ -49,6 +51,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
       const renewed = await changed;
       if (renewed.nativeWaiting?.sourceRevision !== 2 || renewed.lastProgressAt !== undefined
         || renewed.lastToolBatchRevision !== 0 || renewed.activeToolCalls !== 0) throw new Error("Waiting IPC fabricated Native progress");
+      turn.onHeartbeat();
+      turn.onGenerationProgress();
       turn.onReasoningSummary("Reading project");
       turn.onReasoningSummary(" files", true);
       turn.onTextDelta("done");
@@ -106,6 +110,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
   let sendActivated = false;
   let activations = 0;
   let submitted = false;
+  let heartbeats = 0;
+  let generationProgress = 0;
   let released = false;
   const externalProgress = new ChatGptExternalTurnProgress();
   externalProgress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
@@ -135,6 +141,11 @@ test("daemon streams browser lifecycle through the real helper process", async (
         submitted = true;
         externalProgress.recordNativeWaiting({ revision: 2, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
       },
+      onHeartbeat: () => {
+        heartbeats++;
+        expect(externalProgress.snapshot().lastProgressAt).toBeUndefined();
+      },
+      onGenerationProgress: () => { generationProgress++; },
       onReasoningSummary: (text, continuation) => reasoning.push({ text, continuation: continuation === true }),
       onTextDelta: text => deltas.push(text),
       captureLunaCheckpoint: true,
@@ -149,6 +160,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
     expect(sendActivated).toBe(true);
     expect(activations).toBe(1);
     expect(submitted).toBe(true);
+    expect(heartbeats).toBe(1);
+    expect(generationProgress).toBe(1);
     expect(acknowledgedStages).toEqual([1, 2, 3, 4, 5]);
     expect(checkpoints).toEqual([{
       answerHash: "a".repeat(64),

@@ -192,18 +192,20 @@ test("DEV persistence preserves full continuity slugs without changing the defau
 
 test("GPT-6 continuity DEV status uses the canonical history budget", () => {
   const root = scratch("cgw-dev-six-continuity-context");
-  const driver = new DevChatDriver(
-    { ...defaultConfig("full"), browserHost: "launcher" },
-    new DevChatStore(join(root, "chats")),
-    (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
-    root,
-  );
-  for (const suffix of ["sol-instant", "sol"] as const) {
-    const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
-    const { state } = driver.open(suffix, model);
-    expect(driver.status(state)).toMatchObject({
-      model, contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
-    });
+  for (const experimentalBiggerContext of [false, true]) {
+    const driver = new DevChatDriver(
+      { ...defaultConfig("full"), browserHost: "launcher", experimentalBiggerContext },
+      new DevChatStore(join(root, "chats")),
+      (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
+      root,
+    );
+    for (const suffix of ["sol-instant", "sol"] as const) {
+      const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
+      const { state } = driver.open(suffix, model);
+      expect(driver.status(state)).toMatchObject({
+        model, contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
+      });
+    }
   }
 });
 
@@ -273,7 +275,7 @@ test("an existing DEV chat changes route only when the user explicitly requests 
   });
 });
 
-test("Bigger Context triples the DEV compaction window and fails closed for Luna", async () => {
+test("Bigger Context exposes bounded full-history windows for Sol and Luna", async () => {
   const root = scratch("cgw-dev-bigger-context");
   const config = {
     ...defaultConfig("browser-only"),
@@ -319,8 +321,10 @@ test("Bigger Context triples the DEV compaction window and fails closed for Luna
     solAvailable: false,
     extraHighAvailable: false, proAvailable: false,
   }, store, factory, root, { biggerContext: true });
-  expect(() => luna.open("luna-window", "chatgpt-web/luna")).toThrow("unavailable for Luna");
-  expect(() => luna.open("think-window", "chatgpt-web/think")).toThrow("unavailable for Luna");
+  for (const model of ["chatgpt-web/luna", "chatgpt-web/think"] as const) {
+    const state = luna.open(model.split("/")[1]!, model).state;
+    expect(luna.status(state)).toMatchObject({ contextWindow: 84_000, autoCompactTokenLimit: 59_424 });
+  }
   await Promise.all([normal.close(), bigger.close(), luna.close()]);
 });
 

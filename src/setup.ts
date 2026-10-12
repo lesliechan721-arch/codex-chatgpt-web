@@ -47,7 +47,6 @@ import { getTunnelServiceStatus, installTunnelService, restartTunnelService, sto
 import { VERSION } from "./version";
 import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "./native-tool-long-wait-probe";
 import { effectiveToolAuthorityMode, manualCodexConfigurationOnly } from "./server-remote-config";
-import { CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR } from "./chatgpt-web-models";
 
 export interface SetupOptions {
   connectorNameSuffix?: string;
@@ -68,6 +67,7 @@ export interface SetupOptions {
   zeroRiskProEnabled?: boolean;
   zeroRiskRequireSentConfirmation?: boolean;
   replaceCodexRoute?: boolean;
+  preserveDisconnectedRoute?: boolean;
   restartService?: boolean;
   acknowledgedUnofficial?: boolean;
   tunnelId?: string;
@@ -215,11 +215,27 @@ export function tunnelWorkerRuntimeChanged(before: AppConfig | undefined, after:
     || JSON.stringify(before.tunnel) !== JSON.stringify(after.tunnel);
 }
 
+/**
+ * On Windows, EACCES can indicate a reserved port, an exclusive binding, or a security policy.
+ * The error alone does not identify which one prevented the listener from starting.
+ */
+export function portBindFailureMessage(
+  host: string,
+  port: number,
+  error: NodeJS.ErrnoException,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const message = `Cannot bind ${host}:${port}: ${error.message}`;
+  if (platform !== "win32" || error.code !== "EACCES") return message;
+  return `${message}. Windows may have reserved this port, another service may hold it exclusively, or security software may be blocking it. `
+    + "See \"Windows: Cannot bind the local port (EACCES)\" in TROUBLESHOOTING.md";
+}
+
 async function assertPortAvailable(host: string, port: number): Promise<void> {
   await new Promise<void>((resolveAvailable, rejectAvailable) => {
     const server = createServer();
     server.unref();
-    server.once("error", error => rejectAvailable(new Error(`Cannot bind ${host}:${port}: ${error.message}`)));
+    server.once("error", error => rejectAvailable(new Error(portBindFailureMessage(host, port, error))));
     server.listen(port, host, () => server.close(error => error ? rejectAvailable(error) : resolveAvailable()));
   });
 }
@@ -607,9 +623,6 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   config.solAvailable = solAvailable === true;
   config.extraHighAvailable = config.solAvailable && extraHighAvailable === true;
   config.proAvailable = config.solAvailable && proAvailable === true;
-  if (config.experimentalBiggerContext && !config.solAvailable) {
-    throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
-  }
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
   const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
@@ -689,6 +702,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   else {
     installCodexIntegration(config, {
       replaceExistingRoute: options.replaceCodexRoute,
+      preserveDisconnectedRoute: options.preserveDisconnectedRoute,
     });
     clearOpenAiRoutingPending();
   }
@@ -747,10 +761,6 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
   if (nativeLongWaitProbe) {
     config.appName = DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
     config.automaticAppName = DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME;
-  }
-
-  if (config.experimentalBiggerContext && !config.solAvailable) {
-    throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
   }
 
   await configureTunnel(config, existing, options);

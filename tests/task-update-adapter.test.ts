@@ -191,6 +191,23 @@ async function fixture(options: { remote?: boolean; structured?: boolean } = {})
   };
 }
 
+// Generation progress can arrive before queued text is consumed. These cases require
+// the actual consumption boundary before disconnecting or asserting buffered ownership.
+function observeTextConsumption(f: Awaited<ReturnType<typeof fixture>>) {
+  const consumed = deferred<void>();
+  const queue = f.session().runtime.text;
+  const drain = queue.drainWithContext.bind(queue);
+  queue.drainWithContext = () => {
+    const records = drain();
+    if (records.length > 0) {
+      queue.drainWithContext = drain;
+      consumed.resolve();
+    }
+    return records;
+  };
+  return consumed;
+}
+
 async function originalBatch(f: Awaited<ReturnType<typeof fixture>>) {
   const events: AdapterEvent[] = [];
   const round = f.run(f.initial, events);
@@ -676,15 +693,11 @@ describe("Automatic Adapter task updates", () => {
           return batch;
         };
         const sourceEvents: AdapterEvent[] = [];
-        const consumed = deferred<void>();
-        let textObserved = false;
-        const sourceRun = f.run(f.initial, sourceEvents, undefined, undefined, () => {
-          if (textObserved) consumed.resolve();
-        });
+        const sourceRun = f.run(f.initial, sourceEvents, undefined);
         const { token, turn } = await f.ready;
         await f.observing(0);
         const candidate = { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 };
-        textObserved = true;
+        const consumed = observeTextConsumption(f);
         turn.onTextDelta('{"answer":"Before tool', candidate);
         await consumed.promise;
         const session = f.session();
@@ -775,17 +788,13 @@ describe("Automatic Adapter task updates", () => {
       const { token, turn, callId } = await originalBatch(f);
       const next = append(f.initial, callId, [{ id: "update-1", text: "Include validation." }]);
       const events: AdapterEvent[] = [];
-      const consumed = deferred<void>();
-      let textObserved = false;
-      const round = f.run(next, events, undefined, undefined, () => {
-        if (textObserved) consumed.resolve();
-      });
+      const round = f.run(next, events, undefined);
       const result = await f.wait(token, 1);
       await f.observing(1);
       const candidate = { expectedDriverGeneration: 1, taskRevision: 1 };
       const answer = '{"answer":"Unacknowledged answer."}';
       expect(f.broker.taskUpdateState(token)).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 0 });
-      textObserved = true;
+      const consumed = observeTextConsumption(f);
       turn.onTextDelta(answer, candidate);
       // Wait for consumption or immediate rejection, without settling the browser or a timer.
       await Promise.race([consumed.promise, round]);
@@ -836,16 +845,12 @@ describe("Automatic Adapter task updates", () => {
       const f = await fixture({ remote, structured: true });
       try {
         const sourceEvents: AdapterEvent[] = [];
-        const consumed = deferred<void>();
-        let textObserved = false;
-        const sourceRun = f.run(f.initial, sourceEvents, undefined, undefined, () => {
-          if (textObserved) consumed.resolve();
-        });
+        const sourceRun = f.run(f.initial, sourceEvents, undefined);
         const { token, turn } = await f.ready;
         await f.observing(0);
         const candidate = { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 };
         const answer = '{"answer":"Before tool and after tool."}';
-        textObserved = true;
+        const consumed = observeTextConsumption(f);
         turn.onTextDelta(disconnected ? answer : '{"answer":"Before tool', candidate);
         await consumed.promise;
         expect((await f.owner.taskUpdateState!(token))!.finalOutputRevision).toBeNull();
@@ -892,34 +897,44 @@ describe("Automatic Adapter task updates", () => {
     });
   }
 
-  for (const remote of [false, true]) for (const answer of [
+  for (const remote of [false, true]) for (const disconnectBeforeConsumption of [false, true]) for (const answer of [
     '{"answer":"Reconnect answer."}', '{"answer":42}', 'malformed JSON', 'Plain reconnect answer.',
   ]) {
     const structured = answer !== 'Plain reconnect answer.';
     const valid = answer === '{"answer":"Reconnect answer."}' || !structured;
-    test(`${remote ? "Remote" : "Local"} completed disconnected round recovers ${answer}`, async () => {
+    test(`${remote ? "Remote" : "Local"} completed disconnected round recovers ${answer}${disconnectBeforeConsumption ? " before text consumption" : ""}`, async () => {
       const f = await fixture({ remote, structured });
       try {
         const { token, turn, callId, events: sourceEvents } = await originalBatch(f);
         const next = append(f.initial, callId, [{ id: "update-1", text: "Include validation." }]);
         const abort = new AbortController();
-        const consumed = deferred<void>();
-        let textObserved = false;
         const firstEvents: AdapterEvent[] = [];
+        const queue = f.session().runtime.text;
+        const originalDrain = queue.drainWithContext.bind(queue);
+        let consumedRecords = 0;
+        queue.drainWithContext = () => {
+          const records = originalDrain();
+          consumedRecords += records.length;
+          return records;
+        };
+        let observedText = false;
         const round = f.run(next, firstEvents, abort.signal, undefined, () => {
-          if (textObserved) consumed.resolve();
+          if (disconnectBeforeConsumption && observedText) abort.abort();
         }).catch(error => error);
         const result = await f.wait(token, 1);
         await ack(f, token, result.taskUpdate!);
         await f.observing(1);
         const candidate = { expectedDriverGeneration: 1, taskRevision: 1, acknowledgedRevision: 1 };
-        textObserved = true;
+        const consumed = disconnectBeforeConsumption ? undefined : observeTextConsumption(f);
+        observedText = true;
         turn.onTextDelta(answer, candidate);
-        await consumed.promise;
+        if (consumed) await consumed.promise;
         if (structured) expect(firstEvents.some(event => event.type === "text_delta" && event.phase === "final_answer")).toBe(false);
         abort.abort();
         expect(await round).toMatchObject({ name: "AbortError" });
-        expect(f.session().runtime.text.drainWithContext()).toEqual([]);
+        expect(consumedRecords).toBe(disconnectBeforeConsumption ? 0 : 1);
+        queue.drainWithContext = originalDrain;
+        if (!disconnectBeforeConsumption) expect(queue.drainWithContext()).toEqual([]);
         const ticket = await turn.completionFence!.begin(candidate);
         expect(await turn.completionFence!.commit(ticket!, candidate)).toBe(true);
         f.answer.resolve(answer);
@@ -1062,15 +1077,11 @@ describe("Automatic Adapter task updates", () => {
           return nextBatch(capability, signal, context);
         };
         const abortSecond = new AbortController();
-        const consumed = deferred<void>();
-        let textObserved = false;
-        const secondRun = f.run(second, [], abortSecond.signal, undefined, () => {
-          if (textObserved) consumed.resolve();
-        }).catch(error => error);
+        const secondRun = f.run(second, [], abortSecond.signal).catch(error => error);
         await observingSecond.promise;
         const candidate = { expectedDriverGeneration: 1, taskRevision: 1, acknowledgedRevision: 1 };
         const answer = '{"answer":"Only the owning round can recover this answer."}';
-        textObserved = true;
+        const consumed = observeTextConsumption(f);
         turn.onTextDelta(answer, candidate);
         await consumed.promise;
         abortSecond.abort();
@@ -1329,16 +1340,12 @@ describe("Automatic Adapter task updates", () => {
         const { token, turn, callId } = await originalBatch(f);
         const next = append(f.initial, callId, [{ id: "update-1", text: "Include validation." }]);
         const events: AdapterEvent[] = [];
-        const consumed = deferred<void>();
-        let textObserved = false;
-        const round = f.run(next, events, undefined, undefined, () => {
-          if (textObserved) consumed.resolve();
-        });
+        const round = f.run(next, events, undefined);
         const result = await f.wait(token, 1);
         await ack(f, token, result.taskUpdate!);
         await f.observing(1);
         const candidate = { expectedDriverGeneration: 1, taskRevision: 1, acknowledgedRevision: 1 };
-        textObserved = true;
+        const consumed = observeTextConsumption(f);
         turn.onTextDelta(answer, candidate);
         await consumed.promise;
         expect(events.some(event => event.type === "text_delta" && event.phase === "final_answer")).toBe(false);

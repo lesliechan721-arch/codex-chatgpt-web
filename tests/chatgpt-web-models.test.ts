@@ -21,6 +21,7 @@ import {
   resolveChatGptWebContextLimits,
   resolveChatGptWebHistoryLimits,
   resolveChatGptWebTransportLimits,
+  supportsChatGptWebBiggerContext,
 } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
 import { routeChatGptWebRequest } from "../src/server";
@@ -160,8 +161,8 @@ describe("fixed ChatGPT Web model routes", () => {
       for (const effort of ["medium", "high", "xhigh"] as const) {
         const route = requireChatGptWebModelRoute("chatgpt-web/gpt-6-sol", config, effort);
         expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({
-          contextWindow: proAvailable ? 240_000 : 90_000,
-          autoCompactTokenLimit: proAvailable ? 220_000 : 80_000,
+          contextWindow: proAvailable ? 240_000 : 120_000,
+          autoCompactTokenLimit: proAvailable ? 220_000 : 110_000,
         });
       }
       const instant = requireChatGptWebModelRoute("chatgpt-web/gpt-6-sol-instant", config, "low");
@@ -325,6 +326,25 @@ describe("fixed ChatGPT Web model routes", () => {
     });
   });
 
+  test("GPT-6 Plus expands retained context without enlarging one message or unlocking unavailable efforts", () => {
+    const enabled = { ...plus, experimentalBiggerContext: true };
+    for (const effort of ["medium", "high"] as const) {
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus, "6"))
+        .toMatchObject({ contextWindow: 90_000, autoCompactTokenLimit: 80_000 });
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled, "6"))
+        .toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
+      expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled))
+        .toEqual(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus));
+    }
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", enabled, "6"))
+      .toEqual(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus, "6"));
+    expect(() => resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", enabled, "6"))
+      .toThrow("unavailable effort");
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", {
+      ...enabled, extraHighAvailable: true,
+    }, "6")).toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
+  });
+
   test("publishes Luna's real model window without early native compaction", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
       solAvailable: false,
@@ -334,6 +354,25 @@ describe("fixed ChatGPT Web model routes", () => {
       effectiveContextWindowPercent: 100,
       autoCompactTokenLimit: 1_050_000,
     });
+  });
+
+  test("Luna and Think enable experimental context only for their supported efforts across account flags", () => {
+    for (const proAvailable of [false, true]) for (const extraHighAvailable of [false, true]) {
+      const capabilities = { solAvailable: false, proAvailable, extraHighAvailable };
+      for (const effort of ["low", "medium"] as const) {
+        expect(supportsChatGptWebBiggerContext(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, "6")).toBe(true);
+        expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, capabilities))
+          .toMatchObject({ contextWindow: 1_050_000, autoCompactTokenLimit: 1_050_000 });
+        expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, {
+          ...capabilities, experimentalBiggerContext: true,
+        })).toMatchObject({ contextWindow: 84_000, autoCompactTokenLimit: 59_424 });
+        expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, capabilities))
+          .toEqual({ browserMessageTokenLimit: 19_808 });
+      }
+    }
+    for (const effort of ["high", "xhigh", "max"] as const) {
+      expect(supportsChatGptWebBiggerContext(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, "6")).toBe(false);
+    }
   });
 
   test("triples Sol context and compaction limits only when Bigger Context is enabled", () => {
@@ -350,9 +389,9 @@ describe("fixed ChatGPT Web model routes", () => {
       extraHighAvailable: false, proAvailable: false,
       experimentalBiggerContext: true,
     })).toEqual({
-      contextWindow: 1_050_000,
-      effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 1_050_000,
+      contextWindow: 84_000,
+      effectiveContextWindowPercent: 71,
+      autoCompactTokenLimit: 59_424,
     });
   });
 

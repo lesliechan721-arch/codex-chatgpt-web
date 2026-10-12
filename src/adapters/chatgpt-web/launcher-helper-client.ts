@@ -36,7 +36,7 @@ const SUBMISSION_RECEIPT_ACK_FEATURE = "submission-receipt-ack-v1";
 
 type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "ready"; features?: string[] }
-  | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
+  | { type: "event"; id: string; event: "heartbeat" | "generation_progress" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number; candidate?: TaskUpdateOwnerContext }
@@ -156,7 +156,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
       }
       return { type: "event", id: message.id, event, planId: message.planId };
     }
-    if (!["heartbeat", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
+    if (!["heartbeat", "generation_progress", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
       throw new Error("Launcher browser helper emitted an unknown event");
     }
     if (text !== undefined && typeof text !== "string") {
@@ -168,7 +168,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
     return {
       type: "event",
       id: message.id,
-      event: event as "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text",
+      event: event as "heartbeat" | "generation_progress" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text",
       ...(text !== undefined ? { text: text as string } : {}),
       ...(continuation !== undefined ? { continuation: continuation as boolean } : {}),
       ...(candidate ? { candidate } : {}),
@@ -524,6 +524,7 @@ export class LauncherBrowserHelperClient {
         return;
       }
       if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
+      else if (message.event === "generation_progress") pending.turn.onGenerationProgress?.();
       else if (message.event === "tool_batch_observed") {
         const progress = pending.turn.externalProgress;
         if (!progress) {

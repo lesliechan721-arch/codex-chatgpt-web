@@ -284,10 +284,12 @@ test("active compaction delivers the current result and converts every later MCP
       arguments: { cmd: "pwd" },
     });
     const [request] = await broker.nextToolBatch(token);
+    let progressEvents = 0;
     broker.requestCompaction(token, {
       content: [{ type: "text", text: "compact now" }],
       isError: true,
-    });
+    }, undefined, () => { progressEvents++; });
+    expect(progressEvents).toBe(0);
     broker.completeTool(token, request!.callId, {
       content: [{ type: "text", text: "current result" }],
     });
@@ -303,6 +305,7 @@ test("active compaction delivers the current result and converts every later MCP
       content: [{ type: "text", text: "compact now" }],
       isError: true,
     });
+    expect(progressEvents).toBe(1);
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });
@@ -1013,7 +1016,7 @@ test("active compaction aborts its source when the shared handoff deadline expir
 });
 
 test.each([false, true])(
-  "active compaction reports real trace/text feed progress while settling (Zero Risk=%s)",
+  "active compaction reports real generation/trace/text progress while settling (Zero Risk=%s)",
   async zeroRisk => {
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
@@ -1047,6 +1050,7 @@ test.each([false, true])(
       requestCompaction: () => 0,
       compactionDeliveryCount: () => 0,
       completeTool: async () => {
+        setTimeout(() => trace.recordProgress(), 5);
         setTimeout(() => trace.push({ kind: "reasoning", text: "reasoning delta" }), 10);
         setTimeout(() => text.push("summary delta"), 20);
         setTimeout(() => finishBrowser(zeroRisk ? "Zero Risk checkpoint" : "ordinary final"), 30);
@@ -1076,7 +1080,7 @@ test.each([false, true])(
         compactionInstructionDelivered: false,
       });
     }
-    expect(progress).toBeGreaterThanOrEqual(3);
+    expect(progress).toBeGreaterThanOrEqual(4);
   },
 );
 
@@ -2180,6 +2184,73 @@ test("finishing the previous response does not consume the retained checkpoint's
     await run;
     expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
     expect(events.some(event => event.type === "text_delta" && event.text.includes("Checkpoint after previous"))).toBeTrue();
+  } finally {
+    finishSource("cleanup");
+    await run;
+    mock.timers.reset();
+    worker.run = originalRun;
+    chatGptTurnSessions.clear();
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])("compaction source progress renews waiting, but silent source still expires (%s)", async live => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-retained-progress-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web", baseUrl: `browser://retained-phases-${root}`,
+    chatgptWeb: { browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root), localToolsEnabled: true,
+      solAvailable: true, extraHighAvailable: true, proAvailable: true, turnTimeoutMs: 40 },
+  };
+  const sourceRequest = request(false);
+  const namespace = chatGptWebExecutionNamespace(provider);
+  let finishSource!: (text: string) => void;
+  const browser = new Promise<string>(resolve => { finishSource = resolve; });
+  const sourceTrace = new ChatGptTraceFeed();
+  chatGptTurnSessions.getOrCreate(`${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`, () => ({
+    mode: "read-only", browser, physicalSettlement: browser.then(() => {}),
+    trace: sourceTrace, text: new ChatGptTextFeed(), usageInput: sourceRequest,
+    compactionSourceCoverage: deliveredCoverage(sourceRequest),
+    conversationKey: chatGptConversationKey(sourceRequest, namespace), cancel: () => finishSource("cancelled"),
+  }));
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run;
+  const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
+  await broker.listen();
+  worker.run = async turn => {
+    mock.timers.tick(25);
+    expect(turn.abortSignal?.aborted).toBeFalse();
+    const prepared = await turn.prepareResume!();
+    const binding = controlBinding(prepared.text);
+    turn.onSubmitted?.();
+    prepared.release();
+    await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, {
+      method: "submit_compaction_handoff", token: binding.token,
+      handoffId: binding.handoffId, summary: "Checkpoint after previous response settled",
+    });
+    return "Checkpoint submitted";
+  };
+  const events: AdapterEvent[] = [];
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  let run: Promise<void> | undefined;
+  try {
+    run = createChatGptWebAdapter(provider).runTurn!(request(true), { headers: new Headers() }, event => events.push(event));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    for (let step = 0; step < 4; step++) {
+      mock.timers.tick(25);
+      if (live) sourceTrace.recordProgress();
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (live) {
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      finishSource("Previous response finished");
+      await run;
+      expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    } else {
+      await run;
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "compaction_handoff_timeout" });
+    }
   } finally {
     finishSource("cleanup");
     await run;

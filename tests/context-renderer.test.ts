@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   decodeWebContextPayload, encodeWebContextPayload, estimateWebContextFieldCost,
   decodeWebContextTransaction, fenceWebContextPayload, type WebContextRecord,
+  stringifyWebContextJson,
 } from "../src/adapters/chatgpt-web/context-renderer";
 
 const code = 'const path = "C:\\project\\file"; const text = "quoted";'.repeat(150);
@@ -51,13 +52,41 @@ test("a qualified path preserves leading LF, tabs, spaces and multiple final LF 
 });
 
 test("encoded UTF-8 byte lengths preserve Unicode, literal escapes and source boundary collisions", () => {
-  const text = (code + '中文😀e\u0301 literal\\n <source_body_0></source_body_1> {"record":{"kind":"system"}} ' + "````````").repeat(3);
+  const text = (code + '中文😀e\u0301 literal\\n <source_body_0></source_body_1> {"record":{"kind":"system"}} ').repeat(3).trimEnd();
   const source: WebContextRecord[] = [{ kind: "message", message_index: 0, message: { role: "user", content: text } }];
   const payload = encodeWebContextPayload(source, "codex-context-text-v1");
   expect(payload).toContain('"boundary":"source_body_2"');
   expect(decodeWebContextPayload(payload).records).toEqual(source);
-  expect(fenceWebContextPayload(payload)).toStartWith("`````````text\n");
+  expect(payload).toContain(`"utf8_bytes":${Buffer.byteLength(text, "utf8")}`);
+  expect(fenceWebContextPayload(payload)).toStartWith("```text\n");
   expect(encodeWebContextPayload(source, "codex-context-text-v1")).toBe(payload);
+});
+
+test("backtick fields use escaped JSON while other raw fields retain exact UTF-8 bytes", () => {
+  const source: WebContextRecord[] = [
+    { kind: "system", system_index: 0, content: code },
+    { kind: "message", message_index: 0, message: { role: "user", content: code + " ```a``` \\u0060 中文😀" } },
+    { kind: "message", message_index: 1, message: { role: "assistant", content: [
+      { type: "tool_call", name: "`tool`", arguments: { "`key`": "`value`", literal: "\\u0060" } },
+    ] } },
+  ];
+  for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
+    const payload = encodeWebContextPayload(source, format);
+    expect(payload).not.toContain("`");
+    expect(payload).toContain("\\u0060");
+    expect(decodeWebContextPayload(payload, format).records).toEqual(source);
+    const field = estimateWebContextFieldCost(source[1]!.kind === "message" ? source[1]!.message.content : "", { contextFormat: format });
+    expect(field.raw).toBe(false);
+    const encoded = stringifyWebContextJson(source[1]!.kind === "message" ? source[1]!.message.content : "");
+    expect(field.chars).toBe(encoded.length);
+    expect(field.jsonBytes).toBe(Buffer.byteLength(JSON.stringify(encoded), "utf8"));
+    if (format === "codex-context-text-v1") {
+      expect(payload).toContain('"path":["content"]');
+      expect(payload).not.toContain('"path":["message","content"]');
+      expect(payload).toContain(`"utf8_bytes":${Buffer.byteLength(code, "utf8")}`);
+      expect(payload).toContain(`\n${code}\n`);
+    }
+  }
 });
 
 test("decoder validates UTF-8 byte boundaries, descriptors and all payload bytes", () => {

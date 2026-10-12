@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">모든 릴리스</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">모든 릴리스</a>
 </p>
 
 <p align="center">
@@ -95,10 +95,15 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 > 90,000-token 창을 사용합니다. GPT-5.6은 실험적 3× context를 활성화하면 최대 270,000 tokens까지
 > 확장되며, 네이티브 Codex compaction을 지원합니다.
 >
-> GPT-6 Sol의 Bigger Context는 Pro 계정의 Medium, High, Extra High에서만 지원합니다.
-> 컨텍스트 창은 **240,000 tokens**이며 **220,000 tokens**에서 압축합니다. GPT-6 Instant와
-> 다른 요금제의 GPT-6 Sol은 표준 용량을 사용합니다.
+> GPT-6 Sol의 Bigger Context는 Medium, High 및 사용 가능한 Extra High에서 지원합니다.
+> Plus 컨텍스트 창은 **120,000 tokens**이며 **110,000 tokens**에서 압축합니다.
+> Pro 컨텍스트 창은 **240,000 tokens**이며 **220,000 tokens**에서 압축합니다.
+> GPT-6 Instant는 표준 용량을 사용합니다.
 > GPT-5.6과 GPT-6 Pro는 기존 Bigger Context 한도를 유지합니다.
+
+> Luna/Think는 실험적인 분할 Bigger Context를 사용할 수 있습니다. Free의 긴 대화에서는 이전 세부
+> 정보가 손실될 수 있습니다. 끄면 Luna의 롤링 checkpoint를 유지합니다. Continuity first는 별도 기록
+> 예산을 유지하며 분할 전송을 사용하지 않습니다.
 
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.

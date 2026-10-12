@@ -31,6 +31,9 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
+Version `6.1.9-1` integrates upstream `6.1.8` with this fork's continuity, context, API access,
+provider, proxy, and remote-runtime contracts. The service, Launcher, installer, and download
+metadata use the same version.
 The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an
 existing release's pre-release flag when rerun. Other preview builds must have that flag set
 explicitly before publication. Named version suffixes retain preview ordering below the base release.
@@ -49,6 +52,16 @@ plan, Codex version, result of each check, and a redacted Activity log for every
 capture cookies, tunnel IDs, API keys, bearer tokens, or private task prompt contents.
 For controlled synthetic fixtures, retain only the fixture input and output needed to assess the
 result, with credentials redacted.
+
+For `6.1.9-1`, Native protocol compatibility targets the latest stable
+[Codex `0.162.1`](https://github.com/openai/codex/releases/tag/rust-v0.162.1).
+Run `bun run smoke:compaction` with no flags, `--auto`, `--zero-risk`, and
+`--auto --zero-risk`. The smoke uses the real installed Codex and a local deterministic model
+with temporary homes. Check every actual compaction response, the canonical replacement history,
+continued use of the checkpoint, current filesystem/network authority, and repeated manual compaction.
+Automatic `responses/memento` and standalone local compaction return assistant messages; remote v2
+retains its separate compaction-item contract. Internal parser field names alone are not wire evidence.
+These checks do not validate an authenticated ChatGPT session or live model recall.
 
 ## Context navigation validation
 

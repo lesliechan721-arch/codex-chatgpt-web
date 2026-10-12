@@ -1,0 +1,445 @@
+{
+  "capture": {
+    "codex": "0.162.1",
+    "mode": "latest-manual",
+    "requestIndex": 2
+  },
+  "request": {
+    "model": "chatgpt-web/high",
+    "stream": true,
+    "input": [
+      {
+        "type": "message",
+        "id": "msg_01a12f84-dc1f-7802-bc44-60cc149e889d",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "<environment_context>\n  <cwd>/tmp/cgw-codex-0162-compaction/workspace</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-10-12</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>/tmp/cgw-codex-0162-compaction/workspace</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "FIRST_REQUEST: Inspect the task."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "msg_01a12f84-dc1f-7802-bc44-60d033bc7d99",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\nLOCAL_COMPACTION_CHECKPOINT: The first request was completed. Continue the requested task."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.\n"
+          }
+        ]
+      }
+    ],
+    "reasoning": {
+      "effort": "high",
+      "context": "all_turns"
+    },
+    "client_metadata": {
+      "x-codex-turn-metadata": "{\"thread_id\": \"01a12f84-dbc1-7450-aafe-681e8329b10a\", \"agent_name\": \"/root\", \"turn_id\": \"01a12f84-dc38-73e0-a385-2432e6703f54\", \"window_number\": 1, \"context_window_id\": \"01a12f84-dc1f-7802-bc44-608bb46b2db9\", \"request_kind\": \"compaction\", \"sandbox\": \"seatbelt\", \"sandbox_mode\": \"read-only\", \"compaction\": {\"trigger\": \"manual\", \"reason\": \"user_requested\", \"implementation\": \"responses\", \"phase\": \"standalone_turn\", \"strategy\": \"memento\"}}"
+    }
+  },
+  "rolloutFilename": "rollout-2026-10-12T17-49-58-01a12f84-dbc1-7450-aafe-681e8329b10a.jsonl",
+  "rolloutRecords": [
+    {
+      "timestamp": "2026-10-12T09:49:58.613Z",
+      "ordinal": 0,
+      "type": "session_meta",
+      "payload": {
+        "id": "01a12f84-dbc1-7450-aafe-681e8329b10a",
+        "cwd": "/tmp/cgw-codex-0162-compaction/workspace",
+        "source": "vscode"
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.613Z",
+      "ordinal": 1,
+      "type": "event_msg",
+      "payload": {
+        "type": "task_started",
+        "turn_attribution": {
+          "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+          "turn_trigger": null,
+          "parent_turn_id": null,
+          "initiating_agent_path": null,
+          "root_turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f"
+        },
+        "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+        "root_turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+        "started_at": 1791798598,
+        "model_context_window": 80100,
+        "collaboration_mode_kind": "default"
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.621Z",
+      "ordinal": 3,
+      "type": "response_item",
+      "payload": {
+        "type": "message",
+        "id": "msg_01a12f84-dbdd-7b51-a40a-73d3f7bf9cbe",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "<environment_context>\n  <cwd>/tmp/cgw-codex-0162-compaction/workspace</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-10-12</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>/tmp/cgw-codex-0162-compaction/workspace</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>"
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+          "create_time": 1791798598.621427,
+          "content_item_kinds": [
+            "environments.environment_context"
+          ]
+        }
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.622Z",
+      "ordinal": 5,
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+        "root_turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+        "disabled_plugin_ids": [],
+        "cwd": "/tmp/cgw-codex-0162-compaction/workspace",
+        "approval_policy": "never",
+        "approvals_reviewer": "user",
+        "sandbox_policy": {
+          "type": "read-only"
+        },
+        "permission_profile": {
+          "type": "managed",
+          "file_system": {
+            "type": "restricted",
+            "entries": [
+              {
+                "path": {
+                  "type": "special",
+                  "value": {
+                    "kind": "root"
+                  }
+                },
+                "access": "read"
+              }
+            ]
+          },
+          "network": "restricted"
+        },
+        "model": "chatgpt-web/high",
+        "collaboration_mode": {
+          "mode": "default",
+          "settings": {
+            "model": "chatgpt-web/high",
+            "reasoning_effort": null,
+            "developer_instructions": null
+          }
+        },
+        "multi_agent_version": "v1",
+        "realtime_active": false,
+        "summary": "none"
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.623Z",
+      "ordinal": 6,
+      "type": "response_item",
+      "payload": {
+        "type": "message",
+        "id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "FIRST_REQUEST: Inspect the task."
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+          "create_time": 1791798598.623512,
+          "content_item_kinds": [
+            "user.text"
+          ]
+        }
+      },
+      "metadata": {
+        "retained_source": {
+          "id": {
+            "message_id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+            "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+            "role": "user"
+          },
+          "revision": "retained_01a12f84-dbdf-7130-b703-f68b5c215046",
+          "complete": true
+        },
+        "client_authored": false,
+        "user_input_order": 0,
+        "mcp_attribution": {
+          "status": "none"
+        }
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.672Z",
+      "ordinal": 13,
+      "type": "event_msg",
+      "payload": {
+        "type": "task_started",
+        "turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+        "root_turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+        "started_at": 1791798598,
+        "model_context_window": 80100,
+        "collaboration_mode_kind": "default"
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.687Z",
+      "ordinal": 18,
+      "type": "compacted",
+      "payload": {
+        "message": "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\nLOCAL_COMPACTION_CHECKPOINT: The first request was completed. Continue the requested task.",
+        "replacement_history": [
+          {
+            "type": "message",
+            "id": "msg_01a12f84-dc1f-7802-bc44-60cc149e889d",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "<environment_context>\n  <cwd>/tmp/cgw-codex-0162-compaction/workspace</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-10-12</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>/tmp/cgw-codex-0162-compaction/workspace</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>"
+              }
+            ],
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+              "content_item_kinds": [
+                "environments.environment_context"
+              ]
+            }
+          },
+          {
+            "type": "message",
+            "id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "FIRST_REQUEST: Inspect the task."
+              }
+            ],
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+              "create_time": 1791798598.623512,
+              "content_item_kinds": [
+                "user.text"
+              ]
+            }
+          },
+          {
+            "type": "message",
+            "id": "msg_01a12f84-dc1f-7802-bc44-60d033bc7d99",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\nLOCAL_COMPACTION_CHECKPOINT: The first request was completed. Continue the requested task."
+              }
+            ],
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+              "content_item_kinds": [
+                "compaction.summary"
+              ]
+            }
+          }
+        ],
+        "replacement_history_metadata": [
+          {
+            "client_authored": false
+          },
+          {
+            "retained_source": {
+              "id": {
+                "message_id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+                "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+                "role": "user"
+              },
+              "revision": "retained_01a12f84-dbdf-7130-b703-f68b5c215046",
+              "complete": true
+            },
+            "client_authored": false,
+            "user_input_order": 0,
+            "mcp_attribution": {
+              "status": "none"
+            }
+          },
+          {
+            "client_authored": false,
+            "mcp_attribution": {
+              "status": "none"
+            }
+          }
+        ],
+        "retained_context": {
+          "verified_answers": [],
+          "incomplete": false,
+          "user_messages": [
+            {
+              "revision": "retained_01a12f84-dbdf-7130-b703-f68b5c215046",
+              "order": 0,
+              "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+              "message_id": "msg_01a12f84-dbdf-7130-b703-f66cebbb1eff",
+              "text": "FIRST_REQUEST: Inspect the task.",
+              "complete": true
+            }
+          ],
+          "user_messages_incomplete": false,
+          "assistant_messages": [
+            {
+              "revision": "retained_01a12f84-dbfa-72e0-ad57-b964fafd0a32",
+              "order": 1,
+              "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+              "message_id": "msg_f823c2923919453dbfa64a4a5b926e40",
+              "text": "Task completed.",
+              "complete": true,
+              "phase": "final_answer"
+            }
+          ],
+          "assistant_messages_incomplete": false,
+          "next_order": 2
+        },
+        "window_number": 1,
+        "first_window_id": "01a12f84-dbc3-7680-aa42-f5fd9f1173e1",
+        "previous_window_id": "01a12f84-dbc3-7680-aa42-f5fd9f1173e1",
+        "window_id": "01a12f84-dc1f-7802-bc44-608bb46b2db9",
+        "compaction_response_id": "resp_30e6314370d1426983102932cdc5213a",
+        "latest_token_usage_record": {
+          "thread_id": "01a12f84-dbc1-7450-aafe-681e8329b10a",
+          "turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+          "session_id": "01a12f84-dbc1-7450-aafe-681e8329b10a",
+          "root_turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+          "response_id": "resp_30e6314370d1426983102932cdc5213a",
+          "usage": {
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 15
+          },
+          "turn_token_usage": {
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 15
+          },
+          "thread_token_usage": {
+            "input_tokens": 20,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 30
+          }
+        },
+        "resume_metadata": {
+          "multi_agent_version": "v1",
+          "last_started_turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+          "turn_attribution": {
+            "turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f",
+            "turn_trigger": null,
+            "parent_turn_id": null,
+            "initiating_agent_path": null,
+            "root_turn_id": "01a12f84-dbd2-7782-bde3-0db13de0be7f"
+          },
+          "previous_turn_settings": {
+            "model": "chatgpt-web/high",
+            "comp_hash": null,
+            "realtime_active": false
+          }
+        }
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.687Z",
+      "ordinal": 20,
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+        "root_turn_id": "01a12f84-dc0f-76b1-a035-d66ab3a1a65e",
+        "disabled_plugin_ids": [],
+        "cwd": "/tmp/cgw-codex-0162-compaction/workspace",
+        "approval_policy": "never",
+        "approvals_reviewer": "user",
+        "sandbox_policy": {
+          "type": "read-only"
+        },
+        "permission_profile": {
+          "type": "managed",
+          "file_system": {
+            "type": "restricted",
+            "entries": [
+              {
+                "path": {
+                  "type": "special",
+                  "value": {
+                    "kind": "root"
+                  }
+                },
+                "access": "read"
+              }
+            ]
+          },
+          "network": "restricted"
+        },
+        "model": "chatgpt-web/high",
+        "collaboration_mode": {
+          "mode": "default",
+          "settings": {
+            "model": "chatgpt-web/high",
+            "reasoning_effort": null,
+            "developer_instructions": null
+          }
+        },
+        "multi_agent_version": "v1",
+        "realtime_active": false,
+        "summary": "none"
+      }
+    },
+    {
+      "timestamp": "2026-10-12T09:49:58.714Z",
+      "ordinal": 25,
+      "type": "event_msg",
+      "payload": {
+        "type": "task_started",
+        "turn_id": "01a12f84-dc38-73e0-a385-2432e6703f54",
+        "root_turn_id": "01a12f84-dc38-73e0-a385-2432e6703f54",
+        "started_at": 1791798598,
+        "model_context_window": 80100,
+        "collaboration_mode_kind": "default"
+      }
+    }
+  ]
+}

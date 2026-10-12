@@ -647,6 +647,37 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("background tabs retain the measured browser pane size across selection and window visibility", () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    boundsReady: true,
+    bounds: { x: 280, y: 64, width: 710, height: 568 },
+    window: { getContentSize: () => [1120, 720] },
+  });
+  const hidden = host.hiddenTurnBounds();
+  assert.deepEqual(hidden, { x: 1121, y: 721, width: 710, height: 568 });
+  assert.ok(hidden.x > 1120 && hidden.y > 720, "the pane remains entirely offscreen");
+  const sizes = [];
+  const tab = {
+    status: "running", rendererReady: true, deviceEmulationDirty: true,
+    view: {
+      setBounds: ({ width, height }) => sizes.push([width, height]),
+      setVisible() {},
+      webContents: {
+        enableDeviceEmulation: ({ viewSize }) => sizes.push([viewSize.width, viewSize.height]),
+        disableDeviceEmulation() {},
+      },
+    },
+  };
+  host.presentTurnView(tab, false);
+  host.presentTurnView(tab, true);
+  host.presentTurnView(tab, false);
+  assert.ok(sizes.every(([width, height]) => width === 710 && height === 568));
+  // A real pane resize still updates every background renderer.
+  host.bounds = { ...host.bounds, width: 900, height: 640 };
+  host.presentTurnView(tab, false);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 900, height: 640 });
+});
+
 test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
   const calls = [];
   let size = [1120, 720];
@@ -724,23 +755,23 @@ test("turn tabs use the hidden viewport when the launcher window is hidden", () 
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["emulate", {
       screenPosition: "desktop",
-      screenSize: { width: 1120, height: 720 },
+      screenSize: { width: 840, height: 656 },
       viewPosition: { x: 0, y: 0 },
       deviceScaleFactor: 0,
-      viewSize: { width: 1120, height: 720 },
+      viewSize: { width: 840, height: 656 },
       scale: 1,
     }],
-    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["visible", true],
   ]);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
 });
 
-test("new turn tabs defer device emulation until their renderer finishes loading", () => {
+test("new turn tabs defer device emulation until their document is ready", () => {
   const events = [];
   const tab = {
     id: "tab-loading-viewport",
@@ -752,8 +783,8 @@ test("new turn tabs defer device emulation until their renderer finishes loading
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
       webContents: {
-        enableDeviceEmulation: () => assert.fail("emulation started before did-finish-load"),
-        disableDeviceEmulation: () => assert.fail("emulation cleared before did-finish-load"),
+        enableDeviceEmulation: () => assert.fail("emulation started before dom-ready"),
+        disableDeviceEmulation: () => assert.fail("emulation cleared before dom-ready"),
       },
     },
   };
@@ -775,14 +806,59 @@ test("new turn tabs defer device emulation until their renderer finishes loading
   assert.equal(tab.deviceEmulationDirty, true);
 });
 
-test("visible turn tabs establish native bounds before clearing background emulation", () => {
+test("navigation restores the task viewport at DOM readiness without completing bootstrap early", async () => {
+  const emulations = [];
+  let ownershipMarks = 0;
+  const contents = Object.assign(new EventEmitter(), {
+    setWindowOpenHandler() {}, getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    enableDeviceEmulation: options => emulations.push(options.viewSize),
+  });
+  const tab = {
+    id: "navigating", status: "running", rendererReady: false,
+    bootstrapReady: false, deviceEmulationDirty: true,
+    view: { webContents: contents, setBounds() {}, setVisible() {} },
+  };
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]), selectedTabId: "home",
+    boundsReady: true, bounds: { x: 280, y: 64, width: 840, height: 656 },
+    window: { getContentSize: () => [1120, 760], isVisible: () => false, isMinimized: () => false },
+    view: { setBounds() {}, setVisible() {} },
+    snapshot() { return {}; }, markTurnTabSurface: async () => { ownershipMarks++; },
+  });
+  host.bindTurnContents(tab);
+  contents.emit("did-start-navigation", {}, contents.getURL(), false, true);
+  host.syncViewVisibility();
+  assert.equal(emulations.length, 0);
+  contents.emit("dom-ready");
+  assert.deepEqual(emulations, [{ width: 840, height: 656 }]);
+  assert.equal(tab.loading, true);
+  assert.equal(tab.bootstrapReady, false);
+  assert.equal(ownershipMarks, 0);
+  contents.emit("did-start-navigation", {}, contents.getURL(), true, true);
+  contents.emit("did-start-navigation", {}, "https://example.com/iframe", false, false);
+  assert.equal(tab.rendererReady, true, "hash and iframe navigation must not invalidate the viewport");
+  contents.emit("did-finish-load");
+  await Promise.resolve();
+  assert.equal(tab.loading, false);
+  assert.equal(tab.bootstrapReady, true);
+  assert.equal(ownershipMarks, 1);
+  assert.equal(emulations.length, 1, "finishing resource loads must not resize the document again");
+  contents.emit("did-start-navigation", {}, contents.getURL(), false, true);
+  host.syncViewVisibility();
+  assert.equal(tab.rendererReady, false);
+  assert.equal(emulations.length, 1);
+  contents.emit("dom-ready");
+  assert.equal(emulations.length, 2, "each new document needs its viewport restored");
+});
+
+test("visible turn tabs keep the explicit viewport across background transitions", () => {
   const events = [];
   const tab = {
     id: "tab-visible-viewport",
     status: "running",
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
-    deviceEmulationDirty: true,
+    deviceEmulationViewport: { width: 840, height: 656 },
+    deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
@@ -814,13 +890,12 @@ test("visible turn tabs establish native bounds before clearing background emula
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["bounds", { x: 280, y: 64, width: 840, height: 656 }],
-    ["disable-emulation"],
     ["visible", true],
   ]);
-  assert.equal(tab.deviceEmulationViewport, null);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -1356,6 +1431,65 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
   finishRefresh();
   await login;
   assert.deepEqual(calls, ["ChatGPT login", "probe", "inspect"]);
+});
+
+test("choosing passkey during embedded sign-in switches the owned operation instead of swallowing the click", async () => {
+  let finishCapture, opened;
+  const capture = new Promise(resolve => { finishCapture = resolve; });
+  const ready = new Promise(resolve => { opened = resolve; });
+  let captures = 0;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, manualOperation: null, loginOperation: null,
+    turnTabs: new Map(), ready: async () => {}, activateHomeSurface() {}, show() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {},
+      getURL: () => "https://chatgpt.com/?temporary-chat=true" } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    probeAuthentication: async () => ({ authenticated: false }),
+    loginWithPasskey: async onProgress => {
+      captures++;
+      onProgress("waiting");
+      opened();
+      await capture;
+      return { storageState: {} };
+    },
+    installPasskeyLogin: async () => { fixture.setState({ authenticated: true, status: "ready" }); },
+  });
+  const embedded = fixture.openLogin();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.manualOperation, "ChatGPT login");
+  const passkey = fixture.openPasskeyLogin();
+  assert.equal(passkey, embedded);
+  await ready;
+  assert.equal(captures, 1);
+  assert.equal(fixture.manualOperation, "ChatGPT passkey login");
+  assert.equal(fixture.state.passkeyPhase, "waiting");
+  assert.equal(fixture.openPasskeyLogin(), passkey);
+  finishCapture();
+  const result = await passkey;
+  assert.equal(result.authenticated, true);
+  assert.equal(result.passkeyPhase, null);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
+  assert.equal(fixture.loginMode, null);
+});
+
+test("failed passkey launch clears its progress and releases the browser operation", async () => {
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, turnTabs: new Map(),
+    ready: async () => {}, activateHomeSurface() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    loginWithPasskey: async () => { throw new Error("Chrome could not start"); },
+  });
+  await assert.rejects(fixture.openPasskeyLogin(), /Chrome could not start/);
+  assert.equal(fixture.state.passkeyPhase, null);
+  assert.equal(fixture.state.loading, false);
+  assert.equal(fixture.state.status, "error");
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
 });
 
 test("passkey login imports only validated state and re-proves the Launcher session", async () => {
@@ -2034,7 +2168,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
     status: "running",
     lastHeartbeatAt: 1,
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
+    deviceEmulationViewport: { width: 840, height: 656 },
     deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
@@ -2069,7 +2203,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
   BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, tab.helperPid, true);
 
   assert.equal(events.filter(([kind]) => kind === "emulate").length, 1);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -3055,13 +3189,18 @@ test("a completed connector turn without binding is released instead of retained
   assert.equal(closed, true);
 });
 
-test("failed and aborted browser turns release their tab slots", async () => {
-  for (const status of ["failed", "aborted"]) {
+test("aborted, uninitialized and signed-out browser turns release their tab slots", async () => {
+  for (const [status, bootstrapReady, authenticationRequired] of [
+    ["aborted", true, false], ["failed", false, false], ["failed", true, true],
+  ]) {
     let closed = false;
     const tab = {
       id: `tab-${status}`,
       traceId: `trace_${status}`,
       helperPid: 777,
+      interactionMode: "automatic",
+      bootstrapReady,
+      authenticationRequired,
       status: "running",
       loading: true,
       view: { webContents: {
@@ -3098,6 +3237,124 @@ test("failed and aborted browser turns release their tab slots", async () => {
     assert.equal(tab.status, status === "aborted" ? "aborted" : "error");
     assert.equal(closed, true);
   }
+});
+
+function failedAutomaticTurnFixture() {
+  const closed = [];
+  let destroyed = false;
+  const tab = {
+    id: "failed-tab", traceId: "failed-trace", helperPid: 777,
+    status: "running", interactionMode: "automatic", bootstrapReady: true,
+    conversationKey: "f".repeat(64), connectorIdentity: "Codex Native2", connectorBound: true,
+    approvalPending: true, turnProgress: { stage: "chatgpt", activeToolCalls: 0 },
+    view: { webContents: {
+      isDestroyed: () => destroyed, setBackgroundThrottling() {},
+      close() { closed.push(tab.id); destroyed = true; },
+    } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]), userCancelledTurnOwners: new Map(), closedTurnOwners: new Map(),
+    selectedTabId: tab.id, manualOperation: null,
+    window: { contentView: { removeChildView() {} } },
+    syncViewVisibility() {}, writeDescriptor() {}, publishState() {}, snapshot: () => ({ tabs: [] }),
+    hide() { throw new Error("do not hide the failed page the user is inspecting"); },
+    logger: { info() {} },
+    createTurnTab: async (traceId, helperPid, conversationKey, connectorIdentity) => {
+      const fresh = { id: "fresh-tab", surfaceId: "fresh-surface", traceId, helperPid,
+        conversationKey, connectorIdentity, status: "running", interactionMode: "automatic" };
+      fixture.turnTabs.set(fresh.id, fresh);
+      return fresh;
+    },
+  });
+  return { fixture, tab, closed };
+}
+
+test("failed ChatGPT pages remain inspectable but lose turn ownership and cannot become successful", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  assert.deepEqual(await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true, "Check the ChatGPT tab"),
+    { cancelledByUser: false });
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(fixture.selectedTabId, tab.id);
+  assert.equal(tab.status, "error");
+  assert.equal(tab.message, "Check the ChatGPT tab");
+  assert.equal(tab.approvalPending, false);
+  assert.equal(tab.turnProgress, undefined);
+  assert.equal(tab.connectorBound, false);
+  assert.equal(fixture.activeTraceId, null);
+  assert.throws(() => fixture.heartbeatTurn(tab.traceId, tab.helperPid), /no longer running/);
+  assert.throws(() => fixture.setTurnApprovalPending(tab.traceId, tab.helperPid, true), /no longer running/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, 778, "failed", true), /helper ownership mismatch/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, tab.helperPid, "completed", true, undefined, true, true),
+    /already failed/);
+  const failedAt = tab.failedAt;
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true);
+  assert.equal(tab.failedAt, failedAt, "repeated end notifications cannot extend retention");
+  assert.deepEqual(closed, []);
+
+  fixture.lastTurnSweepAt = failedAt + 30 * 60_000 - 2;
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000 - 1);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "helper liveness is irrelevant to a terminal page");
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.size, 0);
+});
+
+test("failed pages cannot supply retained history and a same-trace retry gets a fresh document", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  for (const traceId of [tab.traceId, "next-trace"]) {
+    await assert.rejects(() => fixture.beginTurn(traceId, false, 778, tab.conversationKey, tab.connectorIdentity, true),
+      error => error.code === "retained_conversation_unavailable");
+  }
+  assert.deepEqual(closed, []);
+  const next = await fixture.beginTurn("next-trace", false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(next.reused, false);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "another turn does not immediately erase failure evidence");
+  fixture.turnTabs.delete(next.tabId);
+  const retry = await fixture.beginTurn(tab.traceId, false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(retry.reused, false);
+  assert.notEqual(retry.tabId, tab.id);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal([...fixture.turnTabs.values()].filter(item => item.traceId === tab.traceId).length, 1);
+});
+
+test("failed pages free capacity before reusable conversations without evicting active error states", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  const reusable = { id: "reusable", status: "ready", lastHeartbeatAt: 1 };
+  const activeError = { id: "active-error", status: "error", interactionMode: "automatic", lastHeartbeatAt: 1 };
+  fixture.turnTabs.set(reusable.id, reusable);
+  fixture.turnTabs.set(activeError.id, activeError);
+  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.get(reusable.id), reusable);
+  assert.equal(fixture.turnTabs.get(activeError.id), activeError);
+});
+
+test("a failed continuity page keeps its physical recovery identity until destruction completes", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  const recovery = { schemaVersion: 2, installationId: "a".repeat(64), threadKey: "b".repeat(64),
+    epoch: 1, transactionId: "failed-transaction", transactionVersion: 2, logicalWorkId: "failed-work", attempt: 1,
+    snapshotVersion: 2, snapshotDigest: "e".repeat(64), ownerProcess: { pid: process.pid, startIdentity: "test-owner" } };
+  tab.continuityOwner = "f".repeat(64);
+  tab.continuityRecovery = recovery;
+  const record = { identity: structuredClone(recovery), state: "send-possible", tabId: tab.id };
+  fixture.continuityTransactions = new Map([[`${recovery.installationId}:${recovery.threadKey}`, record]]);
+  let destroyed = false;
+  const contents = Object.assign(new EventEmitter(), {
+    isDestroyed: () => destroyed, setBackgroundThrottling() {}, close: () => closed.push(tab.id),
+  });
+  tab.view.webContents = contents;
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  assert.equal(fixture.evictOldestReclaimableTurnTab(), false, "a close request does not free a physical slot");
+  assert.deepEqual(closed, [tab.id]);
+  assert.deepEqual(fixture.closingTurnTabs.get(contents).continuityRecovery, recovery);
+  assert.equal(record.writerRetired, false);
+  tab.continuityRecovery.snapshotVersion++;
+  destroyed = true;
+  contents.emit("destroyed");
+  assert.equal(fixture.closingTurnTabs.size, 0);
+  assert.equal(record.writerRetired, true, "destruction belongs to the frozen recovery identity");
 });
 
 function manualTurnFixture() {
@@ -3829,7 +4086,7 @@ test("manual hidden tabs use native view placement without DOM or device-emulati
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     bounds: { x: 1, y: 2, width: 640, height: 480 },
     hiddenTurnBounds: () => ({ x: 1000, y: 1000, width: 800, height: 600 }),
-    enableHiddenTurnViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
+    enableBrowserViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
   });
   const tab = {
     interactionMode: "manual",

@@ -20,7 +20,7 @@ import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-
 import { ChatGptBrowserWorker, closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
 import { responseRequest, compactRequest } from "../src/server";
-import { decodeWebContextPayload, type WebContextFormat, type WebContextRecord } from "../src/adapters/chatgpt-web/context-renderer";
+import { decodeWebContextPayload, isWebContextRawTextEligible, type WebContextFormat, type WebContextRecord } from "../src/adapters/chatgpt-web/context-renderer";
 import type { CompiledChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 
 export const LIVE_CASES = ["web-records", "mcp-partial", "mcp-pagination"] as const;
@@ -334,6 +334,7 @@ export function inspectLiveWebPayload(fixture: LiveFixture, prepared: Pick<Compi
   requestedFormat: WebContextFormat) {
   if (!prepared.contextPayload || prepared.contextFormat !== requestedFormat) throw new Error("网页验收未取得请求格式的实际编译包");
   const payload = prepared.contextPayload;
+  if (payload.includes("`")) throw new Error("网页包保留了会进入 Markdown 正则的未转义反引号");
   const decoded = decodeWebContextPayload(payload, requestedFormat);
   const rawPaths = new Set<string>();
   if (requestedFormat === "codex-context-text-v1") {
@@ -359,7 +360,9 @@ export function inspectLiveWebPayload(fixture: LiveFixture, prepared: Pick<Compi
     if (matches.length !== 1) throw new Error(`网页包没有唯一的原 user 字段：${source.id}`);
     const field = matches[0]!;
     const representation = rawPaths.has(JSON.stringify([field.recordIndex, field.path])) ? "raw" : "json";
-    const expected = requestedFormat === "codex-context-text-v1" && source.id === "code-links-fences" ? "raw" : "json";
+    // These fixed, large fixture fields repay raw framing only when their exact bytes are
+    // eligible. Backticks and unqualified whitespace require lossless escaped JSON.
+    const expected = requestedFormat === "codex-context-text-v1" && isWebContextRawTextEligible(source.text) ? "raw" : "json";
     if (representation !== expected) throw new Error(`网页字段表示不符合本次验收：${source.id}`);
     return { fixtureId: source.id, ...field, representation, exactSourceBytes: true, sourceBytes: Buffer.byteLength(source.text), sourceDigest: hash(source.text) };
   });

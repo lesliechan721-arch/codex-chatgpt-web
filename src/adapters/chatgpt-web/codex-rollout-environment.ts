@@ -22,6 +22,7 @@ import type {
   ChatGptTurnEnvironment,
   ChatGptTurnUserRevision,
   ChatGptUnattributedEnvironmentMessage,
+  ChatGptNativeCompactionPhase,
 } from "./environment";
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
@@ -245,11 +246,51 @@ function latestRolloutRecord(
   return matches(item) ? item : undefined;
 }
 
-/** Wire history can omit turn metadata, but an exact native message can prove its source turn. */
-function authenticatesCompactionSource(
+interface LocatedRolloutRecord {
+  item: Record<string, unknown>;
+  order: number;
+  activeTurn: unknown;
+}
+
+function visitRolloutRecords(fd: number, size: number, visit: (entry: LocatedRolloutRecord) => void): void {
+  let activeTurn: unknown;
+  let position = 0;
+  let order = 0;
+  let carry = Buffer.alloc(0);
+  while (position < size) {
+    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
+    const chunk = Buffer.alloc(length);
+    if (readSync(fd, chunk, 0, length, position) !== length) throw new Error("Codex rollout changed during provenance lookup");
+    position += length;
+    const data = Buffer.concat([carry, chunk]);
+    let start = 0;
+    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
+      const line = data.subarray(start, end);
+      start = end + 1;
+      if (!line.length) continue;
+      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+      const item = parseJsonLine(line);
+      const payload = record(item.payload);
+      if (item.type === "event_msg" && payload?.type === "task_started") activeTurn = payload.turn_id;
+      visit({ item, order: order++, activeTurn });
+    }
+    carry = Buffer.from(data.subarray(start));
+    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+  }
+  // Partial records are never provenance evidence.
+}
+
+interface NativeCompactionSourceProof {
+  sourceTurnId: string;
+  environmentTurnId: string;
+}
+
+/** Retained human ownership and the latest permission turn can differ only in a proved checkpoint. */
+function authenticateCompactionSource(
   fd: number, size: number, source: ChatGptTurnUserRevision | undefined, latestTurnId: unknown,
-): boolean {
-  if (!source?.itemId || typeof latestTurnId !== "string") return false;
+  currentTurnId?: string, phase?: ChatGptNativeCompactionPhase,
+): NativeCompactionSourceProof | undefined {
+  if (!source?.itemId || typeof latestTurnId !== "string") return undefined;
   // Local compaction re-ids retained human messages. Only the latest replacement history is
   // current; neither guardian_history nor a message removed by a later compact is proof.
   const item = latestRolloutRecord(fd, size, item => item.type === "compacted"
@@ -259,9 +300,70 @@ function authenticatesCompactionSource(
     ? replacement.map(record).filter(message => message?.id === source.itemId) : [];
   const payload = item?.type === "compacted"
     ? matches.length === 1 ? matches[0] : undefined : record(item?.payload);
-  return payload?.type === "message" && payload.role === "user"
+  if (payload?.type === "message" && payload.role === "user"
     && record(payload.internal_chat_message_metadata_passthrough)?.turn_id === latestTurnId
-    && isDeepStrictEqual(payload.content, source.content);
+    && (source.turnId === undefined || source.turnId === latestTurnId)
+    && isDeepStrictEqual(payload.content, source.content)
+    && (item?.type !== "compacted" || record(record(item.payload)?.resume_metadata)?.last_started_turn_id === undefined)) {
+    if (phase && currentTurnId) {
+      const originals: LocatedRolloutRecord[] = [];
+      let boundary: LocatedRolloutRecord | undefined;
+      visitRolloutRecords(fd, size, entry => {
+        const value = record(entry.item.payload);
+        if (entry.item.type === "response_item" && value?.id === source.itemId) originals.push(entry);
+        if (entry.item.type === "event_msg" && value?.type === "task_started" && value.turn_id === currentTurnId) boundary = entry;
+      });
+      const original = originals[0];
+      const kinds = record(payload.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+      if (originals.length !== 1 || !original || original.activeTurn !== latestTurnId || !boundary
+        || (currentTurnId !== latestTurnId && original.order >= boundary.order)
+        || !Array.isArray(kinds) || !kinds.includes("user.text")
+        || kinds.some(kind => typeof kind !== "string" || !kind.startsWith("user."))) return undefined;
+    }
+    return { sourceTurnId: latestTurnId, environmentTurnId: latestTurnId };
+  }
+  if (!phase || !currentTurnId || item?.type !== "compacted" || matches.length !== 1 || !payload) return undefined;
+  const checkpoint = record(item.payload);
+  const provenance = record(payload.internal_chat_message_metadata_passthrough);
+  const sourceTurnId = provenance?.turn_id;
+  const kinds = provenance?.content_item_kinds;
+  if (payload.type !== "message" || payload.role !== "user" || typeof sourceTurnId !== "string"
+    || (source.turnId !== undefined && source.turnId !== sourceTurnId)
+    || !isDeepStrictEqual(payload.content, source.content) || !Array.isArray(kinds)
+    || !kinds.includes("user.text") || kinds.some(kind => typeof kind !== "string" || !kind.startsWith("user."))
+    || !Array.isArray(payload.content) || kinds.length !== payload.content.length
+    || record(checkpoint?.resume_metadata)?.last_started_turn_id !== latestTurnId) return undefined;
+  const metadata = checkpoint?.replacement_history_metadata;
+  const sourceIndex = Array.isArray(replacement) ? replacement.findIndex(message => record(message)?.id === source.itemId) : -1;
+  const retained = Array.isArray(metadata) && Array.isArray(replacement) && metadata.length === replacement.length
+    ? record(record(metadata[sourceIndex])?.retained_source) : undefined;
+  const retainedId = record(retained?.id);
+  if (retained?.complete !== true || retainedId?.message_id !== source.itemId
+    || retainedId.turn_id !== sourceTurnId || retainedId.role !== "user") return undefined;
+
+  let checkpointLocation: LocatedRolloutRecord | undefined;
+  let contextLocation: LocatedRolloutRecord | undefined;
+  let boundary: LocatedRolloutRecord | undefined;
+  const originals: LocatedRolloutRecord[] = [];
+  visitRolloutRecords(fd, size, entry => {
+    const value = record(entry.item.payload);
+    if (entry.item.type === "compacted") checkpointLocation = entry;
+    if (entry.item.type === "turn_context") contextLocation = entry;
+    if (entry.item.type === "event_msg" && value?.type === "task_started" && value.turn_id === currentTurnId) boundary = entry;
+    if (entry.item.type === "response_item" && value?.id === source.itemId) originals.push(entry);
+  });
+  if (!checkpointLocation || !contextLocation || !boundary
+    || checkpointLocation.activeTurn !== latestTurnId || boundary.activeTurn !== currentTurnId
+    || !(checkpointLocation.order < contextLocation.order && contextLocation.order < boundary.order)
+    || record(contextLocation.item.payload)?.turn_id !== latestTurnId || originals.length !== 1) return undefined;
+  const originalLocation = originals[0]!;
+  const original = record(originalLocation.item.payload)!;
+  const originalProvenance = record(original.internal_chat_message_metadata_passthrough);
+  if (originalLocation.order >= checkpointLocation.order || originalLocation.activeTurn !== sourceTurnId
+    || original.type !== "message" || original.role !== "user" || originalProvenance?.turn_id !== sourceTurnId
+    || !isDeepStrictEqual(originalProvenance.content_item_kinds, kinds)
+    || !isDeepStrictEqual(original.content, source.content)) return undefined;
+  return { sourceTurnId, environmentTurnId: latestTurnId };
 }
 
 interface NativeUserMessageIdentity {
@@ -331,6 +433,7 @@ function originalResponseItemIds(
 export interface ResolvedCodexRolloutMessageIdentity {
   aliases?: Record<string, string>;
   turnId: string;
+  environmentTurnId?: string;
 }
 
 export function resolveCurrentCodexRolloutMessageIdAliases(options: {
@@ -340,6 +443,8 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
   turnId: string;
   revisions: readonly ChatGptTurnUserRevision[];
   compactionSource?: ChatGptTurnUserRevision;
+  compactionTurnId?: string;
+  compactionPhase?: ChatGptNativeCompactionPhase;
 }): ResolvedCodexRolloutMessageIdentity | undefined {
   const requested = options.revisions.filter((revision): revision is ChatGptTurnUserRevision & { itemId: string } => (
     typeof revision.itemId === "string" && revision.itemId.length > 0
@@ -365,11 +470,13 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
         if (!Number.isSafeInteger(size) || size <= 0) continue;
         validateSessionMeta(firstRolloutRecord(fd, size), options.lineage);
         const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
-        const aliasTurnId = latest?.turn_id === options.turnId
-          ? options.turnId
-          : authenticatesCompactionSource(fd, size, options.compactionSource, latest?.turn_id)
-            ? latest?.turn_id
-            : undefined;
+        const sourceProof = authenticateCompactionSource(fd, size, options.compactionSource, latest?.turn_id,
+          options.compactionTurnId, options.compactionPhase);
+        // A wire source owner is a constraint on native proof. Even when it names the latest
+        // permission turn, it cannot establish the retained human's execution identity.
+        const aliasTurnId = options.compactionSource
+          ? sourceProof?.sourceTurnId
+          : latest?.turn_id === options.turnId ? options.turnId : undefined;
         if (typeof aliasTurnId !== "string") continue;
         const compacted = latestRolloutRecord(fd, size, item => item.type === "compacted");
         const replacementHistory = record(compacted?.payload)?.replacement_history;
@@ -396,6 +503,7 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
         if (options.compactionSource || Object.keys(aliases).length > 0) {
           recovered.push({
             turnId: aliasTurnId,
+            ...(sourceProof ? { environmentTurnId: sourceProof.environmentTurnId } : {}),
             ...(Object.keys(aliases).length > 0 ? { aliases } : {}),
           });
         }
@@ -412,55 +520,123 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
   }
 }
 
-function verifyHistoricalEnvironmentMessages(
-  fd: number,
-  size: number,
-  turnId: string,
-  messages: ChatGptUnattributedEnvironmentMessage[],
+interface NativeEnvironmentEvidence {
+  payload: Record<string, unknown>;
+  location: LocatedRolloutRecord;
+  boundary: LocatedRolloutRecord;
+  checkpoint: boolean;
+}
+
+function isNativeEnvironmentMessage(payload: Record<string, unknown>): boolean {
+  const kinds = record(payload.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  const content = payload.content;
+  if (payload.type !== "message" || payload.role !== "user" || !Array.isArray(kinds) || !Array.isArray(content)
+    || kinds.length !== content.length || kinds.filter(kind => kind === "environments.environment_context").length !== 1) return false;
+  const index = kinds.indexOf("environments.environment_context");
+  return /^<environment_context>[\s\S]*<\/environment_context>$/.test(String(record(content[index])?.text ?? "").trim());
+}
+
+/** A latest replacement overrides earlier records, including records with the same message id. */
+function nativeEnvironmentEvidence(
+  fd: number, size: number, turnId: string, message: ChatGptUnattributedEnvironmentMessage,
+): NativeEnvironmentEvidence | undefined {
+  let boundary: LocatedRolloutRecord | undefined;
+  let checkpoint: LocatedRolloutRecord | undefined;
+  const responses: LocatedRolloutRecord[] = [];
+  let checkpointContext: LocatedRolloutRecord | undefined;
+  visitRolloutRecords(fd, size, entry => {
+    const payload = record(entry.item.payload);
+    if (!boundary && entry.item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) boundary = entry;
+    if (entry.item.type === "compacted") {
+      checkpoint = entry;
+      checkpointContext = undefined;
+    }
+    if (entry.item.type === "turn_context" && checkpoint
+      && payload?.turn_id === record(record(checkpoint.item.payload)?.resume_metadata)?.last_started_turn_id) checkpointContext = entry;
+    if (entry.item.type === "response_item" && payload?.id === message.id) responses.push(entry);
+  });
+  if (!boundary) return undefined;
+  if (checkpoint) {
+    const payload = record(checkpoint.item.payload);
+    const replacement = payload?.replacement_history;
+    const candidates = Array.isArray(replacement) ? replacement.map(record).filter(item => item?.id === message.id) : [];
+    if (candidates.length > 1) return undefined;
+    if (candidates.length === 1) {
+      const candidate = candidates[0]!;
+      const owner = record(candidate.internal_chat_message_metadata_passthrough)?.turn_id;
+      const checkpointTurn = record(payload?.resume_metadata)?.last_started_turn_id;
+      if (!isNativeEnvironmentMessage(candidate) || typeof owner !== "string" || owner !== checkpointTurn
+        || checkpoint.activeTurn !== owner || !checkpointContext) return undefined;
+      return { payload: candidate, location: checkpoint, boundary, checkpoint: true };
+    }
+  }
+  // A removed checkpoint item cannot be revived by an earlier independent message. A newer
+  // native message remains part of the active suffix, subject to the usual task boundary.
+  const candidates = checkpoint ? responses.filter(entry => entry.order > checkpoint!.order) : responses;
+  if (candidates.length !== 1) return undefined;
+  const location = candidates[0]!;
+  const payload = record(location.item.payload);
+  return payload ? { payload, location, boundary, checkpoint: false } : undefined;
+}
+
+/** The wire omits ownership; only the exact native current message can supply that proof. */
+function verifyCurrentEnvironmentMessage(
+  fd: number, size: number, turnId: string, message: ChatGptUnattributedEnvironmentMessage,
 ): void {
-  const pending = new Map(messages.map(message => [message.id, message.content]));
-  if (pending.size !== messages.length) {
+  const proof = nativeEnvironmentEvidence(fd, size, turnId, message);
+  const owner = record(proof?.payload.internal_chat_message_metadata_passthrough)?.turn_id;
+  if (!proof || proof.location.order <= proof.boundary.order || proof.location.activeTurn !== turnId
+    || owner !== turnId || !isNativeEnvironmentMessage(proof.payload)) {
+    throw new TrustedCodexEnvironmentValidationError("Codex rollout does not authenticate the current environment message");
+  }
+  if (!isDeepStrictEqual(proof.payload.content, message.content)) {
+    throw new TrustedCodexEnvironmentValidationError("Current environment message differs from its native Codex record");
+  }
+  const provenance = record(proof.payload.internal_chat_message_metadata_passthrough);
+  if ((message.turnId !== undefined && provenance?.turn_id !== message.turnId)
+    || (message.contentItemKinds !== undefined && !isDeepStrictEqual(provenance?.content_item_kinds, message.contentItemKinds))) {
+    throw new TrustedCodexEnvironmentValidationError("Current environment provenance differs from its native Codex record");
+  }
+}
+
+function verifyHistoricalEnvironmentMessages(
+  fd: number, size: number, turnId: string, messages: ChatGptUnattributedEnvironmentMessage[], nativeCompaction = false,
+): ChatGptUnattributedEnvironmentMessage[] {
+  if (new Set(messages.map(message => message.id)).size !== messages.length) {
     throw new TrustedCodexEnvironmentValidationError("Codex environment history repeats a message id");
   }
-  let position = 0;
-  let carry = Buffer.alloc(0);
-  while (position < size) {
-    const length = Math.min(ROLLOUT_READ_CHUNK_BYTES, size - position);
-    const chunk = Buffer.alloc(length);
-    if (readSync(fd, chunk, 0, length, position) !== length) {
-      throw new Error("Codex rollout changed during environment history lookup");
+  const current: ChatGptUnattributedEnvironmentMessage[] = [];
+  for (const message of messages) {
+    const proof = nativeEnvironmentEvidence(fd, size, turnId, message);
+    if (!proof) {
+      let hasBoundary = false;
+      visitRolloutRecords(fd, size, ({ item }) => {
+        const payload = record(item.payload);
+        if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) hasBoundary = true;
+      });
+      if (!hasBoundary) throw new Error("Codex rollout has no current task boundary for environment history");
+      throw new TrustedCodexEnvironmentValidationError("Codex rollout does not authenticate the historical environment messages");
     }
-    position += length;
-    const data = Buffer.concat([carry, chunk]);
-    let start = 0;
-    for (let end = data.indexOf(0x0a); end >= 0; end = data.indexOf(0x0a, start)) {
-      const line = data.subarray(start, end);
-      start = end + 1;
-      if (!line.length) continue;
-      if (line.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
-      const item = parseJsonLine(line);
-      const payload = record(item.payload);
-      // Core writes task_started before this turn's environment update. Merely finding matching
-      // XML somewhere in the file would also accept a current update as historical.
-      if (item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) {
-        if (pending.size === 0) return;
-        throw new TrustedCodexEnvironmentValidationError(
-          "Codex rollout does not authenticate the historical environment messages",
-        );
-      }
-      if (item.type !== "response_item" || payload?.type !== "message" || payload.role !== "user"
-        || typeof payload.id !== "string" || !pending.has(payload.id)) continue;
-      if (!isDeepStrictEqual(payload.content, pending.get(payload.id))) {
-        throw new TrustedCodexEnvironmentValidationError(
-          "Historical environment message differs from its native Codex record",
-        );
-      }
-      pending.delete(payload.id);
+    if (!isDeepStrictEqual(proof.payload.content, message.content)) {
+      throw new TrustedCodexEnvironmentValidationError("Historical environment message differs from its native Codex record");
     }
-    carry = Buffer.from(data.subarray(start));
-    if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
+    const provenance = record(proof.payload.internal_chat_message_metadata_passthrough);
+    if ((nativeCompaction && !isNativeEnvironmentMessage(proof.payload))
+      || (message.turnId !== undefined && provenance?.turn_id !== message.turnId)
+      || (message.contentItemKinds !== undefined && !isDeepStrictEqual(provenance?.content_item_kinds, message.contentItemKinds))) {
+      throw new TrustedCodexEnvironmentValidationError("Historical environment provenance differs from its native Codex record");
+    }
+    if (proof.location.order > proof.boundary.order) {
+      // Only a native compaction installs a new current environment away from the instruction.
+      // An ordinary current update must still pass the explicit current-message proof above.
+      if ((!proof.checkpoint && !nativeCompaction) || proof.location.activeTurn !== turnId
+        || record(proof.payload.internal_chat_message_metadata_passthrough)?.turn_id !== turnId) {
+        throw new TrustedCodexEnvironmentValidationError("Codex rollout does not authenticate the historical environment messages");
+      }
+      current.push(message);
+    }
   }
-  throw new Error("Codex rollout has no current task boundary for environment history");
+  return current;
 }
 
 function validateSessionMeta(
@@ -800,6 +976,9 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   compactionSource?: ChatGptTurnUserRevision;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
+  currentEnvironmentMessage?: ChatGptUnattributedEnvironmentMessage;
+  compactionPhase?: ChatGptNativeCompactionPhase;
+  validateCurrentEnvironmentMessage?: (message: ChatGptUnattributedEnvironmentMessage, environment: ChatGptTurnEnvironment) => void;
   publicationPendingIsTransient?: boolean;
 }): ChatGptTurnEnvironment | undefined {
   const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
@@ -868,8 +1047,19 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         }
         throw new Error("Codex rollout has no complete turn context");
       }
-      if (latest.turn_id !== turnId && (compactionSourceTurnId === undefined || latest.turn_id !== compactionSourceTurnId)
-        && !authenticatesCompactionSource(fd, size, options.compactionSource, latest.turn_id)) {
+      const sourceProof = options.compactionSource
+        ? authenticateCompactionSource(fd, size, options.compactionSource, latest.turn_id, turnId, options.compactionPhase)
+        : undefined;
+      if (options.compactionSource && (!sourceProof
+        || (compactionSourceTurnId !== undefined && sourceProof.sourceTurnId !== compactionSourceTurnId))) {
+        if (options.publicationPendingIsTransient) {
+          throw new CodexRolloutPublicationPendingError("Codex rollout has not authenticated the compaction source yet");
+        }
+        throw new TrustedCodexEnvironmentValidationError("The trusted Codex environment rollout does not authenticate the compaction source");
+      }
+      // Borrowing another turn's permissions requires the exact native human source. A supplied
+      // owner may constrain that proof, but matching the permission owner is never authority.
+      if (latest.turn_id !== turnId && !sourceProof) {
         if (indexed.kind === "found") {
           if (options.publicationPendingIsTransient) {
             throw new CodexRolloutPublicationPendingError(
@@ -883,8 +1073,24 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       }
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
       validateMetadataConsistency(lineage, environment);
+      if (options.currentEnvironmentMessage) {
+        verifyCurrentEnvironmentMessage(fd, size, turnId, options.currentEnvironmentMessage);
+      }
       if (options.historicalEnvironmentMessages) {
-        verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);
+        if (new Set(options.historicalEnvironmentMessages.map(message => message.id)).size
+          !== options.historicalEnvironmentMessages.length) {
+          throw new TrustedCodexEnvironmentValidationError("Codex environment history repeats a message id");
+        }
+        // Exclude only the message whose exact current provenance was proved above. All other
+        // fragments still require native history before this turn's task_started boundary.
+        const current = options.currentEnvironmentMessage;
+        const historical = options.historicalEnvironmentMessages.filter(message => !current
+          || message.id !== current.id || !isDeepStrictEqual(message.content, current.content));
+        if (historical.length > 0) {
+          const currentMessages = verifyHistoricalEnvironmentMessages(fd, size, turnId, historical,
+            Boolean(options.compactionSource && options.compactionPhase));
+          for (const message of currentMessages) options.validateCurrentEnvironmentMessage?.(message, environment);
+        }
       }
       matching.push(environment);
     } finally {

@@ -4,18 +4,46 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
-import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptNativeCompactionPhase, extractChatGptRootThreadMetadata, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import { resolveCurrentCodexRolloutMessageIdAliases } from "../src/adapters/chatgpt-web/codex-rollout-environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { COMPACT_PROMPT, encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
+import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { defaultBrokerEndpoint } from "../src/config";
 import type { CodexParsedRequest, CodexTool } from "../src/types";
 
 const root = resolve(process.cwd());
 // Repeated on-disk SQLite writes can exceed Bun's default budget on Windows CI.
 const SQLITE_TEST_TIMEOUT_MS = 15_000;
 const temporaryRoots: string[] = [];
+
+interface NativeCompactionFixture {
+  request: { input: Array<Record<string, unknown>>; client_metadata: Record<string, string>; [key: string]: unknown };
+  rolloutFilename: string;
+  rolloutRecords: Array<{ type: string; payload: Record<string, unknown> }>;
+}
+
+function nativeCompactionFixture(name: string) {
+  const fixture = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/codex-0162-compaction", `${name}.json`), "utf8")) as NativeCompactionFixture;
+  const codexHome = mkdtempSync(join(tmpdir(), "cgw-native-compaction-env-"));
+  temporaryRoots.push(codexHome);
+  const directory = join(codexHome, "sessions", "2026", "10", "12");
+  mkdirSync(directory, { recursive: true });
+  const path = join(directory, fixture.rolloutFilename);
+  const metadata = JSON.parse(fixture.request.client_metadata["x-codex-turn-metadata"]!);
+  const index = new Database(join(codexHome, "state_5.sqlite"), { create: true });
+  index.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_path TEXT)");
+  index.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
+  index.query("INSERT INTO threads VALUES (?, ?, ?)").run(metadata.thread_id, path, null);
+  index.close();
+  const write = () => writeFileSync(path, fixture.rolloutRecords.map(item => JSON.stringify(item)).join("\n") + "\n");
+  write();
+  const resolveEnvironment = () => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parseRequest(fixture.request));
+  return { fixture, codexHome, metadata, write, resolveEnvironment };
+}
 
 afterEach(() => {
   for (const path of temporaryRoots.splice(0)) rmSync(path, { recursive: true, force: true });
@@ -868,14 +896,25 @@ describe("authenticated full-history compaction environment", () => {
     });
   }
 
-  test("a current trusted environment update takes precedence over the previous source", () => {
+  test("a current trusted environment update requires its network policy before replacing the previous source", () => {
     const { source, compact, body } = fixture();
     const store = new ChatGptThreadEnvironmentStore();
     store.resolve(source);
     const update = currentWire({ sandbox: "read-only", environmentXml: filesystemEnvironmentXml(readOnlyProfileXml) });
     for (const item of (update._rawBody as { input: Array<Record<string, unknown>> }).input) {
+      item.id = `${item.id}_network_update`;
       item.internal_chat_message_metadata_passthrough = { turn_id: "turn_compact" };
       body.input.push(item);
+    }
+    expect(() => store.resolve(compact)).toThrow("missing network access");
+    for (const item of body.input) {
+      const ownership = item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined;
+      if (ownership?.turn_id !== "turn_compact" || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (typeof part.text === "string" && part.text.includes("<environment_context>")) {
+          part.text = part.text.replace("<filesystem>", "<network_access>restricted</network_access><filesystem>");
+        }
+      }
     }
     expect(store.resolve(compact).sandboxPolicy).toEqual({ type: "readOnly", networkAccess: false });
   });
@@ -1236,6 +1275,112 @@ describe("trusted Codex task environment continuity", () => {
     });
   });
 
+  function initialNativeEnvironmentFixture() {
+    const { codexHome, rolloutPath } = resumedRootFixture();
+    const request = currentWire({
+      threadId: rolloutThreadId, sandbox: "read-only",
+      environmentXml: filesystemEnvironmentXml(readOnlyProfileXml),
+    });
+    const body = request._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      request_kind: "turn", thread_id: rolloutThreadId, turn_id: rolloutTurnId,
+      agent_name: "/root", sandbox_mode: "read-only", workspaces: { [root]: {} },
+    });
+    // Codex 0.162 omits per-message provenance on the wire, but writes it in the native rollout.
+    const nativeEnvironment: { type: string; payload: Record<string, unknown> & {
+      internal_chat_message_metadata_passthrough: { turn_id: string; content_item_kinds: string[] };
+    } } = { type: "response_item", payload: {
+      ...structuredClone(body.input[0]!), internal_chat_message_metadata_passthrough: {
+        turn_id: rolloutTurnId,
+        content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+      },
+    } };
+    const boundary = { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } };
+    const context = childTurnContext(rolloutTurnId, {
+      sandbox_policy: { type: "read-only", network_access: true },
+      permission_profile: { type: "managed", network: "enabled", file_system: {
+        type: "restricted", entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }],
+      } },
+    });
+    const session = { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } };
+    const writeRollout = (records: unknown[] = [session, boundary, nativeEnvironment, context]) => {
+      writeFileSync(rolloutPath, records.map(item => JSON.stringify(item)).join("\n") + "\n");
+    };
+    writeRollout();
+    return { codexHome, request, body, nativeEnvironment, boundary, context, session, writeRollout };
+  }
+
+  for (const fault of ["missing id", "duplicate wire id", "missing record", "changed content", "other turn",
+    "wrong kind", "missing kind", "duplicate native id", "no boundary", "before boundary", "historical substitute"] as const) {
+    test(`initial filesystem-only current environment requires exact native proof (${fault})`, () => {
+      const fixture = initialNativeEnvironmentFixture();
+      const { codexHome, request, body, nativeEnvironment, boundary, context, session, writeRollout } = fixture;
+      const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+      expect(store.resolve(request).sandboxPolicy).toEqual({ type: "readOnly", networkAccess: true });
+      const provenance = nativeEnvironment.payload.internal_chat_message_metadata_passthrough;
+      let records: unknown[] = [session, boundary, nativeEnvironment, context];
+      if (fault === "missing id") delete body.input[0]!.id;
+      if (fault === "duplicate wire id") body.input.unshift({
+        type: "message", role: "assistant", id: body.input[0]!.id,
+        content: [{ type: "output_text", text: "An older response" }],
+      });
+      if (fault === "missing record") records = [session, boundary, context];
+      if (fault === "changed content") {
+        (nativeEnvironment.payload.content as Array<{ text: string }>)[0]!.text = "Changed sibling content";
+      }
+      if (fault === "other turn") provenance.turn_id = "01a06c66-0000-75c6-a0df-318f890ef6de";
+      if (fault === "wrong kind") provenance.content_item_kinds[1] = "agents.instructions";
+      if (fault === "missing kind") provenance.content_item_kinds = [];
+      if (fault === "duplicate native id") records.splice(3, 0, structuredClone(nativeEnvironment));
+      if (fault === "no boundary") records = [session, nativeEnvironment, context];
+      if (fault === "before boundary") records = [session, nativeEnvironment, boundary, context];
+      if (fault === "historical substitute") {
+        provenance.turn_id = "01a06c66-0000-75c6-a0df-318f890ef6de";
+        records = [session, { type: "event_msg", payload: { type: "task_started", turn_id: provenance.turn_id } },
+          nativeEnvironment, boundary, context];
+      }
+      writeRollout(records);
+      expect(() => store.resolve(request)).toThrow();
+    });
+  }
+
+  for (const fault of ["cwd", "roots", "sandbox"] as const) {
+    test(`initial current environment rejects native ${fault} authority conflicts`, () => {
+      const { codexHome, request, context, writeRollout } = initialNativeEnvironmentFixture();
+      const payload = context.payload as Record<string, unknown>;
+      if (fault === "cwd") payload.cwd = join(root, "native-subdirectory");
+      if (fault === "roots") payload.workspace_roots = [root, join(root, "native-auxiliary")];
+      if (fault === "sandbox") {
+        payload.sandbox_policy = { type: "danger-full-access" };
+        payload.permission_profile = { type: "disabled" };
+      }
+      writeRollout();
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+        .toThrow("conflicts");
+    });
+  }
+
+  test("authenticated current environment still verifies all untagged historical environment messages", () => {
+    const { codexHome, request, body, session, boundary, nativeEnvironment, context, writeRollout } = initialNativeEnvironmentFixture();
+    const historical = { type: "message", role: "user", id: "msg_prior_environment",
+      content: [{ type: "input_text", text: environmentXml.replaceAll(root, join(root, "previous-task")) }] };
+    body.input.unshift(structuredClone(historical), {
+      type: "message", role: "user", id: "msg_prior_instruction",
+      content: [{ type: "input_text", text: "Earlier instruction" }],
+    });
+    const historyRecord = { type: "response_item", payload: historical };
+    writeRollout([session, historyRecord, boundary, nativeEnvironment, context]);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request).sandboxPolicy).toEqual({ type: "readOnly", networkAccess: true });
+    (body.input[0]!.content as Array<{ text: string }>)[0]!.text += " changed";
+    expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
+    body.input[0] = structuredClone(historical);
+    writeRollout([session, boundary, historyRecord, nativeEnvironment, context]);
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+    writeRollout([session, boundary, nativeEnvironment, context]);
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
+  });
+
   for (const fault of ["none", "content", "id", "older turn", "missing record", "sandbox", "current update", "re-id", "discarded", "guardian only", "duplicate id"]) {
     test(`local compaction proves an untagged source from the latest native turn (fault: ${fault})`, () => {
       const { codexHome, request, rolloutPath } = resumedRootFixture();
@@ -1357,6 +1502,37 @@ describe("trusted Codex task environment continuity", () => {
       internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
       content: [{ type: "input_text", text: environmentXml }] });
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+  });
+
+  for (const afterAssistant of [false, true]) for (const repeatRoots of [false, true]) {
+    test(`calendar update ${afterAssistant ? "after a tool" : "immediately after the instruction"} with ${repeatRoots ? "repeated" : "omitted"} roots uses the current native environment (#812)`, () => {
+      const { codexHome, request, body, delta } = midnightRolloutFixture();
+      if (!afterAssistant) body.input.splice(1, body.input.length - 2);
+      if (repeatRoots) delta.content[0]!.text = delta.content[0]!.text.replace("<filesystem>",
+        `<filesystem><workspace_roots><root>${root}</root></workspace_roots>`);
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+    });
+  }
+
+  test("calendar updates cannot introduce roots or malformed permission fields", () => {
+    const { codexHome, request, body, delta, rolloutPath } = midnightRolloutFixture();
+    body.input.splice(1, body.input.length - 2);
+    const original = delta.content[0]!.text;
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    for (const roots of [
+      `<workspace_roots><root>${resolve(root, "other")}</root></workspace_roots>`,
+      `<workspace_roots><root>${root}</root><root>${resolve(root, "other")}</root></workspace_roots>`,
+      "<workspace_roots><root>relative</root></workspace_roots>",
+      "<workspace_roots/>", "<cwd/>", "<workspace_roots><root/></workspace_roots>",
+    ]) {
+      delta.content[0]!.text = original.replace("<filesystem>", `<filesystem>${roots}`);
+      expect(() => store.resolve(request)).toThrow();
+    }
+    delta.content[0]!.text = original.replace("<filesystem>",
+      `<filesystem><workspace_roots><root>${root}</root></workspace_roots>`);
+    expect(store.resolve(request).cwd).toBe(root);
+    rmSync(rolloutPath);
+    expect(() => store.resolve(request)).toThrow("missing cwd");
   });
 
   test("midnight recovery never borrows cached authority without exact current rollout proof", () => {
@@ -1552,6 +1728,90 @@ describe("trusted Codex task environment continuity", () => {
       .toThrow("Steering environment conflicts");
   });
 
+  // #790. Codex 0.162 emits the same envelope with network access on or off: the permission
+  // profile states filesystem access only, so the envelope cannot contradict the rollout here.
+  for (const mode of ["workspace-write", "read-only"] as const) test(`${mode} uses one native network policy before and after steering`, async () => {
+    const { codexHome, request, body, rolloutPath, environment, auxiliary } = steeredRolloutFixture(false, []);
+    environment.content[1]!.text = environment.content[1]!.text.replace(
+      dangerFullAccessProfileXml, mode === "workspace-write" ? workspaceWriteProfileXml : readOnlyProfileXml,
+    );
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.sandbox_mode = mode;
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    const entries = [
+      { path: { type: "special", value: { kind: "root" } }, access: "read" },
+      ...(mode === "workspace-write" ? [
+        ...[root, auxiliary].map(path => ({ path: { type: "path", path }, access: "write" })),
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+      ] : []),
+    ];
+    const writeRollout = (networkAccess: boolean) => writeFileSync(rolloutPath, [
+      { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } },
+      { type: "response_item", payload: { ...environment, internal_chat_message_metadata_passthrough: {
+        turn_id: rolloutTurnId, content_item_kinds: ["plugins.recommendations", "environments.environment_context"],
+      } } },
+      childTurnContext(rolloutTurnId, {
+        workspace_roots: [root, auxiliary],
+        sandbox_policy: { type: mode, ...(mode === "workspace-write" ? { writable_roots: [auxiliary] } : {}), network_access: networkAccess },
+        permission_profile: {
+          type: "managed", file_system: { type: "restricted", entries }, network: networkAccess ? "enabled" : "restricted",
+        },
+        file_system_sandbox_policy: { kind: "restricted", entries },
+      }),
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    const statePath = join(codexHome, "environment-cache.json");
+    const store = new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome);
+    const resolved = () => store.resolve(request);
+    const beforeSteering = { ...request, _rawBody: { ...body, input: body.input.slice(0, -1) } };
+    const withoutEnvelope = { ...request, _rawBody: { ...body, input: body.input.slice(-1) } };
+    const cachedFollowup = { ...request, _rawBody: {
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: rolloutThreadId, turn_id: rolloutTurnId }) },
+      input: body.input.slice(-1),
+    } };
+    const broker = TurnBroker.forSocket(process.platform === "win32"
+      ? defaultBrokerEndpoint(codexHome)
+      : join(codexHome, "review.sock"));
+    try {
+      for (const enabled of [true, false]) {
+        writeRollout(enabled);
+        const initial = store.resolve(beforeSteering);
+        expect(initial.sandboxPolicy).toEqual(mode === "workspace-write"
+          ? { type: "workspaceWrite", writableRoots: [root, auxiliary], networkAccess: enabled }
+          : { type: "readOnly", networkAccess: enabled });
+        const token = await broker.register(initial, 10_000);
+        for (const input of [request, withoutEnvelope, beforeSteering]) {
+          const next = store.resolve(input);
+          expect(next.sandboxPolicy).toEqual(initial.sandboxPolicy);
+          expect(() => broker.updateEnvironment(token, next)).not.toThrow();
+        }
+        expect(new ChatGptThreadEnvironmentStore(statePath, Date.now, codexHome).resolve(cachedFollowup).sandboxPolicy)
+          .toEqual(initial.sandboxPolicy);
+        writeRollout(!enabled);
+        expect(() => broker.updateEnvironment(token, store.resolve(withoutEnvelope)))
+          .toThrow("authority changed");
+        broker.revoke(token);
+      }
+    } finally { await broker.close(); }
+
+    // An envelope that does state its network policy is still held to the rollout.
+    writeRollout(true);
+    const unstated = environment.content[1]!.text;
+    environment.content[1]!.text = unstated.replace("<filesystem>", "<network_access>restricted</network_access><filesystem>");
+    expect(resolved).toThrow("Steering environment conflicts");
+    environment.content[1]!.text = unstated.replace("<filesystem>", "<network_access>enabled</network_access><filesystem>");
+    expect(resolved().sandboxPolicy).toMatchObject({ networkAccess: true });
+    writeRollout(false);
+    expect(resolved).toThrow("Steering environment conflicts");
+    environment.content[1]!.text = unstated;
+    expect(resolved().sandboxPolicy).toMatchObject({ networkAccess: false });
+    // Unstated permissions require current evidence, even when a cache already exists.
+    rmSync(rolloutPath);
+    expect(() => store.resolve(beforeSteering)).toThrow("missing network access");
+    expect(resolved).toThrow("missing cwd");
+  });
+
   test("steering never replaces missing or contradictory rollout proof with cached authority", () => {
     const { codexHome, request, body, rolloutPath, environment, auxiliary } = steeredRolloutFixture(false, []);
     const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
@@ -1683,7 +1943,7 @@ describe("trusted Codex task environment continuity", () => {
   });
 
   test("a malformed current update is not replaced by a valid older transcript envelope", () => {
-    const { codexHome, request } = resumedRootFixture();
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
     const body = request._rawBody as { input: Array<Record<string, unknown>> };
     const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
     body.input.unshift(
@@ -1695,7 +1955,18 @@ describe("trusted Codex task environment continuity", () => {
       { type: "message", role: "user", id: "invalid_current_context",
         content: [{ type: "input_text", text: "<environment_context><cwd/></environment_context>" }] },
     );
-    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toThrow("missing cwd");
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(() => store.resolve(request)).toThrow("no current task boundary for environment history");
+    // Even recording this malformed envelope does not make it historical when it
+    // belongs to the current task. The valid older envelope cannot replace it.
+    writeFileSync(rolloutPath, [
+      { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } },
+      { type: "response_item", payload: body.input[0] },
+      { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } },
+      { type: "response_item", payload: body.input[3] },
+      childTurnContext(),
+    ].map(record => JSON.stringify(record)).join("\n") + "\n");
+    expect(() => store.resolve(request)).toThrow("does not authenticate the historical environment messages");
   });
 
   test("root rollout lookup authenticates the indexed owner and current sandbox", () => {
@@ -1762,7 +2033,7 @@ describe("trusted Codex task environment continuity", () => {
       .toThrow("session metadata");
   }, SQLITE_TEST_TIMEOUT_MS);
 
-  test("a child's untagged environment must match native history before its current task boundary", () => {
+  for (const child of [true, false]) test(`a ${child ? "child" : "root"} thread's untagged environment must match native history before its current task boundary`, () => {
     const codexHome = mkdtempSync(join(tmpdir(), "codex-child-history-"));
     temporaryRoots.push(codexHome);
     const rolloutPath = join(codexHome, "sessions", "2026", "09", "06",
@@ -1776,17 +2047,23 @@ describe("trusted Codex task environment continuity", () => {
     const history = { type: "response_item", payload: inherited };
     const writeRollout = (records: unknown[]) => writeFileSync(rolloutPath,
       records.map(record => JSON.stringify(record)).join("\n") + "\n");
-    writeRollout([childSessionMeta(), history, boundary, childTurnContext()]);
-    createRolloutState(join(codexHome, "state_5.sqlite"), rolloutPath);
+    const session = child ? childSessionMeta()
+      : { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } };
+    writeRollout([session, history, boundary, childTurnContext()]);
+    if (child) createRolloutState(join(codexHome, "state_5.sqlite"), rolloutPath);
     const request = environmentlessChild(rolloutTurnId, "danger-full-access", []);
-    const body = request._rawBody as { input: Array<Record<string, unknown>> };
+    const body = request._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+    if (!child) body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+      request_kind: "turn", thread_id: rolloutThreadId, turn_id: rolloutTurnId,
+      agent_name: "/root", sandbox_mode: "danger-full-access", workspaces: {},
+    });
     body.input.unshift(structuredClone(inherited), {
       type: "message", role: "user", id: "msg_parent_prompt",
       content: [{ type: "input_text", text: "Original parent instruction" }],
     });
     const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
-    // Git enrichment is absent on the first real child request; historical XML never supplies
-    // the authority. Use the child's current native cwd even when the inherited cwd differs.
+    // Historical XML never supplies authority. Both root and child threads must use
+    // their current native cwd even when a retained historical envelope differs (#812).
     expect(store.resolve(request).cwd).toBe(root);
     body.input[0] = { ...inherited, content: [{ type: "input_text", text: "<environment_context>changed</environment_context>" }] };
     expect(() => store.resolve(request)).toThrow("differs from its native Codex record");
@@ -1795,9 +2072,9 @@ describe("trusted Codex task environment continuity", () => {
     body.input[0] = { ...inherited, internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId } };
     expect(() => store.resolve(request)).toThrow("missing cwd");
     body.input[0] = structuredClone(inherited);
-    writeRollout([childSessionMeta(), boundary, history, childTurnContext()]);
+    writeRollout([session, boundary, history, childTurnContext()]);
     expect(() => store.resolve(request)).toThrow("does not authenticate");
-    writeRollout([childSessionMeta(), history, childTurnContext()]);
+    writeRollout([session, history, childTurnContext()]);
     expect(() => store.resolve(request)).toThrow("no current task boundary");
   });
 
@@ -1809,14 +2086,26 @@ describe("trusted Codex task environment continuity", () => {
     metadata.request_kind = "compaction";
     metadata.turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
     body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    const source = structuredClone(body.input[0]!);
+    source.internal_chat_message_metadata_passthrough = { turn_id: rolloutTurnId, content_item_kinds: ["user.text"] };
+    writeFileSync(rolloutPath, [
+      JSON.stringify({ type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } }),
+      JSON.stringify(childTurnContext()),
+      JSON.stringify({ type: "response_item", payload: source }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: metadata.turn_id } }),
+    ].join("\n") + "\n");
     body.input.push({ type: "compaction_trigger" });
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
     body.input[0]!.internal_chat_message_metadata_passthrough = { turn_id: "01a06c66-0000-75c6-a0df-318f890ef6de" };
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
-      .toThrow("current turn");
+      .toThrow("compaction source");
+    body.input[0]!.internal_chat_message_metadata_passthrough = { turn_id: metadata.turn_id };
     writeFileSync(rolloutPath, [
       JSON.stringify({ type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: metadata.turn_id } }),
       JSON.stringify(childTurnContext(metadata.turn_id)),
+      JSON.stringify({ type: "response_item", payload: body.input[0] }),
     ].join("\n") + "\n");
     expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
     writeFileSync(rolloutPath, [
@@ -1824,7 +2113,7 @@ describe("trusted Codex task environment continuity", () => {
       JSON.stringify(childTurnContext(metadata.turn_id, { turn_id: undefined })),
     ].join("\n") + "\n");
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
-      .toThrow("current turn");
+      .toThrow("compaction source");
   });
 
   test("recovers the exact current child rollout before stale cache using custom state storage", () => {
@@ -2217,4 +2506,275 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(malformed))
       .toThrow("missing cwd");
   });
+});
+
+describe("Codex 0.162.1 native compaction checkpoints", () => {
+  const fixtureRoot = "/tmp/cgw-codex-0162-compaction/workspace";
+  const owner = (item: Record<string, unknown>) => (item.internal_chat_message_metadata_passthrough as { turn_id: string; content_item_kinds: string[] });
+  const replacement = (fixture: NativeCompactionFixture) => fixture.rolloutRecords.findLast(item => item.type === "compacted")!.payload;
+  const environmentItem = (items: Array<Record<string, unknown>>) => items.find(item => Array.isArray(item.content)
+    && (item.content as Array<{ text?: string }>).some(part => part.text?.startsWith("<environment_context>")))!;
+  const resolveSourceIdentity = (parsed: CodexParsedRequest, codexHome: string) => {
+    const source = extractChatGptCompactionSourceRevision(parsed);
+    const identity = extractChatGptTurnIdentity(parsed);
+    return resolveCurrentCodexRolloutMessageIdAliases({
+      codexHome, lineage: extractChatGptRootThreadMetadata(parsed)!,
+      turnId: source.turnId ?? identity.turnId!, revisions: [source], compactionSource: source,
+      compactionTurnId: identity.turnId, compactionPhase: extractChatGptNativeCompactionPhase(parsed),
+    });
+  };
+
+  for (const name of ["manual-first-compaction", "manual-second-compaction"]) {
+    test(`${name} proves an explicit human owner independently of the latest permission owner`, () => {
+      const { fixture, codexHome } = nativeCompactionFixture(name);
+      const original = fixture.rolloutRecords.find(item => item.type === "response_item"
+        && owner(item.payload).content_item_kinds.includes("user.text"))!.payload;
+      const source = fixture.request.input.find(item => item.id === original.id)!;
+      source.internal_chat_message_metadata_passthrough = structuredClone(owner(original));
+      const parsed = parseRequest(fixture.request);
+      const latest = fixture.rolloutRecords.findLast(item => item.type === "turn_context")!.payload;
+      expect(resolveSourceIdentity(parsed, codexHome)).toMatchObject({
+        turnId: owner(original).turn_id, environmentTurnId: latest.turn_id,
+      });
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed).cwd).toBe(fixtureRoot);
+      expect(parsed._chatGptCompactionSourceTurnId).toBe(owner(original).turn_id);
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  for (const fault of ["changed content", "removed", "wrong id", "unknown phase"] as const) {
+    test(`an explicit latest permission owner cannot authorize an unproved human source (${fault})`, () => {
+      const { fixture, codexHome, metadata, write } = nativeCompactionFixture("manual-second-compaction");
+      const checkpoint = replacement(fixture);
+      const items = checkpoint.replacement_history as Array<Record<string, unknown>>;
+      const original = items.find(item => owner(item)?.content_item_kinds.includes("user.text"))!;
+      const source = fixture.request.input.find(item => item.id === original.id)!;
+      const latest = fixture.rolloutRecords.findLast(item => item.type === "turn_context")!.payload;
+      source.internal_chat_message_metadata_passthrough = { turn_id: latest.turn_id, content_item_kinds: ["user.text"] };
+      if (fault === "changed content") source.content = [{ type: "input_text", text: "Unrecorded human source" }];
+      if (fault === "removed") {
+        const index = items.indexOf(original);
+        items.splice(index, 1); (checkpoint.replacement_history_metadata as unknown[]).splice(index, 1);
+      }
+      if (fault === "wrong id") source.id = "msg_unrecorded_human_source";
+      if (fault === "unknown phase") {
+        metadata.compaction.phase = "unsupported";
+        fixture.request.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      }
+      write();
+      const parsed = parseRequest(fixture.request);
+      if (fault === "unknown phase") expect(() => resolveSourceIdentity(parsed, codexHome)).toThrow("invalid phase");
+      else expect(resolveSourceIdentity(parsed, codexHome)).toBeUndefined();
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed)).toThrow();
+      expect(parsed._chatGptCompactionSourceTurnId).toBeUndefined();
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  function currentCompactionFixture() {
+    const result = nativeCompactionFixture("manual-first-compaction");
+    const latest = result.fixture.rolloutRecords.findLast(item => item.type === "turn_context")!.payload;
+    // Keep the captured original turn's complete records; the later standalone task boundary
+    // belongs to another request. This fixture compacts the current turn's recorded history.
+    result.fixture.rolloutRecords = result.fixture.rolloutRecords.filter(item => !(item.type === "event_msg"
+      && item.payload.type === "task_started" && item.payload.turn_id === result.metadata.turn_id));
+    result.metadata.turn_id = latest.turn_id;
+    result.metadata.compaction.phase = "post_turn";
+    result.fixture.request.client_metadata["x-codex-turn-metadata"] = JSON.stringify(result.metadata);
+    const original = result.fixture.rolloutRecords.find(item => item.type === "response_item"
+      && owner(item.payload).content_item_kinds.includes("user.text"))!.payload;
+    const source = result.fixture.request.input.find(item => item.id === original.id)!;
+    source.internal_chat_message_metadata_passthrough = structuredClone(owner(original));
+    result.write();
+    return { ...result, original, source };
+  }
+
+  for (const phase of ["pre_turn", "mid_turn", "post_turn"] as const) {
+    test(`a current permission turn still proves its native human source (${phase})`, async () => {
+      const { fixture, codexHome, metadata, source } = currentCompactionFixture();
+      metadata.compaction.phase = phase;
+      fixture.request.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      const parsed = parseRequest(fixture.request);
+      expect(resolveSourceIdentity(parsed, codexHome)?.turnId).toBe(owner(source).turn_id);
+      const environment = await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+        .resolveWithRolloutPublicationRetry(parsed);
+      expect(environment).toMatchObject({ cwd: fixtureRoot, sandboxPolicy: { type: "readOnly", networkAccess: false } });
+      expect(parsed._chatGptCompactionSourceTurnId).toBe(owner(source).turn_id);
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  for (const fault of ["changed content", "wrong id", "wrong kind", "missing proof", "unknown phase", "missing phase"] as const) {
+    test(`current permission and cached XML cannot authorize a native compact source (${fault})`, async () => {
+      const { fixture, codexHome, metadata, source, original, write } = currentCompactionFixture();
+      const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+      expect(store.resolve(parseRequest(fixture.request)).cwd).toBe(fixtureRoot);
+      if (fault === "changed content") source.content = [{ type: "input_text", text: "Unproved source for current permissions" }];
+      if (fault === "wrong id") source.id = "msg_unproved_current_source";
+      if (fault === "wrong kind") owner(source).content_item_kinds = ["environments.environment_context"];
+      if (fault === "missing proof") fixture.rolloutRecords = fixture.rolloutRecords.filter(item => item.payload !== original);
+      if (fault === "unknown phase") metadata.compaction.phase = "unsupported";
+      if (fault === "missing phase") delete metadata.compaction.phase;
+      fixture.request.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      write();
+      expect(() => store.resolve(parseRequest(fixture.request))).toThrow();
+      const incoming = parseRequest(fixture.request);
+      await expect(store.resolveWithRolloutPublicationRetry(incoming)).rejects.toThrow();
+      expect(incoming._chatGptCompactionSourceTurnId).toBeUndefined();
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  test("native compaction waits for complete source publication before attaching its owner", async () => {
+    const { fixture, codexHome, original, write } = currentCompactionFixture();
+    const published = [...fixture.rolloutRecords];
+    fixture.rolloutRecords = fixture.rolloutRecords.filter(item => item.payload !== original);
+    write();
+    const timer = setTimeout(() => { fixture.rolloutRecords = published; write(); }, 15);
+    try {
+      const parsed = parseRequest(fixture.request);
+      expect((await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+        .resolveWithRolloutPublicationRetry(parsed)).cwd).toBe(fixtureRoot);
+      expect(parsed._chatGptCompactionSourceTurnId).toBe(owner(original).turn_id);
+    } finally { clearTimeout(timer); }
+  }, SQLITE_TEST_TIMEOUT_MS);
+
+  test("a native compact cannot repeat a proved current environment as older attributed history", () => {
+    const { fixture, codexHome, write } = currentCompactionFixture();
+    const native = fixture.rolloutRecords.find(item => item.type === "response_item"
+      && owner(item.payload).content_item_kinds.includes("environments.environment_context"))!.payload;
+    const message = fixture.request.input.find(item => item.id === native.id)!;
+    message.internal_chat_message_metadata_passthrough = structuredClone(owner(native));
+    const duplicate = structuredClone(message);
+    owner(duplicate).turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+    fixture.request.input.push(duplicate);
+    write();
+    const parsed = parseRequest(fixture.request);
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed)).toThrow("repeats a message id");
+    expect(parsed._chatGptCompactionSourceTurnId).toBeUndefined();
+  }, SQLITE_TEST_TIMEOUT_MS);
+
+  for (const fault of ["changed content", "wrong owner", "wrong kind"] as const) {
+    test(`a native compact proves attributed older environment fragments (${fault})`, () => {
+      const { fixture, codexHome, write } = nativeCompactionFixture("manual-first-compaction");
+      const native = fixture.rolloutRecords.find(item => item.type === "response_item"
+        && owner(item.payload).content_item_kinds.includes("environments.environment_context"))!.payload;
+      const message = fixture.request.input.find(item => item.id === native.id)!;
+      message.internal_chat_message_metadata_passthrough = structuredClone(owner(native));
+      if (fault === "changed content") (message.content as Array<{ text: string }>)[0]!.text += " changed";
+      if (fault === "wrong owner") owner(message).turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+      if (fault === "wrong kind") owner(message).content_item_kinds = ["user.text"];
+      write();
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parseRequest(fixture.request))).toThrow();
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  for (const name of ["manual-first-compaction", "manual-second-compaction", "auto-continuation", "manual-continuation"]) {
+    test(`authenticates the captured ${name} with a fresh environment store`, () => {
+      const { fixture, codexHome } = nativeCompactionFixture(name);
+      const parsed = parseRequest(fixture.request);
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed)).toMatchObject({
+        cwd: fixtureRoot, roots: [fixtureRoot], writableRoots: [], sandboxPolicy: { type: "readOnly", networkAccess: false },
+      });
+      if (parsed._compactionRequest) {
+        const original = fixture.rolloutRecords.find(item => item.type === "response_item"
+          && owner(item.payload).content_item_kinds.includes("user.text"))!.payload;
+        expect(extractChatGptCompactionSourceRevision(parsed)).toMatchObject({ itemId: original.id, content: original.content });
+        expect(parsed._chatGptCompactionSourceTurnId).toBe(owner(original).turn_id);
+      }
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
+
+  test("a retained human source keeps its original turn while permission comes from the latest compact turn", () => {
+    const { fixture, codexHome, write } = nativeCompactionFixture("manual-second-compaction");
+    const latest = fixture.rolloutRecords.findLast(item => item.type === "turn_context")!.payload;
+    (latest.permission_profile as Record<string, unknown>).network = "enabled";
+    (latest.sandbox_policy as Record<string, unknown>).network_access = true;
+    write();
+    const parsed = parseRequest(fixture.request);
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(parsed).sandboxPolicy)
+      .toEqual({ type: "readOnly", networkAccess: true });
+    expect(parsed._chatGptCompactionSourceTurnId).toBeDefined();
+    expect(parsed._chatGptCompactionSourceTurnId).not.toBe(latest.turn_id);
+  }, SQLITE_TEST_TIMEOUT_MS);
+
+  for (const name of ["auto-continuation", "manual-continuation"]) {
+    for (const fault of ["changed content", "duplicate id", "wrong kind", "other turn", "missing record", "guardian only",
+      "missing boundary", "wrong boundary side", "no checkpoint context", "older matching record"] as const) {
+      test(`${name} refuses invalid replacement environment proof (${fault})`, () => {
+        const { fixture, metadata, write, resolveEnvironment } = nativeCompactionFixture(name);
+        const checkpoint = replacement(fixture);
+        const items = checkpoint.replacement_history as Array<Record<string, unknown>>;
+        const environment = environmentItem(items);
+        const position = items.indexOf(environment);
+        const nativeMetadata = checkpoint.replacement_history_metadata as unknown[];
+        if (fault === "changed content" || fault === "older matching record") {
+          if (fault === "older matching record") fixture.rolloutRecords.splice(1, 0, { type: "response_item", payload: structuredClone(environment) });
+          (environment.content as Array<{ text: string }>)[0]!.text += " changed";
+        }
+        if (fault === "duplicate id") { items.push(structuredClone(environment)); nativeMetadata.push({ client_authored: false }); }
+        if (fault === "wrong kind") owner(environment).content_item_kinds = ["user.text"];
+        if (fault === "other turn") owner(environment).turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+        if (fault === "missing record" || fault === "guardian only") {
+          items.splice(position, 1); nativeMetadata.splice(position, 1);
+          if (fault === "guardian only") checkpoint.guardian_history = [environment];
+        }
+        if (fault === "missing boundary") fixture.rolloutRecords = fixture.rolloutRecords.filter(item => !(item.type === "event_msg"
+          && item.payload.type === "task_started" && item.payload.turn_id === metadata.turn_id));
+        if (fault === "wrong boundary side") {
+          const record = fixture.rolloutRecords.splice(fixture.rolloutRecords.findIndex(item => item.payload === checkpoint), 1)[0]!;
+          const boundary = fixture.rolloutRecords.findIndex(item => item.type === "event_msg" && item.payload.turn_id === metadata.turn_id);
+          fixture.rolloutRecords.splice(name === "auto-continuation" ? boundary : boundary + 1, 0, record);
+        }
+        if (fault === "no checkpoint context") {
+          const checkpointTurn = (checkpoint.resume_metadata as { last_started_turn_id: string }).last_started_turn_id;
+          fixture.rolloutRecords = fixture.rolloutRecords.filter(item => item.type !== "turn_context" || item.payload.turn_id !== checkpointTurn);
+        }
+        write();
+        expect(resolveEnvironment).toThrow();
+      }, SQLITE_TEST_TIMEOUT_MS);
+    }
+  }
+
+  test("a current replacement environment cannot contradict the latest native permissions", () => {
+    const { fixture, write, resolveEnvironment } = nativeCompactionFixture("auto-continuation");
+    for (const environment of [environmentItem(fixture.request.input), environmentItem(replacement(fixture).replacement_history as Array<Record<string, unknown>>)]) {
+      const content = environment.content as Array<{ text: string }>;
+      content[0]!.text = content[0]!.text.replace("<filesystem>", "<network_access>enabled</network_access><filesystem>");
+    }
+    write();
+    expect(resolveEnvironment).toThrow("Current environment conflicts");
+  }, SQLITE_TEST_TIMEOUT_MS);
+
+  for (const fault of ["removed", "guardian only", "duplicate id", "changed content", "other turn", "wrong kind", "incomplete",
+    "missing original", "original different turn", "missing current boundary", "stale permission turn", "checkpoint after boundary", "unknown phase"] as const) {
+    test(`repeated manual compaction refuses unproved retained human source (${fault})`, () => {
+      const { fixture, metadata, write, resolveEnvironment } = nativeCompactionFixture("manual-second-compaction");
+      const checkpoint = replacement(fixture);
+      const items = checkpoint.replacement_history as Array<Record<string, unknown>>;
+      const source = items.find(item => owner(item).content_item_kinds.includes("user.text"))!;
+      const position = items.indexOf(source);
+      const nativeMetadata = checkpoint.replacement_history_metadata as Array<Record<string, unknown>>;
+      if (fault === "removed" || fault === "guardian only") {
+        items.splice(position, 1); nativeMetadata.splice(position, 1);
+        if (fault === "guardian only") checkpoint.guardian_history = [source];
+      }
+      if (fault === "duplicate id") { items.push(structuredClone(source)); nativeMetadata.push(structuredClone(nativeMetadata[position]!)); }
+      if (fault === "changed content") (source.content as Array<{ text: string }>)[0]!.text = "Changed human request";
+      if (fault === "other turn") owner(source).turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+      if (fault === "wrong kind") owner(source).content_item_kinds = ["compaction.summary"];
+      if (fault === "incomplete") (nativeMetadata[position]!.retained_source as Record<string, unknown>).complete = false;
+      if (fault === "missing original") fixture.rolloutRecords = fixture.rolloutRecords.filter(item => item.type !== "response_item" || item.payload.id !== source.id);
+      if (fault === "original different turn") owner(fixture.rolloutRecords.find(item => item.type === "response_item" && item.payload.id === source.id)!.payload)
+        .turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+      if (fault === "missing current boundary") fixture.rolloutRecords = fixture.rolloutRecords.filter(item => !(item.type === "event_msg" && item.payload.turn_id === metadata.turn_id));
+      if (fault === "stale permission turn") fixture.rolloutRecords.findLast(item => item.type === "turn_context")!.payload.turn_id = owner(source).turn_id;
+      if (fault === "checkpoint after boundary") {
+        const record = fixture.rolloutRecords.splice(fixture.rolloutRecords.findIndex(item => item.payload === checkpoint), 1)[0]!;
+        fixture.rolloutRecords.push(record);
+      }
+      if (fault === "unknown phase") {
+        metadata.compaction.phase = "unsupported";
+        fixture.request.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+      }
+      write();
+      expect(resolveEnvironment).toThrow();
+    }, SQLITE_TEST_TIMEOUT_MS);
+  }
 });

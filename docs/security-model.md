@@ -187,6 +187,11 @@ served. The server remote-desktop deployment permits a non-loopback container li
 API-Key mode; Compose publishes it on host loopback and the intended remote path is the existing
 HTTPS reverse proxy.
 
+A web page is not a local process. Browsers can reach a loopback port with a cross-site request,
+or with a same-origin one after DNS rebinding, and they attach `Origin` to every non-GET request.
+The daemon rejects any non-GET request that carries `Origin` before it reaches a route; Codex and
+the launcher never send that header. This closes the browser path only and is not authentication.
+
 The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
 `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
 user-only application config. The launcher uses them to reject new work, prove that both the HTTP

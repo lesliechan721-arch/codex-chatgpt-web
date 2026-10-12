@@ -136,7 +136,9 @@ function compactionAuthorityConflict(): () => void {
     }),
   ].join("\n") + "\n");
 
-  const currentEnvironment = `<environment_context><cwd>${workspace}</cwd><filesystem><workspace_roots><root>${workspace}</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"><entry access="read"><special>:root</special></entry></file_system></permission_profile></filesystem></environment_context>`;
+  // A filesystem-only envelope inherits native network access. State the conflicting policy
+  // explicitly so this fixture continues to prove a real authority conflict.
+  const currentEnvironment = `<environment_context><cwd>${workspace}</cwd><network_access>restricted</network_access><filesystem><workspace_roots><root>${workspace}</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"><entry access="read"><special>:root</special></entry></file_system></permission_profile></filesystem></environment_context>`;
   const sourceContent = [{ type: "input_text", text: "Continue the earlier task." }];
   const summary = "Trusted compaction checkpoint";
   const parsed = parseRequest({
@@ -170,6 +172,13 @@ function compactionAuthorityConflict(): () => void {
       { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
     ],
   });
+  const currentMessage = (parsed._rawBody as { input: unknown[] }).input[0] as Record<string, unknown>;
+  writeFileSync(rolloutPath, readFileSync(rolloutPath, "utf8") + [
+    { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+    { type: "response_item", payload: { ...currentMessage, internal_chat_message_metadata_passthrough: {
+      turn_id: turnId, content_item_kinds: ["environments.environment_context"],
+    } } },
+  ].map(item => JSON.stringify(item)).join("\n") + "\n");
   rememberCompactionContinuation(
     { ...parsed, _compactionRequest: true },
     extractChatGptTurnIdentity(parsed),

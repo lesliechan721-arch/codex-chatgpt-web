@@ -5,8 +5,10 @@ import { atomicWriteFile } from "../../config";
 import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
-  extractChatGptTurnEnvironment,
   chatGptTurnUserRevisionHistory,
+  extractChatGptTurnEnvironmentClaim,
+  extractChatGptEnvironmentMessageClaim,
+  extractChatGptNativeCompactionPhase,
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
   extractChatGptSteeringEnvironmentClaim,
@@ -15,12 +17,14 @@ import {
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptRolloutEnvironmentMarker,
   hasCurrentChatGptEnvironmentContext,
-  hasChatGptCalendarEnvironmentDelta,
+  extractChatGptCalendarEnvironmentDelta,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
+  nativeChatGptCompactionEnvironmentMessages,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   TrustedCodexEnvironmentValidationError,
+  type ChatGptEnvironmentClaim,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
   type ChatGptTurnUserRevision,
@@ -44,6 +48,7 @@ export function trustedEnvironmentFailureDetails(error: unknown): {
   const reasons: Record<string, string> = {
     "ChatGPT web turn is missing cwd in trusted Codex environment context": "missing_cwd",
     "ChatGPT web turn is missing workspace_roots in trusted Codex environment context": "missing_workspace_roots",
+    "ChatGPT web turn is missing network access in trusted Codex environment context": "missing_network_access",
     "ChatGPT web cwd must contain absolute paths": "relative_cwd",
     "ChatGPT web workspace_roots must contain absolute paths": "relative_workspace_roots",
     "ChatGPT web turn has conflicting trusted Codex cwd values": "conflicting_cwd",
@@ -51,6 +56,12 @@ export function trustedEnvironmentFailureDetails(error: unknown): {
     "ChatGPT web turn requires one explicit trusted Codex sandbox mode": "missing_sandbox_mode",
     "Compaction continuation requires one current native environment claim": "invalid_compaction_claim",
     "Compaction continuation environment conflicts with its current Codex rollout": "compaction_authority_conflict",
+    "Current environment conflicts with its current Codex rollout": "current_authority_conflict",
+    "Steering environment conflicts with its current Codex rollout": "steering_authority_conflict",
+    "Calendar environment delta conflicts with its current Codex rollout": "calendar_authority_conflict",
+    "Current Codex environment claim has no unique source message": "current_environment_source_unproven",
+    "Codex rollout does not authenticate the current environment message": "current_environment_unrecorded",
+    "Current environment message differs from its native Codex record": "current_environment_content_mismatch",
     "Codex thread metadata contains an invalid native identifier": "invalid_native_identifier",
     "Codex environment history repeats a message id": "duplicate_historical_message_id",
     "Codex rollout does not authenticate the historical environment messages": "historical_environment_unrecorded",
@@ -335,21 +346,24 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number, parse
   };
 }
 
-function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment, steering = false): boolean {
+function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment, allowAdditionalWritableRoots = false): boolean {
+  const left = claim.environment;
   const samePaths = (a: string[], b: string[]): boolean => {
     const expected = new Set(b.map(pathIdentity));
     return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
   };
   return pathIdentity(left.cwd) === pathIdentity(right.cwd)
     && samePaths(left.roots, right.roots)
-    // Steering envelopes can omit Codex's extra output directories. The current
+    // Filesystem envelopes can omit Codex's extra output directories. The current
     // native rollout remains the authority returned to the caller, never the claim.
-    && (steering
+    && (allowAdditionalWritableRoots
       ? left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))
       : samePaths(left.writableRoots, right.writableRoots))
     && left.sandboxPolicy.type === right.sandboxPolicy.type
-    && (left.sandboxPolicy.type === "dangerFullAccess" || (right.sandboxPolicy.type !== "dangerFullAccess"
-      && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
+    // An envelope that does not state its network policy cannot contradict the rollout on it.
+    && (left.sandboxPolicy.type === "dangerFullAccess" || !claim.statesNetworkAccess
+      || (right.sandboxPolicy.type !== "dangerFullAccess"
+        && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
 }
 
 /**
@@ -411,9 +425,49 @@ export class ChatGptThreadEnvironmentStore {
     diagnostics.thread_cache_lookup = "not_attempted";
     diagnostics.parent_cache_lookup = "not_attempted";
     const identity = extractChatGptTurnIdentity(parsed);
+    const compactionPhase = extractChatGptNativeCompactionPhase(parsed);
+    const nativeId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (compactionPhase && (nativeId.test(identity.threadId ?? "") || nativeId.test(identity.turnId ?? ""))) {
+      const lineage = extractChatGptThreadSpawnLineage(parsed) ?? extractChatGptRootThreadMetadata(parsed);
+      if (!lineage || !identity.turnId) {
+        throw new TrustedCodexEnvironmentValidationError("Native Codex compaction has no complete source identity");
+      }
+      // The current permission turn does not prove the human source. Authenticate before any
+      // XML/cache return, including the retry path that defers optional alias attachment.
+      const source = extractChatGptCompactionSourceRevision(parsed);
+      const messages = nativeChatGptCompactionEnvironmentMessages(parsed);
+      const native = resolveCurrentCodexRolloutEnvironment({
+        codexHome: this.codexHome, ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+        lineage, turnId: identity.turnId, compactionSource: source, compactionPhase,
+        ...(source.turnId ? { compactionSourceTurnId: source.turnId } : {}),
+        ...(messages.current ? { currentEnvironmentMessage: messages.current } : {}),
+        historicalEnvironmentMessages: messages.historical,
+        validateCurrentEnvironmentMessage(message, environment) {
+          if (!sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, message), environment, true)) {
+            throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
+          }
+        },
+        tools: parsed.context.tools, publicationPendingIsTransient,
+      });
+      if (!native) {
+        if (publicationPendingIsTransient) throw new CodexRolloutPublicationPendingError("Codex compaction rollout is not published yet");
+        throw new TrustedCodexEnvironmentValidationError("The trusted Codex environment has no authenticated native compaction source rollout");
+      }
+      if (messages.current && !sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, messages.current), native, true)) {
+        throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
+      }
+    }
     if (recoverNativeMessageIdAliases) this.attachNativeMessageIdAliases(parsed, identity.turnId);
+    let initialClaim: ChatGptEnvironmentClaim | undefined;
     try {
-      const environment = extractChatGptTurnEnvironment(parsed);
+      const claim = extractChatGptTurnEnvironmentClaim(parsed);
+      const environment = claim.environment;
+      if (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess) {
+        // Modern envelopes state filesystem access only. Resolve the current native policy on
+        // the first round too: absence of a network statement is not a disabled-network grant.
+        initialClaim = claim;
+        throw new MissingTrustedCodexEnvironmentError("network access");
+      }
       if (identity.threadId) this.set(identity.threadId, environment, parsed);
       return environment;
     } catch (error) {
@@ -421,26 +475,33 @@ export class ChatGptThreadEnvironmentStore {
       const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
       const lineage = extractChatGptThreadSpawnLineage(parsed);
       const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
-      const historicalMessages = hasCurrentContext && !currentCompaction && lineage
+      // Root tasks also retain unattributed environment fragments after compaction.
+      // They are historical only when the exact native record predates this task;
+      // neither the fragment nor the cache supplies the current authority.
+      const historicalMessages = hasCurrentContext && !currentCompaction
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       const rolloutMarker = hasCurrentContext && !currentCompaction
         && hasCurrentChatGptRolloutEnvironmentMarker(parsed);
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
-      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
+      const calendarDelta = hasCurrentContext && !currentCompaction
+        ? extractChatGptCalendarEnvironmentDelta(parsed) : undefined;
       if (hasCurrentContext && !currentCompaction
-        && !historicalMessages && !rolloutMarker && !steeringClaim && !calendarDelta) {
+        && !initialClaim && !historicalMessages && !rolloutMarker && !steeringClaim && !calendarDelta) {
         diagnostics.recovery_stage = "current_update_rejected";
         throw error;
       }
       if (currentCompaction) diagnostics.recovery_stage = "compaction_claim";
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
+      const currentClaim = initialClaim ?? (currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim);
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       diagnostics.rollout_lookup = "identity_unavailable";
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
       const compactionSource = parsed._compactionRequest
         ? extractChatGptCompactionSourceRevision(parsed) : undefined;
+      if (initialClaim && !initialClaim.sourceMessage) {
+        throw new TrustedCodexEnvironmentValidationError("Current Codex environment claim has no unique source message");
+      }
       if (rolloutIdentity && identity.turnId) {
         diagnostics.recovery_stage = "rollout";
         diagnostics.rollout_lookup = "error";
@@ -450,8 +511,15 @@ export class ChatGptThreadEnvironmentStore {
           lineage: rolloutIdentity,
           turnId: identity.turnId,
           ...(compactionSource?.turnId ? { compactionSourceTurnId: compactionSource.turnId } : {}),
-          ...(compactionSource && !compactionSource.turnId ? { compactionSource } : {}),
+          ...(compactionSource ? { compactionSource } : {}),
+          ...(extractChatGptNativeCompactionPhase(parsed) ? { compactionPhase: extractChatGptNativeCompactionPhase(parsed) } : {}),
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          ...(initialClaim?.sourceMessage ? { currentEnvironmentMessage: initialClaim.sourceMessage } : {}),
+          validateCurrentEnvironmentMessage(message, nativeEnvironment) {
+            if (!sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, message), nativeEnvironment, true)) {
+              throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
+            }
+          },
           tools: parsed.context.tools,
           publicationPendingIsTransient: publicationPendingIsTransient && rolloutMarker,
         });
@@ -462,12 +530,18 @@ export class ChatGptThreadEnvironmentStore {
         }
         diagnostics.rollout_lookup = rolloutEnvironment ? "hit" : "miss";
         if (rolloutEnvironment) {
-          if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
-            throw new Error("Calendar environment delta conflicts with its current Codex rollout");
+          if (calendarDelta) {
+            const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
+            if (rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess"
+              || calendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
+                || roots.some(root => !nativeRoots.has(root)))) {
+              throw new TrustedCodexEnvironmentValidationError("Calendar environment delta conflicts with its current Codex rollout");
+            }
           }
-          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, steeringClaim !== undefined)) {
+          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, initialClaim !== undefined || steeringClaim !== undefined)) {
+            const source = currentCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
             throw new TrustedCodexEnvironmentValidationError(
-              `${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`,
+              `${source} environment conflicts with its current Codex rollout`,
             );
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment, parsed);
@@ -564,7 +638,10 @@ export class ChatGptThreadEnvironmentStore {
         lineage: rolloutIdentity,
         turnId: aliasTurnId,
         revisions,
-        ...(compactionSource && !compactionSource.turnId ? { compactionSource } : {}),
+        ...(compactionSource ? {
+          compactionSource, compactionTurnId: turnId,
+          ...(extractChatGptNativeCompactionPhase(parsed) ? { compactionPhase: extractChatGptNativeCompactionPhase(parsed) } : {}),
+        } : {}),
       });
       if (resolved?.aliases) parsed._chatGptMessageIdAliases = resolved.aliases;
       if (compactionSource && resolved?.turnId) parsed._chatGptCompactionSourceTurnId = resolved.turnId;

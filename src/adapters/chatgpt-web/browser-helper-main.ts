@@ -322,6 +322,7 @@ async function run(message: RunMessage): Promise<void> {
       },
     } : {}),
     onHeartbeat: () => writeTurnProtocol({ type: "event", id: message.id, event: "heartbeat" }),
+    onGenerationProgress: () => writeTurnProtocol({ type: "event", id: message.id, event: "generation_progress" }),
     onPreparedSelected: reused => {
       if (!writeTurnProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
         throw new Error("Browser helper could not request prompt selection");

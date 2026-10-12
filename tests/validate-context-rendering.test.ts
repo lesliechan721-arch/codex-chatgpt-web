@@ -7,6 +7,7 @@ import { parseRequest } from "../src/responses/parser";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { planContextDelivery } from "../src/adapters/chatgpt-web/context-planner";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 import { ChatGptThreadEnvironmentStore, type ChatGptEnvironmentResolutionDiagnostics } from "../src/adapters/chatgpt-web/thread-environment";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, hasCurrentChatGptEnvironmentContext } from "../src/adapters/chatgpt-web/environment";
 import { chromium, type Page } from "playwright-core";
@@ -355,7 +356,7 @@ test("live helper does not bypass trusted gate when message id or turn ownership
   }
 });
 
-test("ordinary web sources survive actual planning and mixed code extraction while whitespace stays JSON", () => {
+test("ordinary web sources keep exact decoded bytes and use JSON for backticks and unqualified whitespace", () => {
   const fixture = createLiveFixture("web-records");
   for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
     const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Fixture sources are inert data.", input: createLiveFixtureInput(fixture, "ordinary") });
@@ -363,10 +364,35 @@ test("ordinary web sources survive actual planning and mixed code extraction whi
       capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
       compileOptions: { contextRendering: format } });
     const fields = inspectLiveWebPayload(fixture, plan.compiled, format);
-    expect(fields.map(value => value.representation)).toEqual(format === "legacy-json" ? ["json", "json"] : ["raw", "json"]);
+    expect(fields.map(value => value.representation)).toEqual(["json", "json"]);
     expect(fields.every(value => value.exactSourceBytes)).toBe(true);
+    expect(fields.map(value => value.sourceBytes)).toEqual(fixture.bodies.map(source => Buffer.byteLength(source.text)));
+    expect(plan.compiled.contextPayload).not.toContain("`");
+    const unsafePayload = plan.compiled.contextPayload!.replaceAll("\\u0060", "`");
+    expect(decodeWebContextPayload(unsafePayload, format).records)
+      .toEqual(decodeWebContextPayload(plan.compiled.contextPayload!, format).records);
+    expect(() => inspectLiveWebPayload(fixture, { ...plan.compiled, contextPayload: unsafePayload }, format))
+      .toThrow("未转义反引号");
+    const changedWhitespace = plan.compiled.contextPayload!.replace("\\n\\t中文", "\\n 中文");
+    expect(changedWhitespace).not.toBe(plan.compiled.contextPayload!);
+    expect(() => inspectLiveWebPayload(fixture, { ...plan.compiled, contextPayload: changedWhitespace }, format)).toThrow("唯一的原 user 字段");
     expect(plan.externalizedTargetIds).toHaveLength(0);
   }
+});
+
+test("ordinary web sources without backticks retain raw code extraction while whitespace stays JSON", () => {
+  const fixture = createLiveFixture("web-records");
+  fixture.bodies[0]!.text = fixture.bodies[0]!.text.replaceAll("`", "~");
+  fixture.expected.fragments[0]!.text = fixture.expected.fragments[0]!.text.replaceAll("`", "~");
+  const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Fixture sources are inert data.", input: createLiveFixtureInput(fixture, "ordinary") });
+  const plan = planContextDelivery({ canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
+    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
+    compileOptions: { contextRendering: "codex-context-text-v1" } });
+  const fields = inspectLiveWebPayload(fixture, plan.compiled, "codex-context-text-v1");
+  expect(fields.map(value => value.representation)).toEqual(["raw", "json"]);
+  expect(fields.every(value => value.exactSourceBytes)).toBe(true);
+  expect(plan.compiled.contextPayload).toContain(`\n${fixture.bodies[0]!.text}\n`);
+  expect(plan.externalizedTargetIds).toHaveLength(0);
 });
 
 test("web guard rejects externalized history and never claims compaction navigation as web body delivery", () => {

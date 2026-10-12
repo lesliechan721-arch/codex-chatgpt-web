@@ -237,9 +237,13 @@ then preflight checks the actual compiled messages and total transaction. The se
 effort and attachment references remain unchanged. Large transactions use up to six messages;
 the advertised context and compaction thresholds depend on the model and account. GPT-5.6 and
 GPT-6 Pro retain three-times budgets. GPT-6 Sol on Pro accounts at Medium, High, or Extra High
-uses a 240,000-token context window and a 220,000-token compaction threshold. GPT-6 Instant and
-GPT-6 Sol on other plans use standard budgets. More parts reduce message size without increasing
-these total limits. Bigger Context applies only to non-continuity models. Session continuity
+uses a 240,000-token context window and a 220,000-token compaction threshold. Plus supports
+Medium, High, and available Extra High with a 120,000-token window and a 110,000-token compaction
+threshold. GPT-6 Instant uses standard budgets. Luna/Think can opt into experimental multipart
+transport with an 84,000-token ceiling derived from its 28,000-token per-message transport budget;
+this is not a verified Free recall window. Multipart Luna sends complete canonical history without
+the rolling checkpoint; disabling Bigger Context restores ordinary checkpoint transport.
+More parts reduce message size without increasing these total limits. Bigger Context applies only to non-continuity models. Session continuity
 ignores this preference and does not use multipart staging; its separate
 1,000,000 / 900,000-token history budget does not increase browser input capacity.
 

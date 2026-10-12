@@ -192,7 +192,7 @@ async function waitForActiveCompactionBrowserOutcome(
   onProgress?: () => void,
 ): Promise<ChatGptBrowserOutcome> {
   const reportProgress = (): void => onProgress?.();
-  const stopTraceObservation = source.runtime.trace.observe(reportProgress);
+  const stopTraceObservation = source.runtime.trace.observeProgress(reportProgress);
   const stopTextObservation = source.runtime.text.observe(reportProgress);
   try {
     return await withCompactionAbort(source.browserOutcome, signal);
@@ -241,7 +241,8 @@ export async function settleActiveCompactionSource(
     let compactionAccepted = false;
     try {
       token = await source.runtime.token;
-      await broker.requestCompaction(token, interruptedByActiveCompaction(), driverContext);
+      await broker.requestCompaction(token, interruptedByActiveCompaction(), driverContext,
+        () => source.runtime.trace.recordProgress());
       compactionAccepted = true;
       for (const request of outstanding) {
         const result = results.get(request.callId)!;
@@ -253,6 +254,7 @@ export async function settleActiveCompactionSource(
         );
         if (driverContext) source.assertDriverGeneration(driverContext.expectedDriverGeneration);
         source.runtime.externalProgress.recordToolResult();
+        source.runtime.trace.recordProgress();
         onProgress?.();
         source.markResultDelivered(request.callId);
       }
@@ -337,6 +339,7 @@ export async function settleActiveZeroRiskCompactionSource(
         token,
         interruptedByZeroRiskCompaction(compactPrompt),
         driverContext,
+        () => source.runtime.trace.recordProgress(),
       );
       compactionAccepted = true;
       for (const [index, request] of outstanding.entries()) {
@@ -352,6 +355,7 @@ export async function settleActiveZeroRiskCompactionSource(
         );
         if (driverContext) source.assertDriverGeneration(driverContext.expectedDriverGeneration);
         source.runtime.externalProgress.recordToolResult();
+        source.runtime.trace.recordProgress();
         onProgress?.();
         source.markResultDelivered(request.callId);
       }
@@ -470,6 +474,7 @@ export async function requestRetainedCompactionHandoff(
       compaction: true,
       abortSignal: browserAbort.signal,
       onTextDelta: () => { onProgress?.(); },
+      onGenerationProgress: () => { onProgress?.(); },
     });
     continuity?.onPhysicalSettlement(browser.then(() => undefined, () => undefined));
     const handoff = broker.waitForCompactionHandoff(transaction.token, operationSignal);

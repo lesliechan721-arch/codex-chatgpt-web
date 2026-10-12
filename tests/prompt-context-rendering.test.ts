@@ -98,12 +98,24 @@ test("two and six parts preserve complete records, fixed bytes, manifest and ACK
   }
 });
 
-test("fences exceed embedded backtick runs and never gain indentation", () => {
+test("final inline and two/six-part renderers escape code spans and preserve source semantics", () => {
   const parsed = request(body + " ``` ```` ````````  ```text");
+  const original = structuredClone(parsed);
   for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
-    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { contextRendering: format });
-    expect(compiled.text).toContain("\n`````````text\n");
-    expect(compiled.text).not.toContain("\n  `````````text\n");
+    for (const parts of [undefined, 2, 6] as const) {
+      const compiled = compileChatGptWebPrompt(parsed, capabilities, token, {
+        contextRendering: format, experimentalMultipartParts: parts,
+      });
+      const payloads = compiled.multipart?.parts ?? [compiled.contextPayload!];
+      for (const payload of payloads) expect(payload).not.toContain("`");
+      const records = compiled.multipart ? decodeWebContextTransaction(payloads, format)
+        : decodeWebContextPayload(payloads[0]!, format).records;
+      expect(records.find(record => record.kind === "message")!.message.content).toBe(parsed.context.messages[0]!.content);
+      const sent = compiled.multipart ? formatChatGptWebMultipartCommit(compiled.multipart, `ctx_${"0".repeat(32)}`) : compiled.text;
+      expect(sent).toMatch(/\n```(?:text|json)\n/);
+      expect(sent).not.toMatch(/\n +```(?:text|json)\n/);
+      expect(parsed).toEqual(original);
+    }
   }
 });
 

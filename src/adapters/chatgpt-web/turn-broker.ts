@@ -172,6 +172,7 @@ interface TurnChannel {
   compactionRequested: boolean;
   compactionResult?: BrokerToolResult;
   compactionDeliveryCount: number;
+  onCompactionProgress?: () => void;
   safe?: SafeTurnControl;
   /** Every MCP request owns a lease from token claim until its handler has settled. */
   activities: Set<string>;
@@ -530,7 +531,7 @@ export interface TurnBrokerOwner {
   completeTool(token: string, callId: string, result: BrokerToolResult, context?: TaskUpdateOwnerContext): void | Promise<void>;
   waitForSafeStart(token: string, signal?: AbortSignal): Promise<void>;
   waitForSafeCompletion(token: string, signal?: AbortSignal): Promise<string>;
-  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): number | Promise<number>;
+  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext, onProgress?: () => void): number | Promise<number>;
   compactionDeliveryCount(token: string): number | Promise<number>;
   beginCompletionFence(token: string, context?: TaskUpdateOwnerContext): number | undefined | Promise<number | undefined>;
   commitCompletionFence(token: string, revision: number, context?: TaskUpdateOwnerContext): boolean | Promise<boolean>;
@@ -1151,7 +1152,7 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error(`tool call was completed before it was delivered: ${callId}`);
     }
     channel.invocations.delete(callId);
-    console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
+    console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size} isError=${result.isError === true}`);
     invocation.resolve(result);
   }
 
@@ -1630,7 +1631,7 @@ export class TurnBroker implements TurnBrokerOwner {
     return remaining;
   }
 
-  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): number {
+  requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext, onProgress?: () => void): number {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
@@ -1649,6 +1650,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.retireTurnContext(token, channel);
     channel.compactionRequested = true;
     channel.compactionResult = structuredClone(queuedResult);
+    channel.onCompactionProgress = onProgress;
     if (channel.batchTimer) {
       clearTimeout(channel.batchTimer);
       channel.batchTimer = undefined;
@@ -1661,6 +1663,7 @@ export class TurnBroker implements TurnBrokerOwner {
       channel.compactionDeliveryCount += 1;
       if (invocation.operationId !== undefined) channel.nativeOperations.complete(invocation.operationId, queuedResult, "compaction");
       else invocation.resolve(structuredClone(queuedResult));
+      channel.onCompactionProgress?.();
     }
     if (queued.length > 0) {
       console.info(
@@ -2004,66 +2007,7 @@ export class TurnBroker implements TurnBrokerOwner {
       for (const updates of this.retiredTaskUpdates.values()) {
         if (updates.state.acknowledgementDirectory) rmSync(updates.state.acknowledgementDirectory, { recursive: true, force: true });
       }
-      const server = this.server;
-      if (server?.listening) {
-        if (!isWindowsPipeEndpoint(this.socketPath)) {
-          const current = statSync(this.socketPath, { throwIfNoEntry: false });
-          if (current && (!current.isSocket() || current.dev !== this.ownedSocket?.dev
-            || current.ino !== this.ownedSocket.ino)) {
-            // Preserve the existing fail-closed signal when the public endpoint was already lost.
-            // The fd-only listener cannot unlink either pathname, even during runtime teardown.
-            this.lifecycle("cleanup_skipped", { reason: "endpoint_replaced_before_close", ownedSocket: this.ownedSocket });
-            throw new Error("ChatGPT web broker endpoint was replaced; refusing native close until runtime exit");
-          }
-          if (current && current.ctimeMs !== this.ownedSocket?.ctimeMs) {
-            const changed = { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
-            try {
-              await this.verifySocketMetadataChange(changed);
-            } catch (error) {
-              this.lifecycle("cleanup_skipped", {
-                reason: "endpoint_metadata_unverified_before_close",
-                ownedSocket: this.ownedSocket,
-                verificationError: errorOf(error).message,
-              });
-              throw new Error(
-                "ChatGPT web broker endpoint metadata changed and ownership could not be verified; refusing native close until runtime exit",
-                { cause: error },
-              );
-            }
-          }
-        }
-        // Metadata verification can call owner_status through this server. Reject later sockets
-        // only after that ownership check is complete, before native close starts waiting on them.
-        this.rejectNewConnections = true;
-        this.lifecycle("runtime_close_requested", { ownedSocket: this.ownedSocket ?? null });
-        const deadline = setTimeout(() => {
-          this.lifecycle("connections_forced_closed", { connections: this.sockets.size });
-          for (const socket of this.sockets) socket.destroy();
-        }, BROKER_CLOSE_GRACE_MS);
-        try {
-          // Unix listeners were adopted by fd. Native close cannot unlink a pathname, even if
-          // a noncooperating process replaced the real listener after the last ownership check.
-          await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
-            if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
-            else rejectClose(error);
-          }));
-        } finally {
-          clearTimeout(deadline);
-        }
-      }
-      // Keep both filesystem entries. Closing an fd leaves a stale socket (ECONNREFUSED), not a
-      // dangling link; the next cooperating owner handles it through the locked startup probe.
-      this.lifecycle("close_complete", {
-        cleanup: this.ownedSocket ? "fd_closed_path_retained" : "skipped_non_owner",
-        ownedSocket: this.ownedSocket ?? null,
-      });
-      this.server = undefined;
-      this.ownedSocket = undefined;
-      if (this.releaseSocketLock) {
-        this.releaseSocketLock();
-        this.releaseSocketLock = undefined;
-        this.lifecycle("lock_released");
-      }
+      await this.closeEndpoint();
     }).then(() => {
       if (closingBrokers.get(this.socketPath) === closing) closingBrokers.delete(this.socketPath);
       if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
@@ -2078,6 +2022,71 @@ export class TurnBroker implements TurnBrokerOwner {
     closingBrokers.set(this.socketPath, closing);
     if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     return closing;
+  }
+
+  private async closeEndpoint(): Promise<void> {
+    clearInterval(this.endpointMonitor);
+    this.endpointMonitor = undefined;
+    const server = this.server;
+    if (server?.listening) {
+      if (!isWindowsPipeEndpoint(this.socketPath)) {
+        const current = statSync(this.socketPath, { throwIfNoEntry: false });
+        if (current && (!current.isSocket() || current.dev !== this.ownedSocket?.dev
+          || current.ino !== this.ownedSocket.ino)) {
+          // Preserve the existing fail-closed signal when the public endpoint was already lost.
+          // The fd-only listener cannot unlink either pathname, even during runtime teardown.
+          this.lifecycle("cleanup_skipped", { reason: "endpoint_replaced_before_close", ownedSocket: this.ownedSocket });
+          throw new Error("ChatGPT web broker endpoint was replaced; refusing native close until runtime exit");
+        }
+        if (current && current.ctimeMs !== this.ownedSocket?.ctimeMs) {
+          const changed = { dev: current.dev, ino: current.ino, ctimeMs: current.ctimeMs };
+          try {
+            await this.verifySocketMetadataChange(changed);
+          } catch (error) {
+            this.lifecycle("cleanup_skipped", {
+              reason: "endpoint_metadata_unverified_before_close",
+              ownedSocket: this.ownedSocket,
+              verificationError: errorOf(error).message,
+            });
+            throw new Error(
+              "ChatGPT web broker endpoint metadata changed and ownership could not be verified; refusing native close until runtime exit",
+              { cause: error },
+            );
+          }
+        }
+      }
+      // Metadata verification can call owner_status through this server. Reject later sockets
+      // only after that ownership check is complete, before native close starts waiting on them.
+      this.rejectNewConnections = true;
+      this.lifecycle("runtime_close_requested", { ownedSocket: this.ownedSocket ?? null });
+      const deadline = setTimeout(() => {
+        this.lifecycle("connections_forced_closed", { connections: this.sockets.size });
+        for (const socket of this.sockets) socket.destroy();
+      }, BROKER_CLOSE_GRACE_MS);
+      try {
+        // Unix listeners were adopted by fd. Native close cannot unlink a pathname, even if
+        // a noncooperating process replaced the real listener after the last ownership check.
+        await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
+          if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
+          else rejectClose(error);
+        }));
+      } finally {
+        clearTimeout(deadline);
+      }
+    }
+    // Keep both filesystem entries. Closing an fd leaves a stale socket (ECONNREFUSED), not a
+    // dangling link; the next cooperating owner handles it through the locked startup probe.
+    this.lifecycle("close_complete", {
+      cleanup: this.ownedSocket ? "fd_closed_path_retained" : "skipped_non_owner",
+      ownedSocket: this.ownedSocket ?? null,
+    });
+    this.server = undefined;
+    this.ownedSocket = undefined;
+    if (this.releaseSocketLock) {
+      this.releaseSocketLock();
+      this.releaseSocketLock = undefined;
+      this.lifecycle("lock_released");
+    }
   }
 
   private assertListening(): { dev: number; ino: number; ctimeMs: number } | undefined {
@@ -2192,21 +2201,36 @@ export class TurnBroker implements TurnBrokerOwner {
   private start(): Promise<void> {
     if (this.closePromise) return Promise.reject(new Error("ChatGPT web turn broker is closed"));
     if (this.endpointFailure) return Promise.reject(this.endpointFailure);
+    if (this.closeFailure) return Promise.reject(this.closeFailure);
     if (!this.startPromise) {
       const previousClose = closingBrokers.get(this.socketPath);
-      this.startPromise = (async () => {
+      const attempt = (async () => {
         await previousClose;
         if (this.closePromise) throw new Error("ChatGPT web turn broker is closed");
         this.lifecycle("start_requested");
         await this.openEndpoint();
-      })();
+      })().catch(async error => {
+        // Release the failed attempt's fd and ownership lock before permitting a new bind.
+        // Explicit close waits for this entire attempt and never reopens this broker.
+        try {
+          await this.closeEndpoint();
+        } catch (cleanupError) {
+          this.closeFailure = errorOf(cleanupError);
+          for (const socket of this.sockets) socket.destroy();
+          this.server?.unref();
+          this.lifecycle("start_cleanup_failed", {
+            reason: this.closeFailure.message, lockRetained: Boolean(this.releaseSocketLock),
+          });
+        }
+        if (this.startPromise === attempt && !this.closePromise && !this.endpointFailure && !this.closeFailure) {
+          this.rejectNewConnections = false;
+          this.startPromise = undefined;
+        }
+        throw error;
+      });
+      this.startPromise = attempt;
     }
-    return this.startPromise.then(() => this.assertEndpointReady(), async error => {
-      // close waits on the original startup promise, not on this caller's cleanup continuation.
-      // A failed listen must not retain a live-PID lock indefinitely.
-      try { await this.close(); } catch { /* close logged the retained ownership evidence */ }
-      throw error;
-    });
+    return this.startPromise.then(() => this.assertEndpointReady());
   }
 
   private openEndpoint(): Promise<void> {
@@ -2878,6 +2902,7 @@ export class TurnBroker implements TurnBrokerOwner {
       const result = binding.channel.compactionResult;
       if (!result) throw new Error("Codex context compaction control result is unavailable");
       binding.channel.compactionDeliveryCount += 1;
+      binding.channel.onCompactionProgress?.();
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} intercepted a post-compaction MCP call`,
       );
@@ -3053,7 +3078,10 @@ export class TurnBroker implements TurnBrokerOwner {
             : state.acknowledgedRevision !== state.acceptedRevision ? "unacknowledged" : undefined;
           return reason ? { result: this.notExecutedResult(reason), control: "task-update" } : undefined;
         });
-        if (started.created && started.control === "compaction") channel.compactionDeliveryCount += 1;
+        if (started.created && started.control === "compaction") {
+          channel.compactionDeliveryCount += 1;
+          channel.onCompactionProgress?.();
+        }
         if (started.request) {
           const toolRequest = started.request;
           channel.invocations.set(toolRequest.callId, {
@@ -3541,7 +3569,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.finalAnswer;
   }
 
-  async requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext): Promise<number> {
+  async requestCompaction(token: string, queuedResult: BrokerToolResult, context?: TaskUpdateOwnerContext, onProgress?: () => void): Promise<number> {
     const response = await callTurnBroker<{ interrupted?: unknown }>(this.socketPath, {
       method: "owner_request_compaction",
       token,
@@ -3551,7 +3579,11 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     if (!Number.isSafeInteger(response.interrupted) || Number(response.interrupted) < 0) {
       throw new Error("DEV Zero Risk turn owner received an invalid compaction interrupt count");
     }
-    return Number(response.interrupted);
+    const interrupted = Number(response.interrupted);
+    // The returned count proves delivery during this request. Later remote deliveries remain
+    // observed through the existing browser and Native progress feeds.
+    if (interrupted > 0) onProgress?.();
+    return interrupted;
   }
 
   async compactionDeliveryCount(token: string): Promise<number> {

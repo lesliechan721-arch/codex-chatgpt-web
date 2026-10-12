@@ -6,6 +6,12 @@ cost, permission, and client-validation requirements.
 
 ## Records and extraction
 
+Final JSON serialization escapes literal backticks as `\u0060`. This preserves decoded string
+values and prevents the observed ChatGPT Markdown link parser stall. A source field containing a
+backtick stays in JSON instead of a raw body; other eligible raw bodies retain their original bytes.
+Format selection, multipart allocation, and capacity checks count this final encoded representation.
+Dynamic outer fences alone do not provide this protection.
+
 Input is the existing normalized, projected, retired-handle-cleaned JSON value tree. The single-input
 legacy envelope is `{version:3, system, messages}`. Ordered records are:
 

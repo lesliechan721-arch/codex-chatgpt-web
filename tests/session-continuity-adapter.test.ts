@@ -805,14 +805,25 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   const sourceItem = sourceBody.input.find(item => item.id === "item_12")!;
   const sessionDirectory = join(codexHome, "sessions", "2026", "09", "30");
   mkdirSync(sessionDirectory, { recursive: true });
-  writeFileSync(join(sessionDirectory, `rollout-2026-09-30T09-00-00-${f.threadId}.jsonl`), [
+  const rolloutPath = join(sessionDirectory, `rollout-2026-09-30T09-00-00-${f.threadId}.jsonl`);
+  const nativeEnvironment = (item: Record<string, any>, turnId: string) => ({ type: "response_item", payload: {
+    ...item, internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["environments.environment_context"] },
+  } });
+  const nativeContext = (turnId: string) => ({ type: "turn_context", payload: { turn_id: turnId, cwd: "/tmp/cgw-protocol-fixture/workspace",
+    workspace_roots: ["/tmp/cgw-protocol-fixture/workspace"], approval_policy: "never", sandbox_policy: { type: "read-only" },
+    permission_profile: { type: "managed", network: "restricted", file_system: { type: "restricted",
+      entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] } } } });
+  const nativeRecords: unknown[] = [
     { type: "session_meta", payload: { id: f.threadId, source: "vscode" } },
-    { type: "turn_context", payload: { turn_id: sourceTurn, cwd: "/tmp/cgw-protocol-fixture/workspace",
-      workspace_roots: ["/tmp/cgw-protocol-fixture/workspace"], approval_policy: "never", sandbox_policy: { type: "read-only" },
-      permission_profile: { type: "managed", network: "restricted", file_system: { type: "restricted",
-        entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] } } } },
-    { type: "response_item", payload: { ...sourceItem, internal_chat_message_metadata_passthrough: { turn_id: sourceTurn } } },
-  ].map(item => JSON.stringify(item)).join("\n") + "\n");
+    { type: "event_msg", payload: { type: "task_started", turn_id: sourceTurn } },
+    nativeEnvironment(sourceBody.input.find(item => item.id === "item_4")!, sourceTurn),
+    nativeContext(sourceTurn),
+    { type: "response_item", payload: { ...sourceItem, internal_chat_message_metadata_passthrough: {
+      turn_id: sourceTurn, content_item_kinds: ["user.text"],
+    } } },
+  ];
+  const writeNativeRecords = () => writeFileSync(rolloutPath, nativeRecords.map(item => JSON.stringify(item)).join("\n") + "\n");
+  writeNativeRecords();
   const metadata = JSON.parse(sourceBody.client_metadata["x-codex-turn-metadata"]!);
   const options = { model: "gpt-5.6-sol", reasoning: { effort: "low" }, stream: false };
   const first = parseRequest({ ...sourceBody, ...options, client_metadata: { "x-codex-turn-metadata": JSON.stringify({
@@ -833,6 +844,10 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   compact._conversationPolicy = "continuity-first";
   compact._compactionRequest = true;
   compact._compactionOutput = "message";
+  // The retained source environment predates the standalone compaction task. A turn_context
+  // alone is not historical provenance; native Codex writes the task_started boundary too.
+  nativeRecords.push({ type: "event_msg", payload: { type: "task_started", turn_id: compactTurn } });
+  writeNativeRecords();
   await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolveWithRolloutPublicationRetry(compact);
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing verified compaction summary");
@@ -845,6 +860,12 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
     ...JSON.parse(continuedBody.client_metadata["x-codex-turn-metadata"]!), thread_id: f.threadId, turn_id: continuedTurn, request_kind: "turn",
   }) } });
   continued._conversationPolicy = "continuity-first";
+  nativeRecords.push(
+    { type: "event_msg", payload: { type: "task_started", turn_id: continuedTurn } },
+    nativeEnvironment(continuedBody.input.find(item => item.id === "item_20")!, continuedTurn),
+    nativeContext(continuedTurn),
+  );
+  writeNativeRecords();
   const accepted = await f.run(continued);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.pages.size).toBe(1);
@@ -4657,6 +4678,7 @@ for (const manual of [false, true]) for (const aliasedSource of (manual ? [false
     readFileSync(rolloutPath, "utf8") + items.map(item => JSON.stringify(item)).join("\n") + "\n");
   writeFileSync(rolloutPath, [
     { type: "session_meta", payload: { id: f.threadId, source: "vscode" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
     { type: "turn_context", payload: { turn_id: turnId, cwd: "/tmp", workspace_roots: ["/tmp"], approval_policy: "never",
       sandbox_policy: { type: "danger-full-access" }, permission_profile: { type: "disabled" } } },
   ].map(item => JSON.stringify(item)).join("\n") + "\n");
@@ -4672,10 +4694,12 @@ for (const manual of [false, true]) for (const aliasedSource of (manual ? [false
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const sourceItem = { type: "message", role: "user", id: "msg-canonical-source", content: "Source instruction.",
-    internal_chat_message_metadata_passthrough: { turn_id: turnId } };
+    internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["user.text"] } };
   const nativeSource = aliasedSource ? { ...sourceItem, id: "msg-initial-alias" } : sourceItem;
-  if (aliasedSource) append([{ type: "response_item", payload: sourceItem },
-    { type: "compacted", payload: { replacement_history: [nativeSource] } }]);
+  // Both paths prove their original human source before compaction; turn permissions alone
+  // cannot authenticate the canonical message. The aliased path also publishes its replacement.
+  append([{ type: "response_item", payload: sourceItem }]);
+  if (aliasedSource) append([{ type: "compacted", payload: { replacement_history: [nativeSource] } }]);
   const first = request([nativeSource]);
   await f.run(first);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;

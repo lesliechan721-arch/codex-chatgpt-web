@@ -6,6 +6,49 @@ import {
   resolveChatGptWebContextLimits,
 } from "../src/chatgpt-web-models";
 import { modelsRequest } from "../src/server";
+import { apiKeyPolicy, apiAccessRevision } from "../src/api-access";
+import { upstreamProviderRevision, type UpstreamProviderRuntime } from "../src/upstream-provider";
+
+test("API-key catalog client cancellation preserves provider authentication and does not report a failure", async () => {
+  const key = `cgw_${"c".repeat(43)}`;
+  const policy = apiKeyPolicy(key);
+  const config = defaultConfig("browser-only");
+  const runtime: UpstreamProviderRuntime = {
+    available: true, keyMatches: true, apiKey: "fixture-provider-key",
+    config: {
+      version: 2, baseUrl: "https://provider.example/v1/", apiKeySha256: "a".repeat(64),
+      proxy: { mode: "direct" }, models: [{ id: "fixture-model" }], supportsOpenAiServerCompaction: false,
+    },
+  };
+  for (const phase of ["before", "transport", "body"] as const) {
+    const controller = new AbortController();
+    let failures = 0, calls = 0;
+    if (phase === "before") controller.abort();
+    const response = await modelsRequest(new Request("http://127.0.0.1/v1/models", {
+      signal: controller.signal, headers: { authorization: `Bearer ${key}`, cookie: "private=1" },
+    }), config, undefined, undefined, policy, () => { failures++; }, runtime, async request => {
+      calls++;
+      expect(request.url).toBe("https://provider.example/v1/models");
+      expect(request.headers.get("authorization")).toBe("Bearer fixture-provider-key");
+      expect(request.headers.get("cookie")).toBeNull();
+      if (phase === "transport") { controller.abort(); throw new DOMException("cancel", "AbortError"); }
+      return new Response(new ReadableStream({ pull(stream) {
+        controller.abort(); stream.error(new DOMException("cancel", "AbortError"));
+      } }));
+    });
+    expect(response.status).toBe(499);
+    expect(failures).toBe(0);
+    expect(calls).toBe(phase === "before" ? 0 : 1);
+  }
+  const response = await modelsRequest(new Request("http://127.0.0.1/v1/models", {
+    headers: { authorization: `Bearer ${key}` },
+  }), config, undefined, undefined, policy, undefined, runtime,
+  async () => Response.json({ data: [{ id: "fixture-model", object: "model" }] }));
+  expect(response.status).toBe(200);
+  expect(response.headers.get("x-codex-chatgpt-web-api-access-revision")).toBe(apiAccessRevision(policy, config.controlToken));
+  expect(response.headers.get("x-codex-chatgpt-web-upstream-provider-revision"))
+    .toBe(upstreamProviderRevision(runtime.config!, config.controlToken));
+});
 
 test("catalog diagnostics preserve safe causes without attributing an upstream abort to the client", async () => {
   for (const [error, code] of [
@@ -198,4 +241,38 @@ test("ChatGPT-only native catalog rows do not turn model discovery into a 502", 
     .toHaveLength(7);
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))
     .every(model => model.supported_in_api === true)).toBe(true);
+});
+
+
+test("client cancellation is not a catalog failure, including during response body reading", async () => {
+  for (const phase of ["before", "transport", "body"] as const) {
+    const controller = new AbortController();
+    let failures = 0, calls = 0;
+    if (phase === "before") controller.abort();
+    const response = await modelsRequest(new Request("http://127.0.0.1/v1/models", {
+      signal: controller.signal, headers: { authorization: "Bearer fixture" },
+    }), defaultConfig("browser-only"), async () => {
+      calls++;
+      if (phase === "transport") { controller.abort(); throw new DOMException("cancel", "AbortError"); }
+      return new Response(new ReadableStream({ pull(stream) {
+        controller.abort(); stream.error(new DOMException("cancel", "AbortError"));
+      } }));
+    }, undefined, () => { failures++; });
+    expect(response.status).toBe(499);
+    expect(failures).toBe(0);
+    expect(calls).toBe(phase === "before" ? 0 : 1);
+  }
+});
+
+test("a server cancellation remains a failure when the client is still connected", async () => {
+  const server = new AbortController();
+  const client = new AbortController();
+  let failure: unknown;
+  const response = await modelsRequest(new Request("http://127.0.0.1/v1/models", {
+    signal: server.signal, headers: { authorization: "Bearer fixture" },
+  }), defaultConfig("browser-only"), async () => {
+    server.abort(); throw new DOMException("server cancellation", "AbortError");
+  }, undefined, value => { failure = value; }, undefined, undefined, undefined, client.signal);
+  expect(response.status).toBe(502);
+  expect(failure).toEqual({ stage: "transport", code: "ABORT_ERR" });
 });

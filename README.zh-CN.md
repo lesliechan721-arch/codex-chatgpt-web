@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">所有版本</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">所有版本</a>
 </p>
 
 <p align="center">
@@ -91,9 +91,13 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
 > 账户类型、模型和所选 effort。Plus 的 Medium/High 使用实测的 90,000-token 窗口。
 > GPT-5.6 启用实验性的 **3× context** 后最高为 270,000 tokens，并支持原生 Codex compaction。
 >
-> GPT-6 Sol 仅在 Pro 账户的 Medium、High、Extra High 下支持 Bigger Context：窗口为
-> **240,000 tokens**，在 **220,000 tokens** 时压缩。GPT-6 Instant 和其他账户的 GPT-6 Sol
-> 使用标准容量。GPT-5.6 和 GPT-6 Pro 保留原有 Bigger Context 容量。
+> GPT-6 Sol 在 Medium、High 和可用的 Extra High 下支持 Bigger Context：Plus 窗口为
+> **120,000 tokens**，在 **110,000 tokens** 时压缩；Pro 窗口为 **240,000 tokens**，
+> 在 **220,000 tokens** 时压缩。GPT-6 Instant 使用标准容量。
+> GPT-5.6 和 GPT-6 Pro 保留原有 Bigger Context 容量。
+
+> Luna/Think 可启用实验性分段大上下文。Free 长会话可能丢失较早细节。关闭大上下文时，
+> Luna 保留滚动 checkpoint。Continuity first 保持独立历史预算，不使用分段投递。
 
 1. 完成启动器中的必需设置。
 2. 在启动器中打开 **MCP**。请在将使用 ChatGPT 连接器的同一个 OpenAI 账户中创建 Tunnel

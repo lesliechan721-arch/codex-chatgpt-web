@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.7-5/codex-web-gpt-6.1.7-5-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.9-1/codex-web-gpt-6.1.9-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
 </p>
 
 <p align="center">
@@ -91,10 +91,15 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 > Medium/High は実測 90,000-token ウィンドウを使用します。GPT-5.6 では実験的な **3× context**
 > を有効にすると最大 270,000 tokens まで拡張され、ネイティブ Codex compaction に対応します。
 >
-> GPT-6 Sol の Bigger Context は Pro アカウントの Medium、High、Extra High に対応し、
-> **240,000 tokens** のウィンドウと **220,000 tokens** の圧縮閾値を使用します。
-> GPT-6 Instant と他のプランの GPT-6 Sol は標準容量を使用します。
+> GPT-6 Sol の Bigger Context は Medium、High、および利用可能な Extra High に対応します。
+> Plus は **120,000 tokens** のウィンドウと **110,000 tokens** の圧縮閾値、
+> Pro は **240,000 tokens** のウィンドウと **220,000 tokens** の圧縮閾値を使用します。
+> GPT-6 Instant は標準容量を使用します。
 > GPT-5.6 と GPT-6 Pro の既存の Bigger Context 上限は変わりません。
+
+> Luna/Think は試験的な分割 Bigger Context を利用できます。Free の長いチャットでは古い詳細が
+> 失われる場合があります。無効時は Luna のローリング checkpoint を維持します。Continuity first は
+> 独立した履歴予算を維持し、分割送信を使いません。
 
 1. ランチャーの必須セットアップを完了します。
 2. ランチャーで **MCP** を開きます。ChatGPT コネクタを使用するものと同じ OpenAI アカウントで

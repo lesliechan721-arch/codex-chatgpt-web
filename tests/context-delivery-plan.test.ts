@@ -130,21 +130,24 @@ for (const manual of [false, true]) for (const length of [6000, 10000]) {
 
 test("retained history keeps the inline candidate that fits the default window", async () => {
   const canonical = logRequest("A".repeat(6000)), snapshot = createContextSnapshot(canonical);
-  const inline = plan(canonical, { snapshot, contextToolsAvailable: false, budget: { retainedTokens: 75412 } });
+  const baseline = plan(canonical, { snapshot, contextToolsAvailable: false });
+  const maxRetainedTokens = baseline.costs.contextWindowTokens - baseline.costs.requiredTotalTokens;
+  const retainedTokens = maxRetainedTokens - 20;
+  const inline = plan(canonical, { snapshot, contextToolsAvailable: false, budget: { retainedTokens } });
   expect(inline.costs.contextWindowTokens).toBe(90_000);
   expect(inline.costs.requiredTotalTokens).toBe(89_980);
-  const result = plan(canonical, { snapshot, budget: { retainedTokens: 75412 } });
+  const result = plan(canonical, { snapshot, budget: { retainedTokens } });
   expect(result.navigationEnabled).toBe(false);
   expect(result.compiled).toEqual(inline.compiled);
-  expect(plan(canonical, { snapshot, budget: { retainedTokens: 75432 } }).costs.requiredTotalTokens).toBe(90_000);
-  expect(() => plan(canonical, { snapshot, budget: { retainedTokens: 75433 } })).toThrow("exceed the context budget");
+  expect(plan(canonical, { snapshot, budget: { retainedTokens: maxRetainedTokens } }).costs.requiredTotalTokens).toBe(90_000);
+  expect(() => plan(canonical, { snapshot, budget: { retainedTokens: maxRetainedTokens + 1 } })).toThrow("exceed the context budget");
   const limits = { listTokens: 128 };
-  expect(plan(canonical, { snapshot, limits, budget: { retainedTokens: 75432 } }).costs.requiredTotalTokens).toBe(90_000);
-  expect(() => plan(canonical, { snapshot, limits, budget: { retainedTokens: 75433 } })).toThrow("exceed the context budget");
+  expect(plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens } }).costs.requiredTotalTokens).toBe(90_000);
+  expect(() => plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens + 1 } })).toThrow("exceed the context budget");
   const broker = TurnBroker.forSocket(join(tmpdir(), `context-cost-${randomUUID()}.sock`));
   const send = new ContextSend(canonical, broker, capabilities, "cost-boundary", undefined, undefined, snapshot);
   try {
-    const prepared = await send.prepare(canonical, token, {}, 75412);
+    const prepared = await send.prepare(canonical, token, {}, retainedTokens);
     expect(prepared.navigationEnabled).toBe(false);
     expect(prepared.compiled).toEqual(inline.compiled);
     await send.select(token, prepared);

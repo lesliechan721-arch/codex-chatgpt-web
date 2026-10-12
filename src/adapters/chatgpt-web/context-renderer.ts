@@ -58,6 +58,15 @@ function invalid(reason: string): never {
   throw new Error(`Invalid web context payload: ${reason}`);
 }
 
+/** Escape at final serialization: parsing an earlier JSON envelope restores its backticks. */
+export function stringifyWebContextJson(value: unknown): string {
+  const json = JSON.stringify(value);
+  if (json === undefined) throw new Error("Web context field must have a JSON representation");
+  // ChatGPT's Markdown link lexer can stall on repeated code spans inside bracketed JSON.
+  // JSON Unicode escapes preserve both backticks and existing literal backslash sequences.
+  return json.replaceAll("`", "\\u0060");
+}
+
 function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): void {
   if (required.some(key => !own(value, key)) || Object.keys(value).some(key => !required.includes(key) && !optional.includes(key))) {
     invalid("missing or unknown structural field");
@@ -102,6 +111,9 @@ export function isWebContextRawTextEligible(value: string, policy?: WebContextRa
   if (policy && (!policy.evidence.trim() || !["automatic", "zero-risk"].includes(policy.verifiedPath))) {
     throw new Error("Web context whitespace policy requires verified input-path evidence");
   }
+  // Raw bodies are exact source bytes. Keep code spans in escaped JSON rather than changing a
+  // raw body or its UTF-8 length to protect the Markdown parser.
+  if (value.includes("`")) return false;
   // UTF-8 encoding must not replace an isolated surrogate with U+FFFD.
   for (let offset = 0; offset < value.length; offset += 1) {
     const code = value.charCodeAt(offset);
@@ -150,8 +162,7 @@ function location(root: unknown, path: WebContextPath): { parent: Record<string,
 }
 
 function fieldRepresentation(value: unknown, path: WebContextPath, boundary: string, policy?: WebContextRawTextPolicy): { text: string; raw: boolean } {
-  const json = JSON.stringify(value);
-  if (json === undefined) throw new Error("Web context field must have a JSON representation");
+  const json = stringifyWebContextJson(value);
   if (typeof value !== "string" || !value || !isWebContextRawTextEligible(value, policy)) return { text: json, raw: false };
   const descriptor: RawDescriptor = { path: [...path], boundary, utf8_bytes: Buffer.byteLength(value, "utf8") };
   // Charge a whole descriptor list header per field. This conservative filter is bounded and
@@ -174,8 +185,7 @@ export function estimateWebContextFieldCost(value: unknown, options: {
   if (format !== "legacy-json" && format !== WEB_CONTEXT_TEXT_FORMAT) throw new Error("Unknown web context format");
   const representation = format === WEB_CONTEXT_TEXT_FORMAT && options.rawEligible !== false
     ? fieldRepresentation(value, options.path ?? ["message", "content"], "source_body_0", options.rawTextPolicy)
-    : { text: JSON.stringify(value), raw: false };
-  if (representation.text === undefined) throw new Error("Web context field must have a JSON representation");
+    : { text: stringifyWebContextJson(value), raw: false };
   return { tokens: estimateTokens(representation.text), chars: representation.text.length,
     jsonBytes: Buffer.byteLength(JSON.stringify(representation.text), "utf8"), raw: representation.raw, format };
 }
@@ -196,7 +206,7 @@ function renderRecord(record: WebContextRecord, allocate: (reserve?: boolean) =>
     bodies.push(`<${boundary}>\n${target.value}\n</${boundary}>\n`);
     (target.parent as Record<string | number, unknown>)[target.key] = null;
   }
-  return JSON.stringify({ record: cloned, ...(descriptors.length ? { raw_fields: descriptors } : {}) }) + "\n" + bodies.join("");
+  return stringifyWebContextJson({ record: cloned, ...(descriptors.length ? { raw_fields: descriptors } : {}) }) + "\n" + bodies.join("");
 }
 
 /** No mixed candidate is needed when none of the declared leaves can pay its own raw framing. */
@@ -215,7 +225,7 @@ export function encodeWebContextPayload(records: readonly WebContextRecord[], fo
   assertRecordOrder(normalized, !multipart);
   let payload: string;
   if (format === "legacy-json") {
-    payload = JSON.stringify(multipart ? { version: 1, part_index: options.partIndex, total_parts: options.totalParts, records: normalized }
+    payload = stringifyWebContextJson(multipart ? { version: 1, part_index: options.partIndex, total_parts: options.totalParts, records: normalized }
       : contextFromRecords(normalized));
   } else if (format === WEB_CONTEXT_TEXT_FORMAT) {
     const source = JSON.stringify(normalized);
@@ -229,7 +239,7 @@ export function encodeWebContextPayload(records: readonly WebContextRecord[], fo
       if (reserve) { used.add(boundary); next += 1; }
       return boundary;
     };
-    payload = JSON.stringify({ format: WEB_CONTEXT_TEXT_FORMAT, context_version: 3, record_count: normalized.length,
+    payload = stringifyWebContextJson({ format: WEB_CONTEXT_TEXT_FORMAT, context_version: 3, record_count: normalized.length,
       ...(multipart ? { part_index: options.partIndex, total_parts: options.totalParts } : {}) }) + "\n"
       + normalized.map(record => renderRecord(record, allocate, options.rawTextPolicy)).join("");
   } else throw new Error("Unknown web context format");

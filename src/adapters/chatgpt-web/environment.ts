@@ -412,6 +412,9 @@ export function trustedEnvironmentRequestDetails(parsed: CodexParsedRequest): Re
 export interface ChatGptUnattributedEnvironmentMessage {
   id: string;
   content: unknown;
+  /** Optional wire constraints; only a matching native record can prove either value. */
+  turnId?: string;
+  contentItemKinds?: unknown;
 }
 
 /** These are claims to locate in native history, never a source of filesystem authority. */
@@ -434,6 +437,35 @@ export function unattributedChatGptEnvironmentMessages(
     messages.push({ id: item.id, content: item.content });
   }
   return messages.length > 0 ? messages : undefined;
+}
+
+/** A native text compact must prove every carried environment, including attributed history. */
+export function nativeChatGptCompactionEnvironmentMessages(parsed: CodexParsedRequest): {
+  current?: ChatGptUnattributedEnvironmentMessage;
+  historical: ChatGptUnattributedEnvironmentMessage[];
+} {
+  const input = record(parsed._rawBody)?.input;
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  const current: ChatGptUnattributedEnvironmentMessage[] = [];
+  const historical: ChatGptUnattributedEnvironmentMessage[] = [];
+  const ids = new Set<string>();
+  for (const value of Array.isArray(input) ? input : []) {
+    const item = record(value);
+    if (!hasEnvironmentContextFragment(item)) continue;
+    if (typeof item.id !== "string" || !item.id) {
+      throw new TrustedCodexEnvironmentValidationError("Native compaction environment has no source message id");
+    }
+    if (ids.has(item.id)) throw new TrustedCodexEnvironmentValidationError("Codex environment history repeats a message id");
+    ids.add(item.id);
+    const provenance = record(item.internal_chat_message_metadata_passthrough);
+    const message = { id: item.id, content: item.content,
+      ...(itemTurnId(item) ? { turnId: itemTurnId(item) } : {}),
+      ...(provenance?.content_item_kinds !== undefined ? { contentItemKinds: provenance.content_item_kinds } : {}),
+    };
+    (itemTurnId(item) === turnId ? current : historical).push(message);
+  }
+  if (current.length > 1) throw new TrustedCodexEnvironmentValidationError("Native compaction repeats the current environment");
+  return { ...(current[0] ? { current: current[0] } : {}), historical };
 }
 
 function contextualUserMessage(value: Record<string, unknown>): boolean {
@@ -999,8 +1031,57 @@ export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boo
     && isAcceptedCompactionContinuation(parsed, identity, revision);
 }
 
+export interface ChatGptEnvironmentClaim {
+  environment: ChatGptTurnEnvironment;
+  /** Exact request message selected by the environment parser; native provenance is still unproven. */
+  sourceMessage?: ChatGptUnattributedEnvironmentMessage;
+  /**
+   * Codex's permission-profile envelope states filesystem access only; the network policy lives
+   * in the native turn context. Only the legacy sandbox_mode envelope carried a network statement.
+   */
+  statesNetworkAccess: boolean;
+}
+
+export type ChatGptNativeCompactionPhase = "pre_turn" | "mid_turn" | "post_turn" | "standalone_turn";
+
+/** Only the recognized native text protocol can borrow a retained checkpoint's permission turn. */
+export function extractChatGptNativeCompactionPhase(parsed: CodexParsedRequest): ChatGptNativeCompactionPhase | undefined {
+  if (!parsed._compactionRequest) return undefined;
+  const metadata = clientTurnMetadata(parsed);
+  const protocol = record(metadata?.compaction);
+  if (metadata?.request_kind !== "compaction" || protocol?.implementation !== "responses"
+    || protocol.strategy !== "memento") return undefined;
+  const phase = protocol.phase;
+  if (phase === "pre_turn" || phase === "mid_turn" || phase === "post_turn" || phase === "standalone_turn") return phase;
+  // Declaring this native protocol requires its phase. Unknown/missing phases cannot fall back
+  // to the genuinely older wire protocol, which had no responses/memento declaration.
+  throw new TrustedCodexEnvironmentValidationError("Native Codex compaction declares an invalid phase");
+}
+
+function environmentClaim(parsed: CodexParsedRequest, text: string): ChatGptEnvironmentClaim {
+  return {
+    environment: parseChatGptEnvironmentText(parsed, text),
+    statesNetworkAccess: /<network_access\b/i.test(text) || /network access is /i.test(text),
+  };
+}
+
+/** Parse only after the caller has proved this exact message in the native current checkpoint. */
+export function extractChatGptEnvironmentMessageClaim(
+  parsed: CodexParsedRequest, message: ChatGptUnattributedEnvironmentMessage,
+): ChatGptEnvironmentClaim {
+  const texts = (Array.isArray(message.content) ? message.content : []).flatMap(part => {
+    const text = record(part)?.text;
+    return typeof text === "string" && /^<environment_context>[\s\S]*<\/environment_context>$/.test(text.trim())
+      ? [text.trim()] : [];
+  });
+  if (texts.length !== 1) {
+    throw new TrustedCodexEnvironmentValidationError("Codex rollout does not authenticate the current environment message");
+  }
+  return environmentClaim(parsed, texts[0]!);
+}
+
 /** Parse a claim only: the caller must compare it with this turn's native rollout authority. */
-export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
+export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRequest): ChatGptEnvironmentClaim {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const body = record(parsed._rawBody);
   const updates = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
@@ -1022,7 +1103,7 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
       "Compaction continuation requires one current native environment claim",
     );
   }
-  return parseChatGptEnvironmentText(parsed, updates[0]!);
+  return environmentClaim(parsed, updates[0]!);
 }
 
 /**
@@ -1030,7 +1111,7 @@ export function extractChatGptContinuationEnvironmentClaim(parsed: CodexParsedRe
  * Git workspace metadata need not list every native filesystem root. Return that earlier claim
  * only for a same-turn pair; the store must compare it with the current canonical rollout.
  */
-export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
+export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedRequest): ChatGptEnvironmentClaim | undefined {
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   if (!turnId) return undefined;
   const body = record(parsed._rawBody);
@@ -1059,7 +1140,7 @@ export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedReques
     const instruction = record(input[index]);
     if (typeof instruction?.id !== "string" || !instruction.id) continue;
     const text = environmentBeforeUser(input, index, turnId, metadata);
-    if (text) return parseChatGptEnvironmentText(parsed, text);
+    if (text) return environmentClaim(parsed, text);
   }
   return undefined;
 }
@@ -1070,33 +1151,46 @@ export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedReques
  * still requires this exact turn's native rollout and corroborating current sandbox metadata.
  * Unknown profiles/fields are deliberately not classified as permission-neutral updates.
  */
-export function hasChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): boolean {
+export function extractChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): {
+  workspaceRoots: string[][];
+} | undefined {
   const metadata = clientTurnMetadata(parsed);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
-  if (!metadata || !turnId) return false;
+  if (!metadata || !turnId) return undefined;
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const activeIndex = input.findLastIndex(value => isNativeInstruction(record(value), metadata));
   const active = record(input[activeIndex]);
-  if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return false;
+  if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return undefined;
 
   let deltas = 0;
+  const workspaceRoots: string[][] = [];
   for (let index = activeIndex + 1; index < input.length; index += 1) {
     const item = record(input[index]);
     if (!hasEnvironmentContextFragment(item)) continue;
-    if (item.role !== "user" || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id
-      || !hasAssistantOutputBetween(input, activeIndex + 1, index)) return false;
+    if (item.role !== "user" || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id) return undefined;
     const text = rawMessageText(item).trim();
     // Match the whole native fragment, not just the presence of a disabled profile: another
     // profile, a malformed cwd, or any additional permission declaration must fail closed.
-    if (!/^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.test(text)
+    const match = /^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*(?:<workspace_roots>((?:\s*<root>[^<>]+<\/root>\s*)+)<\/workspace_roots>\s*)?<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.exec(text);
+    if (!match
       || !sandboxMetadataMatchesEnvironment(canonicalSandboxMetadata(metadata), text)
       || [metadata.sandbox_mode, metadata.sandbox].some(value => (
         value !== undefined && !sandboxMetadataMatchesEnvironment(value, text)
-      ))) return false;
+      ))) return undefined;
+    if (match[1]) {
+      let roots: string[];
+      try { roots = [...match[1].matchAll(/<root>([^<]+)<\/root>/g)].map(root => decodeXmlText(root[1]!.trim())); }
+      catch { return undefined; }
+      if (roots.some(root => !isAbsolute(root))) return undefined;
+      workspaceRoots.push([...new Set(roots.map(pathIdentity))]);
+    }
     deltas += 1;
   }
-  return deltas > 0;
+  // A native delta may precede the first assistant response (#812). Its current-turn
+  // attribution permits verification, never authority: all repeated roots must agree
+  // with the current rollout before the store can accept this update.
+  return deltas > 0 ? { workspaceRoots } : undefined;
 }
 
 function environmentBeforeUser(input: unknown[], userIndex: number, expectedTurnId?: string, metadata?: Record<string, unknown>): string | undefined {
@@ -1545,6 +1639,24 @@ export function extractChatGptDelegatedTurnCapability(
     turnId,
     tools: structuredClone(parsed.context.tools ?? []),
   };
+}
+
+export function extractChatGptTurnEnvironmentClaim(parsed: CodexParsedRequest): ChatGptEnvironmentClaim {
+  const text = trustedEnvironmentText(parsed);
+  const claim = environmentClaim(parsed, text);
+  const input = record(parsed._rawBody)?.input;
+  const messages = Array.isArray(input) ? input.map(record).filter(item => {
+    if (item?.role !== "user" || typeof item.id !== "string" || !item.id) return false;
+    const parts = typeof item.content === "string" ? [item.content]
+      : Array.isArray(item.content) ? item.content.map(part => record(part)?.text) : [];
+    return parts.some(part => typeof part === "string" && part.trim() === text.trim());
+  }) : [];
+  const source = messages.length === 1 ? messages[0] : undefined;
+  // Duplicate ids or identical competing envelopes cannot identify the selected native message.
+  if (source && (input as unknown[]).filter(value => record(value)?.id === source.id).length === 1) {
+    claim.sourceMessage = { id: source.id as string, content: source.content };
+  }
+  return claim;
 }
 
 function parseChatGptEnvironmentText(parsed: CodexParsedRequest, text: string): ChatGptTurnEnvironment {
