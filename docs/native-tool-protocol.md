@@ -165,8 +165,13 @@ An owner-only transfer binds its ID to immutable local commit data. For the ordi
 includes the exact updates, registry, and original result batch. Continuity retries recover that
 local data without requiring the client to repeat the original batch or history.
 Reservation precedes the short Session preparation barrier; atomic acceptance installs the new
-revision and driver generation before waking real result promises. Outcomes are immutable:
-`committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
+revision and driver generation before waking real result promises.
+Append reservation checks the live tool or confirmation boundary before binding its ID. The
+reservation retains that admission for the same immutable transfer if an ACK closes the window
+before commit; driver, revision, final output, compaction and result-batch checks still apply.
+Remote append reservation checks Broker compatibility before sending the reservation request.
+Draining rejects new external owners; existing tokens can still update and recover transfer receipts.
+Outcomes are immutable: `committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
 same transfer. A timeout or absent lookup is not evidence that it failed to commit.
 
 Native query replies retain their original `pending` or `result` plus a separate `taskUpdate`
@@ -289,7 +294,7 @@ for cleanup before saving inherited candidates. If that storage exhausts the jou
 and capability revocation still occur; a rejected non-owning or older-generation round cannot
 gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 12. Native waiting and task update protocols are 1; the context
+The implemented Broker protocol is 13. Native waiting and task update protocols are 1; the context
 protocol is 2 and requires `context-text-read-v2` for successful text pages.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary

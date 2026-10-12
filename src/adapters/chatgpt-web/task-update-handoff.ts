@@ -126,13 +126,13 @@ export async function tryTaskUpdateHandoff(options: {
       taskRevision: attempt.proof.expectedRevision };
     let reserved: TaskUpdateTransferOutcome | undefined;
     if (!attempt.reserved) {
-      const reserve = () => broker.reserveTaskUpdate!(token, attempt!.transfer.transferId, attempt!.transfer.payloadDigest, context);
+      const reserve = () => broker.reserveTaskUpdate!(token, attempt!.transfer.transferId, attempt!.transfer.payloadDigest, context, true);
       try { reserved = await reserve(); }
       catch (error) {
         if (errorCode(error)?.startsWith("task_update_") || errorCode(error)?.startsWith("codex_tool_")) {
           attempts.delete(session);
           attempt.release();
-          if (errorCode(error) === "task_update_final_output_started" && !continuity) return undefined;
+          if (!continuity && (errorCode(error) === "task_update_final_output_started" || errorCode(error) === "task_update_no_boundary")) return undefined;
           throw error;
         }
         // Reservation receipt loss also recovers the identical outcome slot. A not-found

@@ -13,7 +13,7 @@ import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, sameContinuityRecoveryIdentity, type ContinuityLease, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
 import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnExecutionKey, chatGptTurnSessions, TASK_UPDATE_SESSION_JOURNAL_BYTES } from "../src/adapters/chatgpt-web/turn-execution";
-import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import type { TaskUpdateTransfer, TaskUpdateTransferOutcome, UpdateDelivery } from "../src/adapters/chatgpt-web/task-update-protocol";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
@@ -57,7 +57,7 @@ function resultStorage(session: ReturnType<Awaited<ReturnType<typeof fixture>>["
 }
 
 async function fixture(manual = false, protocol = true, search = false,
-  options: { root?: string; preserveRoot?: boolean } = {}) {
+  options: { root?: string; preserveRoot?: boolean; remote?: boolean } = {}) {
   // Keep Unix socket paths short; Windows uses its system temp directory and named pipes.
   const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-update-"));
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
@@ -208,7 +208,8 @@ async function fixture(manual = false, protocol = true, search = false,
   };
   const originalAccept = broker.acceptTaskUpdate;
   if (!protocol) broker.acceptTaskUpdate = undefined as never;
-  const adapter = createChatGptWebAdapter(provider, { broker, zeroRiskManualControl: manualControl });
+  if (options.remote) await broker.listen();
+  const adapter = createChatGptWebAdapter(provider, { broker: options.remote ? new RemoteTurnBroker(socket) : broker, zeroRiskManualControl: manualControl });
   const request = (input: unknown[] = [user("initial-user", "Inspect the project.")], requestId = "request") => {
     const parsed = parseRequest({ model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : "gpt-5.6-sol",
       stream: false, input, tools: [{ type: "function", name: "exec_command", description: "Simulated tool",
@@ -763,6 +764,124 @@ test("A6 continuity rejects a current result type and an accepted appended text 
   await expect(f.run(f.request([user("append", "conflicting text")]))).rejects.toMatchObject({ code: "task_update_message_conflict" });
   expect(f.session().taskRevision()).toBe(1);
   expect(f.session().isTaskUpdateCancelled()).toBeFalse();
+});
+
+for (const manual of [false, true]) for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} ${manual ? "Zero Risk" : "Automatic"} retains a reserved append across ACK and a lost commit receipt`, async () => {
+  const f = await fixture(manual, true, false, { remote });
+  const [call] = await batch(f);
+  const firstRunning = f.run(f.request([user("first-append", "First update."), output(call!.id)], "first-append"));
+  let firstReply = await f.wait(1);
+  while (firstReply.kind !== "result") firstReply = await f.wait(1);
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  let transferId: string | undefined;
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    const receipt = originalReserve(...args);
+    transferId = args[1];
+    f.ack(firstReply.taskUpdate!);
+    return receipt;
+  });
+  const originalAccept = f.broker.acceptTaskUpdate.bind(f.broker);
+  let receiptLost = false;
+  const accept = spyOn(f.broker, "acceptTaskUpdate").mockImplementation((...args) => {
+    const receipt = originalAccept(...args);
+    if (!receiptLost && receipt.status === "committed") {
+      receiptLost = true;
+      throw new Error("Lost committed append receipt after ACK");
+    }
+    return receipt;
+  });
+  cleanup.push(async () => { reserve.mockRestore(); accept.mockRestore(); });
+  const second = f.request([user("second-append", "Second update.")], "second-append");
+  const secondRunning = f.run(second);
+  expect((await firstRunning).at(-1)).toMatchObject({ type: "incomplete", reason: "task_update_handoff" });
+  const reply = await f.wait(1);
+  expect(receiptLost).toBeTrue();
+  expect(reply.kind).toBe("result");
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["second-append"]);
+  expect(f.broker.taskUpdateTransferOutcome(f.token(), transferId!)).toMatchObject({ status: "committed" });
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 2, driverGeneration: 2, acknowledgedRevision: 1 });
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await secondRunning).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect((await f.run(f.request([user("second-append", "Second update.")], "second-append-retry"))).at(-1))
+    .toMatchObject({ type: "done", endTurn: true });
+  expect(f.session().taskRevision()).toBe(2);
+  expect(f.session().driverGeneration()).toBe(2);
+  expect(f.submissions()).toBe(1);
+});
+
+for (const manual of [false, true]) test(`Remote ${manual ? "Zero Risk" : "Automatic"} recovers a lost reservation receipt while draining`, async () => {
+  const f = await fixture(manual, true, false, { remote: true });
+  const [call] = await batch(f);
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  let receiptLost = false;
+  const transferIds: string[] = [];
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    transferIds.push(args[1]);
+    const receipt = originalReserve(...args);
+    if (!receiptLost) {
+      receiptLost = true;
+      f.broker.setExternalOwnersAccepted(false);
+      throw new Error("Lost reservation receipt while entering drain");
+    }
+    return receipt;
+  });
+  cleanup.push(async () => { reserve.mockRestore(); });
+  const running = f.run(f.request([user("append", "Include validation."), output(call!.id)], "append"));
+  let reply = await f.wait(1);
+  while (reply.kind !== "result") reply = await f.wait(1);
+  expect(receiptLost).toBeTrue();
+  expect(transferIds).toHaveLength(2);
+  expect(new Set(transferIds).size).toBe(1);
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.session().taskRevision()).toBe(1);
+  expect(f.session().driverGeneration()).toBe(1);
+  expect(f.session().hasPendingTaskUpdate()).toBeFalse();
+  expect(f.submissions()).toBe(1);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} rejects a completed tool boundary without binding an update ID and accepts the append at the next boundary`, async () => {
+  const f = await fixture(manual);
+  const [firstCall] = await batch(f);
+  const resultEvents: AdapterEvent[] = [];
+  const resultRound = f.run(f.request([user("initial-user", "Inspect the project."), output(firstCall!.id)], "first-result"), resultEvents);
+  let firstReply = await f.wait(1);
+  while (firstReply.kind !== "result") firstReply = await f.wait(1);
+  expect(f.session().outstanding()).toHaveLength(0);
+  const rejectedIds: string[] = [];
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    rejectedIds.push(args[1]);
+    return originalReserve(...args);
+  });
+  cleanup.push(async () => { reserve.mockRestore(); });
+  for (let retry = 0; retry < 2; retry++) {
+    const appended = f.request([user("append", "Also inspect tests.")], `append-${retry}`);
+    for (const message of appended.context.messages) message.timestamp += retry;
+    await expect(f.run(appended)).rejects.toMatchObject({ code: "task_update_no_boundary" });
+    expect(f.session().isActive()).toBeTrue();
+    expect(f.session().isTaskUpdateCancelled()).toBeFalse();
+    expect(f.session().hasPendingTaskUpdate()).toBeFalse();
+    expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+  }
+  expect(rejectedIds).toHaveLength(2);
+  expect(new Set(rejectedIds).size).toBe(1);
+  expect(f.broker.taskUpdateTransferOutcome(f.token(), rejectedIds[0]!)).toMatchObject({ status: "unknown" });
+  expect(await f.start(2)).toMatchObject({ kind: "pending" });
+  await resultRound;
+  const nextCall = resultEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
+  expect(nextCall).toBeDefined();
+  const running = f.run(f.request([user("append", "Also inspect tests."), output(nextCall!.id)], "append-next-boundary"));
+  let reply = await f.wait(2);
+  while (reply.kind !== "result") reply = await f.wait(2);
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions()).toBe(1);
 });
 
 test("A7-A9 continuity reports no boundary and old protocol without cancelling their physical response", async () => {

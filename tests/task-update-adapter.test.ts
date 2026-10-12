@@ -418,6 +418,36 @@ describe("Automatic Adapter task updates", () => {
     } finally { await f.close(); }
   });
 
+  for (const remote of [false, true]) test(`ACK closes before ${remote ? "Remote" : "Local"} reservation and the ordinary append uses the replacement path`, async () => {
+    const f = await fixture({ remote });
+    try {
+      const { token, callId } = await originalBatch(f);
+      const one = append(f.initial, callId, [{ id: "update-1", text: "Include validation." }]);
+      const prior = f.run(one);
+      const result = await f.wait(token, 1);
+      await f.observing(1);
+      const reserve = f.owner.reserveTaskUpdate!.bind(f.owner);
+      let crossed = false;
+      f.owner.reserveTaskUpdate = async (...args) => {
+        if (!crossed) {
+          crossed = true;
+          await ack(f, token, result.taskUpdate!);
+        }
+        return reserve(...args);
+      };
+      const two = append(one, callId, [{ id: "update-2", text: "Add a conclusion." }]);
+      const events: AdapterEvent[] = [];
+      const newest = f.run(two, events);
+      const replacement = await f.nextRun(1);
+      await prior;
+      await f.finish(replacement.token, replacement.turn, "Replacement answer.", { expectedDriverGeneration: 0, taskRevision: 0 });
+      expect(await newest).toEqual(events);
+      expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+      expect(crossed).toBeTrue();
+      expect(f.submissions()).toBe(2);
+    } finally { await f.close(); }
+  });
+
   test("a committed Remote transfer with a lost receipt is recovered without duplicate result or browser work", async () => {
     const f = await fixture({ remote: true });
     try {

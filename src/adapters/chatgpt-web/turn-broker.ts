@@ -38,6 +38,8 @@ interface TaskUpdateTransferRecord {
   fingerprint?: string;
   context: TaskUpdateOwnerContext;
   outcome: TaskUpdateTransferOutcome;
+  /** This transaction entered an open boundary; its same-version ACK cannot revoke admission. */
+  openBoundaryReserved?: true;
   /** Present only between irreversible acceptance and helper publication/result release. */
   synchronize?: () => void;
   /** Retained after retirement when atomic replacement cannot yet be read back exactly. */
@@ -281,6 +283,7 @@ interface BrokerRequest {
   summary?: string;
   surfaceNonce?: string;
   requireSentConfirmation?: boolean;
+  requireOpenBoundary?: boolean;
   finalAnswer?: string;
   contract?: "native" | "safe";
   operationId?: number;
@@ -308,7 +311,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 12;
+const TURN_BROKER_PROTOCOL_VERSION = 13;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -540,7 +543,7 @@ export interface TurnBrokerOwner {
   revokeTrusted?(token: string, reason?: Error): void | Promise<void>;
   taskUpdateState?(token: string): TaskUpdateState | undefined | Promise<TaskUpdateState | undefined>;
   waitForTaskUpdateState?(token: string, afterRevision: number, signal?: AbortSignal): Promise<TaskUpdateStateSnapshot>;
-  reserveTaskUpdate?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
+  reserveTaskUpdate?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, requireOpenBoundary?: boolean): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
   acceptTaskUpdate?(token: string, transfer: TaskUpdateTransfer): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
   rejectTaskUpdateReservation?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, code?: string): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
   taskUpdateTransferOutcome?(token: string, transferId: string): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
@@ -1173,7 +1176,7 @@ export class TurnBroker implements TurnBrokerOwner {
     return this.waitForSafeState(updates.observers, signal, "Task update observation aborted");
   }
 
-  reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): TaskUpdateTransferOutcome {
+  reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, requireOpenBoundary = false): TaskUpdateTransferOutcome {
     this.prune();
     assertTaskUpdateIdentifier(transferId);
     assertTaskUpdateIdentifier(payloadDigest);
@@ -1196,8 +1199,14 @@ export class TurnBroker implements TurnBrokerOwner {
       throw taskUpdateError("task_update_transfer_pending", "The previous task update transfer must be resolved first");
     }
     if (control.state.finalOutputRevision !== null || channel.completionCommitted) throw taskUpdateError("task_update_final_output_started", "Final answer output has already started");
+    // A completed batch is not a live append boundary. Reject before binding an ID:
+    // a later retry can carry fresh parsed timestamps or arrive at the next batch.
+    if (requireOpenBoundary && channel.deliveredCallIds.size === 0 && control.state.acknowledgedRevision === control.state.acceptedRevision) {
+      throw taskUpdateError("task_update_no_boundary", "This append was not accepted because no tool delivery or confirmation boundary is open");
+    }
     const outcome: TaskUpdateTransferOutcome = { status: "unknown", transferId };
-    control.transfers.set(transferId, { payloadDigest, context: structuredClone(context), outcome });
+    control.transfers.set(transferId, { payloadDigest, context: structuredClone(context), outcome,
+      ...(requireOpenBoundary ? { openBoundaryReserved: true as const } : {}) });
     return structuredClone(outcome);
   }
 
@@ -1292,7 +1301,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (Buffer.byteLength(JSON.stringify(transfer.results)) > TASK_UPDATE_BATCH_LIMIT_BYTES) throw taskUpdateError("task_update_resource_limit", "The task update result batch exceeds its bounded transport budget");
       const resultsDigest = taskFingerprint(transfer.results);
       if (transfer.mode === "continuity") {
-        if (channel.deliveredCallIds.size === 0 && updates.state.acknowledgedRevision === updates.state.acceptedRevision) {
+        if (!record.openBoundaryReserved && channel.deliveredCallIds.size === 0 && updates.state.acknowledgedRevision === updates.state.acceptedRevision) {
           throw taskUpdateError("task_update_no_boundary", "This append was not accepted because no tool delivery or confirmation boundary is open");
         }
         if ([...resultIds].some(id => !channel.deliveredCallIds.has(id) || !channel.invocations.has(id))) {
@@ -1303,7 +1312,7 @@ export class TurnBroker implements TurnBrokerOwner {
           throw taskUpdateError("task_update_batch_invalid", "Task update results must exactly cover the current handed-off batch");
         }
       } else if (transfer.mode === "replay") {
-        if (updates.state.acknowledgedRevision === updates.state.acceptedRevision) throw taskUpdateError("task_update_no_boundary", "The acknowledged task has no open tool return boundary");
+        if (!record.openBoundaryReserved && updates.state.acknowledgedRevision === updates.state.acceptedRevision) throw taskUpdateError("task_update_no_boundary", "The acknowledged task has no open tool return boundary");
         if (!updates.lastBatch || updates.lastBatch.fingerprint !== transfer.batchFingerprint || updates.lastBatch.resultsDigest !== resultsDigest) {
           throw taskUpdateError("task_update_batch_invalid", "Task update replay does not match the last committed result batch");
         }
@@ -2586,7 +2595,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_task_update_reserve") {
       if (!request.token || !request.transferId || !request.payloadDigest || !request.ownerContext) throw new Error("Task update reservation fields are required");
-      return this.reserveTaskUpdate(request.token, request.transferId, request.payloadDigest, request.ownerContext);
+      return this.reserveTaskUpdate(request.token, request.transferId, request.payloadDigest, request.ownerContext, request.requireOpenBoundary === true);
     }
     if (request.method === "owner_task_update_accept") {
       if (!request.token || !request.transfer) throw new Error("Task update transfer is required");
@@ -3434,7 +3443,7 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return callTurnBroker(this.socketPath, { method: "owner_native_waiting", token, revision: afterRevision }, null, signal);
   }
 
-  async assertCompatible(): Promise<void> {
+  private async compatibleOwnerStatus(): Promise<{ protocolVersion?: unknown; acceptingExternalOwners?: unknown }> {
     let status: { protocolVersion?: unknown; acceptingExternalOwners?: unknown };
     try {
       status = await callTurnBroker(this.socketPath, { method: "owner_status" });
@@ -3445,8 +3454,13 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
       );
     }
     if (status.protocolVersion !== TURN_BROKER_PROTOCOL_VERSION) {
-      throw new Error(`Unsupported DEV turn-owner protocol version: ${String(status.protocolVersion)}`);
+      throw taskUpdateError("task_update_upgrade_required", `Unsupported DEV turn-owner protocol version: ${String(status.protocolVersion)}. Update and restart Codex Web GPT before sending task updates.`);
     }
+    return status;
+  }
+
+  async assertCompatible(): Promise<void> {
+    const status = await this.compatibleOwnerStatus();
     if (status.acceptingExternalOwners !== true) {
       throw new Error("The running launcher runtime is draining and is not accepting DEV chat turns");
     }
@@ -3652,8 +3666,10 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return callTurnBroker(this.socketPath, { method: "owner_task_update_observe", token, revision: afterRevision }, null, signal);
   }
 
-  reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext): Promise<TaskUpdateTransferOutcome> {
-    return callTurnBroker(this.socketPath, { method: "owner_task_update_reserve", token, transferId, payloadDigest, ownerContext: context });
+  async reserveTaskUpdate(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, requireOpenBoundary = false): Promise<TaskUpdateTransferOutcome> {
+    // Draining excludes new owners, not updates and receipt recovery on an existing token.
+    if (requireOpenBoundary) await this.compatibleOwnerStatus();
+    return callTurnBroker(this.socketPath, { method: "owner_task_update_reserve", token, transferId, payloadDigest, ownerContext: context, requireOpenBoundary });
   }
 
   acceptTaskUpdate(token: string, transfer: TaskUpdateTransfer): Promise<TaskUpdateTransferOutcome> {
