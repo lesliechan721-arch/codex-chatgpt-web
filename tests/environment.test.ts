@@ -2509,7 +2509,8 @@ describe("trusted Codex task environment continuity", () => {
 });
 
 describe("Codex 0.162.1 native compaction checkpoints", () => {
-  const fixtureRoot = "/tmp/cgw-codex-0162-compaction/workspace";
+  // Captured POSIX paths are normalized by the environment store on the host platform.
+  const fixtureRoot = resolve("/tmp/cgw-codex-0162-compaction/workspace");
   const owner = (item: Record<string, unknown>) => (item.internal_chat_message_metadata_passthrough as { turn_id: string; content_item_kinds: string[] });
   const replacement = (fixture: NativeCompactionFixture) => fixture.rolloutRecords.findLast(item => item.type === "compacted")!.payload;
   const environmentItem = (items: Array<Record<string, unknown>>) => items.find(item => Array.isArray(item.content)
