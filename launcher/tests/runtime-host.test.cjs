@@ -34,7 +34,7 @@ for (const development of [false, true]) for (const mode of ["automatic", "manua
     assert.equal(invocation.options.sensitiveOutput, true);
     assert.equal(invocation.options.timeoutMs, 320_000);
     if (development) {
-      assert.equal(invocation.options.environment.CODEX_WEB_GPT_DEV_HOME, "/dev");
+      assert.equal(invocation.options.environment.CODEX_WEB_GPT_DEV_HOME, path.resolve("/dev"));
       assert.equal(invocation.options.environment.CODEX_CHATGPT_WEB_HOME, undefined);
     }
   });
