@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -200,7 +201,12 @@ test("navigation denial exhaustion returns protocol errors and preserves the sha
       if (count === 2) expect(result.structuredContent).toMatchObject({ error: { navigation_stopped: true } });
     }
     stage = "exhausted navigation protocol error";
-    await expect(invalid()).rejects.toThrow("CONTEXT_NAVIGATION_STOPPED");
+    // Await subprocess I/O before entering Bun's synchronous promise matcher.
+    // On Windows, .rejects can block the pipe callback that settles this request.
+    const rejection = await invalid().then(() => undefined, (error: unknown) => error);
+    expect(rejection).toBeInstanceOf(McpError);
+    expect(rejection).toMatchObject({ code: ErrorCode.InvalidRequest,
+      message: expect.stringContaining("CONTEXT_NAVIGATION_STOPPED") });
     stage = "shared connection tool catalog";
     expect((await f.client.listTools(undefined, requestOptions)).tools.some(tool => tool.name === "codex_context_list")).toBe(true);
     stage = "ordinary context after compaction navigation stopped";
