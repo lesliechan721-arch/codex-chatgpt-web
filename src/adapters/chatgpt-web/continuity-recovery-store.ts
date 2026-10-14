@@ -9,6 +9,7 @@ import { continuityError } from "./continuity-errors";
 import { moveContinuityLockWithoutReplacement } from "./continuity-lock-windows";
 import { assertContextCoverageAdvance, validateContextCoverageJournal, validateContextCoverageReservations, type ContextCoverageJournalEntry, type ContextCoverageReservation } from "./context-coverage-journal";
 import { canonicalJson } from "./canonical-json";
+import { forgetRecoveryDurability, rememberRecoveryDurability, reuseRecoveryDurability } from "./recovery-durability";
 import { isContinuityRecoveryIdentity, type ContinuityRecoveryIdentity } from "./continuity-contract";
 
 export const MAX_CONTINUITY_RECOVERY_BYTES = 24 * 1024 * 1024;
@@ -227,13 +228,16 @@ export function continuityProcessInstanceStatus(instance: ContinuityProcessInsta
   const current = continuityProcessStartIdentity(instance.pid);
   return current === null ? "unverified" : current === instance.startIdentity ? "live" : "exited";
 }
-function safeFile(path: string, maxBytes: number): unknown {
+function safeFile(path: string, maxBytes: number, onRead?: (encoded: string) => void): unknown {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.size > maxBytes || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
     || (typeof process.getuid === "function" && stat.uid !== process.getuid())) throw invalid("Continuity recovery file is unsafe or oversized.");
   const encoded = readFileSync(path);
   if (encoded.byteLength > maxBytes) throw invalid("Continuity recovery file is oversized.");
-  return JSON.parse(encoded.toString("utf8"));
+  const text = encoded.toString("utf8");
+  const value: unknown = JSON.parse(text);
+  onRead?.(text);
+  return value;
 }
 function removeLockOwner(directory: string, owner: string): void {
   try { unlinkSync(join(directory, owner)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -293,10 +297,12 @@ function syncStoredFile(path: string): void {
   if (process.platform !== "win32") { const directoryFd = openSync(join(path, ".."), "r"); try { measureRuntimeOperation("fsync.directory", () => fsyncSync(directoryFd)); } finally { closeSync(directoryFd); } }
 }
 function durableWrite(path: string, encoded: string, afterAtomicReplace?: () => void): void {
-  atomicWriteFile(path, encoded, { durable: true });
-  afterAtomicReplace?.();
-  // The rename and its containing directory must survive a machine interruption too.
-  if (process.platform !== "win32") { const fd = openSync(join(path, ".."), "r"); try { measureRuntimeOperation("fsync.directory", () => fsyncSync(fd)); } finally { closeSync(fd); } }
+  measureRuntimeOperation("recovery.write", () => {
+    atomicWriteFile(path, encoded, { durable: true });
+    afterAtomicReplace?.();
+    // The rename and its containing directory must survive a machine interruption too.
+    if (process.platform !== "win32") { const fd = openSync(join(path, ".."), "r"); try { measureRuntimeOperation("fsync.directory", () => fsyncSync(fd)); } finally { closeSync(fd); } }
+  }, Buffer.byteLength(encoded));
 }
 function validateAttempt(value: unknown): asserts value is RecoveryAttemptRecord {
   exact(value, ["attempt", "epoch", "historyRevision", "snapshotVersion", "snapshotDigest", "stage", "dispatchProtocolComplete", "writerRetired"], ["pageReceiptId", "transactionId", "transactionVersion", "launcherInstance", "sendEvidence", "acquisitionEvidence"]);
@@ -678,6 +684,7 @@ function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
 
 /** Content-free recovery admission evidence. This store never creates or revives Native operations. */
 export class ContinuityRecoveryStore {
+  private readonly documentEncodings = new WeakMap<RecoveryDocument, string>();
   private readonly file: string;
   private readonly marker: string;
   private readonly lock: string;
@@ -803,10 +810,10 @@ export class ContinuityRecoveryStore {
   confirmDurable(thread: string, guard: RecoveryGuard): RecoveryThreadRecord {
     hash(thread); hash(guard.scope);
     return this.exclusive(() => {
-      const record = this.read().threads[thread]; if (!record) throw unproven("The uncertain commit has no retained thread identity.");
+      const document = this.read();
+      const record = document.threads[thread]; if (!record) throw unproven("The uncertain commit has no retained thread identity.");
       this.guard(record, guard);
-      try { syncStoredFile(this.file); }
-      catch { throw invalid("Continuity recovery commit durability remains unverified; no new side effect is permitted."); }
+      this.confirmDocument(document);
       return structuredClone(record);
     });
   }
@@ -895,7 +902,16 @@ export class ContinuityRecoveryStore {
       const previous = structuredClone(record);
       const result: unknown = mutate(record);
       if (result && typeof (result as unknown as { then?: unknown }).then === "function") throw invalid("Continuity recovery transactions must be synchronous.");
-      record.version = previous.version + 1; validateThread(record); transition(previous, record); this.write(document);
+      // The store owns this version. Replays do not constitute a new state change.
+      record.version = previous.version;
+      const unchanged = document.version === 3 && canonicalJson(record) === canonicalJson(previous);
+      if (!unchanged) record.version++;
+      validateThread(record); transition(previous, record);
+      if (unchanged) {
+        measureRuntimeOperation("recovery.noop", () => this.confirmDocument(document));
+      } else {
+        this.write(document);
+      }
       return structuredClone(record);
     });
   }
@@ -932,7 +948,15 @@ export class ContinuityRecoveryStore {
         document.threads[input.thread] = record;
       }
       this.guard(record, { scope: input.scope }); this.admit(record, input);
-      record.version++; validateThread(record); if (previous) transition(previous, record); this.write(document); return structuredClone(record);
+      const unchanged = document.version === 3 && previous && canonicalJson(record) === canonicalJson(previous);
+      if (!unchanged) record.version++;
+      validateThread(record); if (previous) transition(previous, record);
+      if (unchanged) {
+        measureRuntimeOperation("recovery.noop", () => this.confirmDocument(document));
+      } else {
+        this.write(document);
+      }
+      return structuredClone(record);
     });
   }
   issueBatch(thread: string, guard: RecoveryGuard, input: { logicalWorkId: string; attempt: number; calls: Array<{ callId: string; operationId: string; expectedResultType: string }>; localSessionId?: string; localBatchId?: string }): RecoveryThreadRecord {
@@ -984,15 +1008,25 @@ export class ContinuityRecoveryStore {
   }
   /** Reserve optional in-memory result bytes in the same budget as durable terminal evidence. */
   setResultBodyBytes(thread: string, guard: RecoveryGuard, callId: string, bytes: number, owner: ContinuityProcessInstance): boolean {
-    integer(bytes); validateProcess(owner);
-    if (bytes === 0) throw invalid("A retained result body must have positive byte accounting.");
+    return this.setResultBodiesBytes(thread, guard, [{ callId, bytes }], owner);
+  }
+  /** Reserve a complete optional batch before any of its in-memory bodies are published. */
+  setResultBodiesBytes(thread: string, guard: RecoveryGuard, inputs: Array<{ callId: string; bytes: number }>, owner: ContinuityProcessInstance): boolean {
+    validateProcess(owner);
+    for (const { bytes } of inputs) {
+      integer(bytes);
+      if (bytes === 0) throw invalid("A retained result body must have positive byte accounting.");
+    }
+    if (!inputs.length) return true;
     try {
       this.transact(thread, guard, record => {
-        const call = this.call(record, callId);
-        if (call.state !== "settled" || !call.firstResultDigest) throw unproven("Only a real accepted terminal result can retain optional recovery body bytes.");
-        if (call.resultBodyOwner && !sameProcess(call.resultBodyOwner, owner)
-          && continuityProcessInstanceStatus(call.resultBodyOwner) !== "exited") throw unproven("Another live or unverified process retains this optional result body.");
-        call.resultBodyBytes = bytes; call.resultBodyOwner = structuredClone(owner);
+        for (const { callId, bytes } of inputs) {
+          const call = this.call(record, callId);
+          if (call.state !== "settled" || !call.firstResultDigest) throw unproven("Only a real accepted terminal result can retain optional recovery body bytes.");
+          if (call.resultBodyOwner && !sameProcess(call.resultBodyOwner, owner)
+            && continuityProcessInstanceStatus(call.resultBodyOwner) !== "exited") throw unproven("Another live or unverified process retains this optional result body.");
+          call.resultBodyBytes = bytes; call.resultBodyOwner = structuredClone(owner);
+        }
       });
       return true;
     } catch (error) {
@@ -1504,11 +1538,16 @@ export class ContinuityRecoveryStore {
     if (!existsSync(this.marker)) throw invalid("Continuity recovery storage is not initialized; run controlled setup or upgrade.");
     try {
       const marker = safeFile(this.marker, 1024); exact(marker, ["version", "installation"]); hash(marker.installation);
-      const document = safeFile(this.file, MAX_CONTINUITY_RECOVERY_BYTES); exact(document, ["version", "installation", "threads"]); dictionary(document.threads);
+      let encoded = "";
+      const document = safeFile(this.file, MAX_CONTINUITY_RECOVERY_BYTES, value => { encoded = value; });
+      exact(document, ["version", "installation", "threads"]); dictionary(document.threads);
       if (marker.version !== 2 || (document.version !== 2 && document.version !== 3) || document.installation !== marker.installation || document.installation !== this.installation()
         || Object.keys(document.threads).length > MAX_THREADS) throw new Error("invalid installation");
       for (const [thread, record] of Object.entries(document.threads)) { validateThread(record); if (record.thread !== thread) throw new Error("invalid thread index"); }
-      this.checkCapacity(document as unknown as RecoveryDocument); return document as unknown as RecoveryDocument;
+      const checked = document as unknown as RecoveryDocument;
+      this.checkCapacity(checked);
+      this.documentEncodings.set(checked, encoded);
+      return checked;
     } catch (error) {
       if ((error as { code?: string }).code === "continuity_resource_capacity") throw error;
       throw invalid("Continuity recovery storage is missing, unreadable or invalid; it was not reset.");
@@ -1548,13 +1587,32 @@ export class ContinuityRecoveryStore {
     if (checkpointCount > this.limits.checkpoints) throw capacity("Continuity checkpoint capacity is 256.");
     if (size(document) + reserve > this.limits.totalBytes) throw capacity("Continuity recovery and checkpoint capacity is 24 MiB including terminal reservations.");
   }
+  private confirmDocument(document: RecoveryDocument): void {
+    // Unchanged transactions confirm the exact bytes read, including format whitespace.
+    const encoded = this.documentEncodings.get(document) ?? JSON.stringify(document);
+    if (reuseRecoveryDurability(this.file, encoded)) {
+      measureRuntimeOperation("recovery.reuse", () => {});
+      return;
+    }
+    try {
+      measureRuntimeOperation("recovery.confirm", () => syncStoredFile(this.file), Buffer.byteLength(encoded));
+      rememberRecoveryDurability(this.file, encoded);
+    } catch {
+      forgetRecoveryDurability(this.file);
+      throw invalid("Continuity recovery commit durability remains unverified; no new side effect is permitted.");
+    }
+  }
   private write(document: RecoveryDocument): void {
+    // Even a failed write attempt must not leave a proof usable by another store instance.
+    forgetRecoveryDurability(this.file);
     // Atomic format promotion preserves all facts and makes old v2 writers fail closed.
     document.version = 3;
     this.checkCapacity(document);
     let replaced = false;
     try {
-      this.options.beforeWrite?.(); durableWrite(this.file, JSON.stringify(document), () => { replaced = true; this.options.afterAtomicReplace?.(); });
+      const encoded = JSON.stringify(document);
+      this.options.beforeWrite?.(); durableWrite(this.file, encoded, () => { replaced = true; this.options.afterAtomicReplace?.(); });
+      rememberRecoveryDurability(this.file, encoded);
     } catch {
       throw Object.assign(invalid("Continuity recovery evidence could not be confirmed as saved; no new side effect is permitted."), { writeMayHaveCommitted: replaced });
     }

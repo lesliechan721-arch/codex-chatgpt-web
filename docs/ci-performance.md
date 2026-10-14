@@ -19,6 +19,30 @@ Windows file replacement retry waits. `rename.retryWait.count` is the retry coun
 return `null` when the OS cannot verify identity, so this is not an identity-failure count.
 Launcher Electron operations are not included in these backend counters.
 
+Recovery persistence adds these counters:
+
+- `recovery.write`: recovery journal and migration marker write attempts, including file
+  flush, replacement and the required directory flush.
+- `recovery.noop`: transactions whose validated business state did not change.
+- `recovery.confirm`: explicit file/directory flushes when the current process has no valid
+  proof that the exact current file was durably committed.
+- `recovery.reuse`: count of successful proof reuse, without another flush. Its duration is
+  only counter bookkeeping; it does not measure the proof's file reads.
+
+`totalBytes` records the encoded bytes supplied to recovery writes and confirmations,
+including failed attempts. It is not the number of bytes proved durable. Old reports without
+this field contribute zero bytes. Recovery operation timings include nested `fsync` timings;
+do not add them together as independent costs.
+
+Unchanged transactions keep their version after a fresh locked read, authority checks and
+transition validation. A bounded process-local proof can avoid another flush only for the
+same complete contents, file identity/change metadata and canonical parent directory identity.
+It does not cache authority or process liveness. Replacement, an uncertain write or a process
+restart requires confirmation again. Unsupported file identity falls back to flushing.
+Version 2 format promotion still writes version 3. Real state changes still commit before
+external effects. Optional tool-result body accounting is batched after the durable terminal
+results; a rejected batch falls back to independent reservations without undoing those results.
+
 Counters are disabled unless the profiler sets `CGW_RUNTIME_PERFORMANCE_DIR`. The profiler
 flushes before a test file's isolated global is discarded and at normal process exit. A
 process killed without cleanup can lose its last counters. Invalid reports are listed in
@@ -51,3 +75,25 @@ Each run starts with an empty timing file, so earlier measurements do not change
 scheduling. Splitting a large test file is a separate experiment after the two-worker
 measurements. Do not remove durability checks, cache PID liveness, or skip recovery tests
 to improve a benchmark.
+
+## Repeat a comparison on one runner
+
+```sh
+bun run test:compare
+bun run test:compare --repetitions=1 tests/continuity-recovery-store.test.ts
+```
+
+The default runs workers in the order `1, 2, 2, 1`. `--repetitions=1|2|3` selects the number
+of runs for each worker count. Every run starts with fresh timing data and a separate report
+directory. Tests that fail do not stop the later measurements. `comparison.json` keeps every
+exit code and summary path, and reports failure rates and wall times for both worker counts.
+Missing or invalid reports, and any failed run, make `valid` false and leave `speedup` unset
+(`null`). A shorter failed test run is not a performance improvement.
+
+The manually dispatched **Windows test performance comparison** workflow runs this command
+on one Windows runner and uploads the original reports even when tests fail. Select the same
+revision when comparing changes. The normal CI worker count stays unchanged until repeated
+Windows measurements support changing it. A local report's `revision` is its base HEAD;
+`workingTreeDirty` identifies uncommitted changes, so that revision alone does not identify
+the measured source. Keep individual investigation notes and measurement logs in
+`.dev-workflows/windows-performance/evidence/`, outside permanent project documentation.

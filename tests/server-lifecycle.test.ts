@@ -1802,6 +1802,8 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
   };
   let browserStarts = 0;
   let browserCancelled = false;
+  let browserSettled!: () => void;
+  const settlement = new Promise<void>(resolve => { browserSettled = resolve; });
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     const prepared = await turn.prepare();
@@ -1842,8 +1844,14 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
       }
     } finally {
       prepared.release();
+      browserSettled();
     }
   };
+  // Windows I/O can consume the real one-second lease before three replays finish.
+  // Control lease age while keeping HTTP, broker batching and timer delivery real.
+  // Integer milliseconds keep the exact 999/1000 boundary free of rounding error.
+  let now = Math.floor(performance.now());
+  const clock = spyOn(performance, "now").mockImplementation(() => now);
   const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
   const endpoint = "http://127.0.0.1:" + server.port;
   const request = () => fetch(endpoint + "/v1/responses", {
@@ -1860,12 +1868,25 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
     expect(originalCallId).toBeDefined();
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      await Bun.sleep(250);
+      now += 250;
       const replay = await request();
       expect(replay.status).toBe(200);
       expect(callId(await replay.text())).toBe(originalCallId);
     }
-    await Bun.sleep(500);
+    now += 249;
+    expect(await (await fetch(endpoint + "/healthz")).json()).toMatchObject({
+      active_remote_turn_idle_leases: 1,
+      active_browser_turns: 1,
+    });
+    expect(browserCancelled).toBeFalse();
+    now += 1;
+    await settlement;
+
+    const expiredReplay = await request();
+    expect(expiredReplay.status).toBe(504);
+    expect(await expiredReplay.json()).toMatchObject({
+      error: { code: "client_turn_idle_timeout" },
+    });
 
     const health = await (await fetch(endpoint + "/healthz")).json() as {
       active_browser_turns: number;
@@ -1876,6 +1897,7 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
     expect(browserStarts).toBe(1);
     expect(browserCancelled).toBeTrue();
   } finally {
+    clock.mockRestore();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
     await server.stop(true);

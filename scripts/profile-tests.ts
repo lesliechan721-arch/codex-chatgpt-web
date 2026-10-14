@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { RuntimePerformanceCounter, RuntimePerformanceOperation } from "../src/runtime-performance";
+import { RUNTIME_PERFORMANCE_OPERATIONS, type RuntimePerformanceCounter, type RuntimePerformanceOperation } from "../src/runtime-performance";
 
-const operations: RuntimePerformanceOperation[] = ["processIdentity", "fsync.file", "fsync.directory", "rename.retryWait"];
+const operations = RUNTIME_PERFORMANCE_OPERATIONS;
 const root = resolve(import.meta.dir, "..");
 
 export async function profileTests(args: string[]): Promise<number> {
@@ -35,7 +35,7 @@ export async function profileTests(args: string[]): Promise<number> {
   } finally {
     const wallMs = performance.now() - start;
     try {
-      const totals = Object.fromEntries(operations.map(name => [name, { count: 0, errors: 0, totalMs: 0, maxMs: 0 }])) as
+      const totals = Object.fromEntries(operations.map(name => [name, { count: 0, errors: 0, totalMs: 0, maxMs: 0, totalBytes: 0 }])) as
         Record<RuntimePerformanceOperation, RuntimePerformanceCounter>;
       let snapshots = 0;
       const invalidReports: string[] = [];
@@ -43,11 +43,12 @@ export async function profileTests(args: string[]): Promise<number> {
         if (!file.endsWith(".json")) continue;
         try {
           const report = JSON.parse(readFileSync(join(reports, file), "utf8"));
-          if (report.version !== 1 || !report.counters || typeof report.counters !== "object") throw new Error("Invalid report");
+          if (report.version !== 1 || !report.counters || typeof report.counters !== "object" || Array.isArray(report.counters)) throw new Error("Invalid report");
           for (const operation of operations) {
             const counter = report.counters[operation];
             if (counter === undefined) continue;
-            if (![counter.count, counter.errors, counter.totalMs, counter.maxMs].every(value => Number.isFinite(value) && value >= 0)) {
+            if (!counter || ![counter.count, counter.errors, counter.totalMs, counter.maxMs,
+              counter.totalBytes === undefined ? 0 : counter.totalBytes].every(value => Number.isFinite(value) && value >= 0)) {
               throw new Error("Invalid counter");
             }
           }
@@ -58,6 +59,7 @@ export async function profileTests(args: string[]): Promise<number> {
             totals[operation].errors += counter.errors;
             totals[operation].totalMs += counter.totalMs;
             totals[operation].maxMs = Math.max(totals[operation].maxMs, counter.maxMs);
+            totals[operation].totalBytes += counter.totalBytes ?? 0;
           }
           snapshots++;
         } catch { invalidReports.push(file); }
@@ -68,7 +70,7 @@ export async function profileTests(args: string[]): Promise<number> {
       console.info(`[test-performance] wall=${(wallMs / 1000).toFixed(2)}s; exit=${exitCode}; snapshots=${snapshots}`);
       for (const operation of operations) {
         const counter = totals[operation];
-        console.info(`[test-performance] ${operation}: count=${counter.count}; total=${counter.totalMs.toFixed(2)}ms; max=${counter.maxMs.toFixed(2)}ms; errors=${counter.errors}`);
+        console.info(`[test-performance] ${operation}: count=${counter.count}; total=${counter.totalMs.toFixed(2)}ms; max=${counter.maxMs.toFixed(2)}ms; errors=${counter.errors}; bytes=${counter.totalBytes}`);
       }
       if (!snapshots || invalidReports.length) console.warn("[test-performance] Incomplete metric reports; inspect summary.json before comparing runs.");
     } catch (error) {

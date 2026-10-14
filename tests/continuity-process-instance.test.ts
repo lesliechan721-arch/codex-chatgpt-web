@@ -238,11 +238,16 @@ test("Windows durability confirmation uses a writable handle and preserves the a
     const accepted = store.admitWork(input);
     const file = join(directory, "recovery.json");
     const before = readFileSync(file, "utf8");
+    // An unconfirmed replacement must flush even when its contents are unchanged.
+    // The completed admission above already has a reusable durability proof.
+    fs.writeFileSync(`${file}.replacement`, before, { mode: 0o600 });
+    fs.renameSync(`${file}.replacement`, file);
     const originalOpen = fs.openSync, originalSync = fs.fsyncSync;
     const readOnly = new Set<number>();
     const open = spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
       const fd = originalOpen(path, flags, mode);
       if (path === file && flags === "r") readOnly.add(fd);
+      else readOnly.delete(fd); // A closed read descriptor can be reused by the writable open.
       return fd;
     });
     const sync = spyOn(fs, "fsyncSync").mockImplementation(fd => {

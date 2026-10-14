@@ -31,6 +31,7 @@
     "test": "bun test --timeout 30000 ./tests",
     "test:profile": "bun run scripts/profile-tests.ts",
     "test:parallel": "bun run scripts/profile-tests.ts --parallel=2",
+    "test:compare": "bun run scripts/compare-test-performance.ts",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
     "typecheck": "bun x --no-install --bun tsc --noEmit",

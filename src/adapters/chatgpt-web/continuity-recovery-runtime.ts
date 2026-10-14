@@ -334,6 +334,21 @@ export function acceptRecoveryResults(ref: RuntimeRecoveryReference, rawResults:
   let bodies = resultBodies.get(key);
   if (!bodies) { bodies = new Map(); resultBodies.set(key, bodies); }
   resultBodyReferences.set(key, ref);
+  const pendingById = new Map<string, Record<string, unknown>>();
+  for (const item of items) {
+    const id = String(item.call_id);
+    if (!bodies.has(id) && !pendingById.has(id)) pendingById.set(id, item);
+  }
+  const pending = [...pendingById.values()];
+  if (!pending.length) return;
+  try {
+    if (recoveryStore(ref).setResultBodiesBytes(ref.thread, { scope: record.scope },
+      pending.map(item => ({ callId: String(item.call_id), bytes: Buffer.byteLength(JSON.stringify(item)) })), resultBodyOwner)) {
+      for (const item of pending) bodies.set(String(item.call_id), structuredClone(item));
+      return;
+    }
+  } catch { /* Keep accepted terminal facts, and attempt independent optional reservations below. */ }
+  // Capacity or ownership can reject one item without preventing other bodies from fitting.
   for (const item of items) {
     const id = String(item.call_id);
     if (bodies.has(id)) continue;
