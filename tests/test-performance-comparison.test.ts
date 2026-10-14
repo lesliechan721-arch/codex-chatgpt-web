@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { compareTestPerformance, comparisonOptions } from "../scripts/compare-test-performance";
+import { performanceSource, measurementFingerprint, MEASUREMENT_FILES } from "../scripts/test-performance-source";
 
 function summary(workers: number, exitCode = 0) {
-  return { version: 1, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
-    revision: process.env.GITHUB_SHA ?? null, workers, exitCode, wallMs: workers === 1 ? 20 : 10,
+  return { version: 2, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
+    ...performanceSource(join(import.meta.dir, "..")), complete: true, incompleteReasons: [] as string[], workers, exitCode, wallMs: workers === 1 ? 20 : 10,
+    counts: { pass: 1, skip: 0, fail: 0 },
     snapshots: 1, invalidReports: [], totals: { "recovery.write": { count: 1, errors: 0, totalMs: 2, maxMs: 2, totalBytes: 7 } } };
 }
 
@@ -33,7 +35,7 @@ test("comparison alternates worker order and preserves separate original reports
     expect(result.report.speedup).toBe(2);
     expect(result.report.groups.map(group => group.failures)).toEqual([0, 0]);
     expect(new Set(result.report.runs.map(run => run.summaryPath)).size).toBe(4);
-    for (const run of result.report.runs) expect(JSON.parse(readFileSync(run.summaryPath!, "utf8")).totals["recovery.write"].totalBytes).toBe(7);
+    for (const run of result.report.runs) expect(JSON.parse(readFileSync(join(dirname(result.reportPath), run.summaryPath!), "utf8")).totals["recovery.write"].totalBytes).toBe(7);
     expect(JSON.parse(readFileSync(result.reportPath, "utf8")).valid).toBe(true);
   } finally { rmSync(output, { recursive: true, force: true }); }
 });
@@ -58,7 +60,7 @@ test("comparison continues after test failures and preserves every exit code", a
   } finally { rmSync(output, { recursive: true, force: true }); }
 });
 
-for (const defect of ["missing", "json", "snapshots", "invalidReports", "wallMs", "workers", "exitCode", "counter", "version", "bunVersion"]) {
+for (const defect of ["missing", "json", "snapshots", "invalidReports", "wallMs", "workers", "exitCode", "counter", "version", "bunVersion", "complete", "incompleteReasons", "revision", "patchDigest", "toolDigest", "measurementFiles", "known"]) {
   test(`comparison rejects ${defect} reports and continues`, async () => {
     const output = mkdtempSync(join(tmpdir(), "cgw-comparison-invalid-"));
     let calls = 0;
@@ -75,8 +77,15 @@ for (const defect of ["missing", "json", "snapshots", "invalidReports", "wallMs"
           if (defect === "workers") report.workers = 2;
           if (defect === "exitCode") report.exitCode = 3;
           if (defect === "counter") report.totals["recovery.write"].totalBytes = -1;
-          if (defect === "version") report.version = 2;
+          if (defect === "version") report.version = 1;
           if (defect === "bunVersion") report.bunVersion = "different";
+          if (defect === "complete") report.complete = false;
+          if (defect === "incompleteReasons") report.incompleteReasons.push("missing-child-report");
+          if (defect === "revision") report.revision = "0".repeat(40);
+          if (defect === "patchDigest") report.patchDigest = "0".repeat(64);
+          if (defect === "toolDigest") report.toolDigest = "0".repeat(64);
+          if (defect === "measurementFiles") report.measurementFiles = [];
+          if (defect === "known") report.known = false;
           save(path, report);
         } else save(path, summary(workers));
         return 0;
@@ -113,4 +122,24 @@ test("comparison accepts only one to three repetitions", () => {
   for (const arg of ["--repetitions=0", "--repetitions=4", "--repetitions=01", "--parallel=2"]) {
     expect(() => comparisonOptions([arg])).toThrow();
   }
+});
+
+test("measurement fingerprint includes every production and fixture probe file", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cgw-measurement-patch-"));
+  try {
+    for (const file of MEASUREMENT_FILES) {
+      mkdirSync(dirname(join(directory, file)), { recursive: true });
+      writeFileSync(join(directory, file), readFileSync(resolve(import.meta.dir, "..", file)));
+    }
+    const original = measurementFingerprint(directory);
+    expect(original.measurementFiles.map(entry => entry.file)).toEqual([...MEASUREMENT_FILES]);
+    for (const file of ["src/adapters/chatgpt-web/continuity-recovery-store.ts", "src/adapters/chatgpt-web/recovery-durability.ts",
+      "tests/session-continuity-adapter.test.ts", "tests/helpers/retained-compaction-fixture.ts", "tests/helpers/retained-fixture-cleanup.ts"]) {
+      const contents = readFileSync(join(directory, file));
+      writeFileSync(join(directory, file), Buffer.concat([contents, Buffer.from("\n// different measurement patch\n")]));
+      expect(measurementFingerprint(directory).toolDigest).not.toBe(original.toolDigest);
+      writeFileSync(join(directory, file), contents);
+    }
+    expect(measurementFingerprint(directory).toolDigest).toBe(original.toolDigest);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

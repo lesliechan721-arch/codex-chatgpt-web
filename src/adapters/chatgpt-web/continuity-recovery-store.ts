@@ -216,26 +216,26 @@ function validateProcess(value: unknown): asserts value is ContinuityProcessInst
   if (Number(value.pid) < 1 || Number(value.pid) > 2147483647 || typeof value.startIdentity !== "string"
     || (value.startIdentity !== "unverified" && !knownProcessStart(value.startIdentity))) throw invalid("Continuity process instance is invalid.");
 }
-const localStart = continuityProcessStartIdentity(process.pid) ?? "unverified";
+const localStart = measureRuntimeOperation("processIdentity.local", () => continuityProcessStartIdentity(process.pid)) ?? "unverified";
 export function continuityProcessInstance(id = randomBytes(32).toString("hex")): ContinuityProcessInstance {
-  hash(id); return { id, pid: process.pid, startIdentity: localStart };
+  return measureRuntimeOperation("processIdentity.localUse", () => { hash(id); return { id, pid: process.pid, startIdentity: localStart }; });
 }
 export function continuityProcessInstanceStatus(instance: ContinuityProcessInstance): "live" | "exited" | "unverified" {
   validateProcess(instance);
   if (!knownProcessStart(instance.startIdentity)) return "unverified";
   try { process.kill(instance.pid, 0); }
   catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "unverified"; }
-  const current = continuityProcessStartIdentity(instance.pid);
+  const current = measureRuntimeOperation("processIdentity.fresh", () => continuityProcessStartIdentity(instance.pid));
   return current === null ? "unverified" : current === instance.startIdentity ? "live" : "exited";
 }
 function safeFile(path: string, maxBytes: number, onRead?: (encoded: string) => void): unknown {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.size > maxBytes || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
     || (typeof process.getuid === "function" && stat.uid !== process.getuid())) throw invalid("Continuity recovery file is unsafe or oversized.");
-  const encoded = readFileSync(path);
+  const encoded = measureRuntimeOperation("recovery.read", () => readFileSync(path));
   if (encoded.byteLength > maxBytes) throw invalid("Continuity recovery file is oversized.");
   const text = encoded.toString("utf8");
-  const value: unknown = JSON.parse(text);
+  const value: unknown = measureRuntimeOperation("recovery.parse", () => JSON.parse(text), encoded.byteLength);
   onRead?.(text);
   return value;
 }
@@ -249,46 +249,48 @@ export function withContinuityStorageLock<T>(lock: string, operation: () => T): 
   const staging = `${lock}.${owner}`;
   mkdirSync(staging, { mode: 0o700 });
   try {
-    writeFileSync(join(staging, owner), JSON.stringify(continuityProcessInstance()), { mode: 0o600, flag: "wx" });
-    let acquired = false;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      let stat;
-      // Inspect existing evidence before attempting publication. On Windows the
-      // publication itself must also refuse replacements during this window.
-      try { stat = lstatSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (!stat) {
-        try {
-          if (process.platform === "win32") moveContinuityLockWithoutReplacement(staging, lock);
-          else renameSync(staging, lock);
-          acquired = true; break;
-        }
-        catch (error) {
-          const code = (error as NodeJS.ErrnoException).code ?? "";
-          const windowsDenied = process.platform === "win32" && ["EPERM", "EACCES"].includes(code);
-          if (!windowsDenied && !["ENOTEMPTY", "EEXIST", "ENOTDIR", "EISDIR"].includes(code)) throw error;
-          // Another process can publish between inspection and rename. Only treat
-          // access errors as contention when an existing lock can be inspected.
-          try { stat = lstatSync(lock); }
-          catch (readError) {
-            if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
-            if (windowsDenied) throw error;
-            continue;
+    measureRuntimeOperation("recovery.lockWait", () => {
+      writeFileSync(join(staging, owner), JSON.stringify(continuityProcessInstance()), { mode: 0o600, flag: "wx" });
+      let acquired = false;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let stat;
+        // Inspect existing evidence before attempting publication. On Windows the
+        // publication itself must also refuse replacements during this window.
+        try { stat = lstatSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (!stat) {
+          try {
+            if (process.platform === "win32") moveContinuityLockWithoutReplacement(staging, lock);
+            else renameSync(staging, lock);
+            acquired = true; break;
+          }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code ?? "";
+            const windowsDenied = process.platform === "win32" && ["EPERM", "EACCES"].includes(code);
+            if (!windowsDenied && !["ENOTEMPTY", "EEXIST", "ENOTDIR", "EISDIR"].includes(code)) throw error;
+            // Another process can publish between inspection and rename. Only treat
+            // access errors as contention when an existing lock can be inspected.
+            try { stat = lstatSync(lock); }
+            catch (readError) {
+              if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
+              if (windowsDenied) throw error;
+              continue;
+            }
           }
         }
+        if (!stat.isDirectory() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0) || (typeof process.getuid === "function" && stat.uid !== process.getuid())) throw invalid("Continuity storage is busy or its lock is unsafe.");
+        let entries;
+        try { entries = readdirSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+        if (entries.length !== 1 || !/^[1-9]\d*-[a-f0-9]{32}$/.test(entries[0]!)) throw invalid("Continuity storage is busy or its lock is unverified.");
+        const previous = entries[0]!;
+        let instance;
+        try { instance = safeFile(join(lock, previous), 1024); validateProcess(instance); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw invalid("Continuity storage lock owner cannot be verified."); }
+        if (instance.pid !== Number(previous.split("-")[0]) || continuityProcessInstanceStatus(instance) !== "exited") throw invalid("Continuity storage is busy; the lock owner has not verifiably exited.");
+        removeLockOwner(lock, previous);
       }
-      if (!stat.isDirectory() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0) || (typeof process.getuid === "function" && stat.uid !== process.getuid())) throw invalid("Continuity storage is busy or its lock is unsafe.");
-      let entries;
-      try { entries = readdirSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-      if (entries.length !== 1 || !/^[1-9]\d*-[a-f0-9]{32}$/.test(entries[0]!)) throw invalid("Continuity storage is busy or its lock is unverified.");
-      const previous = entries[0]!;
-      let instance;
-      try { instance = safeFile(join(lock, previous), 1024); validateProcess(instance); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw invalid("Continuity storage lock owner cannot be verified."); }
-      if (instance.pid !== Number(previous.split("-")[0]) || continuityProcessInstanceStatus(instance) !== "exited") throw invalid("Continuity storage is busy; the lock owner has not verifiably exited.");
-      removeLockOwner(lock, previous);
-    }
-    if (!acquired) throw invalid("Continuity storage is busy; ownership changed during acquisition.");
-    try { return operation(); } finally { removeLockOwner(lock, owner); }
+      if (!acquired) throw invalid("Continuity storage is busy; ownership changed during acquisition.");
+    });
+    try { return measureRuntimeOperation("recovery.transaction", operation); } finally { removeLockOwner(lock, owner); }
   } finally { removeLockOwner(staging, owner); }
 }
 function syncStoredFile(path: string): void {
@@ -1543,7 +1545,10 @@ export class ContinuityRecoveryStore {
       exact(document, ["version", "installation", "threads"]); dictionary(document.threads);
       if (marker.version !== 2 || (document.version !== 2 && document.version !== 3) || document.installation !== marker.installation || document.installation !== this.installation()
         || Object.keys(document.threads).length > MAX_THREADS) throw new Error("invalid installation");
-      for (const [thread, record] of Object.entries(document.threads)) { validateThread(record); if (record.thread !== thread) throw new Error("invalid thread index"); }
+      measureRuntimeOperation("recovery.validate", () => {
+        dictionary(document.threads);
+        for (const [thread, record] of Object.entries(document.threads)) { validateThread(record); if (record.thread !== thread) throw new Error("invalid thread index"); }
+      }, Buffer.byteLength(encoded));
       const checked = document as unknown as RecoveryDocument;
       this.checkCapacity(checked);
       this.documentEncodings.set(checked, encoded);

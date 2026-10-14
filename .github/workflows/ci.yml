@@ -88,6 +88,7 @@ jobs:
           path: ${{ runner.temp }}/test-performance
           if-no-files-found: ignore
       - run: bun run app:package
+        if: runner.os != 'Windows'
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux'
         run: |
@@ -99,6 +100,35 @@ jobs:
         if: runner.os == 'Linux'
         run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
       - run: bun run app:smoke
+        if: runner.os != 'Windows'
+
+  windows-package:
+    name: Windows package and smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: launcher
+      - name: Prepare AVX2-independent Windows runtime
+        shell: pwsh
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.2 -GitHubEnv $env:GITHUB_ENV
+      - run: bun run app:package
+      - run: bun run app:smoke
+      - name: Upload Windows package diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package-${{ github.sha }}
+          path: |
+            launcher/artifacts/*.exe
+            launcher/artifacts/*.yml
+            launcher/artifacts/*.yaml
+            launcher/artifacts/*.json
+          if-no-files-found: ignore
 
   actionlint:
     runs-on: ubuntu-latest

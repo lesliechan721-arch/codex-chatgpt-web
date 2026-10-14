@@ -128,3 +128,50 @@ for (const exitCode of [0, 23]) test(`a lost report directory preserves the test
     expect(child.stderr).toContain(`Could not collect performance reports; preserving test exit=${exitCode}`);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("failed log writes keep waiting for the successful test and reject its metrics", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-profile-log-"));
+  try {
+    const fixture = join(root, "log-io.test.ts");
+    writeFileSync(fixture, `import {test} from "bun:test";
+      import {renameSync,writeFileSync} from "node:fs";
+      import {dirname,join} from "node:path";
+      test("log destination fails", async()=>{
+        const run=dirname(process.env.CGW_RUNTIME_PERFORMANCE_DIR), held=run+".held";
+        renameSync(run,held);
+        console.info("stdout while destination is missing");
+        console.error("stderr while destination is missing");
+        await new Promise(resolve=>setTimeout(resolve,60));
+        writeFileSync(${JSON.stringify(join(root, "finished"))},"completed");
+        renameSync(held,run);
+      });`);
+    const reports = join(root, "reports");
+    const child = spawnSync(process.execPath, [profiler, fixture], {
+      encoding: "utf8", timeout: 15_000, env: { ...process.env, CGW_TEST_PROFILE_DIR: reports },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(readFileSync(join(root, "finished"), "utf8")).toBe("completed");
+    const summary = JSON.parse(readFileSync(join(reports, readdirSync(reports)[0]!, "summary.json"), "utf8"));
+    expect(summary.counts).toEqual({ pass: 1, skip: 0, fail: 0 });
+    expect(summary.complete).toBe(false);
+    expect(summary.incompleteReasons).toContain("log-write-failed:stdout.log");
+    expect(summary.incompleteReasons).toContain("log-write-failed:stderr.log");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("an unavailable profiling output directory still runs the test", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-profile-setup-"));
+  try {
+    const fixture = join(root, "setup-io.test.ts"), output = join(root, "not-a-directory");
+    writeFileSync(output, "blocked");
+    writeFileSync(fixture, 'import {test,expect} from "bun:test"; test("actual test",()=>expect(2+2).toBe(4));');
+    const child = spawnSync(process.execPath, [profiler, fixture], {
+      encoding: "utf8", timeout: 15_000, env: { ...process.env, CGW_TEST_PROFILE_DIR: output },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stderr).toContain("1 pass");
+    expect(child.stderr).toContain("preserving test exit=0");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

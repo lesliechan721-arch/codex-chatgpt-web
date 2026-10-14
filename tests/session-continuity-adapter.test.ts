@@ -1,14 +1,17 @@
 import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessInstanceStatus } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { createRequire } from "node:module";
-import { mock } from "node:test";
 import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryIdentity, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import * as recoveryRuntime from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import * as continuityInput from "../src/adapters/chatgpt-web/continuity-input";
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn } from "bun:test";
+import { performanceTest } from "./helpers/performance-test";
+import { measureRuntimeOperation, measureRuntimeAsync, runtimePerformanceContext, withRuntimePerformanceContext } from "../src/runtime-performance";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { $ } from "bun";
 import { harmlessContinuityCommand } from "./helpers/continuity-command";
+import { controlledClock } from "./helpers/controlled-clock";
+import { retainedFixtureCleanup } from "./helpers/retained-fixture-cleanup";
 import { OPENAI_ACCESS } from "../src/api-access";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,15 +46,21 @@ import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../s
 import { actualCheckpoint, observeCheckpointResponse, checkpointContinuationBody, compactionBody, observeCompactionHandoff } from "../scripts/validate-unified-task-continuity-transitions";
 import { createLiveRequestBody } from "../scripts/validate-context-rendering";
 
+const test = performanceTest(import.meta.path);
 const cleanups: Array<() => Promise<void>> = [];
 const require = createRequire(import.meta.url);
 const launcherRecovery = require("../launcher/electron/continuity-recovery.cjs");
 const launcherLease = require("../launcher/electron/continuity-lease.cjs");
 const launcherAuthority = require("../launcher/electron/continuity-execution-authority.cjs");
-afterEach(async () => {
+async function disposeTestFixtures(): Promise<void> {
   chatGptTurnSessions.clear();
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
+  const errors: unknown[] = [];
+  for (const cleanup of cleanups.splice(0).reverse()) {
+    try { await cleanup(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length) throw new AggregateError(errors, "Continuity fixture cleanup failed");
+}
+afterEach(disposeTestFixtures);
 
 function recordedCall(call: BrokerToolRequest): Record<string, unknown> {
   return call.freeform
@@ -68,11 +77,17 @@ function taskEnvelope(prompt: string): unknown {
   return JSON.parse(/<codex_context_json>\n([^\n]+)/.exec(prompt)![1]!);
 }
 
-function fixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string } = {}) {
+function fixture(...args: Parameters<typeof createFixture>) {
+  return withRuntimePerformanceContext({ ...runtimePerformanceContext(), fixtureMode: args[0] ? "manual" : "automatic" },
+    () => measureRuntimeOperation("fixture.prepare", () => createFixture(...args)));
+}
+function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean } = {}) {
+  const profileContext = runtimePerformanceContext();
   const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
   const statePath = join(root, "continuity");
-  const registrations = new ContinuityRegistrationStore(statePath);
-  registrations.initialize();
+  const registrations = measureRuntimeOperation("fixture.store", () => {
+    const store = new ContinuityRegistrationStore(statePath); store.initialize(); return store;
+  });
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
   const submissions: Array<{ prompt: string; claim: ContinuityClaim; key: string; reused: boolean }> = [];
   // Fixture identity has the protocol shape; it is not evidence of a real Launcher process.
@@ -80,7 +95,7 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     ? "darwin:Sat Oct 10 00:00:00 2026" : continuityProcessInstance().startIdentity, instanceId: "a".repeat(64) };
   const recoveryHost = { continuityLauncherInstance: launcherInstance, turnTabs: new Map<string, any>(),
     removeTurnTab: (tab: any) => { tab.destroyed = true; recoveryHost.turnTabs.delete(tab.id); } };
-  const server = Bun.serve({
+  const server = measureRuntimeOperation("fixture.http", () => Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       if (new URL(request.url).pathname === "/v1/turn/continuity-capacity") {
@@ -141,11 +156,11 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       }
       return matches ? Response.json({ ok: true, ...page }) : Response.json({ ok: false, code: "continuity_session_lost" }, { status: 409 });
     },
-  });
-  cleanups.push(async () => {
-    await server.stop(true);
+  }));
+  cleanups.push(() => withRuntimePerformanceContext(profileContext, () => measureRuntimeAsync("fixture.cleanup", async () => {
+    await measureRuntimeAsync("cleanup.http", () => server.stop(true));
     if (!options.root) rmSync(root, { recursive: true, force: true });
-  });
+  })));
   const descriptorPath = join(root, "launcher.json");
   const descriptor = {
     version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development", pid: process.pid,
@@ -169,14 +184,14 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       toolAuthorityMode: "delegated", zeroRiskRequireSentConfirmation: true,
     },
   };
-  const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
+  const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
   let modelMcp: Client | undefined;
   const manualMcp = async () => {
     if (!modelMcp) {
       modelMcp = new Client({ name: "continuity-manual-model-fixture", version: "1" });
-      await modelMcp.connect(new StdioClientTransport({ command: process.execPath,
+      await measureRuntimeAsync("fixture.mcp", () => modelMcp!.connect(new StdioClientTransport({ command: process.execPath,
         args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", provider.chatgptWeb!.brokerSocketPath!],
-        cwd: process.cwd(), stderr: "pipe" }));
+        cwd: process.cwd(), stderr: "pipe" })));
     }
     return modelMcp;
   };
@@ -446,15 +461,20 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
     },
     async cancel() {},
   };
-  cleanups.push(async () => {
+  cleanups.push(() => withRuntimePerformanceContext(profileContext, () => measureRuntimeAsync("fixture.cleanup", async () => {
     controls.releaseDeferredCompletion?.();
     controls.releaseAfterToolResults?.();
     automatic.mockRestore(); compatible.mockRestore(); taskUpdatesSupport.mockRestore();
     broker.acceptTaskUpdate = originalAcceptTaskUpdate;
-    await broker.close();
+    await measureRuntimeAsync("cleanup.broker", () => broker.close());
     await controls.modelTask?.catch(() => {});
-    await modelMcp?.close();
-  });
+    await measureRuntimeAsync("cleanup.child", () => modelMcp?.close());
+  })));
+  if (options.waitForRetirement) {
+    const retire = retainedFixtureCleanup(descriptorPath);
+    cleanups.push(() => withRuntimePerformanceContext(profileContext, () => measureRuntimeAsync("cleanup.sessions",
+      () => retire([...pages.keys(), ...submissions.map(submission => submission.key)]))));
+  }
   const threadId = options.threadId ?? `thread-${root}`;
   const request = (text = "First continuity instruction.", turnId = "turn-first", input?: unknown[]): CodexParsedRequest => {
     const parsed = parseRequest({
@@ -477,13 +497,18 @@ function fixture(manual = false, options: { codexHome?: string; threadId?: strin
       internal_chat_message_metadata_passthrough: { turn_id: turnId } },
   ]);
   const adapter = () => createChatGptWebAdapter(provider, { broker, zeroRiskManualControl: manualControl, codexHome: options.codexHome });
-  const run = async (parsed: CodexParsedRequest) => {
+  let firstRequest = true;
+  const run = (parsed: CodexParsedRequest) => withRuntimePerformanceContext(profileContext, () => {
+    const request = () => measureRuntimeAsync("request.total", async () => {
     const current = adapter();
     const events: AdapterEvent[] = [];
     await current.preflight!(parsed, { headers: new Headers() });
     await current.runTurn!(parsed, { headers: new Headers() }, event => events.push(event));
     return events;
-  };
+    });
+    if (firstRequest) { firstRequest = false; return measureRuntimeAsync("fixture.firstRequest", request); }
+    return request();
+  });
   return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost, root, manualControl };
 }
 
@@ -524,13 +549,15 @@ for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "
   }
 });
 
-for (const { name, sourceDelay, checkpointDelay, succeeds } of [
+const compactionBudgetCases = [
   { name: "completes source settlement and checkpoint within the original budget", sourceDelay: 300, checkpointDelay: 300, succeeds: true },
   { name: "preserves the original deadline across source settlement and checkpoint", sourceDelay: 700, checkpointDelay: 700, succeeds: false },
   { name: "still times out during source settlement", sourceDelay: 1600, checkpointDelay: 0, succeeds: false },
   { name: "still times out during the checkpoint", sourceDelay: 0, checkpointDelay: 1600, succeeds: false },
-]) test(`continuity compaction ${name}`, async () => {
-  const f = fixture(false, { turnTimeoutMs: 1000 });
+] as const;
+
+async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds }: typeof compactionBudgetCases[number], preparationDelayMs = 0): Promise<void> {
+  const f = fixture(false, { turnTimeoutMs: 1000, waitForRetirement: true });
   const first = f.request();
   await f.run(first);
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
@@ -549,10 +576,11 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
   let settleSource!: () => void;
   Object.defineProperty(source, "physicalSettlement", { value: new Promise<void>(resolve => { settleSource = resolve; }) });
   let checkpoint: Promise<string> | undefined;
+  const clock = controlledClock();
   f.automatic.mockImplementation(turn => {
     if (!turn.nativeConnector) return ordinary(turn);
     checkpoint = (async () => {
-      mock.timers.tick(checkpointDelay);
+      clock.tick(checkpointDelay);
       turn.abortSignal?.throwIfAborted();
       return ordinary(turn);
     })();
@@ -562,7 +590,6 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
   compact._compactionRequest = true;
   // Deadline arithmetic and timer delivery must share the same clock; real I/O
   // must not consume the simulated budget or grant the checkpoint a fresh one.
-  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   let run: Promise<AdapterEvent[]> | undefined;
   try {
     run = f.run(compact);
@@ -573,10 +600,19 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
     ]);
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(binding.state).toBe("compacting");
-    mock.timers.tick(sourceDelay);
+    if (preparationDelayMs) {
+      const realStart = process.hrtime.bigint();
+      const wallStart = Date.now();
+      const monotonicStart = performance.now();
+      await Bun.sleep(preparationDelayMs);
+      expect(Number(process.hrtime.bigint() - realStart) / 1e6).toBeGreaterThan(1_000);
+      expect(Date.now()).toBe(wallStart);
+      expect(performance.now()).toBe(monotonicStart);
+    }
+    clock.tick(sourceDelay);
     settleSource();
     if (!succeeds) {
-      await expect(run).rejects.toMatchObject({ code: "continuity_session_lost" });
+      await expect(run).rejects.toMatchObject({ code: "continuity_session_lost", message: expect.stringContaining("The handoff exceeded its original deadline.") });
       expect(binding.state).toBe("lost");
       if (sourceDelay > 1000) expect(checkpoint).toBeUndefined();
       else expect(checkpoint).toBeDefined();
@@ -589,14 +625,21 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
     expect(binding.state).toBe("ready");
     expect(f.submissions).toHaveLength(2);
   } finally {
+    clock.restore();
     settleSource();
     await run?.catch(() => {});
     await source.physicalSettlement;
     await checkpoint?.catch(() => {});
-    mock.timers.reset();
     begin.mockRestore();
+    await disposeTestFixtures();
+    await new Promise<void>(resolve => setTimeout(resolve, 1));
   }
-});
+}
+
+for (const scenario of compactionBudgetCases) {
+  test(`continuity compaction ${scenario.name}`, () => compactionBudgetScenario(scenario));
+  test(`controlled clock slow source settlement: ${scenario.name}`, () => compactionBudgetScenario(scenario, 1_100));
+}
 
 for (const manual of [false, true]) for (const replacement of ["empty", "removed"] as const) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} cached ordinary round applies ${replacement} tools before Native admission`, async () => {
   const f = fixture(manual);

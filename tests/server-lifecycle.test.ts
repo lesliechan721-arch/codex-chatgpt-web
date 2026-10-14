@@ -1,9 +1,10 @@
-import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { expect, spyOn } from "bun:test";
+import { performanceTest } from "./helpers/performance-test";
+const test = performanceTest(import.meta.path);
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mock } from "node:test";
 import { chatGptWebExecutionNamespace, chatGptWebTraceId } from "../src/adapters/chatgpt-web";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
@@ -16,6 +17,7 @@ import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snaps
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import { createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
+import { controlledClock } from "./helpers/controlled-clock";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
@@ -2175,21 +2177,28 @@ for (const generationProgress of [true, false]) {
   });
 }
 
-for (const generationProgress of [true, false]) {
-  test(`remote Full Launcher retained checkpoint ${generationProgress ? "generation progress renews" : "idle helper heartbeat expires"} the native turn lease`, async () => {
-    const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
-    process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
-    const f = retainedTaskFixture();
-    const broker = TurnBroker.forSocket(f.provider.chatgptWeb!.brokerSocketPath!);
-    const worker = ChatGptBrowserWorker.forProvider(f.provider);
-    const sourceRun = worker.run;
-    // Durable fixture preparation must not consume the one-second idle lease.
-    // Advance the lease clock and its timers together only during browser generation.
-    const wallStart = Date.now();
-    const monotonicStart = Math.floor(performance.now());
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: wallStart });
-    const clock = spyOn(performance, "now").mockImplementation(() => monotonicStart + Date.now() - wallStart);
-    const server = startServer({ ...f.config, port: 0, brokerSocketPath: broker.socketPath,
+async function remoteRetainedCheckpointLease(generationProgress: boolean, options: {
+  preparationDelayMs?: number; failAfterSource?: boolean; cancelCheckpoint?: boolean;
+} = {}): Promise<void> {
+  const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+  process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  const f = retainedTaskFixture();
+  const broker = TurnBroker.forSocket(f.provider.chatgptWeb!.brokerSocketPath!);
+  const worker = ChatGptBrowserWorker.forProvider(f.provider);
+  const sourceRun = worker.run;
+  // Durable fixture preparation must not consume the one-second idle lease.
+  // Advance the lease clock and its timers together only during browser generation.
+  const clock = controlledClock();
+  let server: ReturnType<typeof startServer> | undefined;
+  let progressEvents = 0;
+  let browserStarts = 0;
+  let cancelled = false;
+  let browserError: unknown;
+  let cancellation: ReturnType<typeof cancelStructuredCompactionNativeTurn> | undefined;
+  let finishBrowser!: () => void;
+  const finished = new Promise<void>(resolve => { finishBrowser = resolve; });
+  try {
+    server = startServer({ ...f.config, port: 0, brokerSocketPath: broker.socketPath,
       browserHostDescriptorPath: f.provider.chatgptWeb!.browserHostDescriptorPath }, {
       accessPolicy: OPENAI_ACCESS,
       adapterFactory: () => createChatGptWebAdapter(f.provider, { broker }),
@@ -2198,111 +2207,139 @@ for (const generationProgress of [true, false]) {
     const send = (body: unknown, compact = false) => fetch(`${endpoint}/v1/responses${compact ? "/compact" : ""}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
     });
-    let progressEvents = 0;
-    let browserStarts = 0;
-    let cancelled = false;
-    let browserError: unknown;
-    let finishBrowser!: () => void;
-    const finished = new Promise<void>(resolve => { finishBrowser = resolve; });
-    try {
-      // The public source turn establishes durable work, delivered coverage and an accepted page lease.
-      const source = await send(f.body);
-      expect(source.status).toBe(200);
-      const original = await source.json() as { status: string; output: unknown[] };
-      expect(original.status).toBe("completed");
-      expect(JSON.stringify(original.output)).toContain(f.ordinaryFinal);
-      const before = f.store.get(continuityDigest(f.threadId))!;
-      expect(before.legacyUnproven).toBeFalse();
-      expect(before.works[before.currentWorkId!]!.state).toBe("completed");
-      expect(before.contextCoverage!.some(entry => entry.metadata.delivered)).toBeTrue();
-      worker.run = async turn => {
-        browserStarts += 1;
-        let prepared: Awaited<ReturnType<BrowserTurn["prepare"]>> | undefined;
-        let lease: ContinuityLease | undefined;
-        try {
-          expect(turn.requireRetainedConversation).toBeTrue();
-          expect(turn.compaction).toBeTrue();
-          const claim = turn.continuity!;
-          const page = f.pages.get(turn.conversationKey!)!;
-          expect(page.state).toBe("ready");
-          expect(claim.expected).toEqual(page.continuity);
-          lease = { owner: claim.owner, traceId: turn.traceId, leaseId: page.continuity.leaseId,
-            ...(claim.recovery ? { recovery: claim.recovery } : {}) };
-          f.pages.set(turn.conversationKey!, { continuity: lease, state: "running" });
-          turn.onContinuityLease!(lease);
-          prepared = await turn.prepareResume!();
-          const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
-          const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
-          expect(token).toBeDefined();
-          expect(handoffId).toBeDefined();
-          await turn.onSendActivated?.();
-          await turn.onSubmitted?.();
-          for (let step = 0; step < 5; step++) {
-            await new Promise<void>(resolve => setImmediate(resolve));
-            mock.timers.tick(300);
-            if (turn.abortSignal?.aborted) {
-              cancelled = true;
-              throw turn.abortSignal.reason;
-            }
-            turn.onHeartbeat?.();
-            if (generationProgress) {
-              expect(turn.onGenerationProgress).toBeDefined();
-              turn.onGenerationProgress!();
-              progressEvents += 1;
-            }
-          }
-          await callTurnBroker(broker.socketPath, {
-            method: "submit_compaction_handoff", token, handoffId, summary: "Checkpoint after silent generation",
-          });
-          return "Checkpoint submitted";
-        } catch (error) {
-          browserError = error;
-          throw error;
-        } finally {
-          prepared?.release();
-          if (lease) f.pages.set(turn.conversationKey!, { continuity: lease, state: "ready" });
-          finishBrowser();
+    if (options.preparationDelayMs) worker.run = async turn => {
+      const before = process.hrtime.bigint();
+      await Bun.sleep(options.preparationDelayMs!);
+      expect(Number(process.hrtime.bigint() - before) / 1e6).toBeGreaterThan(1_000);
+      return sourceRun(turn);
+    };
+    // The public source turn establishes durable work, delivered coverage and an accepted page lease.
+    const source = await send(f.body);
+    expect(source.status).toBe(200);
+    const original = await source.json() as { status: string; output: unknown[] };
+    expect(original.status).toBe("completed");
+    expect(JSON.stringify(original.output)).toContain(f.ordinaryFinal);
+    const before = f.store.get(continuityDigest(f.threadId))!;
+    expect(before.legacyUnproven).toBeFalse();
+    expect(before.works[before.currentWorkId!]!.state).toBe("completed");
+    expect(before.contextCoverage!.some(entry => entry.metadata.delivered)).toBeTrue();
+    if (options.failAfterSource) expect("injected assertion failure").toBe("source must not survive cleanup");
+    worker.run = async turn => {
+      browserStarts += 1;
+      let prepared: Awaited<ReturnType<BrowserTurn["prepare"]>> | undefined;
+      let lease: ContinuityLease | undefined;
+      try {
+        expect(turn.requireRetainedConversation).toBeTrue();
+        expect(turn.compaction).toBeTrue();
+        const claim = turn.continuity!;
+        const page = f.pages.get(turn.conversationKey!)!;
+        expect(page.state).toBe("ready");
+        expect(claim.expected).toEqual(page.continuity);
+        lease = { owner: claim.owner, traceId: turn.traceId, leaseId: page.continuity.leaseId,
+          ...(claim.recovery ? { recovery: claim.recovery } : {}) };
+        f.pages.set(turn.conversationKey!, { continuity: lease, state: "running" });
+        turn.onContinuityLease!(lease);
+        prepared = await turn.prepareResume!();
+        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+        const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
+        expect(token).toBeDefined();
+        expect(handoffId).toBeDefined();
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
+        if (options.cancelCheckpoint) {
+          cancellation = cancelStructuredCompactionNativeTurn(f.threadId, "source-turn", new DOMException("Test operator cancellation", "AbortError"));
+          expect(cancellation.cancelled).toBe(1);
         }
-      };
-      const startedAt = Date.now();
-      const response = await send({ ...f.body, input: [...f.body.input, ...original.output] }, true);
-      const result = await response.json() as { output?: unknown[]; error?: { code?: string } };
-      expect(browserStarts).toBe(1);
-      await finished;
-      expect(Date.now() - startedAt).toBeGreaterThan(1_000);
-      const after = f.store.get(continuityDigest(f.threadId))!;
-      if (generationProgress) {
-        expect(browserError).toBeUndefined();
-        expect(response.status).toBe(200);
-        expect(JSON.stringify(result.output)).toContain("Checkpoint after silent generation");
-        expect(progressEvents).toBe(5);
-        expect(cancelled).toBeFalse();
-        expect(after.historyRevision).toBe(1);
-        expect(Object.keys(after.checkpoints)).toHaveLength(1);
-        expect(f.pages.size).toBe(1);
-      } else {
-        expect(result.error?.code).toBe("client_turn_idle_timeout");
-        expect(progressEvents).toBe(0);
-        expect(cancelled).toBeTrue();
-        expect(after.historyRevision).toBe(0);
-        expect(Object.keys(after.checkpoints)).toHaveLength(0);
+        for (let step = 0; step < 5; step++) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          clock.tick(300);
+          if (turn.abortSignal?.aborted) {
+            cancelled = true;
+            throw turn.abortSignal.reason;
+          }
+          turn.onHeartbeat?.();
+          if (generationProgress) {
+            expect(turn.onGenerationProgress).toBeDefined();
+            turn.onGenerationProgress!();
+            progressEvents += 1;
+          }
+        }
+        await callTurnBroker(broker.socketPath, {
+          method: "submit_compaction_handoff", token, handoffId, summary: "Checkpoint after silent generation",
+        });
+        return "Checkpoint submitted";
+      } catch (error) {
+        browserError = error;
+        throw error;
+      } finally {
+        prepared?.release();
+        if (lease) f.pages.set(turn.conversationKey!, { continuity: lease, state: "ready" });
+        finishBrowser();
       }
-      expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
-        active_http_turns: 0, active_browser_turns: 0,
-        // A successful checkpoint refreshes the native turn; it does not complete that turn.
-        active_remote_turn_idle_leases: generationProgress ? 1 : 0,
-      });
+    };
+    const startedAt = Date.now();
+    const response = await send({ ...f.body, input: [...f.body.input, ...original.output] }, true);
+    const result = await response.json() as { output?: unknown[]; error?: { code?: string } };
+    expect(browserStarts).toBe(1);
+    await finished;
+    await cancellation?.settlement;
+    if (!options.cancelCheckpoint) expect(Date.now() - startedAt).toBeGreaterThan(1_000);
+    const after = f.store.get(continuityDigest(f.threadId))!;
+    if (options.cancelCheckpoint) {
+      expect(browserError).toMatchObject({ name: "AbortError", message: "Test operator cancellation" });
+      expect(response.status).not.toBe(200);
+      expect(cancelled).toBeTrue();
+      expect(after.historyRevision).toBe(0);
+      expect(Object.keys(after.checkpoints)).toHaveLength(0);
+    } else if (generationProgress) {
+      expect(browserError).toBeUndefined();
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(result.output)).toContain("Checkpoint after silent generation");
+      expect(progressEvents).toBe(5);
+      expect(cancelled).toBeFalse();
+      expect(after.historyRevision).toBe(1);
+      expect(Object.keys(after.checkpoints)).toHaveLength(1);
+      expect(f.pages.size).toBe(1);
+    } else {
+      expect(result.error?.code).toBe("client_turn_idle_timeout");
+      expect(progressEvents).toBe(0);
+      expect(cancelled).toBeTrue();
+      expect(after.historyRevision).toBe(0);
+      expect(Object.keys(after.checkpoints)).toHaveLength(0);
+    }
+    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+      active_http_turns: 0, active_browser_turns: 0,
+      // A successful checkpoint refreshes the native turn; it does not complete that turn.
+      active_remote_turn_idle_leases: generationProgress ? 1 : 0,
+    });
+  } finally {
+    // Broker/socket shutdown needs real timers. Old controlled handles are inert.
+    clock.restore();
+    worker.run = sourceRun;
+    try {
+      const results = await Promise.allSettled([server?.stop(true), f.dispose()]);
+      const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (errors.length) throw new AggregateError(errors, "Remote clock scenario cleanup failed");
+      expect(f.pages.size).toBe(0);
+      expect(existsSync(f.root)).toBeFalse();
+      await new Promise<void>(resolve => setTimeout(resolve, 1));
     } finally {
-      worker.run = sourceRun;
-      await server.stop(true);
-      await f.dispose();
-      clock.mockRestore();
-      mock.timers.reset();
       if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
       else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
     }
-  });
+  }
 }
+
+for (const generationProgress of [true, false]) {
+  test(`remote Full Launcher retained checkpoint ${generationProgress ? "generation progress renews" : "idle helper heartbeat expires"} the native turn lease`, () => remoteRetainedCheckpointLease(generationProgress));
+  test(`controlled clock slow source preparation preserves ${generationProgress ? "generation progress" : "heartbeat expiry"} over HTTP`, () => remoteRetainedCheckpointLease(generationProgress, { preparationDelayMs: 1_100 }));
+}
+
+test("controlled clock assertion failure still retires the retained HTTP source", async () => {
+  await expect(remoteRetainedCheckpointLease(true, { failAfterSource: true })).rejects.toThrow("source must not survive cleanup");
+});
+
+test("controlled clock operator cancellation settles the retained HTTP checkpoint", () => remoteRetainedCheckpointLease(true, { cancelCheckpoint: true }));
 
 test("remote compaction progress refreshes the existing native turn idle lease without completing it", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;

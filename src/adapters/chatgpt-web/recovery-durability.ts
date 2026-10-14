@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, type BigIntStats } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { measureRuntimeOperation } from "../../runtime-performance";
 
 // Proof of completed I/O, never a cached read, owner check or execution permit.
 // Recovery writers hold the storage lock while checking or publishing a proof.
@@ -56,19 +57,23 @@ export function forgetRecoveryDurability(path: string): void {
 
 /** Call only after the complete file/rename/directory commit has succeeded. */
 export function rememberRecoveryDurability(path: string, encoded: string): void {
-  const key = resolve(path);
-  proofs.delete(key);
-  const proof = proofOf(path, encoded);
-  if (!proof) return;
-  if (proofs.size >= MAX_PROOFS) proofs.delete(proofs.keys().next().value!);
-  proofs.set(key, proof);
+  measureRuntimeOperation("recovery.proofRemember", () => {
+    const key = resolve(path);
+    proofs.delete(key);
+    const proof = proofOf(path, encoded);
+    if (!proof) return;
+    if (proofs.size >= MAX_PROOFS) proofs.delete(proofs.keys().next().value!);
+    proofs.set(key, proof);
+  }, Buffer.byteLength(encoded));
 }
 
 /** The caller must first freshly validate the document and its authority guard. */
 export function reuseRecoveryDurability(path: string, encoded: string): boolean {
-  const key = resolve(path);
-  const known = proofs.get(key);
-  if (known && proofOf(path, encoded) === known) return true;
-  proofs.delete(key);
-  return false;
+  return measureRuntimeOperation("recovery.proofReuse", () => {
+    const key = resolve(path);
+    const known = proofs.get(key);
+    if (known && proofOf(path, encoded) === known) return true;
+    proofs.delete(key);
+    return false;
+  }, Buffer.byteLength(encoded));
 }

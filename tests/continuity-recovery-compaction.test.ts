@@ -1,4 +1,6 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn } from "bun:test";
+import { performanceTest } from "./helpers/performance-test";
+const test = performanceTest(import.meta.path);
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
