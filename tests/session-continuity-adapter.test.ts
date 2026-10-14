@@ -525,7 +525,8 @@ for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "
 });
 
 for (const { name, sourceDelay, checkpointDelay, succeeds } of [
-  { name: "gives the checkpoint a separate budget after source settlement", sourceDelay: 700, checkpointDelay: 700, succeeds: true },
+  { name: "completes source settlement and checkpoint within the original budget", sourceDelay: 300, checkpointDelay: 300, succeeds: true },
+  { name: "preserves the original deadline across source settlement and checkpoint", sourceDelay: 700, checkpointDelay: 700, succeeds: false },
   { name: "still times out during source settlement", sourceDelay: 1600, checkpointDelay: 0, succeeds: false },
   { name: "still times out during the checkpoint", sourceDelay: 0, checkpointDelay: 1600, succeeds: false },
 ]) test(`continuity compaction ${name}`, async () => {
@@ -559,8 +560,9 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
   });
   const compact = structuredClone(first);
   compact._compactionRequest = true;
-  // Real filesystem and broker work must not consume the simulated phase budgets.
-  mock.timers.enable({ apis: ["setTimeout"] });
+  // Deadline arithmetic and timer delivery must share the same clock; real I/O
+  // must not consume the simulated budget or grant the checkpoint a fresh one.
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   let run: Promise<AdapterEvent[]> | undefined;
   try {
     run = f.run(compact);
@@ -577,6 +579,7 @@ for (const { name, sourceDelay, checkpointDelay, succeeds } of [
       await expect(run).rejects.toMatchObject({ code: "continuity_session_lost" });
       expect(binding.state).toBe("lost");
       if (sourceDelay > 1000) expect(checkpoint).toBeUndefined();
+      else expect(checkpoint).toBeDefined();
       return;
     }
     const events = await run;

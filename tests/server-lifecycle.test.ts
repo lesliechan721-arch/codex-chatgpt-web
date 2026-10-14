@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "no
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mock } from "node:test";
 import { chatGptWebExecutionNamespace, chatGptWebTraceId } from "../src/adapters/chatgpt-web";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
@@ -2182,6 +2183,12 @@ for (const generationProgress of [true, false]) {
     const broker = TurnBroker.forSocket(f.provider.chatgptWeb!.brokerSocketPath!);
     const worker = ChatGptBrowserWorker.forProvider(f.provider);
     const sourceRun = worker.run;
+    // Durable fixture preparation must not consume the one-second idle lease.
+    // Advance the lease clock and its timers together only during browser generation.
+    const wallStart = Date.now();
+    const monotonicStart = Math.floor(performance.now());
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: wallStart });
+    const clock = spyOn(performance, "now").mockImplementation(() => monotonicStart + Date.now() - wallStart);
     const server = startServer({ ...f.config, port: 0, brokerSocketPath: broker.socketPath,
       browserHostDescriptorPath: f.provider.chatgptWeb!.browserHostDescriptorPath }, {
       accessPolicy: OPENAI_ACCESS,
@@ -2231,7 +2238,8 @@ for (const generationProgress of [true, false]) {
           await turn.onSendActivated?.();
           await turn.onSubmitted?.();
           for (let step = 0; step < 5; step++) {
-            await Bun.sleep(300);
+            await new Promise<void>(resolve => setImmediate(resolve));
+            mock.timers.tick(300);
             if (turn.abortSignal?.aborted) {
               cancelled = true;
               throw turn.abortSignal.reason;
@@ -2288,6 +2296,8 @@ for (const generationProgress of [true, false]) {
       worker.run = sourceRun;
       await server.stop(true);
       await f.dispose();
+      clock.mockRestore();
+      mock.timers.reset();
       if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
       else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
     }
