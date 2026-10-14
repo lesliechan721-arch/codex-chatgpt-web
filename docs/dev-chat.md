@@ -98,11 +98,11 @@ not adoption of the new ABI or complete context-navigation acceptance. Current F
 delivery follows the [context navigation contract](context-navigation.md).
 
 Reusing the same name continues its canonical Responses history. Sequential native messages in the
-same compaction epoch lease one Temporary Chat, exactly like production. Every message receives a
+same compatible task lease one Temporary Chat. Every message receives a
 new turn-bound MCP token, and all MCP tool rounds for that message remain inside the same ChatGPT
 response. On an exact native compaction request, the same Web agent submits the checkpoint through
-a one-shot MCP control call in that chat; only then does the surface close and the next epoch open a
-new Temporary Chat. The complete named history remains owned by the existing prompt compiler. New
+a one-shot MCP control call in that chat. Applicable Full Native + Launcher paths retain the
+healthy page across compaction; other paths keep their existing lifecycle. The complete named history remains owned by the existing prompt compiler. New
 chats use the cheapest account-supported browser mode:
 Instant (`light`) when Sol is available, otherwise Luna. Override it with `--model` or `/model`.
 
@@ -151,8 +151,9 @@ that ChatGPT will follow them more reliably.
 Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by
 default. The switch updates the profile's canonical runtime configuration through the normal setup
 transaction; it is not a launcher-only preference. Production setup also rewrites the managed
-Codex model catalog with the selected model's context and auto-compaction thresholds and asks
-you to restart Codex. GPT-5.6 and GPT-6 Pro keep their three-times budgets. GPT-6 Sol uses
+Codex model catalog and asks you to restart Codex. Applicable unified routes advertise a
+1,000,000-token history window and 900,000-token compaction threshold independently of browser
+delivery capacity. GPT-5.6 and GPT-6 Pro keep their three-times budgets. GPT-6 Sol uses
 240,000 context tokens and a 220,000-token compaction threshold only on Pro accounts at Medium,
 High, or Extra High. GPT-6 Instant and GPT-6 Sol on other account plans keep standard budgets.
 The DEV CLI reads the same setting from its isolated runtime configuration on each command.
@@ -160,8 +161,8 @@ The DEV CLI reads the same setting from its isolated runtime configuration on ea
 When enabled, a normal turn stays on the original single-message path while its estimated input
 is below the selected mode's existing auto-compaction threshold. At the first threshold it uses two
 messages; at twice that threshold it uses six messages. The final context part also commits the
-transaction and starts the task, so there is no extra request. The existing DEV compaction threshold
-uses the same model- and account-specific budget as the production catalog.
+transaction and starts the task, so there is no extra request. The named DEV driver keeps its own compaction trigger; it does not demonstrate the public
+Codex history threshold. Delivery still obeys the selected model and account limits.
 
 Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
 must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.
@@ -170,8 +171,8 @@ the final part. MCP-routed images are read through the selected navigation entry
 In Full/MCP mode, compaction does not replay the expanded history into an unrelated summarizer. If
 the source Web response is still waiting on a tool boundary, its canonical tool results finish that
 response first without a compaction suffix. If those results are enough for an ordinary final
-answer, that committed answer remains owned by the logical Responses turn across the physical chat
-retirement. If the Web model instead requests another tool, the broker blocks that new execution
+answer, that committed answer remains owned by the logical Responses turn even if the page is
+later replaced. If the Web model instead requests another tool, the broker blocks that new execution
 and tells the response to stop; the compacted continuation then resumes the unfinished work. The
 exact retained chat receives one strict checkpoint message with the one-shot MCP submission
 capability and, when needed, an independent `compaction_token` for read-only sources. It grants no
@@ -179,20 +180,28 @@ ordinary work capability. The model chooses which sources to read; no full-readi
 required. Source failures, remaining summary reserve, and in-flight reads still gate submission.
 The checkpoint never rides in the tail of a potentially
 huge tool result, and its wait is capped at five minutes independently of the normal turn timeout.
-After the structured handoff is accepted, the bridge explicitly ends that one-purpose browser turn
-and waits for its physical launcher settlement before closing the old surface; the next epoch then
-starts a fresh Temporary Chat. This does not depend on ChatGPT rendering assistant text or a Copy
-action after the control-only response. If the retained private chat was already closed, the bridge
-starts one read-only fallback chat from the canonical Codex history instead. Browser-only mode
-has no retained MCP boundary and uses the six-message compaction path so its summarizer receives
-the complete expanded history.
+For supported Full Native + Launcher tasks, accepting a structured handoff does not require
+closing the page. The checkpoint commits once after its bound execution, source and real-result
+checks; a healthy compatible page remains available for continuation. If a page replacement is
+needed, old project authority must be durably isolated before the successor is activated. Physical
+cleanup runs separately and still consumes its slot until exact destruction. Neither ending the
+one-purpose response nor clicking close proves dispatched operations settled.
+
+Non-applicable paths keep their existing compaction lifecycle: the one-purpose response ends,
+physical Launcher settlement is awaited where required, and the old surface closes before a fresh
+Temporary Chat. This control-only completion does not depend on assistant prose or a Copy action.
+If an applicable task's retained chat was lost without user stop, its uncommitted compaction uses
+legal rebuilt sources and an actual read-only on-demand plan, with the same logical target,
+deadline and retry budget. An existing stop is never cleared. Non-applicable fallback paths retain
+their original source and transport checks. Browser-only has no retained MCP boundary and uses
+the six-message compaction path with its complete expanded history.
 
 Any missing or malformed acknowledgement fails the whole transaction. No later part or final
 commit is sent, and a retry starts again from part one in a fresh Temporary Chat. The model context
 and auto-compaction ceilings follow the model and account rules above. Every individual stage
-must still fit the selected ChatGPT mode's measured one-message boundary. Bigger Context applies
-only to non-continuity models. Session continuity ignores this preference; its
-1,000,000 / 900,000-token history budget does not increase that browser input boundary.
+must still fit the selected ChatGPT mode's measured one-message boundary. Bigger Context uses only the existing supported model/account and staged-send paths. Unified
+task continuity does not exclude it by mode; Zero Risk retains its prohibition. The applicable
+1,000,000 / 900,000-token history budget does not increase the browser input boundary.
 
 Small turns use one request. Two-part turns use one inert staging request and one final request;
 six-part turns use five staging requests and one final request. Browser-only compaction also uses

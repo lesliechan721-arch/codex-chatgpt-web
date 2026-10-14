@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CodexMessage, CodexParsedRequest } from "../../types";
 import { parseRequest } from "../../responses/parser";
+import { contextSourceParserModel } from "./context-source-parser";
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
 import type { ContextSourceEvidence } from "./context-types";
@@ -187,7 +188,7 @@ function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsed
     }
     for (const item of added.get(rawIndex) ?? []) {
       mergedRaw.push(structuredClone(item));
-      const parsed = parseRequest({ model: source.modelId, input: [item] }).context;
+      const parsed = parseRequest({ model: contextSourceParserModel(source), input: [item] }).context;
       restoredSystem.push(...parsed.systemPrompt ?? []);
       if (parsed.messages.length && rawIndex > 0) {
         for (let index = rawIndex - 1; index >= 0; index -= 1) {
@@ -255,8 +256,8 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
   if (digest(originalEnvelope) !== digest(recoveredEnvelope)) unproven();
   const extra = raw.slice(original.length);
   if (extra.some(item => !resultTypes.has(String(rawRecord(item)?.type)))) unproven();
-  const parsedOriginal = parseRequest({ model: request.modelId, instructions: requestRaw!.instructions, input: original }).context;
-  const parsedExtra = parseRequest({ model: request.modelId, input: extra }).context;
+  const parsedOriginal = parseRequest({ model: contextSourceParserModel(request), instructions: requestRaw!.instructions, input: original }).context;
+  const parsedExtra = parseRequest({ model: contextSourceParserModel(request), input: extra }).context;
   const expectedMessages = [...request.context.messages, ...parsedExtra.messages];
   const system = request.context.systemPrompt ?? [];
   const recoveredSystem = recovered.context.systemPrompt ?? [];
@@ -294,11 +295,11 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
     if (addedIds.has(id) || !result || !resultTypes.has(String(result.type)) || result.call_id !== id
       || raw.filter(value => rawRecord(value)?.call_id === id && resultTypes.has(String(rawRecord(value)?.type))).length !== 1) unproven();
     const prefix = rawIndex < original.length
-      ? parseRequest({ model: request.modelId, instructions: requestRaw!.instructions, input: original.slice(0, rawIndex + 1) }).context.messages
-      : parseRequest({ model: request.modelId, input: extra.slice(0, rawIndex - original.length + 1) }).context.messages;
+      ? parseRequest({ model: contextSourceParserModel(request), instructions: requestRaw!.instructions, input: original.slice(0, rawIndex + 1) }).context.messages
+      : parseRequest({ model: contextSourceParserModel(request), input: extra.slice(0, rawIndex - original.length + 1) }).context.messages;
     const candidateIndex = prefix.length - 1 + (rawIndex < original.length ? 0 : request.context.messages.length);
     const target = recovered.context.messages[candidateIndex];
-    const addedMessages = parseRequest({ model: request.modelId, input: [item] }).context.messages;
+    const addedMessages = parseRequest({ model: contextSourceParserModel(request), input: [item] }).context.messages;
     if (!target || target.role !== "toolResult" || target.toolCallId !== id
       || visibleDigest(target) !== visibleDigest(prefix.at(-1)!)
       || addedMessages.length !== 1 || addedMessages[0]!.role !== "assistant") unproven();
@@ -334,10 +335,10 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
       const mapped = rawMessageIndices.get(sourceIndex);
       if (mapped !== undefined) return mapped;
       const index = candidateRawBySourceIndex.get(sourceIndex);
-      if (index === undefined || !parseRequest({ model: request.modelId, input: [raw[index]] }).context.messages.length) return undefined;
+      if (index === undefined || !parseRequest({ model: contextSourceParserModel(request), input: [raw[index]] }).context.messages.length) return undefined;
       const prefix = index < original.length
-        ? parseRequest({ model: request.modelId, input: original.slice(0, index + 1) }).context.messages
-        : parseRequest({ model: request.modelId, input: extra.slice(0, index - original.length + 1) }).context.messages;
+        ? parseRequest({ model: contextSourceParserModel(request), input: original.slice(0, index + 1) }).context.messages
+        : parseRequest({ model: contextSourceParserModel(request), input: extra.slice(0, index - original.length + 1) }).context.messages;
       const candidateIndex = prefix.length - 1 + (index < original.length ? 0 : request.context.messages.length);
       rawMessageIndices.set(sourceIndex, indices[candidateIndex]!);
       return indices[candidateIndex];
@@ -358,14 +359,14 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
 /** Parse the existing continuity selection and retain its exact source positions. */
 export function continuityContextCandidate(canonical: CodexParsedRequest, input: unknown[]): CodexParsedRequest {
   const instructions = (canonical._rawBody as { instructions?: unknown } | undefined)?.instructions;
-  const selectedContext = parseRequest({ model: canonical.modelId, instructions, input }).context;
+  const selectedContext = parseRequest({ model: contextSourceParserModel(canonical), instructions, input }).context;
   const indices: (number | null)[] = [];
   const rawInputIndices: number[] = [];
   const used = new Set<number>();
   for (const item of input) {
     const source = item && typeof item === "object" ? inputSources.get(item) : undefined;
     if (!source || source.canonical !== canonical || source.digest !== digest(item)) unproven();
-    const single = parseRequest({ model: canonical.modelId, input: [item] }).context;
+    const single = parseRequest({ model: contextSourceParserModel(canonical), input: [item] }).context;
     const record = item as { type?: unknown; role?: unknown; content?: unknown };
     if (source.kind === "environment") {
       if ((record.type !== undefined && record.type !== "message")
@@ -389,7 +390,7 @@ export function continuityContextCandidate(canonical: CodexParsedRequest, input:
       && !(source.delegatedToolResult && single.messages[0]!.role === "toolResult"))) unproven();
     // Adjacent calls can merge and non-message items can disappear. Count the original
     // parsed prefix through this instruction instead of equating raw and message indices.
-    const prefix = parseRequest({ model: canonical.modelId, instructions,
+    const prefix = parseRequest({ model: contextSourceParserModel(canonical), instructions,
       input: rawInput.slice(0, source.rawIndex + 1) }).context.messages;
     const index = prefix.length - 1;
     const message = canonical.context.messages[index];

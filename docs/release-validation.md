@@ -121,7 +121,7 @@ observations and pending work. Read coverage alone was not used as a semantic-qu
 
 Before treating the feature as release-ready, exercise both Automatic and Zero Risk:
 
-1. Read the current navigation entry from actual ordinary, retained, and continuity inputs. Across
+1. Read the current navigation entry from actual inline, retained, and cold-start recovery inputs. Across
    two sends, discover and read an earlier unconsumed source using the new entry; old references
    must fail. Check exact reconstruction, source roles, ambiguous call IDs, filter boundaries, and
    UTF-8 pagination through the public tools, without injecting internal credentials into a test model.
@@ -197,92 +197,90 @@ configuration does not prove that an installed Launcher uses that runtime.
 
 ## Session continuity validation
 
-`chatgpt-web-continuity/` has additional validation because it retains conversations and can
-recover unfinished work in a new page under durable admission checks. These checks record release coverage;
-they are not an additional runtime feature flag or alias gate.
+Supported ordinary `chatgpt-web/` Full Native + Launcher routes now have one task contract.
+The historical evidence below covers earlier contracts only. The unified-task real DEV acceptance
+is **not yet complete**; script presence, local fixtures and an older live pass do not establish it.
+Keep Automatic and Zero Risk evidence separate. Navigation's outstanding platform matrix above
+remains outstanding unless a new recorded run actually covers an item.
 
-For both Automatic and Zero Risk on a compatible Full Native + Launcher setup, record:
+Record the following before claiming the unified contract validated:
 
-1. First-use creation, a normal continuation, and a compaction continuation all keep the exact
-   expected native thread, history revision, Launcher surface, and continuity lease. Lost-page and
-   restart recovery can create one new generation only after old write authority and delivered tools
-   settle. Scope conflicts still fail. A stopped request stays stopped; a distinct new instruction
-   can restart after mode exit without clear.
-2. Automatic completed-response and active-response compaction each commit one structured
-   checkpoint and continue on the same page with new tool authority. Zero Risk active compaction
-   uses the delivered control path; a response that ended before control delivery preserves its
-   ordinary result and requires manual handoff without a second automatic prompt. Automatic lost
-   compaction can generate a read-only summary in one new page if not committed; a valid existing
-   handoff commits once and committed results only replay.
-3. The published 1,000,000-token history window and 900,000-token automatic-compaction target do
-   not increase the existing single-browser-input limits. Test a large canonical history with a
-   short valid increment and a first input that exceeds the original browser boundary.
-4. Five healthy continuity pages remain protected from capacity eviction. Measure representative
-   real-page memory plus checkpoint/replay storage under sustained use, and verify that additional
-   work fails before creating a page when no safe capacity remains.
-5. A ready page expires only after 24 hours without successful continuity work. Health checks,
-   replay, inspection, and heartbeats must not renew that clock. Exercise the real 24-hour boundary
-   rather than replacing it only with a mocked clock.
-6. Remote/delegated operation keeps the existing native operation identity, queued/delivered tool
-   boundaries, cancellation, helper liveness, and remote-idle behavior. A retained page never
-   extends a tool capability or authorizes a replay after its exact owner is lost.
-7. Completed-history text, display IDs, and source metadata changes do not change accepted current
-   work or cause extra browser/Native execution. New increments send all current instruction items
-   and attachments, with the required current environment; they never resend completed work.
-   Ambiguous unowned instructions fail before submission. Current payload conflicts remain
-   rejected, and changing tool-call echoes never grants authority. Active appends use the
-   first-result and partial-result rules below instead of ordinary full-batch replay checks.
-8. Old result batches replay their own journal after later batches begin. Cross the 512-round
-   bound and verify that reclaimed results fail while ordinary reconnects retain their original
-   events and usage. Concurrent initial requests preserve the first captured prompt. Shared
-   compaction retries register each accepted cancellation identity without generating another
-   summary. Different sources with identical summaries remain distinct; unresolved revision
-   ambiguity stops instead of selecting the latest revision.
-9. Use the target Codex binary with an isolated Responses fixture first, then a harmless tool and
-   authenticated ChatGPT page. Record the binary, authentication path, JSON/SSE and full/previous-
-   response history forms, local/v1/v2 codec coverage, ordinary → tool result → compact → continue,
-   and lost-response retries. Synthetic metadata variants are not real-client certification.
-10. Inject crashes before/after creation acknowledgement, send-possible, Native delivery-possible,
-    result acceptance, stop, final receipt, and checkpoint/continuation commit. Restart backend,
-    helper, and Launcher independently. Check the actual external execution count, not empty maps.
-    A live backend whose target-thread writer is retired may recover; active/unknown old rights may not.
-    Include a crash after durable admission but before first page acquisition, and a fresh Launcher
-    with no old transaction table. Missing receipts need process-instance and no-surviving-writer
-    proof; a reused PID or an unreadable process identity must not grant a new Send.
-11. Concurrent recovery shares one authenticated transaction. Late responses cannot overwrite new
-    generation/attempt/snapshot versions. Proven-unsent H1 with lost body can rebind H2 atomically;
-    possibly sent H1 must reconnect or settle before any successor Send. Budget counts survive restart.
-12. Verify missing, edited, and correct results along A → B append → restart, with reliable checkpoint
-    coverage as the only old-body exception. Also stop the A/B chain, restart, retry both old requests,
-    and admit a distinct C only under settlement checks. No old request regains write authority.
-    Use the actual authenticated interrupt event and durable-only state after backend restart.
-    Inject append acknowledgement write/rename failures after durable acceptance; the committed
-    instruction must reconcile once and cannot be reported as unaccepted.
-13. Retry checkpoint-only work after its continuation was consumed but before Send, and after possible
-    Send. Consumer identity remains fixed and consumption occurs once. A completed source only replays
-    its answer; missing body returns replay unavailable. Equal summaries and different logical targets
-    remain distinct across page generations and multiple restarts.
-14. Exercise shared 24 MiB recovery/checkpoint capacity, 2 MiB per item, 256 checkpoints/tombstones,
-    512 rounds, and 10,000-thread/4 MiB registration bounds. Reserved result/stop/commit records still
-    fit after new work is refused. Upgrade v1 entries without clearing them; missing proof stays a gap.
-15. Verify transient inspection errors pause rather than declare permanent loss. Input/capacity errors
-    preserve later eligibility. Unknown tool results, conflicts, and stopped requests do not loop.
-    A new Zero Risk prompt must be manually sent and confirmed even if an old prompt was sent.
-16. Use real Electron documents to delay destruction after a close request. Repeated and concurrent
-    authenticated retirement requests, queries, and missing receipts must not report a retired writer
-    or permit successor acquisition while that document survives. After verified destruction, the
-    same retirement retry succeeds. Check late destruction against newer identities and count closing
-    documents against the five-page limit. A synchronous close fixture alone is insufficient.
+1. Recover a legal tool log whose full inline compilation exceeds the old browser window while its
+   source storage and actual on-demand plan fit. Read a unique previously unread tail value from
+   the new page's actually delivered entry. Cover ordinary unfinished work, committed-checkpoint
+   continuation and uncommitted compaction; do not inject test answers or credentials into the
+   model to bypass delivery. Compare a healthy-page incremental continuation.
+2. Use fault page loss that does not invoke user stop, and record original page identity and stop
+   state. Contrast explicit user close of a running page: its work retries stay stopped. Idle
+   reclamation and recovery cleanup must not fabricate stop or erase an existing stop.
+3. Verify missing sources, unknown checkpoint relations, oversized non-externalizable instructions,
+   required-image failure, storage/evidence exhaustion and complete-read-reply limits fail before
+   Send or business dispatch. Check actual full/resume selection and fresh-page image coverage.
+4. Keep an old page or process alive while durable revocation rejects actual old-generation tools,
+   reads, ACK, final output, checkpoint and delayed helper Send/acquisition. Exercise real cross-
+   process dispatch/revocation ordering, trusted late result settlement, first-result conflicts,
+   running-process handles, storage write failures and incompatible running components. Navigation
+   six-call verification does not substitute for this execution capability proof.
+5. Race recovery, stop, task append, checkpoint and lost control receipts. One transfer reserves one
+   successor. Pending accepted updates retain their source/revision and need successor ACK. An
+   uncommitted compaction preserves target, deadline and retry count; old attempts cannot supply
+   new-attempt Send/read/commit proof. A valid accepted handoff settles once; committed summaries
+   only replay, and unavailable committed bodies do not authorize regeneration.
+6. Verify unknown Send and dispatched-result uncertainty block new execution without probing by
+   resend. Crash/restart backend, helper and Launcher around creation, admission, dispatch, result,
+   stop and checkpoint commits. Empty memory, missing transaction tables, reused PID, URLs and
+   digests are not execution or source evidence. Real original content must be rebuilt legally.
+7. Exercise five physical pages, safe idle reclamation, active/uncertain exclusions, late exact
+   destruction and cleanup that never succeeds. At most three automatic closes occur per fixed
+   cleanup transaction. Closing/fault pages still occupy slots; durable isolation remains valid
+   while waiting, no sixth page or additional business attempt is created. Include real browser
+   resource pressure and distinguish it from controlled never-destroyed fixtures.
+8. Load the public 1,000,000 / 900,000 history values with the actual target Codex binary. Verify lower
+   client settings and record the effective trigger. Controlled usage can prove compaction triggers,
+   not million-token browser capacity. Measure canonical bytes, actual plan bytes/token estimates,
+   directory and read costs, unique/repeated reads, images, retries, time and real dispatch counts.
+9. Remove old names from catalogs, exports and managed configuration, and reject them before Send
+   with a normal replacement name. User TOML is not silently rewritten. Migrate old work, stop,
+   Send, first results, checkpoints and retries without reset. Equivalent ordinary aliases and
+   compatible Fresh preferences retain task identity. Missing/corrupt or legacy-unproven evidence
+   stays unknown; interrupted migration does not produce two owners.
+10. Check Automatic, Zero Risk, local Web API Key access and excluded Browser-only, non-Launcher,
+    Luna, Think and upstream API paths. New Zero Risk pages require manual Send, Sent and attachment
+    confirmation; ended compaction retains the explicit manual handoff. Fresh affects only actual
+    new logical sends; Bigger Context keeps existing capabilities and Zero Risk prohibition.
+11. Preserve bounded replay/journal behavior: 24 MiB shared recovery/checkpoint evidence, 2 MiB per
+    item, 256 checkpoints/tombstones, 512 rounds, and 10,000-thread/4 MiB registration bounds.
+    Reserve terminal/stop evidence before side effects. Page retention, source availability, answer
+    bodies and durable execution receipts have distinct lifetimes; cache expiry never grants new
+    execution. Exercise the real 24-hour successful-work clock separately from mocked-clock checks.
+12. Confirm one user notice and bounded logs describe only project-operation isolation when old-page
+    inspection is unavailable. Do not claim ChatGPT-owned platform activities stopped, or global
+    deduplication of equal operations with different identities. Preserve accepted results on all
+    failure paths and do not store prompt/source bodies, images or credentials in runtime journals.
+
+**Currently unverified for this change:** the new-page unique-tail main acceptance in both sending
+modes; all three real recovery entrances; a live old-generation execution-denial observation;
+real physical-page pressure/cleanup; running-component migration
+and the remaining navigation/platform combinations. Record completed local checks separately with
+exact coverage. This list must change only when new evidence exists.
 
 The maintained contract is [current work and committed relationships](session-continuity.md#current-work-and-committed-relationships).
-Keep raw task output in the local ignored workspace, not as a second public implementation spec.
-Record each release's actual results separately from the historical evidence below. Any unexecuted
-platform, 24-hour, resource-load, or remote-idle combination must remain visible in that release's
-record instead of being described as validated.
+Keep raw controlled task output in the local ignored workspace, not as another public specification.
+
+### Current unified-budget evidence
+
+The 2026-10-12 target-Codex loopback probe used synthetic usage without ChatGPT sending. Three
+usage scopes passed with the public 1,000,000 / 900,000 resolver settings; six lower-window,
+lower-limit and combined cases passed with lower client settings. This supports actual client
+budget loading and trigger behavior only. It does not validate new-page source reads, real image
+routing, live execution isolation, throughput, or browser capacity. The local records are
+`.dev-workflows/unified-task-continuity/budget-target.json` and `budget-lower.json`.
 
 ### Recorded continuity evidence
 
-The September 2026 records established different kinds of evidence, not one interchangeable
+These September/October records describe the historical independent-mode and recovery contracts.
+They are retained as evidence, not certification of the unified mechanism or its removed full-source
+window gate and protected-page rules. The September records established different kinds of evidence, not one interchangeable
 end-to-end pass:
 
 | Evidence | What it established | What it did not establish |
@@ -381,7 +379,7 @@ testing. Existing active tasks keep their original protocol; start a new compati
    result with the envelope's `native_result`; control must not alter it. Confirm old queued calls
    and new calls on an unacknowledged revision return an unexecuted terminal.
 5. Check that commentary remains process output and the first final-answer text closes the update
-   window. A later ordinary-policy append uses the replacement path; an active continuity append
+   window. An active unified task append
    is explicitly not accepted until the locked response ends. A late ACK cannot reopen it. Check
    strict structured output, stable Automatic completion without ACK, and refused Zero Risk
    completion followed by a valid ACK and revision-bound complete answer.
@@ -390,7 +388,7 @@ testing. Existing active tasks keep their original protocol; start a new compati
    source. Old observer cleanup must not stop the new driver, while explicit stop still releases
    the physical task. Record each mode's tab/response identity and terminal result.
 
-For `chatgpt-web-continuity/`, also verify that a tool boundary accepts a text-only append and a
+For supported ordinary Web routes, also verify that a tool boundary accepts a text-only append and a
 partial result batch. Supply the missing results later without more user text. Trim completed
 history, reorder results, and repeat known results with changed bodies: locally identified work
 must continue, the first result must remain unchanged, and each call must complete once. A wrong
@@ -404,14 +402,15 @@ The [continuity append probe](../scripts/probe-continuity-append-live.ts) runs a
 app-server, the working-tree Adapter and helper, the isolated DEV Launcher, and one harmless
 Native `sleep`/`printf` command. It steers the same native turn while that command runs, then
 checks delivery, ACK, the changed answer, and one physical response. Run `--check-only` first;
-`--model=chatgpt-web-continuity/gpt-6-pro` selects that supported route when the DEV account has
+`--model=chatgpt-web/gpt-6-pro` selects that supported route when the DEV account has
 Pro access. The probe uses the DEV profile's current interaction mode; Zero Risk still needs
 the first manual send and Sent confirmation. It saves local evidence under `.dev-workflows/`.
 Script availability and a successful preflight are not a real-platform pass.
 
 Local Broker/Remote owner, MCP, Session, helper, and Adapter tests use controlled fixtures and
 failure injection. They establish local contract behavior, not authenticated ChatGPT/connector
-acceptance. On 2026-10-08, the continuity append probe passed the result-plus-append scenario
+acceptance. This is historical evidence for the former independent-mode contract: on 2026-10-08,
+the continuity append probe passed the result-plus-append scenario
 with the real Codex app-server and DEV Automatic GPT-6 Pro. It recorded one Native command and
 result, one page and physical response, two logical execution keys, delivery and ACK, and the
 changed final answer, with no 409 response. Local evidence is retained at

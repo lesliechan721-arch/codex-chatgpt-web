@@ -9,8 +9,12 @@ const {
 } = require("./continuity-lease.cjs");
 const {
   RECOVERY_FEATURE, acquireContinuityTransaction, completeContinuityTransaction, removedContinuityTab, physicalTurnTabs,
+  isSafelyReclaimableTurnTab,
+  acquisitionCapacityFailure, noteAcquisitionEffect,
 } = require("./continuity-recovery.cjs");
-const { launcherInstance } = require("./continuity-process-instance.cjs");
+const { EXECUTION_FENCING_FEATURE, EXECUTION_PROTOCOL, assertExecutionAuthority } = require("./continuity-execution-authority.cjs");
+const { cleanupTurnPage, waitForTurnPageDestroyed } = require("./continuity-page-cleanup.cjs");
+const { launcherInstance, sameLauncherInstance } = require("./continuity-process-instance.cjs");
 const {
   runBrowserHelperOperation,
   verifyConnectorWithBrowserHelper,
@@ -654,9 +658,19 @@ class BrowserHost {
 
   async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal, continuity) {
     signal?.throwIfAborted();
-    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS
-      && (!BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this) || physicalTurnTabs(this).length >= MAX_BROWSER_TABS)) {
-      if (continuity) throw continuityFailure("continuity_resource_capacity");
+    if (this.destroyed) throw continuityFailure("continuity_unverified");
+    if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
+    const instance = launcherInstance(this);
+    let reclaimed = true;
+    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
+      reclaimed = await BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this);
+    }
+    signal?.throwIfAborted();
+    if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))) throw continuityFailure("continuity_unverified");
+    if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
+    // No await from this final capacity check through the turnTabs reservation.
+    if (!reclaimed || physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
+      if (continuity) throw acquisitionCapacityFailure(this, continuity);
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
       );
@@ -666,6 +680,7 @@ class BrowserHost {
     const ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
       .find(candidate => !physicalTurnTabs(this).some(tab => tab.ordinal === candidate));
     if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
+    noteAcquisitionEffect(this, continuity);
     const view = new WebContentsView({
       webPreferences: {
         partition: this.partition,
@@ -744,7 +759,7 @@ class BrowserHost {
     }
   }
 
-  createManualTurnTab(
+  async createManualTurnTab(
     traceId,
     helperPid,
     conversationKey,
@@ -753,9 +768,17 @@ class BrowserHost {
     manualSentConfirmationRequired,
     continuity,
   ) {
-    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS
-      && (!BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this) || physicalTurnTabs(this).length >= MAX_BROWSER_TABS)) {
-      if (continuity) throw continuityFailure("continuity_resource_capacity");
+    if (this.destroyed) throw continuityFailure("continuity_unverified");
+    if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
+    const instance = launcherInstance(this);
+    let reclaimed = true;
+    if (physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
+      reclaimed = await BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this);
+    }
+    if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))) throw continuityFailure("continuity_unverified");
+    if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
+    if (!reclaimed || physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
+      if (continuity) throw acquisitionCapacityFailure(this, continuity);
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
       );
@@ -764,6 +787,7 @@ class BrowserHost {
     const ordinal = Array.from({ length: MAX_BROWSER_TABS }, (_unused, index) => index + 1)
       .find(candidate => !physicalTurnTabs(this).some(tab => tab.ordinal === candidate));
     if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
+    noteAcquisitionEffect(this, continuity);
     const view = new WebContentsView({
       webPreferences: {
         partition: this.partition,
@@ -859,35 +883,35 @@ class BrowserHost {
     }
   }
 
-  evictOldestRetainedTurnTab() {
+  async evictOldestRetainedTurnTab() {
     const retained = [...this.turnTabs.values()]
-      .filter(tab => tab.status === "ready" && (!tab.continuityOwner || continuityExpired(tab)))
-      .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
+      .filter(tab => tab.status === "ready" && isSafelyReclaimableTurnTab(this, tab))
+      .sort((left, right) => (left.continuityLastSuccessAt ?? left.lastHeartbeatAt ?? 0)
+        - (right.continuityLastSuccessAt ?? right.lastHeartbeatAt ?? 0) || left.id.localeCompare(right.id))[0];
     if (!retained) return false;
-    const before = physicalTurnTabs(this).length;
+    const contents = retained.view?.webContents;
     this.removeTurnTab(retained, false);
-    return physicalTurnTabs(this).length < before;
+    return contents ? waitForTurnPageDestroyed(this, contents) : false;
   }
 
-  /** Read-only admission check; allocation repeats it synchronously before creating a page. */
+  /** Read-only admission check; allocation confirms physical cleanup before creating a page. */
   hasContinuityCapacity() {
-    return physicalTurnTabs(this).length < MAX_BROWSER_TABS || [...this.turnTabs.values()].some(tab => (
-      (tab.status === "ready" && (!tab.continuityOwner || continuityExpired(tab)))
-      || (tab.interactionMode === "manual" && tab.status === "error"
-        && ["timed-out", "failed", "cancelled"].includes(tab.manualState))
-    ));
+    return physicalTurnTabs(this).length < MAX_BROWSER_TABS
+      || [...this.turnTabs.values()].some(tab => isSafelyReclaimableTurnTab(this, tab));
   }
 
-  evictOldestReclaimableTurnTab() {
+  async evictOldestReclaimableTurnTab() {
     const terminal = [...this.turnTabs.values()]
       .filter(tab => tab.failedAt !== undefined || (tab.interactionMode === "manual"
         && tab.status === "error"
         && ["timed-out", "failed", "cancelled"].includes(tab.manualState)))
-      .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
+      .filter(tab => isSafelyReclaimableTurnTab(this, tab))
+      .sort((left, right) => (left.failedAt ?? left.lastHeartbeatAt ?? 0) - (right.failedAt ?? right.lastHeartbeatAt ?? 0)
+        || left.id.localeCompare(right.id))[0];
     if (terminal) {
-      const before = physicalTurnTabs(this).length;
+      const contents = terminal.view?.webContents;
       this.removeTurnTab(terminal, false);
-      return physicalTurnTabs(this).length < before;
+      return contents ? waitForTurnPageDestroyed(this, contents) : false;
     }
     return BrowserHost.prototype.evictOldestRetainedTurnTab.call(this);
   }
@@ -1922,6 +1946,7 @@ class BrowserHost {
 
   trackClosingTurnTab(tab) {
     tab.continuityInvalidated = true;
+    tab.physicalPageId ??= randomBytes(24).toString("hex");
     const contents = tab.view.webContents;
     if (!contents.isDestroyed()) {
       this.closingTurnTabs ??= new Map();
@@ -1929,7 +1954,9 @@ class BrowserHost {
       // Keep only physical identity and capacity data. A close request may return before
       // Electron destroys the document; delayed events must never adopt a newer tag.
       const closing = { id: tab.id, ordinal: tab.ordinal, traceId: tab.traceId, helperPid: tab.helperPid,
-        view: tab.view, closing: true, ...(tab.continuityRecovery ? { continuityRecovery: structuredClone(tab.continuityRecovery) } : {}) };
+        physicalPageId: tab.physicalPageId, view: tab.view, closing: true,
+        ...(tab.continuityCreationRecovery ? { continuityCreationRecovery: structuredClone(tab.continuityCreationRecovery) } : {}),
+        ...(tab.continuityRecovery ? { continuityRecovery: structuredClone(tab.continuityRecovery) } : {}) };
       this.closingTurnTabs.set(contents, closing);
       contents.once?.("destroyed", () => {
         if (!contents.isDestroyed() || this.closingTurnTabs.get(contents) !== closing) return;
@@ -1967,7 +1994,7 @@ class BrowserHost {
       tab.status = "aborted";
     }
     try { this.window.contentView.removeChildView(tab.view); } catch {}
-    try { if (!contents.isDestroyed()) contents.close(); }
+    try { cleanupTurnPage(this, tab); }
     finally { removedContinuityTab(this, tab); }
     if (this.selectedTabId === tab.id) {
       this.selectedTabId = [...this.turnTabs.keys()].at(-1) || "home";
@@ -2356,11 +2383,11 @@ class BrowserHost {
 
   beginManualTurn(traceId, helperPid, prompt, conversationKey, resumePrompt, compaction = false,
     manualSentConfirmationRequired = true, expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
-    continuity, requireRetainedConversation = false, contextPlans) {
+    continuity, requireRetainedConversation = false, contextPlans, requestId) {
     const create = () => (this.beginManualTurnAcquisition ?? BrowserHost.prototype.beginManualTurnAcquisition).call(this, traceId, helperPid, prompt, conversationKey, resumePrompt,
       compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation, contextPlans);
     return continuity?.recovery
-      ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create)
+      ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create, requestId)
       : create();
   }
 
@@ -2378,7 +2405,7 @@ class BrowserHost {
     contextPlans,
   ) {
     if (this.manualOperation) {
-      if (continuity && !continuity.expected) throw continuityFailure("continuity_resource_capacity");
+      if (continuity && !continuity.expected) throw acquisitionCapacityFailure(this, continuity);
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
     if (contextPlans === undefined && (typeof prompt !== "string" || prompt.length < 1 || prompt.length > MAX_MANUAL_PROMPT_CHARS)) {
@@ -2496,6 +2523,29 @@ class BrowserHost {
     if (typeof selectedPrompt !== "string" || selectedPrompt.length < 1 || selectedPrompt.length > MAX_MANUAL_PROMPT_CHARS) {
       throw new Error(`The selected manual prompt must contain between 1 and ${MAX_MANUAL_PROMPT_CHARS} characters`);
     }
+    const finish = tab => {
+      this.bindManualContextPlan(tab, selectedPlan);
+      this.armManualTurnDeadline(tab);
+      this.selectedTabId = tab.id;
+      this.showWindow();
+      this.show();
+      this.publishState?.(this.snapshot());
+      this.writeDescriptor();
+      this.logger.info("browser.manual_turn_started", {
+        tabId: tab.id,
+        traceId,
+        reused: retained.length === 1,
+      });
+      return {
+        tabId: tab.id,
+        ...(tab.continuityOwner ? { continuity: continuityLease(tab) } : {}),
+        reused: retained.length === 1,
+        deadlineAt: new Date(tab.manualDeadlineAt).toISOString(),
+        state: tab.manualState,
+        sentConfirmationRequired: tab.manualSentConfirmationRequired,
+        ...(selectedPlan ? { selectedPlanId: selectedPlan.planId } : {}),
+      };
+    };
     if (tab) {
       if (typeof resumePrompt !== "string" || !resumePrompt) {
         throw new Error("A retained Zero Risk conversation requires an incremental resume prompt");
@@ -2520,7 +2570,8 @@ class BrowserHost {
       bindContinuityTab(tab, continuity);
     } else {
       if (requireRetainedConversation) throw continuityFailure();
-      tab = this.createManualTurnTab(
+      const instance = launcherInstance(this);
+      const created = this.createManualTurnTab(
         traceId,
         helperPid,
         conversationKey,
@@ -2529,36 +2580,23 @@ class BrowserHost {
         manualSentConfirmationRequired,
         ...(continuity ? [continuity] : []),
       );
-      bindContinuityTab(tab, continuity);
-      try {
-        this.writeManualPrompt(prompt);
-      } catch (error) {
-        this.signalManualTerminal(tab, "failed");
-        this.removeTurnTab(tab, true);
-        throw error;
-      }
+      const accept = tab => {
+        bindContinuityTab(tab, continuity);
+        try {
+          if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))
+            || this.turnTabs.get(tab.id) !== tab || tab.view?.webContents?.isDestroyed?.()) throw continuityFailure("continuity_unverified");
+          if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
+          this.writeManualPrompt(prompt);
+        } catch (error) {
+          this.signalManualTerminal(tab, "failed");
+          this.removeTurnTab(tab, true);
+          throw error;
+        }
+        return finish(tab);
+      };
+      return created && typeof created.then === "function" ? created.then(accept) : accept(created);
     }
-    this.bindManualContextPlan(tab, selectedPlan);
-    this.armManualTurnDeadline(tab);
-    this.selectedTabId = tab.id;
-    this.showWindow();
-    this.show();
-    this.publishState?.(this.snapshot());
-    this.writeDescriptor();
-    this.logger.info("browser.manual_turn_started", {
-      tabId: tab.id,
-      traceId,
-      reused: retained.length === 1,
-    });
-    return {
-      tabId: tab.id,
-      ...(tab.continuityOwner ? { continuity: continuityLease(tab) } : {}),
-      reused: retained.length === 1,
-      deadlineAt: new Date(tab.manualDeadlineAt).toISOString(),
-      state: tab.manualState,
-      sentConfirmationRequired: tab.manualSentConfirmationRequired,
-      ...(selectedPlan ? { selectedPlanId: selectedPlan.planId } : {}),
-    };
+    return finish(tab);
   }
 
   bindManualContextPlan(tab, plan) {
@@ -2853,7 +2891,7 @@ class BrowserHost {
   }
 
   async beginTurn(traceId, reveal, helperPid, conversationKey, connectorIdentity,
-    requireRetainedConversation = false, signal, continuity) {
+    requireRetainedConversation = false, signal, continuity, requestId) {
     if (!continuity?.recovery) {
       return (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
         requireRetainedConversation, signal, continuity);
@@ -2861,7 +2899,7 @@ class BrowserHost {
     // Acquisition belongs to its transaction. Closing one HTTP observer does not retire it.
     return acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "automatic", () =>
       (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
-        requireRetainedConversation, undefined, continuity));
+        requireRetainedConversation, undefined, continuity), requestId);
   }
 
   async beginTurnAcquisition(
@@ -2876,7 +2914,7 @@ class BrowserHost {
   ) {
     signal?.throwIfAborted();
     if (this.manualOperation) {
-      if (continuity && !continuity.expected) throw continuityFailure("continuity_resource_capacity");
+      if (continuity && !continuity.expected) throw acquisitionCapacityFailure(this, continuity);
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
     if (this.userCancelledTurnOwners.has(traceId)) {
@@ -3607,7 +3645,8 @@ class BrowserHost {
     }
     const descriptor = {
       version: 3,
-      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE, CONTEXT_DELIVERY_FEATURE],
+      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE, CONTEXT_DELIVERY_FEATURE, EXECUTION_FENCING_FEATURE],
+      executionProtocol: EXECUTION_PROTOCOL,
       kind: "codex-web-gpt-launcher",
       profile: this.profile,
       pid: process.pid,
@@ -3674,7 +3713,7 @@ class BrowserHost {
       }
       const contents = BrowserHost.prototype.trackClosingTurnTab.call(this, tab);
       try { this.window.contentView.removeChildView(tab.view); } catch {}
-      try { if (!contents.isDestroyed()) contents.close(); }
+      try { cleanupTurnPage(this, tab); }
       finally { removedContinuityTab(this, tab); }
     }
     this.turnTabs.clear();

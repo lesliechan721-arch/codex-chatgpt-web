@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import {
   LauncherBrowserTurnCancelledError, LauncherManualTurnTimedOutError,
   inspectLauncherManualAttachments, startLauncherManualTurn, waitForLauncherManualAttachments,
 } from "../src/launcher-browser-host";
-import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { LAUNCHER_SUBMISSION_RECEIPT_TIMEOUT_MS, LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { validateBrowserHelperContextPlan } from "../src/adapters/chatgpt-web/browser-helper-prompt-selection";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 
@@ -386,4 +386,392 @@ test("an older real helper cannot finish ahead of a delayed or rejected local re
       expect(released).toBeTrue();
     } finally { receipt.resolve(); await client.close(); }
   }
+});
+
+const terminalReceiptSource = `
+  import { createInterface } from "node:readline";
+  const emit = value => process.stdout.write(JSON.stringify(value) + "\\n");
+  emit({ type: "ready", features: ["submission-receipt-ack-v1"] });
+  createInterface({ input: process.stdin }).on("line", line => {
+    const message = JSON.parse(line);
+    if (message.type === "run") emit({ type: "event", id: message.id, event: "prepared_selected", reused: false });
+    if (message.type === "prepared_selected_ack") emit({ type: "event", id: message.id, event: "submitted" });
+    if (message.type === "test_result") emit({ type: "result", id: message.id, text: "legacy result" });
+    if (message.type === "test_failure") emit({ type: "error", id: message.id, message: "physical turn ended" });
+    if (message.type === "test_exit") process.exit(17);
+    if (message.type === "abort") emit({ type: "error", id: message.id, name: "AbortError", message: "physical turn aborted" });
+    if (message.type === "shutdown") process.exit(0);
+  });
+`;
+
+test("a legacy successful terminal has a finite receipt deadline and never treats timeout as success", async () => {
+  const { config } = descriptor("http://127.0.0.1:39001", [], terminalReceiptSource);
+  const client = new LauncherBrowserHelperClient(config);
+  const received = deferred();
+  const receipt = deferred();
+  let releases = 0;
+  const internal = client as unknown as { send(message: Record<string, unknown>): Promise<void>; pending: Map<string, unknown> };
+  const originalTimer = globalThis.setTimeout;
+  let restoreTimer: (() => void) | undefined;
+  try {
+    const outcome = client.run({ traceId: "legacy_stalled_terminal", modelId: "gpt-6-sol",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }),
+      onSubmitted: async () => { received.resolve(); await receipt.promise; }, onTextDelta() {},
+    }).catch(error => error);
+    await received.promise;
+    // Ready has already completed. Accelerate only the parent's fixed receipt deadline.
+    const acceleratedTimer = (...args: Parameters<typeof setTimeout>): ReturnType<typeof setTimeout> => {
+      if (args[1] === LAUNCHER_SUBMISSION_RECEIPT_TIMEOUT_MS) args[1] = 20;
+      return originalTimer(...args);
+    };
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(acceleratedTimer as typeof setTimeout);
+    restoreTimer = () => timer.mockRestore();
+    await internal.send({ type: "test_result", id: "legacy_stalled_terminal" });
+    expect(await outcome).toMatchObject({ message: "Launcher browser helper submission receipt persistence timed out" });
+    expect(releases).toBe(1);
+    expect(internal.pending.size).toBe(0);
+    receipt.resolve();
+    await Promise.resolve();
+    expect(releases).toBe(1);
+  } finally { restoreTimer?.(); receipt.resolve(); await client.close(); }
+});
+
+for (const terminal of ["failure", "abort", "exit"] as const) {
+  for (const rejectReceipt of [false, true]) {
+    test(`a ${terminal} terminal does not wait for its observed receipt and ignores a late ${rejectReceipt ? "rejection" : "resolution"}`, async () => {
+      const endReceived = deferred();
+      const endReleased = deferred();
+      const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+        const body = await request.json() as Record<string, unknown>;
+        if (body.phase === "end") { endReceived.resolve(); await endReleased.promise; }
+        return Response.json({ ok: true, cancelledByUser: false });
+      } });
+      const { config } = descriptor(`http://127.0.0.1:${server.port}`, [], terminalReceiptSource);
+      const client = new LauncherBrowserHelperClient(config);
+      const received = deferred();
+      const callbackEnded = deferred();
+      const receipt = deferred();
+      const stop = new AbortController();
+      const traceId = `terminal_${terminal}_${rejectReceipt}`;
+      const sent: string[] = [];
+      let settled = false, releases = 0, callbacks = 0, deltas = 0;
+      const internal = client as unknown as { send(message: Record<string, unknown>): Promise<void>; pending: Map<string, unknown> };
+      const send = internal.send.bind(client);
+      internal.send = async message => { sent.push(String(message.type)); await send(message); };
+      try {
+        const outcome = client.run({ traceId, modelId: "gpt-6-sol", abortSignal: stop.signal,
+          capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+          prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }),
+          onSubmitted: async () => { callbacks++; received.resolve(); try { await receipt.promise; } finally { callbackEnded.resolve(); } },
+          onTextDelta() { deltas++; },
+        }).catch(error => error).finally(() => { settled = true; });
+        await received.promise;
+        if (terminal === "abort") stop.abort();
+        else await internal.send({ type: terminal === "exit" ? "test_exit" : "test_failure", id: traceId });
+        if (terminal === "exit") {
+          await endReceived.promise;
+          expect(settled).toBeFalse();
+          expect(releases).toBe(0);
+          endReleased.resolve();
+        }
+        const error = await outcome;
+        expect(error).toBeInstanceOf(Error);
+        expect(releases).toBe(1);
+        expect(internal.pending.size).toBe(0);
+        if (rejectReceipt) receipt.reject(new Error("late persistence rejection")); else receipt.resolve();
+        await callbackEnded.promise;
+        await Bun.sleep(0);
+        expect(callbacks).toBe(1);
+        expect(sent).not.toContain("submitted_ack");
+        expect(releases).toBe(1);
+        expect(deltas).toBe(0);
+      } finally { endReleased.resolve(); receipt.resolve(); await client.close(); server.stop(true); }
+    });
+  }
+}
+
+test("explicit abort after a legacy successful terminal ends receipt waiting immediately", async () => {
+  const { config } = descriptor("http://127.0.0.1:39001", [], terminalReceiptSource);
+  const client = new LauncherBrowserHelperClient(config);
+  const received = deferred();
+  const stop = new AbortController();
+  let released = false;
+  const internal = client as unknown as { send(message: Record<string, unknown>): Promise<void> };
+  try {
+    const outcome = client.run({ traceId: "legacy_result_abort", modelId: "gpt-6-sol", abortSignal: stop.signal,
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "ordinary", images: [], release() { released = true; } }),
+      onSubmitted: () => { received.resolve(); return new Promise<void>(() => {}); }, onTextDelta() {},
+    }).catch(error => error);
+    await received.promise;
+    await internal.send({ type: "test_result", id: "legacy_result_abort" });
+    // Wait for the terminal frame, rather than for a guessed transport delay.
+    const pending = (client as unknown as { pending: Map<string, { terminalReceived?: boolean }> }).pending;
+    while (!pending.get("legacy_result_abort")?.terminalReceived) await Bun.sleep(0);
+    stop.abort();
+    expect(await outcome).toMatchObject({ name: "AbortError" });
+    expect(released).toBeTrue();
+  } finally { await client.close(); }
+});
+
+test("a late old receipt cannot acknowledge or finish a new run that reuses the trace", async () => {
+  const { config } = descriptor("http://127.0.0.1:39001", [], terminalReceiptSource);
+  const client = new LauncherBrowserHelperClient(config);
+  const oldReceived = deferred(), oldReceipt = deferred(), oldEnded = deferred();
+  const nextReceived = deferred(), nextReceipt = deferred();
+  let releases = 0;
+  const sent: string[] = [];
+  const internal = client as unknown as { send(message: Record<string, unknown>): Promise<void> };
+  const send = internal.send.bind(client);
+  internal.send = async message => { sent.push(String(message.type)); await send(message); };
+  const traceId = "reused_receipt_trace";
+  const base: BrowserTurn = { traceId, modelId: "gpt-6-sol",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }), onTextDelta() {},
+  };
+  try {
+    const oldOutcome = client.run({ ...base, onSubmitted: async () => {
+      oldReceived.resolve(); await oldReceipt.promise; oldEnded.resolve();
+    } }).catch(error => error);
+    await oldReceived.promise;
+    await internal.send({ type: "test_failure", id: traceId });
+    expect(await oldOutcome).toBeInstanceOf(Error);
+    let nextSettled = false;
+    const nextOutcome = client.run({ ...base, onSubmitted: async () => { nextReceived.resolve(); await nextReceipt.promise; } })
+      .finally(() => { nextSettled = true; });
+    await nextReceived.promise;
+    oldReceipt.resolve();
+    await oldEnded.promise;
+    await Bun.sleep(0);
+    expect(sent.filter(type => type === "submitted_ack")).toHaveLength(0);
+    expect(nextSettled).toBeFalse();
+    expect(releases).toBe(1);
+    nextReceipt.resolve();
+    await Bun.sleep(0);
+    expect(sent.filter(type => type === "submitted_ack")).toHaveLength(1);
+    await internal.send({ type: "test_result", id: traceId });
+    expect(await nextOutcome).toBe("legacy result");
+    expect(releases).toBe(2);
+  } finally { oldReceipt.resolve(); nextReceipt.resolve(); await client.close(); }
+});
+
+for (const failCleanup of [false, true]) test(`a real helper retires only the aborted run and ${failCleanup ? "reports failed cleanup" : "holds resources until cleanup"}`, async () => {
+  const endReceived = deferred(), endReleased = deferred(), workerReleased = deferred(), workerSettled = deferred();
+  const started = deferred();
+  let endpoint: string;
+  const ended: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/test/worker-gate") { await workerReleased.promise; return Response.json({ ok: true }); }
+    if (path === "/test/worker-settled") { workerSettled.resolve(); return Response.json({ ok: true }); }
+    const body = await request.json() as Record<string, unknown>;
+    if (body.phase === "end") {
+      ended.push(body.traceId as string); endReceived.resolve(); await endReleased.promise;
+      if (failCleanup) return Response.json({ error: "physical release failed" }, { status: 500 });
+    }
+    return Response.json({ ok: true, cancelledByUser: false });
+  } });
+  endpoint = `http://127.0.0.1:${server.port}`;
+  const source = `
+    const originalTimer = globalThis.setTimeout;
+    globalThis.setTimeout = (callback, delay, ...args) => originalTimer(callback, delay === 15000 ? 20 : delay, ...args);
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    ChatGptBrowserWorker.prototype.run = async function(turn) {
+      await turn.onPreparedSelected(false);
+      await turn.prepare();
+      if (turn.traceId === "ignored_abort_worker") {
+        turn.onHeartbeat();
+        await fetch(${JSON.stringify(endpoint + "/test/worker-gate")});
+        await fetch(${JSON.stringify(endpoint + "/test/worker-settled")});
+        return "old worker ignored abort";
+      }
+      return "other run remains healthy";
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
+  `;
+  const { config } = descriptor(endpoint, [], source);
+  const client = new LauncherBrowserHelperClient(config);
+  const stop = new AbortController();
+  let releases = 0, settled = false;
+  const base: BrowserTurn = { traceId: "ignored_abort_worker", modelId: "gpt-6-sol",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }), onTextDelta() {},
+  };
+  try {
+    const outcome = client.run({ ...base, abortSignal: stop.signal, onHeartbeat() { started.resolve(); } })
+      .catch(error => error).finally(() => { settled = true; });
+    await started.promise;
+    stop.abort();
+    await endReceived.promise;
+    expect(settled).toBeFalse();
+    expect(releases).toBe(0);
+    // Let the underlying worker settle while its watchdog target-end is still blocked.
+    workerReleased.resolve();
+    await workerSettled.promise;
+    await expect(client.run({ ...base, traceId: "healthy_sibling_worker" })).resolves.toBe("other run remains healthy");
+    expect(settled).toBeFalse();
+    expect(releases).toBe(1);
+    endReleased.resolve();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(Error);
+    if (failCleanup) expect(error.message).toContain("could not release the aborted turn");
+    else expect(error.name).toBe("AbortError");
+    expect(releases).toBe(2);
+    expect(ended).toEqual(["ignored_abort_worker"]);
+    // The already settled worker must not leave a tombstone or affect later runs.
+    await expect(client.run({ ...base, traceId: "healthy_after_retirement" })).resolves.toBe("other run remains healthy");
+  } finally { workerReleased.resolve(); endReleased.resolve(); await client.close(); server.stop(true); }
+});
+
+test("an ignored legacy abort uses target cleanup, keeps a bounded trace quarantine and leaves other runs alive", async () => {
+  const ended: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as Record<string, unknown>;
+    expect(body.phase).toBe("end");
+    ended.push(body.traceId as string);
+    return Response.json({ ok: true, cancelledByUser: false });
+  } });
+  const ignoredAbortSource = terminalReceiptSource.replace(/    if \(message.type === "abort"\).*\n/, "");
+  const { config } = descriptor(`http://127.0.0.1:${server.port}`, [], ignoredAbortSource);
+  const client = new LauncherBrowserHelperClient(config);
+  const internal = client as unknown as { send(frame: Record<string, unknown>): Promise<void>; unfinishedAborts: Map<string, unknown> };
+  const originalTimer = globalThis.setTimeout;
+  let timer: ReturnType<typeof spyOn> | undefined;
+  const base: BrowserTurn = { traceId: "legacy_abort_initial", modelId: "gpt-6-sol",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "ordinary", images: [], release() {} }), onTextDelta() {},
+  };
+  try {
+    const received = deferred();
+    const stop = new AbortController();
+    const first = client.run({ ...base, abortSignal: stop.signal,
+      onSubmitted: () => { received.resolve(); return new Promise<void>(() => {}); },
+    }).catch(error => error);
+    await received.promise;
+    timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      if (args[1] === 15_000) args[1] = 20;
+      return originalTimer(...args);
+    }) as typeof setTimeout);
+    stop.abort();
+    expect(await first).toMatchObject({ name: "AbortError" });
+    expect(internal.unfinishedAborts.size).toBe(1);
+    for (let index = 1; index < 5; index++) {
+      const observed = deferred();
+      const controller = new AbortController();
+      const outcome = client.run({ ...base, traceId: `legacy_abort_${index}`, abortSignal: controller.signal,
+        onSubmitted: () => { observed.resolve(); return new Promise<void>(() => {}); },
+      }).catch(error => error);
+      await observed.promise;
+      controller.abort();
+      expect(await outcome).toMatchObject({ name: "AbortError" });
+    }
+    expect(internal.unfinishedAborts.size).toBe(5);
+    await expect(client.run({ ...base, traceId: "quarantine_capacity" })).rejects.toThrow("unfinished aborted turn");
+    await expect(client.run(base)).rejects.toThrow("unfinished aborted turn");
+    expect(ended).toHaveLength(5);
+    await internal.send({ type: "test_failure", id: base.traceId });
+    while (internal.unfinishedAborts.size === 5) await Bun.sleep(0);
+    const nextReceived = deferred();
+    const healthy = client.run({ ...base, traceId: "legacy_healthy_after_abort", onSubmitted() { nextReceived.resolve(); } });
+    await nextReceived.promise;
+    await internal.send({ type: "test_result", id: "legacy_healthy_after_abort" });
+    expect(await healthy).toBe("legacy result");
+    expect(internal.unfinishedAborts.size).toBe(4);
+  } finally { timer?.mockRestore(); await client.close(); server.stop(true); }
+});
+
+test("helper exit cleanup has its own finite control deadline and never waits for a receipt", async () => {
+  const endReceived = deferred();
+  const endReleased = deferred();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as Record<string, unknown>;
+    expect(body.phase).toBe("end");
+    endReceived.resolve();
+    await endReleased.promise;
+    return Response.json({ ok: true, cancelledByUser: false });
+  } });
+  const { config } = descriptor(`http://127.0.0.1:${server.port}`, [], terminalReceiptSource);
+  const client = new LauncherBrowserHelperClient(config);
+  const received = deferred();
+  let released = false;
+  const internal = client as unknown as { send(frame: Record<string, unknown>): Promise<void> };
+  const originalTimer = globalThis.setTimeout;
+  let timer: ReturnType<typeof spyOn> | undefined;
+  try {
+    const outcome = client.run({ traceId: "exit_cleanup_deadline", modelId: "gpt-6-sol",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "ordinary", images: [], release() { released = true; } }),
+      onSubmitted: () => { received.resolve(); return new Promise<void>(() => {}); }, onTextDelta() {},
+    }).catch(error => error);
+    await received.promise;
+    timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      if (args[1] === 15_000) args[1] = 20;
+      return originalTimer(...args);
+    }) as typeof setTimeout);
+    await internal.send({ type: "test_exit", id: "exit_cleanup_deadline" });
+    await endReceived.promise;
+    expect(released).toBeFalse();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error.errors.some((failure: Error) => failure.message.includes("timed out after 15000ms"))).toBeTrue();
+    expect(released).toBeTrue();
+  } finally { timer?.mockRestore(); endReleased.resolve(); await client.close(); server.stop(true); }
+});
+
+for (const earlyText of [false, true]) test(`a helper ${earlyText ? "text and result" : "result"} without its required submitted frame fails and cannot adopt a first late receipt`, async () => {
+  const source = terminalReceiptSource.replace(
+    'if (message.type === "prepared_selected_ack") emit({ type: "event", id: message.id, event: "submitted" });',
+    `if (message.type === "prepared_selected_ack") {
+      ${earlyText ? 'emit({ type: "event", id: message.id, event: "text", text: "unproven text" });' : ""}
+      emit({ type: "result", id: message.id, text: "unproven success" });
+    }`,
+  ).replace(
+    'if (message.type === "test_result") emit({ type: "result", id: message.id, text: "legacy result" });',
+    'if (message.type === "test_result") emit({ type: "event", id: message.id, event: "submitted" });',
+  );
+  const { config } = descriptor("http://127.0.0.1:39001", [], source);
+  const client = new LauncherBrowserHelperClient(config);
+  let callbacks = 0, releases = 0, outputs = 0;
+  const internal = client as unknown as { send(frame: Record<string, unknown>): Promise<void>; pending: Map<string, unknown> };
+  try {
+    await expect(client.run({ traceId: "missing_required_receipt", modelId: "gpt-6-sol",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }),
+      onSubmitted() { callbacks++; }, onTextDelta() { outputs++; },
+    })).rejects.toThrow(earlyText ? "published output before submission receipt persistence" : "completed without a submission receipt");
+    await internal.send({ type: "test_result", id: "missing_required_receipt" });
+    // The old frame is received through the real child, with no run left to authorize it.
+    await Bun.sleep(0);
+    expect(callbacks).toBe(0);
+    expect(outputs).toBe(0);
+    expect(releases).toBe(1);
+    expect(internal.pending.size).toBe(0);
+  } finally { await client.close(); }
+});
+
+for (const event of ["text", "completion_fence_begin"] as const) test(`legacy ${event} cannot cross a stalled submission receipt`, async () => {
+  const source = terminalReceiptSource.replace(
+    'if (message.type === "test_result") emit({ type: "result", id: message.id, text: "legacy result" });',
+    `if (message.type === "test_result") emit({ type: "event", id: message.id, event: ${JSON.stringify(event)}, text: "premature output", requestId: 1 });`,
+  );
+  const { config } = descriptor("http://127.0.0.1:39001", [], source);
+  const client = new LauncherBrowserHelperClient(config);
+  const received = deferred(), receipt = deferred();
+  let outputs = 0, fences = 0, releases = 0;
+  const internal = client as unknown as { send(frame: Record<string, unknown>): Promise<void> };
+  try {
+    const outcome = client.run({ traceId: `receipt_barrier_${event}`, modelId: "gpt-6-sol",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }),
+      onSubmitted: async () => { received.resolve(); await receipt.promise; }, onTextDelta() { outputs++; },
+      completionFence: { async begin() { fences++; return 0; }, async commit() { fences++; return true; } },
+    }).catch(error => error);
+    await received.promise;
+    await internal.send({ type: "test_result", id: `receipt_barrier_${event}` });
+    expect(await outcome).toMatchObject({ message: "Launcher browser helper published output before submission receipt persistence" });
+    expect(outputs).toBe(0);
+    expect(fences).toBe(0);
+    expect(releases).toBe(1);
+  } finally { receipt.resolve(); await client.close(); }
 });

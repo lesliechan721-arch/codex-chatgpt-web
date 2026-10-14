@@ -5,7 +5,7 @@ const CONTINUITY_IDLE_TTL_MS = 86_400_000;
 const CONTINUITY_FEATURE = "session-continuity-v1";
 function continuityFailure(code = "continuity_session_lost") {
   const error = new Error(code === "continuity_resource_capacity"
-    ? "The browser has no free capacity. Close an existing page before starting another task; healthy continuity pages were not evicted"
+    ? "The browser has no free physical page. Wait for safe idle-page cleanup or close a page before starting another task"
     : code === "continuity_source_unproven"
     ? "The exact continuity owner or source head cannot be proved; no new page was created"
     : code === "continuity_unverified"
@@ -84,7 +84,10 @@ function bindContinuityTab(tab, claim) {
   tab.continuityOwner = claim.owner;
   tab.continuityLeaseId ??= randomBytes(16).toString("hex");
   tab.continuityClaimDigest = claimDigest(claim);
-  if (claim.recovery) tab.continuityRecovery = structuredClone(claim.recovery);
+  if (claim.recovery) {
+    tab.continuityRecovery = structuredClone(claim.recovery);
+    tab.continuityCreationRecovery ??= structuredClone(claim.recovery);
+  }
 }
 
 function inspectContinuityConversation(host, conversationKey, expected) {

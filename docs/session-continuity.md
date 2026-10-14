@@ -1,66 +1,75 @@
-# Session continuity first
+# Session continuity
 
-Compatible Full Native tools + Launcher environments expose the opt-in
-`chatgpt-web-continuity/` model aliases without
-an additional internal verification flag. Existing `chatgpt-web/` models keep their current behavior
-and remain the default. Implementation and test presence do not replace the real-platform evidence
-required in [release validation](release-validation.md#session-continuity-validation).
+Supported Full Native + Launcher routes use one task mechanism with the ordinary `chatgpt-web/`
+model names. It covers the six Automatic routes, two Zero Risk routes, and supported ordinary
+aliases that resolve to the same capability. Account, model, reasoning, tool, and source checks
+still apply. Browser-only, non-Launcher Managed Chrome, Luna, Think, and API upstream forwarding
+keep their existing contracts. API Key authentication to a local Web route does not exclude it;
+actual runtime capability and trusted task identity determine eligibility.
+
+Implementation presence does not establish a real-platform pass. See the explicit outstanding
+checks in [release validation](release-validation.md#session-continuity-validation).
 
 ## Intended behavior
 
-This policy starts a new ChatGPT conversation for a native Codex thread and prefers that page
-for later ordinary instructions and accepted compaction checkpoints. If the page can no longer
-continue, the bridge can create a new page generation for the same thread after it proves that
-the old writer cannot dispatch and that delivered tools have real results. It then continues the
-unfinished instruction from the current request, without requiring clear or another user message.
-It never adopts an arbitrary older chat. Every initial or recovery prompt must fit the original
-model's single-input limits before page creation.
+A page is a replaceable execution surface. A healthy compatible page is preferred for incremental
+work and across compaction. If current instructions cannot be synchronized, the page is unavailable,
+or its remaining budget is insufficient, recovery selects a new page after three separate checks:
+execution admission, complete legal sources, and the actual selected delivery plan.
 
-Recovery can cover backend, helper, and Launcher restarts. A timeout while inspecting a page is
-an unverified state: coordinate with the original execution before deciding whether a new page
-is safe. Process exit or capability revocation does not prove that an external tool stopped.
-The new page receives only the context actually available in the current canonical request.
-Browser-only history and the previous model's internal state cannot be restored.
+Execution admission preserves accepted instructions, issued calls, first real results, stop,
+completion, checkpoint, and retry facts. A completed request only replays its available answer;
+a missing answer body is an explicit failure, not permission to rerun. A stopped work item remains
+stopped. Unknown Send or delivered-operation results block successor execution. Neither a timeout,
+a missing page, nor permission revocation proves that a command did not run or has finished.
+A running-process handle remains a running-process handle and must be handed over with its legal
+wait path, without repeating the original start.
 
-The policy requires Full Native tools and Launcher. It preserves the account, model, effort,
-connector, and Zero Risk manual-submission requirements. Luna and Think have no continuity alias.
-Fresh Conversation Per Turn is incompatible with this policy. Bigger Context can remain enabled;
-it applies only to non-continuity models. Continuity keeps its fixed history budget and original
-single-input limits without multipart staging.
+When old-page inspection is unavailable, takeover is allowed only after durable isolation of all
+project-controlled entry points, real settlement of registered dispatches, confirmed original Send
+state, and final source/plan checks. The old page can remain present. This guarantee covers project
+tools and state commits; ChatGPT-owned search or research can still run. The user receives one
+notice of this limited guarantee. It is not global semantic deduplication: a new operation identity
+with the same arguments can represent a new business request.
 
-The catalog advertises a 1,000,000-token execution history window and a 900,000-token
-auto-compaction limit. These are Codex history budgets, not a larger ChatGPT context window or
-permission to send a million-token prompt. Each actual initial prompt or continuation increment
-still has its original token, character, attachment, and HTTP limits. Usage counts the complete
-canonical history, not only the small increment sent to the retained page.
+Cold start includes all current effective system, developer, AGENTS, skill, delegation and user
+instructions, the specifically bound checkpoint, uncovered text, work/result relationships, and
+required images. It is not an old resume suffix or just the last user message and a directory.
+Only tool history and images eligible under the existing contract use the on-demand route.
+Other required text cannot be silently summarized, trimmed, or made optional reading.
 
-Compaction verifies the source, accepts a bound handoff, waits for physical completion, retires
-the old execution's authority, and commits one new history revision. The page remains. An exact
-retry can replay an available committed result; it cannot generate a second summary. A summary
-alone never authorizes work, and a control summary does not replace an accepted ordinary answer.
+Complete sources need not fit as one browser prompt. The actual plan must fit its model and account
+window, composer/attachment limits, existing page cost, directory discovery, complete read replies,
+required images, error allowance, and work/summary reserve. HTTP, parsing, source readability,
+32 MiB snapshot storage, and durable-evidence limits remain separate. Navigation retains its
+96,000 estimated-token and 64 MiB wire cumulative limits. A small legal inline request remains valid.
+Navigation requires the configured Native5 / Native5 DEV / Zero Risk4 or supported custom connector
+and its real Verify runtime result; Full + Launcher alone does not establish navigation readiness.
 
-The bridge checks current work against local thread, owner, lease, instruction, tool-batch, and
-revision records. It does not require completed history to match an earlier copy item by item.
-Changes to old text or display metadata do not update a healthy retained ChatGPT page. A recovery
-page uses the current valid request history, so those edits can become part of its initial context.
-Current instruction conflicts and changes to the first accepted required tool result remain errors.
-Historical tool records cannot authorize tools or cause their calls to be dispatched again.
+All three recovery entrances use these checks: unfinished ordinary work, continuation after a
+committed checkpoint, and uncommitted compaction after page loss. A checkpoint transition is
+consumed once; an accepted summary is replayed, never regenerated. Uncommitted compaction keeps
+its logical target, deadline and cumulative retry budget. A new execution uses one successor
+attempt with fresh bound credentials; the old Send, snapshot, credentials and late handoff stay
+with the old attempt. Concurrent retries attach to the same transfer. A valid already-accepted
+handoff is settled once before starting another summarization attempt.
 
-Current instruction identity and payload, result call IDs and types, and compaction source proof
-still have to match. Identical summaries can belong to different revisions. If local records
-cannot distinguish the requested work or a new increment from completed history, the bridge
-returns `continuity_source_unproven` before submitting it. It does not select the latest revision
-or repeat work to resolve that ambiguity.
+The catalog publishes a finite 1,000,000-token Codex history window and 900,000-token automatic
+compaction threshold for applicable routes and equivalent ordinary aliases. Lower client limits
+still apply. Usage estimates the canonical history, not just a small retained-page increment.
+These values do not enlarge the actual ChatGPT window, per-message transport, source storage,
+read budget, or result cache, and do not claim platform billing or complete visual-token counts.
 
-An explicitly owned new turn can continue without replaying its completed predecessor. The
-current native instruction prefix, including applicable developer and grouped AGENTS instructions,
-remains part of the current payload. An active ordinary retry updates the current advertised tools
-before replaying its response; a removed tool cannot start a new operation.
+Fresh Conversation Per Turn selects a new page for each logical send that needs new browser input.
+It does not create a page for tool round trips, HTTP replay, or task updates, nor change task identity
+or reset stop/checkpoint/retry facts. Bigger Context keeps existing model/account/send capabilities
+and single-message limits; supported fixed-part, final-commit, ACK and Send-retry contracts still
+apply. Zero Risk's existing Bigger Context prohibition remains. Mode unification adds no new manual
+multipart permission.
 
-Zero Risk remains manual. An active response can return a checkpoint only through its existing
-MCP control path. When that response finishes before the control instruction is delivered, the
-bridge returns `continuity_manual_handoff_required`. It preserves the accepted answer and real
-tool results, and does not copy or send a second prompt. The user must control any handoff.
+Zero Risk still requires user sending, Sent confirmation, and required-attachment confirmation.
+An already-ended response uses the existing explicit manual checkpoint handoff; recovery never
+sends an automatic second prompt or treats navigation reads as Sent confirmation.
 
 ## Current work and committed relationships
 
@@ -146,11 +155,11 @@ newer driver.
 | --- | --- |
 | Tool boundary or open confirmation window | Accept and queue the update; delivery and acknowledgement follow separately. |
 | Running without an available boundary | The append is not accepted. Keep the current task and send again when a boundary is available or the response has ended. |
-| Final answer locked but response still running | The append is not accepted. Wait for completion, then send a normal continuity instruction. |
+| Final answer locked but response still running | The append is not accepted. Wait for completion, then send a normal continuation. |
 | Compaction owns the source | The append is not accepted. Report the busy state and preserve the compaction. |
 | Earlier transfer outcome unknown | Recover the same transfer identity; do not assume rejection or start another transfer. |
 | Old response without negotiated update support | The append is not accepted. Preserve that response; do not restart or upgrade it. |
-| Response normally completed on a healthy page | Use ordinary continuity continuation with only the new increment. Zero Risk still requires manual sending. |
+| Response normally completed on a healthy page | Use ordinary continuation with only the new increment. Zero Risk still requires manual sending. |
 
 These checks prevent misrouting, duplicate execution, and competing writers. They do not verify
 complete history or tool-result content integrity. See the [Native update protocol](native-tool-protocol.md#user-updates-during-tool-work)
@@ -158,7 +167,8 @@ for delivery, acknowledgement, and final-answer admission.
 
 ### Checkpoint selection and one-time continuation
 
-The committed checkpoint is the source of recovery, not the ordinary-mode summary cache. Exact
+The specifically committed checkpoint relation is the source of checkpoint recovery; a summary
+cache alone grants no authority. Exact
 delegated proof still includes request-carried source thread/turn, item ID, content, model, and
 reasoning identity. Neither the current compaction turn nor a matching summary replaces the source.
 Verified mode retains only its existing legitimate mappings. Recovery must select a unique durable
@@ -182,7 +192,8 @@ Compaction work is bound to a stable source work, accepted task revision, histor
 create another summary transaction. Deliver any valid current results first, then recheck source
 generation and acquire the single-writer transaction before control delivery. A preflight that
 became stale must not retire a newer owner. Once control delivery starts or is uncertain, coordinate its original attempt before admitting
-recovery. An accepted handoff with unconfirmed physical settlement is not a successful checkpoint.
+recovery. An accepted handoff does not itself prove successful checkpoint commit; bound execution,
+result, source and one-time commit checks remain required.
 Automatic can generate a read-only summary on a new page for an uncommitted lost compaction after
 the old writer and delivered tools settle. If a complete valid handoff body is already available,
 commit it once instead of generating another summary. A successful commit only replays its own
@@ -202,8 +213,8 @@ Control delivery, actual source availability, summary reserve, settled in-flight
 existing writer, revision, ACK, Send, and real-result checks still gate acceptance.
 
 Healthy retained compaction need not resend all source bodies or read every source within the
-cumulative allowance. A fresh recovery page still requires the complete compiled input to pass
-the original full-capacity admission below before navigation can be published. Missing source bytes,
+cumulative allowance. A fresh recovery page checks complete legal sources and the actual on-demand plan before
+navigation can be published; unsent full-source compilation is not a browser-window gate. Missing source bytes,
 permanent read failure, cancellation, or expiry prevent a successful checkpoint and preserve
 accepted ordinary results for their original replay path. Correctable budget errors can let the
 model stop reading and submit; exhausting the source-query reply allowance stops reads with a
@@ -216,15 +227,26 @@ new sources require actual verified content. See [context navigation](context-na
 A healthy ready page has a 24-hour idle limit measured from successful ordinary work or a
 committed checkpoint. Queries, heartbeats, and final-answer replay do not extend this time.
 Active-tool leases, cancellation, helper failure, remote idle, and explicit task deadlines keep
-their existing rules. The five-page limit remains; a sixth task cannot evict a healthy continuity
-page. Expiry ends the old page lease, but does not permanently deny the thread's recovery eligibility.
+their existing rules. The five physical-page limit remains. Under pressure, safe idle pages can be reclaimed early,
+with terminal failed pages preferred and then least recent successful work in stable order. Active
+dispatches, unknown Send, unsettled calls, checkpoint commits, and active transfers exclude a page
+from idle reclamation. Reclamation preserves task evidence and does not create a user stop. Expiry ends the old page lease, but does not permanently deny the thread's recovery eligibility.
 
-A page being closed still occupies a page slot until its physical document is confirmed destroyed.
-Removing a tab or acknowledging a close request does not prove writer retirement. Queries and
-concurrent retirement retries must retain the same closing-page evidence; a successor page waits
-for verified destruction. A late destruction event can settle only that page's original identity.
+A closing or failed-cleanup page still occupies its physical slot until exact destruction is
+confirmed. Durable execution isolation is independent of that physical cleanup. A successor can
+use another free slot, but cannot create a sixth page. Each fixed-target cleanup transaction has
+at most three automatic close attempts with finite control timeouts. Exhaustion reports a cleanup
+fault and waits for explicit further cleanup or a real destruction event; it does not start an
+unbounded background loop. Late acquisition/destruction receipts must match the original physical
+page and creation transaction, not a reused UI tab number. Cleanup failure preserves isolation.
 
-An explicit stop, closing a running page, or leaving the policy records stopped work. Its retries
+Page retention, source availability, answer-body replay, and durable execution evidence have
+separate lifetimes. Active snapshots do not promise 24-hour original-text availability. Bounded
+answer caches can expire independently of page retention. Durable stop and anti-replay facts
+cannot expire into new execution rights.
+
+An explicit stop or user closing a running page records stopped work. Fault page loss, idle
+reclamation, and recovery cleanup do not automatically record user stop or remove an existing stop. Its retries
 remain stopped. A distinct new user instruction can start a new page generation without clear,
 after the previous writer and delivered tools settle. A plain HTTP disconnect only detaches an
 observer. Changing the model or provider scope cannot take over an old page.
@@ -249,8 +271,10 @@ Preparation retains the preceding and target identities until Launcher confirms 
 A creating transaction must finish or retire before input rebinding. Interrupted preparation
 continues the same recorded transition; it cannot authorize a second Send.
 A page acquisition records the Launcher process and host instance before it starts. After a
-restart, a missing transaction requires proof that the old instance retired and the current host
-has no surviving writer for that thread. Missing memory alone does not authorize another Send.
+restart, a missing transaction requires authenticated proof of the old execution state. A compatible
+running instance can be durably isolated for that thread; an incompatible instance needs verified
+actual retirement. Registered dispatches and original Send must still be resolved before activating
+a successor. Missing memory alone does not authorize another Send.
 
 Recovery requires the results of delivered calls from the unfinished work's durable source chain,
 including append predecessors and prior attempts. A reliable accepted checkpoint can cover older
@@ -266,41 +290,41 @@ errors reject new work while preserving already admitted results and healthy tas
 
 The independent previous_response_id cache still has its one-hour lifetime and capacity limits.
 A missing cache returns 409: provide full canonical history through normal client handling.
-The bridge does not reconstruct missing history from a chat URL or a digest. The complete compiled
-recovery input, including its controls and current tool authority, must fit every original model,
-attachment, and HTTP limit. There is no multipart recovery upload or silent trimming.
+The bridge does not reconstruct missing history from a chat URL or a digest. The selected actual recovery plan must fit its browser and attachment limits. Complete sources
+remain subject to HTTP, parsing and storage limits. There is no silent trimming or implied new
+multipart capability.
 
 Setup/upgrade preserves the installation and existing registrations. Old v1 entries lack send,
 call, and stop evidence and are legacy-unproven; they cannot be treated as never executed.
-Missing or corrupt initialized storage fails closed and is not automatically reset. Recovery
-requires compatible runtime/helper/Launcher features, including `session-continuity-recovery-v3`.
-An older component is rejected before taking the recovery start path. Deleting the registry is not supported.
+Missing or corrupt initialized storage fails closed and is not automatically reset. Recovery requires compatible running Broker, trusted result receiver, helper and Launcher
+execution-isolation capabilities. Navigation verification or newer files on disk do not prove
+that an old running instance enforces revocation. Unsupported old components need verified actual
+retirement and dispatch settlement, or the transfer is rejected with an upgrade diagnostic. Deleting the registry is not supported.
 
-## Why these boundaries exist
+## Configuration and existing tasks
 
-The September 2026 choices established retained-page behavior. The October 2026 recovery design
-permits a new page when the original cannot continue and admission evidence is sufficient.
-Conversation identity and tool authority remain separate.
+The independent continuity mode and its model names are removed. An old
+`chatgpt-web-continuity/gpt-6-pro` configuration must use `chatgpt-web/gpt-6-pro` instead; the same
+prefix replacement applies to the corresponding supported model. Old names are rejected before
+Send or new-work admission with the replacement name. They are not hidden callable aliases.
+Model catalogs, exports and project-managed configuration use ordinary names. User-maintained
+TOML is not silently rewritten. Responses retain the legal ordinary slug requested by the client.
 
-| Decision | Reason and consequence |
-| --- | --- |
-| Keep the original page through necessary compaction | Reduce interruptions without treating every summary as migration. A lost page can continue from current context after writer retirement and tool settlement. |
-| Stop completed Zero Risk responses at manual handoff | Preserve the existing human-send boundary instead of adding an automatic second message or a new manual-compaction product flow. |
-| Use finite 1,000,000 / 900,000 history budgets and 24-hour retention | Support longer work and a return within a day, while accepting increased local memory/page use. This is not a claim about ChatGPT memory or unlimited upstream context. Lower explicit client limits still apply. |
-| Treat first explicit alias selection as the mode's start | A client history cannot prove that a thread never ran. First creation and later recovery accept only actual request context within input limits; existing registration is not proof of an empty thread. |
-| Use a separate `chatgpt-web-continuity/` prefix | Preserve ordinary model names and make policy ownership explicit throughout routing, filtering, and export. |
-| Validate current work, not all completed client history | The client is trusted; serialization changes should not invalidate legitimate new work. Edited old history is not backfilled into a healthy page, but can enter a new recovery page; required accepted results remain protected and unobserved external execution is not detected by full-history comparison. Local authority and idempotency remain required. |
-
-Revisit the affected decision when adding different resources, Luna, or a new Zero Risk compaction flow. Do not implement those changes by silently extending old tokens,
-replaying side effects, or weakening source proof.
+Versioned atomic migration preserves existing work, calls, attempts, Send, stop, checkpoint,
+revision and retry relationships. Switching equivalent supported ordinary aliases or compatible
+Fresh preferences neither records mode-exit nor creates another task identity. Account, actual
+model and authorization-scope compatibility still apply. An old task with only client history
+cannot be adopted as proven unfinished execution. Legacy-unproven records and missing/corrupt
+initialized journals stay unknown; do not delete the registry or write an empty journal to reset
+execution rights. Interrupted migration resumes the same mapping without two active owners.
 
 ## Stop reasons and manual handoff
 
 | Error | Meaning and next action |
 | --- | --- |
 | `continuity_session_lost` | The original page cannot continue. Recovery requires settled execution and valid current context; clear is not a general remedy. |
-| `continuity_unverified` | The original page could not be inspected. Retry the bounded coordination after restoring the connection; do not send in a second page yet. |
-| `continuity_execution_unsettled` | Old writer or delivered tools are unresolved. Supply real settlement evidence; do not rerun the tools. |
+| `continuity_unverified` | The original page could not be inspected. Coordinate durable project isolation, real settlement and Send proof; lack of inspection alone does not authorize another Send. |
+| `continuity_execution_unsettled` | Old project authority or dispatched operations are unresolved. Supply isolation and real settlement evidence; do not rerun the tools. |
 | `continuity_context_missing` / `continuity_result_conflict` | Required current context or real results are missing or conflict with their first accepted digest. Correct the evidence before retrying. |
 | `continuity_replay_unavailable` | Work completed, but its body is unavailable. It cannot run again. |
 | `continuity_legacy_unproven` | The older registration lacks complete recovery evidence. Its previous execution must be proved settled. |
@@ -310,7 +334,7 @@ replaying side effects, or weakening source proof.
 | `continuity_manual_handoff_required` | Zero Risk ended before checkpoint control was delivered. Keep the accepted answer and tool results; any next task is a user-controlled handoff. |
 | `continuity_configuration_conflict` | Configuration, registration storage, or component versions are incompatible. Check the specific diagnostic; changing settings does not restore a lost owner. |
 | `continuity_input_limit` | The actual next prompt is too large. Reduce the new input; this policy does not increase the single-input limit. |
-| `continuity_resource_capacity` | Page or state capacity is full. Existing protected tasks were not evicted. Page capacity can be released by explicitly closing an unneeded task. |
+| `continuity_resource_capacity` | Page or state capacity is full. Active or uncertain work cannot be evicted for capacity. Wait for safe idle reclamation or exact physical destruction; failed cleanup still consumes its slot. |
 
 Temporary coordination failures can retry within the same logical work's durable budget: at most
 three retries after its initial attempt within a 30-minute window. The window starts at the first

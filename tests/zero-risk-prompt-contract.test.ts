@@ -152,7 +152,7 @@ describe("Zero Risk Pro original character boundary", () => {
     const suffix = '"\\'.repeat(200);
     input = {
       modelId: "chatgpt-web-zero-risk-pro", stream: true, options: { reasoning: "low" },
-      _conversationPolicy: "continuity-first",
+      _conversationPolicy: "task",
       context: { messages: [{ role: "user", content: suffix, timestamp: 1 }] },
     };
     // Keep the exact original boundary even if surrounding instructions change. This bare input

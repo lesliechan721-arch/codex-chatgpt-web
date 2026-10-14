@@ -2,12 +2,12 @@ import { validateSkillFiles } from "./skill-attachments";
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
 import type { CodexProviderConfig } from "../../types";
-import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
+import { assertBrowserTurnExecutionAuthority, ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection, validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
-import { LAUNCHER_CONTEXT_DELIVERY_FEATURE } from "../../launcher-browser-host";
+import { CONTINUITY_EXECUTION_FENCING_FEATURE, getLauncherKnownUnsentReceipt, LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn } from "../../launcher-browser-host";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityClaim, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
@@ -36,6 +36,8 @@ interface RunMessage {
     requireRetainedConversation?: boolean;
     conversationKey?: string;
     continuity?: ContinuityClaim;
+    recoveryStoreDirectory?: string;
+    recoveryRequestId?: string;
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
@@ -105,6 +107,23 @@ console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
 const turnRecoveryIdentities = new Map<string, ContinuityRecoveryIdentity>();
+const turnAuthorityChecks = new Map<string, () => void>();
+const acknowledgedSendTurns = new Set<string>();
+interface RunControl {
+  failure?: Error;
+  ended: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  retire: () => Promise<void>;
+  retirement?: Promise<void>;
+  reject: (error: Error) => void;
+}
+const runControls = new Map<string, RunControl>();
+// Only trace identities remain here after forced per-turn retirement. The worker must
+// actually settle before that identity can be reused; no prepared prompt is retained.
+const unfinishedWorkers = new Set<string>();
+const retiredWorkers = new Set<string>();
+const ABORT_RETIREMENT_TIMEOUT_MS = 15_000;
+const MAX_UNFINISHED_ABORTS = 5;
 const turnProgress = new Map<string, ChatGptMirroredTurnProgress>();
 const taskUpdateTurns = new Set<string>();
 const preparedSelections = new Map<string, ReturnType<typeof createBrowserHelperPromptSelection>>();
@@ -146,6 +165,45 @@ let completionFenceRequestId = 0;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | undefined;
 
+function abortRun(id: string, failure?: Error, reason?: Error): void {
+  const control = runControls.get(id);
+  if (!control || control.ended) return;
+  if (failure) control.failure ??= failure;
+  const aborted = failure ?? reason ?? new DOMException("Browser helper turn aborted", "AbortError");
+  abortControllers.get(id)?.abort(reason ?? failure);
+  preparedSelections.get(id)?.cancel();
+  clearContextPlanSelection(id);
+  const sendWaiter = sendActivationWaiters.get(id);
+  sendActivationWaiters.delete(id);
+  sendWaiter?.reject(aborted);
+  if (!turnRecoveryIdentities.has(id) || !acknowledgedSendTurns.has(id)) {
+    clearSubmissionReceiptWaiter(id)?.reject(aborted);
+  }
+  const beginWaiter = completionFenceBeginWaiters.get(id);
+  completionFenceBeginWaiters.delete(id);
+  beginWaiter?.reject(aborted);
+  const commitWaiter = completionFenceCommitWaiters.get(id);
+  completionFenceCommitWaiters.delete(id);
+  commitWaiter?.reject(aborted);
+  if (control.timer) return;
+  control.timer = setTimeout(() => {
+    if (control.ended) return;
+    retiredWorkers.add(id);
+    control.retirement = control.retire();
+    void control.retirement.then(
+      () => {
+        control.ended = true;
+        control.reject(control.failure ?? aborted);
+      },
+      error => {
+        control.ended = true;
+        control.reject(new AggregateError([control.failure ?? aborted, error], "Browser helper could not release the aborted turn"));
+      },
+    );
+  }, ABORT_RETIREMENT_TIMEOUT_MS);
+  control.timer.unref?.();
+}
+
 function requestShutdown(): Promise<void> {
   if (shutdownPromise) return shutdownPromise;
   let completeShutdown!: () => void;
@@ -153,6 +211,7 @@ function requestShutdown(): Promise<void> {
     completeShutdown = resolveShutdown;
   });
   shuttingDown = true;
+  for (const control of runControls.values()) if (control.timer) clearTimeout(control.timer);
   protocolOutput.close();
   diagnosticOutput.close();
   for (const controller of abortControllers.values()) controller.abort();
@@ -194,7 +253,8 @@ async function run(message: RunMessage): Promise<void> {
   if (!/^[A-Za-z0-9_-]{6,128}$/.test(message.id) || message.id !== message.turn.traceId) {
     throw new Error("Browser helper turn identity is invalid");
   }
-  if (abortControllers.has(message.id)) throw new Error(`Browser helper turn already exists: ${message.id}`);
+  if (abortControllers.has(message.id) || unfinishedWorkers.has(message.id)) throw new Error(`Browser helper turn already exists: ${message.id}`);
+  if (retiredWorkers.size >= MAX_UNFINISHED_ABORTS) throw new Error("Browser helper has too many unfinished aborted turns");
   if (message.turn.resumeAvailable !== undefined && typeof message.turn.resumeAvailable !== "boolean") {
     throw new Error("Browser helper resume availability is invalid");
   }
@@ -232,7 +292,12 @@ async function run(message: RunMessage): Promise<void> {
     throw new Error("Browser helper submission receipt acknowledgement flag is invalid");
   }
   const recovery = message.turn.continuity?.recovery;
+  if (message.turn.recoveryRequestId !== undefined && (typeof message.turn.recoveryRequestId !== "string"
+    || !/^[A-Za-z0-9_-]{16,128}$/.test(message.turn.recoveryRequestId))) throw new Error("Browser helper acquisition request identity is invalid");
+  const assertExecutionAuthority = () => assertBrowserTurnExecutionAuthority(message.turn);
+  assertExecutionAuthority();
   if (recovery) turnRecoveryIdentities.set(message.id, recovery);
+  if (recovery) turnAuthorityChecks.set(message.id, assertExecutionAuthority);
   const writeTurnProtocol = (value: Record<string, unknown>): boolean => writeProtocol({ ...value, ...(recovery ? { recovery } : {}) });
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -249,6 +314,23 @@ async function run(message: RunMessage): Promise<void> {
   };
   const abortController = new AbortController();
   abortControllers.set(message.id, abortController);
+  let rejectRetirement!: (error: Error) => void;
+  const retirement = new Promise<never>((_, reject) => { rejectRetirement = reject; });
+  const control: RunControl = { ended: false, reject: rejectRetirement, retire: async () => {
+    await notifyLauncherTurn(message.config.browserHostDescriptorPath, {
+      phase: "end", traceId: message.id, helperPid: process.pid, status: "failed",
+      message: "Browser helper did not finish the aborted turn",
+      ...(recovery ? { recovery } : {}),
+      ...(message.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: message.turn.recoveryStoreDirectory } : {}),
+    });
+  } };
+  runControls.set(message.id, control);
+  const assertActiveOutput = () => {
+    if (control.ended) throw new DOMException("Browser helper turn has ended", "AbortError");
+    if (control.failure) throw control.failure;
+    assertExecutionAuthority();
+    if (abortController.signal.aborted) throw abortController.signal.reason;
+  };
   // The Codex MCP broker runs in the daemon process, so this mirror is the only way the worker can
   // observe that a turn is still executing while its ChatGPT DOM is unavailable. Trace ids are
   // derived deterministically and can repeat, so each run starts a fresh mirror rather than
@@ -279,7 +361,11 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     ...(message.turn.continuity ? {
       continuity: message.turn.continuity,
+      ...(message.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: message.turn.recoveryStoreDirectory } : {}),
+      ...(message.turn.recoveryRequestId ? { recoveryRequestId: message.turn.recoveryRequestId } : {}),
+      assertExecutionAuthority,
       onContinuityLease: lease => {
+        assertExecutionAuthority();
         if (!writeTurnProtocol({ type: "event", id: message.id, event: "continuity_lease", lease })) {
           throw new Error("Browser helper could not return the continuity lease");
         }
@@ -321,9 +407,10 @@ async function run(message: RunMessage): Promise<void> {
         }),
       },
     } : {}),
-    onHeartbeat: () => writeTurnProtocol({ type: "event", id: message.id, event: "heartbeat" }),
-    onGenerationProgress: () => writeTurnProtocol({ type: "event", id: message.id, event: "generation_progress" }),
+    onHeartbeat: () => !control.ended && writeTurnProtocol({ type: "event", id: message.id, event: "heartbeat" }),
+    onGenerationProgress: () => !control.ended && writeTurnProtocol({ type: "event", id: message.id, event: "generation_progress" }),
     onPreparedSelected: reused => {
+      assertActiveOutput();
       if (!writeTurnProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
         throw new Error("Browser helper could not request prompt selection");
       }
@@ -337,6 +424,7 @@ async function run(message: RunMessage): Promise<void> {
       }
     },
     onSendActivated: () => new Promise<void>((resolve, reject) => {
+      assertActiveOutput();
       if (sendActivationWaiters.has(message.id)) {
         reject(new Error("Browser helper Send activation already awaits acknowledgement"));
         return;
@@ -348,6 +436,10 @@ async function run(message: RunMessage): Promise<void> {
       }
     }),
     onSubmitted: () => {
+      if (control.ended) throw new DOMException("Browser helper turn has ended", "AbortError");
+      if (recovery && !acknowledgedSendTurns.has(message.id)) {
+        throw new Error("Browser helper submission has no acknowledged Send for this run");
+      }
       if (!message.turn.submissionReceiptAcknowledgement) {
         if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
           throw new Error("Browser helper could not persist ChatGPT submission evidence");
@@ -374,35 +466,49 @@ async function run(message: RunMessage): Promise<void> {
       return promise;
     },
     onMultipartStageAcknowledged: stageIndex => {
+      assertActiveOutput();
       if (!writeTurnProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
         throw new Error("Browser helper could not persist multipart acknowledgement evidence");
       }
     },
-    onReasoningSummary: (text, continuation) => writeTurnProtocol({
-      type: "event",
-      id: message.id,
-      event: "reasoning",
-      text,
-      ...(continuation ? { continuation: true } : {}),
-    }),
-    onCommentary: (text, continuation) => writeTurnProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-    onTextDelta: (text, candidate) => writeTurnProtocol({ type: "event", id: message.id, event: "text", text,
-      ...(candidate ? { candidate } : {}) }),
+    onReasoningSummary: (text, continuation) => {
+      assertActiveOutput();
+      writeTurnProtocol({ type: "event", id: message.id, event: "reasoning", text, ...(continuation ? { continuation: true } : {}) });
+    },
+    onCommentary: (text, continuation) => {
+      assertActiveOutput();
+      writeTurnProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) });
+    },
+    onTextDelta: (text, candidate) => {
+      assertActiveOutput();
+      writeTurnProtocol({ type: "event", id: message.id, event: "text", text,
+        ...(candidate ? { candidate } : {}) });
+    },
     ...(message.turn.captureLunaCheckpoint ? {
       captureLunaCheckpoint: true,
-      onLunaCheckpoint: captured => writeTurnProtocol({
-        type: "event",
-        id: message.id,
-        event: "luna_checkpoint",
-        ...captured,
-      }),
+      onLunaCheckpoint: captured => {
+        assertActiveOutput();
+        writeTurnProtocol({ type: "event", id: message.id, event: "luna_checkpoint", ...captured });
+      },
     } : {}),
   };
   try {
-    const text = await ChatGptBrowserWorker.forProvider(provider).run(turn);
+    unfinishedWorkers.add(message.id);
+    const workerResult = Promise.resolve().then(() => ChatGptBrowserWorker.forProvider(provider).run(turn));
+    const workerSettled = () => { unfinishedWorkers.delete(message.id); retiredWorkers.delete(message.id); };
+    void workerResult.then(workerSettled, workerSettled);
+    const text = await Promise.race([workerResult, retirement]);
     await submissionReceiptWaiters.get(message.id)?.promise;
+    assertActiveOutput();
     writeTurnProtocol({ type: "result", id: message.id, text });
   } catch (error) {
+    error = control.failure ?? error;
+    // A worker can settle while watchdog cleanup is in flight. Its terminal must
+    // still wait for that cleanup, and a failed release must remain visible.
+    if (control.retirement) {
+      try { await control.retirement; }
+      catch (cleanupError) { error = new AggregateError([error, cleanupError], "Browser helper could not release the aborted turn"); }
+    }
     writeTurnProtocol({
       type: "error",
       id: message.id,
@@ -414,8 +520,13 @@ async function run(message: RunMessage): Promise<void> {
         code: error.code,
         retryable: error.retryable,
       } : {}),
+      ...(getLauncherKnownUnsentReceipt(error) ? { sendUnsentReceipt: getLauncherKnownUnsentReceipt(error) } : {}),
     });
   } finally {
+    control.ended = true;
+    if (control.timer) clearTimeout(control.timer);
+    if (!unfinishedWorkers.has(message.id)) retiredWorkers.delete(message.id);
+    runControls.delete(message.id);
     preparedSelections.get(message.id)?.cancel();
     preparedSelections.delete(message.id);
     clearContextPlanSelection(message.id);
@@ -432,6 +543,8 @@ async function run(message: RunMessage): Promise<void> {
     commitWaiter?.reject(new DOMException("Browser helper turn ended before completion-fence commit", "AbortError"));
     abortControllers.delete(message.id);
     turnRecoveryIdentities.delete(message.id);
+    turnAuthorityChecks.delete(message.id);
+    acknowledgedSendTurns.delete(message.id);
     turnProgress.delete(message.id);
     taskUpdateTurns.delete(message.id);
   }
@@ -503,13 +616,23 @@ input.on("line", line => {
   if (message.type !== "run" && "id" in message) {
     const recovery = turnRecoveryIdentities.get(message.id);
     if (recovery && (!message.recovery || !sameContinuityRecoveryIdentity(message.recovery, recovery))) return;
+    // Abort and the original semantic Send receipt remain valid after withdrawal. They cannot
+    // grant execution rights. Every other delayed control frame must read current authority.
+    if (message.type !== "abort" && message.type !== "submitted_ack") {
+      try { turnAuthorityChecks.get(message.id)?.(); }
+      catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        // A rejected control frame is not a worker terminal. Preserve its error and
+        // allow the acknowledged original Send to report its trusted receipt first.
+        abortRun(message.id, failure);
+        return;
+      }
+    }
   }
   if (message.type === "prepared_selected_ack") {
     const prepared = message.prepared;
     if (!prepared || typeof prepared.text !== "string" || !Array.isArray(prepared.images)) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper prompt selection is invalid" });
-      abortControllers.get(message.id)?.abort();
-      preparedSelections.get(message.id)?.cancel();
+      abortRun(message.id, new Error("Browser helper prompt selection is invalid"));
       return;
     }
     try {
@@ -517,9 +640,7 @@ input.on("line", line => {
       validateBrowserHelperContextPlan(prepared.contextPlan);
     }
     catch (error) {
-      writeProtocol({ type: "error", id: message.id, message: error instanceof Error ? error.message : String(error) });
-      abortControllers.get(message.id)?.abort();
-      preparedSelections.get(message.id)?.cancel();
+      abortRun(message.id, error instanceof Error ? error : new Error(String(error)));
       return;
     }
     if (prepared.multipart !== undefined) {
@@ -528,39 +649,29 @@ input.on("line", line => {
         || !isChatGptWebMultipartPartCount(multipart.parts.length)
         || multipart.parts.some(part => typeof part !== "string")
         || typeof multipart.commit !== "string") {
-        writeProtocol({ type: "error", id: message.id, message: "Browser helper multipart prompt is invalid" });
-        abortControllers.get(message.id)?.abort();
-        preparedSelections.get(message.id)?.cancel();
+        abortRun(message.id, new Error("Browser helper multipart prompt is invalid"));
         return;
       }
     }
     const selection = preparedSelections.get(message.id);
     if (!selection) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
+      abortRun(message.id, new Error("Browser helper has no pending prompt selection"));
       return;
     }
     if (prepared.contextPlan) {
       if (contextPlanSelections.has(message.id)) {
-        writeProtocol({ type: "error", id: message.id, message: "Browser helper context plan selection is already pending" });
-        abortControllers.get(message.id)?.abort();
-        selection.cancel();
+        abortRun(message.id, new Error("Browser helper context plan selection is already pending"));
         return;
       }
       const recovery = turnRecoveryIdentities.get(message.id);
       const timer = setTimeout(() => {
-        clearContextPlanSelection(message.id);
-        writeProtocol({ type: "error", id: message.id, message: "Browser helper context plan acknowledgement timed out",
-          ...(recovery ? { recovery } : {}) });
-        abortControllers.get(message.id)?.abort();
-        selection.cancel();
+        abortRun(message.id, new Error("Browser helper context plan acknowledgement timed out"));
       }, CONTEXT_PLAN_ACK_TIMEOUT_MS);
       timer.unref?.();
       contextPlanSelections.set(message.id, { prepared, timer });
       if (!writeProtocol({ type: "event", id: message.id, event: "context_plan_selected", planId: prepared.contextPlan.planId,
         ...(recovery ? { recovery } : {}) })) {
-        clearContextPlanSelection(message.id);
-        abortControllers.get(message.id)?.abort();
-        selection.cancel();
+        abortRun(message.id, new Error("Browser helper could not request context plan selection"));
       }
     } else {
       selection.select(prepared);
@@ -569,9 +680,7 @@ input.on("line", line => {
     const prepared = contextPlanSelections.get(message.id)?.prepared;
     const selection = preparedSelections.get(message.id);
     if (!prepared?.contextPlan || !selection || message.planId !== prepared.contextPlan.planId) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper received a mismatched context plan acknowledgement" });
-      abortControllers.get(message.id)?.abort();
-      selection?.cancel();
+      abortRun(message.id, new Error("Browser helper received a mismatched context plan acknowledgement"));
       return;
     }
     clearContextPlanSelection(message.id);
@@ -580,23 +689,23 @@ input.on("line", line => {
   } else if (message.type === "send_activation_ack") {
     const waiter = sendActivationWaiters.get(message.id);
     if (!waiter) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending Send activation" });
+      abortRun(message.id, new Error("Browser helper has no pending Send activation"));
       return;
     }
     sendActivationWaiters.delete(message.id);
+    acknowledgedSendTurns.add(message.id);
     waiter.resolve();
   } else if (message.type === "submitted_ack") {
     const waiter = clearSubmissionReceiptWaiter(message.id);
     if (!waiter) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending submission receipt" });
+      abortRun(message.id, new Error("Browser helper has no pending submission receipt"));
       return;
     }
     waiter.resolve();
   } else if (message.type === "completion_fence_begin_ack") {
     if (!Number.isSafeInteger(message.requestId) || message.requestId <= 0
       || (message.revision !== null && (!Number.isSafeInteger(message.revision) || message.revision < 0))) {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper completion fence revision is invalid" });
-      abortControllers.get(message.id)?.abort();
+      abortRun(message.id, new Error("Browser helper completion fence revision is invalid"));
       return;
     }
     const waiter = completionFenceBeginWaiters.get(message.id);
@@ -606,8 +715,7 @@ input.on("line", line => {
   } else if (message.type === "completion_fence_commit_ack") {
     if (!Number.isSafeInteger(message.requestId) || message.requestId <= 0
       || typeof message.committed !== "boolean") {
-      writeProtocol({ type: "error", id: message.id, message: "Browser helper completion fence result is invalid" });
-      abortControllers.get(message.id)?.abort();
+      abortRun(message.id, new Error("Browser helper completion fence result is invalid"));
       return;
     }
     const waiter = completionFenceCommitWaiters.get(message.id);
@@ -625,10 +733,9 @@ input.on("line", line => {
     } catch (error) {
       if (taskUpdateTurns.has(message.id)
         && (progress.snapshot().taskUpdates !== undefined || message.snapshot?.taskUpdates !== undefined)) {
-        writeProtocol({ type: "error", id: message.id,
-          message: "Browser helper lost valid negotiated task update control state",
-          status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false });
-        abortControllers.get(message.id)?.abort();
+        abortRun(message.id, new ChatGptWebAdapterError("Browser helper lost valid negotiated task update control state", {
+          status: 503, errorType: "server_error", code: "task_update_protocol_missing", retryable: false,
+        }));
         return;
       }
       // Progress carries liveness and tool-boundary state, never response content. Invalid progress
@@ -639,22 +746,9 @@ input.on("line", line => {
       );
     }
   } else if (message.type === "abort") {
-    abortControllers.get(message.id)?.abort(message.reason === "compaction_handoff_accepted"
+    abortRun(message.id, undefined, message.reason === "compaction_handoff_accepted"
       ? new ChatGptCompactionHandoffAccepted()
       : undefined);
-    preparedSelections.get(message.id)?.cancel();
-    clearContextPlanSelection(message.id);
-    acknowledgedContextPlanIds.delete(message.id);
-    const waiter = sendActivationWaiters.get(message.id);
-    sendActivationWaiters.delete(message.id);
-    waiter?.reject(new DOMException("Browser helper turn aborted before Send acknowledgement", "AbortError"));
-    clearSubmissionReceiptWaiter(message.id)?.reject(new DOMException("Browser helper turn aborted before submission receipt acknowledgement", "AbortError"));
-    const beginWaiter = completionFenceBeginWaiters.get(message.id);
-    completionFenceBeginWaiters.delete(message.id);
-    beginWaiter?.reject(new DOMException("Browser helper turn aborted before completion-fence begin", "AbortError"));
-    const commitWaiter = completionFenceCommitWaiters.get(message.id);
-    completionFenceCommitWaiters.delete(message.id);
-    commitWaiter?.reject(new DOMException("Browser helper turn aborted before completion-fence commit", "AbortError"));
   }
   else if (message.type === "shutdown") {
     void requestShutdown();
@@ -675,14 +769,17 @@ input.on("line", line => {
       type: "error",
       id: message.id,
       message: error instanceof Error ? error.message : String(error),
+      ...(message.turn.continuity?.recovery ? { recovery: message.turn.continuity.recovery } : {}),
+      ...(error instanceof ChatGptWebAdapterError ? { status: error.status, errorType: error.errorType,
+        code: error.code, retryable: error.retryable } : {}),
+      ...(getLauncherKnownUnsentReceipt(error) ? { sendUnsentReceipt: getLauncherKnownUnsentReceipt(error) } : {}),
     }));
   } else {
     // Never treat an unrecognised frame as a run; unsupported protocol data fails explicitly.
-    writeProtocol({
-      type: "error",
-      id: (message as { id?: string }).id ?? "unknown",
-      message: `Browser helper received an unsupported message type: ${String((message as { type?: unknown }).type)}`,
-    });
+    const id = (message as { id?: string }).id ?? "unknown";
+    const failure = new Error(`Browser helper received an unsupported message type: ${String((message as { type?: unknown }).type)}`);
+    if (runControls.has(id)) abortRun(id, failure);
+    else writeProtocol({ type: "error", id, message: failure.message });
   }
 });
 input.on("close", () => {
@@ -696,4 +793,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });

@@ -6,9 +6,54 @@ import { encodeCompactionSummary } from "../src/responses/compaction";
 import { assertSupportedContextImage, contextSnapshotPriorityImageLocators, createContextSnapshot, restoreContextSnapshot, serializeContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import type { CodexParsedRequest } from "../src/types";
+import { defaultConfig } from "../src/config";
+import { routeChatGptWebRequest } from "../src/server";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
 const imageRequest = (data: Uint8Array, mime = "image/png") => parseRequest({ model: "gpt-6", input: [{ role: "user", content: [{ type: "input_image", image_url: `data:${mime};base64,${Buffer.from(data).toString("base64")}` }] }] });
+
+describe("routed source snapshot provenance", () => {
+  for (const model of ["chatgpt-web/gpt-6-sol-instant", "chatgpt-web/light", "chatgpt-web/zero-risk"]) {
+    test(`assistant raw locations survive execution routing (${model})`, () => {
+      const body = { model, input: [
+        { type: "message", id: "source-user", role: "user", content: "Read the original return." },
+        { type: "function_call", call_id: "source-call", name: "exec_command", arguments: ' { "cmd": "source" } ' },
+        { type: "function_call_output", call_id: "source-call", output: "Original return." },
+        { type: "message", id: "source-commentary", role: "assistant", phase: "commentary",
+          content: [{ type: "output_text", text: "Original commentary." }] },
+      ] };
+      const parsed = parseRequest(body);
+      const before = createContextSnapshot(parsed);
+      routeChatGptWebRequest(parsed, { ...defaultConfig("full"), browserHost: "launcher", solAvailable: true,
+        browserInteractionMode: model.includes("zero-risk") ? "manual" : "automatic" });
+      const backend = parsed.modelId;
+      const snapshot = createContextSnapshot(parsed);
+      const commentary = snapshot.targets.find(target => target.kind === "message_text" && target.original_role === "assistant")!;
+      expect(commentary).toMatchObject({ provenance: "verified_raw", locator: { message_index: 3, raw_input_index: 3 } });
+      expect(snapshot.getText(commentary.read_ref!)).toBe("Original commentary.");
+      expect(snapshot.targets.map(target => [target.kind, target.provenance, target.locator,
+        snapshot.getText(target.read_ref ?? "")])).toEqual(before.targets.map(target => [target.kind, target.provenance,
+        target.locator, before.getText(target.read_ref ?? "")]));
+      expect(parsed.modelId).toBe(backend);
+      expect(parsed._rawBody).toBe(body);
+      expect(body.model).toBe(model);
+      expect(restoreContextSnapshot(serializeContextSnapshot(snapshot)).targets).toEqual(snapshot.targets);
+    });
+  }
+
+  test("an assistant model changed after routing cannot obtain raw provenance", () => {
+    const parsed = parseRequest({ model: "chatgpt-web/gpt-6-sol-instant", input: [
+      { type: "message", id: "source-user", role: "user", content: "Accepted task." },
+      { type: "message", id: "source-assistant", role: "assistant", content: [{ type: "output_text", text: "Original response." }] },
+    ] });
+    routeChatGptWebRequest(parsed, { ...defaultConfig("full"), browserHost: "launcher", solAvailable: true });
+    const assistant = parsed.context.messages.find(message => message.role === "assistant")!;
+    assistant.model = parsed.modelId;
+    const target = createContextSnapshot(parsed).targets.find(value => value.original_role === "assistant")!;
+    expect(target.provenance).toBe("parsed");
+    expect(target.locator.raw_input_index).toBeUndefined();
+  });
+});
 function pngChunk(name: string, data: Buffer): Buffer {
   const chunk = Buffer.alloc(data.length + 12); chunk.writeUInt32BE(data.length); chunk.write(name, 4, "ascii"); data.copy(chunk, 8);
   let crc = 0xffffffff;

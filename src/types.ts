@@ -8,7 +8,7 @@ export interface CodexParsedRequest {
   /** Set only by the trusted Web route, never parsed from caller-supplied model metadata. */
   _chatgptModelFamily?: "5.6" | "6";
   /** Internal trusted-route policy. Never parsed from request metadata or summary text. */
-  _conversationPolicy?: "recoverable" | "continuity-first";
+  _conversationPolicy?: "recoverable" | "task";
   /** Resolved only from the live continuity binding, never from request metadata. */
   _continuityHistoryRevision?: number;
   /** Local recovery identity, never parsed from request JSON. */
@@ -17,6 +17,9 @@ export interface CodexParsedRequest {
   _continuityAttempt?: number;
   /** Provider/model scope bound by the Adapter before resolving local checkpoint evidence. */
   _continuityScope?: string;
+  /** Canonical provider scope and exact old keys, computed from trusted local configuration. */
+  _continuityCanonicalScope?: string;
+  _continuityLegacyScopes?: string[];
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**
@@ -24,6 +27,8 @@ export interface CodexParsedRequest {
    * This controls summarization and lifecycle, not the output wire format.
    */
   _compactionRequest?: boolean;
+  /** Trusted HTTP source options, kept separate from the control-only compaction execution. */
+  _compactionSourceOptions?: CodexRequestOptions;
   /** Local Responses compaction consumes assistant text; remote compaction consumes an item. */
   _compactionOutput?: "message";
   /** Native compact.rs text compaction also consumes assistant text instead of a compaction item. */

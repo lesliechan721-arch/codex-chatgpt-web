@@ -585,7 +585,7 @@ interface ContinuityInstructionSelection {
 const continuityInstructionSelections = new WeakMap<CodexParsedRequest, ContinuityInstructionSelection>();
 
 function continuityInstructionSelection(parsed: CodexParsedRequest, input: unknown[]): ContinuityInstructionSelection | undefined {
-  if (parsed._conversationPolicy !== "continuity-first") return undefined;
+  if (parsed._conversationPolicy !== "task") return undefined;
   const cached = continuityInstructionSelections.get(parsed);
   if (cached && cached.input === input && cached.scope === parsed._continuityScope
     && cached.compaction === parsed._compactionRequest) return cached;
@@ -606,7 +606,7 @@ export function requestCarriedChatGptInstructionRevision(parsed: CodexParsedRequ
     return index >= 0 ? userRevision(input[index], expectedTurnId, metadata, true) : undefined;
   }
   for (let index = input.length - 1; index >= 0; index -= 1) {
-    const revision = userRevision(input[index], expectedTurnId, metadata, parsed._conversationPolicy === "continuity-first");
+    const revision = userRevision(input[index], expectedTurnId, metadata, parsed._conversationPolicy === "task");
     if (revision) {
       selection?.carried.set(expectedTurnId, index);
       return revision;
@@ -626,7 +626,7 @@ export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): numb
       ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId;
   }
   const metadata = clientTurnMetadata(parsed);
-  const checkpoint = parsed._conversationPolicy === "continuity-first" && !parsed._compactionRequest
+  const checkpoint = parsed._conversationPolicy === "task" && !parsed._compactionRequest
     ? recoverCompactionInstruction(parsed, identity) : undefined;
   const selection = continuityInstructionSelection(parsed, input);
   if (selection?.index !== undefined) return selection.index;
@@ -649,7 +649,7 @@ export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): numb
     }
     const revision = userRevision(input[index], identity.turnId, metadata);
     if (!revision && itemTurnId(input[index]) === undefined
-      && parsed._conversationPolicy === "continuity-first" && !parsed._compactionRequest
+      && parsed._conversationPolicy === "task" && !parsed._compactionRequest
       && isNativeInstruction(record(input[index]), metadata)) {
       throw continuityError("continuity_source_unproven", "The current native instruction has no item or turn identity.");
     }
@@ -688,18 +688,69 @@ export function chatGptInstructionContent(item: Record<string, unknown>): unknow
   });
 }
 
+/** Fixed, domain-separated proof of one accepted instruction representation. */
+export function continuityCheckpointSiblingProof(parsed: CodexParsedRequest, value: unknown) {
+  const item = record(value);
+  if (!item) return undefined;
+  const id = typeof item.id === "string" ? parsed._chatGptMessageIdAliases?.[item.id] ?? item.id : undefined;
+  const normalized = { ...item, content: chatGptInstructionContent(item), ...(id ? { id } : {}) };
+  const hash = (domain: string, value: unknown) => createHash("sha256").update(canonicalJson([domain, value])).digest("hex");
+  return { identity: id ? hash("continuity-checkpoint-sibling-id-v1", id) : undefined,
+    representation: hash("continuity-checkpoint-sibling-value-v1", normalized) };
+}
+
+export function continuityCheckpointSiblingGroup(proofs: readonly { representation: string }[]): string {
+  return createHash("sha256").update(canonicalJson(["continuity-checkpoint-sibling-group-v1", proofs.map(proof => proof.representation)])).digest("hex");
+}
+
+export const CONTINUITY_CHECKPOINT_SIBLING_PROOF = createHash("sha256")
+  .update(canonicalJson(["continuity-checkpoint-sibling-proof-v1"])).digest("hex");
+
+/** Reuse the source work's accepted predecessor boundary, not its full old history. */
+export function continuityCheckpointSiblings(parsed: CodexParsedRequest,
+  previous?: { instructionIdentity?: string; nativeTurnId?: string }, sourceIndex = chatGptCurrentInstructionIndex(parsed)) {
+  const input = record(parsed._rawBody)?.input;
+  if (!Array.isArray(input) || sourceIndex < 0) return [];
+  if (!input.slice(0, sourceIndex).some(value => {
+    const item = record(value);
+    return item && (inputItemType(item) === "message" || item.type === "agent_message" || isDelegatedInstruction(item));
+  })) return [];
+  const selected = continuityCurrentInstructionInput(parsed, previous, true, sourceIndex);
+  let cursor = 0;
+  return selected.flatMap(value => {
+    const encoded = canonicalJson(value);
+    const index = input.findIndex((item, position) => position >= cursor && canonicalJson(item) === encoded);
+    if (index < 0) throw continuityError("continuity_source_unproven");
+    cursor = index + 1;
+    // Current system/developer and environment constraints can be rebuilt by the
+    // client. Their first-consumer payload is checked by the continuation path;
+    // this proof binds the source work's native task instructions only.
+    if (!hasNativeChatGptInstruction(parsed, [value])) return [];
+    return index < sourceIndex ? [{ ...continuityCheckpointSiblingProof(parsed, value)!, index, value }] : [];
+  });
+}
+
+/** Publish only after the exact durable checkpoint proved its carried sibling group. */
+export function bindContinuityCheckpointSourceIndex(parsed: CodexParsedRequest, index: number): void {
+  const input = record(parsed._rawBody)?.input;
+  if (!Array.isArray(input) || index < 0 || index >= input.length) throw continuityError("continuity_source_unproven");
+  const selected = continuityInstructionSelection(parsed, input);
+  if (selected) { selected.index = index; selected.inputs.clear(); }
+}
+
 /** Reintroduce all native instruction items belonging to the current incremental work. */
 export function continuityCurrentInstructionInput(
   parsed: CodexParsedRequest,
   previous?: { instructionIdentity?: string; nativeTurnId?: string; trustedLowerBound?: number },
   includeRetainedSource = false,
+  sourceInstructionIndex?: number,
 ): unknown[] {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
-  const index = chatGptCurrentInstructionIndex(parsed);
+  const index = sourceInstructionIndex ?? chatGptCurrentInstructionIndex(parsed);
   const selection = continuityInstructionSelection(parsed, input);
   const selectionKey = JSON.stringify([previous?.instructionIdentity ?? null, previous?.nativeTurnId ?? null,
-    previous?.trustedLowerBound ?? null, includeRetainedSource]);
+    previous?.trustedLowerBound ?? null, sourceInstructionIndex ?? null, includeRetainedSource]);
   const cached = selection?.inputs.get(selectionKey);
   const clone = (candidate: number): unknown => {
     const item = structuredClone(input[candidate]);
@@ -751,6 +802,13 @@ export function continuityCurrentInstructionInput(
     && checkpointIndex >= 0 && checkpointIndex < input.length
     ? checkpointIndex
     : -1;
+  const currentId = record(input[index])?.id;
+  const currentInstructionId = typeof currentId === "string" ? parsed._chatGptMessageIdAliases?.[currentId] ?? currentId
+    : itemTurnId(input[index]) ? `turn:${itemTurnId(input[index])}` : undefined;
+  if (prior?.instructionIdentity && currentInstructionId === prior.instructionIdentity
+    && isRetainedCompactionSourceInstruction(parsed, input[index])) {
+    lowerBound = Math.max(lowerBound, index);
+  }
   if (index < 0 && lowerBound < 0) return remember([]);
   let predecessorDefinesBoundary = false;
   if (prior?.instructionIdentity && index > lowerBound) {
@@ -799,7 +857,7 @@ export function continuityCurrentInstructionInput(
     && input.slice(checkpointIndex + 1, index).every((_, offset) => requestPrefix.has(checkpointIndex + 1 + offset));
   let trailingOutput = false;
   const selected: number[] = [];
-  for (let candidate = 0; candidate < input.length; candidate += 1) {
+  for (let candidate = 0; candidate < (sourceInstructionIndex === undefined ? input.length : index + 1); candidate += 1) {
     const item = input[candidate];
     const message = record(item);
     const revision = userRevision(item, identity.turnId, metadata);
@@ -859,7 +917,7 @@ export function hasInitialChatGptTurnInstruction(parsed: CodexParsedRequest): bo
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
   if (!identity.threadId || !identity.turnId) return false;
-  const currentIndex = parsed._conversationPolicy === "continuity-first"
+  const currentIndex = parsed._conversationPolicy === "task"
     ? chatGptCurrentInstructionIndex(parsed) : undefined;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const item = record(input[index]);
@@ -897,7 +955,7 @@ export function continuityCurrentEnvironmentInput(parsed: CodexParsedRequest, se
 /** A retained source copied by the checkpoint codec is not a new instruction to execute. */
 export function isRetainedCompactionSourceInstruction(parsed: CodexParsedRequest, value: unknown): boolean {
   const identity = extractChatGptTurnIdentity(parsed);
-  const revision = userRevision(value, identity.turnId, clientTurnMetadata(parsed), parsed._conversationPolicy === "continuity-first");
+  const revision = userRevision(value, identity.turnId, clientTurnMetadata(parsed), parsed._conversationPolicy === "task");
   const accepted = recoverCompactionInstruction(parsed, identity);
   return Boolean(revision && accepted
     && (!revision.itemId || !accepted.source.itemId
@@ -927,7 +985,7 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const metadata = clientTurnMetadata(parsed);
   const revisions = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
-    const revision = userRevision(value, turnId, metadata, parsed._conversationPolicy === "continuity-first");
+    const revision = userRevision(value, turnId, metadata, parsed._conversationPolicy === "task");
     return revision ? [revision] : [];
   });
   if (revisions.length > 0) return revisions;
@@ -1015,7 +1073,7 @@ export function extractChatGptCompactV1SourceRevision(parsed: CodexParsedRequest
   const identity = extractChatGptTurnIdentity(parsed);
   const metadata = clientTurnMetadata(parsed);
   for (let index = input.length - 1; index >= 0; index -= 1) {
-    const source = userRevision(input[index], identity.turnId, metadata, parsed._conversationPolicy === "continuity-first");
+    const source = userRevision(input[index], identity.turnId, metadata, parsed._conversationPolicy === "task");
     if (source) return source;
   }
   return extractChatGptCompactionSourceRevision(parsed);

@@ -54,7 +54,7 @@ export async function tryTaskUpdateHandoff(options: {
 }): Promise<ChatGptTurnSession | undefined> {
   const { parsed, broker } = options;
   if (parsed._compactionRequest) return undefined;
-  const continuity = parsed._conversationPolicy === "continuity-first";
+  const continuity = parsed._conversationPolicy === "task";
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId || !identity.turnId) return undefined;
   const foundSession = chatGptTurnSessions.findTaskUpdateOwner(identity.threadId, identity.turnId, options.ownerKey);

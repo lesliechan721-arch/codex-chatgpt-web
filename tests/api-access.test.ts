@@ -26,16 +26,20 @@ const upstreamRuntime: UpstreamProviderRuntime = {
 const request = (path = "/v1/models", authorization: string | null = `Bearer ${key}`, method = "GET") =>
   new Request(`http://127.0.0.1${path}`, { method, headers: authorization ? { authorization } : {} });
 
-test("both Web namespaces reach trusted route admission rather than upstream dispatch", () => {
+test("standard and removed Web names reach trusted admission rather than upstream dispatch", () => {
   for (const model of ["chatgpt-web/gpt-5.6-sol", "chatgpt-web-continuity/gpt-5.6-sol", "chatgpt-web-continuity/unknown"]) {
     assert.equal(requireWebModelInApiKeyMode(model, policy), undefined);
     assert.equal(requireWebModelInApiKeyMode(model, policy, upstreamRuntime), undefined);
   }
   assert.equal(requireWebModelInApiKeyMode("chatgpt-web-continuity-other/model", policy)?.status, 400);
   assert.match(renderApiKeyCodexConfig({
+    port: 8080, catalogPath: "/tmp/catalog.json", model: "chatgpt-web/gpt-5.6-sol",
+    reasoningEffort: "medium", apiKey: key,
+  }), /model = "chatgpt-web\/gpt-5.6-sol"/);
+  assert.throws(() => renderApiKeyCodexConfig({
     port: 8080, catalogPath: "/tmp/catalog.json", model: "chatgpt-web-continuity/gpt-5.6-sol",
     reasoningEffort: "medium", apiKey: key,
-  }), /model = "chatgpt-web-continuity\/gpt-5.6-sol"/);
+  }), /removed.*chatgpt-web\/gpt-5.6-sol/);
 });
 
 test("generated keys have 256 random bits and only their digest is persisted", () => {

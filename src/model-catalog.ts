@@ -47,13 +47,6 @@ function routedModelPriority(
   config: AppConfig,
 ): number | undefined {
   const priority = modelPriority(template);
-  if (priority !== undefined && route.conversationPolicy === "continuity-first") {
-    if (priority > Number.MAX_SAFE_INTEGER - 2) {
-      throw new Error("Native Codex model template priority cannot reserve the existing Web model order");
-    }
-    // New opt-in identities follow both ordinary reasoning routes and the V1 instant entry.
-    return priority + 2;
-  }
   if (priority === undefined
     || config.subagentProtocol !== "compatibility-v1"
     || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-6-sol-instant"].includes(route.slug)) return priority;

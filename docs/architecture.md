@@ -132,16 +132,15 @@ of [release validation](release-validation.md#context-navigation-validation).
 
 ## Browser lifecycle
 
-The following describes the recoverable `chatgpt-web/` policy. The continuity policy is described
+The following describes the browser lifecycle. Unified task recovery is described
 separately below.
 
 The desktop launcher owns one persistent Electron partition and up to five task-bound browser
-tabs. Each task/model/effort/compaction epoch owns one exact `WebContentsView` lease; sequential
-native messages reuse that surface, while each message receives a fresh turn-bound MCP token and
-keeps all of its MCP tool rounds inside one ChatGPT response. Compaction asks the same retained Web
-agent for a one-shot structured checkpoint, waits for the response and physical helper cleanup,
-then closes the old surface. The next epoch gets a new browser chat. Model messages never copy
-state between tabs. Tabs share only the local login
+tabs. Each task owns an exact `WebContentsView` lease. Compatible native messages reuse that
+surface, while each message receives a fresh turn-bound MCP token and keeps all of its MCP rounds
+inside one ChatGPT response. For eligible unified routes, accepted compaction advances history
+revision while retaining a healthy compatible page; page replacement is a separate action. Other
+paths keep their existing lifecycle. Model messages never copy state between unrelated task tabs. Tabs share only the local login
 partition and keep independent documents and lifecycles. Closing a running tab destroys its page
 and terminates that browser turn. A sixth concurrent turn fails explicitly; the cap avoids excessive
 parallel traffic that could trigger account abuse controls.
@@ -161,7 +160,7 @@ temporary session-transfer directory.
 
 The selected Codex input retains its task-text contract. In Full/MCP mode, eligible tool-history
 fields can become references into an immutable legal-source snapshot, with a bounded entry in the
-actual browser input. Retained and continuity inputs also receive a fresh entry when they omit
+actual browser input. Retained inputs also receive a fresh entry when they omit
 readable history. The canonical request and real tool results used for settlement stay intact.
 Images prefer fixed inline MCP image blocks; required fallback images use the existing attachment
 path. Image bytes stay out of the prompt JSON. No context JSONL file, synthetic context document,
@@ -180,9 +179,10 @@ separate `context-text-read-v2` result with two metadata representations and one
 Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
 same choice remains available in Settings; changing it uses the transactional setup path, replaces
 the installed catalog, and requires a Codex restart. Zero Risk never reads or mutates the ChatGPT DOM.
-For a new ChatGPT chat the adapter provides the complete compiled prompt; for an exactly retained
-chat it also provides an incremental prompt containing only the Codex suffix after the last assistant
-reply. The Launcher chooses between those two prompts from its own retained-tab ownership and writes
+For a new ChatGPT chat the adapter provides the selected cold-start plan, including effective
+instructions and any required on-demand entries; unsent full-source compilation is not its browser
+gate. For an exactly retained chat it also provides a legal incremental prompt with current entry
+and coverage checks. The Launcher chooses between those two prompts from its own retained-tab ownership and writes
 the selected text to the system clipboard. The Launcher captures the Sent-confirmation policy for
 each manual turn. The adapter sends its expected policy with `/v1/manual/start`; if that expectation
 does not match the Launcher's captured policy, the start fails before the prompt is exposed. The
@@ -218,24 +218,24 @@ retain their measured adapter-owned limits.
 uses ordinary saved conversations for task turns in Automatic and Zero Risk modes. This is
 independent of conversation reuse. Changing it releases idle retained tabs, and its provider
 configuration participates in conversation identity. Saved history does not authorize reopening
-an arbitrary ChatGPT conversation. Compaction still starts the next context epoch in a new chat;
+an arbitrary ChatGPT conversation. Applicable unified tasks prefer page reuse across compaction;
 account inspection continues to use an empty Temporary Chat. ChatGPT memory and custom instructions
 may apply to saved conversations.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
-default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each native turn
-gets a new browser chat, the complete canonical Codex context and a fresh connector attachment.
-Tool rounds and reconnects within that turn keep their existing owner. Compaction deliberately
-uses a fresh read-only summarization chat with the same bounded lifecycle. This can isolate lost
-connector access on retained follow-ups, at the cost of resending more context. The preference is
-preserved but inactive in Zero Risk mode.
+default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each logical send
+that needs actual new browser input selects a new page with a legal cold-start plan and current
+connector attachment. Tool rounds, HTTP replays and task updates do not create pages solely for
+this preference. It changes page choice, not work identity, stop, checkpoint or retry facts. The
+existing Zero Risk send capability and manual boundaries still apply.
 
 Bigger Context partitions complete ordered records against each message's available token and
 composer budgets. Inert stages carry text; the final message also carries actual fallback attachments,
 the execution contract and any output schema. Their reserves are deducted before partitioning,
 then preflight checks the actual compiled messages and total transaction. The selected execution
 effort and attachment references remain unchanged. Large transactions use up to six messages;
-the advertised context and compaction thresholds depend on the model and account. GPT-5.6 and
+the actual delivery window and multipart thresholds depend on the model and account. These are
+separate from the public unified-task history window and automatic-compaction threshold. GPT-5.6 and
 GPT-6 Pro retain three-times budgets. GPT-6 Sol on Pro accounts at Medium, High, or Extra High
 uses a 240,000-token context window and a 220,000-token compaction threshold. Plus supports
 Medium, High, and available Extra High with a 120,000-token window and a 110,000-token compaction
@@ -243,9 +243,9 @@ threshold. GPT-6 Instant uses standard budgets. Luna/Think can opt into experime
 transport with an 84,000-token ceiling derived from its 28,000-token per-message transport budget;
 this is not a verified Free recall window. Multipart Luna sends complete canonical history without
 the rolling checkpoint; disabling Bigger Context restores ordinary checkpoint transport.
-More parts reduce message size without increasing these total limits. Bigger Context applies only to non-continuity models. Session continuity
-ignores this preference and does not use multipart staging; its separate
-1,000,000 / 900,000-token history budget does not increase browser input capacity.
+More parts reduce message size without increasing these delivery limits. Bigger Context uses
+existing supported model/account and transport capabilities. Applicable unified routes use the
+separate 1,000,000 / 900,000-token history budget; it does not increase browser input capacity.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
@@ -254,13 +254,18 @@ environment. When required, the same control message also supplies an independen
 submission does not require full reading or image coverage. Reading grants no submission or business
 authority. Source availability, remaining summary allowance, in-flight reads, and original ownership
 and settlement checks still gate acceptance. A permanent source failure prevents a checkpoint.
-Zero Risk always advertises a fixed three-times compaction interval without enabling
-Bigger Context multipart transport. At that boundary its active ChatGPT response receives the
-checkpoint instruction as an MCP result, returns the compacted context through its bound completion
-control, and ends. The old manual chat is retired; the next compacted Codex request owns a fresh
-browser chat and its locally compiled prompt is copied to the clipboard. A missing Automatic
-retained source falls back to a dedicated read-only browser chat built from canonical Codex
-history; a missing Zero Risk source uses the same explicit manual checkpoint contract. An invalid or
+Zero Risk retains its Bigger Context multipart prohibition. Applicable unified routes advertise
+1,000,000 / 900,000 history values separately from actual delivery limits. Active compaction receives
+the checkpoint instruction as an MCP result and submits through its bound completion control.
+A healthy compatible page can remain after the checkpoint; replacing it is a separate decision.
+Every actual new manual input still requires its selected plan, Sent and attachment confirmation.
+An ended Zero Risk response retains the explicit manual checkpoint handoff.
+
+Applicable Automatic lost-page compaction rebuilds complete legal sources and admits the actual
+read-only on-demand plan, without requiring their full inline browser compilation. Old project
+execution isolation, confirmed Send and real dispatch settlement gate successor execution;
+physical cleanup is independent. Non-applicable routes retain their original compaction interval,
+page retirement and fresh summarizer/source admission behavior. An invalid or
 ambiguous handoff still fails explicitly. Browser-only mode
 uses the same read-only summarization path, then returns the native replacement-history shape expected
 by Codex. A prompt-level checkpoint marker is translated into a visible Codex trace item;
@@ -272,8 +277,8 @@ Codex commentary.
 
 A new compatible Full Native runtime negotiates `task-updates-v1`. A proven plain user suffix in
 the same native thread and turn can keep the existing physical ChatGPT response after the old
-Responses round has registered its tools and tool-use terminal and Codex returns the complete
-real results. Broker state separates accepted, delivered, and acknowledged revisions from driver
+local execution records identify its source and pending tools. Result batches may arrive partly;
+first-result and expected-type checks remain mandatory. Broker state separates accepted, delivered, and acknowledged revisions from driver
 generation and registry generation. A short owner transfer commits the registry, updates, new
 driver, and real result batch together; an unknown receipt recovers the same transfer.
 
@@ -284,81 +289,59 @@ physical response continues. Control arrives only in existing MCP replies or ACK
 It adds no composer message, Native tool, or extra browser observation barrier. Versioned browser
 and helper candidates preserve their captured task head through completion and final text.
 
-Once final output starts, the ordinary replacement path applies. Continuity-first work, initial
-manual requests awaiting Sent, and unproven or unsupported inputs retain their existing mode
-boundaries. Unresolved updates block compaction; accepted updates make the latest logical route
+Once final output locks, appends wait for normal continuation. Initial manual requests awaiting
+Sent and unproven or unsupported inputs retain their existing boundaries. Unresolved updates block compaction; accepted updates make the latest logical route
 the exact compaction source. See the [public protocol](native-tool-protocol.md#user-updates-during-tool-work)
 and [acceptance gate](release-validation.md#inflight-user-update-validation).
 
-### Continuity policy
+### Unified task continuity
 
-`chatgpt-web-continuity/` is a separate, opt-in namespace. Only trusted routing selects the policy.
-Full Native tools, Launcher, supported
-account/model/effort controls, and compatible helper features are required. Fresh Conversation
-Per Turn is rejected. Bigger Context applies only to non-continuity models. No additional internal release-verification flag is
-required to expose these models.
+Ordinary `chatgpt-web/` routes use one task mechanism for supported Full Native + Launcher
+Automatic and Zero Risk paths. Task/work, execution attempt/generation, source/plan and physical
+page are separate. Healthy compatible pages receive increments and remain usable across accepted
+compaction. Fresh selects pages for actual new logical sends without changing task identity.
+Bigger Context retains existing model/account, staged ACK/final-commit and Send-retry limits;
+Zero Risk retains its existing prohibition and manual-send boundary.
 
-The physical conversation key does not change at compaction. Execution keys and response rounds
-include a trusted scope and a separate history revision. Before first-page creation, the actual
-ordinary input passes environment, identity, version, input, and capacity checks, then a durable
-content-free registry records the thread and current ownership. Logical work identity is independent
-of page generation; completed or stopped receipts are checked before loss handling. A missing live
-owner is coordinated through durable admission records. A changed scope or damaged registration
-still fails before new work.
+The public history window is 1,000,000 estimated tokens with a 900,000 automatic-compaction
+threshold, including equivalent ordinary aliases. Lower client limits still apply. Canonical
+history usage remains distinct from actual browser/attachment, source storage, navigation and
+answer-cache budgets. No million-token browser input is implied.
 
-The compaction driver accepts the exact source's handoff, waits for physical settlement, retires
-old execution authority, and commits one checkpoint/revision while retaining the page. Accepted
-but uncommitted evidence remains bounded evidence, not continuation authority. Completed ordinary
-answers remain separate from control summaries. Zero Risk uses only an active response's real
-MCP control delivery; a response that already ended requires manual handoff without a new prompt.
+Ordinary unfinished recovery, committed-checkpoint continuation and uncommitted compaction
+share execution, legal-source and actual-plan admission. New pages receive current effective
+instructions, specifically bound checkpoints, uncovered required text/images and fresh on-demand
+entries. Complete eligible tool sources may exceed a full inline browser prompt; they still need
+real readable content within independent HTTP, snapshot and evidence limits. Digests and expired
+references cannot reconstruct content. Submitted summaries are never regenerated on retry.
 
-The 1,000,000/900,000-token catalog values govern canonical Codex history. Actual browser prompts
-still use the original transport checks. Healthy ready pages and their current logical heads
-use a 24-hour successful-work clock; queries and replay do not renew it. Five protected pages
-block a sixth allocation. Durable registration, checkpoint evidence, response caches, tool
-capabilities, and physical pages have separate limits and lifetimes; retained pages do not extend
-tool authority. Restart recovery uses separate durable evidence. See [the policy guide](session-continuity.md)
-for limits, failure handling, and release status.
+Durable project revocation precedes successor authorization. Running Broker, trusted result
+receiver, helper and Launcher must enforce the same generation at actual side-effect and commit
+boundaries. Revocation preserves pre-registered dispatched calls for trusted real settlement.
+Unknown Send/results cannot be guessed or repeated. A process handle is preserved with its wait
+path, not described as termination. Concurrent recovery shares one transfer and successor;
+accepted unacknowledged updates retain revision and require fresh-owner ACK. Stop races target
+the current work, and old final output/checkpoint/ACK cannot overwrite the successor.
 
-Continuity work identity uses native instruction identity, locally issued tool batches, and the
-accepted source/revision transaction. Completed history, client output echoes, and checkpoint
-prefix positions are not content proofs. Current payload conflicts still fail. An ordinary
-reconnect replays its original journal; a result retry selects its original local batch. Journal
-and batch comparison records share the 512-round bound, with the initial ordinary journal
-protected while its execution is retained. Reclaimed results cannot start new work.
+Physical cleanup is a separate fixed-target transaction with at most three automatic attempts.
+Closing or failed-cleanup documents count toward five real pages until precise destruction.
+A logically isolated old page can remain while a successor uses another free slot. No sixth page
+or unrelated Launcher shutdown is permitted. Pressure can reclaim safe idle pages early after
+preserving task facts; active, possibly-sent or unsettled work is not idle. Page TTL, source
+availability, answer replay and durable anti-replay evidence have independent lifetimes.
 
-Continuation input uses current native instruction ownership and the committed checkpoint relation.
-An explicitly owned new turn can omit its completed predecessor. The native instruction prefix of
-the current execution-history window remains part of the current payload, including developer and
-grouped AGENTS instructions whose turn metadata records their earlier creation. Unowned instructions
-mixed with completed output remain ambiguous and are rejected before submission. Source relationships and codec comparison data live in the bounded checkpoint commit; continuity
-does not recover source authority from the ordinary mode's continuation cache. Each request reuses its selected commit, and the start
-boundary checks ownership again before consuming its transition once. Historical edits are not sent
-back to the retained page. Active ordinary reconnects publish the current tool registry under the
-execution lock before replaying their journal; historical execution replay cannot update a later owner.
+Old independent mode names are rejected before admission with an ordinary replacement name.
+Managed exports use ordinary names; user TOML needs explicit replacement. Versioned migration
+preserves work, stop, Send, first results, checkpoints and retry budgets. Equivalent ordinary
+aliases and compatible Fresh changes do not create new work or mode-exit. Missing/corrupt evidence
+cannot be reset into fresh rights. Old incompatible running components need real retirement and
+settlement, or transfer is rejected. Non-Launcher, Browser-only, Luna, Think and upstream API
+paths retain existing behavior; local Web API Key authentication alone is not excluded.
 
-
-Recovery introduces sequential page generations while preserving the thread's monotonic history
-revision. A versioned, content-minimal journal records source lineages, work/attempt/snapshot
-identities, send/delivery-possible stages, first-result digests, stop/completion receipts, stable
-compaction targets, and continuation consumers. New side effects require durable admission first.
-No operation object or capability is restored from disk. A missing result must be supplied through
-the authenticated request or remain a specific recovery gap.
-
-A lost page can initialize from the current canonical request after old thread write authority and
-delivered calls settle. Authenticated Launcher creation/query/preparation transactions are unique
-across retries and versions; late receipts cannot take over a later generation. Healthy pages are
-preferred, and a transient inspect failure pauses submission rather than declaring permanent loss.
-A new explicit instruction can restart after stop or mode exit; stopped retries cannot revive.
-
-Automatic can finish an uncommitted lost compaction in a new read-only page, or commit an existing
-valid handoff once. Committed results only replay. Checkpoints keep durable call coverage and one
-consumer relationship; that consumer's later attempts reuse the relationship without consuming it
-again. Completed-source checkpoint-only requests replay the original answer. Zero Risk ended
-compaction still needs manual handoff, and all new ordinary Zero Risk prompts need actual sending.
-When source navigation is needed, the new page receives its bounded read-only entry only after the
-original full-source recovery admission. Navigation does not permit missing-source recovery or
-resending an unknown Send.
+The limited guarantee covers project operations and state commits; old ChatGPT platform-owned
+activity may continue. See [session continuity](session-continuity.md) for durable budgets, source
+reconstruction, manual handoff and failure meanings, and [release validation](release-validation.md)
+for actual evidence and outstanding real-platform checks.
 
 ## Local ChatGPT Limits
 

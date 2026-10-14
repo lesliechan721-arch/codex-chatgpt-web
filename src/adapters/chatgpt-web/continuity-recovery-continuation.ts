@@ -35,7 +35,7 @@ export function selectRecoveryContinuation(
   record: RecoveryThreadRecord,
   identity: { threadId?: string; turnId?: string },
 ): RecoveryContinuationSelection | undefined {
-  if (parsed._conversationPolicy !== "continuity-first") return undefined;
+  if (parsed._conversationPolicy !== "task") return undefined;
   if (!identity.threadId || !identity.turnId || record.thread !== digest(identity.threadId)
     || parsed._continuityScope !== record.scope) {
     throw continuityError("continuity_source_unproven", "The checkpoint request does not match its durable thread and scope.");

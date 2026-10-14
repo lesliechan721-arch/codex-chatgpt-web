@@ -69,7 +69,7 @@ if (zeroRisk) {
   config.browserHostDescriptorPath = join(root, "fake-launcher.json");
   config.zeroRiskProEnabled = true;
 }
-const model = zeroRisk ? "chatgpt-web-continuity/zero-risk-pro" : "chatgpt-web-continuity/gpt-5.6-sol";
+const model = zeroRisk ? "chatgpt-web/zero-risk-pro" : "chatgpt-web/gpt-5.6-sol";
 const bundled = spawnSync(codex, ["debug", "models", "--bundled"], { encoding: "utf8", timeout: 15_000 });
 assert.equal(bundled.status, 0, "bundled native model catalog");
 writeFileSync(join(root, "models.json"), JSON.stringify(augmentNativeModelCatalog(JSON.parse(bundled.stdout), config)));

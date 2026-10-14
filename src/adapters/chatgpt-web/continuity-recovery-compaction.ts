@@ -1,10 +1,13 @@
-import { createHash } from "node:crypto";
+import { observeRetainedCompaction } from "./continuity-compaction";
+import { createHash, randomBytes } from "node:crypto";
+import { estimateTokens } from "../../lib/token-estimate";
 import type { CodexMessage, CodexParsedRequest, CodexProviderConfig } from "../../types";
 import { buildCompactV1Output, COMPACT_PROMPT, extractCompactUserMessages } from "../../responses/compaction";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { assertLauncherContinuityCapacity, inspectLauncherContinuityConversation,
   markLauncherContinuitySendPossible, readLauncherContinuityInstance, retireLauncherContinuityWriter } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
+import { canonicalJson } from "./canonical-json";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { canonicalizeCompactionHandoff, existingStructuredCompactionRun, MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   runStructuredCompactionOnce, withCompactionAbort } from "./compaction-handoff";
@@ -15,18 +18,23 @@ import { chatGptConversationKey } from "./conversation-key";
 import { continuityError } from "./continuity-errors";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import type { PreparedContinuityRequest } from "./continuity-request";
-import { evictOptionalRecoveryResults, recoveryCanonicalResults, recoveryContext, recoveryDigest, recoveryFinalReceipt, recoveryIdentity, recoveryResultDigest } from "./continuity-recovery-runtime";
+import { beginRecoveryAcquisition, beginRecoverySend, evictOptionalRecoveryResults, recoveryCanonicalResults, recoveryContext, recoveryDigest, recoveryFinalReceipt, recoveryIdentity, recoveryResultDigest, settleRecoveryKnownUnsent, settleRecoverySend, type RuntimeRecoverySendReference } from "./continuity-recovery-runtime";
 import { continuityProcessInstance, type RecoveryCheckpointRecord, type RecoveryCompactionTarget,
   MAX_CONTINUITY_RECOVERY_ITEM_BYTES, type ContinuityRecoveryStore, type RecoveryThreadRecord, type RecoveryWorkRecord } from "./continuity-recovery-store";
 import { chatGptCurrentInstructionIndex, extractChatGptCompactionSourceRevision, extractChatGptCompactV1SourceRevision,
-  extractChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
+  extractChatGptTurnIdentity, continuityCheckpointSiblings, continuityCheckpointSiblingGroup, continuityCheckpointSiblingProof, CONTINUITY_CHECKPOINT_SIBLING_PROOF, type ChatGptTurnUserRevision } from "./environment";
 import type { ChatGptWebCapabilities } from "./model";
 import { structuredCompactionHandoffInstruction } from "./native-compaction-control";
-import { CompactionSourceCoverage, compactionAvailableTokens, registerCompactionSource } from "./compaction-context";
+import { CompactionSourceCoverage, assertCompactionReadable, compactionAvailableTokens, compactionSourceInstruction, compactionSourcePageCost, previewRetainedCompactionSource, registerCompactionSource } from "./compaction-context";
 import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
-import { compileChatGptWebPrompt, type CompiledChatGptWebPrompt } from "./prompt";
+import type { CompiledChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type TurnBrokerOwner } from "./turn-broker";
-import { assertContinuityToolResultReplayEvidence, chatGptContinuityInstructionPayloadDigest, chatGptTurnSessions } from "./turn-execution";
+import { assertContinuityToolResultReplayEvidence, chatGptContinuityInstructionPayloadDigest, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptTurnRuntime } from "./turn-execution";
+
+export type StartManualRecoveryCompaction = (options: {
+  traceId: string; sourceSnapshot: ContextSnapshot; deadlineAt: number;
+  verifyCompleteSource: (snapshot: ContextSnapshot) => void; signal: AbortSignal;
+}) => ChatGptTurnRuntime;
 
 interface CompactionSelection {
   target: RecoveryCompactionTarget;
@@ -35,11 +43,13 @@ interface CompactionSelection {
   checkpoint?: RecoveryCheckpointRecord;
 }
 interface RecoveryCompactionPlan extends CompactionSelection {
-  mode: "replay" | "recover";
+  mode: "replay" | "recover" | "observe";
+  observedRun?: Promise<string>;
   input?: CodexParsedRequest;
   sourceSnapshot?: ContextSnapshot;
   summary?: string;
   acceptedHandoff?: string;
+  acceptedHandoffIdentity?: import("./continuity-contract").ContinuityRecoveryIdentity;
   sourceExecutionKey?: string;
   sourceBinding?: ContinuityBinding;
   preserveFinalResponse: boolean;
@@ -55,6 +65,7 @@ interface HealthyCompactionObserver {
   transactionVersion: number;
 }
 const healthyObservers = new WeakMap<PreparedContinuityRequest, HealthyCompactionObserver>();
+const healthySends = new WeakMap<PreparedContinuityRequest, RuntimeRecoverySendReference>();
 
 function retainHealthyObserver(prepared: PreparedContinuityRequest, work: RecoveryWorkRecord): void {
   const attempt = work.attempts.at(-1)!;
@@ -83,14 +94,29 @@ function sourcePayloadRepresentation(digest: string): string {
   return continuityDigest(["continuity-compaction-source-payload", digest]);
 }
 function registerTarget(store: ContinuityRecoveryStore, directory: string, record: RecoveryThreadRecord,
-  input: Parameters<ContinuityRecoveryStore["registerCompactionTarget"]>[2], retainRequiredInput?: () => void): RecoveryThreadRecord {
-  try { return store.registerCompactionTarget(record.thread, { scope: record.scope, expectedVersion: record.version }, input); }
+  input: Parameters<ContinuityRecoveryStore["registerCompactionTarget"]>[2], retainRequiredInput?: () => void,
+  initialSiblingProof = false): RecoveryThreadRecord {
+  const register = (current: RecoveryThreadRecord) => {
+    if (initialSiblingProof) {
+      const existing = Object.values(current.compactionTargets).find(target => target.sourceLogicalWorkId === input.sourceLogicalWorkId
+        && target.acceptedTaskRevision === input.acceptedTaskRevision && target.sourceHistoryRevision === input.sourceHistoryRevision
+        && target.sourceToolBatchHeadSequence === input.sourceToolBatchHeadSequence);
+      // Capacity reconciliation may have observed a competing first target. The
+      // store's representation-union API must not authenticate another sibling set.
+      if (existing && (existing.sourceIdentity !== input.sourceIdentity
+        || input.representationDigests?.some(value => !existing.representationDigests.includes(value)))) {
+        throw continuityError("continuity_source_unproven", "The first compaction sibling proof was already fixed by another request.");
+      }
+    }
+    return store.registerCompactionTarget(current.thread, { scope: current.scope, expectedVersion: current.version }, input);
+  };
+  try { return register(record); }
   catch (error) {
     if ((error as { code?: string })?.code !== "continuity_resource_capacity") throw error;
     retainRequiredInput?.();
     evictOptionalRecoveryResults(directory);
     const current = store.get(record.thread)!;
-    return store.registerCompactionTarget(current.thread, { scope: current.scope, expectedVersion: current.version }, input);
+    return register(current);
   }
 }
 function currentCompactionResults(parsed: CodexParsedRequest): Record<string, unknown>[] {
@@ -99,6 +125,15 @@ function currentCompactionResults(parsed: CodexParsedRequest): Record<string, un
 }
 function sourcePayloadDigest(parsed: CodexParsedRequest, source: RecoveryWorkRecord): string {
   return chatGptContinuityInstructionPayloadDigest(parsed, source.instructionPrevious, source.allowRetainedSourceFallback ?? false);
+}
+function assertEndedManualResults(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: RecoveryWorkRecord): void {
+  if (!isChatGptWebZeroRiskBackendModel(parsed.modelId) || source.state !== "completed") return;
+  for (const result of currentCompactionResults(parsed)) {
+    const call = record.calls[String(result.call_id)];
+    if (!call || call.workLineageId !== source.workLineageId || call.state !== "settled" || call.expectedResultType !== result.type) {
+      throw continuityError("continuity_source_unproven", "The manual checkpoint contains a result outside its accepted source calls.");
+    }
+  }
 }
 function assertSourcePayload(parsed: CodexParsedRequest, source: RecoveryWorkRecord, target?: RecoveryCompactionTarget): void {
   const payload = sourcePayloadDigest(parsed, source);
@@ -152,6 +187,17 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
     throw continuityError("continuity_source_unproven", "The compaction target has no accepted source work.");
   }
   assertSourcePayload(parsed, source, target);
+  for (const value of (parsed._rawBody as { input: unknown[] }).input) {
+    const proof = continuityCheckpointSiblingProof(parsed, value);
+    if (proof?.identity && target.representationDigests.includes(proof.identity)
+      && !target.representationDigests.includes(proof.representation)) {
+      throw continuityError("continuity_source_unproven", "The compaction sibling conflicts with its first accepted source.");
+    }
+  }
+  const siblings = continuityCheckpointSiblings(parsed, source.instructionPrevious);
+  if (siblings.length && !target.representationDigests.includes(continuityCheckpointSiblingGroup(siblings))) {
+    throw continuityError("continuity_source_unproven", "The compaction sibling group differs from its first accepted source.");
+  }
   const checkpointDigest = continuityCheckpoint(parsed).digest;
   const covered = new Set(Object.values(record.checkpoints).find(checkpoint => checkpoint.summaryDigest === checkpointDigest
     && checkpoint.targetHistoryRevision === target.sourceHistoryRevision && checkpoint.workLineageId === target.workLineageId)?.coveredCallIds ?? []);
@@ -218,14 +264,13 @@ function compactionPayloadDigest(parsed: CodexParsedRequest, target: RecoveryCom
   return continuityDigest({ compactionTargetId: target.compactionTargetId, control: compactPrompt(parsed) });
 }
 
-/** Compile the entire canonical input. Ordinary compaction's history trimming is not recovery. */
+/** Admit the actual cold compaction entry. Source bytes are validated separately. */
 export function compileRecoveryCompactionInput(parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities,
-  transaction: { token: string; handoffId: string }): CompiledChatGptWebPrompt {
-  const input: CodexParsedRequest = { ...parsed, _compactionRequest: false,
-    options: { ...parsed.options, outputFormat: undefined }, context: { ...parsed.context, tools: [] } };
-  const compiled = compileChatGptWebPrompt(input, { ...capabilities, localToolsEnabled: false });
-  compiled.text += `\n\n${structuredCompactionHandoffInstruction(transaction, compactPrompt(parsed))}`;
-  assertContinuityCompiledInput(compiled, input, capabilities);
+  transaction: { token: string; handoffId: string }, snapshot = createContextSnapshot(parsed)): CompiledChatGptWebPrompt {
+  const instruction = structuredCompactionHandoffInstruction(transaction, compactPrompt(parsed));
+  const compiled = { text: compactionSourceInstruction(snapshot, instruction, compactionAvailableTokens(parsed, capabilities, 0)), images: [] };
+  assertContinuityCompiledInput(compiled, { ...parsed, context: { ...parsed.context, messages: [] } }, capabilities,
+    (transaction.token.length + transaction.handoffId.length + 42) * 2);
   return compiled;
 }
 
@@ -234,7 +279,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
   bindings: ContinuityBindings, record: RecoveryThreadRecord | undefined, descriptor: string,
   abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
-  verifyContextCapability?: () => Promise<void>): Promise<PreparedContinuityRequest | undefined> {
+  verifyContextCapability?: () => Promise<void>, existingTargetId?: string): Promise<PreparedContinuityRequest | undefined> {
   if (!parsed._compactionRequest) return undefined;
   if (!record) throw continuityError("continuity_source_unproven", "A standalone compaction cannot activate a continuity thread.");
   if (record.legacyUnproven) throw continuityError("continuity_legacy_unproven");
@@ -244,9 +289,12 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   record = store.get(record.thread)!;
   let retainedInput: CodexParsedRequest | undefined;
   let selection = selectRecoveryCompactionTarget(parsed, record);
+  // A stale preview may observe its original target, but cannot admit a new writer.
+  if (existingTargetId && selection?.target.compactionTargetId !== existingTargetId) return undefined;
   if (!selection) {
     const source = selectSource(parsed, record);
     assertSourcePayload(parsed, source);
+    assertEndedManualResults(parsed, record, source);
     const lineage = record.lineages[source.workLineageId];
     const revisions = sourceRevisions(parsed, record);
     if (!lineage || revisions.length !== 1 || revisions[0] !== record.historyRevision) {
@@ -270,11 +318,13 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
       return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
         descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     }
+    const siblings = continuityCheckpointSiblings(parsed, source.instructionPrevious);
     record = registerTarget(store, bindings.registrations.directory, record, {
       sourceLogicalWorkId: source.logicalWorkId, sourceIdentity: sourceIdentity(parsed, sourceRevision),
       acceptedTaskRevision: source.acceptedTaskRevision, sourceHistoryRevision: revisions[0],
       sourceToolBatchHeadSequence: sequence, representationDigests: [continuitySourceRepresentationDigest(parsed, sourceRevision),
-        sourcePayloadRepresentation(source.workPayloadDigest)],
+        sourcePayloadRepresentation(source.workPayloadDigest), CONTINUITY_CHECKPOINT_SIBLING_PROOF,
+        continuityCheckpointSiblingGroup(siblings), ...siblings.flatMap(proof => proof.identity ? [proof.identity, proof.representation] : [proof.representation])],
       checkpointBytes: MAX_CONTINUITY_RECOVERY_ITEM_BYTES,
     }, () => {
       const checkpointDigest = continuityCheckpoint(parsed).digest;
@@ -282,10 +332,11 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
         && value.targetHistoryRevision === revisions[0] && value.workLineageId === source.workLineageId);
       retainedInput = recoveryContext(parsed, { directory: bindings.registrations.directory,
         thread: record!.thread, logicalWorkId: source.logicalWorkId, attempt: source.attempts.at(-1)!.attempt }, covered?.commitId);
-    });
+    }, true);
     selection = selectRecoveryCompactionTarget(parsed, record);
     if (!selection) throw continuityError("continuity_source_unproven");
   }
+  assertEndedManualResults(parsed, record, selection.source);
   requestTargets.set(parsed, selection);
   parsed._continuityHistoryRevision = selection.target.sourceHistoryRevision;
   parsed._continuityEpoch = record.epoch;
@@ -306,7 +357,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     const prepared: PreparedContinuityRequest = { bindings, binding, descriptor, executionKey,
       conversationKey: chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
       revision: selection.target.sourceHistoryRevision };
-    preparedPlans.set(prepared, { ...selection, mode: "replay", summary,
+    preparedPlans.set(prepared, { ...selection, mode: "replay", summary, observedRun: cached,
       preserveFinalResponse: Boolean(selection.checkpoint.ordinaryFinalReceiptId) });
     return prepared;
   }
@@ -314,17 +365,63 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     throw continuityError("continuity_stopped");
   }
   // A network observer attaches to the existing transaction. It never retires that writer.
-  if (existingStructuredCompactionRun<string>(executionKey)) {
+  const observedRun = existingStructuredCompactionRun<string>(executionKey, compactionPayloadDigest(parsed, selection.target), {
+    ownerKey: `${namespace}:continuity-recovery:${record.thread}`,
+    traceIds: [createHash("sha256").update(`${executionKey}:recovery-handoff`).digest("hex").slice(0, 12)],
+    nativeThreadId: identity.threadId, nativeTurnId: identity.turnId,
+  });
+  if (observedRun) {
     const binding = observed ?? bindings.installRecovered(record, executionKey, continuityCheckpoint(parsed).digest, identity.turnId);
     const prepared: PreparedContinuityRequest = { bindings, binding, descriptor, executionKey,
       conversationKey: binding.conversation?.key ?? chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
       revision: selection.target.sourceHistoryRevision };
-    preparedPlans.set(prepared, { ...selection, mode: "recover", preserveFinalResponse: selection.source.state === "completed" });
+    preparedPlans.set(prepared, { ...selection, mode: "observe", observedRun, preserveFinalResponse: selection.source.state === "completed" });
+    return prepared;
+  }
+  if (existingTargetId) {
+    const retainedKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+    if (!observed?.compactionKey || observed.compactionKey !== retainedKey) return undefined;
+    const prepared: PreparedContinuityRequest = { bindings, binding: observed, descriptor, executionKey: retainedKey,
+      conversationKey: observed.conversation?.key ?? chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
+      revision: selection.target.sourceHistoryRevision, sourceExecutionKey: observed.executionKey };
+    const retainedRun = observeRetainedCompaction(parsed, prepared, namespace);
+    if (!retainedRun) return undefined;
+    // A preflight observer can disconnect before runTurn attaches its error handler.
+    void retainedRun.catch(() => {});
+    preparedPlans.set(prepared, { ...selection, mode: "observe", observedRun: retainedRun,
+      preserveFinalResponse: selection.source.state === "completed" });
     return prepared;
   }
   const healthy = observed && ["running", "ready", "compacting"].includes(observed.state)
     && ["running", "ready", "compacting"].includes(record.state) && observed.lease && record.owner.id === bindings.owner;
-  if (healthy) return undefined;
+  const endedManual = isChatGptWebZeroRiskBackendModel(parsed.modelId) && selection.source.state === "completed";
+  // Public compact is the explicit manual request. An ended source needs a new
+  // control-only owner; an active source keeps its original handoff boundary.
+  if (healthy && !endedManual) {
+    const source = observed.executionKey ? chatGptTurnSessions.find(observed.executionKey) : undefined;
+    const coverage = source?.runtime.compactionSourceCoverage;
+    if (!source || !coverage) return undefined;
+    await source.runtime.syncContextUsage?.();
+    // A concurrent commit can reclaim the source coverage during the usage wait.
+    // Let the caller revalidate the original identity before reading that old source.
+    const afterUsage = store.get(record.thread);
+    if (afterUsage?.historyRevision !== record.historyRevision || afterUsage.currentWorkId !== record.currentWorkId) return undefined;
+    const preview = previewRetainedCompactionSource(parsed, source);
+    const snapshot = preview.snapshot;
+    const pageTokens = Math.max(observed.retainedPageTokens ?? 0, preview.coverage.pageTokenReserve());
+    const available = compactionAvailableTokens(parsed, capabilities, pageTokens);
+    try {
+      const control = structuredCompactionHandoffInstruction({ token: `control_${"0".repeat(32)}`,
+        handoffId: `handoff_${"0".repeat(32)}` }, compactPrompt(parsed));
+      const instruction = compactionSourceInstruction(snapshot, control, available);
+      await assertCompactionReadable(snapshot, available - Math.max(8_192, estimateTokens(instruction)));
+      return undefined;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "continuity_input_limit") throw error;
+      // An otherwise healthy page may fit ordinary work but lack the independent
+      // checkpoint reading and summary allowance. Admit the actual cold plan below.
+    }
+  }
   await assertExecutionCompatible?.();
   abortSignal?.throwIfAborted();
   const afterCompatibility = store.get(record.thread)!;
@@ -332,13 +429,23 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
       descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
   }
-  if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) throw continuityError("continuity_manual_handoff_required");
+  if (isChatGptWebZeroRiskBackendModel(parsed.modelId) && !endedManual) throw continuityError("continuity_manual_handoff_required");
   const sourceAttempt = selection.source.attempts.at(-1);
   if (!sourceAttempt) throw continuityError("continuity_source_unproven");
   const accepted = observed?.acceptedHandoff;
   const acceptedHandoff = accepted && accepted.sourceRevision === selection.target.sourceHistoryRevision
     && (accepted.sourceExecutionKey === observed?.executionKey || accepted.key === executionKey)
     ? canonicalizeCompactionHandoff(parsed, accepted.summary) : undefined;
+  const acceptedHandoffIdentity = acceptedHandoff ? accepted?.lease.recovery : undefined;
+  if (!acceptedHandoff && previousCompaction?.attempts.at(-1)?.stage === "send-possible") {
+    throw continuityError("continuity_execution_unsettled", "The original compaction Send has no verified submission result.");
+  }
+  if (acceptedHandoff && (!acceptedHandoffIdentity || acceptedHandoffIdentity.logicalWorkId !== previousCompaction?.logicalWorkId
+    || acceptedHandoffIdentity.attempt !== previousCompaction.attempts.at(-1)!.attempt
+    || acceptedHandoffIdentity.epoch !== previousCompaction.attempts.at(-1)!.epoch
+    || acceptedHandoffIdentity.snapshotVersion !== previousCompaction.attempts.at(-1)!.snapshotVersion)) {
+    throw continuityError("continuity_source_unproven", "The accepted handoff has no matching original compaction attempt.");
+  }
   const checkpointDigest = continuityCheckpoint(parsed).digest;
   const coveredCheckpoint = Object.values(record.checkpoints).find(checkpoint => checkpoint.summaryDigest === checkpointDigest
     && checkpoint.targetHistoryRevision === selection!.target.sourceHistoryRevision
@@ -372,9 +479,14 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
       CompactionSourceCoverage.assertRecordedSource(sourceSnapshot, coverage.map(entry => entry.metadata), selection.target.sourceHistoryRevision);
     }
   }
-  // Check the complete control envelope before acquiring a new page or admission transaction.
-  if (!acceptedHandoff) compileRecoveryCompactionInput(input, capabilities,
-    { token: `control_${"0".repeat(32)}`, handoffId: `handoff_${"0".repeat(32)}` });
+  // Check the selected entry and individual source reads without charging unread
+  // task history as browser input. No credentials or page are created here.
+  if (!acceptedHandoff) {
+    const compiled = compileRecoveryCompactionInput(input, capabilities,
+      { token: `control_${"0".repeat(32)}`, handoffId: `handoff_${"0".repeat(32)}` }, sourceSnapshot);
+    await assertCompactionReadable(sourceSnapshot!, compactionAvailableTokens(input, capabilities, 0)
+      - estimateTokens(compiled.text));
+  }
   record = store.get(record.thread)!;
   if (!acceptedHandoff) {
     await verifyContextCapability?.();
@@ -387,7 +499,16 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   }
   // This coordinator verifies the target thread's retired authority, not merely a live PID.
   const { retireRecoveryWriter } = await import("./continuity-recovery-runtime");
-  record = await retireRecoveryWriter(bindings, record, descriptor);
+  const currentCompaction = record.works[`compaction:${selection.target.compactionTargetId}`];
+  const currentAttempt = currentCompaction?.attempts.at(-1);
+  const waitingAcquisition = currentCompaction?.logicalWorkId === record.currentWorkId
+    && record.owner.id === bindings.owner && currentAttempt?.stage === "prepared" && !currentAttempt.writerRetired
+    && currentAttempt.acquisitionEvidence?.status === "not-acquired" && Boolean(currentAttempt.acquisitionEvidence.receiptId);
+  if (waitingAcquisition && currentAttempt!.acquisitionEvidence!.identityDigest
+    !== recoveryDigest(canonicalJson(recoveryIdentity(record, store.installationId())))) {
+    throw continuityError("continuity_source_unproven", "The known unacquired retry no longer matches its original reservation.");
+  }
+  if (!waitingAcquisition) record = await retireRecoveryWriter(bindings, record, descriptor);
   const shadow = record.works[`compaction:${selection.target.compactionTargetId}`];
   if (shadow?.activationState === "shadow") {
     const attempt = shadow.attempts.at(-1)!;
@@ -401,7 +522,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   const prepared: PreparedContinuityRequest = { bindings, binding, descriptor, executionKey,
     conversationKey: chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
     revision: selection.target.sourceHistoryRevision, sourceExecutionKey: observed?.executionKey };
-  preparedPlans.set(prepared, { ...selection, mode: "recover", input, sourceSnapshot, acceptedHandoff,
+  preparedPlans.set(prepared, { ...selection, mode: "recover", input, sourceSnapshot, acceptedHandoff, acceptedHandoffIdentity,
     sourceExecutionKey: observed?.executionKey, sourceBinding: observed,
     preserveFinalResponse: selection.source.state === "completed" });
   return prepared;
@@ -453,7 +574,15 @@ function representations(parsed: CodexParsedRequest, selection: CompactionSelect
 export function commitRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
   selection: CompactionSelection, logicalWorkId: string, summary: string, preserveFinalResponse: boolean): RecoveryCheckpointRecord {
   assertHealthyRecoveryCompactionAuthority(prepared);
-  if (prepared.recovery) healthyRecoveryRecord(prepared);
+  const acceptedPlan = preparedPlans.get(prepared);
+  if (prepared.recovery && acceptedPlan?.acceptedHandoffIdentity
+    && sameContinuityRecoveryIdentity(prepared.recovery, acceptedPlan.acceptedHandoffIdentity)
+    && acceptedPlan.acceptedHandoff === summary) {
+    const current = prepared.bindings.recoveryStore.get(prepared.binding.thread)!;
+    if (!sameContinuityRecoveryIdentity(prepared.recovery, recoveryIdentity(current, prepared.bindings.recoveryStore.installationId()))) {
+      throw continuityError("continuity_source_unproven", "The accepted handoff cannot settle a different compaction attempt.");
+    }
+  } else if (prepared.recovery) healthyRecoveryRecord(prepared);
   const store = prepared.bindings.recoveryStore;
   let record = store.get(prepared.binding.thread)!;
   const work = record.works[logicalWorkId];
@@ -485,7 +614,8 @@ export function commitRecoveryCompaction(parsed: CodexParsedRequest, prepared: P
   return record.checkpoints[commitId]!;
 }
 
-export function beginHealthyRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest): string | undefined {
+export function beginHealthyRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
+  timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS): string | undefined {
   const selection = requestTargets.get(parsed);
   if (!selection) return undefined;
   const logicalWorkId = `compaction:${selection.target.compactionTargetId}`;
@@ -501,9 +631,12 @@ export function beginHealthyRecoveryCompaction(parsed: CodexParsedRequest, prepa
     workPayloadDigest: compactionPayloadDigest(parsed, selection.target), snapshotDigest: continuityDigest({ control: compactPrompt(parsed) }),
     purpose: "compaction", compactionTargetId: selection.target.compactionTargetId, createPage: false, activate: false,
     dispatchProtocolComplete: true });
-  const controlled = store.markAttempt(admitted.thread, { scope: admitted.scope, expectedVersion: admitted.version }, {
+  let controlled = store.markAttempt(admitted.thread, { scope: admitted.scope, expectedVersion: admitted.version }, {
     logicalWorkId, attempt: admitted.works[logicalWorkId]!.attempts.at(-1)!.attempt,
     stage: isChatGptWebZeroRiskBackendModel(parsed.modelId) ? "send-possible" : "prepared", launcherInstance: sourceInstance });
+  const budget = controlled.works[logicalWorkId]!.retryBudget!;
+  controlled = store.setCompactionDeadline(controlled.thread, { scope: controlled.scope, expectedVersion: controlled.version },
+    logicalWorkId, budget.deadlineAt ?? budget.startedAt + Math.min(timeoutMs, MAX_COMPACTION_HANDOFF_TIMEOUT_MS));
   retainHealthyObserver(prepared, controlled.works[logicalWorkId]!);
   return logicalWorkId;
 }
@@ -586,15 +719,19 @@ export function acceptHealthyRecoveryCompactionLease(prepared: PreparedContinuit
 }
 export async function markHealthyRecoveryCompactionSend(prepared: PreparedContinuityRequest): Promise<void> {
   const record = healthyRecoveryRecord(prepared);
-  prepared.bindings.recoveryStore.markAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, {
-    logicalWorkId: prepared.recovery!.logicalWorkId, attempt: prepared.recovery!.attempt, stage: "send-possible" });
-  await markLauncherContinuitySendPossible(prepared.descriptor, prepared.recovery!);
+  healthySends.set(prepared, beginRecoverySend({ directory: prepared.bindings.registrations.directory,
+    thread: record.thread, logicalWorkId: prepared.recovery!.logicalWorkId, attempt: prepared.recovery!.attempt,
+    ownerId: record.owner.id }, prepared.recovery!));
+  await markLauncherContinuitySendPossible(prepared.descriptor, prepared.recovery!, prepared.bindings.registrations.directory);
   healthyRecoveryRecord(prepared);
 }
-export function markHealthyRecoveryCompactionAccepted(prepared: PreparedContinuityRequest): void {
+export function markHealthyRecoveryCompactionAccepted(prepared: PreparedContinuityRequest): boolean {
+  const reference = healthySends.get(prepared);
+  if (reference && !settleRecoverySend(reference).currentWriter) return false;
   const record = healthyRecoveryRecord(prepared);
-  prepared.bindings.recoveryStore.markAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, {
-    logicalWorkId: prepared.recovery!.logicalWorkId, attempt: prepared.recovery!.attempt, stage: "accepted" });
+  if (!reference) prepared.bindings.recoveryStore.markAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, {
+      logicalWorkId: prepared.recovery!.logicalWorkId, attempt: prepared.recovery!.attempt, stage: "accepted" });
+  return true;
 }
 export async function failHealthyRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest): Promise<void> {
   const selection = requestTargets.get(parsed);
@@ -611,7 +748,7 @@ export async function failHealthyRecoveryCompaction(parsed: CodexParsedRequest, 
     || prepared.recovery.epoch !== attempt.epoch || prepared.recovery.snapshotVersion !== attempt.snapshotVersion)) return;
   let retired = work.activationState === "shadow" || attempt.stage === "prepared";
   if (!retired && prepared.recovery) {
-    try { retired = (await retireLauncherContinuityWriter(prepared.descriptor, prepared.recovery)).writerRetired; }
+    try { retired = (await retireLauncherContinuityWriter(prepared.descriptor, prepared.recovery, prepared.bindings.registrations.directory)).writerRetired; }
     catch { /* An unknown physical summary writer remains unknown. */ }
   }
   record = store.get(record.thread)!;
@@ -635,14 +772,25 @@ function checkAttempt(prepared: PreparedContinuityRequest, workId: string, attem
 export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
   worker: ChatGptBrowserWorker, owner: TurnBrokerOwner, capabilities: ChatGptWebCapabilities, namespace: string,
   configuredTimeout?: number, onProgress?: () => void, onRecovered?: () => void,
-  verifyContextCapability?: () => Promise<void>): Promise<string> {
+  verifyContextCapability?: () => Promise<void>, startManual?: StartManualRecoveryCompaction): Promise<string> {
   const plan = preparedPlans.get(prepared);
   if (!plan) throw continuityError("continuity_source_unproven");
+  if (plan.mode === "observe") {
+    // Keep the actual promise: cache eviction must never turn this observer into a writer.
+    assertRecoveryCompactionNotStopped(parsed, prepared);
+    const result = await plan.observedRun!.catch(error => failRecoveryCompactionObserver(parsed, prepared, plan, error));
+    assertRecoveryCompactionNotStopped(parsed, prepared);
+    await assertRecoveryCompactionResult(prepared);
+    const record = prepared.bindings.recoveryStore.get(prepared.binding.thread)!;
+    const checkpoint = Object.values(record.checkpoints).find(value => value.compactionTargetId === plan.target.compactionTargetId)!;
+    if (continuityDigest(result) !== checkpoint.summaryDigest) throw continuityError("continuity_replay_unavailable");
+    return result;
+  }
   if (plan.mode === "replay") {
     await assertRecoveryCompactionResult(prepared);
     let result = plan.summary;
     if (!result) {
-      try { result = await existingStructuredCompactionRun<string>(prepared.executionKey); }
+      try { result = await plan.observedRun; }
       catch { throw continuityError("continuity_replay_unavailable", "The committed compaction has no successful cached result body."); }
     }
     if (!result || continuityDigest(result) !== plan.checkpoint!.summaryDigest) {
@@ -656,7 +804,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       && prepared.binding.epoch === record.epoch) {
       // A durable commit may outlive local publication. Repair only its still-current head.
       prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, plan.checkpoint!, result,
-        plan.sourceRevision, representations(parsed, plan, result), plan.preserveFinalResponse);
+          plan.sourceRevision, representations(parsed, plan, result), plan.preserveFinalResponse, plan.sourceExecutionKey);
     }
     return result;
   }
@@ -670,11 +818,15 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
   }, async (operatorSignal, retainOwnershipUntil) => {
     const timeoutMs = Math.min(configuredTimeout ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The recovered compaction exceeded its bounded deadline.")), timeoutMs);
+    let timer = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The recovered compaction exceeded its bounded deadline.")), timeoutMs);
     timer.unref?.();
     const signal = AbortSignal.any([operatorSignal, deadline.signal]);
     const browserAbort = new AbortController();
-    const abortBrowser = (): void => browserAbort.abort(signal.reason);
+    let manualRuntime: ChatGptTurnRuntime | undefined;
+    const abortBrowser = (): void => {
+      browserAbort.abort(signal.reason);
+      manualRuntime?.cancel(signal.reason instanceof Error ? signal.reason : undefined);
+    };
     signal.addEventListener("abort", abortBrowser, { once: true });
     const store = prepared.bindings.recoveryStore;
     let transaction: Awaited<ReturnType<TurnBroker["beginCompactionTransaction"]>> | undefined;
@@ -683,35 +835,41 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
     let logicalWorkId: string | undefined;
     let attemptNumber: number | undefined;
     let cleanupIdentity: ReturnType<typeof recoveryIdentity> | undefined;
+    let sendReference: RuntimeRecoverySendReference | undefined;
     try {
       signal.throwIfAborted();
       const oldRecord = store.get(prepared.binding.thread)!;
       logicalWorkId = `compaction:${plan.target.compactionTargetId}`;
-      let compiled: CompiledChatGptWebPrompt | undefined;
-      if (!plan.acceptedHandoff) {
-        await withCompactionAbort(Promise.resolve().then(() => verifyContextCapability?.()), signal);
-        signal.throwIfAborted();
-        const pendingTransaction = owner.beginCompactionTransaction(traceId, timeoutMs);
-        void pendingTransaction.then(lateTransaction => {
-          if (signal.aborted && transaction !== lateTransaction) owner.abortCompactionTransaction(lateTransaction.token);
-        }, () => {});
-        transaction = await withCompactionAbort(pendingTransaction, signal);
-        // Preserve the original full-history admission even though actual publication uses
-        // a bounded read-only entry. recoveryContext already verified the complete lineage.
-        compileRecoveryCompactionInput(plan.input!, capabilities, transaction);
-        const registered = await registerCompactionSource(owner, {
-          snapshot: plan.sourceSnapshot!, contract: "native", transactionToken: transaction.token,
-          handoffId: transaction.handoffId, historyRevision: plan.target.sourceHistoryRevision,
-          ownerGeneration: `${prepared.bindings.owner}:${oldRecord.epoch}:${oldRecord.version}`,
-          expiresAt: Date.now() + timeoutMs,
-          availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
-        }, structuredCompactionHandoffInstruction(transaction, compactPrompt(parsed)));
-        sourceToken = registered.token;
-        compiled = { text: registered.instruction, images: [] };
-        assertContinuityCompiledInput(compiled, { ...plan.input!, context: { ...plan.input!.context, messages: [] } }, capabilities);
+      if (plan.acceptedHandoff) {
+        // This summary was accepted under the original capability. Complete that
+        // attempt before considering a successor; never rebind its credentials.
+        prepared.recovery = plan.acceptedHandoffIdentity;
+        prepared.binding = prepared.bindings.installRecovered(oldRecord, prepared.executionKey,
+          continuityCheckpoint(parsed).digest, identity.turnId);
+        prepared.binding.conversation = { key: prepared.conversationKey, descriptor: prepared.descriptor };
+        const checkpoint = commitRecoveryCompaction(parsed, prepared, plan, logicalWorkId,
+          plan.acceptedHandoff, plan.preserveFinalResponse);
+        prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, checkpoint, plan.acceptedHandoff,
+          plan.sourceRevision, representations(parsed, plan, plan.acceptedHandoff), plan.preserveFinalResponse, plan.sourceExecutionKey);
+        return plan.acceptedHandoff;
       }
-      const snapshotDigest = continuityDigest(compiled ?? { summaryDigest: continuityDigest(plan.acceptedHandoff!) });
+      const priorBudget = oldRecord.works[logicalWorkId]?.retryBudget;
+      if (priorBudget?.deadlineAt !== undefined && Date.now() >= priorBudget.deadlineAt) {
+        throw continuityError("continuity_retry_exhausted", "The original compaction deadline has expired.");
+      }
+      // Physical capacity waiting does not allocate or fail a business attempt.
+      await assertLauncherContinuityCapacity(prepared.descriptor);
+      signal.throwIfAborted();
+      if (store.get(oldRecord.thread)?.version !== oldRecord.version) throw continuityError("continuity_source_unproven");
+      let compiled: CompiledChatGptWebPrompt | undefined;
+      await withCompactionAbort(Promise.resolve().then(() => verifyContextCapability?.()), signal);
+      signal.throwIfAborted();
+      const snapshotDigest = continuityDigest({ control: compactPrompt(parsed), sources: plan.sourceSnapshot!.targets.map(target => ({
+        kind: target.kind, role: target.original_role, callId: target.call_id, digest: target.content_digest,
+      })) });
       const existing = oldRecord.works[logicalWorkId];
+      if (existing?.attempts.at(-1)?.acquisitionEvidence?.status === "not-acquired"
+        && existing.attempts.at(-1)!.snapshotDigest !== snapshotDigest) throw continuityError("continuity_source_unproven");
       let record: RecoveryThreadRecord;
       if (existing && existing.state !== "completed" && existing.attempts.at(-1)!.writerRetired) {
         record = store.reserveRecovery(oldRecord.thread, { scope: oldRecord.scope, expectedVersion: oldRecord.version }, {
@@ -724,6 +882,14 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       }
       const attempt = record.works[logicalWorkId]!.attempts.at(-1)!;
       attemptNumber = attempt.attempt;
+      const budget = record.works[logicalWorkId]!.retryBudget!;
+      const deadlineAt = budget.deadlineAt ?? budget.startedAt + timeoutMs;
+      record = store.setCompactionDeadline(record.thread, { scope: record.scope, expectedVersion: record.version }, logicalWorkId, deadlineAt);
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) throw continuityError("continuity_retry_exhausted", "The original compaction deadline has expired.");
+      clearTimeout(timer);
+      timer = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The recovered compaction exceeded its original deadline.")), remainingMs);
+      timer.unref?.();
       cleanupIdentity = recoveryIdentity(record, store.installationId());
       prepared.recovery = cleanupIdentity;
       parsed._continuityEpoch = record.epoch;
@@ -731,84 +897,147 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       prepared.binding = prepared.bindings.installRecovered(record, prepared.executionKey, continuityCheckpoint(parsed).digest, identity.turnId);
       prepared.binding.conversation = { key: prepared.conversationKey, descriptor: prepared.descriptor };
       const check = (): RecoveryThreadRecord => checkAttempt(prepared, logicalWorkId!, attempt.attempt, attempt.epoch, attempt.snapshotVersion);
-      let reportedRecovery = false;
-      let summary = plan.acceptedHandoff;
-      if (!summary) {
-        await assertLauncherContinuityCapacity(prepared.descriptor);
-        signal.throwIfAborted();
-        record = check();
-        record = store.markAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, {
-          logicalWorkId, attempt: attempt.attempt, stage: "page-possible",
-          launcherInstance: readLauncherContinuityInstance(prepared.descriptor) });
-        const recovery = recoveryIdentity(record, store.installationId());
-        cleanupIdentity = recovery;
-        prepared.recovery = recovery;
-        const prepare = async () => {
-          signal.throwIfAborted(); check();
-          return { ...compiled!, release() {} };
-        };
-        browser = worker.run({ traceId, modelId: parsed.modelId, reasoning: parsed.options.reasoning,
-          ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
-          capabilities: { ...capabilities, localToolsEnabled: false }, nativeConnector: true,
-          continuity: { owner: prepared.bindings.owner, recovery }, conversationKey: prepared.conversationKey,
-          retainConversation: true, compaction: true, prepare, prepareResume: prepare,
-          onContinuityLease(lease) {
+      let summary: string;
+      if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
+        if (!startManual || !plan.preserveFinalResponse) throw continuityError("continuity_manual_handoff_required");
+        // The manual runtime owns a new start/Sent token and this durable attempt.
+        // It never refreshes the completed ordinary source's Send authorization.
+        prepared.input = plan.input;
+        manualRuntime = startManual({ traceId, sourceSnapshot: plan.sourceSnapshot!, deadlineAt, signal,
+          verifyCompleteSource(snapshot) {
             const current = check();
-            if (lease.traceId !== traceId || !lease.recovery || !sameContinuityRecoveryIdentity(lease.recovery, recovery)) {
-              throw continuityError("continuity_source_unproven");
-            }
-            store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
-              logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "page-acquired", pageReceiptId: lease.leaseId });
-            prepared.bindings.acceptLease(prepared.binding, lease);
-          },
-          async onSendActivated() {
-            const current = check();
-            store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
-              logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "send-possible" });
-            await markLauncherContinuitySendPossible(prepared.descriptor, recovery);
-            check();
-            if (!reportedRecovery) {
-              reportedRecovery = true;
-              try { onRecovered?.(); } catch { /* An observer can detach without stopping this transaction. */ }
-            }
-          },
-          onSubmitted() {
-            const current = check();
-            store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
-              logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "accepted" });
-            owner.markCompactionContextDelivered(sourceToken!);
-          }, abortSignal: browserAbort.signal, onTextDelta() { onProgress?.(); },
-        });
-        retainOwnershipUntil(browser.then(() => undefined, () => undefined));
-        const noHandoff = browser.then<never>(() => { throw continuityError("continuity_source_unproven", "The new page settled without a structured handoff."); });
-        summary = canonicalizeCompactionHandoff(parsed, await withCompactionAbort(Promise.race([
-          owner.waitForCompactionHandoff(transaction!.token, signal), noHandoff,
-        ]), signal));
+            if (snapshot !== plan.sourceSnapshot) throw continuityError("continuity_source_unproven");
+            const coverage = (current.contextCoverage ?? []).filter(entry => entry.workLineageId === plan.target.workLineageId);
+            const covered = Object.values(current.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityCheckpoint(parsed).digest
+              && checkpoint.targetHistoryRevision === plan.target.sourceHistoryRevision
+              && checkpoint.workLineageId === plan.target.workLineageId
+              && checkpoint.acceptedTaskRevision === plan.target.acceptedTaskRevision
+              && checkpoint.sourceToolBatchHeadSequence === plan.target.sourceToolBatchHeadSequence);
+            if (coverage.length || !covered) CompactionSourceCoverage.assertRecordedSource(snapshot,
+              coverage.map(entry => entry.metadata), plan.target.sourceHistoryRevision);
+          } });
+        browser = manualRuntime.browser;
+        if (manualRuntime.mode === "tools") void manualRuntime.token.catch(() => {});
+        retainOwnershipUntil(manualRuntime.physicalSettlement);
+        summary = canonicalizeCompactionHandoff(parsed, await withCompactionAbort(browser, signal));
         check();
-        // Retain the valid body before physical cleanup. A failed cleanup must not generate it twice.
         prepared.binding.acceptedHandoff = { key: prepared.executionKey,
           sourceExecutionKey: plan.sourceExecutionKey ?? prepared.executionKey, sourceRevision: plan.target.sourceHistoryRevision,
           bytes: Buffer.byteLength(summary), summary, lease: { ...prepared.binding.lease! } };
-        browserAbort.abort(new ChatGptCompactionHandoffAccepted());
-        await withCompactionAbort(browser.then(() => undefined, () => undefined), signal);
+        await withCompactionAbort(manualRuntime.physicalSettlement, signal);
+        await manualRuntime.retireCapability?.();
         const lease = prepared.binding.lease;
-        if (!lease) throw continuityError("continuity_session_lost");
-        const page = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, lease);
-        if (page.state !== "ready") throw continuityError("continuity_session_lost");
+        if (!lease || (await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, lease)).state !== "ready") {
+          throw continuityError("continuity_session_lost");
+        }
+      } else {
+        const pendingTransaction = owner.beginCompactionTransaction(traceId, remainingMs);
+        void pendingTransaction.then(lateTransaction => {
+          if (signal.aborted && transaction !== lateTransaction) owner.abortCompactionTransaction(lateTransaction.token);
+        }, () => {});
+        transaction = await withCompactionAbort(pendingTransaction, signal);
+        check();
+        const registered = await registerCompactionSource(owner, {
+          snapshot: plan.sourceSnapshot!, contract: "native", transactionToken: transaction.token,
+          handoffId: transaction.handoffId, historyRevision: plan.target.sourceHistoryRevision,
+          recovery: { directory: prepared.bindings.registrations.directory, thread: record.thread,
+            logicalWorkId, attempt: attempt.attempt, ownerId: record.owner.id },
+          ownerGeneration: `${prepared.bindings.owner}:${attempt.epoch}:${attempt.attempt}`,
+          expiresAt: deadlineAt,
+          availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
+        }, structuredCompactionHandoffInstruction(transaction, compactPrompt(parsed)));
+        sourceToken = registered.token;
+        compiled = { text: registered.instruction, images: [] };
+        assertContinuityCompiledInput(compiled, { ...plan.input!, context: { ...plan.input!.context, messages: [] } }, capabilities);
+        let reportedRecovery = false;
+        summary = plan.acceptedHandoff!;
+        if (!summary) {
+          signal.throwIfAborted();
+          record = check();
+          record = store.markAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, {
+            logicalWorkId, attempt: attempt.attempt, stage: "page-possible",
+            launcherInstance: readLauncherContinuityInstance(prepared.descriptor) });
+          const recovery = recoveryIdentity(record, store.installationId());
+          const recoveryReference = { directory: prepared.bindings.registrations.directory, thread: record.thread,
+            logicalWorkId, attempt: attempt.attempt, ownerId: record.owner.id };
+          const acquisitionRequestId = randomBytes(24).toString("hex");
+          beginRecoveryAcquisition(recoveryReference, recovery, acquisitionRequestId);
+          cleanupIdentity = recovery;
+          prepared.recovery = recovery;
+          const prepare = async () => {
+            signal.throwIfAborted(); check();
+            return { ...compiled!, release() {} };
+          };
+          browser = worker.run({ traceId, modelId: parsed.modelId, reasoning: parsed.options.reasoning,
+            ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
+            capabilities: { ...capabilities, localToolsEnabled: false }, nativeConnector: true,
+            continuity: { owner: prepared.bindings.owner, recovery }, recoveryStoreDirectory: prepared.bindings.registrations.directory,
+            recoveryRequestId: acquisitionRequestId,
+            conversationKey: prepared.conversationKey,
+            retainConversation: true, compaction: true, prepare, prepareResume: prepare,
+            onContinuityLease(lease) {
+              const current = check();
+              if (lease.traceId !== traceId || !lease.recovery || !sameContinuityRecoveryIdentity(lease.recovery, recovery)) {
+                throw continuityError("continuity_source_unproven");
+              }
+              store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
+                logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "page-acquired", pageReceiptId: lease.leaseId });
+              prepared.bindings.acceptLease(prepared.binding, lease);
+            },
+            async onSendActivated() {
+              check();
+              sendReference = beginRecoverySend(recoveryReference, recovery, acquisitionRequestId);
+              await markLauncherContinuitySendPossible(prepared.descriptor, recovery, prepared.bindings.registrations.directory);
+              check();
+              if (!reportedRecovery) {
+                reportedRecovery = true;
+                try { onRecovered?.(); } catch { /* An observer can detach without stopping this transaction. */ }
+              }
+            },
+            onSubmitted() {
+              if (!sendReference) throw continuityError("continuity_source_unproven");
+              if (!settleRecoverySend(sendReference).currentWriter) return;
+              check();
+              owner.markCompactionContextDelivered(sourceToken!);
+            }, abortSignal: browserAbort.signal, onTextDelta() { onProgress?.(); },
+          });
+          retainOwnershipUntil(browser.then(() => undefined, () => undefined));
+          const noHandoff = browser.then<never>(() => { throw continuityError("continuity_source_unproven", "The new page settled without a structured handoff."); });
+          summary = canonicalizeCompactionHandoff(parsed, await withCompactionAbort(Promise.race([
+            owner.waitForCompactionHandoff(transaction!.token, signal), noHandoff,
+          ]), signal));
+          check();
+          // Retain the valid body before physical cleanup. A failed cleanup must not generate it twice.
+          prepared.binding.acceptedHandoff = { key: prepared.executionKey,
+            sourceExecutionKey: plan.sourceExecutionKey ?? prepared.executionKey, sourceRevision: plan.target.sourceHistoryRevision,
+            bytes: Buffer.byteLength(summary), summary, lease: { ...prepared.binding.lease! } };
+          browserAbort.abort(new ChatGptCompactionHandoffAccepted());
+          await withCompactionAbort(browser.then(() => undefined, () => undefined), signal);
+          const lease = prepared.binding.lease;
+          if (!lease) throw continuityError("continuity_session_lost");
+          const page = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, lease);
+          if (page.state !== "ready") throw continuityError("continuity_session_lost");
+        }
       }
       signal.throwIfAborted(); check();
       const checkpoint = commitRecoveryCompaction(parsed, prepared, plan, logicalWorkId, summary, plan.preserveFinalResponse);
       prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, checkpoint, summary,
-        plan.sourceRevision, representations(parsed, plan, summary), plan.preserveFinalResponse);
+        plan.sourceRevision, representations(parsed, plan, summary), plan.preserveFinalResponse, plan.sourceExecutionKey);
+      const pageCost = await compactionSourcePageCost(owner, plan.sourceSnapshot!);
+      prepared.binding.retainedPageTokens = pageCost === undefined ? undefined : pageCost + estimateTokens(summary);
       onProgress?.();
       return summary;
     } catch (error) {
       browserAbort.abort(error);
+      manualRuntime?.cancel(error instanceof Error ? error : undefined);
       // Physical cleanup remains in the owner gate. A deadline cannot wait forever for it.
       const physical = browser?.then(() => undefined, () => undefined);
       if (physical) retainOwnershipUntil(physical);
       if (transaction) owner.abortCompactionTransaction(transaction.token);
       if (logicalWorkId && attemptNumber !== undefined) {
+        const ref = { directory: prepared.bindings.registrations.directory, thread: prepared.binding.thread,
+          logicalWorkId, attempt: attemptNumber };
+        if (settleRecoveryKnownUnsent(ref, error)) throw error;
         let record = store.get(prepared.binding.thread);
         const work = record?.works[logicalWorkId];
         if (record && work && work.state !== "completed" && work.state !== "stopped"
@@ -820,7 +1049,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
           const stage = work.attempts.at(-1)!.stage;
           let retired = stage === "prepared";
           if (!retired && cleanupIdentity) {
-            try { retired = (await retireLauncherContinuityWriter(prepared.descriptor, cleanupIdentity)).writerRetired; }
+            try { retired = (await retireLauncherContinuityWriter(prepared.descriptor, cleanupIdentity, prepared.bindings.registrations.directory)).writerRetired; }
             catch { /* Unknown writer ownership must remain unknown in the journal. */ }
           }
           if (retired) {
@@ -842,15 +1071,18 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       if (transaction) owner.abortCompactionTransaction(transaction.token);
     }
   });
-  return running.catch(error => {
-    assertRecoveryCompactionNotStopped(parsed, prepared);
-    if (["client_cancelled", "continuity_stopped"].includes(String((error as { code?: string })?.code))) {
-      const record = prepared.bindings.recoveryStore.get(prepared.binding.thread);
-      if (record?.works[plan.source.logicalWorkId]) {
-        prepared.bindings.recoveryStore.stopWork(record.thread, { scope: record.scope }, plan.source.logicalWorkId, "native-interrupt");
-      }
+  return running.catch(error => failRecoveryCompactionObserver(parsed, prepared, plan, error));
+}
+
+function failRecoveryCompactionObserver(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
+  plan: RecoveryCompactionPlan, error: unknown): never {
+  assertRecoveryCompactionNotStopped(parsed, prepared);
+  if (["client_cancelled", "continuity_stopped"].includes(String((error as { code?: string })?.code))) {
+    const record = prepared.bindings.recoveryStore.get(prepared.binding.thread);
+    if (record?.works[plan.source.logicalWorkId]) {
+      prepared.bindings.recoveryStore.stopWork(record.thread, { scope: record.scope }, plan.source.logicalWorkId, "native-interrupt");
     }
-    if (error instanceof ChatGptWebAdapterError) throw error;
-    throw continuityError("continuity_source_unproven", "The handoff did not commit; already accepted results were not re-executed.");
-  });
+  }
+  if (error instanceof ChatGptWebAdapterError) throw error;
+  throw continuityError("continuity_source_unproven", "The handoff did not commit; already accepted results were not re-executed.");
 }

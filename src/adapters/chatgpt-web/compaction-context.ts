@@ -20,6 +20,7 @@ import { validateContextCoverageMetadata, type ContextCoverageMetadata } from ".
 
 const MAX_COVERAGE_BYTES = 512 * 1024;
 export const COMPACTION_SUMMARY_RESERVE = 8_192;
+const compactionPageEntries = new WeakMap<ContextSnapshot, { token: string; instructionTokens: number }>();
 export interface CompactionSourcePlan {
   historyRevision: number;
   pageGeneration: string;
@@ -288,6 +289,25 @@ export function captureCompactionSource(parsed: CodexParsedRequest, coverage: Co
 export function captureRetainedCompactionSource(parsed: CodexParsedRequest, source: ChatGptTurnSession): ContextSnapshot {
   const coverage = source.runtime.compactionSourceCoverage;
   if (!coverage) unavailable("Compaction has no accepted source coverage evidence.");
+  const { accepted, provenance } = retainedCompactionInput(parsed, source);
+  return captureCompactionSource(accepted, coverage, provenance);
+}
+
+/** Capacity preview does not accept results or publish source coverage. The actual
+ * source transaction must still validate and admit the first real result. */
+export function previewRetainedCompactionSource(parsed: CodexParsedRequest, source: ChatGptTurnSession): {
+  snapshot: ContextSnapshot; coverage: CompactionSourceCoverage;
+} {
+  const coverage = source.runtime.compactionSourceCoverage?.fork();
+  if (!coverage) unavailable("Compaction has no accepted source coverage evidence.");
+  const { accepted, provenance } = retainedCompactionInput(parsed, source);
+  coverage.prepareToolResults(accepted, source.outstanding().map(call => call.callId));
+  return { snapshot: captureCompactionSource(accepted, coverage, provenance), coverage };
+}
+
+function retainedCompactionInput(parsed: CodexParsedRequest, source: ChatGptTurnSession): {
+  accepted: CodexParsedRequest; provenance: ReadonlyMap<number, ContextSourceEvidence>;
+} {
   const original = source.runtime.continuityBinding?.initialAcceptedInput ?? source.runtime.usageInput ?? parsed;
   const raw = (value: CodexParsedRequest): unknown[] => {
     const body = value._rawBody as { input?: unknown[] } | undefined;
@@ -325,7 +345,7 @@ export function captureRetainedCompactionSource(parsed: CodexParsedRequest, sour
     }
   }
   accepted.context = { ...accepted.context, messages };
-  return captureCompactionSource(accepted, coverage, provenance);
+  return { accepted, provenance };
 }
 
 export function compactionAvailableTokens(parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities & { experimentalBiggerContext?: boolean },
@@ -401,13 +421,36 @@ export async function registerCompactionSource(broker: TurnBrokerOwner, input: O
     remainingBudget: { tokens: remaining, wire_bytes: contextLimits(input.limits).maxTotalWireBytes,
       reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 } }, ownerContext);
   try {
-    const navigation = compactionContextPrompt({ contextId: handle.contextId, compactionToken: handle.compactionToken,
-      overview: { sources: input.snapshot.sources.length, targets: input.snapshot.targets.length,
-        images: input.snapshot.targets.filter(t => t.kind === "image").length,
-        remaining_tokens: remaining, summary_reserved_tokens: COMPACTION_SUMMARY_RESERVE } }).join("\n");
-    if (estimateTokens(navigation) > 4_096) throw continuityError("continuity_input_limit");
-    return { instruction: `${instruction}\n\n${navigation}`, token: handle.compactionToken };
+    if (handle.contextId !== input.snapshot.context_id) unavailable("The compaction source registration changed its fixed context identity.");
+    const selectedInstruction = compactionSourceInstruction(input.snapshot, instruction, availableTokens,
+      handle.compactionToken, input.limits);
+    compactionPageEntries.set(input.snapshot, { token: handle.compactionToken, instructionTokens: estimateTokens(selectedInstruction) });
+    return { instruction: selectedInstruction, token: handle.compactionToken };
   } catch (error) { await broker.revokeCompactionContext(handle.compactionToken); throw error; }
+}
+
+/** A checkpoint changes the logical source revision, not the physical page.
+ * Preserve the exact entry and confirmed navigation cost before clearing its ledger. */
+export async function compactionSourcePageCost(broker: TurnBrokerOwner, snapshot: ContextSnapshot): Promise<number | undefined> {
+  const entry = compactionPageEntries.get(snapshot);
+  if (!entry) return undefined;
+  const evidence = await broker.contextUsage?.(entry.token);
+  if (!evidence || !evidence.final || evidence.purpose !== "compaction" || evidence.context_id !== snapshot.context_id) return undefined;
+  const cost = entry.instructionTokens + evidence.usage.text_tokens + evidence.usage.visual_token_reserve;
+  return Number.isSafeInteger(cost) && cost >= 0 ? cost : undefined;
+}
+
+/** The exact read-only entry used for cold compaction admission. It contains no
+ * historical task text; the independently verified snapshot remains readable. */
+export function compactionSourceInstruction(snapshot: ContextSnapshot, instruction: string, availableTokens: number,
+  compactionToken = `compaction_${"0".repeat(32)}`, overrides: ContextLimitOverrides = {}): string {
+  const remaining = Math.min(contextLimits(overrides).maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
+  const navigation = compactionContextPrompt({ contextId: snapshot.context_id, compactionToken,
+    overview: { sources: snapshot.sources.length, targets: snapshot.targets.length,
+      images: snapshot.targets.filter(target => target.kind === "image").length,
+      remaining_tokens: remaining, summary_reserved_tokens: COMPACTION_SUMMARY_RESERVE } }).join("\n");
+  if (estimateTokens(navigation) > 4_096) throw continuityError("continuity_input_limit");
+  return `${instruction}\n\n${navigation}`;
 }
 
 /** Existing fresh-page/manual compaction only. The caller owns the original writer/Send
@@ -416,11 +459,13 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
   capabilities: ChatGptWebCapabilities, options: {
     historyRevision: number; ownerGeneration: string; traceId: string; timeoutMs?: number;
     signal?: AbortSignal;
+    deadlineAt?: number;
+    recovery?: import("./continuity-recovery-runtime").RuntimeRecoveryReference;
     sourceCoverage?: CompactionSourceCoverage;
     /** Independent fixed source captured after the original live source proof. */
     sourceSnapshot?: ContextSnapshot;
     verifyCompleteSource?: (snapshot: ContextSnapshot) => void | Promise<void>;
-    /** Retains an existing path's multipart/full-capacity admission, without history trimming. */
+    /** Additional selected-input check for an existing send contract. */
     assertFullInput?: (compiled: CompiledChatGptWebPrompt, input: CodexParsedRequest) => void | Promise<void>;
     turnToken?: string;
     /** Trusted acceptance path; cannot change source, authority or send policy. */
@@ -437,12 +482,6 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
     if (!options.verifyCompleteSource) unavailable("Fresh compaction requires independent complete source-chain evidence.");
     await options.verifyCompleteSource(snapshot);
   }
-  const fullInput: CodexParsedRequest = { ...parsed, _compactionRequest: false,
-    options: { ...parsed.options, outputFormat: undefined }, context: { ...parsed.context, tools: [] } };
-  const full = compileChatGptWebPrompt(fullInput, { ...capabilities, localToolsEnabled: Boolean(options.turnToken) }, options.turnToken,
-    { ...options.contextPresentation, ...(options.turnToken ? { manualControl: true } : {}) });
-  if (options.assertFullInput) await options.assertFullInput(full, fullInput);
-  else assertContinuityCompiledInput(full, fullInput, capabilities);
   options.signal?.throwIfAborted();
   const timeout = Math.min(options.timeoutMs ?? 300_000, 300_000);
   if (!options.turnToken && (!broker.beginCompactionTransaction || !broker.abortCompactionTransaction || !broker.commitCompactionContext)) {
@@ -475,9 +514,16 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
         handoffId: `manual:${options.traceId}` } : { contract: "native" as const, transactionToken: transaction!.token,
         handoffId: transaction!.handoffId }),
       historyRevision: options.historyRevision, ownerGeneration: options.ownerGeneration,
-      expiresAt: Date.now() + timeout, availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
+      expiresAt: options.deadlineAt ?? Date.now() + timeout, availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
+      ...(options.recovery ? { recovery: options.recovery } : {}),
     }, instruction);
     sourceToken = registered.token;
+    const selectedInput: CodexParsedRequest = { ...parsed, context: { ...parsed.context, systemPrompt: [], tools: [],
+      messages: [{ role: "user", content: registered.instruction, timestamp: 0 }] } };
+    const compiled = compileChatGptWebPrompt(selectedInput, { ...capabilities, localToolsEnabled: Boolean(options.turnToken) }, options.turnToken,
+      { ...options.contextPresentation, ...(options.turnToken ? { manualControl: true } : {}) });
+    if (options.assertFullInput) await options.assertFullInput(compiled, selectedInput);
+    else assertContinuityCompiledInput(compiled, selectedInput, capabilities);
     options.signal?.throwIfAborted();
     return { instruction: registered.instruction,
       markDelivered: async () => { await broker.markCompactionContextDelivered?.(sourceToken!); },

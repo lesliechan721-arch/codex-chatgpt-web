@@ -15,7 +15,6 @@ import {
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
   CHATGPT_WEB_MODEL_ROUTES,
-  CHATGPT_WEB_CONTINUITY_MODEL_ROUTES,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
   resolveChatGptWebContextLimits,
@@ -71,46 +70,34 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(CHATGPT_WEB_LUNA_MODEL_ROUTE.backendModel).toBe("gpt-5.6-luna");
   });
 
-  test("continuity candidates preserve account gates and reject incompatible configurations", () => {
+  test("all supported Full Launcher routes use one task policy and preserve account gates", () => {
     const config = { ...defaultConfig("full"), ...plus, browserHost: "launcher" as const };
-    expect(availableChatGptWebModelRoutes(config).map(route => route.slug)).toEqual([
+    const routes = availableChatGptWebModelRoutes(config);
+    expect(routes.map(route => route.slug)).toEqual([
       "chatgpt-web/gpt-6-sol-instant", "chatgpt-web/gpt-6-sol",
       "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
-      "chatgpt-web-continuity/gpt-6-sol-instant", "chatgpt-web-continuity/gpt-6-sol",
-      "chatgpt-web-continuity/gpt-5.6-sol-instant", "chatgpt-web-continuity/gpt-5.6-sol",
     ]);
-    expect(CHATGPT_WEB_CONTINUITY_MODEL_ROUTES).toHaveLength(8);
-    expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/gpt-5.6-pro", config)).toThrow("not available");
-    expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/gpt-5.6-sol", config, "xhigh")).toThrow("does not support effort");
-    for (const suffix of ["luna", "think", "light", "gpt-5.6-luna", "unknown"]) {
-      expect(() => requireChatGptWebModelRoute(`chatgpt-web-continuity/${suffix}`, config)).toThrow("not enabled");
+    expect(routes.every(route => route.conversationPolicy === "task")).toBe(true);
+    expect(() => requireChatGptWebModelRoute("chatgpt-web/gpt-5.6-pro", config)).toThrow("not available");
+    expect(() => requireChatGptWebModelRoute("chatgpt-web/gpt-5.6-sol", config, "xhigh")).toThrow("does not support effort");
+    for (const conflict of [{ mode: "browser-only" as const }, { browserHost: "managed-chrome" as const }]) {
+      expect(availableChatGptWebModelRoutes({ ...config, ...conflict }).some(route => route.conversationPolicy === "task")).toBe(false);
     }
-    for (const conflict of [
-      { mode: "browser-only" as const }, { browserHost: "managed-chrome" as const },
-      { experimentalFreshConversationPerTurn: true },
-    ]) {
-      const unavailable = { ...config, ...conflict };
-      expect(availableChatGptWebModelRoutes(unavailable).some(route => route.conversationPolicy === "continuity-first")).toBe(false);
-      expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/gpt-5.6-sol", unavailable)).toThrow();
-    }
+    expect(availableChatGptWebModelRoutes({ ...config, experimentalFreshConversationPerTurn: true })
+      .every(route => route.conversationPolicy === "task")).toBe(true);
     const manual = { ...config, browserInteractionMode: "manual" as const, solAvailable: false };
-    expect(requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk", manual).backendModel).toBe(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL);
-    expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk-pro", manual)).toThrow("not enabled in Zero Risk model settings");
+    expect(requireChatGptWebModelRoute("chatgpt-web/zero-risk", manual)).toMatchObject({ backendModel: CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, conversationPolicy: "task" });
+    expect(() => requireChatGptWebModelRoute("chatgpt-web/zero-risk-pro", manual)).toThrow("not enabled in Zero Risk model settings");
     const manualPro = { ...manual, zeroRiskProEnabled: true };
-    expect(availableChatGptWebModelRoutes(manualPro).map(route => route.slug)).toEqual([
-      "chatgpt-web/zero-risk-pro", "chatgpt-web-continuity/zero-risk-pro",
-    ]);
-    expect(() => requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk", manualPro))
-      .toThrow("not enabled in Zero Risk model settings");
-    expect(requireChatGptWebModelRoute("chatgpt-web-continuity/zero-risk-pro", manualPro).backendModel)
-      .toBe(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL);
+    expect(availableChatGptWebModelRoutes(manualPro).map(route => route.slug)).toEqual(["chatgpt-web/zero-risk-pro"]);
+    expect(requireChatGptWebModelRoute("chatgpt-web/zero-risk-pro", manualPro)).toMatchObject({ backendModel: CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, conversationPolicy: "task" });
   });
 
-  test("only trusted routing selects continuity and its larger history budget", () => {
+  test("trusted ordinary routing selects task continuity and ignores caller policy", () => {
     const config = { ...defaultConfig("full"), ...plus, browserHost: "launcher" as const };
-    const request = parsed("chatgpt-web-continuity/gpt-5.6-sol", "medium");
+    const request = parsed("chatgpt-web/gpt-5.6-sol", "medium");
     const route = routeChatGptWebRequest(request, config);
-    expect(request._conversationPolicy).toBe("continuity-first");
+    expect(request._conversationPolicy).toBe("task");
     expect(request.modelId).toBe(CHATGPT_WEB_BACKEND_MODEL);
     expect(request.options.reasoning).toBe("medium");
     expect(resolveChatGptWebHistoryLimits(route, config)).toEqual({
@@ -119,14 +106,14 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config).contextWindow).toBe(90_000);
     expect(resolveChatGptWebTransportLimits(route.backendModel, route.adapterEffort, config).browserComposerCharLimit).toBe(500_000);
     const ordinary = parsed("chatgpt-web/gpt-5.6-sol", "medium");
-    ordinary._conversationPolicy = "continuity-first";
-    ordinary._rawBody = { metadata: { conversationPolicy: "continuity-first" }, _conversationPolicy: "continuity-first" };
-    const ordinaryRoute = routeChatGptWebRequest(ordinary, config);
+    ordinary._conversationPolicy = "task";
+    ordinary._rawBody = { metadata: { conversationPolicy: "task" }, _conversationPolicy: "task" };
+    const ordinaryRoute = routeChatGptWebRequest(ordinary, { ...config, mode: "browser-only" });
     expect(ordinary).toMatchObject({ _conversationPolicy: "recoverable" });
-    expect(resolveChatGptWebHistoryLimits(ordinaryRoute, config).contextWindow).toBe(90_000);
+    expect(resolveChatGptWebHistoryLimits(ordinaryRoute, { ...config, mode: "browser-only" }).contextWindow).toBe(90_000);
   });
 
-  test("GPT-6 continuity retains its history budget and exact browser family without expanding one message", () => {
+  test("GPT-6 task routes retain their history budget and exact browser family without expanding one message", () => {
     const config = { ...defaultConfig("full"), ...pro, browserHost: "launcher" as const };
     for (const [suffix, effort, contextWindow, messageTokens] of [
       ["sol-instant", "low", 111_193, 103_000],
@@ -135,9 +122,9 @@ describe("fixed ChatGPT Web model routes", () => {
       ["sol", "xhigh", 111_193, 103_000],
       ["pro", "max", 112_193, 104_000],
     ] as const) {
-      const request = parsed(`chatgpt-web-continuity/gpt-6-${suffix}`, effort);
+      const request = parsed(`chatgpt-web/gpt-6-${suffix}`, effort);
       const route = routeChatGptWebRequest(request, config);
-      expect(request).toMatchObject({ _conversationPolicy: "continuity-first", _chatgptModelFamily: "6" });
+      expect(request).toMatchObject({ _conversationPolicy: "task", _chatgptModelFamily: "6" });
       expect(resolveChatGptWebHistoryLimits(route, config)).toEqual({
         contextWindow: 1_000_000, autoCompactTokenLimit: 900_000, effectiveContextWindowPercent: 90,
       });

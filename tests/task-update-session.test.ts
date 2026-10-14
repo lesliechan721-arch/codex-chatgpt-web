@@ -1,10 +1,15 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { parseRequest } from "../src/responses/parser";
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 import { trustedChatGptTaskUpdateUserText } from "../src/adapters/chatgpt-web/environment";
 import { captureTaskUpdateSource } from "../src/adapters/chatgpt-web/task-update-source";
+import { continuityBindingsFor, continuityDigest, type ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
+import { continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import type { BrokerToolRequest } from "../src/adapters/chatgpt-web/turn-broker";
 import type { TaskUpdateState, TaskUpdateTransferOutcome } from "../src/adapters/chatgpt-web/task-update-protocol";
 import {
@@ -25,7 +30,7 @@ function request(input: unknown[] = [user("initial")], requestId?: string): Code
   return parseRequest({ model: "gpt-6.1-sol", instructions: "Fixed system instructions", input,
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread", turn_id: "turn", ...(requestId ? { request_id: requestId } : {}) }) } });
 }
-function fixture(parsed = request(), conversationKey?: string) {
+function fixture(parsed = request(), conversationKey?: string, continuityBinding?: ContinuityBinding) {
   let finishBrowser!: (answer: string) => void;
   let settlePhysical!: () => void;
   let retirements = 0;
@@ -34,6 +39,7 @@ function fixture(parsed = request(), conversationKey?: string) {
   const retirement = new Promise<void>(resolve => { retired = resolve; });
   const taskUpdates: NonNullable<ChatGptTurnRuntime["taskUpdates"]> = { protocolVersion: 1 };
   const runtime = { mode: "tools" as const, token: Promise.resolve("physical-token"), taskUpdates, conversationKey,
+    ...(continuityBinding ? { continuityBinding } : {}),
     browser: new Promise<string>(resolve => { finishBrowser = resolve; }),
     physicalSettlement: new Promise<void>(resolve => { settlePhysical = resolve; }),
     trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), externalProgress: new ChatGptExternalTurnProgress(),
@@ -789,4 +795,40 @@ test("prepared transfer reserves source and handoff bytes separately from both r
   expect(rejected.session.driverGeneration()).toBe(0);
   expect(rejected.session.taskRevision()).toBe(0);
   expect(rejected.session.appendRoundError(admission.roundKey, { type: "error", message: "prepare exhausted" }).code).toBe("task_update_capacity");
+});
+
+test("a recovered session restores durable accepted revision and the next append uses revision plus one", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cgw-task-session-restore-"));
+  try {
+    const parsed = request([user("initial"), user("one", "First accepted append"), user("two", "Second accepted append")]);
+    const bindings = continuityBindingsFor(directory);
+    bindings.registrations.initialize();
+    const store = bindings.recoveryStore;
+    const thread = continuityDigest("thread"), scope = continuityDigest("same-real-provider");
+    const workId = "accepted-head-work";
+    store.admitWork({ thread, scope, logicalWorkId: workId, instructionIdentity: "two", nativeTurnId: "turn",
+      owner: continuityProcessInstance(), workPayloadDigest: continuityDigest(parsed._rawBody), snapshotDigest: continuityDigest(parsed.context),
+      createPage: true, dispatchProtocolComplete: true });
+    const source = captureTaskUpdateSource(parsed, execution)!;
+    const restored = store.transact(thread, { scope }, record => {
+      record.works[workId]!.taskUpdateJournal = { streamId: "original-root-work", acceptedRevision: 2,
+        acknowledgedRevision: 0, driverGeneration: 1, deliveries: [], updates: source.messages.slice(1).map((message, index) => ({
+          revision: index + 1, sourceMessageId: message.sourceMessageId, payloadDigest: message.payloadDigest,
+        })) };
+    });
+    const binding = bindings.installRecovered(restored, chatGptTurnExecutionKey(parsed), continuityDigest(null), "turn");
+    const f = fixture(parsed, undefined, binding);
+    expect(f.session.taskRevision()).toBe(2);
+    expect(f.session.driverGeneration()).toBe(1);
+    expect(f.session.taskUpdateRoute(chatGptTurnExecutionKey(parsed))).toMatchObject({ acceptedRevision: 2, driverGeneration: 1 });
+    emitBatch(f.session, parsed);
+    const proof = eligible(f.session.proveTaskUpdate(request([
+      ...(parsed._rawBody as { input: unknown[] }).input, result, user("three", "New authorized append"),
+    ]), execution));
+    expect(proof.expectedRevision).toBe(2);
+    expect(proof.expectedDriverGeneration).toBe(1);
+    expect(proof.updates).toMatchObject([{ revision: 3, sourceMessageId: "three", content: "New authorized append" }]);
+    expect(proof.route).toMatchObject({ acceptedRevision: 3, driverGeneration: 2 });
+    expect(store.get(thread)!.works[workId]!.taskUpdateJournal!.acknowledgedRevision).toBe(0);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

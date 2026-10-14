@@ -10,9 +10,66 @@ import {
   type ContinuityClaim, type ContinuityLease, type ContinuityRecoveryIdentity, type ContinuityTransactionReceipt, type ContinuityLauncherInstance,
 } from "./adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "./adapters/chatgpt-web/continuity-errors";
+import { ChatGptWebAdapterError } from "./adapters/chatgpt-web/adapter-error";
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
 export const LAUNCHER_CONTEXT_DELIVERY_FEATURE = "context-delivery-plan-v1";
+export const CONTINUITY_EXECUTION_FENCING_FEATURE = "execution-generation-fencing-v1";
+
+export interface LauncherKnownUnsentReceipt {
+  schemaVersion: 1;
+  receiptId: string;
+  state: "known-unsent";
+  recovery: ContinuityRecoveryIdentity;
+  launcherInstance: ContinuityLauncherInstance;
+  traceId: string;
+  helperPid: number;
+  requestId: string;
+  executionProtocol: 1;
+  sendState: "not-started";
+}
+
+export function isLauncherKnownUnsentReceipt(value: unknown): value is LauncherKnownUnsentReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return Object.keys(receipt).sort().join(",") === "executionProtocol,helperPid,launcherInstance,receiptId,recovery,requestId,schemaVersion,sendState,state,traceId"
+    && receipt.schemaVersion === 1 && receipt.state === "known-unsent" && receipt.executionProtocol === 1 && receipt.sendState === "not-started"
+    && typeof receipt.receiptId === "string" && /^[a-f0-9]{32}$/.test(receipt.receiptId)
+    && typeof receipt.requestId === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(receipt.requestId)
+    && typeof receipt.traceId === "string" && /^[A-Za-z0-9_-]{6,128}$/.test(receipt.traceId)
+    && Number.isSafeInteger(receipt.helperPid) && Number(receipt.helperPid) > 0
+    && isContinuityRecoveryIdentity(receipt.recovery) && isContinuityLauncherInstance(receipt.launcherInstance)
+    && sameContinuityLauncherInstance(receipt.recovery.launcherInstance, receipt.launcherInstance);
+}
+
+export class LauncherKnownUnsentReceiptError extends ChatGptWebAdapterError {
+  readonly sendUnsentReceipt: LauncherKnownUnsentReceipt;
+  constructor(receipt: LauncherKnownUnsentReceipt) {
+    const error = continuityError("continuity_resource_capacity");
+    super(error.message, { status: error.status, errorType: error.errorType, code: error.code, retryable: error.retryable });
+    this.name = "LauncherKnownUnsentReceiptError";
+    this.sendUnsentReceipt = structuredClone(receipt);
+  }
+}
+
+export function getLauncherKnownUnsentReceipt(error: unknown): LauncherKnownUnsentReceipt | undefined {
+  return error instanceof LauncherKnownUnsentReceiptError ? structuredClone(error.sendUnsentReceipt) : undefined;
+}
+
+function rejectKnownUnsentStart(
+  response: Response, decoded: Record<string, unknown>, descriptor: LauncherBrowserHostDescriptor,
+  owner: { traceId: string; helperPid: number; requestId?: string }, recovery?: ContinuityRecoveryIdentity,
+): void {
+  if (response.ok || decoded.code !== "continuity_resource_capacity" || decoded.sendUnsentReceipt === undefined) return;
+  const receipt = decoded.sendUnsentReceipt;
+  if (!recovery || !owner.requestId || !isLauncherKnownUnsentReceipt(receipt)
+    || receipt.requestId !== owner.requestId || receipt.traceId !== owner.traceId || receipt.helperPid !== owner.helperPid
+    || !sameContinuityRecoveryIdentity(receipt.recovery, recovery)
+    || !sameContinuityLauncherInstance(receipt.launcherInstance, descriptor.launcherInstance)) {
+    throw continuityError("continuity_unverified", "Launcher returned a mismatched unsent receipt. The original Send state remains unknown.");
+  }
+  throw new LauncherKnownUnsentReceiptError(receipt);
+}
 export const LAUNCHER_BROWSER_IDLE_URL = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Cmeta%20charset%3D%22utf-8%22%3E%3Ctitle%3ECodex%20Web%20GPT%3C%2Ftitle%3E%3C%2Fhead%3E%3Cbody%3E%3C%2Fbody%3E%3C%2Fhtml%3E#codex-web-gpt-browser-host";
 export type LauncherBrowserHostProfile = "production" | "development";
 
@@ -379,7 +436,7 @@ export async function inspectLauncherBrowserHost(
 export const LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS = 30_000;
 export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
-export type LauncherTurnActivity = { recovery?: ContinuityRecoveryIdentity } & (
+export type LauncherTurnActivity = { recovery?: ContinuityRecoveryIdentity; recoveryStoreDirectory?: string; requestId?: string } & (
   | {
       phase: "approval";
       traceId: string;
@@ -438,6 +495,9 @@ export interface LauncherManualTurnOwner {
   traceId: string;
   helperPid: number;
   recovery?: ContinuityRecoveryIdentity;
+  recoveryStoreDirectory?: string;
+  /** Authenticated reservation identity fixed before this start request is sent. */
+  requestId?: string;
 }
 
 export interface LauncherManualTurnStart extends LauncherManualTurnOwner {
@@ -523,6 +583,11 @@ async function launcherManualRequest(
       signal: controller.signal,
     });
     const decoded = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const recovery = body.recovery ?? ("continuity" in body ? body.continuity?.recovery : undefined);
+    if (action === "start") rejectKnownUnsentStart(response, decoded, descriptor, body, recovery);
+    if (response.ok && recovery && decoded.executionProtocol !== 1) {
+      throw continuityError("continuity_configuration_conflict", "The running Launcher does not confirm execution generation fencing.");
+    }
     if (response.ok && action !== "start" && body.recovery
       && (!isContinuityRecoveryIdentity(decoded.recovery) || !sameContinuityRecoveryIdentity(decoded.recovery, body.recovery))) {
       throw continuityError("continuity_unverified", "Launcher returned an outdated manual lifecycle receipt.");
@@ -558,9 +623,10 @@ async function reconcileLauncherManualMutation(
       observedInvalidAcknowledgement = true;
       ambiguousError = new LauncherManualTurnFailedError(invalidAcknowledgementMessage);
     } catch (error) {
+      if (error instanceof LauncherKnownUnsentReceiptError || (error instanceof ChatGptWebAdapterError && error.code === "continuity_unverified")) throw error;
       ambiguousError = error;
       if (action === "start" && "continuity" in body && body.continuity?.recovery) {
-        const observed = await launcherContinuityRequestWithDescriptor(descriptor, "query", body.continuity.recovery);
+        const observed = await launcherContinuityRequestWithDescriptor(descriptor, "query", body.continuity.recovery, undefined, body.recoveryStoreDirectory);
         if (observed.state === "unknown") throw continuityError("continuity_unverified");
       }
     }
@@ -862,6 +928,7 @@ export async function notifyLauncherTurn(
       if (!response.ok) {
         deterministicResponse = true;
         const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+        if (activity.phase === "start") rejectKnownUnsentStart(response, body, descriptor, activity, activity.continuity?.recovery);
         if (isContinuityControlCode(body.code)) throw continuityError(body.code);
         if (response.status === 409 && body.code === "turn_cancelled") {
           throw new LauncherBrowserTurnCancelledError(
@@ -877,6 +944,10 @@ export async function notifyLauncherTurn(
         throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
       }
       const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const recovery = activity.recovery ?? (activity.phase === "start" ? activity.continuity?.recovery : undefined);
+      if (recovery && body.executionProtocol !== 1) {
+        throw continuityError("continuity_configuration_conflict", "The running Launcher does not confirm execution generation fencing.");
+      }
       if (activity.phase !== "start" && activity.recovery
         && (!isContinuityRecoveryIdentity(body.recovery) || !sameContinuityRecoveryIdentity(body.recovery, activity.recovery))) {
         throw continuityError("continuity_unverified", "Launcher returned an outdated lifecycle receipt.");
@@ -923,7 +994,7 @@ export async function notifyLauncherTurn(
       if (reconcileInitialStart && attempt === 0 && !deterministicResponse) {
         if (activity.phase === "start" && activity.continuity?.recovery) {
           // Query the original transaction first. A new trace cannot resolve an ambiguous Send.
-          const observed = await queryLauncherContinuityTransaction(descriptorPath, activity.continuity.recovery);
+          const observed = await queryLauncherContinuityTransaction(descriptorPath, activity.continuity.recovery, activity.recoveryStoreDirectory);
           if (observed.state === "unknown") throw continuityError("continuity_unverified");
           if (["retired", "completed", "missing"].includes(observed.state)) throw continuityError("continuity_execution_unsettled");
         }
@@ -978,7 +1049,8 @@ export async function releaseLauncherRetainedConversation(
 
 export function assertLauncherContinuityFeature(descriptor: LauncherBrowserHostDescriptor, recovery = false): void {
   if (!descriptor.features?.includes(CONTINUITY_FEATURE)
-    || (recovery && (!descriptor.features.includes(CONTINUITY_RECOVERY_FEATURE) || !descriptor.launcherInstance))) {
+    || (recovery && (!descriptor.features.includes(CONTINUITY_RECOVERY_FEATURE)
+      || !descriptor.features.includes(CONTINUITY_EXECUTION_FENCING_FEATURE) || !descriptor.launcherInstance))) {
     throw continuityError("continuity_configuration_conflict", "Update and restart Launcher before starting this mode.");
   }
 }
@@ -1008,13 +1080,14 @@ async function launcherContinuityRequest(
   action: "query" | "prepare" | "send-possible" | "retire",
   recovery: ContinuityRecoveryIdentity,
   expected?: ContinuityRecoveryIdentity,
+  recoveryStoreDirectory?: string,
 ): Promise<ContinuityTransactionReceipt & { sendAuthorized?: boolean }> {
   if (!isContinuityRecoveryIdentity(recovery) || (expected && !isContinuityRecoveryIdentity(expected))) {
     throw continuityError("continuity_source_unproven");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   assertLauncherContinuityFeature(descriptor, true);
-  return launcherContinuityRequestWithDescriptor(descriptor, action, recovery, expected);
+  return launcherContinuityRequestWithDescriptor(descriptor, action, recovery, expected, recoveryStoreDirectory);
 }
 
 async function launcherContinuityRequestWithDescriptor(
@@ -1022,11 +1095,13 @@ async function launcherContinuityRequestWithDescriptor(
   action: "query" | "prepare" | "send-possible" | "retire",
   recovery: ContinuityRecoveryIdentity,
   expected?: ContinuityRecoveryIdentity,
+  recoveryStoreDirectory?: string,
 ): Promise<ContinuityTransactionReceipt & { sendAuthorized?: boolean }> {
   try {
     const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-${action}`, {
       method: "POST", headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ recovery, ...(expected ? { expected } : {}) }),
+      body: JSON.stringify({ recovery, ...(expected ? { expected } : {}),
+        ...(recoveryStoreDirectory ? { recoveryStoreDirectory } : {}) }),
       signal: AbortSignal.timeout(action === "retire" ? LAUNCHER_TURN_END_TIMEOUT_MS : LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
     });
     const body = await response.json() as Record<string, unknown>;
@@ -1036,6 +1111,9 @@ async function launcherContinuityRequestWithDescriptor(
       throw continuityError("continuity_unverified");
     }
     const preparationExpected = body.preparationExpected;
+    if (body.executionProtocol !== 1) {
+      throw continuityError("continuity_configuration_conflict", "The running Launcher does not confirm execution generation fencing. Update and restart Launcher.");
+    }
     if (body.ok !== true || !isContinuityRecoveryIdentity(body.recovery)
       || !sameContinuityRecoveryIdentity(body.recovery, recovery)
       || !["creating", "prepared", "send-possible", "completed", "retired", "missing", "unknown"].includes(String(body.state))
@@ -1055,7 +1133,9 @@ async function launcherContinuityRequestWithDescriptor(
         || !body.continuity.recovery || !sameContinuityRecoveryIdentity(body.continuity.recovery, recovery)))
       || (body.surfaceId !== undefined && (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)))
       || (body.tabId !== undefined && (typeof body.tabId !== "string" || !body.tabId))
-      || (action === "send-possible" && typeof body.sendAuthorized !== "boolean")) {
+      || (action === "send-possible" && typeof body.sendAuthorized !== "boolean")
+      || (action === "retire" && (body.writerRetired !== true || body.executionIsolated !== true
+        || !["pending", "destroyed", "failed"].includes(String(body.physicalCleanup))))) {
       throw continuityError("continuity_unverified", "Launcher returned a stale or incomplete transaction receipt.");
     }
     return body as unknown as ContinuityTransactionReceipt & { sendAuthorized?: boolean };
@@ -1065,26 +1145,26 @@ async function launcherContinuityRequestWithDescriptor(
   }
 }
 
-export function queryLauncherContinuityTransaction(descriptorPath: string, recovery: ContinuityRecoveryIdentity): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "query", recovery);
+export function queryLauncherContinuityTransaction(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "query", recovery, undefined, recoveryStoreDirectory);
 }
 
 export function updateLauncherContinuityPreparation(descriptorPath: string, update: {
   expected: ContinuityRecoveryIdentity; recovery: ContinuityRecoveryIdentity;
-}): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "prepare", update.recovery, update.expected);
+}, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "prepare", update.recovery, update.expected, recoveryStoreDirectory);
 }
 
 /** Call after the durable send-possible write, and await before the actual Send activation. */
-export async function markLauncherContinuitySendPossible(descriptorPath: string, recovery: ContinuityRecoveryIdentity): Promise<ContinuityTransactionReceipt> {
-  const result = await launcherContinuityRequest(descriptorPath, "send-possible", recovery);
+export async function markLauncherContinuitySendPossible(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
+  const result = await launcherContinuityRequest(descriptorPath, "send-possible", recovery, undefined, recoveryStoreDirectory);
   if (!result.sendAuthorized) throw continuityError("continuity_execution_unsettled", "This page may already have been sent; attach or retire its original attempt.");
   return result;
 }
 
-/** Retires only the exact page writer. The caller must separately retire Broker rights and settle tools. */
-export function retireLauncherContinuityWriter(descriptorPath: string, recovery: ContinuityRecoveryIdentity): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "retire", recovery);
+/** Confirms logical isolation. Exact page cleanup proceeds independently; tools still need settlement. */
+export function retireLauncherContinuityWriter(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "retire", recovery, undefined, recoveryStoreDirectory);
 }
 
 /** Reject known capacity exhaustion before consuming a new thread's creation registration. */
@@ -1100,7 +1180,7 @@ export async function assertLauncherContinuityCapacity(descriptorPath: string): 
       signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
     });
     const body = await response.json() as Record<string, unknown>;
-    if (!response.ok || body.ok !== true || typeof body.available !== "boolean") throw new Error("Invalid capacity acknowledgement");
+    if (!response.ok || body.ok !== true || body.executionProtocol !== 1 || typeof body.available !== "boolean") throw new Error("Invalid capacity acknowledgement");
     available = body.available;
   } catch {
     throw continuityError("continuity_configuration_conflict", "Launcher cannot confirm the continuity capacity contract. Update or restore the local control connection before starting this mode.");

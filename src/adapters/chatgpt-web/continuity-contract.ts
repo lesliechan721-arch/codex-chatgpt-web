@@ -47,6 +47,12 @@ export interface ContinuityTransactionReceipt {
   recovery: ContinuityRecoveryIdentity;
   state: "creating" | "prepared" | "send-possible" | "completed" | "retired" | "missing" | "unknown";
   writerRetired: boolean;
+  executionProtocol?: 1;
+  executionIsolated?: boolean;
+  physicalCleanup?: "pending" | "destroyed" | "failed";
+  cleanup?: Array<{ cleanupId: string; tabId: string; physicalPageId: string;
+    launcherInstance: ContinuityLauncherInstance; creation?: ContinuityRecoveryIdentity;
+    state: "pending" | "closing" | "destroyed" | "failed"; attempts: number; executionIsolated: boolean; reason?: string }>;
   /** A page lease can never prove that an external tool has finished. */
   toolsSettled: false;
   launcherInstance?: ContinuityLauncherInstance;

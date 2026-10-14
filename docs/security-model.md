@@ -220,24 +220,29 @@ The following recovery behavior applies to the published `chatgpt-web/` models.
 
 Browser turns use at most five independent task-bound tabs in one private login partition. Every
 outer Codex task owns an exact launcher surface lease and retains its Temporary Chat only across
-sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
+compatible sequential messages and accepted compaction; chats are never reused across tasks.
 Closing a running tab destroys its page and terminates that turn. The five-tab limit bounds parallel
 account traffic. Tool calls remain in the same ChatGPT response. The
 bounded local continuation cache is private, expires, and exists only to implement Codex
 `previous_response_id` replay. Full-mode context compaction accepts a checkpoint only through its
 one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
-fresh read-only Temporary Chat uses actual canonical sources under the original recovery admission.
+fresh read-only Temporary Chat uses actual legal sources and the selected on-demand recovery plan.
 Where navigation applies, its control exposes those sources through the independent read-only
 credential instead of replaying every body. The bridge never parses ordinary assistant prose as a
 structured handoff on the retained path.
 In delegated mode, retained compaction source proof comes only from the request-carried source turn ID,
 source message ID, source content, current native thread, model, and reasoning identity. Rollout aliases
-and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof retires the
-retained conversation before a fresh compaction starts from the full request history.
+and rollout-derived source-turn fallbacks are not accepted. Missing or conflicting proof does not authorize adoption of a guessed source. Applicable unified
+tasks must establish a specific legal compaction source and actual plan, then isolate old project
+authority and settle dispatched calls before any successor. Non-applicable recoverable paths retain
+their original retained-page retirement and full-request fallback admission.
 
-The `chatgpt-web-continuity/` policy prefers the original page. A recovery page requires explicit
-admission proof: the previous thread writer is retired, delivered tools have real terminal results,
-and current request context is valid. Thread page generation can change, while logical work and
+The unified task mechanism prefers a healthy compatible original page. Recovery requires durable
+isolation of project-controlled execution, actual results under each dispatched tool contract,
+confirmed original Send state, complete legal sources and a valid actual delivery plan. A tool
+returning a running-process handle does not prove that process exited. Physical old-page destruction
+is not a prerequisite when another real slot is free. ChatGPT-owned activity can remain active;
+this guarantee is limited to project operations and state commits. Thread page generation can change, while logical work and
 history revision remain durable. A summary, empty memory map, process exit, or response-cache hit
 cannot establish settled tools or authorize new execution.
 
@@ -255,12 +260,14 @@ recheck thread, scope, generation, transaction, attempt, snapshot, and cancellat
 Authenticated Launcher transactions coordinate lost receipts without parallel pages or a second
 unknown Send. Locks are recovered only with a verified process instance, never an arbitrary timeout.
 A page acquisition records its Launcher process and host instance before it starts. A missing
-transaction in a new Launcher needs authenticated proof of no surviving thread writer and verified
-old-instance retirement; missing memory alone grants no right to send.
+transaction in a new Launcher needs authenticated execution-state proof: compatible instances can
+be durably isolated for the thread, while incompatible old instances need verified actual retirement.
+Original Send and registered dispatches still require proof; missing memory alone grants no right
+to send.
 A living backend can retire one thread while continuing others; retirement is not external tool
 settlement. Old operations and credentials are never resurrected across restart.
 
-Within the existing authenticated Codex boundary, continuity trusts the client's current native
+Within the existing authenticated Codex boundary, unified tasks trust the client's current native
 task identity. It does not authenticate completed history against a full saved copy. This permits
 old text and metadata changes. They do not update a healthy retained page, but can enter a recovery
 page through the current canonical request. They may hide external execution the bridge did not observe.
@@ -272,26 +279,36 @@ Repeated summaries and unclear instruction ownership stop when local records can
 work item. Retry comparison records are bounded with their journals or checkpoints; in-memory first-input
 capture can be released without dropping the durable identity or send-state protections.
 
-Continuity source recovery reads one selected committed checkpoint relation. Identical summaries
+Task source recovery reads one selected committed checkpoint relation. Identical summaries
 cannot merge different source identities or extend the accepted source representations on replay.
 The request's persistent native instruction prefix remains current payload even when its metadata
 records an earlier creation turn; this prompt selection grants no filesystem or tool authority.
 Active ordinary replay updates the current tool registry only after payload and owner validation
 under the execution lock. Earlier execution replay cannot update a later owner's registry.
 
-Continuity's 24-hour ready-page retention is not a capability extension. Native operation
+The 24-hour ready-page retention is not a capability extension. Native operation
 identity, real tool results, queued/delivered boundaries, completion barriers, cancellation,
-helper liveness and remote idle keep their existing contracts. Healthy continuity pages are not
-capacity-eviction candidates. Zero Risk cannot generate a second checkpoint prompt after its
+helper liveness and remote idle keep their existing contracts. Safe idle pages can be reclaimed early under pressure after preserving task facts. Active or
+uncertain work cannot be evicted for another task. Closing and failed-cleanup pages still count
+toward five physical slots; each cleanup has at most three automatic attempts. Zero Risk cannot generate a second checkpoint prompt after its
 active control path has ended. The separate
 [release validation matrix](release-validation.md#session-continuity-validation) records validation
-coverage; it is not an additional runtime alias gate.
+coverage; it is not a substitute for running execution-isolation or navigation capability checks.
 
 Old v1 registrations lack complete send/call/stop facts and remain legacy-unproven until real
 evidence can be supplied. Missing or corrupt initialized records cannot be silently replaced.
 An explicit stop survives restart; a distinct new instruction can restart only after settlement.
 HTTP observer disconnect does not revoke the task or clear its evidence. Current permission and
 approval checks apply to all new work; recovery does not restore old tool authority.
+
+Source reconstruction uses current authenticated input, legal previous-response expansion, or
+still-held verifiable content. There is no permanent original-text database. A checkpoint covers
+only its specifically bound range; missing bytes, digests and expired references cannot supply
+uncovered evidence. Answer-body cache expiry never revives completed work. User close of a running
+page preserves stop; fault loss, idle reclamation and recovery cleanup do not fabricate stop.
+Migration preserves existing work/stop/checkpoint/retry facts and does not silently reset unknown
+or corrupt journals. Generation revocation and actual dispatch registration share an atomic order;
+trusted late result settlement is separate from revoked model write authority.
 
 ## Network exposure
 

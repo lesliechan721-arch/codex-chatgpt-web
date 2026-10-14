@@ -96,18 +96,19 @@ test("initial Automatic creation and old recoverable pages keep their existing n
   }
 });
 
-test("five healthy continuity pages refuse both creation paths before allocation or clipboard writes", async () => {
+test("five active pages refuse both creation paths before allocation or clipboard writes", async () => {
   const f = fixture();
   for (let index = 1; index < 5; index++) f.host.turnTabs.set(`tab-${index}`, { ...f.tab, id: `tab-${index}` });
-  f.host.removeTurnTab = () => { throw new Error("A healthy continuity page must not be evicted"); };
+  for (const tab of f.host.turnTabs.values()) tab.status = "running";
+  f.host.removeTurnTab = () => { throw new Error("An active page must not be evicted"); };
   f.host.writeManualPrompt = () => { throw new Error("Capacity must be checked before copying a prompt"); };
   assert.equal(f.host.hasContinuityCapacity(), false);
   await assert.rejects(f.host.createTurnTab("next-trace", process.pid, "c".repeat(64), "connector", undefined,
     { owner: "b".repeat(64) }), { code: "continuity_resource_capacity" });
-  assert.throws(() => f.host.createManualTurnTab("next-trace", process.pid, "c".repeat(64), "prompt", 1000, true,
+  await assert.rejects(f.host.createManualTurnTab("next-trace", process.pid, "c".repeat(64), "prompt", 1000, true,
     { owner: "b".repeat(64) }), { code: "continuity_resource_capacity" });
   assert.equal(f.host.turnTabs.size, 5);
-  delete f.host.turnTabs.get("tab-4").continuityOwner;
+  f.host.turnTabs.get("tab-4").status = "ready";
   assert.equal(f.host.hasContinuityCapacity(), true);
   assert.equal(f.host.turnTabs.size, 5);
 });
@@ -144,10 +145,64 @@ test("the authenticated capacity query is read-only and works without Zero Risk 
     const before = f.tab.continuityLastSuccessAt;
     const full = await query(`Bearer ${token}`);
     assert.equal(full.status, 200);
-    assert.deepEqual(await full.json(), { ok: true, available: false });
+    assert.deepEqual(await full.json(), { ok: true, available: true, executionProtocol: 1 });
     assert.equal(f.tab.continuityLastSuccessAt, before);
     assert.equal(f.host.turnTabs.size, 5);
     f.host.turnTabs.delete("tab-4");
-    assert.deepEqual(await (await query(`Bearer ${token}`)).json(), { ok: true, available: true });
+    assert.deepEqual(await (await query(`Bearer ${token}`)).json(), { ok: true, available: true, executionProtocol: 1 });
   } finally { await server.close(); }
+});
+
+test("pressure reclaims safe continuity pages by last successful work without recording user stop", async () => {
+  const f = fixture();
+  const removed = [];
+  let cancellations = 0;
+  Object.assign(f.host, {
+    window: { contentView: { removeChildView() {} } }, selectedTabId: "home", closedTurnOwners: new Map(),
+    userCancelledTurnOwners: new Map([["already-stopped", 7]]), writeDescriptor() {},
+    cancelTurn() { cancellations++; },
+  });
+  f.host.removeTurnTab = BrowserHost.prototype.removeTurnTab;
+  f.host.turnTabs.clear();
+  for (const [id, success, heartbeat] of [["b", 10, 1000], ["a", 10, 9999], ["c", 20, 1]]) {
+    let destroyed = false;
+    const contents = Object.assign(new EventEmitter(), { isDestroyed: () => destroyed,
+      close() { destroyed = true; removed.push(id); contents.emit("destroyed"); } });
+    f.host.turnTabs.set(id, { ...f.tab, id, traceId: id, continuityLastSuccessAt: success,
+      lastHeartbeatAt: heartbeat, view: { webContents: contents } });
+  }
+  assert.equal(await f.host.evictOldestRetainedTurnTab(), true);
+  assert.deepEqual(removed, ["a"], "same successful-work time has stable page-identity order");
+  assert.equal(await f.host.evictOldestRetainedTurnTab(), true);
+  assert.deepEqual(removed, ["a", "b"], "heartbeats do not reorder successful work");
+  assert.equal(cancellations, 0);
+  assert.deepEqual([...f.host.userCancelledTurnOwners], [["already-stopped", 7]]);
+});
+
+test("idle reclamation excludes every unresolved execution and transfer boundary", async () => {
+  const f = fixture();
+  for (const field of ["pendingBusinessDispatch", "unsettledOperations", "unknownSend", "checkpointPending", "taskTransferPending", "initializingSurface"]) {
+    f.tab[field] = true;
+    assert.equal(await f.host.evictOldestRetainedTurnTab(), false, field);
+    delete f.tab[field];
+  }
+  f.tab.closing = true;
+  assert.equal(await f.host.evictOldestRetainedTurnTab(), false);
+  delete f.tab.closing;
+  f.tab.status = "running";
+  assert.equal(await f.host.evictOldestRetainedTurnTab(), false);
+});
+
+test("renderer fault removes the exact page without using the user stop path", () => {
+  const f = fixture(false, false);
+  let cancellations = 0;
+  let removed;
+  f.host.cancelTurn = () => { cancellations++; };
+  f.host.userCancelledTurnOwners = new Map([["already-stopped", 7]]);
+  f.host.removeTurnTab = tab => { removed = tab; f.host.turnTabs.delete(tab.id); };
+  f.contents.emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+  assert.equal(removed, f.tab);
+  assert.equal(cancellations, 0);
+  assert.deepEqual([...f.host.userCancelledTurnOwners], [["already-stopped", 7]]);
+  assert.throws(() => inspectContinuityConversation(f.host, "a".repeat(64), continuityLease(f.tab)), { code: "continuity_session_lost" });
 });

@@ -3133,10 +3133,11 @@ describe("ChatGPT outer-native harness v4", () => {
         annotations: tool.annotations ?? null,
       }));
       // This unreleased v2 upgrade keeps the approved connector identity. Its changed
-      // tools/list contract requires same-name refresh and new runtime capability evidence.
+      // tools/list contract, including recovered ACK revision guidance, requires same-name
+      // refresh and new runtime capability evidence.
       expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("2358c27e933113aea6cffd37e3ff0ab95974ce9d2d88455f5b30c2e741f1a101");
+        .toBe("43a4005920b0b513d303d05606b55eecfcc1d80584928f0e50c669aaadcb5c30");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {

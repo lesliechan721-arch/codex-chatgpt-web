@@ -53,7 +53,6 @@ Interactive commands:
   /send-fill TOKENS    Send deterministic inert text through the live browser now
   /compact             Run the real browser compaction path now
   /model MODEL         Select gpt-6-sol-instant, gpt-6-sol, gpt-6-pro, gpt-5.6-luna, gpt-5.6-sol-instant, gpt-5.6-sol, gpt-5.6-pro, zero-risk, or zero-risk-pro
-                       For session continuity, use the full chatgpt-web-continuity/... model slug
   /reset yes           Clear this named DEV chat and create a new thread identity
   /help                Show this command list
   /exit                Exit
@@ -96,6 +95,9 @@ function compactJson(value: unknown, limit = 2_000): string {
 function modelFromCli(value: string | undefined): DevChatModel | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase();
+  if (normalized.startsWith("chatgpt-web-continuity/")) {
+    throw new Error(`This model name was removed. Use ${normalized.replace("chatgpt-web-continuity/", "chatgpt-web/")} instead.`);
+  }
   const slug = isChatGptWebModelSlug(normalized) ? normalized : `chatgpt-web/${normalized}`;
   if (!(DEV_CHAT_MODELS as readonly string[]).includes(slug)) {
     throw new Error(`Unknown DEV model ${JSON.stringify(value)}; choose ${DEV_CHAT_MODELS.map(model => model.replace("chatgpt-web/", "")).join(", ")}`);

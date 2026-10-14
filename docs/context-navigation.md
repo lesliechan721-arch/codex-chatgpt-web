@@ -58,7 +58,7 @@ roles, order, original representations, and known completeness. Tool calls and r
 only by a unique call ID. A recorded result is evidence that a result exists, not evidence of
 business success. Labels, snippets, digests, and references are not complete sources.
 
-The existing full, retained-suffix, or continuity input selection happens first. Within that
+The unified task mechanism selects a legal full or retained-suffix input first. Within that
 candidate, only eligible tool-history arguments and results can be replaced by references. A field
 must offer at least 1 KiB of potential encoded-byte savings in its selected presentation. The planner
 then compares complete inline and externalized candidates in their best available presentation.
@@ -73,7 +73,7 @@ the real tool results used for settlement remain intact. This feature generates 
 summary and does not silently trim an oversized request.
 
 A new navigation entry is also required when the legal snapshot contains readable tool history or
-fixed images that the selected retained or continuity input omits. The current credential,
+fixed images that the selected retained input omits. The current credential,
 `context_id`, and first list call then appear in the actual input, even if that entry adds bytes.
 The directory can expose those legal historical sources without sending the full history again.
 It cannot recover sources that the current request and existing authorized restoration do not hold.
@@ -204,8 +204,11 @@ Historical instructions are summary evidence, not new work to execute.
 The control entry must actually be delivered before reads open. Existing owner, generation,
 revision, ACK, Send, real-result settlement, and checkpoint checks still apply. A healthy retained
 source does not need to fit all source bytes into a new browser input or all reads into the cumulative
-allowance. Existing fresh-page and recovery full-input admission checks remain in force. An ended
-Zero Risk continuity response still requires manual handoff; navigation does not create a second
+allowance. Fresh-page recovery checks complete legal sources independently from the actual selected plan;
+unsent full-source compilation is not a browser-window admission gate. Ordinary recovery, committed
+checkpoint continuation, and uncommitted compaction all use this separation. The new plan includes
+current effective instructions and rechecks required images from zero page coverage. An ended
+Zero Risk response still requires manual handoff; navigation does not create a second
 automatic prompt.
 
 Sources must remain real and individually readable. Missing source bytes fail before control
@@ -290,3 +293,14 @@ Local contract tests do not prove cloud schema adoption, model understanding, su
 exact visual token use, or stable repeated image consumption across all models. See the
 [release validation checks](release-validation.md#context-navigation-validation) for the limited
 live image evidence and the remaining acceptance requirements.
+
+## Page replacement and source reconstruction
+
+Retired or restarted snapshots do not provide a permanent original-text store. Rebuild from the
+current authenticated request, legal previous-response expansion, or still-held verifiable content.
+A specifically bound checkpoint may cover its earlier history, but cannot recover discarded bytes.
+A digest, URL, expired reference, or result-exists record does not replace source content. Publish a
+fresh bound entry only after execution isolation, real dispatch settlement, confirmed Send state,
+and final source/plan admission. Old in-flight reads cannot contribute delivery or read proof to
+the successor. Physical page cleanup is independent of this permission boundary. See
+[session continuity](session-continuity.md) for scope, budgets and cleanup limits.

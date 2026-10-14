@@ -125,16 +125,17 @@ test("Bigger Context compaction selects six parts before the legacy inline byte 
     .toEqual([parsed.context.messages[0]!.content]);
 });
 
-test("continuity skips Bigger Context staging and keeps the same usage for ordinary and compaction work", () => {
+test("unified tasks keep supported Bigger Context staging and canonical usage", () => {
   for (const compaction of [false, true]) {
     const parsed = request(compaction ? "Summarize the task." : "word ".repeat(100_000));
     parsed._compactionRequest = compaction;
     parsed._conversationPolicy = "recoverable";
-    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeDefined();
-    parsed._conversationPolicy = "continuity-first";
-    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBeUndefined();
-    expect(estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, true))
-      .toEqual(estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, false));
+    const parts = resolveBiggerContextMultipartParts(parsed, capabilities);
+    const usage = estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, true);
+    expect(parts).toBeDefined();
+    parsed._conversationPolicy = "task";
+    expect(resolveBiggerContextMultipartParts(parsed, capabilities)).toBe(parts);
+    expect(estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, true)).toEqual(usage);
   }
 });
 

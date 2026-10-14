@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { mock } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
@@ -55,6 +55,11 @@ import {
 } from "../src/adapters/chatgpt-web/native-compaction-control";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { NativeTurnIdleRegistry } from "../src/native-turn-idle";
+import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
+import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
+import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
+import { parseRequest } from "../src/responses/parser";
+import { routeChatGptWebRequest } from "../src/server";
 
 /**
  * These fixtures hand the turn broker a Unix socket under their temp root. macOS puts TMPDIR at
@@ -182,7 +187,7 @@ test("ordinary checkpoint recovery remains isolated from continuity commit autho
     ...compact._rawBody as object, input: [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary) }],
   } };
   expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
-  const continuity = { ...continued, _conversationPolicy: "continuity-first" as const, _continuityScope: "uncommitted-continuity-scope" };
+  const continuity = { ...continued, _conversationPolicy: "task" as const, _continuityScope: "uncommitted-continuity-scope" };
   rememberCompactionContinuation({ ...compact, ...continuity, _compactionRequest: true }, identity, [source], summary);
   expect(recoverCompactionInstruction(continuity, identity)).toBeUndefined();
   expect(recoverCompactionInstruction(continued, identity)?.source).toEqual(source);
@@ -190,7 +195,7 @@ test("ordinary checkpoint recovery remains isolated from continuity commit autho
 
 test("continuity retains its physical key but partitions execution and round replay by verified revision", () => {
   const first = request();
-  first._conversationPolicy = "continuity-first";
+  first._conversationPolicy = "task";
   first._continuityHistoryRevision = 0;
   const next = structuredClone(first);
   next._continuityHistoryRevision = 1;
@@ -2174,7 +2179,7 @@ test("finishing the previous response does not consume the retained checkpoint's
     return "Checkpoint submitted";
   };
   const events: AdapterEvent[] = [];
-  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   let run: Promise<void> | undefined;
   try {
     run = createChatGptWebAdapter(provider).runTurn!(request(true), { headers: new Headers() }, event => events.push(event));
@@ -2260,4 +2265,79 @@ test.each([false, true])("compaction source progress renews waiting, but silent 
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test.each([false, true])("public Full Launcher task commits a retained checkpoint once and preserves its final (Bigger Context=%s)", async experimentalBiggerContext => {
+  const f = retainedTaskFixture(experimentalBiggerContext);
+  try {
+    const source = await f.send(f.body);
+    expect(source.status).toBe(200);
+    const original = await source.json() as { status: string; output: unknown[] };
+    expect(original.status).toBe("completed");
+    expect(JSON.stringify(original.output)).toContain(f.ordinaryFinal);
+    const before = f.store.get(continuityDigest(f.threadId))!;
+    expect(before.legacyUnproven).toBe(false);
+    expect(before.contextCoverage!.some(entry => entry.metadata.delivered)).toBe(true);
+    const sourceWork = before.works[before.currentWorkId!]!;
+    expect(sourceWork.state).toBe("completed");
+    expect(sourceWork.attempts[0]!.stage).toBe("completed");
+
+    const compactBody = { ...f.body, input: [...f.body.input, ...original.output] };
+    const compact = await f.send(compactBody, true);
+    expect(compact.status).toBe(200);
+    const compacted = await compact.json() as { output: unknown[] };
+    expect(JSON.stringify(compacted.output)).toContain(f.summary);
+    const committed = f.store.get(continuityDigest(f.threadId))!;
+    expect(committed.historyRevision).toBe(1);
+    expect(Object.keys(committed.checkpoints)).toHaveLength(1);
+    expect(f.submissions).toHaveLength(2);
+    expect(f.submissions[1]!.turn.requireRetainedConversation).toBe(true);
+    expect(f.submissions[1]!.turn.conversationKey).toBe(f.submissions[0]!.turn.conversationKey);
+    expect(f.pages.size).toBe(1);
+
+    const replay = await f.send(compactBody, true);
+    expect(replay.status).toBe(200);
+    expect((await replay.json() as { output: unknown[] }).output).toEqual(compacted.output);
+    const finalReplay = await f.send(f.body);
+    expect(finalReplay.status).toBe(200);
+    const replayedFinal = await finalReplay.json() as { status: string; output: Array<{ content: unknown }> };
+    expect(replayedFinal.status).toBe("completed");
+    expect(replayedFinal.output.map(item => item.content)).toEqual(original.output.map(item => (item as { content: unknown }).content));
+    expect(f.submissions).toHaveLength(2);
+    const after = f.store.get(continuityDigest(f.threadId))!;
+    expect(after.historyRevision).toBe(1);
+    expect(Object.keys(after.checkpoints)).toHaveLength(1);
+    expect(sourceWork.terminalReceiptId).toBeDefined();
+    expect(after.works[sourceWork.logicalWorkId]!.terminalReceiptId).toBe(sourceWork.terminalReceiptId);
+    expect(after.works[sourceWork.logicalWorkId]!.terminalDigest).toBe(sourceWork.terminalDigest);
+  } finally { await f.dispose(); }
+});
+
+test("public Full Launcher task rejects a v1 retained registration without dispatch evidence before Send", async () => {
+  const f = retainedTaskFixture();
+  try {
+    const parsed = parseRequest(f.body);
+    routeChatGptWebRequest(parsed, f.config);
+    bindContinuityRequestScope(parsed, chatGptWebExecutionNamespace(f.provider));
+    const thread = continuityDigest(f.threadId);
+    f.registrations.claim(thread, parsed._continuityScope!, "b".repeat(64));
+    // Recreate the actual v1 storage shape: registration exists, but no recovery journal.
+    // Controlled migration must keep this as unproved; it cannot invent a no-call history.
+    const marker = JSON.parse(readFileSync(join(f.statePath, "initialized.json"), "utf8"));
+    delete marker.recoveryVersion;
+    writeFileSync(join(f.statePath, "initialized.json"), JSON.stringify(marker));
+    rmSync(join(f.statePath, "recovery.json"));
+    rmSync(join(f.statePath, "recovery-initialized.json"));
+    f.registrations.initialize();
+    const before = f.store.get(thread)!;
+    expect(before.legacyUnproven).toBe(true);
+    expect(before.works).toEqual({});
+
+    const rejected = await f.send(f.body);
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({ error: { code: "continuity_legacy_unproven" } });
+    expect(f.submissions).toHaveLength(0);
+    expect(f.pages.size).toBe(0);
+    expect(f.store.get(thread)).toEqual(before);
+  } finally { await f.dispose(); }
 });

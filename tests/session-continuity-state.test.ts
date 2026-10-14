@@ -54,7 +54,7 @@ for (const recovery of ["no-checkpoint", "no-match", "distinct-instruction"] as 
       encrypted_content: encodeCompactionSummary(recovery === "no-match" ? "Unrelated checkpoint." : summary) });
     body.input.push(current);
     const parsed = parseRequest({ ...body, model: "gpt-5.6-sol" });
-    parsed._conversationPolicy = "continuity-first";
+    parsed._conversationPolicy = "task";
     parsed._continuityScope = scope;
     parsed._continuityHistoryRevision = 0;
     const binding = bindings.create(continuityDigest(identity.threadId), scope, "source-execution", continuityDigest(null));
@@ -106,7 +106,7 @@ test("request checkpoint selection cannot revive a reclaimed authoritative sourc
       internal_chat_message_metadata_passthrough: { turn_id: identity.turnId } },
     { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
   ] });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   parsed._continuityScope = scope;
   const binding = bindings.create(continuityDigest(identity.threadId), scope, "source-execution", continuityDigest(null));
   bindings.acceptLease(binding, { owner: bindings.owner, leaseId: "1".repeat(32), traceId: "2".repeat(12) });

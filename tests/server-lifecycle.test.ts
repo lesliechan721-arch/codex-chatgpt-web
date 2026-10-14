@@ -6,18 +6,22 @@ import { join } from "node:path";
 import { chatGptWebExecutionNamespace, chatGptWebTraceId } from "../src/adapters/chatgpt-web";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
-import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
-import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
+import { cancelStructuredCompactionNativeTurn, runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compaction-handoff";
+import { continuityDigest, type ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
+import type { ContinuityLease } from "../src/adapters/chatgpt-web/continuity-contract";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptTurnSessions, type ChatGptTurnRuntime } from "../src/adapters/chatgpt-web/turn-execution";
 import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import { createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
+import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { apiKeyPolicy, OPENAI_ACCESS } from "../src/api-access";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
+import { NativeTurnIdleRegistry } from "../src/native-turn-idle";
 import { parseRequest } from "../src/responses/parser";
 import { compactRequest, HttpTurnCounter, ModelCatalogFetches, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import type { AdapterEvent } from "../src/types";
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -2031,9 +2035,7 @@ for (const generationProgress of [true, false]) {
 }
 
 for (const generationProgress of [true, false]) {
-  test(`remote retained checkpoint ${generationProgress ? "generation progress renews" : "idle helper heartbeat expires"} the native turn lease`, async () => {
-    const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
-    process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+  test(`legacy adapter retained checkpoint ${generationProgress ? "generation progress renews" : "idle helper heartbeat expires"} the native turn lease`, async () => {
     const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-retained-lease-"));
     const config = { ...defaultConfig("full"), port: 0, brokerSocketPath: defaultBrokerEndpoint(root),
       browserHost: "launcher" as const, browserHostDescriptorPath: join(root, "launcher.json") };
@@ -2050,10 +2052,14 @@ for (const generationProgress of [true, false]) {
     { type: "message", role: "user", content: [{ type: "input_text", text: "Finish this task, then save its checkpoint." }],
       internal_chat_message_metadata_passthrough: { turn_id: sourceTurnId } }];
     const sourceRequest = parseRequest({
-      model: "chatgpt-web/high", input, stream: false,
+      model: "gpt-5.6-sol", input, stream: false,
       client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: sourceTurnId }) },
     });
-    routeChatGptWebRequest(sourceRequest, config);
+    // Bare internal backend requests have no public route provenance and retain the old contract.
+    const parsed = parseRequest({
+      model: "gpt-5.6-sol", input: [...input, { type: "compaction_trigger" }], stream: false,
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: compactTurnId }) },
+    });
     const coverage = new CompactionSourceCoverage();
     coverage.prepare(createContextSnapshot(sourceRequest), {
       historyRevision: 0, pageGeneration: "test-page", planId: "test-source-plan",
@@ -2102,52 +2108,164 @@ for (const generationProgress of [true, false]) {
         finishBrowser();
       }
     };
-    const server = startServer(config, {
-      accessPolicy: OPENAI_ACCESS,
-      adapterFactory: currentProvider => {
-        const adapter = createChatGptWebAdapter(currentProvider);
-        const namespace = chatGptWebExecutionNamespace(currentProvider);
-        return { ...adapter, async runTurn(parsed, incoming, emit) {
-          // Bind the completed page to the routed source identity used by the real compact request.
-          const source = chatGptTurnSessions.getOrCreate(`${namespace}:${chatGptCompactionSourceExecutionKey(parsed)}`, () => ({
-            mode: "read-only", browser: Promise.resolve("Task completed"), physicalSettlement: Promise.resolve(),
-            trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), usageInput: sourceRequest,
-            compactionSourceCoverage: coverage, conversationKey: chatGptConversationKey(parsed, namespace), cancel() {},
-          }));
-          await source.browserOutcome;
-          return adapter.runTurn!(parsed, incoming, emit);
-        } };
-      },
+    const namespace = chatGptWebExecutionNamespace(provider);
+    const source = chatGptTurnSessions.getOrCreate(`${namespace}:${chatGptCompactionSourceExecutionKey(parsed)}`, () => ({
+      mode: "read-only", browser: Promise.resolve("Task completed"), physicalSettlement: Promise.resolve(),
+      trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(), usageInput: sourceRequest,
+      compactionSourceCoverage: coverage, conversationKey: chatGptConversationKey(parsed, namespace), cancel() {},
+    }), undefined, undefined, sourceTurnId, threadId);
+    await source.browserOutcome;
+    const identity = { threadId, turnId: compactTurnId };
+    const idle = new NativeTurnIdleRegistry(1, (expired, reason) => {
+      cancelStructuredCompactionNativeTurn(expired.threadId, expired.turnId, reason);
     });
-    const endpoint = `http://127.0.0.1:${server.port}`;
+    const idleSignal = idle.signal(identity);
+    const events: AdapterEvent[] = [];
     try {
       const startedAt = Date.now();
-      const response = await fetch(`${endpoint}/v1/responses/compact`, {
-        method: "POST", headers: { "content-type": "application/json",
-          "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: compactTurnId }) },
-        body: JSON.stringify({ model: "chatgpt-web/high", input }),
-      });
-      const result = await response.json() as { output?: unknown[]; error?: { code?: string } };
+      await createChatGptWebAdapter(provider, { broker }).runTurn!(parsed, {
+        headers: new Headers(), abortSignal: idleSignal, onProgress: () => { idle.touch(identity); },
+      }, event => events.push(event));
       expect(browserStarts).toBe(1);
       await finished;
       if (generationProgress) expect(browserError).toBeUndefined();
       expect(Date.now() - startedAt).toBeGreaterThan(1_000);
       if (generationProgress) {
+        expect(events.some(event => event.type === "text_delta" && event.text.includes("Checkpoint after silent generation"))).toBeTrue();
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+        expect(progressEvents).toBe(5);
+        expect(cancelled).toBeFalse();
+        expect(idleSignal.aborted).toBeFalse();
+      } else {
+        expect(events.at(-1)).toMatchObject({ type: "error", code: "client_turn_idle_timeout" });
+        expect(progressEvents).toBe(0);
+        expect(cancelled).toBeTrue();
+        expect(idleSignal.aborted).toBeTrue();
+      }
+    } finally {
+      idle.clear();
+      worker.run = originalRun;
+      chatGptTurnSessions.clear();
+      await broker.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const generationProgress of [true, false]) {
+  test(`remote Full Launcher retained checkpoint ${generationProgress ? "generation progress renews" : "idle helper heartbeat expires"} the native turn lease`, async () => {
+    const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
+    process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
+    const f = retainedTaskFixture();
+    const broker = TurnBroker.forSocket(f.provider.chatgptWeb!.brokerSocketPath!);
+    const worker = ChatGptBrowserWorker.forProvider(f.provider);
+    const sourceRun = worker.run;
+    const server = startServer({ ...f.config, port: 0, brokerSocketPath: broker.socketPath,
+      browserHostDescriptorPath: f.provider.chatgptWeb!.browserHostDescriptorPath }, {
+      accessPolicy: OPENAI_ACCESS,
+      adapterFactory: () => createChatGptWebAdapter(f.provider, { broker }),
+    });
+    const endpoint = `http://127.0.0.1:${server.port}`;
+    const send = (body: unknown, compact = false) => fetch(`${endpoint}/v1/responses${compact ? "/compact" : ""}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    let progressEvents = 0;
+    let browserStarts = 0;
+    let cancelled = false;
+    let browserError: unknown;
+    let finishBrowser!: () => void;
+    const finished = new Promise<void>(resolve => { finishBrowser = resolve; });
+    try {
+      // The public source turn establishes durable work, delivered coverage and an accepted page lease.
+      const source = await send(f.body);
+      expect(source.status).toBe(200);
+      const original = await source.json() as { status: string; output: unknown[] };
+      expect(original.status).toBe("completed");
+      expect(JSON.stringify(original.output)).toContain(f.ordinaryFinal);
+      const before = f.store.get(continuityDigest(f.threadId))!;
+      expect(before.legacyUnproven).toBeFalse();
+      expect(before.works[before.currentWorkId!]!.state).toBe("completed");
+      expect(before.contextCoverage!.some(entry => entry.metadata.delivered)).toBeTrue();
+      worker.run = async turn => {
+        browserStarts += 1;
+        let prepared: Awaited<ReturnType<BrowserTurn["prepare"]>> | undefined;
+        let lease: ContinuityLease | undefined;
+        try {
+          expect(turn.requireRetainedConversation).toBeTrue();
+          expect(turn.compaction).toBeTrue();
+          const claim = turn.continuity!;
+          const page = f.pages.get(turn.conversationKey!)!;
+          expect(page.state).toBe("ready");
+          expect(claim.expected).toEqual(page.continuity);
+          lease = { owner: claim.owner, traceId: turn.traceId, leaseId: page.continuity.leaseId,
+            ...(claim.recovery ? { recovery: claim.recovery } : {}) };
+          f.pages.set(turn.conversationKey!, { continuity: lease, state: "running" });
+          turn.onContinuityLease!(lease);
+          prepared = await turn.prepareResume!();
+          const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+          const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
+          expect(token).toBeDefined();
+          expect(handoffId).toBeDefined();
+          await turn.onSendActivated?.();
+          await turn.onSubmitted?.();
+          for (let step = 0; step < 5; step++) {
+            await Bun.sleep(300);
+            if (turn.abortSignal?.aborted) {
+              cancelled = true;
+              throw turn.abortSignal.reason;
+            }
+            turn.onHeartbeat?.();
+            if (generationProgress) {
+              expect(turn.onGenerationProgress).toBeDefined();
+              turn.onGenerationProgress!();
+              progressEvents += 1;
+            }
+          }
+          await callTurnBroker(broker.socketPath, {
+            method: "submit_compaction_handoff", token, handoffId, summary: "Checkpoint after silent generation",
+          });
+          return "Checkpoint submitted";
+        } catch (error) {
+          browserError = error;
+          throw error;
+        } finally {
+          prepared?.release();
+          if (lease) f.pages.set(turn.conversationKey!, { continuity: lease, state: "ready" });
+          finishBrowser();
+        }
+      };
+      const startedAt = Date.now();
+      const response = await send({ ...f.body, input: [...f.body.input, ...original.output] }, true);
+      const result = await response.json() as { output?: unknown[]; error?: { code?: string } };
+      expect(browserStarts).toBe(1);
+      await finished;
+      expect(Date.now() - startedAt).toBeGreaterThan(1_000);
+      const after = f.store.get(continuityDigest(f.threadId))!;
+      if (generationProgress) {
+        expect(browserError).toBeUndefined();
         expect(response.status).toBe(200);
         expect(JSON.stringify(result.output)).toContain("Checkpoint after silent generation");
         expect(progressEvents).toBe(5);
         expect(cancelled).toBeFalse();
+        expect(after.historyRevision).toBe(1);
+        expect(Object.keys(after.checkpoints)).toHaveLength(1);
+        expect(f.pages.size).toBe(1);
       } else {
         expect(result.error?.code).toBe("client_turn_idle_timeout");
         expect(progressEvents).toBe(0);
         expect(cancelled).toBeTrue();
+        expect(after.historyRevision).toBe(0);
+        expect(Object.keys(after.checkpoints)).toHaveLength(0);
       }
+      expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
+        active_http_turns: 0, active_browser_turns: 0,
+        // A successful checkpoint refreshes the native turn; it does not complete that turn.
+        active_remote_turn_idle_leases: generationProgress ? 1 : 0,
+      });
     } finally {
-      worker.run = originalRun;
-      chatGptTurnSessions.clear();
+      worker.run = sourceRun;
       await server.stop(true);
-      await broker.close();
-      rmSync(root, { recursive: true, force: true });
+      await f.dispose();
       if (previousTimeout === undefined) delete process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
       else process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = previousTimeout;
     }
@@ -3554,6 +3672,7 @@ test("a cancelled model request does not replace health from the last completed 
   const aborted = new Promise<void>(resolve => { abortObserved = resolve; });
   let pending = false;
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    accessPolicy: OPENAI_ACCESS,
     // An abandoned upstream attempt is normally kept for the client's retry (#696).
     modelCatalogFetches: new ModelCatalogFetches(0),
     fetchUpstream: async request => {
@@ -3591,6 +3710,7 @@ test("a cancelled model request does not replace health from the last completed 
 test("a web page cannot start or control turns through the loopback route", async () => {
   let adapterTurns = 0;
   const server = startServer({ ...defaultConfig("browser-only"), port: 0, solAvailable: false }, {
+    accessPolicy: OPENAI_ACCESS,
     adapterFactory: () => ({
       name: "browser-origin-test",
       async runTurn(_parsed, _incoming, emit) {
@@ -3637,6 +3757,7 @@ test("a catalog request that outlives the client's deadline completes for its re
   let upstreamCalls = 0;
   let upstreamAborts = 0;
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: async request => {
       upstreamCalls += 1;
       await new Promise<void>((resolve, reject) => {
@@ -3682,6 +3803,7 @@ test("shared catalog attempts stay bound to one request identity and are final o
   const catalog = { models: [{ slug: "native", visibility: "list", supported_reasoning_levels: [] }] };
   const upstream: Array<{ authorization: string | null; aborted: boolean; respond: (response: Response) => void }> = [];
   const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
+    accessPolicy: OPENAI_ACCESS,
     fetchUpstream: request => new Promise<Response>((resolve, reject) => {
       const call = { authorization: request.headers.get("authorization"), aborted: false, respond: resolve };
       upstream.push(call);

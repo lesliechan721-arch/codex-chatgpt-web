@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { inflateSync } from "node:zlib";
 import { chatGptWebImageTokenReserve } from "../../chatgpt-web-models";
 import { parseRequest } from "../../responses/parser";
+import { contextSourceParserModel } from "./context-source-parser";
 import type { CodexMessage, CodexParsedRequest, CodexToolCall } from "../../types";
 import { CONTEXT_LIMITS } from "./context-budget";
 import { hasNativeChatGptInstruction } from "./environment";
@@ -459,7 +460,7 @@ function rawFields(parsed: CodexParsedRequest): {
   let systemIndex = typeof parsed._rawBody.instructions === "string" && parsed._rawBody.instructions.length > 0 ? 1 : 0;
   for (const entry of raw) if (entry.item.role === "system" && (entry.item.type === "message" || entry.item.type === undefined)) {
     let single: CodexParsedRequest;
-    try { single = parseRequest({ model: parsed.modelId, input: [entry.item] }); } catch { continue; }
+    try { single = parseRequest({ model: contextSourceParserModel(parsed), input: [entry.item] }); } catch { continue; }
     const flat = single.context.systemPrompt?.[0];
     if (sameSystems) {
       systems.push({ ...entry, ...(flat !== undefined ? { system_index: systemIndex++ } : {}) });
@@ -515,7 +516,7 @@ function rawFields(parsed: CodexParsedRequest): {
     if (!(entry.item.type === "agent_message" || ["compaction", "compaction_summary", "context_compaction"].includes(String(entry.item.type))
       || entry.item.type === "message" || (!entry.item.type && entry.item.role))) continue;
     let single: CodexParsedRequest;
-    try { single = parseRequest({ model: parsed.modelId, input: [entry.item] }); } catch { continue; }
+    try { single = parseRequest({ model: contextSourceParserModel(parsed), input: [entry.item] }); } catch { continue; }
     for (const candidate of single.context.messages) {
       const signature = messageSignature(candidate);
       const matches = rawMessages.get(signature) ?? []; matches.push(entry); rawMessages.set(signature, matches);

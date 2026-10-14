@@ -97,7 +97,7 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
 > GPT-5.6 和 GPT-6 Pro 保留原有 Bigger Context 容量。
 
 > Luna/Think 可启用实验性分段大上下文。Free 长会话可能丢失较早细节。关闭大上下文时，
-> Luna 保留滚动 checkpoint。Continuity first 保持独立历史预算，不使用分段投递。
+> Luna 保留滚动 checkpoint。适用 Full Native + Launcher 路由使用统一历史预算，网页投递仍遵守原有传输能力。
 
 1. 完成启动器中的必需设置。
 2. 在启动器中打开 **MCP**。请在将使用 ChatGPT 连接器的同一个 OpenAI 账户中创建 Tunnel
@@ -208,7 +208,7 @@ bun run app:package
 
 `dev:launcher` 在 `~/.codex-chatgpt-web-dev` 下使用独立配置和账户。`dev:chat` 使用真实浏览器与压缩流程，并提供明确的模拟工具结果，不改变正常 Codex 路由。设置和命令请参阅 [DEV chat harness](docs/dev-chat.md)。
 
-[会话连续性优先](docs/session-continuity.md)在压缩后保留同一会话；原页面丢失时明确停止，不自动重建。兼容的 Full Native + Launcher 环境会提供可选的 `chatgpt-web-continuity/` 别名；Fresh Conversation Per Turn 仍不兼容。Bigger Context 可以保持开启，仅作用于非 Continuity first 模型。更大的 Codex 历史预算不提高 ChatGPT 单次输入上限，也不改变现有模型。
+[会话连续性](docs/session-continuity.md)在受支持的 Full Native + Launcher 路由中使用统一任务机制和常规 `chatgpt-web/` 模型名。健康且兼容的页面优先复用；普通未完成工作、checkpoint 续接和未提交压缩可在项目权限隔离、真实工具结算、合法来源与实际计划核对后换页恢复。未知 Send、未知结果和停止事实仍有效。Fresh Conversation Per Turn 只改变页面选择；Bigger Context 保留既有能力与 Zero Risk 限制。1,000,000 / 900,000-token Codex 历史预算不扩大网页窗口。物理页面上限仍为五个，清理次数有限。旧前缀配置需改为对应常规模型名，迁移保留 work、stop、checkpoint 和 retry 事实。真实平台验证状态见文档。
 
 </details>
 

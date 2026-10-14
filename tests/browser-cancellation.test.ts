@@ -5,8 +5,9 @@ import { spawnSync } from "node:child_process";
 test("browser cancellation owns rejected operations even when already aborted", () => {
   const source = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   const start = source.indexOf("function withBrowserTurnAbort<T>");
-  const end = source.indexOf("\nexport interface BrowserTurn", start);
+  const end = source.indexOf("\n}\n", start) + 3;
   expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
   const helper = new Bun.Transpiler({ loader: "ts", target: "node" }).transformSync(source.slice(start, end));
   // The packaged helper runs on Node: test process survival, not just the caught
   // outer error. Bun and Node can handle unowned rejections differently.

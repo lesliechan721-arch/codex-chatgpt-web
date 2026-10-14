@@ -12,7 +12,7 @@ explanation. Start with the topic that owns the contract rather than a completed
 | API access, local keys, manual Codex configuration, and restart behavior | [API Key mode](api-key-mode.md) |
 | Upstream routing, explicit model selection, and Codex metadata | [Upstream provider](upstream-provider.md) |
 | Global HTTP/HTTPS proxy authentication and failure handling | [Network proxy](network-proxy.md) |
-| Same-conversation work, checkpoints, retention, and handoff | [Session continuity](session-continuity.md) |
+| Unified tasks, page recovery, checkpoints, retention, and handoff | [Session continuity](session-continuity.md) |
 | Docker desktop, external Codex, private networking, and persistence | [Server deployment](../deploy/server/README.md) |
 | Isolated browser and MCP development | [DEV chat mode](dev-chat.md) |
 | Release gates and the limits of recorded evidence | [Release validation](release-validation.md) |

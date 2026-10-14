@@ -2,7 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { assertLauncherContextDeliveryFeature, LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { assertLauncherContextDeliveryFeature, CONTINUITY_EXECUTION_FENCING_FEATURE, isLauncherKnownUnsentReceipt,
+  LauncherKnownUnsentReceiptError, type LauncherKnownUnsentReceipt,
+  LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
@@ -30,9 +32,19 @@ interface PendingTurn {
   preparing?: boolean;
   submissionReceipt?: Promise<void>;
   submissionReceiptAcknowledgement?: boolean;
+  submissionReceiptAccepted?: boolean;
+  sendActivationAcknowledged?: boolean;
+  terminalReceived?: boolean;
+  receiptTimer?: ReturnType<typeof setTimeout>;
+  abortTimer?: ReturnType<typeof setTimeout>;
+  retirement?: Promise<void>;
+  exiting?: boolean;
 }
 
 const SUBMISSION_RECEIPT_ACK_FEATURE = "submission-receipt-ack-v1";
+export const LAUNCHER_SUBMISSION_RECEIPT_TIMEOUT_MS = 15_000;
+const ABORT_RETIREMENT_TIMEOUT_MS = 15_000;
+const MAX_UNFINISHED_ABORTS = 5;
 
 type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "ready"; features?: string[] }
@@ -55,6 +67,7 @@ type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
       errorType?: string;
       code?: string;
       retryable?: boolean;
+      sendUnsentReceipt?: LauncherKnownUnsentReceipt;
     });
 
 function parseHelperMessage(line: string): HelperMessage {
@@ -188,6 +201,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
     const errorType = message.errorType;
     const code = message.code;
     const retryable = message.retryable;
+    const sendUnsentReceipt = message.sendUnsentReceipt;
     const structured = status !== undefined
       || errorType !== undefined
       || code !== undefined
@@ -203,7 +217,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
         || typeof code !== "string"
         || !code
         || typeof retryable !== "boolean"
-      ))) {
+      )) || (sendUnsentReceipt !== undefined && (code !== "continuity_resource_capacity" || !isLauncherKnownUnsentReceipt(sendUnsentReceipt)))) {
       throw new Error("Launcher browser helper error payload is invalid");
     }
     return {
@@ -217,6 +231,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
         code: code as string,
         retryable: retryable as boolean,
       } : {}),
+      ...(sendUnsentReceipt ? { sendUnsentReceipt: sendUnsentReceipt as LauncherKnownUnsentReceipt } : {}),
     };
   }
   throw new Error("Launcher browser helper emitted an unknown message type");
@@ -229,6 +244,9 @@ export class LauncherBrowserHelperClient {
   private readyReject?: (error: Error) => void;
   private readonly pending = new Map<string, PendingTurn>();
   private helperFeatures = new Set<string>();
+  // A timed-out legacy worker may still emit frames. Do not reuse its trace until its
+  // terminal frame or process exit proves that the old producer has stopped.
+  private readonly unfinishedAborts = new Map<string, { child: ChildProcessWithoutNullStreams; recovery?: ContinuityRecoveryIdentity }>();
 
   constructor(private readonly config: ResolvedBrowserConfig) {}
 
@@ -258,6 +276,9 @@ export class LauncherBrowserHelperClient {
     if (turn.continuity?.recovery && !turn.onSendActivated) {
       throw continuityError("continuity_configuration_conflict", "Recovery requires an acknowledged durable Send boundary before browser submission.");
     }
+    if (turn.continuity?.recovery && !turn.recoveryStoreDirectory?.trim()) {
+      throw continuityError("continuity_configuration_conflict", "Recovery requires the authenticated durable state directory in the browser helper.");
+    }
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
       throw new Error(
@@ -286,6 +307,10 @@ export class LauncherBrowserHelperClient {
       });
     }
     return await new Promise<string>((resolveResult, rejectResult) => {
+        if (this.unfinishedAborts.has(turn.traceId) || this.unfinishedAborts.size >= MAX_UNFINISHED_ABORTS) {
+          rejectResult(new Error("Launcher browser helper still owns an unfinished aborted turn"));
+          return;
+        }
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
@@ -296,6 +321,13 @@ export class LauncherBrowserHelperClient {
         this.pending.set(turn.traceId, pending);
         if (turn.abortSignal) {
           const abortListener = () => {
+            if (this.pending.get(turn.traceId) !== pending) return;
+            if (pending.terminalReceived) {
+              if (!pending.exiting && !pending.retirement) {
+                this.finishWithError(turn.traceId, pending.localFailure ?? new DOMException("ChatGPT web turn aborted", "AbortError"));
+              }
+              return;
+            }
             if (!pending.sent) {
               this.finishWithError(
                 turn.traceId,
@@ -303,6 +335,7 @@ export class LauncherBrowserHelperClient {
               );
               return;
             }
+            this.scheduleAbortRetirement(turn.traceId, pending);
             void this.send({
               type: "abort",
               id: turn.traceId,
@@ -310,6 +343,7 @@ export class LauncherBrowserHelperClient {
                 ? { reason: "compaction_handoff_accepted" }
                 : {}),
             }).catch(error => {
+              if (this.pending.get(turn.traceId) !== pending) return;
               this.finishWithError(
                 turn.traceId,
                 error instanceof Error ? error : new Error(String(error)),
@@ -351,6 +385,8 @@ export class LauncherBrowserHelperClient {
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),
             ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
             ...(turn.continuity ? { continuity: turn.continuity } : {}),
+            ...(turn.recoveryStoreDirectory ? { recoveryStoreDirectory: turn.recoveryStoreDirectory } : {}),
+            ...(turn.recoveryRequestId ? { recoveryRequestId: turn.recoveryRequestId } : {}),
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
@@ -363,7 +399,11 @@ export class LauncherBrowserHelperClient {
           .then(() => {
             if (!progressForwarding.signal.aborted) this.forwardProgress(turn, progressForwarding.signal);
           })
-          .catch(error => this.finishWithError(turn.traceId, error instanceof Error ? error : new Error(String(error))));
+          .catch(error => {
+            if (this.pending.get(turn.traceId) === pending) {
+              this.finishWithError(turn.traceId, error instanceof Error ? error : new Error(String(error)));
+            }
+          });
       });
   }
 
@@ -376,6 +416,7 @@ export class LauncherBrowserHelperClient {
     for (const id of [...this.pending.keys()]) {
       this.finishWithError(id, new DOMException("Launcher browser helper is closing", "AbortError"));
     }
+    this.unfinishedAborts.clear();
     if (!child) return;
     await this.sendTo(child, { type: "shutdown" }).catch(() => {});
     await this.terminateChild(child, 2_000);
@@ -384,7 +425,8 @@ export class LauncherBrowserHelperClient {
   async assertContinuityCompatible(recovery = false): Promise<void> {
     await this.ensureChild();
     if (!this.helperFeatures.has(CONTINUITY_FEATURE) || !this.helperFeatures.has("native-tool-wait-v1")
-      || (recovery && !this.helperFeatures.has(CONTINUITY_RECOVERY_FEATURE))) {
+      || (recovery && (!this.helperFeatures.has(CONTINUITY_RECOVERY_FEATURE)
+        || !this.helperFeatures.has(CONTINUITY_EXECUTION_FENCING_FEATURE)))) {
       throw continuityError("continuity_configuration_conflict", "Update the runtime and browser helper before starting this mode.");
     }
   }
@@ -504,7 +546,14 @@ export class LauncherBrowserHelperClient {
       return;
     }
     const pending = this.pending.get(message.id);
-    if (!pending) return;
+    if (!pending) {
+      const unfinished = this.unfinishedAborts.get(message.id);
+      if (unfinished?.child === child && (message.type === "result" || message.type === "error")
+        && (!unfinished.recovery || (message.recovery && sameContinuityRecoveryIdentity(message.recovery, unfinished.recovery)))) {
+        this.unfinishedAborts.delete(message.id);
+      }
+      return;
+    }
     const recovery = pending.turn.continuity?.recovery;
     if (recovery) {
       if (!message.recovery) {
@@ -514,6 +563,14 @@ export class LauncherBrowserHelperClient {
       if (!sameContinuityRecoveryIdentity(message.recovery, recovery)) return;
     }
     if (message.type === "event") {
+      if (pending.terminalReceived) return;
+      if ((pending.localFailure || pending.turn.abortSignal?.aborted)
+        && message.event !== "submitted") return;
+      if (pending.turn.onSubmitted && !pending.submissionReceiptAccepted
+        && ["text", "reasoning", "commentary", "luna_checkpoint", "completion_fence_begin", "completion_fence_commit"].includes(message.event)) {
+        this.abortWithLocalFailure(message.id, new Error("Launcher browser helper published output before submission receipt persistence"), pending);
+        return;
+      }
       if (pending.turn.taskUpdateProtocol && (
         message.event === "text" || message.event === "completion_fence_begin" || message.event === "completion_fence_commit"
       ) && (!message.candidate || message.candidate.acknowledgedRevision === undefined)) {
@@ -595,7 +652,8 @@ export class LauncherBrowserHelperClient {
           return;
         }
         void Promise.resolve().then(() => pending.turn.onSendActivated?.()).then(() => {
-          if (this.pending.get(message.id) !== pending) return;
+          if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+          pending.sendActivationAcknowledged = true;
           return this.send({ type: "send_activation_ack", id: message.id });
         }).catch(error => this.abortWithLocalFailure(
           message.id,
@@ -604,18 +662,29 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "submitted") {
+        if (recovery && !pending.sendActivationAcknowledged) {
+          this.abortWithLocalFailure(message.id, continuityError("continuity_source_unproven", "The helper submission has no acknowledged Send boundary for this run."), pending);
+          return;
+        }
         if (pending.prepared?.contextPlan && pending.selectedContextPlanId !== pending.prepared.contextPlan.planId) {
           this.abortWithLocalFailure(message.id, new Error("Launcher browser helper submitted without its selected context plan"), pending);
           return;
         }
-        pending.submissionReceipt = (pending.submissionReceipt ?? Promise.resolve())
+        // This exact helper channel may settle its original Send after cancellation or withdrawal.
+        // It cannot grant rights or publish a final answer. Duplicate receipts share one write.
+        if (pending.submissionReceipt) return;
+        const receipt = pending.submissionReceipt = Promise.resolve()
           .then(() => {
-            if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+            if (!recovery && (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted)) return;
             return pending.turn.onSubmitted?.();
-          })
-          .then(() => {
+          });
+        // Keep rejection on the receipt itself: an old helper's result must not turn a
+        // failed persistence callback into success. This separate observer owns the ACK.
+        void receipt.then(() => {
+            pending.submissionReceiptAccepted = true;
             if (!pending.submissionReceiptAcknowledgement || this.pending.get(message.id) !== pending
-              || pending.localFailure || pending.turn.abortSignal?.aborted) return;
+              || pending.terminalReceived || this.child !== child) return;
+            if (!recovery && (pending.localFailure || pending.turn.abortSignal?.aborted)) return;
             return this.send({ type: "submitted_ack", id: message.id });
           }).catch(error => this.abortWithLocalFailure(
             message.id, error instanceof Error ? error : new Error(String(error)), pending,
@@ -723,17 +792,48 @@ export class LauncherBrowserHelperClient {
       else if (message.event === "text" && message.text) pending.turn.onTextDelta(message.text, message.candidate);
       return;
     }
+    if (pending.terminalReceived) return;
+    pending.terminalReceived = true;
+    if (pending.abortTimer) clearTimeout(pending.abortTimer);
+    pending.abortTimer = undefined;
     if (message.type === "result") {
+      if (pending.localFailure || pending.turn.abortSignal?.aborted) {
+        if (pending.retirement) return;
+        this.finishWithError(message.id, pending.localFailure ?? new DOMException("ChatGPT web turn aborted", "AbortError"));
+        return;
+      }
+      if (pending.turn.onSubmitted && !pending.submissionReceipt) {
+        this.finishWithError(message.id, new Error("Launcher browser helper completed without a submission receipt"));
+        return;
+      }
       // An older helper can complete while the daemon is still persisting its receipt.
       // Keep ownership and prepared resources until that receipt has settled too.
+      if (pending.submissionReceipt) {
+        pending.receiptTimer = setTimeout(() => {
+          if (this.pending.get(message.id) !== pending) return;
+          this.finishWithError(message.id, pending.localFailure ?? new Error("Launcher browser helper submission receipt persistence timed out"));
+        }, LAUNCHER_SUBMISSION_RECEIPT_TIMEOUT_MS);
+        pending.receiptTimer.unref?.();
+      }
       void (pending.submissionReceipt ?? Promise.resolve()).then(() => {
-        if (this.pending.get(message.id) !== pending) return;
+        if (this.pending.get(message.id) !== pending || pending.exiting) return;
         this.finish(message.id);
         if (pending.localFailure) pending.reject(pending.localFailure);
+        else if (pending.turn.abortSignal?.aborted) pending.reject(new DOMException("ChatGPT web turn aborted", "AbortError"));
         else pending.resolve(message.text);
+      }, error => {
+        if (this.pending.get(message.id) !== pending || pending.exiting) return;
+        this.finishWithError(message.id, pending.localFailure ?? (error instanceof Error ? error : new Error(String(error))));
       });
     } else if (message.type === "error") {
-      const error = message.status !== undefined
+      const receipt = message.sendUnsentReceipt;
+      const matchingUnsentReceipt = receipt && recovery && pending.turn.recoveryRequestId === receipt.requestId
+        && pending.turn.traceId === receipt.traceId && child.pid === receipt.helperPid
+        && sameContinuityRecoveryIdentity(receipt.recovery, recovery);
+      const error = receipt
+        ? matchingUnsentReceipt ? new LauncherKnownUnsentReceiptError(receipt)
+          : continuityError("continuity_unverified", "The helper returned an unsent receipt for another acquisition.")
+        : message.status !== undefined
         ? new ChatGptWebAdapterError(message.message, {
           status: message.status,
           errorType: message.errorType!,
@@ -743,14 +843,27 @@ export class LauncherBrowserHelperClient {
         : message.name === "AbortError"
           ? new DOMException(message.message, "AbortError")
           : new Error(message.message);
-      this.finish(message.id);
-      pending.reject(pending.localFailure ?? error);
+      // The producer sends a terminal error after Launcher retirement. An already
+      // observed receipt continues independently with its captured original identity.
+      if (pending.retirement) {
+        pending.localFailure ??= error;
+      } else {
+        this.finish(message.id);
+        pending.reject(pending.localFailure ?? error);
+      }
     }
   }
 
   private abortWithLocalFailure(id: string, error: Error, pending: PendingTurn): void {
     if (this.pending.get(id) !== pending || pending.localFailure) return;
     pending.localFailure = error;
+    if (pending.exiting) return;
+    if (pending.terminalReceived) {
+      if (pending.retirement) return;
+      this.finishWithError(id, error);
+      return;
+    }
+    this.scheduleAbortRetirement(id, pending);
     void this.send({ type: "abort", id }).catch(sendError => {
       if (this.pending.get(id) !== pending) return;
       this.finishWithError(
@@ -761,6 +874,35 @@ export class LauncherBrowserHelperClient {
         ),
       );
     });
+  }
+
+  private scheduleAbortRetirement(id: string, pending: PendingTurn): void {
+    if (pending.abortTimer || pending.terminalReceived) return;
+    const child = this.child;
+    if (!child) return;
+    pending.abortTimer = setTimeout(() => {
+      pending.abortTimer = undefined;
+      if (this.pending.get(id) !== pending || pending.terminalReceived) return;
+      this.unfinishedAborts.set(id, { child, recovery: pending.turn.continuity?.recovery });
+      pending.retirement = notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+        phase: "end", traceId: id, helperPid: child.pid!, status: "failed",
+        message: "Launcher browser helper did not finish the aborted turn",
+        ...(pending.turn.continuity?.recovery ? { recovery: pending.turn.continuity.recovery } : {}),
+        ...(pending.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: pending.turn.recoveryStoreDirectory } : {}),
+      }).then(() => {});
+      void pending.retirement.then(() => {
+        if (this.pending.get(id) !== pending) return;
+        if (pending.terminalReceived) this.unfinishedAborts.delete(id);
+        this.finishWithError(id, pending.localFailure ?? new DOMException("ChatGPT web turn aborted", "AbortError"));
+      }, error => {
+        if (this.pending.get(id) !== pending) return;
+        this.finishWithError(id, new AggregateError(
+          [pending.localFailure ?? new DOMException("ChatGPT web turn aborted", "AbortError"), error],
+          "Launcher browser helper could not release the aborted turn",
+        ));
+      });
+    }, ABORT_RETIREMENT_TIMEOUT_MS);
+    pending.abortTimer.unref?.();
   }
 
   /**
@@ -802,14 +944,19 @@ export class LauncherBrowserHelperClient {
   private finish(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
+    if (pending.receiptTimer) clearTimeout(pending.receiptTimer);
+    if (pending.abortTimer) clearTimeout(pending.abortTimer);
+    pending.receiptTimer = undefined;
+    pending.abortTimer = undefined;
     if (pending.abortListener && pending.turn.abortSignal) {
       pending.turn.abortSignal.removeEventListener("abort", pending.abortListener);
     }
     pending.progressForwarding?.abort();
     pending.progressForwarding = undefined;
-    pending.prepared?.release();
+    const prepared = pending.prepared;
     pending.prepared = undefined;
     this.pending.delete(id);
+    prepared?.release();
   }
 
   private finishWithError(id: string, error: Error): void {
@@ -826,24 +973,36 @@ export class LauncherBrowserHelperClient {
     this.readyResolve = undefined;
     this.ready = undefined;
     this.child = undefined;
+    for (const [id, unfinished] of this.unfinishedAborts) {
+      if (unfinished.child === child) this.unfinishedAborts.delete(id);
+    }
     for (const id of [...this.pending.keys()]) {
       const pending = this.pending.get(id);
       if (!pending) continue;
-      void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+      pending.terminalReceived = true;
+      pending.exiting = true;
+      if (pending.abortTimer) clearTimeout(pending.abortTimer);
+      if (pending.receiptTimer) clearTimeout(pending.receiptTimer);
+      pending.abortTimer = undefined;
+      pending.receiptTimer = undefined;
+      const retirement = pending.retirement ?? notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
         phase: "end",
         traceId: id,
         helperPid: child.pid!,
         status: "failed",
         message: "Launcher browser helper exited before completing the turn",
-      }).then(
-        () => this.finishWithError(id, pending.localFailure ?? error),
-        controlError => this.finishWithError(
-          id,
-          new AggregateError(
+        ...(pending.turn.continuity?.recovery ? { recovery: pending.turn.continuity.recovery } : {}),
+        ...(pending.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: pending.turn.recoveryStoreDirectory } : {}),
+      });
+      void retirement.then(
+        () => { if (this.pending.get(id) === pending) this.finishWithError(id, pending.localFailure ?? error); },
+        controlError => {
+          if (this.pending.get(id) !== pending) return;
+          this.finishWithError(id, new AggregateError(
             [pending.localFailure ?? error, controlError instanceof Error ? controlError : new Error(String(controlError))],
             `Launcher browser helper exited and failed to release turn ${id}`,
-          ),
-        ),
+          ));
+        },
       );
     }
   }

@@ -66,7 +66,7 @@ export function captureTaskUpdateSource(
     || !identity.threadId || !identity.turnId || identity.subagentKind
     || execution.capabilityIdentity === undefined || !Array.isArray(body?.input)) return undefined;
   const messages: TaskUpdateSourceMessage[] = [];
-  const continuity = parsed._conversationPolicy === "continuity-first";
+  const continuity = parsed._conversationPolicy === "task";
   const conflictingMessageIds: string[] = [];
   const prefix: unknown[] = [];
   const ids = new Set<string>();
@@ -160,4 +160,19 @@ export function isTaskUpdateRawResult(item: Record<string, unknown>): boolean {
 /** Bind every raw field: parsed text alone loses image/resource/error/metadata evidence. */
 export function taskUpdateRawResultDigest(item: Record<string, unknown>): string {
   return taskUpdateDigest(item);
+}
+
+/** Only the already admitted native request supplies bodies for durable update digests. */
+export function recoveryTaskUpdateSources(parsed: CodexParsedRequest): Array<{ sourceMessageId: string; payloadDigest: string; content: string }> {
+  const sources = [...(captureTaskUpdateSource(parsed, { capabilityIdentity: "durable-recovery-source" })?.messages ?? [])];
+  const body = record(parsed._rawBody);
+  for (const raw of Array.isArray(body?.input) ? body.input : []) {
+    const item = record(raw), metadata = record(item?.internal_chat_message_metadata_passthrough);
+    if (typeof metadata?.turn_id !== "string") continue;
+    const user = trustedChatGptTaskUpdateUserText(item, metadata.turn_id);
+    if (!user) continue;
+    sources.push({ sourceMessageId: parsed._chatGptMessageIdAliases?.[user.sourceMessageId] ?? user.sourceMessageId,
+      payloadDigest: taskUpdateDigest(user.content), content: user.content, representationDigest: taskUpdateDigest(instructionRepresentation(user.item)) });
+  }
+  return sources.map(({ sourceMessageId, payloadDigest, content }) => ({ sourceMessageId, payloadDigest, content }));
 }

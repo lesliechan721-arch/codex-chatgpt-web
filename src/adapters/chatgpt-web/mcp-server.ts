@@ -22,7 +22,7 @@ const turnTokenSchema = z.string().min(20).max(256);
 const operationIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
   .describe("Allocate the next positive operation_id before the first call. Retry and wait reuse it. A new logical operation needs a new ID. Keep this counter across reconnects within the same capability.");
 const taskRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
-  .describe("Required for every Native start in task-updates-v1, initially 0. Pass the exact acknowledged task revision. An identical start retry retains its original revision; never upgrade an old operation or infer the current revision.");
+  .describe("Required for every Native start in task-updates-v1. Pass the exact acknowledged task_revision from this request's task contract or the Broker ACK reply. A recovered stream can start above 0. An identical start retry retains its original revision; never upgrade an old operation or infer the current revision.");
 // An infrastructure deadline, not a Native operation deadline. Broker queries normally settle at 30 seconds.
 export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 export function chatGptMcpInvocationTimeout<T extends object>(environment: T & { expiresAt?: number }, now = Date.now()): number {
@@ -107,7 +107,7 @@ function requestScopeSummary(extra: McpRequestExtra): string {
 export async function runChatGptMcpServer(options: { brokerSocketPath: string; contract?: ChatGptMcpContract }): Promise<void> {
   const contract = options.contract ?? "native";
   const instructions = contract === "safe"
-    ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete and its exact acknowledged task_revision (initially 0). " + NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS
+    ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete and the exact acknowledged task_revision from this request's task contract or the Broker ACK reply. " + NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS
     : NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS;
   const server = new McpServer({ name: contract === "safe" ? "codex-safe" : "codex-native", version: VERSION }, { instructions });
 
@@ -287,7 +287,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
         ? "List tools available to the connected Zero Risk request, including configured MCP and app tools."
         : (contract === "safe" ? "For a Zero Risk request connected by codex_turn_start. " : "") + info.description)
         + " Allocate operation_id before the first call; reuse it for retry/wait. Pending requires codex_tool_wait, not another execution."
-        + " In task-updates-v1 every Native start, including inventory, requires the exact acknowledged task_revision (initially 0); a start retry retains its original revision."
+        + " In task-updates-v1 every Native start, including inventory, requires the exact acknowledged task_revision from this request's task contract or the Broker ACK reply; a recovered stream can start above 0, and a start retry retains its original revision."
         + (contract === "native" && entry === "codex_tool_call" ? " Only codex.control.compaction_handoff is exempt from operation_id and task_revision." : ""),
       inputSchema,
       annotations: { readOnlyHint: info.readOnly, destructiveHint: !info.readOnly, idempotentHint: true, openWorldHint: !info.readOnly && entry !== "codex_apply_patch" },
@@ -353,7 +353,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
           request_id: turnTokenSchema,
           final_answer: z.string().min(1).max(5_000_000),
           task_revision: taskRevisionSchema.optional()
-            .describe("The exact acknowledged task revision for this complete answer. Omission is allowed only for an initial revision-0 answer; it never upgrades an answer to a later revision."),
+            .describe("The exact acknowledged task revision for this complete answer. Omission is allowed only when both acknowledged and accepted revisions are 0; it never upgrades an answer to a later revision."),
         },
         outputSchema: {
           completed: z.literal(true),

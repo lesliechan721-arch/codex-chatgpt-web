@@ -21,15 +21,6 @@ export const DEV_CHAT_MODELS = [
   "chatgpt-web/high",
   "chatgpt-web/extra-high",
   "chatgpt-web/pro",
-  // Parsing/persistence does not bypass trusted route release and mode admission checks.
-  "chatgpt-web-continuity/gpt-6-sol-instant",
-  "chatgpt-web-continuity/gpt-6-sol",
-  "chatgpt-web-continuity/gpt-5.6-sol-instant",
-  "chatgpt-web-continuity/gpt-5.6-sol",
-  "chatgpt-web-continuity/gpt-5.6-pro",
-  "chatgpt-web-continuity/gpt-6-pro",
-  "chatgpt-web-continuity/zero-risk",
-  "chatgpt-web-continuity/zero-risk-pro",
 ] as const;
 
 export type DevChatModel = typeof DEV_CHAT_MODELS[number];
@@ -102,6 +93,10 @@ function newThreadId(): string {
 }
 
 function parseState(value: unknown, path: string): DevChatState {
+  if (value && typeof value === "object" && "model" in value
+    && typeof value.model === "string" && value.model.startsWith("chatgpt-web-continuity/")) {
+    throw new Error(`The saved DEV model was removed. Change it to ${value.model.replace("chatgpt-web-continuity/", "chatgpt-web/")} in ${path}.`);
+  }
   const parsed = stateSchema.safeParse(value);
   if (!parsed.success) throw new Error(`Invalid DEV chat state in ${path}: ${parsed.error.message}`);
   if (parsed.data.name !== assertDevChatName(parsed.data.name)) {

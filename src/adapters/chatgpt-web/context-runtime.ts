@@ -36,6 +36,7 @@ export interface ContextStatus {
 }
 export interface CompactionContextRegistration {
   snapshot: ContextSnapshot;
+  recovery?: import("./continuity-recovery-runtime").RuntimeRecoveryReference;
   contract: "native" | "safe";
   /** Existing explicit manual compaction input, prepared before its original start/Sent. */
   explicitManual?: true;
