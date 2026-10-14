@@ -130,6 +130,37 @@ test("failed child ledger writes preserve results and make recovered reports inc
   } finally { rmSync(directory, { recursive: true, force: true }); rmSync(directory + ".held", { recursive: true, force: true }); }
 });
 
+test("profiled Bun test children keep native process identities and bypass package scripts", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cgw-test-child-"));
+  const tracker = resolve(import.meta.dir, "../scripts/test-performance-children.ts");
+  try {
+    const reports = join(directory, "reports"); mkdirSync(reports);
+    writeFileSync(join(directory, "package.json"), JSON.stringify({ scripts: { test: "exit 73" } }));
+    writeFileSync(join(directory, "pid.test.ts"), `import { test } from "bun:test";
+      test("actual process", () => console.info("ACTUAL_PID", process.pid));`);
+    const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", CGW_RUNTIME_PERFORMANCE_DIR: reports,
+      CGW_PERFORMANCE_RUN_ID: "run", CGW_PERFORMANCE_PROCESS_ID: "root", CGW_PERFORMANCE_ROOT_PROCESS_ID: "root", CGW_PERFORMANCE_CONTEXT: "" };
+    delete env.BUN_TEST_WORKER_ID;
+    const child = Bun.spawnSync([process.execPath, "-e", `
+      import { trackTestChildren } from ${JSON.stringify(tracker)};
+      trackTestChildren();
+      for (const objectForm of [false, true]) {
+        const command = [process.execPath, "test", "./pid.test.ts"];
+        const options = { stdout: "pipe", stderr: "pipe" };
+        const sync = objectForm ? Bun.spawnSync({ ...options, cmd: command }) : Bun.spawnSync(command, options);
+        if (sync.exitCode !== 0 || Number(sync.stdout.toString().match(/ACTUAL_PID (\\d+)/)?.[1]) !== sync.pid) throw Error(sync.stderr.toString() || "sync child PID changed");
+        const asyncChild = objectForm ? Bun.spawn({ ...options, cmd: command }) : Bun.spawn(command, options);
+        const [stdout, stderr, exitCode] = await Promise.all([new Response(asyncChild.stdout).text(), new Response(asyncChild.stderr).text(), asyncChild.exited]);
+        if (exitCode !== 0 || Number(stdout.match(/ACTUAL_PID (\\d+)/)?.[1]) !== asyncChild.pid) throw Error(stderr || "async child PID changed");
+      }
+    `], { cwd: directory, env, stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+    expect(child.exitCode, `${child.stdout.toString()}\n${child.stderr.toString()}`).toBe(0);
+    const metrics = collectPerformanceReports(reports, "run", "root", child.pid);
+    expect({ complete: metrics.complete, reasons: metrics.incompleteReasons, invalid: metrics.invalidReports }).toEqual({ complete: true, reasons: [], invalid: [] });
+    expect(metrics.totals["process.start"]?.count).toBe(4);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("performance test registration preserves modifiers, row arguments and done completion", () => {
   const directory = mkdtempSync(join(tmpdir(), "cgw-registration-"));
   const wrapper = resolve(import.meta.dir, "helpers/performance-test.ts");
@@ -201,7 +232,11 @@ test("performance test registration preserves modifiers, row arguments and done 
 });
 
 for (const failRelease of [false, true]) test(`retained cleanup attributes both actual page releases (failure=${failRelease})`, () => {
-  const directory = mkdtempSync(join(tmpdir(), "cgw-release-metrics-"));
+  // defaultConfig uses Bun.main for the service command. Keep this generated
+  // entry in the checkout so the real durable-command check also works on Linux.
+  const fixtures = resolve(import.meta.dir, "../output/runtime-performance-fixtures");
+  mkdirSync(fixtures, { recursive: true });
+  const directory = mkdtempSync(join(fixtures, "cgw-release-metrics-"));
   const helper = resolve(import.meta.dir, "helpers/retained-compaction-fixture.ts");
   const preload = resolve(import.meta.dir, "../scripts/test-performance-preload.ts");
   try {
@@ -221,7 +256,6 @@ for (const failRelease of [false, true]) test(`retained cleanup attributes both 
           }
           return native(...args);
         };
-        process.argv = [process.execPath, ${JSON.stringify(resolve(import.meta.dir, "../src/cli.ts"))}];
         const fixture = retainedTaskFixture();
         try {
           const source = await fixture.send(fixture.body); expect(source.status).toBe(200);
@@ -241,7 +275,7 @@ for (const failRelease of [false, true]) test(`retained cleanup attributes both 
     const child = Bun.spawnSync([process.execPath, "test", "--preload", preload, file], { env,
       stdout: "pipe", stderr: "pipe", timeout: 10_000,
     });
-    expect(child.exitCode).toBe(0);
+    expect(child.exitCode, `${child.stdout.toString()}\n${child.stderr.toString()}`).toBe(0);
     const metrics = collectPerformanceReports(reports, "run", "root", child.pid);
     expect({ complete: metrics.complete, reasons: metrics.incompleteReasons, invalid: metrics.invalidReports }).toEqual({ complete: true, reasons: [], invalid: [] });
     expect(metrics.totals["cleanup.release"]?.count).toBe(2);
