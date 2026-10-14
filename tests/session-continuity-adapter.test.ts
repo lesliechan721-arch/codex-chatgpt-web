@@ -8272,7 +8272,7 @@ test.skipIf(!process.env.REPAIR11_CHECKPOINT_SEED_ROOT)("repair11 child checkpoi
 }, 30000);
 
 for (const marker of [false, true]) for (const turnOnly of [false, true]) test(`repair11: checkpoint sibling proofs survive an actual backend exit marker=${marker} turnOnly=${turnOnly}`, async () => {
-  const root = mkdtempSync(join("/tmp", "repair11-restarted-"));
+  const root = mkdtempSync(join(tmpdir(), "repair11-restarted-"));
   cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
   const log = Bun.file(join(root, "child.log"));
   const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^repair11 child checkpoint seed$"], {

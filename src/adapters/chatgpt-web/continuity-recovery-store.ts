@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, win32 } from "node:path";
 import { atomicWriteFile } from "../../config";
+import { measureRuntimeOperation } from "../../runtime-performance";
 import { continuityError } from "./continuity-errors";
 import { moveContinuityLockWithoutReplacement } from "./continuity-lock-windows";
 import { assertContextCoverageAdvance, validateContextCoverageJournal, validateContextCoverageReservations, type ContextCoverageJournalEntry, type ContextCoverageReservation } from "./context-coverage-journal";
@@ -171,6 +172,9 @@ function dictionary(value: unknown): asserts value is Record<string, unknown> { 
 function mapping(value: unknown): void { dictionary(value); for (const [key, number] of Object.entries(value)) { identity(key); integer(number); } }
 export function continuityProcessStartIdentity(pid: number): string | null {
   if (!Number.isSafeInteger(pid) || pid < 1 || pid > 2147483647) return null;
+  return measureRuntimeOperation("processIdentity", () => probeProcessStartIdentity(pid));
+}
+function probeProcessStartIdentity(pid: number): string | null {
   try {
     if (process.platform === "linux") {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -285,14 +289,14 @@ export function withContinuityStorageLock<T>(lock: string, operation: () => T): 
 }
 function syncStoredFile(path: string): void {
   // Windows FlushFileBuffers requires write access; r+ preserves existing bytes.
-  const fd = openSync(path, process.platform === "win32" ? "r+" : "r"); try { fsyncSync(fd); } finally { closeSync(fd); }
-  if (process.platform !== "win32") { const directoryFd = openSync(join(path, ".."), "r"); try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); } }
+  const fd = openSync(path, process.platform === "win32" ? "r+" : "r"); try { measureRuntimeOperation("fsync.file", () => fsyncSync(fd)); } finally { closeSync(fd); }
+  if (process.platform !== "win32") { const directoryFd = openSync(join(path, ".."), "r"); try { measureRuntimeOperation("fsync.directory", () => fsyncSync(directoryFd)); } finally { closeSync(directoryFd); } }
 }
 function durableWrite(path: string, encoded: string, afterAtomicReplace?: () => void): void {
   atomicWriteFile(path, encoded, { durable: true });
   afterAtomicReplace?.();
   // The rename and its containing directory must survive a machine interruption too.
-  if (process.platform !== "win32") { const fd = openSync(join(path, ".."), "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+  if (process.platform !== "win32") { const fd = openSync(join(path, ".."), "r"); try { measureRuntimeOperation("fsync.directory", () => fsyncSync(fd)); } finally { closeSync(fd); } }
 }
 function validateAttempt(value: unknown): asserts value is RecoveryAttemptRecord {
   exact(value, ["attempt", "epoch", "historyRevision", "snapshotVersion", "snapshotDigest", "stage", "dispatchProtocolComplete", "writerRetired"], ["pageReceiptId", "transactionId", "transactionVersion", "launcherInstance", "sendEvidence", "acquisitionEvidence"]);

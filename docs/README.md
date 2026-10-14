@@ -15,6 +15,7 @@ explanation. Start with the topic that owns the contract rather than a completed
 | Unified tasks, page recovery, checkpoints, retention, and handoff | [Session continuity](session-continuity.md) |
 | Docker desktop, external Codex, private networking, and persistence | [Server deployment](../deploy/server/README.md) |
 | Isolated browser and MCP development | [DEV chat mode](dev-chat.md) |
+| CI timings and controlled test parallelism | [CI test performance](ci-performance.md) |
 | Release gates and the limits of recorded evidence | [Release validation](release-validation.md) |
 
 ## Document lifetime

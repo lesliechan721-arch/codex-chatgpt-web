@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -556,7 +557,7 @@ test("a late old receipt cannot acknowledge or finish a new run that reuses the 
   } finally { oldReceipt.resolve(); nextReceipt.resolve(); await client.close(); }
 });
 
-for (const failCleanup of [false, true]) test(`a real helper retires only the aborted run and ${failCleanup ? "reports failed cleanup" : "holds resources until cleanup"}`, async () => {
+for (const fragmentProtocol of [false, true]) for (const failCleanup of [false, true]) test(`a real helper retires only the aborted run and ${failCleanup ? "reports failed cleanup" : "holds resources until cleanup"}${fragmentProtocol ? " with fragmented protocol" : ""}`, async () => {
   const endReceived = deferred(), endReleased = deferred(), workerReleased = deferred(), workerSettled = deferred();
   const started = deferred();
   let endpoint: string;
@@ -575,7 +576,33 @@ for (const failCleanup of [false, true]) test(`a real helper retires only the ab
   endpoint = `http://127.0.0.1:${server.port}`;
   const source = `
     const originalTimer = globalThis.setTimeout;
-    globalThis.setTimeout = (callback, delay, ...args) => originalTimer(callback, delay === 15000 ? 20 : delay, ...args);
+    // This fixture has no context-plan or submission-receipt timers. Its first
+    // 15s timer is the abort watchdog; leave the later HTTP cleanup deadline intact.
+    let shortenedWatchdog = false;
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      if (delay === 15000 && !shortenedWatchdog) {
+        shortenedWatchdog = true;
+        return originalTimer(callback, 20, ...args);
+      }
+      return originalTimer(callback, delay, ...args);
+    };
+    ${fragmentProtocol ? `
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    let outputTail = Promise.resolve();
+    process.stdout.write = (chunk, encoding, callback) => {
+      const done = typeof encoding === "function" ? encoding : callback;
+      const line = String(chunk);
+      outputTail = outputTail.then(async () => {
+        for (let offset = 0; offset < line.length; offset += 17) {
+          await new Promise((resolve, reject) => originalWrite(line.slice(offset, offset + 17), error => error ? reject(error) : resolve()));
+          await new Promise(resolve => originalTimer(resolve, 1));
+        }
+        done?.();
+      });
+      void outputTail.catch(error => done?.(error));
+      return true;
+    };
+    ` : ""}
     import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       await turn.onPreparedSelected(false);
@@ -594,6 +621,68 @@ for (const failCleanup of [false, true]) test(`a real helper retires only the ab
   const client = new LauncherBrowserHelperClient(config);
   const stop = new AbortController();
   let releases = 0, settled = false;
+  // Keep stage failures inside the test, before Bun's outer timeout kills the
+  // process and hides which pipe or retirement boundary stopped progressing.
+  const frames: string[] = [];
+  const record = (frame: string) => { frames.push(frame); if (frames.length > 24) frames.shift(); };
+  const internal = client as unknown as {
+    child?: ChildProcessWithoutNullStreams;
+    pending: Map<string, { preparing?: boolean; prepared?: unknown; terminalReceived?: boolean; retirement?: Promise<void> }>;
+    unfinishedAborts: Map<string, unknown>;
+    send(message: { type?: string; id?: string }): Promise<void>;
+    sendTo(child: ChildProcessWithoutNullStreams, message: unknown): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  if (fragmentProtocol) {
+    // Pipe chunks need not align with JSON frames. Queue complete frames so the
+    // delayed chunks preserve the transport's normal write order in both directions.
+    let inputTail = Promise.resolve();
+    internal.sendTo = (child, message) => {
+      const encoded = `${JSON.stringify(message)}\n`;
+      const next = inputTail.then(async () => {
+        for (let offset = 0; offset < encoded.length; offset += 64) {
+          await new Promise<void>((resolve, reject) => child.stdin.write(encoded.slice(offset, offset + 64), error => error ? reject(error) : resolve()));
+          await Bun.sleep(1);
+        }
+      });
+      inputTail = next.catch(() => {});
+      return next;
+    };
+  }
+  const send = internal.send.bind(client);
+  internal.send = async message => {
+    const frame = `${message.type}:${message.id ?? "helper"}`;
+    record(`write-start:${frame}`);
+    try { await send(message); record(`write-complete:${frame}`); }
+    catch (error) { record(`write-failed:${frame}`); throw error; }
+  };
+  const handleLine = internal.handleLine.bind(client);
+  internal.handleLine = (child, line) => {
+    try {
+      const frame = JSON.parse(line) as { type: string; id?: string; event?: string };
+      record(`read:${frame.type}:${frame.id ?? "helper"}${frame.event ? `:${frame.event}` : ""}`);
+    } catch { record("read:invalid-json"); }
+    handleLine(child, line);
+  };
+  const withinStage = async <T>(name: string, operation: Promise<T>): Promise<T> => {
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const child = internal.child;
+        const state = {
+          child: child ? { pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode,
+            killed: child.killed, inputDestroyed: child.stdin.destroyed, inputEnded: child.stdin.writableEnded,
+            inputBufferedBytes: child.stdin.writableLength } : null,
+          pending: [...internal.pending].map(([id, turn]) => ({ id, preparing: Boolean(turn.preparing),
+            prepared: Boolean(turn.prepared), terminalReceived: Boolean(turn.terminalReceived), retiring: Boolean(turn.retirement) })),
+          unfinishedAborts: internal.unfinishedAborts.size, releases, settled, ended,
+        };
+        reject(new Error(`Helper retirement stage '${name}' stalled for 5000ms; state=${JSON.stringify(state)}; frames=${JSON.stringify(frames)}`));
+      }, 5_000);
+    });
+    try { return await Promise.race([operation, deadline]); }
+    finally { clearTimeout(timer); }
+  };
   const base: BrowserTurn = { traceId: "ignored_abort_worker", modelId: "gpt-6-sol",
     capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
     prepare: async () => ({ text: "ordinary", images: [], release() { releases++; } }), onTextDelta() {},
@@ -601,26 +690,28 @@ for (const failCleanup of [false, true]) test(`a real helper retires only the ab
   try {
     const outcome = client.run({ ...base, abortSignal: stop.signal, onHeartbeat() { started.resolve(); } })
       .catch(error => error).finally(() => { settled = true; });
-    await started.promise;
+    await withinStage("aborted worker prepared and started", started.promise);
     stop.abort();
-    await endReceived.promise;
+    await withinStage("watchdog target cleanup started", endReceived.promise);
     expect(settled).toBeFalse();
     expect(releases).toBe(0);
     // Let the underlying worker settle while its watchdog target-end is still blocked.
     workerReleased.resolve();
-    await workerSettled.promise;
-    await expect(client.run({ ...base, traceId: "healthy_sibling_worker" })).resolves.toBe("other run remains healthy");
+    await withinStage("aborted worker reached settlement", workerSettled.promise);
+    expect(await withinStage("healthy sibling during cleanup", client.run({ ...base, traceId: "healthy_sibling_worker" })))
+      .toBe("other run remains healthy");
     expect(settled).toBeFalse();
     expect(releases).toBe(1);
     endReleased.resolve();
-    const error = await outcome;
+    const error = await withinStage("target cleanup and aborted terminal", outcome);
     expect(error).toBeInstanceOf(Error);
     if (failCleanup) expect(error.message).toContain("could not release the aborted turn");
     else expect(error.name).toBe("AbortError");
     expect(releases).toBe(2);
     expect(ended).toEqual(["ignored_abort_worker"]);
     // The already settled worker must not leave a tombstone or affect later runs.
-    await expect(client.run({ ...base, traceId: "healthy_after_retirement" })).resolves.toBe("other run remains healthy");
+    expect(await withinStage("healthy run after retirement", client.run({ ...base, traceId: "healthy_after_retirement" })))
+      .toBe("other run remains healthy");
   } finally { workerReleased.resolve(); endReleased.resolve(); await client.close(); server.stop(true); }
 });
 

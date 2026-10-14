@@ -480,14 +480,19 @@ test("a settled browser response without a checkpoint reports the missing handof
     usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest), conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
   });
   const abort = new AbortController();
-  const guard = setTimeout(() => abort.abort(new Error("test observation guard")), 1000);
+  let guard: ReturnType<typeof setTimeout> | undefined;
   try {
     await expect(requestRetainedCompactionHandoff(
-      { run: async () => "The requested tool call did not run." } as never,
+      { run: async () => {
+        // Observe the settled response; broker startup and source preparation precede it.
+        guard = setTimeout(() => abort.abort(new Error("test observation guard")), 1000);
+        return "The requested tool call did not run.";
+      } } as never,
       request(true), source, broker,
       { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
       "trace_missing_handoff", abort.signal,
     )).rejects.toMatchObject({ code: "compaction_handoff_missing", retryable: false });
+    expect(guard).toBeDefined();
   } finally {
     clearTimeout(guard);
     await broker.close();

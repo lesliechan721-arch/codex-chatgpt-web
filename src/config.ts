@@ -12,6 +12,7 @@ import type { CodexProviderConfig, ToolAuthorityMode } from "./types";
 import { effectiveToolAuthorityMode } from "./server-remote-config";
 import { VERSION } from "./version";
 import { DEV_NATIVE_LONG_WAIT_CONNECTOR_NAME } from "./native-tool-long-wait-probe";
+import { measureRuntimeOperation } from "./runtime-performance";
 
 export type RuntimeMode = "browser-only" | "full";
 export type BrowserHostMode = "managed-chrome" | "launcher";
@@ -219,7 +220,7 @@ function renameAtomicFile(source: string, destination: string): void {
         && (code === "EBUSY" || code === "EPERM" || code === "EACCES");
       const delay = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt];
       if (!transientWindowsError || delay === undefined) throw error;
-      Atomics.wait(atomicWaitCell, 0, 0, delay);
+      measureRuntimeOperation("rename.retryWait", () => Atomics.wait(atomicWaitCell, 0, 0, delay));
     }
   }
 }
@@ -238,7 +239,7 @@ export function atomicWriteFile(
   const fd = openSync(temp, "wx", mode);
   try {
     writeFileSync(fd, data);
-    if (durable) fsyncSync(fd);
+    if (durable) measureRuntimeOperation("fsync.file", () => fsyncSync(fd));
     closeSync(fd);
     renameAtomicFile(temp, path);
   } catch (error) {

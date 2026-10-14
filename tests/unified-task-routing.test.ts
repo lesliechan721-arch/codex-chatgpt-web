@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config";
 import { availableChatGptWebModelRoutes, requireChatGptWebModelRoute, resolveChatGptWebHistoryLimits, resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
@@ -17,7 +18,7 @@ import type { CodexProviderConfig } from "../src/types";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function provider(): CodexProviderConfig {
-  const root = mkdtempSync("/tmp/cgw-task-routing-"); roots.push(root);
+  const root = mkdtempSync(join(tmpdir(), "cgw-task-routing-")); roots.push(root);
   return { adapter: "chatgpt-web", baseUrl: "https://chatgpt.com", chatgptWeb: {
     browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
     continuityStateDirectory: join(root, "task-state"), localToolsEnabled: true,

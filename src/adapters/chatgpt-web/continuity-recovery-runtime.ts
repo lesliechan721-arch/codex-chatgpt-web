@@ -455,9 +455,8 @@ export async function retireRecoveryWriter(
   const attempt = work?.attempts.at(-1);
   if (attempt) {
     // A live instance must prove this protocol, not merely be running new files on disk.
-    const processExited = continuityProcessInstanceStatus(observed.owner) === "exited";
     if (bindings.broker?.assertRecoveryFencing) await bindings.broker.assertRecoveryFencing();
-    else if (!processExited) throw continuityError("continuity_configuration_conflict", "The running Broker cannot prove execution generation fencing; update and restart it.");
+    else if (continuityProcessInstanceStatus(observed.owner) !== "exited") throw continuityError("continuity_configuration_conflict", "The running Broker cannot prove execution generation fencing; update and restart it.");
     // This CAS and dispatch registration use the same storage lock. After this commit,
     // every old process observes the fence even if cancellation or cleanup loses its reply.
     const current = bindings.recoveryStore.get(observed.thread)!;

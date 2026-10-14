@@ -29,6 +29,8 @@
     "dev:launcher": "bun run src/cli.ts dev launcher",
     "dev:chat": "bun run src/cli.ts dev chat",
     "test": "bun test --timeout 30000 ./tests",
+    "test:profile": "bun run scripts/profile-tests.ts",
+    "test:parallel": "bun run scripts/profile-tests.ts --parallel=2",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
     "typecheck": "bun x --no-install --bun tsc --noEmit",
