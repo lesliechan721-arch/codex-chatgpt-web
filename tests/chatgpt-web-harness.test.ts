@@ -13,6 +13,7 @@ import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation
 import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptDelegatedTurnCapability, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
+import { scheduleChatGptWebHeartbeat, type ChatGptWebHeartbeatScheduler } from "../src/adapters/chatgpt-web/heartbeat";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
@@ -4356,14 +4357,41 @@ describe("adapter liveness covers every path through a turn", () => {
     return request;
   }
 
-    async function observeLiveness(
+  function barrier<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(done => { resolve = done; });
+    return { promise, resolve };
+  }
+
+  function manualHeartbeatScheduler() {
+    const callbacks = new Set<() => void>();
+    const intervals: number[] = [];
+    const schedule: ChatGptWebHeartbeatScheduler = (callback, intervalMs) => {
+      intervals.push(intervalMs);
+      callbacks.add(callback);
+      return () => { callbacks.delete(callback); };
+    };
+    return { schedule, intervals, callbacks, tick: () => { for (const callback of callbacks) callback(); } };
+  }
+
+  type ObservedTurn = {
+    abort: AbortController;
+    events: AdapterEvent[];
+    running: Promise<void>;
+  };
+
+  async function observeLiveness(
     label: string,
-    observeMs: number,
+    heartbeatScheduler: ChatGptWebHeartbeatScheduler,
     drive: (
-      provider: CodexProviderConfig,
-      run: (request: CodexParsedRequest, emit: (event: AdapterEvent) => void, signal: AbortSignal) => Promise<void>,
-    ) => Promise<{ heartbeats: number[]; stop: () => void }>,
-  ): Promise<number[]> {
+      fixture: {
+        provider: CodexProviderConfig;
+        browserStarted: Promise<BrowserTurn>;
+        browserTurns: Array<{ turn: BrowserTurn; complete: () => void }>;
+        run: (request: CodexParsedRequest, emit?: (event: AdapterEvent) => void) => ObservedTurn;
+      },
+    ) => Promise<void>,
+  ): Promise<void> {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://liveness-${label}-${Date.now()}`,
@@ -4371,53 +4399,92 @@ describe("adapter liveness covers every path through a turn", () => {
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
-    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = () => new Promise<string>(() => {});
+    const browserStarted = barrier<BrowserTurn>();
+    const browserTurns: Array<{ turn: BrowserTurn; complete: () => void }> = [];
+    const observed: Array<ObservedTurn & { request: CodexParsedRequest; settled: Promise<PromiseSettledResult<void>> }> = [];
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = turn => {
+      const answer = barrier<string>();
+      let completed = false;
+      browserTurns.push({ turn, complete: () => {
+        if (completed) return;
+        completed = true;
+        turn.onTextDelta("browser completed");
+        answer.resolve("browser completed");
+      } });
+      browserStarted.resolve(turn);
+      return answer.promise;
+    };
     try {
-      const run = async (
+      const adapter = createChatGptWebAdapter(provider, { heartbeatScheduler });
+      const run = (
         request: CodexParsedRequest,
-        emit: (event: AdapterEvent) => void,
-        signal: AbortSignal,
-      ) => {
-        await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers(), abortSignal: signal }, emit);
+        emit: (event: AdapterEvent) => void = () => {},
+      ): ObservedTurn => {
+        const abort = new AbortController();
+        const events: AdapterEvent[] = [];
+        const running = adapter.runTurn!(request, { headers: new Headers(), abortSignal: abort.signal }, event => {
+          events.push(event);
+          emit(event);
+        });
+        // Attach the rejection handler immediately, then await every observer during cleanup.
+        const settled = Promise.allSettled([running]).then(results => results[0]!);
+        const turn = { request, abort, events, running, settled };
+        observed.push(turn);
+        return turn;
       };
-      const { heartbeats, stop } = await drive(provider, run);
-      await Bun.sleep(observeMs);
-      stop();
-      return heartbeats;
+      await drive({ provider, browserStarted: browserStarted.promise, browserTurns, run });
     } finally {
-      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      try {
+        for (const turn of observed) turn.abort.abort();
+        for (const browser of browserTurns) browser.complete();
+        await Promise.all(observed.map(turn => turn.settled));
+        for (const turn of observed) {
+          await chatGptTurnSessions.retireAndWait(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(turn.request)}`);
+        }
+      } finally {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
     }
   }
 
   test("a turn blocked waiting for the previous owner to retire still proves it is alive", async () => {
-    const started = Date.now();
-    const heartbeats = await observeLiveness(
-      "owner-retirement",
-      CHATGPT_WEB_ADAPTER_HEARTBEAT_MS + 2_000,
-      async (_provider, run) => {
-        const holder = new AbortController();
-        const blocked = new AbortController();
-        const beats: number[] = [];
-        // The first turn owns the thread and never physically settles, so the second turn parks in
-        // getOrCreateAfterOwnerRetirement before any session — and before any per-session wiring —
-        // exists to speak for it.
-        void run(livenessRequest("turn_live_1", "thread_live", false), () => {}, holder.signal).catch(() => {});
-        await Bun.sleep(250);
-        void run(
-          livenessRequest("turn_live_2", "thread_live", false),
-          event => { if (event.type === "heartbeat") beats.push(Date.now() - started); },
-          blocked.signal,
-        ).catch(() => {});
-        return { heartbeats: beats, stop: () => { blocked.abort(); holder.abort(); } };
-      },
-    );
+    const scheduler = manualHeartbeatScheduler();
+    await observeLiveness("owner-retirement", scheduler.schedule, async ({ provider, browserStarted, browserTurns, run }) => {
+      // The first turn owns the thread and never physically settles, so the second turn parks in
+      // getOrCreateAfterOwnerRetirement before any session — and before any per-session wiring —
+      // exists to speak for it.
+      const owner = run(livenessRequest("turn_live_1", "thread_live", false));
+      await browserStarted;
+      const waitingForOwner = barrier<void>();
+      const originalWait = chatGptTurnSessions.getOrCreateAfterOwnerRetirement.bind(chatGptTurnSessions);
+      const wait = spyOn(chatGptTurnSessions, "getOrCreateAfterOwnerRetirement").mockImplementation((...args) => {
+        const result = originalWait(...args);
+        if (args[5] === "turn_live_2") waitingForOwner.resolve();
+        return result;
+      });
+      try {
+        const request = livenessRequest("turn_live_2", "thread_live", false);
+        const blocked = run(request);
+        // The initial event is synchronous, before the owner wait or any scheduler tick.
+        expect(blocked.events).toEqual([{ type: "heartbeat" }]);
+        await waitingForOwner.promise;
+        expect(browserTurns).toHaveLength(1);
+        expect(chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`)).toBeUndefined();
+        expect(scheduler.intervals).toEqual([10_000, 10_000]);
+        scheduler.tick();
+        expect(blocked.events).toEqual([{ type: "heartbeat" }, { type: "heartbeat" }]);
 
-    expect(heartbeats.length).toBeGreaterThanOrEqual(2);
-    // One on entry, before the wait is even reached, then the armed interval.
-    expect(heartbeats[0]).toBeLessThan(2_000);
-    // Verify continued liveness, not millisecond-exact OS timer scheduling.
-    expect(heartbeats.at(-1)).toBeGreaterThan(heartbeats[0]!);
-  }, 40_000);
+        blocked.abort.abort();
+        await expect(blocked.running).rejects.toMatchObject({ name: "AbortError" });
+        expect(scheduler.callbacks.size).toBe(1);
+        scheduler.tick();
+        expect(blocked.events).toHaveLength(2);
+        browserTurns[0]!.complete();
+        await owner.running;
+        expect(scheduler.callbacks.size).toBe(0);
+      } finally { wait.mockRestore(); }
+    });
+  });
 
   test("aborting while waiting for a previous owner settles the observer promptly", async () => {
     const provider: CodexProviderConfig = {
@@ -4467,24 +4534,61 @@ describe("adapter liveness covers every path through a turn", () => {
   }, 10_000);
 
   test("a compaction turn proves it is alive while the summarizing browser turn runs", async () => {
-    const started = Date.now();
-    const heartbeats = await observeLiveness(
-      "compaction",
-      CHATGPT_WEB_ADAPTER_HEARTBEAT_MS + 2_000,
-      async (_provider, run) => {
-        const abort = new AbortController();
-        const beats: number[] = [];
-        void run(
-          livenessRequest("turn_compact_1", "thread_compact", true),
-          event => { if (event.type === "heartbeat") beats.push(Date.now() - started); },
-          abort.signal,
-        ).catch(() => {});
-        return { heartbeats: beats, stop: () => abort.abort() };
-      },
-    );
+    const scheduler = manualHeartbeatScheduler();
+    await observeLiveness("compaction", scheduler.schedule, async ({ browserStarted, browserTurns, run }) => {
+      const compaction = run(livenessRequest("turn_compact_1", "thread_compact", true));
+      expect(compaction.events).toEqual([{ type: "heartbeat" }]);
+      const browser = await browserStarted;
+      expect(browser.compaction).toBeTrue();
+      expect(scheduler.intervals).toEqual([10_000]);
+      scheduler.tick();
+      expect(compaction.events).toEqual([{ type: "heartbeat" }, { type: "heartbeat" }]);
 
-    expect(heartbeats.length).toBeGreaterThanOrEqual(2);
-    // Verify continued liveness, not millisecond-exact OS timer scheduling.
-    expect(heartbeats.at(-1)).toBeGreaterThan(heartbeats[0]!);
-  }, 40_000);
+      browserTurns[0]!.complete();
+      await compaction.running;
+      expect(compaction.events.some(event => event.type === "done")).toBeTrue();
+      expect(compaction.events.some(event => event.type === "error")).toBeFalse();
+      expect(scheduler.callbacks.size).toBe(0);
+      const eventCount = compaction.events.length;
+      scheduler.tick();
+      expect(compaction.events).toHaveLength(eventCount);
+    });
+  });
+
+  test.each(["abort", "complete"] as const)("real heartbeat timers stop after a turn %s", async outcome => {
+    const periodicHeartbeat = barrier<void>();
+    const intervals: number[] = [];
+    let timerTicks = 0;
+    const shortRealScheduler: ChatGptWebHeartbeatScheduler = (callback, intervalMs) => {
+      intervals.push(intervalMs);
+      // Use the production timer implementation with a short local interval. Only this turn's
+      // heartbeat clock changes; HTTP, MCP and other timers keep their real clocks.
+      return scheduleChatGptWebHeartbeat(() => { timerTicks += 1; callback(); }, 10);
+    };
+    await observeLiveness(`real-timer-${outcome}`, shortRealScheduler, async ({ browserStarted, browserTurns, run }) => {
+      let heartbeats = 0;
+      const turn = run(livenessRequest(`turn_real_${outcome}`, `thread_real_${outcome}`, false), event => {
+        if (event.type === "heartbeat" && ++heartbeats === 2) periodicHeartbeat.resolve();
+      });
+      expect(heartbeats).toBe(1);
+      await browserStarted;
+      await periodicHeartbeat.promise;
+      expect(CHATGPT_WEB_ADAPTER_HEARTBEAT_MS).toBe(10_000);
+      expect(intervals).toEqual([CHATGPT_WEB_ADAPTER_HEARTBEAT_MS]);
+      expect(timerTicks).toBeGreaterThanOrEqual(1);
+      if (outcome === "abort") {
+        turn.abort.abort();
+        await expect(turn.running).rejects.toMatchObject({ name: "AbortError" });
+      } else {
+        browserTurns[0]!.complete();
+        await turn.running;
+        expect(turn.events.some(event => event.type === "done")).toBeTrue();
+      }
+      const stoppedTicks = timerTicks;
+      // Count timer callbacks as well as events: a leaked interval after abort would otherwise
+      // silently swallow the detached observer error and appear to have stopped.
+      await Bun.sleep(30);
+      expect(timerTicks).toBe(stoppedTicks);
+    });
+  });
 });

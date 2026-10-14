@@ -12,6 +12,7 @@ import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, cont
 import { createContextSnapshot, contextSnapshotPriorityImageLocators, type ContextSnapshot } from "./context-snapshot";
 import { prepareFreshCompactionSource, captureRetainedCompactionSource, type CompactionSourceCoverage } from "./compaction-context";
 import { assertProviderContextCapabilityVerified } from "./context-capability-verification";
+import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, scheduleChatGptWebHeartbeat, type ChatGptWebHeartbeatScheduler } from "./heartbeat";
 import { estimateTokens } from "../../lib/token-estimate";
 import {
   cancelLauncherManualTurn,
@@ -462,8 +463,7 @@ function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequ
   }
 }
 
-/** Keep the Responses bridge alive during every awaited phase of a browser turn. */
-export const CHATGPT_WEB_ADAPTER_HEARTBEAT_MS = 10_000;
+export { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS } from "./heartbeat";
 
 export function createChatGptWebAdapter(
   provider: CodexProviderConfig,
@@ -473,12 +473,15 @@ export function createChatGptWebAdapter(
     codexHome?: string;
     /** Private host dependency; never populated from Responses input. */
     verifyContextCapability?: () => Promise<void>;
+    /** Internal timer dependency; never read from user input or provider configuration. */
+    heartbeatScheduler?: ChatGptWebHeartbeatScheduler;
     /** Private acceptance dependency. Never read from user input or provider configuration. */
     contextPresentation?: Pick<CompileChatGptWebPromptOptions, "contextRendering" | "contextRawTextPolicy">;
   } = {},
 ): ProviderAdapter {
   if (provider.chatgptWeb?.continuityStateDirectory) continuityBindingsFor(resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory)));
   const worker = ChatGptBrowserWorker.forProvider(provider);
+  const scheduleHeartbeat = dependencies.heartbeatScheduler ?? scheduleChatGptWebHeartbeat;
   const contextPresentation = {
     contextRendering: dependencies.contextPresentation?.contextRendering,
     contextRawTextPolicy: dependencies.contextPresentation?.contextRawTextPolicy,
@@ -2801,7 +2804,7 @@ export function createChatGptWebAdapter(
       // Emit initial liveness immediately. HTTP callers run trusted-environment preflight first,
       // while direct adapter callers keep the original runTurn event contract.
       emit({ type: "heartbeat" });
-      const heartbeat = setInterval(
+      const stopHeartbeat = scheduleHeartbeat(
         () => {
           try { emit({ type: "heartbeat" }); }
           catch { /* emit detached the observer and wakes its pending awaits. */ }
@@ -2811,7 +2814,7 @@ export function createChatGptWebAdapter(
       try {
         await runChatGptWebTurn();
       } finally {
-        clearInterval(heartbeat);
+        stopHeartbeat();
       }
     },
   };

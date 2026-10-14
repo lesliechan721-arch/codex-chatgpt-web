@@ -28,10 +28,11 @@ import { activateDevProfileEnvironment } from "./dev-chat/profile";
 import { runCommand } from "./process";
 import { startServer } from "./server";
 import { assertServiceIdle, cancelActiveTurns, getServiceStatus, installService, interruptActiveTurn, restartService, startService, stopService, uninstallService } from "./service";
-import { existingFullSetupCredentials, preflightSetup, setup, type SetupOptions } from "./setup";
+import { existingFullSetupCredentials, preflightSetup, setup } from "./setup";
 import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import { parseProductionSetupArgs } from "./setup-cli-args";
 import { runDevCommand } from "./dev-chat/cli";
 import { runApiKeyCommand } from "./api-key-cli";
 import { clearOpenAiRoutingPending, loadApiAccessPolicy } from "./api-access-config";
@@ -291,91 +292,8 @@ async function loginCommand(args: string[]): Promise<void> {
 }
 
 async function setupCommand(args: string[]): Promise<void> {
-  const preflightOnly = takeFlag(args, "--preflight-only");
-  const browserOnly = takeFlag(args, "--browser-only");
-  const full = takeFlag(args, "--full");
-  if (browserOnly === full) throw new Error("Choose exactly one setup mode: --browser-only or --full");
-  const portRaw = takeOption(args, "--port");
-  let acknowledged = takeFlag(args, "--acknowledge-unofficial");
-  const options: SetupOptions = {
-    mode: full ? "full" : "browser-only",
-    ...(portRaw ? { port: Number(portRaw) } : {}),
-  };
-  const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
-  const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
-  if (automaticBrowserInteraction && manualBrowserInteraction) {
-    throw new Error(
-      "Choose at most one browser interaction mode: --automatic-browser-interaction or --zero-risk-browser-interaction",
-    );
-  }
-  if (automaticBrowserInteraction || manualBrowserInteraction) {
-    options.browserInteractionMode = manualBrowserInteraction ? "manual" : "automatic";
-  }
-  const toolAuthorityMode = takeOption(args, "--tool-authority-mode");
-  if (toolAuthorityMode !== undefined) {
-    if (toolAuthorityMode !== "verified-environment" && toolAuthorityMode !== "delegated") {
-      throw new Error("--tool-authority-mode must be verified-environment or delegated");
-    }
-    options.toolAuthorityMode = toolAuthorityMode;
-  }
-  const connectorNameSuffix = takeOption(args, "--connector-name-suffix");
-  if (connectorNameSuffix !== undefined) options.connectorNameSuffix = connectorNameSuffix;
-  const subagentProtocol = takeOption(args, "--subagent-protocol");
-  if (subagentProtocol !== undefined) {
-    if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
-      throw new Error("--subagent-protocol must be compatibility-v1 or native");
-    }
-    options.subagentProtocol = subagentProtocol;
-  }
-  const tunnelId = takeOption(args, "--tunnel-id");
-  const runtimeKeyFile = takeOption(args, "--runtime-key-file");
-  const chrome = takeOption(args, "--chrome");
-  const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
-  if (chrome) options.chromeExecutablePath = chrome;
-  if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
-  options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
-  if (tunnelId) options.tunnelId = tunnelId;
-  if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
-  options.forceLogin = takeFlag(args, "--login");
-  options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
-  const skillAttachments = takeFlag(args, "--skill-attachments");
-  const inlineSkills = takeFlag(args, "--inline-skills");
-  if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
-  const savedChats = takeFlag(args, "--saved-chats");
-  const temporaryChats = takeFlag(args, "--temporary-chats");
-  if (savedChats && temporaryChats) throw new Error("Choose --saved-chats or --temporary-chats");
-  if (savedChats || temporaryChats) options.useSavedChats = savedChats;
-  const freshConversation = takeFlag(args, "--fresh-conversation");
-  const retainedConversation = takeFlag(args, "--retained-conversation");
-  if (freshConversation && retainedConversation) {
-    throw new Error("Choose --fresh-conversation or --retained-conversation");
-  }
-  if (freshConversation || retainedConversation) options.experimentalFreshConversationPerTurn = freshConversation;
-  const biggerContext = takeFlag(args, "--bigger-context");
-  const standardContext = takeFlag(args, "--standard-context");
-  if (biggerContext && standardContext) {
-    throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
-  }
-  if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
-  if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
-  const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
-  const zeroRiskDefault = takeFlag(args, "--zero-risk-default");
-  if (zeroRiskPro && zeroRiskDefault) {
-    throw new Error("Choose at most one Zero Risk model profile: --zero-risk-pro or --zero-risk-default");
-  }
-  if (zeroRiskPro || zeroRiskDefault) options.zeroRiskProEnabled = zeroRiskPro;
-  const zeroRiskSentConfirmation = takeFlag(args, "--zero-risk-sent-confirmation");
-  const zeroRiskNoSentConfirmation = takeFlag(args, "--zero-risk-no-sent-confirmation");
-  if (zeroRiskSentConfirmation && zeroRiskNoSentConfirmation) {
-    throw new Error("Choose at most one Zero Risk Sent confirmation mode");
-  }
-  if (zeroRiskSentConfirmation || zeroRiskNoSentConfirmation) {
-    options.zeroRiskRequireSentConfirmation = zeroRiskSentConfirmation;
-  }
-  options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
-  options.preserveDisconnectedRoute = takeFlag(args, "--preserve-disconnected-route");
-  options.restartService = takeFlag(args, "--restart-service");
-  assertNoArgs(args);
+  const { options, preflightOnly, acknowledged: acknowledgementProvided } = parseProductionSetupArgs(args);
+  let acknowledged = acknowledgementProvided;
 
   if (!acknowledged) {
     stdout.write(
@@ -401,7 +319,7 @@ async function setupCommand(args: string[]): Promise<void> {
     && !reusableCredentials.runtimeKey
     && !existsSync(managedRuntimeKeyPath(interactionMode));
 
-  if (full && (needsTunnelId || needsRuntimeKey) && stdin.isTTY) {
+  if (options.mode === "full" && (needsTunnelId || needsRuntimeKey) && stdin.isTTY) {
     stdout.write("Full mode needs an OpenAI tunnel and a runtime key with Tunnels Read + Use.\n");
     stdout.write("Tunnels: https://platform.openai.com/settings/organization/tunnels\n");
     stdout.write("Runtime keys: https://platform.openai.com/settings/organization/api-keys\n");

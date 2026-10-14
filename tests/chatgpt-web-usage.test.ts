@@ -30,7 +30,8 @@ test.each([
 test.each([
   ["small inline input", ["small task"], undefined],
   ["whole-record token pressure", [50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
-  ["whole-record composer pressure", Array.from({ length: 3 }, () => " ".repeat(450_000)), 6],
+  // Any two whole records exceed the 500k composer limit; one still fits a stage.
+  ["whole-record composer pressure", Array.from({ length: 3 }, () => " ".repeat(260_000)), 6],
 ] as const)("%s multipart selection accounts for whole-record and composer fit before submission", (_label, contents, expected) => {
   const plus = { ...capabilities, extraHighAvailable: false, proAvailable: false };
   const parsed = request("");

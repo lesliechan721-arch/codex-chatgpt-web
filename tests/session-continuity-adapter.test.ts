@@ -8101,31 +8101,41 @@ for (const marker of [false, true]) for (const lost of [true, false]) test(`repa
   expect(f.store.get(f.thread)!.checkpoints).toEqual(after.checkpoints);
 }, 30000);
 
-for (const marker of [false, true]) for (const mutation of ["payload", "identity", "role", "turn", "forged", "primary", "scope", "duplicate", "identity-role-payload", "removed"] as const) {
-  test(`repair11: checkpoint refuses changed source before execution marker=${marker} mutation=${mutation}`, async () => {
+for (const marker of [false, true]) {
+  test(`repair11: checkpoint refuses changed source before execution marker=${marker}`, async () => {
     const f = await repair11CheckpointFixture(marker);
     f.pages.clear();
-    const changed = structuredClone(f.continuation) as any;
-    const sibling = changed.input.find((item: any) => item.id === "msg_live_turn-1_1");
-    if (mutation === "payload") sibling.content = "A different instruction.";
-    if (mutation === "identity") sibling.id = "forged-sibling-id";
-    if (mutation === "role") sibling.role = "assistant";
-    if (mutation === "turn") sibling.internal_chat_message_metadata_passthrough.turn_id = "different-turn";
-    if (mutation === "forged") changed.input.splice(changed.input.indexOf(sibling), 0, { ...structuredClone(sibling), id: "new-before-old", content: "Injected older instruction." });
-    if (mutation === "duplicate") changed.input.splice(changed.input.indexOf(sibling), 0, structuredClone(sibling));
-    if (mutation === "removed") changed.input.splice(changed.input.indexOf(sibling), 1);
-    if (mutation === "identity-role-payload") Object.assign(sibling, { id: "new-developer-id", role: "developer", content: "Changed developer directive." });
-    if (mutation === "primary") changed.input.find((item: any) => item.id === "msg_live_turn-1_2").content = "Changed primary.";
-    if (mutation === "scope") changed.reasoning = { effort: "high" };
-    const before = f.store.get(f.thread)!, sends = f.submissions.length;
-    const response = await f.send(changed);
-    expect(response.status).toBe(409);
-    expect(f.submissions).toHaveLength(sends);
-    const after = f.store.get(f.thread)!;
-    expect(after.checkpoints).toEqual(before.checkpoints);
-    expect(after.calls).toEqual(before.calls);
-    expect(Object.keys(after.works)).toEqual(Object.keys(before.works));
-    expect(after.currentWorkId).toBe(before.currentWorkId);
+    // Every rejection must preserve this committed baseline, so the mutations can
+    // share its expensive setup. Clone each request and check for state pollution.
+    for (const mutation of ["payload", "identity", "role", "turn", "forged", "primary", "scope", "duplicate", "identity-role-payload", "removed"] as const) {
+      const changed = structuredClone(f.continuation) as any;
+      const sibling = changed.input.find((item: any) => item.id === "msg_live_turn-1_1");
+      if (mutation === "payload") sibling.content = "A different instruction.";
+      if (mutation === "identity") sibling.id = "forged-sibling-id";
+      if (mutation === "role") sibling.role = "assistant";
+      if (mutation === "turn") sibling.internal_chat_message_metadata_passthrough.turn_id = "different-turn";
+      if (mutation === "forged") changed.input.splice(changed.input.indexOf(sibling), 0, { ...structuredClone(sibling), id: "new-before-old", content: "Injected older instruction." });
+      if (mutation === "duplicate") changed.input.splice(changed.input.indexOf(sibling), 0, structuredClone(sibling));
+      if (mutation === "removed") changed.input.splice(changed.input.indexOf(sibling), 1);
+      if (mutation === "identity-role-payload") Object.assign(sibling, { id: "new-developer-id", role: "developer", content: "Changed developer directive." });
+      if (mutation === "primary") changed.input.find((item: any) => item.id === "msg_live_turn-1_2").content = "Changed primary.";
+      if (mutation === "scope") changed.reasoning = { effort: "high" };
+      const before = f.store.get(f.thread)!, sends = f.submissions.length;
+      const response = await f.send(changed);
+      expect(response.status, mutation).toBe(409);
+      expect(f.submissions, mutation).toHaveLength(sends);
+      const after = f.store.get(f.thread)!;
+      expect(after.checkpoints, mutation).toEqual(before.checkpoints);
+      expect(after.calls, mutation).toEqual(before.calls);
+      expect(Object.keys(after.works), mutation).toEqual(Object.keys(before.works));
+      expect(after.currentWorkId, mutation).toBe(before.currentWorkId);
+      expect(after, `durable baseline changed after ${mutation}`).toEqual(f.before);
+    }
+    const sends = f.submissions.length;
+    const valid = await f.send(f.continuation);
+    expect(valid.status).toBe(200);
+    expect((await valid.json() as any).status).toBe("completed");
+    expect(f.submissions).toHaveLength(sends + 1);
   }, 30000);
 }
 
