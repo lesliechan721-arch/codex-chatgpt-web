@@ -1,8 +1,10 @@
 # CI test performance
 
-Normal CI runs the server tests serially. Launcher type checks and tests run first, so a
-Launcher failure does not wait for the full server suite. Each verification command prints
-its elapsed time and exit code.
+Normal CI runs the server tests with two workers on Windows and one worker on Linux and
+macOS. Manual CI runs use the same defaults when `test_workers` is `auto`; selecting `1`
+or `2` overrides the worker count on every OS in that run. Launcher type checks and tests
+run first, so a Launcher failure does not wait for the full server suite. Each verification
+command prints its elapsed time and exit code.
 
 CI profiles the server tests and uploads `test-performance-<OS>-workers-<N>` even when tests
 fail. A run contains:
@@ -92,8 +94,7 @@ Missing or invalid reports, and any failed run, make `valid` false and leave `sp
 
 The manually dispatched **Windows test performance comparison** workflow runs this command
 on one Windows runner and uploads the original reports even when tests fail. Select the same
-revision when comparing changes. The normal CI worker count stays unchanged until repeated
-Windows measurements support changing it. A local report's `revision` is its base HEAD;
+revision when comparing changes. A local report's `revision` is its base HEAD;
 `workingTreeDirty` identifies uncommitted changes, so that revision alone does not identify
 the measured source. Keep individual investigation notes and measurement logs in
 `.dev-workflows/windows-performance/evidence/`, outside permanent project documentation.

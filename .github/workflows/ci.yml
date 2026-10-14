@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       test_workers:
-        description: "Server test workers (1 = serial baseline, 2 = isolated file parallelism)"
+        description: "Server test workers (auto = Windows 2, other OSes 1; 1 = serial; 2 = parallel)"
         type: choice
-        options: ["1", "2"]
-        default: "1"
+        options: ["auto", "1", "2"]
+        default: "auto"
 
 permissions:
   contents: read
@@ -39,6 +39,8 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CGW_TEST_WORKERS: ${{ inputs.test_workers != 'auto' && inputs.test_workers || (matrix.os == 'windows-latest' && '2' || '1') }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate launcher installer with Windows PowerShell 5.1
@@ -78,12 +80,11 @@ jobs:
       - run: bun run verify
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
-          CGW_TEST_WORKERS: ${{ inputs.test_workers || '1' }}
       - name: Upload test performance reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-performance-${{ matrix.os }}-workers-${{ inputs.test_workers || '1' }}
+          name: test-performance-${{ matrix.os }}-workers-${{ env.CGW_TEST_WORKERS }}
           path: ${{ runner.temp }}/test-performance
           if-no-files-found: ignore
       - run: bun run app:package
