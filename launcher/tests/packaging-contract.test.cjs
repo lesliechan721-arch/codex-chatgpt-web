@@ -106,6 +106,74 @@ test("release installers resolve checksummed native launcher assets", () => {
   assert.match(packageSmoke, /reg\.exe[\s\S]*InstallLocation/);
 });
 
+test("macOS pull requests can sign ad hoc without enabling certificate signing", () => {
+  const packageScript = path.join(launcherRoot, "scripts", "package.cjs");
+  const source = fs.readFileSync(packageScript, "utf8");
+  const scriptRequire = createRequire(packageScript);
+  for (const credentials of [{}, { CSC_LINK: "test-certificate.p12" }, { CSC_NAME: "Test Developer ID" }]) {
+    const env = { GITHUB_BASE_REF: "main", CSC_FOR_PULL_REQUEST: "false", ...credentials };
+    const stopped = new Error("builder invocation captured");
+    let invocation;
+    const mockRequire = name => name === "node:child_process" ? {
+      spawnSync: (command, args, options) => {
+        invocation = { command, args, env: options.env };
+        return { error: stopped };
+      },
+    } : scriptRequire(name);
+    mockRequire.resolve = scriptRequire.resolve;
+    assert.throws(() => vm.runInNewContext(source, {
+      require: mockRequire,
+      __dirname: path.dirname(packageScript),
+      process: { argv: ["node", packageScript], platform: "darwin", arch: "arm64", env },
+    }), error => error === stopped);
+    assert.equal(invocation.command, "node");
+    const adHoc = !credentials.CSC_LINK && !credentials.CSC_NAME;
+    assert.equal(invocation.args.includes("--config.mac.identity=-"), adHoc);
+    assert.equal(invocation.env.CSC_FOR_PULL_REQUEST, adHoc ? "true" : "false");
+    if (adHoc) assert.equal(invocation.env.CSC_IDENTITY_AUTO_DISCOVERY, "false");
+    assert.equal(env.CSC_FOR_PULL_REQUEST, "false", "the parent environment must remain unchanged");
+  }
+});
+
+test("failed package smoke reports readiness and launcher logs before removing its scratch directory", () => {
+  const smokeScript = path.join(launcherRoot, "scripts", "smoke-package.cjs");
+  const scriptRequire = createRequire(smokeScript);
+  const diagnostics = [];
+  let scratch;
+  const mockFs = {
+    ...fs,
+    readdirSync: directory => directory === path.join(launcherRoot, "artifacts")
+      ? ["test-win-x64.exe"] : fs.readdirSync(directory),
+    existsSync: file => file.endsWith("Codex Web GPT.exe") || fs.existsSync(file),
+  };
+  const mockRequire = name => name === "node:fs" ? mockFs : name === "node:child_process" ? {
+    spawnSync: (command, args, options) => {
+      if (command === "reg.exe") return { status: 0, stdout: "  InstallLocation  REG_SZ  C:\\Installed\n" };
+      if (!args.includes("--launcher-smoke-test")) return { status: 0 };
+      scratch = options.cwd;
+      const logs = path.join(options.env.CODEX_WEB_GPT_LAUNCHER_DATA_DIR, "logs");
+      fs.mkdirSync(logs, { recursive: true });
+      fs.writeFileSync(options.env.CODEX_WEB_GPT_SMOKE_FILE, '{"ok":true}\n');
+      fs.writeFileSync(path.join(logs, "launcher-fatal.log"), "shutdown diagnostic\n");
+      return { status: 3, stdout: "application stdout", stderr: "application stderr" };
+    },
+  } : scriptRequire(name);
+  assert.throws(() => vm.runInNewContext(fs.readFileSync(smokeScript, "utf8"), {
+    require: mockRequire,
+    __dirname: path.dirname(smokeScript),
+    process: { env: {}, platform: "win32", arch: "x64" },
+    console: { error: message => diagnostics.push(message) },
+  }), error => {
+    assert.match(error.message, /status 3/);
+    assert.match(error.message, /application stdout/);
+    assert.match(error.message, /application stderr/);
+    return true;
+  });
+  assert.match(diagnostics.join("\n"), /ready\.json[\s\S]*"ok":true/);
+  assert.match(diagnostics.join("\n"), /launcher-fatal\.log[\s\S]*shutdown diagnostic/);
+  assert.equal(fs.existsSync(scratch), false);
+});
+
 test("packaged launcher owns a detached checksummed updater for every release platform", () => {
   const updater = fs.readFileSync(path.join(launcherRoot, "electron", "update.cjs"), "utf8");
   const worker = fs.readFileSync(path.join(launcherRoot, "electron", "update-worker.cjs"), "utf8");
