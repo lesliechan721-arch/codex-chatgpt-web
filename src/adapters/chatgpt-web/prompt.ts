@@ -19,7 +19,7 @@ import {
   supportsChatGptWebBiggerContext,
 } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { estimateTokens } from "../../lib/token-estimate";
+import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import type { CodexAssistantContentPart, CodexContentPart, CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -893,25 +893,28 @@ function promptCandidateCost(compiled: CompiledChatGptWebPrompt, parsed: CodexPa
     mode.effort, capabilities).browserComposerCharLimit ?? Infinity;
   if (!compiled.multipart) {
     const tokens = estimateTokens(compiled.text, parsed.modelId);
-    return { tokens: tokens + images + files, jsonBytes: chatGptPromptJsonBytes(compiled.text),
+    const jsonBytes = chatGptPromptJsonBytes(compiled.text);
+    return { tokens: tokens + images + files, jsonBytes,
       fits: tokens <= finalBudget && compiled.text.length <= finalChars
-        && (!parsed._compactionRequest || chatGptPromptJsonBytes(compiled.text) <= CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET) };
+        && (!parsed._compactionRequest || jsonBytes <= CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET) };
   }
   const id = `ctx_${"0".repeat(32)}`;
   const stages = compiled.multipart.parts.slice(0, -1).map((payload, offset) =>
     formatChatGptWebMultipartStage(payload, id, offset + 1, compiled.multipart!.parts.length));
   const final = formatChatGptWebMultipartCommit(compiled.multipart, id);
   const finalTokens = estimateTokens(final, parsed.modelId);
+  const stageTokens = stages.map(stage => estimateTokens(stage.text, parsed.modelId));
   const backendModel = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID ? CHATGPT_WEB_LUNA_MODEL_ID : CHATGPT_WEB_MODEL_ID;
   const stageEfforts = backendModel === CHATGPT_WEB_LUNA_MODEL_ID ? ["low"] as const
     : capabilities.proAvailable ? ["max"] as const : ["low", "medium"] as const;
   const stagesFit = stageEfforts.some(effort => {
     const budget = resolveChatGptWebStagingTokenBudget(backendModel, effort, capabilities);
     const chars = resolveChatGptWebTransportLimits(backendModel, effort, capabilities).browserComposerCharLimit ?? Infinity;
-    return stages.every(stage => estimateTokens(stage.text, parsed.modelId) <= budget && stage.text.length <= chars);
+    return stages.every((stage, index) => stageTokens[index]! <= budget && stage.text.length <= chars);
   });
   const texts = [...stages.flatMap(stage => [stage.text, stage.acknowledgement]), final];
-  const tokens = texts.reduce((sum, text) => sum + estimateTokens(text, parsed.modelId), 0) + images + files;
+  const tokens = finalTokens + stages.reduce((sum, stage, index) =>
+    sum + stageTokens[index]! + estimateTokens(stage.acknowledgement, parsed.modelId), 0) + images + files;
   const baseWindow = resolveChatGptWebMessageTokenBudget(backendModel, mode.effort, capabilities)
     + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
   const { contextWindow: expandedWindow } = resolveChatGptWebContextLimits(backendModel, mode.effort,
@@ -923,6 +926,11 @@ function promptCandidateCost(compiled: CompiledChatGptWebPrompt, parsed: CodexPa
 
 /** Compare complete same-source transport candidates before any existing compaction fit recovery. */
 export function compileChatGptWebPrompt(parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities,
+  turnToken?: string, options?: CompileChatGptWebPromptOptions): CompiledChatGptWebPrompt {
+  return withTokenEstimateCache(() => compilePromptCandidates(parsed, capabilities, turnToken, options));
+}
+
+function compilePromptCandidates(parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities,
   turnToken?: string, options?: CompileChatGptWebPromptOptions): CompiledChatGptWebPrompt {
   const rendering = options?.contextRendering ?? "auto";
   if (!["auto", "legacy-json", WEB_CONTEXT_TEXT_FORMAT].includes(rendering)) throw new Error("Unknown web context rendering mode");

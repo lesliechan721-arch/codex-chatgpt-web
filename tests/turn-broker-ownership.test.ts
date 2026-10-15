@@ -8,12 +8,57 @@ import { acquireBrokerSocketLock } from "../src/adapters/chatgpt-web/turn-broker
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 
 const brokerModule = JSON.stringify(new URL("../src/adapters/chatgpt-web/turn-broker.ts", import.meta.url).href);
+const brokerReadinessTimeoutMs = 15_000;
 
-async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (!existsSync(path) && Date.now() < deadline) await Bun.sleep(10);
-  expect(existsSync(path)).toBe(true);
+async function waitForFile(path: string,
+  child?: Pick<ReturnType<typeof Bun.spawn>, "pid" | "exitCode" | "signalCode">,
+  timeoutMs = 5_000): Promise<void> {
+  const deadline = process.hrtime.bigint() + BigInt(timeoutMs) * 1_000_000n;
+  while (!existsSync(path)) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      // The child can write its result between the file check and exit observation.
+      if (existsSync(path)) return;
+      throw new Error(`Child pid=${child.pid} exited before writing ${path}; exit=${child.exitCode}; signal=${child.signalCode}`);
+    }
+    if (process.hrtime.bigint() >= deadline) {
+      const status = child ? `; pid=${child.pid}; exit=${child.exitCode}; signal=${child.signalCode}` : "";
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${path}${status}`);
+    }
+    await Bun.sleep(10);
+  }
 }
+
+test("broker readiness accepts a result written between the file check and child exit observation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-ready-race-"));
+  const result = join(root, "result");
+  const child = {
+    pid: process.pid,
+    get exitCode() {
+      writeFileSync(result, "ready");
+      return 0;
+    },
+    signalCode: null,
+  };
+  try {
+    await expect(waitForFile(result, child)).resolves.toBeUndefined();
+    expect(readFileSync(result, "utf8")).toBe("ready");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("broker readiness rejects a child that exits successfully before writing its result", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-ready-exit-"));
+  const result = join(root, "result");
+  const child = Bun.spawn([process.execPath, "-e", "process.exit(0)"], { stdout: "ignore", stderr: "inherit" });
+  try {
+    await expect(waitForFile(result, child, brokerReadinessTimeoutMs)).rejects.toThrow(`Child pid=${child.pid} exited before writing ${result}; exit=0`);
+  } finally {
+    child.kill();
+    await child.exited;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("a delayed lock release cannot remove the successor's owner marker", () => {
   if (process.platform === "win32") return;
@@ -47,10 +92,11 @@ test("competing processes recover a crashed owner without unlinking the winning 
     console.info = () => {};
     await TurnBroker.forSocket(${JSON.stringify(path)}).listen();
     writeFileSync(${JSON.stringify(ready)}, "ready");
-  `], { stdout: "pipe", stderr: "pipe" });
+  `], { stdout: "ignore", stderr: "inherit" });
   const contenders: ReturnType<typeof Bun.spawn>[] = [];
   try {
-    await waitForFile(ready);
+    // Fresh broker imports and four competing startups need more time on Intel CI.
+    await waitForFile(ready, crashed, brokerReadinessTimeoutMs);
     crashed.kill("SIGKILL");
     await crashed.exited;
     expect(existsSync(path)).toBe(true);
@@ -71,9 +117,9 @@ test("competing processes recover a crashed owner without unlinking the winning 
           await broker.close();
         }
         process.exit(0);
-      `], { stdin: "pipe", stdout: "pipe", stderr: "pipe" }));
+      `], { stdin: "pipe", stdout: "ignore", stderr: "inherit" }));
     }
-    await Promise.all(results.map(waitForFile));
+    await Promise.all(results.map((result, index) => waitForFile(result, contenders[index], brokerReadinessTimeoutMs)));
     const outcomes = results.map(result => readFileSync(result, "utf8"));
     expect(outcomes.filter(outcome => outcome === "owner")).toHaveLength(1);
     for (let index = 0; index < outcomes.length; index += 1) {
@@ -96,7 +142,7 @@ test("competing processes recover a crashed owner without unlinking the winning 
     await Promise.all([crashed.exited, ...contenders.map(child => child.exited)]);
     rmSync(root, { recursive: true, force: true });
   }
-}, 15_000);
+}, 45_000);
 
 test("stale-socket probing does not delete a regular file that replaced the socket", async () => {
   if (process.platform === "win32") return;

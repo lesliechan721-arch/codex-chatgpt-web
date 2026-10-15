@@ -200,7 +200,7 @@ function renderRecord(record: WebContextRecord, allocate: (reserve?: boolean) =>
     // Only allocate labels for extracted fields, so ignored short fields do not consume labels.
     if (!fieldRepresentation(target.value, path, "source_body_0", policy).raw) continue;
     const boundary = allocate();
-    if (!fieldRepresentation(target.value, path, boundary, policy).raw) continue;
+    if (boundary !== "source_body_0" && !fieldRepresentation(target.value, path, boundary, policy).raw) continue;
     allocate(true);
     descriptors.push({ path, boundary, utf8_bytes: Buffer.byteLength(target.value, "utf8") });
     bodies.push(`<${boundary}>\n${target.value}\n</${boundary}>\n`);
