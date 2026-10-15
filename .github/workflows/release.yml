@@ -64,6 +64,15 @@ jobs:
         if: runner.os == 'Linux'
         run: bun run launcher/scripts/prepare-linux-appimage-tools.cjs
       - run: bun run verify
+        env:
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+      - name: Upload test performance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-performance-release-${{ matrix.runner }}
+          path: ${{ runner.temp }}/test-performance
+          if-no-files-found: ignore
       - run: bun run app:package
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux' && runner.arch == 'X64'

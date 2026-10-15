@@ -1,13 +1,16 @@
 # CI test performance
 
-Normal CI runs the server tests with two workers on Windows and one worker on Linux and
-macOS. Manual CI runs use the same defaults when `test_workers` is `auto`; selecting `1`
-or `2` overrides the worker count on every OS in that run. Launcher type checks and tests
-run first, so a Launcher failure does not wait for the full server suite. Each verification
-command prints its elapsed time and exit code.
+Local runs, CI and release verification use `bun run test` for the server tests, with two
+workers by default on every OS. Set `CGW_TEST_WORKERS=1` or pass `--parallel=1` to run serially;
+the command-line option takes precedence. Manual CI runs use two workers when `test_workers`
+is `auto`; selecting `1` or `2` overrides the worker count on every OS in that run.
+`test:profile` is an alias for `test`, and `test:parallel` explicitly selects two workers.
+Launcher type checks and tests run first, so a Launcher failure does not wait for the full
+server suite. Each verification command prints its elapsed time and exit code.
 
-CI profiles the server tests and uploads `test-performance-<OS>-workers-<N>` even when tests
-fail. A run contains:
+CI uploads `test-performance-<OS>-workers-<N>`, and release builds upload
+`test-performance-release-<runner>`, even when tests fail. `CGW_TEST_PROFILE_DIR` selects the
+report output directory; it does not change the test entry point or worker count. A run contains:
 
 - `file-timings.json`: Bun's measured duration for each test file.
 - `summary.json`: platform, Bun version, revision, worker count, test exit code, wall time,
@@ -109,16 +112,16 @@ totals cover the selected suite; run a single file to attribute those totals to 
 ## Compare serial and two-worker runs
 
 ```sh
-bun run test:profile
-bun run test:parallel
+bun run test --parallel=1
+bun run test --parallel=2
 ```
 
 Reports go to separate run directories under ignored `output/test-performance/`. Set
 `CGW_TEST_PROFILE_DIR` to choose another output directory. To profile the recovery tests:
 
 ```sh
-bun run test:profile tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
-bun run test:parallel tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
+bun run test --parallel=1 tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
+bun run test --parallel=2 tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
 ```
 
 For hosted measurements, manually run the CI workflow on the same revision with

@@ -225,7 +225,7 @@ JSON/SSE, the MCP tool loop, continuation, v1/v2 compaction, and the Luna checkp
 
 To prevent the current API Key policy and inherited proxy variables from contaminating tests, Core/`verify` should use temporary `HOME`, `CODEX_HOME`, and `CODEX_CHATGPT_WEB_HOME`, and clear inherited HTTP(S)/ALL proxy variables in the test subprocess. Isolating only the application HOME is not sufficient because test cleanup can fall back to the real user directory. This isolation does not modify the real Launcher or user configuration.
 
-Repeatable repository entry points are `bun test ./tests`, `bun run --cwd launcher test`, typecheck/build on both sides, and the full `bun run verify`. Record the version, scope, and actual result that were run. A historical successful run does not prove that the current release passes.
+Repeatable repository entry points are `bun run test`, `bun run --cwd launcher test`, typecheck/build on both sides, and the full `bun run verify`. Record the version, scope, and actual result that were run. A historical successful run does not prove that the current release passes.
 
 Automated tests use the real filesystem plus injected supervisor/safeStorage simulations. They are not equivalent to an actual Electron OS keyring, a real third-party upstream provider, or an end-to-end ChatGPT account test. Release checks are listed in [API access, upstream, and proxy validation](release-validation.md#api-access-upstream-and-proxy-validation).
 

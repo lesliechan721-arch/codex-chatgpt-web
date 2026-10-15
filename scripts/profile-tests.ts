@@ -6,7 +6,7 @@ import { performanceSource } from "./test-performance-source";
 
 const root = resolve(import.meta.dir, "..");
 export async function profileTests(args: string[]): Promise<number> {
-  let workers = process.env.CGW_TEST_WORKERS || "1";
+  let workers = process.env.CGW_TEST_WORKERS || "2";
   const files: string[] = [], filters: string[] = [];
   for (const arg of args) {
     if (arg.startsWith("--parallel=")) workers = arg.slice("--parallel=".length);

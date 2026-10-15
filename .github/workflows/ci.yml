@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       test_workers:
-        description: "Server test workers (auto = Windows 2, other OSes 1; 1 = serial; 2 = parallel)"
+        description: "Server test workers (auto = 2 on all OSes; 1 = serial; 2 = parallel)"
         type: choice
         options: ["auto", "1", "2"]
         default: "auto"
@@ -40,7 +40,7 @@ jobs:
         os: [macos-15, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
-      CGW_TEST_WORKERS: ${{ inputs.test_workers != 'auto' && inputs.test_workers || (matrix.os == 'windows-latest' && '2' || '1') }}
+      CGW_TEST_WORKERS: ${{ inputs.test_workers != 'auto' && inputs.test_workers || '2' }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate launcher installer with Windows PowerShell 5.1
