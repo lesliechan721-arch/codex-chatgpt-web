@@ -1,9 +1,35 @@
 import { expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { chromium } from "playwright-core";
-import { chatGptResponseStructures } from "../src/adapters/chatgpt-web/browser-response-structure";
-import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptSubmissionRejectionObserver, ChatGptTurnDomHealthTracker } from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "../src/adapters/chatgpt-web/browser-response-structure";
+import { ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptSubmissionRejectionObserver, ChatGptTurnDomHealthTracker } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
+
+test("the largest response diagnostics survive the launcher's safe-log string limit intact", () => {
+  const { sanitizeForExport } = require("../launcher/electron/logging.cjs");
+  const structures = Array.from({ length: 3 }, () => ({
+    truncated: true,
+    nodes: Array.from({ length: 200 }, (_, index) => ({
+      parent: index - 1, tag: "section", rendered: true, assistant: true, user: false,
+      searchUnit: true, markdown: true, streamingStatus: true, activityStart: true, completionControl: true,
+    })),
+  }));
+  const entries = chatGptResponseStructureLogEntries("a".repeat(128), "99-turn-failed", structures);
+  expect(entries).toHaveLength(3);
+  const prefix = "[chatgpt-web] response_structure ";
+  for (let index = 0; index < entries.length; index++) {
+    const exported = sanitizeForExport(entries[index]);
+    expect(exported).not.toContain("[truncated]");
+    const payload = JSON.parse(exported.slice(prefix.length));
+    expect(payload.turnCount).toBe(3);
+    expect(payload.turnIndex).toBe(index);
+    expect(payload.turns[0].nodes).toHaveLength(200);
+    expect(payload.turns[0].nodes[199][0]).toBe(198);
+  }
+  const empty = chatGptResponseStructureLogEntries("empty-trace", "99-turn-failed", []);
+  expect(empty).toHaveLength(1);
+  expect(JSON.parse(empty[0]!.slice(prefix.length)).turns).toEqual([]);
+});
 
 test("a browser security challenge is scoped to the owned submission and never retried automatically", async () => {
   const frame = {};
@@ -198,3 +224,103 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("real Enter accepts MCP while
     expect(calls).toBe(1);
   } finally { await browser.close(); server.stop(true); }
 }, 10_000);
+
+test.each(["accepted", "recovery-failed", "cancelled"])("same-page recovery owns a disconnected pending Enter: %s", async outcome => {
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+  const page = { isClosed: () => false, locator: () => hidden };
+  const reboundPage = { ...page };
+  const controller = new AbortController();
+  let presses = 0;
+  let submitted = false;
+  let recovered = false;
+  let activationSignal: AbortSignal | undefined;
+  const order: string[] = [];
+  let disconnect!: (reason: Error) => void;
+  const button = {
+    waitFor: async () => {}, isEnabled: async () => true,
+    press: async (_key: string, options: { signal: AbortSignal }) => {
+      presses++;
+      activationSignal = options.signal;
+      order.push("press");
+      // Closing the old Playwright connection rejects its outstanding keypress.
+      // This does not mean that the preserved physical tab or its response closed.
+      await new Promise<void>((_resolve, reject) => { disconnect = reject; });
+    },
+  };
+  worker.activeComposer = async () => ({ locator: () => ({ locator: () => button }) });
+  worker.waitForSubmissionAccepted = async (observedPage: unknown, _baseline: unknown, signal: AbortSignal,
+    _progress: unknown, _revision: unknown, _tracker: unknown, observeBoundary: (snapshot: unknown) => void) => {
+    if (observedPage === page) throw new ChatGptBrowserObservationTimeoutError(5_000);
+    expect(observedPage).toBe(reboundPage);
+    expect(signal.aborted).toBeFalse();
+    observeBoundary({ visibleText: "Before tools" });
+    return "assistant_turn";
+  };
+  const result = await worker.sendAttachedPrompt(page, {}, undefined, controller.signal, undefined, {
+    onSendActivated: async () => { order.push("activated"); await Promise.resolve(); },
+    assertExecutionAuthority: () => { order.push("authority"); },
+    dispatchWithExecutionAuthority: <T>(dispatch: () => T) => { order.push("dispatch"); return dispatch(); },
+    onSubmitted: () => { submitted = true; },
+  }, undefined, async (_attempt: number, _cause: unknown, baseline: unknown, signal: AbortSignal) => {
+    order.push("recovery");
+    expect(activationSignal?.aborted).toBeTrue();
+    expect(signal.aborted).toBeFalse();
+    disconnect(new Error("locator.press: Target page, context or browser has been closed"));
+    // Yield like a real reconnect. The old Enter error must not retire the turn here.
+    await new Promise(resolve => setTimeout(resolve, 15));
+    if (outcome === "cancelled") controller.abort();
+    if (signal.aborted) throw new DOMException("aborted", "AbortError");
+    if (outcome === "recovery-failed") throw new Error("same-page recovery failed");
+    recovered = true;
+    return { page: reboundPage, baseline };
+  }, (snapshot: { visibleText: string }) => {
+    expect(snapshot.visibleText).toBe("Before tools");
+    order.push("boundary");
+  }).then((value: unknown) => ({ value }), (error: unknown) => ({ error }));
+  expect(presses).toBe(1);
+  expect(order.slice(0, 5)).toEqual(["activated", "authority", "dispatch", "press", "recovery"]);
+  expect(submitted).toBe(outcome === "accepted");
+  if (outcome === "accepted") {
+    expect(result).toEqual({ value: "assistant_turn" });
+    expect(recovered).toBeTrue();
+    expect(order[5]).toBe("boundary");
+  } else if (outcome === "recovery-failed") {
+    expect(result).toMatchObject({ error: { message: "same-page recovery failed" } });
+  } else {
+    expect(result).toMatchObject({ error: { name: "AbortError" } });
+  }
+});
+
+test.each(["authority-read", "dispatch-fence"])("a superseded helper cannot Send after activation acknowledgement: %s", async boundary => {
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  const hidden = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+  const page = { isClosed: () => false, locator: () => hidden };
+  const stale = new Error("execution authority was superseded");
+  const order: string[] = [];
+  let current = true;
+  const button = {
+    waitFor: async () => {}, isEnabled: async () => true,
+    press: async () => { order.push("press"); },
+  };
+  worker.activeComposer = async () => ({ locator: () => ({ locator: () => button }) });
+  worker.waitForSubmissionAcceptedWithRecovery = async () => { order.push("observe"); return "user_turn"; };
+  await expect(worker.sendAttachedPrompt(page, {}, undefined, undefined, undefined, {
+    onSendActivated: async () => {
+      await Promise.resolve();
+      current = false;
+      order.push("activated");
+    },
+    assertExecutionAuthority: () => {
+      order.push("authority");
+      if (boundary === "authority-read" && !current) throw stale;
+    },
+    dispatchWithExecutionAuthority: <T>(dispatch: () => T) => {
+      order.push("dispatch");
+      if (!current) throw stale;
+      return dispatch();
+    },
+    onSubmitted: () => { order.push("submitted"); },
+  })).rejects.toBe(stale);
+  expect(order).toEqual(boundary === "authority-read" ? ["activated", "authority"] : ["activated", "authority", "dispatch"]);
+});

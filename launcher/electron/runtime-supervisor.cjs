@@ -13,6 +13,7 @@ const {
 const { runtimeInvocation } = require("./runtime-command.cjs");
 const { DEV_LONG_WAIT_CONNECTOR_NAME } = require("./connector-identity.cjs");
 const { windowsTrustEnvironment } = require("./windows-trust.cjs");
+const { tunnelConnectionEnvironment } = require("./tunnel-proxy.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
@@ -341,6 +342,7 @@ class RuntimeSupervisor {
     publishOperation,
     runtimeInvocationFactory = runtimeInvocation,
     onConfigRead,
+    resolveProxy,
   }) {
     this.app = app;
     this.logger = logger;
@@ -362,6 +364,7 @@ class RuntimeSupervisor {
       : undefined;
     this.runtimeInvocationFactory = runtimeInvocationFactory;
     this.onConfigRead = onConfigRead;
+    this.resolveProxy = resolveProxy;
     this.configPath = path.join(coreHome, "config.json");
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
     this.daemon = null;
@@ -1085,6 +1088,7 @@ class RuntimeSupervisor {
   }
 
   async runTunnelConnectCommand(config) {
+    const connection = await tunnelConnectionEnvironment({ resolveProxy: this.resolveProxy });
     const contract = config.browserInteractionMode === "manual"
       ? "safe"
       : config.purpose === "dev-harness" && config.devNativeToolLongWaitProbe === true
@@ -1100,9 +1104,10 @@ class RuntimeSupervisor {
     ]);
     return await this.runTunnelCommand(
       config,
-      managedTunnelConnectArgs(config, invocation),
+      [...managedTunnelConnectArgs(config, invocation), "--control-plane-base-url", connection.baseURL],
       TUNNEL_START_TIMEOUT_MS,
       "Tunnel managed startup",
+      connection.env,
     );
   }
 
@@ -1646,12 +1651,15 @@ class RuntimeSupervisor {
     );
   }
 
-  async runTunnelCommand(config, args, timeoutMs, label) {
+  async runTunnelCommand(config, args, timeoutMs, label, env = process.env) {
     const tunnel = config.tunnel;
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
+    const environment = { ...env };
+    delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
     return await new Promise((resolve, reject) => {
       const child = spawn(tunnel.binaryPath, args, {
         cwd: tunnel.profileDir,
+        env: environment,
         detached: DETACH_OWNED_CHILD,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,

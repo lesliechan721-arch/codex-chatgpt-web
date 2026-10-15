@@ -241,6 +241,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
       return asMcpResult(encodeTaskUpdateMcpResult(nativeOperationFailure(
         error instanceof NativeOperationError ? error.code : "codex_tool_infrastructure_failure",
         error instanceof NativeOperationError ? error.message : "The Native waiting channel is unavailable. Preserve the original operation_id; do not repeat the operation with a new ID.", entry,
+        error instanceof NativeOperationError ? error.retirementDiagnostics : undefined,
       ), error instanceof NativeOperationError ? error.taskUpdate : undefined));
     }
   };

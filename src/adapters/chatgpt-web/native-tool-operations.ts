@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { BrokerToolRequest, BrokerToolResult } from "./turn-broker";
+import type { BrokerRetirementDiagnostics, BrokerToolRequest, BrokerToolResult } from "./turn-broker";
 import { isTaskRevision, type UpdateDelivery } from "./task-update-protocol";
 import {
   finishNativeToolResult,
@@ -23,7 +23,7 @@ export const NATIVE_RESULT_TOTAL_BYTES = 64 * 1_024 * 1_024;
 const NATIVE_RESULT_ERROR_RESERVE_BYTES = NATIVE_OPERATION_LIMIT * 1_024;
 
 export class NativeOperationError extends Error {
-  constructor(readonly code: string, message: string, readonly taskUpdate?: UpdateDelivery) {
+  constructor(readonly code: string, message: string, readonly taskUpdate?: UpdateDelivery, readonly retirementDiagnostics?: BrokerRetirementDiagnostics) {
     super(message);
     this.name = "NativeOperationError";
   }
@@ -136,8 +136,9 @@ function deepCanonicalFingerprint(value: unknown): string {
   return hash.digest("hex");
 }
 
-export function nativeOperationFailure(code: string, message: string, tool?: string): BrokerToolResult {
-  return nativePublicResult({ code, message, retryable: false, ...(tool ? { tool } : {}) }, true);
+export function nativeOperationFailure(code: string, message: string, tool?: string, diagnostics?: BrokerRetirementDiagnostics): BrokerToolResult {
+  return nativePublicResult({ code, message, retryable: false, ...(tool ? { tool } : {}),
+    ...(diagnostics ? { broker_state_at_retirement: diagnostics } : {}) }, true);
 }
 
 export function nativeControlResult(kind: string, value: BrokerToolResult): BrokerToolResult {

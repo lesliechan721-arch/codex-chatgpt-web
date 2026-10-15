@@ -10,6 +10,23 @@ const {
   validateSidebarState,
 } = require("../electron/state.cjs");
 
+test("prediction setting defaults off for new, old, and invalid state and persists explicit choices", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prediction-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+    for (const value of [undefined, null, "true", 1]) {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, composerPredictionsEnabled: value }));
+      assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+    }
+    const store = createStateStore(file);
+    store.update({ composerPredictionsEnabled: true });
+    assert.equal(createStateStore(file).read().composerPredictionsEnabled, true);
+    store.update({ composerPredictionsEnabled: false });
+    assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("launcher state persists onboarding, language, autostart, and network proxy atomically", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-launcher-state-"));
   const file = path.join(root, "state.json");
@@ -28,6 +45,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
@@ -63,6 +81,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       browserInteractionMode: "automatic",
       toolAuthorityMode: "delegated",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
@@ -149,6 +168,7 @@ test("persisted sidebar and proxy corruption are repaired without changing the r
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,

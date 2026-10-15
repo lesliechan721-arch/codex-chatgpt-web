@@ -15,6 +15,7 @@ for (const { name, parse } of parsers) {
   for (const { flags, message } of [
     { flags: ["--app-name", "Other Connector"], message: `Unknown ${name === "DEV" ? "DEV setup " : ""}arguments: --app-name Other Connector` },
     { flags: ["--fresh-conversation", "--retained-conversation"], message: "Choose --fresh-conversation or --retained-conversation" },
+    { flags: ["--composer-predictions", "--no-composer-predictions"], message: "Choose --composer-predictions or --no-composer-predictions" },
     { flags: ["--skill-attachments", "--inline-skills"], message: "Choose --skill-attachments or --inline-skills" },
     { flags: ["--saved-chats", "--temporary-chats"], message: "Choose --saved-chats or --temporary-chats" },
     { flags: ["--bigger-context", "--standard-context"], message: "Choose at most one context mode: --bigger-context or --standard-context" },
@@ -45,6 +46,7 @@ for (const { name, parse } of parsers) {
   test(`${name} setup preserves explicit opt-in and opt-out values`, () => {
     for (const { enabled, disabled, property } of [
       { enabled: "--fresh-conversation", disabled: "--retained-conversation", property: "experimentalFreshConversationPerTurn" },
+      { enabled: "--composer-predictions", disabled: "--no-composer-predictions", property: "composerPredictionsEnabled" },
       { enabled: "--skill-attachments", disabled: "--inline-skills", property: "experimentalSkillAttachments" },
       { enabled: "--saved-chats", disabled: "--temporary-chats", property: "useSavedChats" },
       { enabled: "--bigger-context", disabled: "--standard-context", property: "experimentalBiggerContext" },

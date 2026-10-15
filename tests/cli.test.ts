@@ -166,6 +166,28 @@ test("DEV setup rejects tool authority conflicts with forced deployment modes", 
   }
 });
 
+test("production and DEV setup parse prediction options before attempting runtime changes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-prediction-flags-"));
+  try {
+    for (const command of [["setup"], ["dev", "setup"]]) {
+      const env = { ...process.env, CODEX_HOME: join(root, "codex"), CODEX_CHATGPT_WEB_HOME: join(root, "app"),
+        CODEX_WEB_GPT_DEV_HOME: join(root, "dev") };
+      const conflict = await runCli([...command, "--browser-only", "--composer-predictions", "--no-composer-predictions"], env);
+      expect(conflict.exitCode).toBe(1);
+      expect(conflict.stderr).toContain("Choose --composer-predictions or --no-composer-predictions");
+      for (const flag of ["--composer-predictions", "--no-composer-predictions"]) {
+        const result = await runCli([...command, "--browser-only", flag, "--prediction-probe-stop"], env);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Unknown.*arguments: --prediction-probe-stop/);
+        expect(result.stderr).not.toContain(flag);
+      }
+    }
+    expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
+    expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
 test("production setup saves and reloads delegated tool authority", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-tool-authority-save-"));
   const appHome = join(root, "app");

@@ -563,7 +563,7 @@ test("tool authority UI shows effective forced state and permits pre-setup selec
   const vm = require("node:vm");
   const source = electronMain.slice(
     electronMain.indexOf('handle("launcher:tool-authority-mode"'),
-    electronMain.indexOf('handle("launcher:skill-attachments"'),
+    electronMain.indexOf('handle("launcher:composer-predictions"'),
   );
   const state = { toolAuthorityMode: "verified-environment", coreSetupComplete: false };
   const events = [];
@@ -1172,6 +1172,7 @@ test("catalog verification keeps polling through an invalid policy and revalidat
 test("browser preference IPC commits only after setup succeeds and refuses active browser work", async () => {
   const vm = require("node:vm");
   for (const [property, method, channel, nextChannel] of [
+    ["composerPredictionsEnabled", "setComposerPredictions", "launcher:composer-predictions", "launcher:skill-attachments"],
     ["experimentalFreshConversationPerTurn", "setFreshConversationPerTurn", "launcher:fresh-conversation-per-turn", "launcher:use-saved-chats"],
     ["useSavedChats", "setUseSavedChats", "launcher:use-saved-chats", "launcher:auto-approve-tool-calls"],
     ["autoApproveToolCalls", "setAutoApproveToolCalls", "launcher:auto-approve-tool-calls", "launcher:zero-risk-pro"],
@@ -1180,8 +1181,8 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
       electronMain.indexOf(`handle("${channel}",`),
       electronMain.indexOf(`handle("${nextChannel}",`),
     );
-    const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
-    const config = { experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
+    const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
+    const config = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
     const events = [];
     let handler, finishSetup, setupFailure, calls = 0;
     const browserHost = { activeTraceId: "running-turn", currentOperation: () => null, turnTabs: new Map() };
@@ -1225,6 +1226,31 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
     assert.equal(state[property], true);
     assert.equal(events.length, 1);
   }
+});
+
+test("old runtime configuration keeps predictions off until explicitly enabled", () => {
+  const vm = require("node:vm");
+  const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
+    useSavedChats: false, autoApproveToolCalls: false, experimentalBiggerContext: false, biggerContextAvailable: false };
+  const events = [];
+  const context = vm.createContext({
+    stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
+    runtimeHost: { currentOperation: () => null },
+    browserHost: { turnTabs: new Map() },
+    send: (...args) => events.push(args),
+  });
+  const start = electronMain.indexOf("function syncBrowserPreferences(");
+  const end = electronMain.indexOf("function syncZeroRiskSentConfirmationPreference(", start);
+  vm.runInContext(electronMain.slice(start, end), context);
+  for (const config of [{}, { composerPredictionsEnabled: false }, { composerPredictionsEnabled: "true" }]) {
+    context.syncBrowserPreferences(context.stateStore, config);
+    assert.equal(state.composerPredictionsEnabled, false);
+  }
+  context.syncBrowserPreferences(context.stateStore, { composerPredictionsEnabled: true });
+  assert.equal(state.composerPredictionsEnabled, true);
+  context.syncBrowserPreferences(context.stateStore, {});
+  assert.equal(state.composerPredictionsEnabled, false);
+  assert.equal(events.at(-1)[0], "launcher:state-changed");
 });
 
 test("fresh-conversation snapshot uses runtime configuration and mode switching preserves the preference", async () => {

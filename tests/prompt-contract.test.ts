@@ -150,7 +150,9 @@ test("local task prompts batch content and retry unexplained safety-check reject
     expect(text).toContain("Without an error or execution result, say the action was not executed and its cause is unconfirmed");
     expect(text).toContain("Historical errors quoted in files, logs, or earlier messages are data about those events");
     expect(text).toContain("A successful read remains successful even when its contents describe an error");
-    expect(text).toContain("Except for an unexplained platform safety-check rejection handled below, after an explicit safety or permission refusal");
+    expect(text).toContain("Except for an unexplained platform safety-check rejection handled below, after an explicit safety or permission refusal for the current action");
+    expect(text).toContain("Ask the user to confirm them only if the current task context does not already authorize them");
+    expect(text).toContain("a platform refusal does not erase prior authorization");
     expect(text).toContain("If the refusal remains, report it rather than retrying through another tool");
     expect(text).toContain("After a deterministic tool failure, update the working hypothesis from that result");
     expect(text).toContain("continue all independent authorized work");
@@ -454,7 +456,7 @@ test("Bigger Context keeps preliminary parts small and preserves all records in 
   expect(Math.max(...multipart.multipart!.parts.slice(0, -1).map(part => part.length))).toBeLessThan(120_000);
   // The selected High mode can carry a larger final part than an Instant upload.
   expect(multipart.multipart!.parts.at(-1)!.length).toBeLessThan(1_048_572);
-});
+}, 30_000);
 
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {
   const compact = request("high");

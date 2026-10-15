@@ -15,10 +15,12 @@ import {
   extractCodexTurnIdentityFromBody,
   extractChatGptCompactionSourceRevision,
   extractChatGptCompactV1SourceRevision,
+  isCodexComposerPrediction,
   isCodexGuardianReviewRequestFromBody,
   isCodexRecapRequestFromBody,
   isCodexThreadTitleRequestFromBody,
 } from "./adapters/chatgpt-web/environment";
+import { assertComposerPredictionFits, configureComposerPrediction } from "./composer-predictions";
 import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compaction-continuation";
 import { cancelAbandonedContinuityCreation, leaveContinuityMode, stopDurableContinuity } from "./adapters/chatgpt-web/continuity-lifecycle";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
@@ -1200,11 +1202,14 @@ export async function responseRequest(
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
   const expanded = expandPreviousResponseInput(raw);
+  const prediction = isCodexComposerPrediction(raw);
+  let executionConfig = config;
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
   try {
     parsed = parseRequest(expanded);
-    route = routeChatGptWebRequest(parsed, config);
+    if (prediction) executionConfig = configureComposerPrediction(parsed, config);
+    route = routeChatGptWebRequest(parsed, executionConfig);
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
@@ -1222,6 +1227,16 @@ export async function responseRequest(
       "invalid_request_error",
       "Local continuation state for previous_response_id is unavailable; refusing to run ChatGPT Web with partial Codex context. Compact the Codex task or start a new task before retrying.",
     );
+  }
+
+  if (prediction) {
+    try {
+      assertComposerPredictionFits(parsed, executionConfig);
+    } catch (error) {
+      // An optional suggestion must not compact/retry the task merely to make itself fit.
+      return formatErrorResponse(400, "invalid_request_error", `Next-message prediction skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    console.info(`[chatgpt-web] composer_prediction model=${route.slug} effort=medium`);
   }
 
   const compaction = parsed._compactionRequest === true;
@@ -1274,7 +1289,7 @@ export async function responseRequest(
     }
   }
 
-  const provider = providerConfig(config);
+  const provider = providerConfig(executionConfig);
   try {
     // Continuity resolves its history revision during preflight. An unverified caller value
     // must never participate in trace, cancellation, or replay identity.

@@ -70,6 +70,9 @@ export function parseProductionSetupArgs(arguments_: readonly string[]): {
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
+  const predictions = takeFlag(args, "--composer-predictions");
+  const noPredictions = takeFlag(args, "--no-composer-predictions");
+  if (predictions && noPredictions) throw new Error("Choose --composer-predictions or --no-composer-predictions");
   const skillAttachments = takeFlag(args, "--skill-attachments");
   const inlineSkills = takeFlag(args, "--inline-skills");
   if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
@@ -89,6 +92,7 @@ export function parseProductionSetupArgs(arguments_: readonly string[]): {
     throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
   }
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+  if (predictions || noPredictions) options.composerPredictionsEnabled = predictions;
   if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
   const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
   const zeroRiskDefault = takeFlag(args, "--zero-risk-default");
@@ -138,6 +142,9 @@ export function parseDevSetupArgs(
     && toolAuthorityMode !== "delegated") {
     throw new Error("--tool-authority-mode must be verified-environment or delegated");
   }
+  const predictions = takeFlag(args, "--composer-predictions");
+  const noPredictions = takeFlag(args, "--no-composer-predictions");
+  if (predictions && noPredictions) throw new Error("Choose --composer-predictions or --no-composer-predictions");
   const skillAttachments = takeFlag(args, "--skill-attachments");
   const inlineSkills = takeFlag(args, "--inline-skills");
   if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
@@ -168,6 +175,7 @@ export function parseDevSetupArgs(
       : {}),
     ...(toolAuthorityMode ? { toolAuthorityMode } : {}),
     ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
+    ...(predictions || noPredictions ? { composerPredictionsEnabled: predictions } : {}),
     ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
     ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
     ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),

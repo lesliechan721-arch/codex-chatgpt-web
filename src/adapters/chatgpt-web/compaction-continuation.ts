@@ -148,6 +148,28 @@ export function recoverCompactionInstruction(
   return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;
 }
 
+/** A new instruction after compaction keeps its own consumer identity. Only recognize the
+ * committed prefix for environment validation; the caller must still check the native rollout. */
+export function hasCompactionEnvironmentCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): boolean {
+  if (recoverCompactionInstruction(parsed, identity)) {
+    if (parsed._conversationPolicy !== "task") return true;
+    const carried = requestCarriedChatGptInstructionRevision(parsed, identity.turnId);
+    return !carried || isAcceptedCompactionContinuation(parsed, identity, carried);
+  }
+  if (parsed._conversationPolicy !== "task") return false;
+  const body = parsed._rawBody as { input?: unknown[] } | undefined;
+  const input = body?.input;
+  if (!Array.isArray(input)) return false;
+  const checkpoint = continuityCheckpoint(parsed);
+  if (checkpoint.index < 0 || checkpoint.index === input.length - 1) return false;
+  // Do not change the original request or cache this projection as admission evidence.
+  const prefix = { ...parsed, _rawBody: { ...body, input: input.slice(0, checkpoint.index + 1) } };
+  const recovered = recoverCompactionInstruction(prefix, identity);
+  if (!recovered) return false;
+  const carried = requestCarriedChatGptInstructionRevision(prefix, identity.turnId);
+  return !carried || isAcceptedCompactionContinuation(prefix, identity, carried);
+}
+
 function acceptedCheckpoint(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,

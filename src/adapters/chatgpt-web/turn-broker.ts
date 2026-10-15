@@ -109,8 +109,27 @@ export interface BrokerToolResult {
 interface PendingInvocation {
   request: BrokerToolRequest;
   operationId?: number;
+  queuedAt: number;
+  deliveredAt?: number;
   resolve: (result: BrokerToolResult) => void;
   reject: (error: Error) => void;
+}
+
+export interface BrokerRetirementDiagnostics {
+  traceId: string;
+  pendingTools: number;
+  queuedTools: number;
+  deliveredTools: number;
+  activeMcpRequests: number;
+  completionCommitted: boolean;
+  pendingCalls: Array<{
+    callRef: string;
+    tool: string;
+    state: "queued" | "delivered";
+    queuedMs: number;
+    awaitingResultMs?: number;
+  }>;
+  omittedPendingCalls: number;
 }
 
 interface ToolWaiter {
@@ -306,6 +325,7 @@ interface BrokerResponse {
   errorKind?: "admission_rejected" | "recovery_writer_retired";
   errorCode?: string;
   taskUpdate?: UpdateDelivery;
+  retirementDiagnostics?: BrokerRetirementDiagnostics;
 }
 
 const brokers = new Map<string, TurnBroker>();
@@ -334,6 +354,34 @@ const toolArgumentsAjv = new Ajv({
   useDefaults: false,
   validateFormats: false,
 });
+const MAX_PENDING_CALL_DIAGNOSTICS = 16;
+
+function retirementDiagnostics(channel: TurnChannel): BrokerRetirementDiagnostics {
+  const now = performance.now();
+  const pendingCalls: BrokerRetirementDiagnostics["pendingCalls"] = [];
+  for (const [callId, invocation] of channel.invocations) {
+    if (pendingCalls.length === MAX_PENDING_CALL_DIAGNOSTICS) break;
+    pendingCalls.push({
+      callRef: callId.slice(0, 17),
+      tool: invocation.request.wireName,
+      state: invocation.deliveredAt === undefined ? "queued" : "delivered",
+      queuedMs: Math.max(0, Math.floor((invocation.deliveredAt ?? now) - invocation.queuedAt)),
+      ...(invocation.deliveredAt === undefined ? {} : {
+        awaitingResultMs: Math.max(0, Math.floor(now - invocation.deliveredAt)),
+      }),
+    });
+  }
+  return {
+    traceId: channel.traceId,
+    pendingTools: channel.invocations.size,
+    queuedTools: channel.queuedCallIds.length,
+    deliveredTools: channel.deliveredCallIds.size,
+    activeMcpRequests: channel.activities.size + channel.nativeQueryCount,
+    completionCommitted: channel.completionCommitted,
+    pendingCalls,
+    omittedPendingCalls: channel.invocations.size - pendingCalls.length,
+  };
+}
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
@@ -602,7 +650,9 @@ export class TurnBroker implements TurnBrokerOwner {
   // The Codex context replayed into ChatGPT still carries the handles of finished turns, so a model
   // can present one. Remembering which turn retired a handle is what separates "you are holding a
   // previous turn's handle" from "this handle never existed".
-  private readonly retiredBindings = new Map<string, string>();
+  // Keep content-free diagnostics with the existing bounded history so an expiry immediately
+  // before timeout cleanup cannot erase the last observed delivery state.
+  private readonly retiredBindings = new Map<string, BrokerRetirementDiagnostics>();
   private readonly retiredTokens = new Map<string, string>();
   private readonly retiredTaskUpdates = new Map<string, TaskUpdateControl>();
   private acceptingExternalOwners = true;
@@ -1926,13 +1976,9 @@ export class TurnBroker implements TurnBrokerOwner {
     this.retireTurnContext(token, channel);
     for (const [readToken, record] of this.compactionContexts) if (record.registration.turnToken === token) this.revokeCompactionContext(readToken);
     this.compactionContextBindings.delete(token);
+    const diagnostics = retirementDiagnostics(channel);
     console.info(`[chatgpt-web] broker_retired ${JSON.stringify({
-      traceId: channel.traceId,
-      pendingTools: channel.invocations.size,
-      queuedTools: channel.queuedCallIds.length,
-      deliveredTools: channel.deliveredCallIds.size,
-      activeMcpRequests: channel.activities.size + channel.nativeQueryCount,
-      completionCommitted: channel.completionCommitted,
+      ...diagnostics,
       ...(failure ? { failure } : {}),
     })}`);
     this.channels.delete(token);
@@ -1958,15 +2004,16 @@ export class TurnBroker implements TurnBrokerOwner {
     this.pending.delete(token);
     clearTimeout(channel.deadlineTimer);
     channel.deadlineTimer = undefined;
-    const nativeReason = reason instanceof NativeOperationError ? reason
+    const nativeReason = reason instanceof NativeOperationError
+      ? new NativeOperationError(reason.code, reason.message, reason.taskUpdate, diagnostics)
       : reason.name === "AbortError"
-        ? new NativeOperationError("codex_tool_cancelled", "The Native turn was explicitly cancelled")
-        : new NativeOperationError("codex_tool_operation_retired", "Codex Native retired the turn binding before its tool work completed");
+        ? new NativeOperationError("codex_tool_cancelled", "The Native turn was explicitly cancelled", undefined, diagnostics)
+        : new NativeOperationError("codex_tool_operation_retired", "Codex Native retired the turn binding before its tool work completed", undefined, diagnostics);
     this.rejectSafeWaiters(channel.nativeWaitingObservers, nativeReason);
     channel.nativeOperations.retire(nativeReason);
     if (channel.bindingId) {
       this.bindings.delete(channel.bindingId);
-      this.retire(this.retiredBindings, channel.bindingId, channel.traceId);
+      this.retire(this.retiredBindings, channel.bindingId, diagnostics);
     }
     if (channel.safe) {
       channel.safe.state = "revoked";
@@ -2005,9 +2052,9 @@ export class TurnBroker implements TurnBrokerOwner {
     this.acceptingExternalOwners = accepted && !this.endpointFailure && !this.closePromise;
   }
 
-  private retire(history: Map<string, string>, handle: string, traceId: string): void {
+  private retire<T>(history: Map<string, T>, handle: string, value: T): void {
     history.delete(handle);
-    history.set(handle, traceId);
+    history.set(handle, value);
     while (history.size > MAX_RETIRED_TURN_HANDLES) {
       const oldest = history.keys().next();
       if (oldest.done) return;
@@ -2571,7 +2618,10 @@ export class TurnBroker implements TurnBrokerOwner {
           ...(error instanceof TurnBrokerAdmissionError ? { errorKind: "admission_rejected" as const } : {}),
           ...(request!.method === "owner_update" && isRetiredWriterError(error)
             ? { errorKind: "recovery_writer_retired" as const } : {}),
-          ...(error instanceof NativeOperationError ? { errorCode: error.code, ...(error.taskUpdate ? { taskUpdate: error.taskUpdate } : {}) } : {}),
+          ...(error instanceof NativeOperationError ? { errorCode: error.code,
+            ...(error.taskUpdate ? { taskUpdate: error.taskUpdate } : {}),
+            ...(error.retirementDiagnostics ? { retirementDiagnostics: error.retirementDiagnostics } : {}),
+          } : {}),
         }, settleControl),
       );
     });
@@ -2996,14 +3046,17 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!binding) {
       const retiredTurn = this.retiredBindings.get(bindingId);
       if (request.method === "release" && retiredTurn !== undefined) {
-        return { released: true, duplicate: true };
+        if (request.failure !== undefined) assertRetirementFailure(request.failure);
+        return { released: true, duplicate: true,
+          ...(request.failure === undefined ? {} : { diagnostics: retiredTurn }),
+        };
       }
       console.error(
         `[chatgpt-web] broker rejected ${request.method} (binding=${bindingId.slice(0, 17)},`
-        + ` retiredTurn=${retiredTurn ?? "unknown"})`,
+        + ` retiredTurn=${retiredTurn?.traceId ?? "unknown"})`,
       );
       throw new NativeOperationError("codex_tool_operation_retired", retiredTurn !== undefined
-        ? `${retiredTurnLabel(retiredTurn)} has already finished; this Codex Native action can no longer run.`
+        ? `${retiredTurnLabel(retiredTurn.traceId)} has already finished; this Codex Native action can no longer run.`
         : "internal Codex turn binding is invalid or expired");
     }
     if (request.method === "release") {
@@ -3013,7 +3066,9 @@ export class TurnBroker implements TurnBrokerOwner {
       } else {
         this.revokeTrusted(binding.token);
       }
-      return { released: true };
+      return { released: true,
+        ...(request.failure === undefined ? {} : { diagnostics: this.retiredBindings.get(bindingId)! }),
+      };
     }
     if (request.method === "resolve") {
       if (binding.channel.recovery) assertRecoveryWriter(binding.channel.recovery);
@@ -3071,7 +3126,7 @@ export class TurnBroker implements TurnBrokerOwner {
           };
           binding.channel.devLongWaitProbeOperations.set(operationId!, operation);
           binding.channel.invocations.set(callId, {
-            request: toolRequest,
+            request: toolRequest, queuedAt: performance.now(),
             resolve: result => this.completeDevLongWaitProbe(operation!, result),
             reject: error => this.failDevLongWaitProbe(operation!, error),
           });
@@ -3120,7 +3175,9 @@ export class TurnBroker implements TurnBrokerOwner {
       ...(freeform ? { input: request.input ?? "" } : { arguments: request.arguments ?? {} }),
     };
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
-      binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
+      binding.channel.invocations.set(callId, {
+        request: toolRequest, queuedAt: performance.now(), resolve: resolveInvoke, reject: rejectInvoke,
+      });
       binding.channel.queuedCallIds.push(callId);
       console.info(
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
@@ -3208,7 +3265,7 @@ export class TurnBroker implements TurnBrokerOwner {
         if (started.request) {
           const toolRequest = started.request;
           channel.invocations.set(toolRequest.callId, {
-            request: toolRequest, operationId,
+            request: toolRequest, operationId, queuedAt: performance.now(),
             resolve: result => channel.nativeOperations.complete(operationId, result),
             reject: error => channel.nativeOperations.retire(error),
           });
@@ -3249,6 +3306,7 @@ export class TurnBroker implements TurnBrokerOwner {
     for (const id of ids) {
       const invocation = channel.invocations.get(id);
       if (invocation) {
+        invocation.deliveredAt ??= performance.now();
         channel.deliveredCallIds.add(id);
         if (invocation.operationId !== undefined) channel.nativeOperations.handoff(invocation.operationId);
       }
@@ -3433,7 +3491,7 @@ export async function callTurnBroker<T>(
       cleanup();
       if (response.error) {
         rejectCall(response.errorKind === "recovery_writer_retired" ? withRetiredWriterReason(new Error(response.error))
-          : response.errorCode ? new NativeOperationError(response.errorCode, response.error, response.taskUpdate)
+          : response.errorCode ? new NativeOperationError(response.errorCode, response.error, response.taskUpdate, response.retirementDiagnostics)
           : response.errorKind === "admission_rejected"
           ? new TurnBrokerAdmissionError(response.error)
           : new Error(response.error));

@@ -9,7 +9,7 @@ import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continu
 import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { selectRecoveryContinuation } from "../src/adapters/chatgpt-web/continuity-recovery-continuation";
 import { recoverCompactionInstruction, isAcceptedCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
-import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision, isChatGptCompactionContinuation } from "../src/adapters/chatgpt-web/environment";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -174,4 +174,55 @@ test("trusted-environment recognition uses durable identity without inventing lo
     { type: "message", role: "user", id: "distinct-item", content: "New user instruction.", internal_chat_message_metadata_passthrough: { turn_id: native.turnId } }]);
   newInstruction._continuityStateDirectory = directory;
   expect(recoverCompactionInstruction(newInstruction, extractChatGptTurnIdentity(newInstruction))).toBeUndefined();
+});
+
+for (const format of ["encrypted", "readable"] as const) test(`same-turn ${format} checkpoint authenticates the rebuilt environment without consuming a new instruction`, () => {
+  const { directory, store } = fixture();
+  continuityBindingsFor(directory);
+  const summary = format === "encrypted"
+    ? { type: "compaction", encrypted_content: encodeCompactionSummary(text) }
+    : { type: "message", role: "user", content: `${SUMMARY_PREFIX}\n${text}` };
+  const parsed = request([sourceItem("original-item"), summary, sourceItem("new-item", "New requested change.")]);
+  parsed._continuityStateDirectory = directory;
+  const before = store.get(thread)!;
+  expect(isChatGptCompactionContinuation(parsed)).toBe(true);
+  expect(extractChatGptTurnUserRevision(parsed)).toBe("New requested change.");
+  expect(recoverCompactionInstruction(parsed, native)).toBeUndefined();
+  expect(selectRecoveryContinuation(parsed, before, native)).toBeUndefined();
+  expect(store.get(thread)!.version).toBe(before.version);
+  expect(store.get(thread)!.checkpoints["commit-one"]!.continuation.state).toBe("available");
+
+  const modified = request([sourceItem("original-item", "Changed retained instruction."), summary,
+    sourceItem("new-item", "New requested change.")]);
+  modified._continuityStateDirectory = directory;
+  expect(() => isChatGptCompactionContinuation(modified)).toThrow("conflicts with its accepted checkpoint source");
+  const unproven = request([{ type: "compaction", encrypted_content: encodeCompactionSummary("Uncommitted summary") },
+    sourceItem("new-item", "New requested change.")]);
+  unproven._continuityStateDirectory = directory;
+  expect(isChatGptCompactionContinuation(unproven)).toBe(false);
+});
+
+for (const newInstruction of [false, true]) test(`live checkpoint environment recognition validates source content with new instruction=${newInstruction}`, () => {
+  const directory = mkdtempSync(join(tmpdir(), "continuity-live-environment-")); roots.push(directory);
+  new ContinuityRegistrationStore(directory).initialize();
+  const registry = continuityBindingsFor(directory);
+  const binding = registry.create(thread, scope, "source-execution", continuityDigest(null), native.turnId);
+  const source = { itemId: "original-item", turnId: native.turnId, content: "Same source text.", instructionEnvelope: { role: "user" } };
+  binding.checkpoints.set("live-checkpoint", {
+    sourceRevision: 0, revision: 1, sourceExecutionKey: "source-execution", bytes: text.length, summary: text,
+    preserveFinalResponse: false, sourceInstruction: source, continuationNativeTurnId: native.turnId,
+    sourceRepresentationDigests: [continuityDigest([source.turnId, source.itemId, source.content, source.instructionEnvelope])],
+    sourceInstructionReplay: { instructionIdentity: source.itemId, nativeTurnId: source.turnId,
+      allowRetainedSourceFallback: false, contentDigest: continuityDigest(source.content), sourceDigest: continuityDigest(source) },
+  });
+  for (const changed of [false, true]) {
+    const parsed = request([sourceItem("original-item", changed ? "Modified source text." : source.content),
+      { type: "compaction", encrypted_content: encodeCompactionSummary(text) },
+      ...(newInstruction ? [sourceItem("new-item", "Next instruction.")] : [])]);
+    parsed._continuityStateDirectory = directory;
+    expect(isChatGptCompactionContinuation(parsed)).toBe(!changed);
+    if (newInstruction) expect(recoverCompactionInstruction(parsed, native)).toBeUndefined();
+  }
+  expect(binding.checkpoints.size).toBe(1);
+  expect(binding.checkpoints.get("live-checkpoint")!.continuationExecutionKey).toBeUndefined();
 });
