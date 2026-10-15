@@ -1235,7 +1235,7 @@ export async function responseRequest(
       return;
     }
     // Continuity records both producer representations at commit; cached HTTP reads add none.
-    if (parsed._conversationPolicy === "continuity-first" || response.status !== "completed") return;
+    if (parsed._conversationPolicy === "task" || response.status !== "completed") return;
     const identity = extractChatGptTurnIdentity(parsed);
     if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
     const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
@@ -1265,6 +1265,7 @@ export async function responseRequest(
     // History compaction is a dedicated summarization turn. It must never bind the active Codex
     // tool bridge or continue an in-flight MCP round; the returned summary becomes the next turn's
     // replacement history through the Responses compaction contract.
+    parsed._compactionSourceOptions = structuredClone(parsed.options);
     delete parsed.context.tools;
     delete parsed.options.toolChoice;
     delete parsed.options.parallelToolCalls;
@@ -1277,7 +1278,7 @@ export async function responseRequest(
   try {
     // Continuity resolves its history revision during preflight. An unverified caller value
     // must never participate in trace, cancellation, or replay identity.
-    if (parsed._conversationPolicy !== "continuity-first") traceId = chatGptWebTraceId(provider, parsed);
+    if (parsed._conversationPolicy !== "task") traceId = chatGptWebTraceId(provider, parsed);
   } catch (error) {
     // A cancelled browser session can only exist after the adapter accepted canonical native
     // turn identity and user-revision metadata. Requests without that identity have no matching
@@ -1355,7 +1356,7 @@ export async function responseRequest(
   if (adapter.preflight) {
     try {
       await adapter.preflight(parsed, incoming);
-      if (parsed._conversationPolicy === "continuity-first") traceId = chatGptWebTraceId(provider, parsed);
+      if (parsed._conversationPolicy === "task") traceId = chatGptWebTraceId(provider, parsed);
     } catch (error) {
       const event = adapterErrorEvent(error);
       options.onAdapterEvent?.(event, { compaction });
@@ -1370,7 +1371,7 @@ export async function responseRequest(
     }
   }
   try {
-    if (parsed._conversationPolicy !== "continuity-first") {
+    if (parsed._conversationPolicy !== "task") {
       incoming.abortSignal.throwIfAborted();
       await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, webTurnIdentity?.threadId);
     } else if (traceId) {

@@ -8,6 +8,7 @@ import {
   readLauncherBrowserHostDescriptor,
 } from "../launcher-browser-host";
 import { setupDevProfile } from "../setup";
+import { parseDevSetupArgs } from "../setup-cli-args";
 import { tunnelStatus } from "../tunnel";
 import {
   createLauncherDevAdapter,
@@ -53,7 +54,6 @@ Interactive commands:
   /send-fill TOKENS    Send deterministic inert text through the live browser now
   /compact             Run the real browser compaction path now
   /model MODEL         Select gpt-6-sol-instant, gpt-6-sol, gpt-6-pro, gpt-5.6-luna, gpt-5.6-sol-instant, gpt-5.6-sol, gpt-5.6-pro, zero-risk, or zero-risk-pro
-                       For session continuity, use the full chatgpt-web-continuity/... model slug
   /reset yes           Clear this named DEV chat and create a new thread identity
   /help                Show this command list
   /exit                Exit
@@ -96,6 +96,9 @@ function compactJson(value: unknown, limit = 2_000): string {
 function modelFromCli(value: string | undefined): DevChatModel | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase();
+  if (normalized.startsWith("chatgpt-web-continuity/")) {
+    throw new Error(`This model name was removed. Use ${normalized.replace("chatgpt-web-continuity/", "chatgpt-web/")} instead.`);
+  }
   const slug = isChatGptWebModelSlug(normalized) ? normalized : `chatgpt-web/${normalized}`;
   if (!(DEV_CHAT_MODELS as readonly string[]).includes(slug)) {
     throw new Error(`Unknown DEV model ${JSON.stringify(value)}; choose ${DEV_CHAT_MODELS.map(model => model.replace("chatgpt-web/", "")).join(", ")}`);
@@ -349,64 +352,8 @@ export async function runDevCommand(args: string[]): Promise<void> {
   }
   if (action === "setup") {
     activateDevProfileEnvironment(paths);
-    const browserOnly = takeFlag(args, "--browser-only");
-    const full = takeFlag(args, "--full");
-    if (browserOnly === full) throw new Error("Choose exactly one DEV setup mode: --browser-only or --full");
-    const tunnelId = takeOption(args, "--tunnel-id");
-    const runtimeKeyFile = takeOption(args, "--runtime-key-file");
-    const descriptorPath = takeOption(args, "--browser-host-descriptor") ?? paths.descriptorPath;
-    const connectorNameSuffix = takeOption(args, "--connector-name-suffix");
-    const acknowledgedUnofficial = takeFlag(args, "--acknowledge-unofficial");
-    const refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
-    const autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
-    const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
-    const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
-    if (automaticBrowserInteraction && manualBrowserInteraction) {
-      throw new Error("Choose at most one browser interaction mode");
-    }
-    const toolAuthorityMode = takeOption(args, "--tool-authority-mode");
-    if (toolAuthorityMode !== undefined
-      && toolAuthorityMode !== "verified-environment"
-      && toolAuthorityMode !== "delegated") {
-      throw new Error("--tool-authority-mode must be verified-environment or delegated");
-    }
-    const skillAttachments = takeFlag(args, "--skill-attachments");
-    const inlineSkills = takeFlag(args, "--inline-skills");
-    if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
-    const savedChats = takeFlag(args, "--saved-chats");
-    const temporaryChats = takeFlag(args, "--temporary-chats");
-    if (savedChats && temporaryChats) throw new Error("Choose --saved-chats or --temporary-chats");
-    const freshConversation = takeFlag(args, "--fresh-conversation");
-    const retainedConversation = takeFlag(args, "--retained-conversation");
-    if (freshConversation && retainedConversation) {
-      throw new Error("Choose --fresh-conversation or --retained-conversation");
-    }
-    const biggerContext = takeFlag(args, "--bigger-context");
-    const standardContext = takeFlag(args, "--standard-context");
-    const nativeToolLongWaitProbe = takeFlag(args, "--native-tool-long-wait-probe");
-    if (biggerContext && standardContext) {
-      throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
-    }
-    if (args.length > 0) throw new Error(`Unknown DEV setup arguments: ${args.join(" ")}`);
-    const result = await setupDevProfile({
-      mode: full ? "full" : "browser-only",
-      browserHostDescriptorPath: descriptorPath,
-      ...(connectorNameSuffix !== undefined ? { connectorNameSuffix } : {}),
-      refreshAccountCapabilities,
-      autoApproveToolCalls,
-      acknowledgedUnofficial,
-      ...(automaticBrowserInteraction || manualBrowserInteraction
-        ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
-        : {}),
-      ...(toolAuthorityMode ? { toolAuthorityMode } : {}),
-      ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
-      ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
-      ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
-      ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),
-      ...(tunnelId ? { tunnelId } : {}),
-      ...(runtimeKeyFile ? { runtimeKeyFile } : {}),
-      ...(nativeToolLongWaitProbe ? { devNativeToolLongWaitProbe: true } : {}),
-    });
+    const options = parseDevSetupArgs(args, paths.descriptorPath);
+    const result = await setupDevProfile(options);
     stdout.write(
       `Isolated DEV profile configured (${result.mode}) at ${result.configPath}.\n`
       + "No Codex route, Responses listener, or system service was installed."

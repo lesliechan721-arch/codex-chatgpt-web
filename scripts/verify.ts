@@ -7,6 +7,8 @@ const scratch = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-verify-"));
 const runtimeBundle = join(scratch, "runtime");
 
 async function run(args: string[]): Promise<void> {
+  const start = performance.now();
+  console.info(`[verify] start: bun ${args.join(" ")}`);
   const child = Bun.spawn([process.execPath, ...args], {
     cwd: root,
     stdin: "inherit",
@@ -14,6 +16,7 @@ async function run(args: string[]): Promise<void> {
     stderr: "inherit",
   });
   const exitCode = await child.exited;
+  console.info(`[verify] finish: bun ${args.join(" ")}; elapsed=${((performance.now() - start) / 1000).toFixed(2)}s; exit=${exitCode}`);
   if (exitCode !== 0) throw new Error(`Verification command failed (${exitCode}): bun ${args.join(" ")}`);
 }
 
@@ -22,9 +25,9 @@ try {
   await run(["run", "audit"]);
   await run(["run", "launcher:audit"]);
   await run(["run", "typecheck"]);
-  await run(["run", "test"]);
   await run(["run", "launcher:typecheck"]);
   await run(["run", "launcher:test"]);
+  await run(["run", process.env.CGW_TEST_PROFILE_DIR ? "test:profile" : "test"]);
   await run(["run", "launcher:build"]);
   await run(["run", "scripts/build-runtime-bundle.ts", runtimeBundle]);
   await run([

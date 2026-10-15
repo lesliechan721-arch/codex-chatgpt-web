@@ -50,32 +50,23 @@ function source(): Record<string, unknown> {
 }
 
 describe("native /models augmentation", () => {
-  test("continuity history metadata is isolated and does not displace the native V1 roster", () => {
-    const config = {
-      ...defaultConfig("full"), browserHost: "launcher" as const,
-      proAvailable: true, extraHighAvailable: true,
-      subagentProtocol: "compatibility-v1" as const,
-    };
-    const unavailable = { ...config, browserHost: "managed-chrome" as const };
-    const baseline = augmentNativeModelCatalog(source(), unavailable)
-      .models as Array<Record<string, unknown>>;
-    const augmented = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
-    const aliases = augmented.filter(model => String(model.slug).startsWith("chatgpt-web-continuity/"));
-    expect(aliases).toHaveLength(6);
-    for (const alias of aliases) {
-      expect(alias).toMatchObject({
-        context_window: 1_000_000, max_context_window: 1_000_000,
-        auto_compact_token_limit: 900_000, effective_context_window_percent: 90,
-      });
-    }
-    expect(augmented.filter(model => !String(model.slug).startsWith("chatgpt-web-continuity/"))).toEqual(baseline);
-    const roster = (models: Array<Record<string, unknown>>) => models
+  test("one public Web catalog uses task history limits without changing native V1 ordering", () => {
+    const config = { ...defaultConfig("full"), browserHost: "launcher" as const,
+      proAvailable: true, extraHighAvailable: true, subagentProtocol: "compatibility-v1" as const };
+    const baseline = augmentNativeModelCatalog(source(), { ...config, browserHost: "managed-chrome" }).models as Array<Record<string, unknown>>;
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    expect(models.some(model => String(model.slug).startsWith("chatgpt-web-continuity/"))).toBe(false);
+    const publicWeb = models.filter(model => String(model.slug).startsWith("chatgpt-web/") && model.visibility === "list");
+    expect(publicWeb).toHaveLength(6);
+    for (const model of publicWeb) expect(model).toMatchObject({ context_window: 1_000_000,
+      max_context_window: 1_000_000, auto_compact_token_limit: 900_000, effective_context_window_percent: 90 });
+    const roster = (entries: Array<Record<string, unknown>>) => entries
       .filter(model => model.visibility === "list" && model.supported_in_api === true)
       .toSorted((a, b) => Number(a.priority) - Number(b.priority)).slice(0, 5).map(model => model.slug);
-    expect(roster(augmented)).toEqual(roster(baseline));
-    const stale = { models: [...(source().models as unknown[]), ...aliases] };
-    expect(augmentNativeModelCatalog(stale, unavailable).models).toEqual(baseline);
-    expect(() => buildChatGptWebModel(aliases[0], CHATGPT_WEB_MODEL_ROUTES[0]!, config)).toThrow("native Codex model");
+    expect(roster(models)).toEqual(roster(baseline));
+    const removed = { slug: "chatgpt-web-continuity/gpt-6-sol" };
+    expect(augmentNativeModelCatalog({ models: [...(source().models as unknown[]), removed] }, config).models).toEqual(models);
+    expect(() => buildChatGptWebModel(removed, CHATGPT_WEB_MODEL_ROUTES[0]!, config)).toThrow("native Codex model");
   });
 
   test("preserves native models, groups supported efforts, and retains hidden legacy metadata", () => {
@@ -140,21 +131,13 @@ describe("native /models augmentation", () => {
     expect(pro.auto_compact_token_limit).toBe(285_000);
   });
 
-  test("Bigger Context expands ordinary models while keeping continuity aliases and their fixed history budgets", () => {
-    const config = {
-      ...defaultConfig("full"), browserHost: "launcher" as const,
-      proAvailable: true, extraHighAvailable: true, experimentalBiggerContext: true,
-    };
+  test("Bigger Context preserves the common history budget on Full Launcher routes", () => {
+    const config = { ...defaultConfig("full"), browserHost: "launcher" as const,
+      proAvailable: true, extraHighAvailable: true, experimentalBiggerContext: true };
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
-    const aliases = models.filter(model => String(model.slug).startsWith("chatgpt-web-continuity/"));
-    expect(aliases).toHaveLength(6);
-    for (const alias of aliases) {
-      expect(alias).toMatchObject({ context_window: 1_000_000, auto_compact_token_limit: 900_000 });
-    }
-    expect(models.find(model => model.slug === "chatgpt-web/gpt-6-sol"))
-      .toMatchObject({ context_window: 240_000, auto_compact_token_limit: 220_000 });
-    expect(models.find(model => model.slug === "chatgpt-web/gpt-5.6-sol"))
-      .toMatchObject({ context_window: 333_579, auto_compact_token_limit: 285_000 });
+    expect(models.some(model => String(model.slug).startsWith("chatgpt-web-continuity/"))).toBe(false);
+    for (const slug of ["chatgpt-web/gpt-6-sol", "chatgpt-web/gpt-5.6-sol"])
+      expect(models.find(model => model.slug === slug)).toMatchObject({ context_window: 1_000_000, auto_compact_token_limit: 900_000 });
   });
 
   test("publishes measured GPT-6 context by account and effort while preserving GPT-5.6 and Pro budgets", () => {

@@ -18,7 +18,7 @@
     "package:win": "bun run build && bun run build:runtime && bun run scripts/package.cjs --win",
     "package:linux": "bun run build && bun run build:runtime && bun run scripts/package.cjs --linux",
     "smoke:package": "bun run scripts/smoke-package.cjs",
-    "test": "node --test tests/*.test.cjs",
+    "test": "install-electron --no && node --test tests/*.test.cjs",
     "start": "electron ."
   },
   "dependencies": {
@@ -34,7 +34,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.2.0",
-    "electron": "41.10.7",
+    "electron": "42.11.10",
     "electron-builder": "^26.8.1",
     "typescript": "^5.9.3",
     "vite": "^6.0.0"

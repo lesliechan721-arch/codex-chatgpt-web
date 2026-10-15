@@ -3,7 +3,8 @@ const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { inspectContinuityConversation, validateContinuityClaim } = require("./continuity-lease.cjs");
 const { queryContinuityTransaction, updateContinuityPreparation, markContinuitySendPossible, retireContinuityWriter,
-  assertContinuityActivity } = require("./continuity-recovery.cjs");
+  retryContinuityCleanup, assertContinuityActivity, acquisitionKnownUnsentReceipt } = require("./continuity-recovery.cjs");
+const { EXECUTION_PROTOCOL, bindExecutionAuthority } = require("./continuity-execution-authority.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
@@ -111,6 +112,7 @@ class BrowserControlServer {
       ["/v1/turn/continuity-prepare", "prepare"],
       ["/v1/turn/continuity-send-possible", "send-possible"],
       ["/v1/turn/continuity-retire", "retire"],
+      ["/v1/turn/continuity-cleanup", "cleanup"],
     ]).get(request.url);
     const isSessionInspect = request.url === "/v1/session/inspect";
     const isProxyResolution = request.url === "/v1/network/resolve-proxy";
@@ -128,6 +130,7 @@ class BrowserControlServer {
       writeJson(response, 404, { error: "not_found" });
       return;
     }
+    let startFailureContext;
     try {
       const body = await readJson(
         request,
@@ -154,15 +157,17 @@ class BrowserControlServer {
         throw error;
       }
       if (recoveryAction) {
+        bindExecutionAuthority(host, body.recovery, body.recoveryStoreDirectory);
         const result = recoveryAction === "query" ? queryContinuityTransaction(host, body.recovery)
           : recoveryAction === "prepare" ? updateContinuityPreparation(host, body.expected, body.recovery)
           : recoveryAction === "send-possible" ? markContinuitySendPossible(host, body.recovery)
+          : recoveryAction === "cleanup" ? await retryContinuityCleanup(host, body.recovery, body.cleanupRequestId)
           : await retireContinuityWriter(host, body.recovery);
         writeJson(response, 200, { ok: true, ...result });
         return;
       }
       if (isContinuityCapacity) {
-        writeJson(response, 200, { ok: true, available: host.hasContinuityCapacity() });
+        writeJson(response, 200, { ok: true, available: host.hasContinuityCapacity(), executionProtocol: EXECUTION_PROTOCOL });
         return;
       }
       if (isSessionInspect) {
@@ -197,6 +202,9 @@ class BrowserControlServer {
       if (!Number.isInteger(body.helperPid) || body.helperPid < 1) {
         throw new Error("browser helper pid is invalid");
       }
+      if (body.requestId !== undefined && (typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(body.requestId))) {
+        throw new Error("browser acquisition requestId is invalid");
+      }
       if (body.conversationKey !== undefined && !/^[a-f0-9]{64}$/.test(body.conversationKey)) {
         throw new Error("conversationKey is invalid");
       }
@@ -217,13 +225,15 @@ class BrowserControlServer {
         throw new Error("connectorIdentity requires conversationKey");
       }
       validateContinuityClaim(body.continuity);
+      const executionIdentity = body.continuity?.recovery ?? body.recovery;
+      if (executionIdentity) bindExecutionAuthority(host, executionIdentity, body.recoveryStoreDirectory);
       if (body.continuity !== undefined && body.conversationKey === undefined) {
         throw new Error("continuity requires conversationKey");
       }
       if (!(request.url === "/v1/turn/start" || manualAction === "start")) {
         assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
       }
-      const recoveryAcknowledgement = body.recovery ? { recovery: body.recovery } : {};
+      const recoveryAcknowledgement = body.recovery ? { recovery: body.recovery, executionProtocol: EXECUTION_PROTOCOL } : {};
       if (body.retain !== undefined && typeof body.retain !== "boolean") {
         throw new Error("retain is invalid");
       }
@@ -258,7 +268,9 @@ class BrowserControlServer {
           if (body.compaction !== undefined && body.compaction !== true) {
             throw new Error("manual compaction flag is invalid");
           }
-          const lease = host.beginManualTurn(
+          if (body.continuity?.recovery) startFailureContext = { host, recovery: body.continuity.recovery,
+            traceId: body.traceId, helperPid: body.helperPid, requestId: body.requestId };
+          const lease = await host.beginManualTurn(
             body.traceId,
             body.helperPid,
             body.prompt,
@@ -267,7 +279,9 @@ class BrowserControlServer {
             body.compaction === true,
             preferences.zeroRiskRequireSentConfirmation !== false,
             body.sentConfirmationRequired,
-            ...(body.contextPlans !== undefined
+            ...(body.continuity?.recovery
+              ? [body.continuity, body.requireRetainedConversation === true, body.contextPlans, body.requestId]
+              : body.contextPlans !== undefined
               ? [body.continuity, body.requireRetainedConversation === true, body.contextPlans]
               : body.continuity || body.requireRetainedConversation
                 ? [body.continuity, body.requireRetainedConversation === true] : []),
@@ -406,6 +420,8 @@ class BrowserControlServer {
         let lease;
         try {
           if (response.destroyed) onClose();
+          if (body.continuity?.recovery) startFailureContext = { host, recovery: body.continuity.recovery,
+            traceId: body.traceId, helperPid: body.helperPid, requestId: body.requestId };
           lease = await host.beginTurn(
             body.traceId,
             preferences.showBrowserDuringTurns === true,
@@ -414,7 +430,7 @@ class BrowserControlServer {
             body.connectorIdentity,
             body.requireRetainedConversation === true,
             acquisition.signal,
-            ...(body.continuity ? [body.continuity] : []),
+            ...(body.continuity ? [body.continuity, body.requestId] : []),
           );
         } finally {
           response.off("close", onClose);
@@ -453,6 +469,8 @@ class BrowserControlServer {
       const manualTimedOut = error?.code === "manual_turn_timed_out";
       const continuityCode = ["continuity_session_lost", "continuity_source_unproven", "continuity_resource_capacity", "continuity_unverified", "continuity_execution_unsettled", "continuity_configuration_conflict"].includes(error?.code)
         ? error.code : undefined;
+      const sendUnsentReceipt = startFailureContext ? acquisitionKnownUnsentReceipt(startFailureContext.host, error,
+        startFailureContext.recovery, startFailureContext.traceId, startFailureContext.helperPid, startFailureContext.requestId) : undefined;
       writeJson(
         response,
         continuityCode === "continuity_unverified" ? 503 : cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
@@ -467,6 +485,7 @@ class BrowserControlServer {
         ...(manualSentPolicyMismatch ? { code: "manual_sent_policy_mismatch" } : {}),
         ...(manualTimedOut ? { code: "manual_turn_timed_out" } : {}),
         ...(continuityCode ? { code: continuityCode } : {}),
+        ...(sendUnsentReceipt ? { sendUnsentReceipt } : {}),
         },
       );
     }

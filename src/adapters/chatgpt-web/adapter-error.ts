@@ -56,6 +56,15 @@ export function chatGptBrowserTabClosedError(): ChatGptWebAdapterError {
   );
 }
 
+/** Physical loss alone does not prove that the user stopped a durable task. */
+export class ChatGptBrowserPageClosedError extends ChatGptWebAdapterError {
+  constructor() {
+    // Preserve the existing cancellation contract outside task + Launcher recovery.
+    const cancellation = chatGptBrowserTabClosedError();
+    super(cancellation.message, cancellation);
+  }
+}
+
 export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "A newer Codex instruction superseded this ChatGPT response.",

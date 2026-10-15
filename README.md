@@ -100,8 +100,8 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 > GPT-5.6 and GPT-6 Pro keep their existing Bigger Context limits.
 
 > Luna/Think can opt into experimental multipart Bigger Context. Long Free chats may lose older
-> details. With Bigger Context off, Luna keeps its rolling checkpoint. Continuity first keeps its
-> independent history budget and does not use multipart staging.
+> details. With Bigger Context off, Luna keeps its rolling checkpoint. Applicable Full Native + Launcher
+> routes use the unified history budget; browser delivery still follows each supported transport.
 
 1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
    **Connect harness**.
@@ -218,7 +218,7 @@ bun run app:package
 
 `dev:launcher` uses a separate profile and account under `~/.codex-chatgpt-web-dev`. `dev:chat` exercises the real browser and compaction paths with explicit simulated tool results, without changing your normal Codex route. See the [DEV chat harness](docs/dev-chat.md) for setup and commands.
 
-[Session continuity first](docs/session-continuity.md) prefers the original conversation across ordinary work and compaction. If that page is lost, it can load the current request into a new page after the old writer and delivered tools are settled. Recovery also supports component restarts when durable evidence is available. Compatible Full Native + Launcher setups expose the opt-in `chatgpt-web-continuity/` aliases; Fresh Conversation Per Turn remains incompatible. Bigger Context can remain enabled and applies only to non-continuity models. The larger Codex history budget does not increase ChatGPT's single-input limit or change existing models.
+[Session continuity](docs/session-continuity.md) uses one task mechanism on supported Full Native + Launcher routes with ordinary `chatgpt-web/` models. It reuses healthy compatible pages and can recover unfinished work, checkpoint continuation, or uncommitted compaction on a new page after project execution isolation, real tool settlement, legal-source and actual-plan checks. Unknown Send/results and stops remain binding. Fresh Conversation Per Turn changes page selection only; Bigger Context keeps existing supported paths and Zero Risk restrictions. The 1,000,000 / 900,000-token Codex history budget does not enlarge the ChatGPT window. Five physical pages and bounded cleanup still apply. Existing old-prefix configuration must use the corresponding ordinary name; migration preserves work, stop, checkpoint and retry facts. Real-platform validation remains tracked in the guide.
 
 </details>
 

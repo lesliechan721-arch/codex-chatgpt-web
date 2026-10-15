@@ -970,7 +970,7 @@ test.each(["low", "high"] as const)("GPT-6 Plus stages High but keeps the Instan
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("two-part saved chats re-prove unchanged effort after the first message creates the conversation URL", async () => {
+test("two-part saved chats fence each Send and re-prove effort after the conversation URL changes", async () => {
   const root = mkdtempSync(join(tmpdir(), "saved-chat-multipart-"));
   const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
   const prepared = { ...compileChatGptWebPrompt({
@@ -995,6 +995,7 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
     evaluate: async () => { throw new Error("No real browser in the transport fixture"); },
   });
   let sends = 0;
+  let dispatchFences = 0;
   const finished = new Error("final send reached with a current effort proof");
   Object.assign(worker, {
     prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { expect(saved).toBeTrue(); },
@@ -1009,19 +1010,23 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
     waitForNewAssistantTurn: async () => ({}),
     waitForMultipartAcknowledgement: async () => ({ identity: "stage:1" }),
     sendAttachedPrompt: async (_page: unknown, _baseline: unknown, _capture: unknown, _signal: unknown,
-      _progress: unknown, lifecycle: { onSendActivated(): Promise<void> }) => {
+      _progress: unknown, lifecycle: { onSendActivated(): Promise<void>; dispatchWithExecutionAuthority<T>(dispatch: () => T): T }) => {
       await lifecycle.onSendActivated();
-      if (++sends === 2) throw finished;
-      url = savedUrl;
+      lifecycle.dispatchWithExecutionAuthority(() => {
+        if (++sends === 2) throw finished;
+        url = savedUrl;
+      });
       return "user_turn";
     },
   });
   try {
     await expect(worker.runBrowserTurn({
       traceId: "saved_multipart", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      dispatchWithExecutionAuthority: <T>(dispatch: () => T) => { dispatchFences++; return dispatch(); },
       prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
     }, undefined, page)).rejects.toBe(finished);
     expect(sends).toBe(2);
+    expect(dispatchFences).toBe(2);
     expect(selections).toEqual(["https://chatgpt.com/", savedUrl]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

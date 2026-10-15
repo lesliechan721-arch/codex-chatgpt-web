@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { estimateTokens } from "../../lib/token-estimate";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { inspectLauncherContinuityConversation, releaseLauncherRetainedConversation } from "../../launcher-browser-host";
 import type { CodexParsedRequest } from "../../types";
@@ -13,12 +14,13 @@ import {
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
-import { assertCompactionReadable, captureRetainedCompactionSource, compactionAvailableTokens } from "./compaction-context";
+import { assertCompactionReadable, captureRetainedCompactionSource, compactionAvailableTokens, compactionSourcePageCost } from "./compaction-context";
 import {
   acceptHealthyRecoveryCompactionLease, admitHealthyRecoveryCompaction, assertHealthyRecoveryCompactionAuthority, assertRecoveryCompactionResult,
   beginHealthyRecoveryCompaction, commitRecoveryCompaction, failHealthyRecoveryCompaction,
   assertRecoveryCompactionNotStopped, isRecoveryCompaction, markHealthyRecoveryCompactionAccepted, markHealthyRecoveryCompactionSend,
   prepareHealthyRecoveryCompactionControl, recoveryCompactionTarget, runRecoveryCompaction,
+  type StartManualRecoveryCompaction,
 } from "./continuity-recovery-compaction";
 import { continuityToolRegistry } from "./continuity-tools";
 import type { ContextSnapshot } from "./context-snapshot";
@@ -46,22 +48,8 @@ export async function assertContinuityCompactionResult(prepared: PreparedContinu
   bindings.assertCompactionReplay(binding, executionKey, revision);
 }
 
-/** One strict transaction. HTTP observers may detach without cancelling its physical owner. */
-export function runContinuityCompaction(
-  parsed: CodexParsedRequest,
-  prepared: PreparedContinuityRequest,
-  worker: ChatGptBrowserWorker,
-  broker: TurnBrokerOwner,
-  capabilities: ChatGptWebCapabilities,
-  namespace: string,
-  configuredTimeout?: number,
-  onProgress?: () => void,
-  onRecovered?: () => void,
-  verifyContextCapability?: () => Promise<void>,
-): Promise<string> {
-  if (isRecoveryCompaction(prepared)) {
-    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered, verifyContextCapability);
-  }
+/** Share the exact retained-source replay checks with preview observers. */
+function retainedCompactionAdmission(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest, namespace: string) {
   const { binding, bindings, executionKey } = prepared;
   const checkpoint = binding.checkpoints.get(executionKey);
   const replaySourceKey = checkpoint?.sourceExecutionKey ?? prepared.sourceExecutionKey;
@@ -98,12 +86,43 @@ export function runContinuityCompaction(
     existingStructuredCompactionRun<string>(executionKey, requestDigest, owner);
     // A concurrent retry can arrive before the first result batch is accepted under the
     // source lock. Recheck against its committed evidence before returning the shared summary.
-    return cached.then(summary => { assertCommittedPayload(); return summary; });
+    return { owner, cached: cached.then(summary => { assertCommittedPayload(); return summary; }) };
   }
   if (checkpoint) {
     bindings.assertCompactionReplay(binding, executionKey, prepared.revision);
     throw continuityError("continuity_source_unproven", "The committed result is no longer in the bounded replay cache.");
   }
+  return { owner, cached: undefined };
+}
+
+/** Capture an existing healthy run without permission to start another run. */
+export function observeRetainedCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
+  namespace: string): Promise<string> | undefined {
+  return retainedCompactionAdmission(parsed, prepared, namespace).cached;
+}
+
+/** One strict transaction. HTTP observers may detach without cancelling its physical owner. */
+export function runContinuityCompaction(
+  parsed: CodexParsedRequest,
+  prepared: PreparedContinuityRequest,
+  worker: ChatGptBrowserWorker,
+  broker: TurnBrokerOwner,
+  capabilities: ChatGptWebCapabilities,
+  namespace: string,
+  configuredTimeout?: number,
+  onProgress?: () => void,
+  onRecovered?: () => void,
+  verifyContextCapability?: () => Promise<void>,
+  startManual?: StartManualRecoveryCompaction,
+): Promise<string> {
+  if (isRecoveryCompaction(prepared)) {
+    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered, verifyContextCapability, startManual);
+  }
+  const { binding, bindings, executionKey } = prepared;
+  const { owner, cached } = retainedCompactionAdmission(parsed, prepared, namespace);
+  if (cached) return cached;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const handoffTraceId = createHash("sha256").update(`${executionKey}:continuity-handoff`).digest("hex").slice(0, 12);
   return runStructuredCompactionOnce(executionKey, owner, async (operatorSignal, retainOwnershipUntil) => {
     const sourceExecutionKey = prepared.sourceExecutionKey;
     const source = sourceExecutionKey ? chatGptTurnSessions.find(sourceExecutionKey) : undefined;
@@ -123,12 +142,13 @@ export function runContinuityCompaction(
     let durableCompactionWorkId: string | undefined;
     let noControlDelivered = false;
     const timeoutMs = Math.min(configuredTimeout ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
+    let deadlineAt = Date.now() + timeoutMs;
     const deadline = new AbortController();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const reportProgress = (): void => {
       if (deadline.signal.aborted) return;
       clearTimeout(timeout);
-      timeout = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The handoff stopped making progress within its bounded deadline.")), timeoutMs);
+      timeout = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The handoff exceeded its original deadline.")), Math.max(0, deadlineAt - Date.now()));
       timeout.unref?.();
       onProgress?.();
     };
@@ -180,7 +200,13 @@ export function runContinuityCompaction(
           + Buffer.byteLength(JSON.stringify(identity.turnId)) + 128 + 512;
         const accepted = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
         try {
-          if (!manual || source.isActive()) durableCompactionWorkId = beginHealthyRecoveryCompaction(parsed, prepared);
+          if (!manual || source.isActive()) {
+            durableCompactionWorkId = beginHealthyRecoveryCompaction(parsed, prepared, timeoutMs);
+            if (durableCompactionWorkId) {
+              deadlineAt = bindings.recoveryStore.get(binding.thread)!.works[durableCompactionWorkId]!.retryBudget!.deadlineAt!;
+              reportProgress();
+            }
+          }
         } catch (error) {
           bindings.abandonUndeliveredCompaction(binding, executionKey, sourceExecutionKey);
           throw error;
@@ -262,6 +288,9 @@ export function runContinuityCompaction(
           });
       }
       const summary = canonicalizeCompactionHandoff(parsed, rawSummary);
+      const sourcePageTokens = Math.max(binding.retainedPageTokens ?? 0,
+        source.runtime.compactionSourceCoverage?.pageTokenReserve() ?? 0);
+      const compactionPageTokens = sourceSnapshot ? await compactionSourcePageCost(broker, sourceSnapshot) : undefined;
       if (signal.aborted) throw signal.reason;
       await readyPage(prepared);
       await chatGptTurnSessions.retireContinuityExecution(sourceExecutionKey, source, prepared.conversationKey, preserveFinalResponse);
@@ -287,6 +316,8 @@ export function runContinuityCompaction(
           .map(revision => continuitySourceRepresentationDigest(parsed, revision)))],
         identity.turnId,
       );
+      binding.retainedPageTokens = compactionPageTokens === undefined ? undefined
+        : sourcePageTokens + compactionPageTokens + estimateTokens(summary);
       source.runtime.compactionSourceCoverage?.checkpointCommitted(prepared.revision);
       return summary;
     } catch (error) {

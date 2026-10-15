@@ -99,8 +99,8 @@ const report: Message = { schema: "codex-chatgpt-web/continuity-append-live-evid
     client: "real-codex-app-server", adapter: "working-tree-createChatGptWebAdapter",
     page: `real-DEV-Launcher-${manual ? "Zero-Risk" : "Automatic"}`, nativeTool: "real-exec-command-sleep-printf",
     authority: "delegated-request-carried", model: option("--model") ?? (manual
-      ? config.zeroRiskProEnabled ? "chatgpt-web-continuity/zero-risk-pro" : "chatgpt-web-continuity/zero-risk"
-      : "chatgpt-web-continuity/gpt-5.6-sol"),
+      ? config.zeroRiskProEnabled ? "chatgpt-web/zero-risk-pro" : "chatgpt-web/zero-risk"
+      : "chatgpt-web/gpt-5.6-sol"),
     simulatedPage: false, simulatedTools: false, configFilesChanged: false,
     baselineHead: spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
   }, preflight, events: [], requests: [], checks: {} };
@@ -308,7 +308,7 @@ try {
     const adapter = createChatGptWebAdapter(actual, { broker, zeroRiskManualControl: manualControl, codexHome: clientHome });
     const run = adapter.runTurn!.bind(adapter);
     return { ...adapter, async runTurn(parsed, incoming, emit) {
-      assert.equal(parsed._conversationPolicy, "continuity-first", "真实请求必须选择连续性模式");
+      assert.equal(parsed._conversationPolicy, "task", "真实请求必须使用统一任务机制");
       const identity = extractChatGptTurnIdentity(parsed);
       assert.equal(identity.threadId, threadId, "追加必须属于同一原生线程");
       nativeTurnId ??= identity.turnId;

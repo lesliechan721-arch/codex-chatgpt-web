@@ -98,8 +98,8 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 > GPT-5.6 と GPT-6 Pro の既存の Bigger Context 上限は変わりません。
 
 > Luna/Think は試験的な分割 Bigger Context を利用できます。Free の長いチャットでは古い詳細が
-> 失われる場合があります。無効時は Luna のローリング checkpoint を維持します。Continuity first は
-> 独立した履歴予算を維持し、分割送信を使いません。
+> 失われる場合があります。無効時は Luna のローリング checkpoint を維持します。対応する Full Native + Launcher
+> 経路は共通の履歴予算を使います。ブラウザー送信には既存の伝送制限が適用されます。
 
 1. ランチャーの必須セットアップを完了します。
 2. ランチャーで **MCP** を開きます。ChatGPT コネクタを使用するものと同じ OpenAI アカウントで
@@ -218,7 +218,7 @@ bun run app:package
 
 `dev:launcher` は `~/.codex-chatgpt-web-dev` 内の独立したプロファイルとアカウントを使います。`dev:chat` は実際のブラウザーとコンパクション処理を使い、ツールの結果は明示的にシミュレーションします。通常の Codex のルートは変更しません。設定とコマンドは [DEV chat ハーネス](docs/dev-chat.md)を参照してください。
 
-[セッション継続性優先](docs/session-continuity.md)は、コンパクション後も同じ会話を維持し、元のページを失った場合は再構築せず停止します。互換性のある Full Native + Launcher 構成では、オプトインの `chatgpt-web-continuity/` エイリアスを利用できます。Fresh Conversation Per Turn は引き続き非互換です。Bigger Context は有効のままにでき、Continuity first 以外のモデルにのみ適用されます。Codex の履歴上限を増やしても、ChatGPT の単一入力上限や既存モデルは変わりません。
+[セッション継続性](docs/session-continuity.md)は、対応する Full Native + Launcher 経路で通常の `chatgpt-web/` モデル名と共通のタスク処理を使います。正常で互換性のあるページを再利用し、プロジェクトの実行権限の隔離、実際のツール結果、合法なソースと送信計画を確認した後、未完了作業、checkpoint 後の継続、未確定の圧縮を新しいページで復旧できます。不明な Send、結果、停止の記録は引き続き有効です。Fresh Conversation Per Turn はページ選択だけを変更します。Bigger Context は既存の対応能力と Zero Risk の制限を維持します。1,000,000 / 900,000-token の Codex 履歴予算はブラウザーの容量を増やしません。物理ページは最大五つで、終了処理の試行回数も有限です。旧プレフィックスの設定は対応する通常名に変更してください。移行は work、stop、checkpoint、retry の記録を維持します。実環境の検証状況は文書に記載します。
 
 </details>
 

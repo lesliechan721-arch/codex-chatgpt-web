@@ -143,6 +143,12 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} task-u
         const tool = listed.tools.find(candidate => candidate.name === name)!;
         expect(tool.inputSchema.properties!.task_revision).toMatchObject({ type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
         expect(tool.description).toContain("every Native start");
+        expect(tool.description).toContain("this request's task contract or the Broker ACK reply");
+        expect(tool.description).not.toContain("initially 0");
+        expect(tool.inputSchema.properties!.task_revision).toMatchObject({
+          description: expect.stringContaining("this request's task contract or the Broker ACK reply"),
+        });
+        expect(JSON.stringify(tool.inputSchema.properties!.task_revision)).not.toContain("initially 0");
       }
       const ack = listed.tools.find(candidate => candidate.name === "codex_task_update_ack")!;
       expect(ack.inputSchema.required).toEqual([contract === "native" ? "turn_token" : "request_id", "delivery_id", "through_revision"]);
@@ -151,6 +157,10 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} task-u
       expect(ack.inputSchema.properties).not.toHaveProperty("content");
       expect(BRIDGE_TOOL_NAMES.has(ack.name)).toBe(true);
       expect(f.client.getInstructions()).toContain("task-updates-v1");
+      expect(f.client.getInstructions()).toContain("read its task_revision as the initial acknowledged revision");
+      expect(f.client.getInstructions()).toContain("a recovered stream can start above 0");
+      expect(f.client.getInstructions()).not.toContain("initially 0");
+      expect(f.client.getInstructions()).not.toContain("initial acknowledged task revision is 0");
       const started = await f.client.callTool({ name: "codex_tool_inventory", arguments: { ...f.reference, operation_id: 8, task_revision: 3 } });
       expect(started.structuredContent).toEqual({ native_result: original, task_update: delivery() });
       const retried = await f.client.callTool({ name: "codex_tool_inventory", arguments: { ...f.reference, operation_id: 8, task_revision: 3 } });
@@ -331,6 +341,29 @@ test("initial protocol is opt in and keeps tool results below user instructions 
   expect(retained.text).toContain("This response continues the same retained conversation");
   expect(() => compileChatGptWebPrompt({ ...parsed, _compactionRequest: true }, capabilities, token, { taskUpdateProtocol: 1 })).toThrow("new ordinary Full Native execution");
 });
+
+for (const manualControl of [false, true]) for (const retainedContinuity of [false, true]) {
+  test(`${manualControl ? "Zero Risk" : "Automatic"} ${retainedContinuity ? "retained" : "full"} entry uses the actual acknowledged revision and keeps pending updates unacknowledged`, () => {
+    const parsed: CodexParsedRequest = {
+      modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "high" },
+      context: { systemPrompt: ["system priority"], messages: [{ role: "user", content: "continue accepted work", timestamp: 1 }] },
+    };
+    const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+    for (const [acknowledgedRevision, acceptedRevision] of [[0, 0], [1, 1], [0, 1], [1, 2]] as const) {
+      const compiled = compileChatGptWebPrompt(parsed, capabilities, token, {
+        taskUpdateProtocol: 1, taskUpdateInitialState: { acknowledgedRevision, acceptedRevision },
+        ...(manualControl ? { manualControl: true } : {}), ...(retainedContinuity ? { retainedContinuity: true } : {}),
+      });
+      expect(compiled.text).toContain(`"protocol":"task-updates-v1","task_revision":${acknowledgedRevision},"accepted_revision":${acceptedRevision}`);
+      expect(compiled.text).toContain("read its task_revision as the initial acknowledged revision");
+      expect(compiled.text).toContain("Only a new update stream starts at 0; a recovered stream can start above 0");
+      expect(compiled.text).toContain("If accepted_revision is higher, obtain and explicitly ACK the pending Broker delivery");
+      expect(compiled.text).toContain("accepted_revision alone is not an ACK");
+      expect(compiled.text).not.toContain("initial acknowledged task revision is 0");
+      expect(compiled.text).not.toContain("initially 0");
+    }
+  });
+}
 
 test("ACK controls and their Zero Risk namespace cannot become Native gateway tools", async () => {
   const snapshot = { tools: [

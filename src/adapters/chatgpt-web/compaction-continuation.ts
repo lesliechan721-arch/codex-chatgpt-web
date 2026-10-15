@@ -3,7 +3,7 @@ import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFI
 import type { CodexParsedRequest } from "../../types";
 import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
 import { continuityError } from "./continuity-errors";
-import { continuityDigest, continuitySourceRepresentationDigest, findContinuityRecoveryRecord, selectContinuityCheckpoint } from "./continuity-binding";
+import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest, findContinuityRecoveryRecord, selectContinuityCheckpoint } from "./continuity-binding";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
 
 interface CompletedCheckpoint {
@@ -20,6 +20,19 @@ const reservations = new Set<string>();
 // Missing instruction content is never reconstructed from a digest. This identity-only
 // object supports recognition; the recovery caller compiles the actual current context.
 const durableSources = new WeakMap<CodexParsedRequest, { commitId: string; workId: string; source: ChatGptTurnUserRevision }>();
+// Like instruction selection, this scan belongs to one parsed input. Rebuilt input
+// has a new identity. Cache only its shape, never durable source or writer authority.
+const checkpointPresence = new WeakMap<CodexParsedRequest, { input: unknown[]; length: number; present: boolean }>();
+
+function hasCarriedCheckpoint(parsed: CodexParsedRequest): boolean {
+  const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+  if (!Array.isArray(input)) return false;
+  const cached = checkpointPresence.get(parsed);
+  if (cached?.input === input && cached.length === input.length) return cached.present;
+  const present = continuityCheckpoint(parsed).index >= 0;
+  checkpointPresence.set(parsed, { input, length: input.length, present });
+  return present;
+}
 
 function durableContinuation(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
   if (!parsed._continuityScope || !identity.threadId || !identity.turnId) return undefined;
@@ -39,7 +52,7 @@ function liveCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentit
 
 function scope(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): string | undefined {
   if (!identity.threadId || !identity.turnId) return undefined;
-  if (parsed._conversationPolicy === "continuity-first") return undefined;
+  if (parsed._conversationPolicy === "task") return undefined;
   return JSON.stringify([identity.threadId, identity.turnId, parsed.modelId, parsed.options.reasoning]);
 }
 
@@ -94,7 +107,7 @@ export function isAcceptedCompactionContinuation(
   identity: ChatGptTurnIdentity,
   source: ChatGptTurnUserRevision,
 ): boolean {
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     const live = liveCheckpoint(parsed, identity);
     if (live?.checkpoint.sourceRepresentationDigests?.includes(continuitySourceRepresentationDigest(parsed, source))) return true;
     const durable = durableContinuation(parsed, identity);
@@ -112,18 +125,20 @@ export function recoverCompactionInstruction(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
 ): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     const selected = liveCheckpoint(parsed, identity);
     if (selected?.checkpoint.sourceInstruction) return { source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex };
-    // An explicitly new instruction uses its own normal identity and must not inherit
-    // a summary's consumer or the stopped source's execution rights.
-    if (requestCarriedChatGptInstructionRevision(parsed, identity.turnId)) return undefined;
+    // The durable selector distinguishes an exact carried source from a new
+    // instruction. Presence alone cannot reject the source after backend restart.
+    if (!hasCarriedCheckpoint(parsed)) return undefined;
     const durable = durableContinuation(parsed, identity);
     if (!durable) return undefined;
+    const carried = requestCarriedChatGptInstructionRevision(parsed, identity.turnId);
+    if (carried && !durable.checkpoint.representationDigests.includes(continuitySourceRepresentationDigest(parsed, carried))) return undefined;
     let retained = durableSources.get(parsed);
     if (!retained || retained.commitId !== durable.checkpoint.commitId || retained.workId !== durable.work.logicalWorkId) {
       retained = { commitId: durable.checkpoint.commitId, workId: durable.work.logicalWorkId,
-        source: { itemId: durable.work.instructionIdentity,
+        source: carried ?? { itemId: durable.work.instructionIdentity,
           ...(durable.work.nativeTurnId ? { turnId: durable.work.nativeTurnId } : {}), content: [] } };
       durableSources.set(parsed, retained);
     }

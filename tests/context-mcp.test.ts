@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,15 +23,25 @@ async function fixture(contract: "native" | "safe", publishOrdinary = true, requ
   const token = contract === "safe" ? await broker.registerSafe(env, "mcp-context-surface-12345678", undefined, "context-mcp-test", { requireSentConfirmation }) : await broker.register(env);
   const client = new Client({ name: "context-mcp-test", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath, args: ["src/cli.ts", "mcp", "--contract", contract, "--broker-socket", socket], cwd: process.cwd(), stderr: "pipe" });
-  // Drain diagnostic output so a full pipe cannot block protocol replies.
-  transport.stderr?.on("data", () => {});
-  await client.connect(transport);
+  // Drain diagnostic output and retain a bounded tail for failed stdio requests.
+  let diagnostics = "";
+  const recordDiagnostic = (message: string) => { diagnostics = (diagnostics + message).slice(-16_384); };
+  transport.stderr?.on("data", chunk => recordDiagnostic(chunk.toString()));
+  client.onerror = error => recordDiagnostic(`[context-mcp-test] client error: ${error.message}\n`);
+  try {
+    await client.connect(transport, { timeout: 10_000 });
+  } catch (error) {
+    console.error(`[context-mcp-test] connection failed\n${diagnostics}`);
+    await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
   const snapshot = createContextSnapshot(parseRequest({ model: "gpt-5", input: [{ role: "user", content: [{ type: "input_text", text: "独有片段 marker-zeta" }, { type: "input_image", image_url: `data:image/png;base64,${png}` }] }] }));
   if (publishOrdinary) { broker.registerContextPlan(token, { snapshot, planId: "selected", manifestDigest: "manifest-selected", deliveryByTarget: Object.fromEntries(snapshot.targets.map(t => [t.target_id, t.kind === "image" ? { delivery: "mcp", media_route: "mcp", required: true } : { delivery: "inline", required: false }])) });
   broker.selectContextPlan(token, "selected"); }
   const reference = contract === "safe" ? { request_id: token } : { turn_token: token };
   const call = (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: { ...reference, context_id: snapshot.context_id, ...args } });
-  return { broker, client, snapshot, token, call, reference, async close() { await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); } };
+  return { broker, client, snapshot, token, call, reference, diagnostics: () => diagnostics,
+    async close() { await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} context protocol`, () => {
   test("publishes all read tools with exclusive credentials and sends one fixed image without duplicate base64", async () => {
@@ -173,6 +184,8 @@ test("fresh manual Zero Risk compaction keeps original start, Sent and source de
 
 test("navigation denial exhaustion returns protocol errors and preserves the shared MCP connection and compaction submission", async () => {
   const f = await fixture("native");
+  let stage = "register compaction context";
+  const requestOptions = { timeout: 5_000 };
   try {
     f.broker.markContextPlanSent(f.token, "selected");
     const transaction = await f.broker.beginCompactionTransaction("finite-navigation-errors");
@@ -181,17 +194,31 @@ test("navigation denial exhaustion returns protocol errors and preserves the sha
       remainingBudget: { tokens: 2_000, reserved_tokens: 500, wire_bytes: 20_000, reserved_wire_bytes: 1000 } });
     f.broker.markCompactionContextDelivered(handle.compactionToken);
     const invalid = () => f.client.callTool({ name: "codex_context_list", arguments: { compaction_token: handle.compactionToken,
-      context_id: handle.contextId, view: "entries", cursor: "invalid" } });
+      context_id: handle.contextId, view: "entries", cursor: "invalid" } }, undefined, requestOptions);
     for (let count = 0; count < 3; count++) {
+      stage = `navigation denial ${count + 1}`;
       const result = await invalid(); expect(result.isError).toBe(true);
       if (count === 2) expect(result.structuredContent).toMatchObject({ error: { navigation_stopped: true } });
     }
-    await expect(invalid()).rejects.toThrow("CONTEXT_NAVIGATION_STOPPED");
-    expect((await f.client.listTools()).tools.some(tool => tool.name === "codex_context_list")).toBe(true);
-    expect((await f.call("codex_context_list", { view: "overview" })).isError).not.toBe(true);
+    stage = "exhausted navigation protocol error";
+    // Await subprocess I/O before entering Bun's synchronous promise matcher.
+    // On Windows, .rejects can block the pipe callback that settles this request.
+    const rejection = await invalid().then(() => undefined, (error: unknown) => error);
+    expect(rejection).toBeInstanceOf(McpError);
+    expect(rejection).toMatchObject({ code: ErrorCode.InvalidRequest,
+      message: expect.stringContaining("CONTEXT_NAVIGATION_STOPPED") });
+    stage = "shared connection tool catalog";
+    expect((await f.client.listTools(undefined, requestOptions)).tools.some(tool => tool.name === "codex_context_list")).toBe(true);
+    stage = "ordinary context after compaction navigation stopped";
+    expect((await f.client.callTool({ name: "codex_context_list", arguments: { ...f.reference,
+      context_id: f.snapshot.context_id, view: "overview" } }, undefined, requestOptions)).isError).not.toBe(true);
+    stage = "compaction handoff submission";
     const submitted = await f.client.callTool({ name: "codex_tool_call", arguments: { turn_token: transaction.token,
-      wire_name: "codex.control.compaction_handoff", arguments: { handoff_id: transaction.handoffId, summary: "Stopped reading; preserved summary reserve" } } });
+      wire_name: "codex.control.compaction_handoff", arguments: { handoff_id: transaction.handoffId, summary: "Stopped reading; preserved summary reserve" } } }, undefined, requestOptions);
     expect(submitted.isError).not.toBe(true);
+  } catch (error) {
+    console.error(`[context-mcp-test] failed at ${stage}\n${f.diagnostics()}`);
+    throw error;
   } finally { await f.close(); }
 });
 

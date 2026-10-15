@@ -27,6 +27,42 @@ function input(logicalWorkId = "work-A", extra: Partial<AdmitRecoveryWorkInput> 
   return { thread, scope, owner, logicalWorkId, instructionIdentity: `instruction-${logicalWorkId}`, nativeTurnId: "turn-A",
     workPayloadDigest: payload, snapshotDigest: snapshot, dispatchProtocolComplete: true, createPage: true, ...extra };
 }
+
+for (const userClosed of [false, true]) test(`helper failure settlement excludes cross-process retirement until its one durable commit (user-close=${userClosed})`, () => {
+  let inspectCommit = false, commits = 0;
+  const { path, store } = fixture({ now: () => 10_000, beforeWrite: () => {
+    if (!inspectCommit) return;
+    commits++;
+    // A competing process enters the actual retirement API at the atomic write boundary.
+    // It must not acquire the lock between failure budget and page-close stop.
+    const code = `import {ContinuityRecoveryStore} from ${JSON.stringify(join(import.meta.dir, "../src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+      try { const store=new ContinuityRecoveryStore(${JSON.stringify(path)});
+        store.retireAttempt(${JSON.stringify(thread)},{scope:${JSON.stringify(scope)}},"work-A",0);
+        store.reserveRecovery(${JSON.stringify(thread)},{scope:${JSON.stringify(scope)}},{logicalWorkId:"work-A",owner:${JSON.stringify(owner)},snapshotDigest:${JSON.stringify(snapshot)}});
+        process.stdout.write("reserved");
+      } catch(error) { process.stdout.write(String(error).includes("busy") ? "blocked" : String(error)); }`;
+    const child = spawnSync(process.execPath, ["--eval", code], { encoding: "utf8", timeout: 10_000 });
+    expect(child.status).toBe(0); expect(child.stdout).toBe("blocked"); expect(child.stderr).toBe("");
+  } });
+  store.admitWork(input());
+  store.issueBatch(thread, guard, { logicalWorkId: "work-A", attempt: 0, localSessionId: "session-A", localBatchId: "batch-A",
+    calls: [{ callId: "queued-call", operationId: "queued-operation", expectedResultType: "function_call_output" }] });
+  const before = store.get(thread)!;
+  inspectCommit = true;
+  const settled = store.settleWriterFailure({ thread, logicalWorkId: "work-A", attempt: 0, ownerId: owner.id }, userClosed ? "page-close" : undefined)!;
+  inspectCommit = false;
+  expect(commits).toBe(1); expect(settled.version).toBe(before.version + 1);
+  expect(settled.works["work-A"]!.state).toBe(userClosed ? "stopped" : before.works["work-A"]!.state);
+  expect(settled.works["work-A"]!.stopReason).toBe(userClosed ? "page-close" : undefined);
+  expect(settled.works["work-A"]!.retryBudget).toEqual(userClosed ? undefined : { attempts: 1, startedAt: 10_000, lastFailureAt: 10_000 });
+  expect(settled.calls["queued-call"]!.state).toBe(userClosed ? "cancelled-before-delivery" : "queued");
+  expect(store.get(thread)).toEqual(settled);
+  if (userClosed) {
+    const bytes = readFileSync(join(path, "recovery.json"), "utf8");
+    expect(store.settleWriterFailure({ thread, logicalWorkId: "work-A", attempt: 0, ownerId: owner.id }, "page-close")).toBeUndefined();
+    expect(readFileSync(join(path, "recovery.json"), "utf8")).toBe(bytes);
+  }
+});
 function batch(store: ContinuityRecoveryStore, callId = "call-A", work = "work-A", attempt = 0) {
   store.issueBatch(thread, guard, { logicalWorkId: work, attempt, localSessionId: `session-${attempt}`, localBatchId: callId,
     calls: [{ callId, operationId: `operation-${callId}`, expectedResultType: "function_call_output" }] });
@@ -206,13 +242,13 @@ test("recovery budgets survive restart and epochs, while one transaction owns su
   let now = 1000; const { path, store } = fixture({ now: () => now }); const first = store.admitWork(input()); const transactionId = first.transaction!.transactionId;
   for (let number = 0; number < 3; number++) {
     const current = new ContinuityRecoveryStore(path, { now: () => now });
-    current.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: number, stage: "send-possible" }); current.retireAttempt(thread, guard, "work-A", number);
+    current.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: number, stage: "accepted" }); current.retireAttempt(thread, guard, "work-A", number);
     const next = current.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot });
     expect(next.transaction!.transactionId).toBe(transactionId); expect(next.epoch).toBe(number + 1); expect(next.works["work-A"]!.retryBudget!.attempts).toBe(number + 2);
     expect(current.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot }).epoch).toBe(number + 1);
     now += 1000;
   }
-  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 3, stage: "send-possible" }); store.retireAttempt(thread, guard, "work-A", 3);
+  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 3, stage: "accepted" }); store.retireAttempt(thread, guard, "work-A", 3);
   expect(() => store.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot })).toThrow("exhausted");
   expect(store.get(thread)!.epoch).toBe(3);
 });
@@ -329,7 +365,7 @@ test("ordinary final result settles earlier accepted instructions without mutati
 test("retry window does not reset on restart or delete pending tool evidence", () => {
   let now = 1000; const { path, store } = fixture({ now: () => now }); store.admitWork(input()); batch(store); settle(store);
   store.recordFailure(thread, guard, "work-A");
-  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "send-possible" }); store.retireAttempt(thread, guard, "work-A", 0);
+  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "accepted" }); store.retireAttempt(thread, guard, "work-A", 0);
   now += 30 * 60_000 + 1; const restarted = new ContinuityRecoveryStore(path, { now: () => now });
   expect(() => restarted.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot })).toThrow("exhausted");
   expect(restarted.get(thread)!.calls["call-A"]!.firstResultDigest).toBe(result);
@@ -337,7 +373,7 @@ test("retry window does not reset on restart or delete pending tool evidence", (
 
 test("concurrent processes reserve one recovery transaction and one successor attempt", async () => {
   const { path, store } = fixture(); store.admitWork(input());
-  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "send-possible" }); store.retireAttempt(thread, guard, "work-A", 0);
+  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "accepted" }); store.retireAttempt(thread, guard, "work-A", 0);
   const modulePath = join(import.meta.dir, "../src/adapters/chatgpt-web/continuity-recovery-store.ts");
   const source = `import { ContinuityRecoveryStore } from ${JSON.stringify(modulePath)};
     const store = new ContinuityRecoveryStore(${JSON.stringify(path)});
@@ -536,7 +572,7 @@ test("persisted accepted selection compares every instruction in the original mu
     { type: "message", role: "user", id: "accepted-a", content: "Accepted instruction A.", internal_chat_message_metadata_passthrough: { turn_id: "turn-A" } },
     { type: "message", role: "user", id: "accepted-b", content: "Accepted instruction B.", internal_chat_message_metadata_passthrough: { turn_id: "turn-A" } },
   ], client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: "native-thread", turn_id: "turn-A" }) } };
-  const parsed = parseRequest(body); parsed._conversationPolicy = "continuity-first";
+  const parsed = parseRequest(body); parsed._conversationPolicy = "task";
   const previous = { instructionIdentity: "completed-item", nativeTurnId: "previous-turn" };
   const acceptedDigest = chatGptContinuityInstructionPayloadDigest(parsed, previous, false);
   store.admitWork(input("work-A", { instructionIdentity: "accepted-b", instructionPrevious: previous,
@@ -544,7 +580,7 @@ test("persisted accepted selection compares every instruction in the original mu
   const recorded = new ContinuityRecoveryStore(path).get(thread)!.works["work-A"]!;
   expect(chatGptContinuityInstructionPayloadDigest(parsed, recorded.instructionPrevious, recorded.allowRetainedSourceFallback)).toBe(recorded.workPayloadDigest);
   const edited = structuredClone(body); edited.input[2]!.content = "Modified earlier instruction A.";
-  const changed = parseRequest(edited); changed._conversationPolicy = "continuity-first";
+  const changed = parseRequest(edited); changed._conversationPolicy = "task";
   expect(chatGptContinuityInstructionPayloadDigest(changed, recorded.instructionPrevious, recorded.allowRetainedSourceFallback)).not.toBe(recorded.workPayloadDigest);
   expect(recorded.instructionIdentity).toBe("accepted-b");
   const disk = readFileSync(join(path, "recovery.json"), "utf8"); expect(disk).not.toContain("Accepted instruction"); expect(disk).not.toContain("Previous answer");
@@ -641,7 +677,7 @@ test("shadow snapshot rebinding rejects late activation and never changes the so
 test("failed shadow control retains its budget across restart, retirement, activation and recovery", () => {
   let now = 1000; const { path, store } = fixture({ now: () => now }); store.admitWork(input()); const admitted = shadow(store);
   const observed = activationIdentity(admitted); const before = store.get(thread)!;
-  store.markAttempt(thread, guard, { logicalWorkId: "compact-A", attempt: 0, stage: "send-possible" });
+  store.markAttempt(thread, guard, { logicalWorkId: "compact-A", attempt: 0, stage: "accepted" });
   now += 5000; store.recordFailure(thread, guard, "compact-A");
   const retired = store.retireAttempt(thread, guard, "compact-A", 0);
   expect(retired.currentWorkId).toBe("work-A"); expect(retired.state).toBe(before.state); expect(retired.transaction).toEqual(before.transaction);
@@ -651,7 +687,7 @@ test("failed shadow control retains its budget across restart, retirement, activ
   expect(() => reopened.markAttempt(thread, guard, { logicalWorkId: "compact-A", attempt: 0, stage: "accepted" })).toThrow("late observer");
   const recovered = reopened.reserveRecovery(thread, guard, { logicalWorkId: "compact-A", owner, snapshotDigest: snapshot });
   expect(recovered.works["compact-A"]!.attempts).toHaveLength(2); expect(recovered.works["compact-A"]!.retryBudget!.attempts).toBe(2);
-  expect(recovered.works["compact-A"]!.retryBudget!.startedAt).toBe(now); expect(recovered.transaction!.transactionId).toBe(observed.transactionId);
+  expect(recovered.works["compact-A"]!.retryBudget!.startedAt).toBe(admitted.works["compact-A"]!.retryBudget!.startedAt); expect(recovered.transaction!.transactionId).toBe(observed.transactionId);
   expect(recovered.epoch).toBe(1); expect(recovered.works["work-A"]!.attempts).toHaveLength(1);
 });
 
@@ -702,7 +738,7 @@ test("a long-running task first loss starts the recovery window and still requir
   expect(recovered.epoch).toBe(1); expect(recovered.works["work-A"]!.retryBudget!.startedAt).toBe(firstLoss);
   expect(recovered.works["work-A"]!.retryBudget!.attempts).toBe(2);
   now += 10 * 60_000; reopened.recordFailure(thread, guard, "work-A");
-  reopened.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 1, stage: "send-possible" }); reopened.retireAttempt(thread, guard, "work-A", 1);
+  reopened.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 1, stage: "accepted" }); reopened.retireAttempt(thread, guard, "work-A", 1);
   now = firstLoss + 30 * 60_000 + 1;
   const restarted = new ContinuityRecoveryStore(path, { now: () => now });
   expect(() => restarted.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot })).toThrow("exhausted");
@@ -719,7 +755,7 @@ test("restart without first-failure evidence anchors once and permits only three
     const recovered = reopened.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot });
     expect(recovered.works["work-A"]!.retryBudget!.startedAt).toBe(firstRecovery);
     expect(recovered.works["work-A"]!.retryBudget!.attempts).toBe(attempt + 1);
-    reopened.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt, stage: "send-possible" }); reopened.retireAttempt(thread, guard, "work-A", attempt);
+    reopened.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt, stage: "accepted" }); reopened.retireAttempt(thread, guard, "work-A", attempt);
     now += 1000; reopened.recordFailure(thread, guard, "work-A");
   }
   const final = new ContinuityRecoveryStore(path, { now: () => now }); const before = readFileSync(join(path, "recovery.json"), "utf8");
@@ -893,6 +929,7 @@ test("Launcher acquisition instance is durable before acquisition and cannot be 
   store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "send-possible", launcherInstance: other });
   expect(() => store.rebindSnapshot(thread, guard, "work-A", snapshot)).toThrow("sent");
   expect(() => store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "accepted", launcherInstance: launcher })).toThrow("another Launcher");
+  store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "accepted", launcherInstance: other });
   store.retireAttempt(thread, guard, "work-A", 0);
   const recovered = store.reserveRecovery(thread, guard, { logicalWorkId: "work-A", owner, snapshotDigest: snapshot });
   expect(recovered.works["work-A"]!.attempts[0]!.launcherInstance).toEqual(other); expect(recovered.transaction!.launcherInstance).toBeUndefined();

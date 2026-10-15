@@ -17,12 +17,14 @@ import {
   updateLauncherContinuityPreparation,
   markLauncherContinuitySendPossible,
   retireLauncherContinuityWriter,
+  CONTINUITY_EXECUTION_FENCING_FEATURE,
   notifyLauncherTurn,
   markLauncherManualTurnStarted,
   readLauncherBrowserHostDescriptor,
   releaseLauncherRetainedConversation,
   selectLauncherPage,
   startLauncherManualTurn,
+  getLauncherKnownUnsentReceipt,
   waitForLauncherManualSent,
   waitForLauncherManualTerminal,
 } from "../src/launcher-browser-host";
@@ -38,6 +40,50 @@ function recoveryIdentity(overrides: Partial<ContinuityRecoveryIdentity> = {}): 
     transactionId: "c".repeat(64), transactionVersion: 0, logicalWorkId: "d".repeat(64), attempt: 0,
     snapshotVersion: 0, snapshotDigest: "e".repeat(64), ownerProcess: { pid: process.pid, startIdentity: "verified-start" }, launcherInstance, ...overrides };
 }
+
+for (const mode of ["manual", "automatic"] as const) test(`${mode} start preserves only its exact authenticated known-unsent receipt`, async () => {
+  const recovery = recoveryIdentity();
+  const owner = { traceId: "known-unsent-trace", helperPid: process.pid, requestId: "known-unsent-request-id" };
+  let receipt: unknown;
+  let requests = 0;
+  const valid = { schemaVersion: 1, receiptId: "f".repeat(32), state: "known-unsent", recovery, launcherInstance,
+    ...owner, executionProtocol: 1, sendState: "not-started" } as const;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    requests++;
+    expect(new URL(request.url).pathname).toBe(mode === "manual" ? "/v1/manual/start" : "/v1/turn/start");
+    expect(request.headers.get("authorization")).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
+    expect((await request.json() as Record<string, unknown>).requestId).toBe(owner.requestId);
+    return Response.json({ code: "continuity_resource_capacity", ...(receipt ? { sendUnsentReceipt: receipt } : {}) }, { status: 409 });
+  } });
+  const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined,
+    [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
+  const start = () => mode === "manual"
+    ? startLauncherManualTurn(path, { ...owner, prompt: "fixture prompt", sentConfirmationRequired: true, continuity: { owner: "d".repeat(64), recovery } })
+    : notifyLauncherTurn(path, { ...owner, phase: "start", continuity: { owner: "d".repeat(64), recovery } });
+  try {
+    for (const [candidate, expectedCode] of [
+      [undefined, "continuity_resource_capacity"],
+      [{ ...valid, requestId: "another-request-id" }, "continuity_unverified"],
+      [{ ...valid, recovery: { ...recovery, snapshotDigest: "9".repeat(64) } }, "continuity_unverified"],
+      [{ ...valid, helperPid: process.pid + 1 }, "continuity_unverified"],
+      [{ ...valid, traceId: "another-trace" }, "continuity_unverified"],
+      [{ ...valid, executionProtocol: 2 }, "continuity_unverified"],
+      [{ ...valid, sendState: "send-possible" }, "continuity_unverified"],
+    ] as const) {
+      receipt = candidate;
+      const error = await start().catch(error => error);
+      expect(error).toMatchObject({ code: expectedCode });
+      expect(getLauncherKnownUnsentReceipt(error)).toBeUndefined();
+    }
+    receipt = valid;
+    const error = await start().catch(error => error);
+    expect(error).toMatchObject({ code: "continuity_resource_capacity" });
+    expect(getLauncherKnownUnsentReceipt(error)).toEqual(valid);
+    expect(requests).toBe(8);
+    // A plain error payload with the same visible fields cannot become a verified receipt.
+    expect(getLauncherKnownUnsentReceipt({ sendUnsentReceipt: valid, code: "continuity_resource_capacity" })).toBeUndefined();
+  } finally { server.stop(true); }
+});
 
 test("continuity inspect distinguishes transient control failures from a confirmed missing page", async () => {
   const lease = { owner: "a".repeat(64), leaseId: "b".repeat(32), traceId: "inspect-trace" };
@@ -81,13 +127,14 @@ test("recovery helpers authenticate and reject late snapshot and repeated Send a
     if (action === "prepare") { expect(body.expected).toEqual(identity); preparationExpected = body.expected; identity = body.recovery; }
     if (action === "send-possible") {
       const sendAuthorized = !sent; sent = true;
-      return Response.json({ ok: true, recovery: identity, state: "send-possible", writerRetired: false, toolsSettled: false, launcherInstance, hostNoWriter: false, sendAuthorized });
+      return Response.json({ ok: true, recovery: identity, state: "send-possible", writerRetired: false, toolsSettled: false, executionProtocol: 1, launcherInstance, hostNoWriter: false, sendAuthorized });
     }
     return Response.json({ ok: true, recovery: identity, state: action === "retire" ? "retired" : "prepared",
-      writerRetired: action === "retire", toolsSettled: false, launcherInstance, hostNoWriter: action === "retire", preparationExpected });
+      writerRetired: action === "retire", toolsSettled: false, executionProtocol: 1, launcherInstance, hostNoWriter: action === "retire", preparationExpected,
+      ...(action === "retire" ? { executionIsolated: true, physicalCleanup: "pending" } : {}) });
   } });
   try {
-    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
     await expect(queryLauncherContinuityTransaction(path, identity)).resolves.toMatchObject({ state: "prepared" });
     const before = identity;
     const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1, snapshotDigest: "1".repeat(64) });
@@ -100,6 +147,42 @@ test("recovery helpers authenticate and reject late snapshot and repeated Send a
   } finally { server.stop(true); }
 });
 
+test("a disk feature flag does not prove the running Launcher execution protocol", async () => {
+  const recovery = recoveryIdentity();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ ok: true, recovery, state: "prepared", writerRetired: false,
+      toolsSettled: false, launcherInstance, hostNoWriter: false });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined,
+      [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
+    await expect(queryLauncherContinuityTransaction(path, recovery)).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+  } finally { server.stop(true); }
+});
+
+test("retirement needs logical isolation evidence and can return before physical cleanup", async () => {
+  const recovery = recoveryIdentity();
+  let isolated = false;
+  const directory = "/trusted/runtime/continuity";
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    expect(request.headers.get("authorization")).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
+    const body = await request.json() as Record<string, unknown>;
+    expect(body.recoveryStoreDirectory).toBe(directory);
+    return Response.json({ ok: true, recovery, state: "retired", writerRetired: true,
+      toolsSettled: false, executionProtocol: 1, launcherInstance, hostNoWriter: false,
+      executionIsolated: isolated, physicalCleanup: "pending" });
+  } });
+  try {
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined,
+      [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
+    await expect(retireLauncherContinuityWriter(path, recovery, directory)).rejects.toMatchObject({ code: "continuity_unverified" });
+    isolated = true;
+    await expect(retireLauncherContinuityWriter(path, recovery, directory)).resolves.toMatchObject({
+      writerRetired: true, executionIsolated: true, physicalCleanup: "pending", toolsSettled: false,
+    });
+  } finally { server.stop(true); }
+});
+
 test("prepared CAS receipts must prove their complete predecessor before a migration can finish", async () => {
   const before = recoveryIdentity();
   const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1,
@@ -107,10 +190,10 @@ test("prepared CAS receipts must prove their complete predecessor before a migra
   let preparationExpected: ContinuityRecoveryIdentity | undefined;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
     return Response.json({ ok: true, recovery: after, state: "prepared", writerRetired: false,
-      toolsSettled: false, launcherInstance, hostNoWriter: false, preparationExpected });
+      toolsSettled: false, executionProtocol: 1, launcherInstance, hostNoWriter: false, preparationExpected });
   } });
   try {
-    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
     await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).rejects.toMatchObject({ code: "continuity_unverified" });
     preparationExpected = { ...before, ownerProcess: after.ownerProcess };
     await expect(updateLauncherContinuityPreparation(path, { expected: before, recovery: after })).rejects.toMatchObject({ code: "continuity_unverified" });
@@ -126,10 +209,10 @@ test("a late lifecycle acknowledgement cannot be accepted for the next snapshot"
   const before = recoveryIdentity();
   const after = recoveryIdentity({ transactionVersion: 1, snapshotVersion: 1 });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    return Response.json({ ok: true, cancelledByUser: false, recovery: before });
+    return Response.json({ ok: true, cancelledByUser: false, recovery: before, executionProtocol: 1 });
   } });
   try {
-    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    const path = descriptorFile(`http://127.0.0.1:${server.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
     await expect(notifyLauncherTurn(path, { phase: "end", traceId: "late-end-trace", helperPid: process.pid,
       recovery: after, status: "failed" })).rejects.toMatchObject({ code: "continuity_unverified" });
   } finally { server.stop(true); }
@@ -157,15 +240,15 @@ test("a lost recovery start response queries the original transaction before ret
     }
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(request.url === "/v1/turn/continuity-query"
-      ? { ok: true, recovery, state: "prepared", writerRetired: false, toolsSettled: false, launcherInstance, hostNoWriter: false, continuity,
+      ? { ok: true, recovery, state: "prepared", writerRetired: false, toolsSettled: false, executionProtocol: 1, launcherInstance, hostNoWriter: false, continuity,
         surfaceId: "s".repeat(32), tabId: "single-page" }
-      : { ok: true, surfaceId: "s".repeat(32), reused: false, connectorBound: false, continuity }));
+      : { ok: true, surfaceId: "s".repeat(32), reused: false, connectorBound: false, continuity, executionProtocol: 1 }));
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("No test control port");
-    const path = descriptorFile(`http://127.0.0.1:${address.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE]);
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`, "production", undefined, [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE]);
     await expect(notifyLauncherTurn(path, { phase: "start", traceId, helperPid: process.pid,
       conversationKey: "e".repeat(64), continuity: { owner, recovery } }, 500)).resolves.toMatchObject({ continuity });
     expect(routes).toEqual(["/v1/turn/start", "/v1/turn/continuity-query", "/v1/turn/start"]);

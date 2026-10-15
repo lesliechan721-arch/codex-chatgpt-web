@@ -102,8 +102,8 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 > GPT-5.6과 GPT-6 Pro는 기존 Bigger Context 한도를 유지합니다.
 
 > Luna/Think는 실험적인 분할 Bigger Context를 사용할 수 있습니다. Free의 긴 대화에서는 이전 세부
-> 정보가 손실될 수 있습니다. 끄면 Luna의 롤링 checkpoint를 유지합니다. Continuity first는 별도 기록
-> 예산을 유지하며 분할 전송을 사용하지 않습니다.
+> 정보가 손실될 수 있습니다. 끄면 Luna의 롤링 checkpoint를 유지합니다. 지원되는 Full Native + Launcher
+> 경로는 공통 기록 예산을 사용하며 웹 전송은 기존 전송 제한을 따릅니다.
 
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.
@@ -220,7 +220,7 @@ bun run app:package
 
 `dev:launcher`는 `~/.codex-chatgpt-web-dev`의 별도 프로필과 계정을 사용합니다. `dev:chat`은 실제 브라우저와 compaction 경로를 사용하며, 도구 결과는 명시적인 시뮬레이션입니다. 일반 Codex 경로는 변경하지 않습니다. 설정과 명령은 [DEV chat harness](docs/dev-chat.md)를 참고하세요.
 
-[세션 연속성 우선](docs/session-continuity.md)은 compaction 후에도 동일한 대화를 유지하며, 기존 페이지를 잃으면 다시 만들지 않고 중지합니다. 호환되는 Full Native + Launcher 구성에서는 선택형 `chatgpt-web-continuity/` 별칭을 제공합니다. Fresh Conversation Per Turn은 계속 호환되지 않습니다. Bigger Context는 켜 둬도 되며 Continuity first가 아닌 모델에만 적용됩니다. 더 큰 Codex 기록 예산은 ChatGPT의 단일 입력 한도를 늘리거나 기존 모델을 변경하지 않습니다.
+[세션 연속성](docs/session-continuity.md)은 지원되는 Full Native + Launcher 경로에서 일반 `chatgpt-web/` 모델 이름과 공통 작업 처리를 사용합니다. 정상이며 호환되는 페이지를 재사용합니다. 프로젝트 실행 권한 격리, 실제 도구 결과, 유효한 소스와 전송 계획을 확인한 뒤 미완료 작업, checkpoint 후 계속 작업, 미확정 압축을 새 페이지에서 복구할 수 있습니다. 알 수 없는 Send, 결과, 중지 기록은 계속 유효합니다. Fresh Conversation Per Turn은 페이지 선택만 변경합니다. Bigger Context는 기존 기능과 Zero Risk 제한을 유지합니다. 1,000,000 / 900,000-token Codex 기록 예산은 웹페이지 용량을 늘리지 않습니다. 실제 페이지는 최대 다섯 개이며 정리 시도 횟수는 제한됩니다. 이전 접두사 설정은 해당 일반 이름으로 변경해야 합니다. 이전 작업의 work, stop, checkpoint, retry 기록은 유지됩니다. 실제 환경 검증 상태는 문서에서 확인할 수 있습니다.
 
 </details>
 

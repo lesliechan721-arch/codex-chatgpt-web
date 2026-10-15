@@ -1,8 +1,9 @@
+import { getLauncherKnownUnsentReceipt } from "../../launcher-browser-host";
 import { createHash } from "node:crypto";
 import type { CodexParsedRequest } from "../../types";
 import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
-import { continuityError } from "./continuity-errors";
+import { continuityError, withRetiredWriterReason } from "./continuity-errors";
 import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryWorkRecord } from "./continuity-recovery-store";
 import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import type { BrokerToolRequest } from "./turn-broker";
@@ -56,9 +57,60 @@ export function assertRecoveryWriter(ref: RuntimeRecoveryReference): RecoveryThr
   if (record.pendingPreparation) throw continuityError("continuity_unverified", "The prior input preparation is still being coordinated.");
   if ((ref.ownerId !== undefined && ref.ownerId !== record.owner.id) || record.currentWorkId !== ref.logicalWorkId || attempt.writerRetired
     || attempt.epoch !== record.epoch || attempt !== work.attempts.at(-1) || work.state === "completed") {
-    throw continuityError("continuity_source_unproven", "An obsolete execution cannot write to the current recovery attempt.");
+    throw withRetiredWriterReason(continuityError("continuity_source_unproven", "An obsolete execution cannot write to the current recovery attempt."));
   }
   return record;
+}
+/** The callback commits synchronously; it must not start another journal transaction. */
+export function withRecoveryWriter<T>(ref: RuntimeRecoveryReference, commit: () => T): T {
+  return recoveryStore(ref).withWriterAuthority(ref, commit);
+}
+/** False means the original helper no longer owns failure or stop authority; no journal write occurred. */
+export function settleRecoveryFailure(ref: RuntimeRecoveryReference, stopReason?: NonNullable<RecoveryWorkRecord["stopReason"]>): boolean {
+  return recoveryStore(ref).settleWriterFailure(ref, stopReason) !== undefined;
+}
+/** Captured by the trusted outer transport before its one possible Send, never model input. */
+export interface RuntimeRecoverySendReference {
+  readonly directory: string;
+  readonly scope: string;
+  readonly identity: ContinuityRecoveryIdentity;
+  readonly authorizationId: string;
+}
+export function beginRecoverySend(ref: RuntimeRecoveryReference, original: ContinuityRecoveryIdentity,
+  authorizationId?: string): RuntimeRecoverySendReference {
+  const record = recoveryRecord(ref);
+  if (ref.ownerId !== undefined && ref.ownerId !== record.owner.id) throw continuityError("continuity_source_unproven");
+  if (original.threadKey !== ref.thread || original.logicalWorkId !== ref.logicalWorkId || original.attempt !== ref.attempt) {
+    throw continuityError("continuity_source_unproven", "The Send authorization belongs to another original attempt.");
+  }
+  const store = recoveryStore(ref);
+  const next = store.markAttempt(ref.thread, { scope: record.scope, expectedVersion: record.version }, {
+    logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "send-possible",
+    transactionVersion: original.transactionVersion, sendIdentity: original, ...(authorizationId ? { sendAuthorizationId: authorizationId } : {}) });
+  return Object.freeze({ directory: ref.directory, scope: record.scope, identity: Object.freeze(structuredClone(original)),
+    authorizationId: next.works[ref.logicalWorkId]!.attempts[ref.attempt]!.sendEvidence!.authorizationId });
+}
+export function beginRecoveryAcquisition(ref: RuntimeRecoveryReference, original: ContinuityRecoveryIdentity, requestId: string): void {
+  if (original.threadKey !== ref.thread || original.logicalWorkId !== ref.logicalWorkId || original.attempt !== ref.attempt) throw continuityError("continuity_source_unproven");
+  const record = assertRecoveryWriter(ref);
+  // Reattaching an already acquired physical page cannot produce a no-allocation receipt.
+  if (record.works[ref.logicalWorkId]!.attempts[ref.attempt]!.stage === "page-acquired") return;
+  recoveryStore(ref).beginAcquisition(ref.thread, { scope: record.scope, expectedVersion: record.version }, original, requestId);
+}
+/** Only authenticated, exact transport errors can roll an unexecuted transaction back to prepared. */
+export function settleRecoveryKnownUnsent(ref: RuntimeRecoveryReference, error: unknown): boolean {
+  const receipt = getLauncherKnownUnsentReceipt(error);
+  if (!receipt) return false;
+  const record = assertRecoveryWriter(ref);
+  if (receipt.recovery.threadKey !== ref.thread || receipt.recovery.logicalWorkId !== ref.logicalWorkId || receipt.recovery.attempt !== ref.attempt) throw continuityError("continuity_source_unproven");
+  recoveryStore(ref).settleKnownUnsent(ref.thread, { scope: record.scope, expectedVersion: record.version }, receipt.recovery, receipt.requestId, receipt.receiptId);
+  return true;
+}
+/** Settlement records only the original Send; false forbids publishing new delivery/coverage facts. */
+export function settleRecoverySend(reference: RuntimeRecoverySendReference): { record: RecoveryThreadRecord; currentWriter: boolean } {
+  const store = new ContinuityRecoveryStore(reference.directory);
+  const record = store.settleSendReceipt(reference.identity.threadKey, { scope: reference.scope }, reference.identity, reference.authorizationId);
+  return { record, currentWriter: store.hasSendWriterAuthority(reference.identity) };
 }
 /** Merge complete in-memory evidence; missing entries are not proof of restored sources. */
 function applyRecoveryContextCoverage(record: RecoveryThreadRecord, ref: RuntimeRecoveryReference,
@@ -282,6 +334,21 @@ export function acceptRecoveryResults(ref: RuntimeRecoveryReference, rawResults:
   let bodies = resultBodies.get(key);
   if (!bodies) { bodies = new Map(); resultBodies.set(key, bodies); }
   resultBodyReferences.set(key, ref);
+  const pendingById = new Map<string, Record<string, unknown>>();
+  for (const item of items) {
+    const id = String(item.call_id);
+    if (!bodies.has(id) && !pendingById.has(id)) pendingById.set(id, item);
+  }
+  const pending = [...pendingById.values()];
+  if (!pending.length) return;
+  try {
+    if (recoveryStore(ref).setResultBodiesBytes(ref.thread, { scope: record.scope },
+      pending.map(item => ({ callId: String(item.call_id), bytes: Buffer.byteLength(JSON.stringify(item)) })), resultBodyOwner)) {
+      for (const item of pending) bodies.set(String(item.call_id), structuredClone(item));
+      return;
+    }
+  } catch { /* Keep accepted terminal facts, and attempt independent optional reservations below. */ }
+  // Capacity or ownership can reject one item without preventing other bodies from fitting.
   for (const item of items) {
     const id = String(item.call_id);
     if (bodies.has(id)) continue;
@@ -399,45 +466,56 @@ export async function retireRecoveryWriter(
   const binding = bindings.observed(observed.thread);
   const source = binding ? (binding.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined)
     ?? chatGptTurnSessions.findFailedContinuityCreation(binding) : undefined;
-  let locallyRetired = false;
-  if (source) {
-    await source.runtime.retireCapability?.();
-    if (source.isActive()) source.cancel(Object.assign(new Error("The previous continuity writer is retired for recovery."), { code: "continuity_recovery_retired" }));
-    await source.physicalSettlement;
-    locallyRetired = true;
-  }
   const work = observed.currentWorkId ? observed.works[observed.currentWorkId] : undefined;
   const attempt = work?.attempts.at(-1);
-  const retiredPreparation = observed.retiredPreparation?.expected.transaction;
-  const stoppedPreparationRetired = retiredPreparation?.logicalWorkId === work?.logicalWorkId
-    && retiredPreparation?.attempt === attempt?.attempt && retiredPreparation?.targetEpoch === attempt?.epoch;
-  if (attempt && (!attempt.writerRetired || (work?.state === "stopped" && !stoppedPreparationRetired))) {
-    // Local Broker revocation and page settlement prove both writers. After a backend
-    // restart, Launcher retirement proves the page; the old process identity proves Broker.
-    let pageRetired = locallyRetired;
+  if (attempt) {
+    // A live instance must prove this protocol, not merely be running new files on disk.
+    if (bindings.broker?.assertRecoveryFencing) await bindings.broker.assertRecoveryFencing();
+    else if (continuityProcessInstanceStatus(observed.owner) !== "exited") throw continuityError("continuity_configuration_conflict", "The running Broker cannot prove execution generation fencing; update and restart it.");
+    // This CAS and dispatch registration use the same storage lock. After this commit,
+    // every old process observes the fence even if cancellation or cleanup loses its reply.
+    const current = bindings.recoveryStore.get(observed.thread)!;
+    if (current.version !== observed.version || current.owner.id !== observed.owner.id
+      || current.currentWorkId !== work!.logicalWorkId || current.epoch !== observed.epoch) {
+      throw continuityError("continuity_source_unproven", "The retirement observation is stale; inspect the current writer again.");
+    }
+    if (!attempt.writerRetired) bindings.recoveryStore.retireAttempt(current.thread,
+      { scope: current.scope, expectedVersion: current.version, expectedOwner: current.owner.id }, work!.logicalWorkId, attempt.attempt);
+    if (source) {
+      try { await source.runtime.retireCapability?.(); }
+      catch { /* The durable fence already denies effects; late coverage cannot delay isolation. */ }
+      if (source.isActive()) source.cancel(Object.assign(new Error("The previous task writer is retired for recovery."), { code: "continuity_recovery_retired" }));
+    }
+    if (bindings.broker?.retireRecoveryWriter) await bindings.broker.retireRecoveryWriter({ directory: bindings.registrations.directory,
+      thread: observed.thread, logicalWorkId: work!.logicalWorkId, attempt: attempt.attempt });
     if (observed.transaction) {
-      try {
-        const receipt = await retireLauncherContinuityWriter(descriptor,
-          recoveryIdentity(observed, bindings.recoveryStore.installationId()));
-        pageRetired ||= receipt.writerRetired === true;
-      } catch (error) {
-        if (!locallyRetired) throw continuityError("continuity_unverified", "The previous page writer retirement could not be verified.");
+      const original = recoveryIdentity(observed, bindings.recoveryStore.installationId());
+      const retiredPreparation = observed.retiredPreparation;
+      const archivedExpected = retiredPreparation && recoveryIdentity({ ...observed, ...retiredPreparation.expected }, bindings.recoveryStore.installationId());
+      // A stopped CAS may have applied its target before the reply was lost. Its
+      // archived pair remains the exact cleanup authority after pending is cleared.
+      let receipt;
+      if (work!.state === "stopped" && archivedExpected && canonicalJson(archivedExpected) === canonicalJson(original)) {
+        const target = recoveryIdentity({ ...observed, ...retiredPreparation!.target }, bindings.recoveryStore.installationId());
+        try { receipt = await retireLauncherContinuityWriter(descriptor, target, bindings.registrations.directory); }
+        catch { receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory); }
+      } else receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory);
+      if (receipt.writerRetired !== true) throw continuityError("continuity_unverified", "The page execution fence could not be verified.");
+      if (receipt.physicalCleanup !== "destroyed") {
+        const isolated = bindings.recoveryStore.get(observed.thread)!;
+        if (isolated.takeoverNoticeEpoch !== attempt.epoch) bindings.recoveryStore.transact(observed.thread,
+          { scope: isolated.scope, expectedVersion: isolated.version }, record => { record.takeoverNoticePending = true; record.takeoverNoticeEpoch = attempt.epoch; });
+      }
+      if (!attempt.writerRetired) {
+        const settled = bindings.recoveryStore.get(observed.thread)!;
+        const calls = Object.values(settled.calls).filter(call => call.workLineageId === work!.workLineageId);
+        console.info(`[chatgpt-web] execution_isolated ${JSON.stringify({ thread: observed.thread.slice(0, 16),
+          epoch: attempt.epoch, attempt: attempt.attempt, dispatched: calls.filter(call => call.state !== "queued" && call.state !== "cancelled-before-delivery").length,
+          settled: calls.filter(call => call.state === "settled").length, physicalCleanup: receipt.physicalCleanup ?? "pending",
+          guarantee: "project-controlled-effects-only", platformActivity: "unverified" })}`);
       }
     }
-    if (!locallyRetired && bindings.broker?.retireRecoveryWriter) {
-      locallyRetired = await bindings.broker.retireRecoveryWriter({ directory: bindings.registrations.directory,
-        thread: observed.thread, logicalWorkId: work!.logicalWorkId, attempt: attempt.attempt }).catch(() => false);
-    }
-    if (work?.purpose === "compaction" && attempt.dispatchProtocolComplete && pageRetired
-      && !Object.values(observed.calls).some(call => call.logicalWorkId === work.logicalWorkId && call.attempt === attempt.attempt)) locallyRetired = true;
-    // A durable stop fences every Broker dispatch, but cannot prove that the old
-    // browser writer has retired. Require its independent page receipt above.
-    if (work?.state === "stopped" && attempt.dispatchProtocolComplete) locallyRetired = true;
-    const processExited = continuityProcessInstanceStatus(observed.owner) === "exited";
-    if (!locallyRetired && !processExited) throw continuityError("continuity_execution_unsettled", "The previous Broker writer has not acknowledged retirement.");
-    if (!pageRetired) throw continuityError("continuity_unverified");
-    const current = bindings.recoveryStore.get(observed.thread)!;
-    bindings.recoveryStore.retireAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, work!.logicalWorkId, attempt.attempt);
+    // Physical settlement is independent. Live or failed-to-close pages retain their slot.
   }
   if (source?.settledOutcome()?.type === "error" && binding?.executionKey) {
     chatGptTurnSessions.retire(binding.executionKey, source,
@@ -454,7 +532,7 @@ export interface RecoveryAppendAdmission {
   contextCoverage?: readonly Readonly<ContextCoverageMetadata>[];
 }
 /** Broker calls this after validation, immediately before publishing the new writer version. */
-export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: RecoveryAppendAdmission): void | { committed: boolean; confirm: () => void } {
+export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: RecoveryAppendAdmission, updates?: readonly import("./task-update-protocol").UserUpdate[], driverGeneration?: number): void | { committed: boolean; confirm: () => void } {
   const record = assertRecoveryWriter(ref);
   const store = recoveryStore(ref);
   let candidate: RecoveryThreadRecord | undefined;
@@ -472,7 +550,19 @@ export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: Recov
       if (call.firstResultDigest && call.firstResultDigest !== result.resultDigest) throw continuityError("continuity_result_conflict");
       call.state = "settled"; call.firstResultDigest = result.resultDigest;
     }
-    if (input.logicalWorkId === ref.logicalWorkId) return;
+    const taskUpdateJournal = predecessor.taskUpdateJournal && structuredClone(predecessor.taskUpdateJournal);
+    if (updates) {
+      if (!taskUpdateJournal || driverGeneration !== taskUpdateJournal.driverGeneration + 1
+        || updates.some((update, index) => update.revision !== taskUpdateJournal.acceptedRevision + index + 1 || recoveryDigest(update.content) !== update.payloadDigest)
+        || new Set([...taskUpdateJournal.updates, ...updates].map(update => update.sourceMessageId)).size !== taskUpdateJournal.updates.length + updates.length
+        || input.localTaskRevision !== taskUpdateJournal.acceptedRevision + updates.length) throw continuityError("continuity_source_unproven", "The append is not the next durable task update range.");
+      taskUpdateJournal.updates.push(...updates.map(({ content, ...update }) => structuredClone(update)));
+      taskUpdateJournal.acceptedRevision += updates.length; taskUpdateJournal.driverGeneration = driverGeneration;
+    } else if (taskUpdateJournal) throw continuityError("continuity_source_unproven", "Durable task update acceptance requires its exact update facts.");
+    if (input.logicalWorkId === ref.logicalWorkId) {
+      if (taskUpdateJournal) predecessor.taskUpdateJournal = taskUpdateJournal;
+      return;
+    }
     if (draft.works[input.logicalWorkId] || lineage.headLogicalWorkId !== predecessor.logicalWorkId) throw continuityError("continuity_source_unproven");
     const oldAttempt = predecessor.attempts[ref.attempt]!;
     oldAttempt.writerRetired = true;
@@ -489,6 +579,7 @@ export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: Recov
     draft.works[input.logicalWorkId] = { logicalWorkId: input.logicalWorkId, instructionIdentity: input.instructionIdentity,
       nativeTurnId: input.nativeTurnId, workPayloadDigest: input.workPayloadDigest, purpose: "ordinary", state: "active",
       workLineageId: predecessor.workLineageId, acceptedTaskRevision: taskRevision,
+      ...(taskUpdateJournal ? { taskUpdateJournal } : {}),
       predecessorLogicalWorkId: predecessor.logicalWorkId, attempts: [next], retryBudget: { attempts: 1, startedAt: Date.now() } };
     draft.currentWorkId = input.logicalWorkId;
     if (draft.transaction?.logicalWorkId === predecessor.logicalWorkId) draft.transaction.writerRetired = true;

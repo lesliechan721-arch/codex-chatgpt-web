@@ -1,6 +1,6 @@
 import { skillFileTokens } from "./skill-attachments";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { estimateTokens } from "../../lib/token-estimate";
+import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
@@ -42,6 +42,14 @@ export function estimateChatGptWebInputTokens(
   capabilities: ChatGptWebCapabilities,
   options: CompileChatGptWebPromptOptions = {},
 ): number {
+  return withTokenEstimateCache(() => inputTokens(parsed, capabilities, options));
+}
+
+function inputTokens(
+  parsed: CodexParsedRequest,
+  capabilities: ChatGptWebCapabilities,
+  options: CompileChatGptWebPromptOptions,
+): number {
   const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
   const mode = manual
     ? { localTools: true }
@@ -73,9 +81,14 @@ export function resolveBiggerContextMultipartParts(
   capabilities: ChatGptWebCapabilities,
   experimentalSkillAttachments = false,
 ): ChatGptWebMultipartPartCount | undefined {
-  // Continuity keeps one page and its original single-input limits. The shared preference
-  // applies only to recoverable routes, including prompt staging and usage estimates.
-  if (parsed._conversationPolicy === "continuity-first") return undefined;
+  return withTokenEstimateCache(() => selectBiggerContextMultipartParts(parsed, capabilities, experimentalSkillAttachments));
+}
+
+function selectBiggerContextMultipartParts(
+  parsed: CodexParsedRequest,
+  capabilities: ChatGptWebCapabilities,
+  experimentalSkillAttachments: boolean,
+): ChatGptWebMultipartPartCount | undefined {
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
     throw new Error("Bigger Context is unavailable for ChatGPT Zero Risk");
   }

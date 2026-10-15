@@ -13,13 +13,16 @@ import {
 } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
+import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE } from "../src/adapters/chatgpt-web/continuity-contract";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import type { ContextArgs, ContextMethod } from "../src/adapters/chatgpt-web/context-runtime";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
-import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE, LAUNCHER_BROWSER_HOST_KIND,
+  LAUNCHER_BROWSER_IDLE_URL, startLauncherManualTurn } from "../src/launcher-browser-host";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { defaultBrokerEndpoint, defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { apiKeyPolicy } from "../src/api-access";
@@ -113,13 +116,15 @@ for (const scenario of [
   const { BrowserHost } = require("../launcher/electron/browser-host.cjs");
   const { BrowserControlServer } = require("../launcher/electron/control-server.cjs");
   const latestNative = "latestNative" in scenario;
+  const unified = scenario.apiKey || latestNative;
   const nativeLocal = scenario.format === "local";
   const reIdAfterLocalCompaction = nativeLocal && !latestNative;
   const nativeThreadId = "01be7f20-1111-7111-8111-111111111111";
   const nativeTurnId = "01be7f20-2222-7222-8222-222222222222";
   const nativeCompactTurnId = "01be7f20-3333-7333-8333-333333333333";
+  const nativeContinuationTurnId = "01be7f20-4444-7444-8444-444444444444";
   const nativeSecondCompactTurnId = "01be7f20-5555-7555-8555-555555555555";
-  const codexHome = join(root, `codex-home-local-${scenario.finalWins}-${latestNative}`);
+  const codexHome = join(root, `codex-home-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}-${scenario.delegated}-${latestNative}`);
   let rolloutPath: string | undefined;
   if (nativeLocal) {
     const rolloutDir = join(codexHome, "sessions", "2026", "09", "17");
@@ -154,10 +159,12 @@ for (const scenario of [
     ].join("\n") + "\n");
   }
   const config = provider(`owner-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}-${scenario.delegated}-${latestNative}`);
-  if (latestNative) {
+  if (unified) {
     config.chatgptWeb!.continuityStateDirectory = join(codexHome, "continuity");
     new ContinuityRegistrationStore(config.chatgptWeb!.continuityStateDirectory).initialize();
   }
+  const recoveryRecord = () => new ContinuityRecoveryStore(config.chatgptWeb!.continuityStateDirectory!)
+    .get(continuityDigest(nativeLocal ? nativeThreadId : "thread_safe_adapter"))!;
   if (scenario.delegated) config.chatgptWeb!.toolAuthorityMode = "delegated";
   config.chatgptWeb!.threadEnvironmentStatePath = join(
     root,
@@ -171,10 +178,13 @@ for (const scenario of [
     cwd: process.cwd(), stderr: "pipe" }));
   const localCompactPrompt = "CUSTOM_LOCAL_COMPACT_PROMPT preserve database migration and rollback steps.";
   const logs: string[] = [];
-  const logger = { info(event: string) { logs.push(event); }, warn() {}, error() {} };
+  const controlRejections: string[] = [];
+  const logger = { info(event: string) { logs.push(event); },
+    warn(event: string, detail?: { message?: string }) { if (event === "browser.control_rejected" && detail?.message) controlRejections.push(detail.message); },
+    error() {} };
   const host = Object.assign(Object.create(BrowserHost.prototype), {
     turnTabs: new Map(), manualTerminalSignals: new Map(), manualCompletionSignals: new Map(),
-    manualOperation: null, clipboard: { writeText() {} }, logger,
+    manualOperation: null, interactionModeOverride: "manual", clipboard: { writeText() {} }, logger,
     publishState() {}, snapshot: () => ({}), showWindow() {}, show() {}, writeDescriptor() {},
     createManualTurnTab(traceId: string, helperPid: number, conversationKey: string | undefined,
       prompt: string, manualSubmitTimeoutMs: number, manualSentConfirmationRequired = true) {
@@ -204,8 +214,8 @@ for (const scenario of [
     partition: "persist:codex-web-gpt-dev-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL,
     surfaceId: "launcher_surface_id_0123456789AB", createdAt: new Date().toISOString(),
     surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
-    ...(latestNative ? {
-      features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE],
+    ...(unified ? {
+      features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE],
       launcherInstance: require("../launcher/electron/continuity-process-instance.cjs").launcherInstance(host),
     } : {}),
   }), { mode: 0o600 });
@@ -213,11 +223,13 @@ for (const scenario of [
   const bindings = new Map<string, string>();
   let modelAction: Promise<void> | undefined;
   const control: ChatGptZeroRiskManualControl = {
-    async start(_path, activity) {
-      const receipt = host.beginManualTurn(activity.traceId, activity.helperPid, activity.prompt,
-        activity.conversationKey, activity.resumePrompt, activity.compaction,
-        activity.sentConfirmationRequired ?? true, activity.sentConfirmationRequired ?? true,
-        activity.continuity, activity.requireRetainedConversation, activity.contextPlans);
+    async start(path, activity) {
+      // The authenticated control endpoint binds the real private journal before acquisition.
+      const receipt = unified ? await startLauncherManualTurn(path, activity)
+        : host.beginManualTurn(activity.traceId, activity.helperPid, activity.prompt,
+          activity.conversationKey, activity.resumePrompt, activity.compaction,
+          activity.sentConfirmationRequired ?? true, activity.sentConfirmationRequired ?? true,
+          activity.continuity, activity.requireRetainedConversation, activity.contextPlans);
       starts.push(activity.traceId);
       const tab = [...host.turnTabs.values()].find((item: any) => item.traceId === activity.traceId);
       bindings.set(activity.traceId, binding(tab.prompt).request_id);
@@ -282,7 +294,7 @@ for (const scenario of [
   const adapter = createAdapter();
   const source = request(nativeLocal ? nativeTurnId : "turn_safe_active_compaction");
   if (latestNative) {
-    source._conversationPolicy = "continuity-first";
+    source._conversationPolicy = "task";
     // Latest Codex keeps native provenance in rollout, while the wire history carries ids only.
     for (const item of (source._rawBody as { input: Array<Record<string, unknown>> }).input) {
       delete item.internal_chat_message_metadata_passthrough;
@@ -314,7 +326,7 @@ for (const scenario of [
   const key = "cgw_" + "z".repeat(43);
   const accessPolicy = apiKeyPolicy(key);
   const appConfig = { ...defaultConfig("full"), appName: ZERO_RISK_CHATGPT_CONNECTOR_NAME,
-    browserInteractionMode: "manual" as const, ...(latestNative ? { browserHost: "launcher" as const } : {}) };
+    browserInteractionMode: "manual" as const, browserHost: "launcher" as const };
   const apiRequest = (parsed: CodexParsedRequest, v1 = false) => {
     const raw = parsed._rawBody as { input: unknown[]; client_metadata: Record<string, string> };
     const local = parsed._compactionRequest && scenario.format === "local";
@@ -325,7 +337,7 @@ for (const scenario of [
         ...(v1 ? { "x-codex-turn-metadata": raw.client_metadata["x-codex-turn-metadata"]! } : {}),
       },
       body: JSON.stringify({
-        ...raw, model: latestNative ? "chatgpt-web-continuity/zero-risk" : "chatgpt-web/zero-risk", stream: false,
+        ...raw, model: "chatgpt-web/zero-risk", stream: false,
         reasoning: { effort: parsed.options.reasoning },
         ...(v1 ? { client_metadata: undefined } : {}),
         ...(local ? { client_metadata: { "x-codex-turn-metadata": JSON.stringify({
@@ -364,13 +376,29 @@ for (const scenario of [
       });
     } };
   };
+  const runOrdinary = async (parsed: CodexParsedRequest, emitted: AdapterEvent[]) => {
+    if (!scenario.apiKey) {
+      await adapter.runTurn!(parsed, { headers: new Headers() }, event => emitted.push(event));
+      return;
+    }
+    const real = createAdapter();
+    const response = await responseRequest(apiRequest(parsed), appConfig, () => ({
+      ...real, async runTurn(incoming, request, emit) {
+        await real.runTurn!(incoming, request, event => { emitted.push(event); emit(event); });
+      },
+    }), { accessPolicy, rememberState: false });
+    const body = await response.json() as { error?: unknown; status?: string };
+    expect(response.status, JSON.stringify(body)).toBe(200);
+    expect(body.error, JSON.stringify(body)).toBeFalsy();
+    expect(body.status).toBe("completed");
+  };
   try {
     let sourceOutput: unknown[] = [];
     if (scenario.apiKey) {
       const response = await responseRequest(apiRequest(source), appConfig, apiAdapter, { accessPolicy, rememberState: false });
       const body = await response.json() as { status: string; output: unknown[] };
       expect(response.status, JSON.stringify(body)).toBe(200);
-      expect(body.status, JSON.stringify(body)).toBe("completed");
+      expect(body.status, JSON.stringify({ body, controlRejections })).toBe("completed");
       sourceOutput = body.output;
     } else {
       await adapter.runTurn!(source, { headers: new Headers() }, event => events.push(event));
@@ -398,14 +426,16 @@ for (const scenario of [
     }
     compact._compactionRequest = true;
     if (scenario.apiKey) {
-      // A standalone/pre-turn compact has a new envelope turn id, but its full history still
-      // belongs to the source turn. No previous_response_id or authenticated replay is sent.
+      // The real active-compact capture keeps the unfinished source's native turn.
+      // Local Responses compaction uses its captured standalone envelope and custom prompt.
       const compactRaw = compact._rawBody as { client_metadata: Record<string, string> };
       const compactMetadata = JSON.parse(compactRaw.client_metadata["x-codex-turn-metadata"]!);
       compactRaw.client_metadata = {
         "x-codex-turn-metadata": JSON.stringify({
           ...compactMetadata,
-          turn_id: nativeLocal ? nativeCompactTurnId : "turn_safe_http_compaction",
+          turn_id: scenario.finalWins || nativeLocal
+            ? nativeLocal ? nativeCompactTurnId : "turn_safe_http_compaction"
+            : compactMetadata.turn_id,
         }),
       };
       const sendCompact = (request = compact) => scenario.format === "v1"
@@ -434,20 +464,13 @@ for (const scenario of [
         expect(response.status).toBe(400);
         expect(body.error.message).toContain(scenario.format === "local" && rejected === forgedHistory
           ? "Historical environment message differs from its native Codex record"
-          : "trusted Codex environment");
+          : "trusted Codex");
         expect(starts).toHaveLength(1);
       }
       checkpoint.length = 0;
-      const response = await sendCompact();
+      // Surface a failed model assertion while HTTP still waits for its handoff.
+      const response = await Promise.race([sendCompact(), modelAction!.then(() => new Promise<Response>(() => {}))]);
       const body = await response.json() as { error?: unknown; status?: string; output?: Array<{ type?: string; content?: unknown; encrypted_content?: string }> };
-      if (latestNative) {
-        expect(response.status).toBe(200);
-        expect(body.status).toBe("failed");
-        expect(body.error).toMatchObject({ code: "continuity_manual_handoff_required" });
-        expect(starts).toHaveLength(1);
-        expect(host.manualCompletionSignals.has(starts[0])).toBeTrue();
-        return;
-      }
       expect(body.error).toBeFalsy();
       expect(response.status).toBe(200);
       expect(body.output?.length).toBeGreaterThan(0);
@@ -471,7 +494,7 @@ for (const scenario of [
     }
     await modelAction;
     expect(checkpoint.at(-1)).toMatchObject({ type: "done", endTurn: true });
-    if (scenario.delegated) {
+    if (scenario.delegated && !unified) {
       expect(checkpoint.at(-1)).toMatchObject({
         responseMetadata: {
           codex_chatgpt_web_compaction_path: "fresh",
@@ -480,9 +503,15 @@ for (const scenario of [
       });
     }
     expect(host.manualCompletionSignals.has(starts[0])).toBeTrue();
-    if (!latestNative) expect(logs).toContain("browser.retained_conversation_released");
+    if (!unified) expect(logs).toContain("browser.retained_conversation_released");
     else expect([...host.turnTabs.values()].some((tab: any) => tab.continuityOwner)).toBeTrue();
     const summary = checkpoint.filter(event => event.type === "text_delta").map(event => event.text).join("");
+    if (unified) {
+      const record = recoveryRecord();
+      expect(record.historyRevision).toBe(1);
+      expect(Object.values(record.checkpoints)).toHaveLength(1);
+      expect(Object.values(record.checkpoints)[0]!.coveredCallIds).toContain(call.id);
+    }
     if (!scenario.apiKey) {
       // Direct Adapter calls omit the HTTP checkpoint-evidence registration used in production.
       rememberCompactionContinuation(compact, extractChatGptTurnIdentity(compact),
@@ -522,16 +551,60 @@ for (const scenario of [
       ].map(item => JSON.stringify(item)).join("\n") + "\n");
       instruction.id = retained.id;
     }
+    if (nativeLocal && unified) {
+      // Match the captured manual-continuation wire: a new human Continue turn has
+      // its own current environment while the checkpoint/source remain history.
+      const raw = continuation._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+        ...JSON.parse(raw.client_metadata["x-codex-turn-metadata"]!),
+        request_kind: "turn", turn_id: nativeContinuationTurnId,
+      });
+      const currentEnvironment = { ...structuredClone(raw.input.find(item => item.id === "msg_environment")!),
+        id: "msg_environment_continue", internal_chat_message_metadata_passthrough: {
+          turn_id: nativeContinuationTurnId, content_item_kinds: ["environments.environment_context"],
+        } };
+      const currentInstruction = { type: "message", role: "user", id: "msg_continue", content: [
+        { type: "input_text", text: "Continue the accepted task after the checkpoint." },
+      ], internal_chat_message_metadata_passthrough: {
+        turn_id: nativeContinuationTurnId, content_item_kinds: ["user.text"],
+      } };
+      raw.input.push(currentEnvironment, currentInstruction);
+      appendFileSync(rolloutPath!, [
+        { type: "event_msg", payload: { type: "task_started", turn_id: nativeContinuationTurnId } },
+        { type: "turn_context", payload: {
+          turn_id: nativeContinuationTurnId, cwd: root, workspace_roots: [root], approval_policy: "never",
+          sandbox_policy: { type: "danger-full-access" }, permission_profile: { type: "disabled" },
+          model: "chatgpt-web/zero-risk", summary: "auto",
+        } },
+        { type: "response_item", payload: currentEnvironment },
+        { type: "response_item", payload: currentInstruction },
+      ].map(item => JSON.stringify(item)).join("\n") + "\n");
+    }
+    if (unified) {
+      // A real HTTP request reparses checkpoint history; it does not retain the old
+      // source request's context candidates, execution keys or history revision.
+      continuation = parseRequest(continuation._rawBody);
+    }
     const final: AdapterEvent[] = [];
-    await adapter.runTurn!(continuation, { headers: new Headers() }, event => final.push(event));
-    expect(starts).toHaveLength(2);
+    await runOrdinary(continuation, final);
+    const continuationStarts = nativeLocal && scenario.finalWins ? 3 : 2;
+    expect(starts).toHaveLength(continuationStarts);
     expect(starts[1]).not.toBe(starts[0]);
-    const expectedFinal = scenario.finalWins ? "Ordinary final answer before compaction" : "Final answer after compaction";
+    const expectedFinal = scenario.finalWins && !nativeLocal ? "Ordinary final answer before compaction" : "Final answer after compaction";
     expect(final.some(event => event.type === "text_delta" && event.text === expectedFinal), JSON.stringify(final)).toBeTrue();
+    const consumerBeforeReplay = unified ? Object.values(recoveryRecord().checkpoints)[0]!.continuation : undefined;
+    if (unified && !nativeLocal) {
+      expect(consumerBeforeReplay?.state).toBe("consumed");
+      expect(recoveryRecord().works[consumerBeforeReplay!.consumerLogicalWorkId!]!.state).toBe("completed");
+    }
     const replay: AdapterEvent[] = [];
-    await adapter.runTurn!(continuation, { headers: new Headers() }, event => replay.push(event));
-    expect(starts).toHaveLength(2); // exact reconnect replays, it must not submit again
+    await runOrdinary(continuation, replay);
+    expect(starts).toHaveLength(continuationStarts); // exact reconnect replays, it must not submit again
     expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    if (unified) {
+      expect(recoveryRecord().historyRevision).toBe(1);
+      expect(Object.values(recoveryRecord().checkpoints)[0]!.continuation).toEqual(consumerBeforeReplay!);
+    }
     expect(() => host.beginManualTurn(starts[0], process.pid, "old prompt")).toThrow("already completed");
 
     if (nativeLocal && !scenario.finalWins) {
@@ -555,28 +628,16 @@ for (const scenario of [
         error?: unknown; status?: string; output?: Array<{ type?: string; content?: unknown }>;
       };
       expect(secondResponse.status, JSON.stringify(secondBody)).toBe(200);
-      expect(secondBody.error).toBeFalsy();
+      // Public compact prepares a separate manual activity after the ordinary final.
+      // The same Launcher start/Sent contract confirms this checkpoint.
       expect(secondBody.status).toBe("completed");
-      expect(secondBody.output?.[0]?.type).toBe("message");
-      const startsAfterSecondCompaction = starts.length;
-      const secondSummary = checkpoint.filter(event => event.type === "text_delta").map(event => event.text).join("");
-      expect(secondSummary.length).toBeGreaterThan(0);
-      const secondContinuation = structuredClone(continuation);
-      (secondContinuation._rawBody as { input: unknown[] }).input.push({
-        type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${secondSummary}` }],
-      });
-      // This legacy replay keeps its accepted ordinary input prefix. The latest native
-      // replacement-history protocol has separate captured source/environment regressions.
-      appendFileSync(rolloutPath, JSON.stringify({
-        type: "turn_context", payload: {
-          turn_id: nativeTurnId, cwd: root, workspace_roots: [root], approval_policy: "never",
-          sandbox_policy: { type: "danger-full-access" }, permission_profile: { type: "disabled" },
-          model: "chatgpt-web/zero-risk", summary: "auto",
-        },
-      }) + "\n");
+      expect(secondBody.error).toBeUndefined();
+      expect(starts).toHaveLength(3);
+      expect(checkpoint.some(event => event.type === "text_delta" && event.phase === "final_answer")).toBeTrue();
+      expect(Object.values(recoveryRecord().checkpoints)).toHaveLength(2);
       const secondFinal: AdapterEvent[] = [];
-      await adapter.runTurn!(secondContinuation, { headers: new Headers() }, event => secondFinal.push(event));
-      expect(starts).toHaveLength(startsAfterSecondCompaction);
+      await runOrdinary(continuation, secondFinal);
+      expect(starts).toHaveLength(3);
       expect(secondFinal.some(event => event.type === "text_delta" && event.text === "Final answer after compaction")).toBeTrue();
       expect(secondFinal.at(-1)).toMatchObject({ type: "done", endTurn: true });
     }

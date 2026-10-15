@@ -18,7 +18,15 @@ function fixture(manual = false) {
   let allocations = 0;
   let copies = 0;
   let wait;
+  const revoked = new Set();
+  const authorityKey = identity => JSON.stringify(identity);
   const host = Object.assign(Object.create(BrowserHost.prototype), {
+    continuityAuthorityReader(identity) {
+      const attempt = { ...identity, writerRetired: revoked.has(authorityKey(identity)) };
+      const work = { logicalWorkId: identity.logicalWorkId, state: "prepared", purpose: "ordinary", workLineageId: identity.logicalWorkId, attempts: [attempt] };
+      return { attempt, work, record: { epoch: identity.epoch, currentWorkId: identity.logicalWorkId,
+        owner: identity.ownerProcess, works: { [identity.logicalWorkId]: work } } };
+    },
     continuityLauncherInstance: instance, turnTabs: new Map(), logger: { info() {}, warn() {}, error() {} },
     browserInteractionMode: () => manual ? "manual" : "automatic",
     removeTurnTab(tab) { tab.view.webContents.close(); this.turnTabs.delete(tab.id); },
@@ -46,7 +54,7 @@ function fixture(manual = false) {
     host.turnTabs.set(tab.id, tab);
     return tab;
   }
-  return { host, allocations: () => allocations, copies: () => copies, hold: promise => { wait = promise; } };
+  return { host, allocations: () => allocations, copies: () => copies, hold: promise => { wait = promise; }, revoke: identity => revoked.add(authorityKey(identity)) };
 }
 function start(f, identity, trace = "first-trace", pid = process.pid) {
   return f.host.beginTurn(trace, false, pid, "1".repeat(64), "connector", false, new AbortController().signal,
@@ -83,30 +91,40 @@ function useActualDeferredRemoval(f, tab) {
     destroy: (notify = true) => { destroyed = true; if (notify) contents.emit("destroyed"); } };
 }
 
-test("actual remove keeps asynchronous closing writers visible to repeated retirement and admission", async () => {
+async function retire(f, identity) { f.revoke(identity); return retireContinuityWriter(f.host, identity); }
+async function waitForCleanup(f, identity, state) {
+  const deadline = Date.now() + 1500;
+  while (queryContinuityTransaction(f.host, identity).physicalCleanup !== state && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal(queryContinuityTransaction(f.host, identity).physicalCleanup, state);
+}
+
+test("durable isolation permits a successor while the exact old physical page still occupies a slot", async () => {
   const f = fixture();
   const identity = recovery();
   const acquired = await start(f, identity);
   const old = f.host.turnTabs.get(acquired.tabId);
   const closing = useActualDeferredRemoval(f, old);
   markContinuitySendPossible(f.host, identity);
-  for (let index = 0; index < 3; index++) {
-    await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-    const observed = queryContinuityTransaction(f.host, identity);
-    assert.equal(observed.writerRetired, false);
-    assert.equal(observed.hostNoWriter, false);
-  }
-  assert.equal(f.host.turnTabs.size, 0);
-  assert.equal(closing.closes(), 1);
+  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
+  const isolated = await retire(f, identity);
+  assert.equal(isolated.writerRetired, true);
+  assert.equal(isolated.executionIsolated, true);
+  assert.equal(isolated.executionProtocol, 1);
+  assert.equal(isolated.physicalCleanup, "pending");
+  assert.equal(isolated.hostNoWriter, false);
+  for (let index = 0; index < 3; index++) await retireContinuityWriter(f.host, identity);
+  assert.equal(closing.closes(), 1, "reconciliation does not restart cleanup");
   const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
-  await assert.rejects(start(f, next, "blocked-next"), { code: "continuity_execution_unsettled" });
-  assert.equal(f.allocations(), 1);
-  closing.destroy();
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
-  await start(f, next, "after-actual-destroy");
+  await start(f, next, "successor");
   assert.equal(f.allocations(), 2);
+  assert.throws(() => markContinuitySendPossible(f.host, identity));
+  closing.destroy();
+  const observed = queryContinuityTransaction(f.host, identity);
+  assert.equal(observed.writerRetired, true);
+  assert.equal(observed.physicalCleanup, "destroyed");
   assert.equal(markContinuitySendPossible(f.host, next).sendAuthorized, true);
-  assert.equal(markContinuitySendPossible(f.host, next).sendAuthorized, false);
 });
 
 test("a lost transaction table cannot hide a closing physical writer", async () => {
@@ -119,26 +137,24 @@ test("a lost transaction table cannot hide a closing physical writer", async () 
   f.host.continuityTransactions.clear();
   const observed = queryContinuityTransaction(f.host, identity);
   assert.equal(observed.state, "unknown");
-  assert.equal(observed.hostNoWriter, false);
+  assert.equal(observed.physicalCleanup, "pending");
   assert.equal(observed.writerRetired, false);
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, false);
   const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
   await assert.rejects(start(f, next), { code: "continuity_execution_unsettled" });
   closing.destroy();
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
+  assert.equal((await retire(f, identity)).writerRetired, true);
   await start(f, next);
   assert.equal(f.allocations(), 2);
 });
 
-test("a late destroyed event and old tab removal cannot retire a newer transaction", async () => {
+test("late destroyed and cleanup replies cannot release a successor at the same UI position", async () => {
   const f = fixture();
   const identity = recovery();
   const acquired = await start(f, identity);
   const old = f.host.turnTabs.get(acquired.tabId);
+  old.ordinal = 1;
   const closing = useActualDeferredRemoval(f, old);
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  closing.destroy(false);
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
+  const isolated = await retire(f, identity);
   const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
   const acquiredNext = await start(f, next, "new-trace");
   const current = f.host.turnTabs.get(acquiredNext.tabId);
@@ -146,34 +162,30 @@ test("a late destroyed event and old tab removal cannot retire a newer transacti
   current.id = old.id;
   f.host.turnTabs.set(current.id, current);
   f.host.continuityTransactions.get(`${next.installationId}:${next.threadKey}`).tabId = current.id;
-  closing.contents.emit("destroyed");
+  closing.destroy();
   f.host.removeTurnTab(old, true);
   assert.equal(f.host.turnTabs.get(current.id), current);
-  const observed = queryContinuityTransaction(f.host, next);
-  assert.equal(observed.writerRetired, false);
-  assert.equal(observed.hostNoWriter, false);
-  assert.equal(observed.state, "prepared");
+  assert.equal(queryContinuityTransaction(f.host, identity).cleanup[0].cleanupId, isolated.cleanup[0].cleanupId);
+  assert.equal(queryContinuityTransaction(f.host, next).state, "prepared");
 });
 
-test("creating retirement waits for the acquisition and exact physical destruction", async () => {
+test("an isolated late acquisition cannot bind or clean up the successor", async () => {
   const f = fixture();
   let release;
-  f.hold(new Promise(resolve => { release = resolve; }));
+  const gate = new Promise(resolve => { release = resolve; });
+  const original = f.host.beginTurnAcquisition;
+  f.host.beginTurnAcquisition = async (...args) => { if (args[0] === "first-trace") await gate; return original(...args); };
   const identity = recovery();
   const acquiring = start(f, identity);
-  const old = [...f.host.turnTabs.values()][0];
-  const closing = useActualDeferredRemoval(f, old);
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  closing.destroy();
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, false);
+  assert.equal(f.allocations(), 0);
+  assert.equal((await retire(f, identity)).executionIsolated, true);
   const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
-  await assert.rejects(start(f, next), { code: "continuity_execution_unsettled" });
+  const current = await start(f, next, "successor");
   release();
   await assert.rejects(acquiring, { code: "continuity_source_unproven" });
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
-  await start(f, next, "after-creating-settled");
-  assert.equal(f.allocations(), 2);
+  assert.equal(f.host.turnTabs.size, 1);
+  assert.equal(f.host.turnTabs.has(current.tabId), true);
+  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, true);
 });
 
 test("closing eviction occupies the fifth physical slot for automatic and manual allocation", async () => {
@@ -187,92 +199,61 @@ test("closing eviction occupies the fifth physical slot for automatic and manual
     const lease = await start(f, recovery({ threadKey: String(index).repeat(64), transactionId: String(index).repeat(64) }), `other-${index}`);
     f.host.turnTabs.get(lease.tabId).ordinal = index;
   }
-  old.status = "ready";
-  delete old.continuityOwner;
-  assert.equal(f.host.hasContinuityCapacity(), true);
-  assert.throws(() => f.host.createManualTurnTab("sixth-manual", process.pid, "6".repeat(64), "prompt", 1000, true,
-    { owner }), { code: "continuity_resource_capacity" });
+  await retire(f, identity);
   assert.equal(f.host.hasContinuityCapacity(), false);
+  await assert.rejects(f.host.createManualTurnTab("sixth-manual", process.pid, "6".repeat(64), "prompt", 1000, true,
+    { owner }), { code: "continuity_resource_capacity" });
   await assert.rejects(f.host.createTurnTab("sixth-auto", process.pid, "6".repeat(64), "connector", undefined,
     { owner }), { code: "continuity_resource_capacity" });
   assert.equal(f.allocations(), 5);
   assert.equal(closing.closes(), 1);
   closing.destroy();
   assert.equal(f.host.hasContinuityCapacity(), true);
-  assert.equal(f.host.hasContinuityCapacity(), true);
-  assert.equal(f.host.turnTabs.size, 4);
 });
 
-test("a failed close request cannot grant retirement before physical destruction", async () => {
+test("cleanup fails after three attempts without restarting on recovery scans or retries", async () => {
   const f = fixture();
   const identity = recovery();
   const acquired = await start(f, identity);
   const old = f.host.turnTabs.get(acquired.tabId);
   const closing = useActualDeferredRemoval(f, old);
-  closing.contents.close = () => { throw new Error("Local close request failed"); };
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  assert.equal(queryContinuityTransaction(f.host, identity).hostNoWriter, false);
-  const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
-  await assert.rejects(start(f, next), { code: "continuity_execution_unsettled" });
+  f.host.continuityCleanupAttemptTimeoutMs = 2;
+  await retire(f, identity);
+  await waitForCleanup(f, identity, "failed");
+  let observed = queryContinuityTransaction(f.host, identity);
+  assert.equal(observed.physicalCleanup, "failed");
+  assert.equal(observed.cleanup[0].attempts, 3);
+  assert.equal(closing.closes(), 3);
+  for (let index = 0; index < 5; index++) await retireContinuityWriter(f.host, identity);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(closing.closes(), 3);
+  assert.equal(observed.writerRetired, true);
+  assert.equal(require("../electron/continuity-recovery.cjs").physicalTurnTabs(f.host).length, 1);
+  const cleanupId = observed.cleanup[0].cleanupId;
+  await require("../electron/continuity-recovery.cjs").retryContinuityCleanup(f.host, identity, "explicit-retry-1");
+  assert.equal(closing.closes(), 4, "explicit retry starts one new bounded budget");
+  assert.equal(queryContinuityTransaction(f.host, identity).cleanup[0].cleanupId, cleanupId);
+  await waitForCleanup(f, identity, "failed");
+  await require("../electron/continuity-recovery.cjs").retryContinuityCleanup(f.host, identity, "explicit-retry-1");
+  assert.equal(closing.closes(), 6, "a lost explicit retry reply does not start another budget");
   closing.destroy();
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
-  await start(f, next, "after-close-failure-settled");
-  assert.equal(f.allocations(), 2);
+  observed = queryContinuityTransaction(f.host, identity);
+  assert.equal(observed.physicalCleanup, "destroyed");
 });
 
-test("retiring a pending allocator cannot grant a page before its late physical entity is destroyed", async () => {
-  const f = fixture();
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  const original = f.host.beginTurnAcquisition;
-  let closing;
-  f.host.beginTurnAcquisition = async (...args) => {
-    await gate;
-    const result = original(...args);
-    if (args[0] === "first-trace") closing = useActualDeferredRemoval(f, [...f.host.turnTabs.values()][0]);
-    return result;
-  };
-  const identity = recovery();
-  const acquiring = start(f, identity);
-  assert.equal(f.allocations(), 0);
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, false);
-  assert.equal(queryContinuityTransaction(f.host, identity).hostNoWriter, false);
-  const next = recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 });
-  await assert.rejects(start(f, next), { code: "continuity_execution_unsettled" });
-  release();
-  await assert.rejects(acquiring, { code: "continuity_source_unproven" });
-  assert.equal(f.host.turnTabs.size, 0);
-  assert.equal(closing.closes(), 1);
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, false);
-  assert.equal(queryContinuityTransaction(f.host, identity).hostNoWriter, false);
-  await assert.rejects(start(f, next), { code: "continuity_execution_unsettled" });
-  closing.destroy();
-  assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
-  await start(f, next, "after-late-entity-destroyed");
-  assert.equal(f.allocations(), 2);
-});
-
-test("whole-host destruction shares closing evidence and cannot create another page", async () => {
+test("a close request failure preserves logical isolation and physical capacity", async () => {
   const f = fixture();
   const identity = recovery();
   const acquired = await start(f, identity);
   const closing = useActualDeferredRemoval(f, f.host.turnTabs.get(acquired.tabId));
-  Object.assign(f.host, { shellZoomShortcutBindings: new Map(), closeAuthView() {}, clearHomeNavigationTimeout() {},
-    powerSaveBlockerId: null });
-  f.host.window.off = () => {};
-  f.host.destroy();
-  assert.equal(f.host.turnTabs.size, 0);
-  assert.equal(closing.closes(), 1);
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, false);
-  assert.equal(queryContinuityTransaction(f.host, identity).hostNoWriter, false);
-  await assert.rejects(start(f, recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 })),
-    { code: "continuity_unverified" });
+  closing.contents.close = () => { throw new Error("close failed"); };
+  f.host.continuityCleanupAttemptTimeoutMs = 2;
+  assert.equal((await retire(f, identity)).executionIsolated, true);
+  await waitForCleanup(f, identity, "failed");
+  assert.equal(queryContinuityTransaction(f.host, identity).physicalCleanup, "failed");
+  assert.equal(require("../electron/continuity-recovery.cjs").physicalTurnTabs(f.host).length, 1);
   closing.destroy();
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, true);
-  assert.equal(queryContinuityTransaction(f.host, identity).hostNoWriter, true);
+  assert.equal(queryContinuityTransaction(f.host, identity).physicalCleanup, "destroyed");
 });
 
 test("real automatic entry shares one concurrent transaction and reconciles its lost response", async () => {
@@ -393,7 +374,7 @@ test("retirement removes only the target thread while its owner process remains 
   await start(f, before);
   await start(f, recovery({ threadKey: "3".repeat(64), transactionId: "4".repeat(64) }), "other-trace");
   markContinuitySendPossible(f.host, before);
-  const retired = await retireContinuityWriter(f.host, before);
+  const retired = await retire(f, before);
   assert.equal(retired.state, "retired");
   assert.equal(retired.writerRetired, true);
   assert.equal(retired.toolsSettled, false);
@@ -411,8 +392,7 @@ test("late acquisition cannot bind after its transaction was retired", async () 
   f.hold(new Promise(resolve => { release = resolve; }));
   const identity = recovery();
   const pending = start(f, identity);
-  await assert.rejects(retireContinuityWriter(f.host, identity), { code: "continuity_unverified" });
-  assert.equal(queryContinuityTransaction(f.host, identity).writerRetired, false);
+  assert.equal((await retire(f, identity)).writerRetired, true);
   release();
   await assert.rejects(pending, { code: "continuity_source_unproven" });
   assert.equal((await retireContinuityWriter(f.host, identity)).writerRetired, true);
@@ -434,9 +414,9 @@ test("real manual entry preserves the new prompt's manual confirmation and canno
     recovery({ transactionVersion: 1, snapshotVersion: 1 })), { code: "continuity_execution_unsettled" });
 });
 
-test("the exact host with no thread writer proves a missing receipt without declaring tool settlement", () => {
+test("the exact host with no thread writer cannot substitute for durable revocation", () => {
   const observed = queryContinuityTransaction(fixture().host, recovery());
-  assert.deepEqual(observed, { recovery: recovery(), state: "missing", writerRetired: true, toolsSettled: false, launcherInstance: instance, hostNoWriter: true });
+  assert.deepEqual(observed, { recovery: recovery(), state: "missing", writerRetired: false, toolsSettled: false, launcherInstance: instance, hostNoWriter: true, executionProtocol: 1, executionIsolated: false, physicalCleanup: "pending", cleanup: [] });
 });
 
 test("actual authenticated control endpoints query, CAS, freeze and retire one page", async () => {
@@ -460,6 +440,7 @@ test("actual authenticated control endpoints query, CAS, freeze and retire one p
     assert.equal(f.host.turnTabs.size, 1);
     assert.equal((await post("continuity-send-possible", { recovery: identity })).status, 409);
     assert.equal((await (await post("continuity-send-possible", { recovery: after })).json()).sendAuthorized, true);
+    f.revoke(after);
     const retired = await (await post("continuity-retire", { recovery: after })).json();
     assert.equal(retired.writerRetired, true);
     assert.equal(retired.toolsSettled, false);
@@ -467,15 +448,14 @@ test("actual authenticated control endpoints query, CAS, freeze and retire one p
   } finally { await server.close(); }
 });
 
-test("an unconfirmed page destruction cannot grant a subsequent attempt", async () => {
+test("unconfirmed physical cleanup does not revoke established logical isolation", async () => {
   const f = fixture();
   const before = recovery();
   await start(f, before);
   f.host.removeTurnTab = () => {};
-  await assert.rejects(retireContinuityWriter(f.host, before), { code: "continuity_unverified" });
-  await assert.rejects(start(f, recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 })),
-    { code: "continuity_execution_unsettled" });
-  assert.equal(f.allocations(), 1);
+  assert.equal((await retire(f, before)).writerRetired, true);
+  await start(f, recovery({ epoch: 1, attempt: 1, snapshotVersion: 1, transactionVersion: 1 }), "successor");
+  assert.equal(f.allocations(), 2);
 });
 
 test("the real healthy-page acquisition accepts the next work without increasing its epoch or allocating a page", async () => {

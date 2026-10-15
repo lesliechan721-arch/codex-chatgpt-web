@@ -17,6 +17,8 @@ export interface TaskUpdateOwnerContext {
 
 export interface TaskUpdateRegistrationOptions {
   taskUpdateProtocol?: 1;
+  /** Authenticated outer owner supplies source text; Broker verifies it against durable digests. */
+  recoveryTaskUpdateSources?: Array<Omit<UserUpdate, "revision">>;
   recovery?: import("./continuity-recovery-runtime").RuntimeRecoveryReference;
 }
 

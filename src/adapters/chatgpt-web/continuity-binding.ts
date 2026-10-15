@@ -1,12 +1,12 @@
 import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryCheckpointRecord } from "./continuity-recovery-store";
-import type { RuntimeRecoveryReference } from "./continuity-recovery-runtime";
+import { recoveryIdentity, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
 import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest, CodexTool } from "../../types";
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
 import { ContinuityRegistrationStore } from "./continuity-registration";
-import { CONTINUITY_IDLE_TTL_MS, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
+import { CONTINUITY_IDLE_TTL_MS, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityLease, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
 import { chatGptTurnSessions, type ContinuitySourceInstructionReplayEvidence } from "./turn-execution";
 export { CONTINUITY_IDLE_TTL_MS, CONTINUITY_FEATURE } from "./continuity-contract";
@@ -80,7 +80,7 @@ export function continuitySourceRepresentationDigest(parsed: CodexParsedRequest,
 
 /** Summary content filters committed relations; request-carried identity selects the source. */
 export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): ContinuityCheckpointSelection | undefined {
-  if (parsed._conversationPolicy !== "continuity-first" || !parsed._continuityScope || !identity.threadId) return undefined;
+  if (parsed._conversationPolicy !== "task" || !parsed._continuityScope || !identity.threadId) return undefined;
   const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
   const cached = checkpointSelections.get(parsed);
   if (cached && cached.input === input && cached.scope === parsed._continuityScope
@@ -164,6 +164,8 @@ export interface ContinuityBinding {
   state: "creating" | "running" | "ready" | "compacting" | "unverified" | "lost" | "ended";
   revision: number;
   lastUsedAt: number;
+  /** Verified cumulative cost of this physical page, including committed compaction. */
+  retainedPageTokens?: number;
   lease?: ContinuityLease;
   /** Trusted local ownership metadata only; never persisted or supplied by request JSON. */
   conversation?: { key: string; descriptor: string };
@@ -507,6 +509,7 @@ export class ContinuityBindings {
   installRecoveryCheckpoint(
     binding: ContinuityBinding, key: string, checkpoint: RecoveryCheckpointRecord, summary: string,
     sourceInstruction: ChatGptTurnUserRevision, sourceRepresentationDigests: readonly string[], preserveFinalResponse: boolean,
+    retainedSourceExecutionKey?: string,
   ): void {
     const bytes = Buffer.byteLength(summary) + Buffer.byteLength(JSON.stringify(sourceInstruction));
     const prior = binding.checkpoints.get(key);
@@ -515,8 +518,14 @@ export class ContinuityBindings {
       return;
     }
     if (bytes > MAX_CHECKPOINT_BYTES || this.checkpointCount >= MAX_CHECKPOINTS || this.checkpointBytes + bytes > MAX_TOTAL_CHECKPOINT_BYTES) throw continuityError("continuity_resource_capacity");
-    const sourceExecutionKey = binding.executionKey ?? key;
+    // A cold compaction page has its own execution key. Its source remains the
+    // exact ordinary session selected before migration, never a later head.
+    const sourceExecutionKey = retainedSourceExecutionKey ?? binding.executionKey ?? key;
     const source = chatGptTurnSessions.find(sourceExecutionKey);
+    if (retainedSourceExecutionKey && source
+      && (source.runtime.continuityBinding?.scope !== binding.scope || source.runtime.continuityBinding?.thread !== binding.thread)) {
+      throw continuityError("continuity_source_unproven");
+    }
     const replay = source?.acceptedContinuityInstructionIdentity() ? source.continuitySourceInstructionReplayEvidence() : undefined;
     binding.checkpoints.set(key, { sourceRevision: checkpoint.sourceHistoryRevision, revision: checkpoint.targetHistoryRevision,
       sourceExecutionKey, bytes, summary, preserveFinalResponse,
@@ -554,7 +563,37 @@ export class ContinuityBindings {
   }
 
   /** Old cleanup can only retire the execution that still owns this binding. */
-  lose(binding: ContinuityBinding, executionKey?: string): void {
+  lose(binding: ContinuityBinding, executionKey?: string, expectedRecovery?: {
+    ownerId: string; identity: ContinuityRecoveryIdentity;
+  }): void {
+    if (expectedRecovery) {
+      if (this.bindings.get(binding.thread) !== binding
+        || executionKey !== undefined && binding.executionKey !== executionKey) {
+        throw continuityError("continuity_source_unproven");
+      }
+      const store = this.recoveryStore, installationId = store.installationId();
+      const registration = this.registrations.get(binding.thread);
+      if (!registration) throw continuityError("continuity_source_unproven");
+      const expected = expectedRecovery.identity;
+      // The missing-page observation belongs to its original writer. Check that
+      // identity under the journal write lock before publishing any lost state.
+      store.transact(binding.thread, { scope: binding.scope, expectedOwner: expectedRecovery.ownerId,
+        expectedEpoch: expected.epoch }, record => {
+        const work = record.works[expected.logicalWorkId];
+        if (record.currentWorkId !== expected.logicalWorkId || !work
+          || work.attempts.at(-1)?.attempt !== expected.attempt
+          || !sameContinuityRecoveryIdentity(recoveryIdentity(record, installationId), expected)) {
+          throw continuityError("continuity_source_unproven");
+        }
+        if (record.state === "stopped" || work.state === "stopped") throw continuityError("continuity_stopped");
+        record.state = "lost";
+      });
+      this.registrations.compareAndSwap(binding.thread, registration, { owner: expectedRecovery.ownerId,
+        state: "lost", epoch: expected.epoch, transactionId: expected.transactionId });
+      binding.state = "lost";
+      binding.evidenceExpiresAt = this.now() + TERMINAL_EVIDENCE_TTL_MS;
+      return;
+    }
     if (this.bindings.get(binding.thread) !== binding) return;
     if (executionKey !== undefined && binding.executionKey !== executionKey) return;
     if (binding.state === "lost" || binding.state === "ended") return;

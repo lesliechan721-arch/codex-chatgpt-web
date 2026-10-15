@@ -48,7 +48,7 @@ test("production and DEV setup reject the removed connector-name option before c
       ...process.env,
       CODEX_HOME: join(root, "codex"),
       CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-      CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
+      CODEX_WEB_GPT_DEV_HOME: join(root, "dev"),
     };
     for (const command of [["setup"], ["dev", "setup"]]) {
       const result = await runCli([
@@ -66,149 +66,19 @@ test("production and DEV setup reject the removed connector-name option before c
   }
 });
 
-test("production and DEV setup reject conflicting conversation modes before configuration", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codex-web-conversation-flags-"));
-  try {
-    for (const command of [["setup"], ["dev", "setup"]]) {
-      const result = await runCli([
-        ...command, "--browser-only", "--fresh-conversation", "--retained-conversation",
-      ], {
-        ...process.env,
-        CODEX_HOME: join(root, "codex"),
-        CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-        CODEX_CHATGPT_WEB_DEV_HOME: join(root, "dev"),
-      });
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain("Choose --fresh-conversation or --retained-conversation");
-    }
-    expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
-    expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("setup validates the port before performing runtime work", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-"));
-  try {
-    const result = await runCli([
-      "setup",
-      "--browser-only",
-      "--chrome",
-      process.execPath,
-      "--browser-host-descriptor",
-      join(root, "launcher-browser.json"),
-      "--port",
-      "0",
-      "--acknowledge-unofficial",
-    ], {
-      ...process.env,
-      CODEX_HOME: join(root, "codex"),
-      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-    });
-    const { stderr } = result;
-    expect(result.exitCode).toBe(1);
-    expect(stderr).toContain("--port must be an integer from 1 to 65535");
-    expect(stderr).not.toContain("Choose either --chrome or --browser-host-descriptor");
-    expect(stderr).not.toContain("Unknown arguments");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("setup browser-interaction flags are explicit and mutually exclusive", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-interaction-"));
-  try {
-    const result = await runCli([
-      "setup",
-      "--browser-only",
-      "--automatic-browser-interaction",
-      "--zero-risk-browser-interaction",
-      "--acknowledge-unofficial",
-    ], {
-      ...process.env,
-      CODEX_HOME: join(root, "codex"),
-      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("Choose at most one browser interaction mode");
-
-    const profileConflict = await runCli([
-      "setup",
-      "--browser-only",
-      "--zero-risk-browser-interaction",
-      "--zero-risk-pro",
-      "--zero-risk-default",
-      "--acknowledge-unofficial",
-    ], {
-      ...process.env,
-      CODEX_HOME: join(root, "codex"),
-      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-    });
-    expect(profileConflict.exitCode).toBe(1);
-    expect(profileConflict.stderr).toContain("Choose at most one Zero Risk model profile");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("manual setup rejects capability refresh and Bigger Context", async () => {
+test("production setup rejects manual browser-only mode before configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-manual-invalid-"));
   try {
-    const env = {
-      ...process.env,
-      CODEX_HOME: join(root, "codex"),
-      CODEX_CHATGPT_WEB_HOME: join(root, "app"),
-    };
-    const refresh = await runCli([
-      "setup",
-      "--browser-only",
-      "--zero-risk-browser-interaction",
-      "--refresh-account-capabilities",
-      "--acknowledge-unofficial",
-    ], env);
-    expect(refresh.exitCode).toBe(1);
-    expect(refresh.stderr).toContain("cannot refresh account capabilities");
-
-    const bigger = await runCli([
-      "setup",
-      "--browser-only",
-      "--zero-risk-browser-interaction",
-      "--bigger-context",
-      "--acknowledge-unofficial",
-    ], env);
-    expect(bigger.exitCode).toBe(1);
-    expect(bigger.stderr).toContain("does not support Bigger Context");
-
-    const browserOnly = await runCli([
-      "setup",
-      "--browser-only",
-      "--zero-risk-browser-interaction",
-      "--acknowledge-unofficial",
-    ], env);
-    expect(browserOnly.exitCode).toBe(1);
-    expect(browserOnly.stderr).toContain("requires --full");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}, 20_000);
-
-test("setup rejects an invalid tool authority mode", async () => {
-  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-tool-authority-"));
-  try {
     const result = await runCli([
-      "setup",
-      "--browser-only",
-      "--tool-authority-mode",
-      "unsafe",
-      "--acknowledge-unofficial",
+      "setup", "--browser-only", "--zero-risk-browser-interaction", "--acknowledge-unofficial",
     ], {
       ...process.env,
       CODEX_HOME: join(root, "codex"),
       CODEX_CHATGPT_WEB_HOME: join(root, "app"),
     });
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("--tool-authority-mode must be verified-environment or delegated");
+    expect(result.stderr).toContain("requires --full");
+    expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -802,60 +672,24 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
   }
 });
 
-test("DEV setup accepts explicit browser-interaction flags and preserves manual fail-closed validation", async () => {
+test("DEV setup rejects manual browser-only mode before configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-dev-interaction-"));
   const devHome = join(root, "dev");
-  const descriptorPath = join(devHome, "runtime", "launcher-browser.json");
-  const helperScript = join(root, "helper.cjs");
   try {
-    mkdirSync(join(devHome, "runtime"), { recursive: true });
-    writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
-    writeFileSync(descriptorPath, `${JSON.stringify({
-      version: 3,
-      kind: "codex-web-gpt-launcher",
-      profile: "development",
-      pid: process.pid,
-      endpoint: "http://127.0.0.1:48131",
-      control: {
-        endpoint: "http://127.0.0.1:48132",
-        token: "dev-manual-control-token-0123456789abcdefghijklmnop",
-      },
-      helper: { executable: process.execPath, script: helperScript },
-      partition: "persist:codex-web-gpt-dev-chatgpt",
-      idleUrl: LAUNCHER_BROWSER_IDLE_URL,
-      surfaceId: "m".repeat(32),
-      surfaceTargets: { ["m".repeat(32)]: "native-owned-target" },
-      createdAt: new Date().toISOString(),
-    })}\n`, { mode: 0o600 });
-    const env = {
+    const result = await runCli([
+      "dev", "setup", "--browser-only", "--browser-host-descriptor", join(devHome, "missing-launcher.json"),
+      "--zero-risk-browser-interaction", "--acknowledge-unofficial",
+    ], {
       ...process.env,
       CODEX_WEB_GPT_DEV_HOME: devHome,
       CODEX_CHATGPT_WEB_HOME: join(root, "production"),
       CODEX_HOME: join(root, "production-codex"),
-    };
-
-    const manualBrowserOnly = await runCli([
-      "dev",
-      "setup",
-      "--browser-only",
-      "--browser-host-descriptor",
-      descriptorPath,
-      "--zero-risk-browser-interaction",
-      "--acknowledge-unofficial",
-    ], env);
-    expect(manualBrowserOnly.exitCode).toBe(1);
-    expect(manualBrowserOnly.stderr).toContain("requires --full");
-    expect(manualBrowserOnly.stderr).not.toContain("Unknown DEV arguments");
-
-    const conflicting = await runCli([
-      "dev",
-      "setup",
-      "--browser-only",
-      "--automatic-browser-interaction",
-      "--zero-risk-browser-interaction",
-    ], env);
-    expect(conflicting.exitCode).toBe(1);
-    expect(conflicting.stderr).toContain("Choose at most one browser interaction mode");
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("requires --full");
+    expect(result.stderr).not.toContain("Unknown DEV arguments");
+    expect(existsSync(join(devHome, "config.json"))).toBeFalse();
+    expect(existsSync(join(root, "production", "config.json"))).toBeFalse();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -12,7 +12,7 @@ import { contextErrorReserve, measureContextResponse } from "../src/adapters/cha
 import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
 import { planContextDelivery, type ContextDeliveryPlan, type ContextDeliveryPlanInput } from "../src/adapters/chatgpt-web/context-planner";
 import { ContextDeliveryPlanningError, contextAttachmentImage } from "../src/adapters/chatgpt-web/context-media-plan";
-import { assertContinuityCompiledInput, preflightContinuityInput, preflightFullRecoveryContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
+import { assertContinuityCompiledInput, preflightContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { estimateWebContextFieldCost } from "../src/adapters/chatgpt-web/context-renderer";
@@ -477,7 +477,7 @@ test("continuity preflight uses the selected projection for tool history and MCP
   expect(canonical).toEqual(before);
 });
 
-test("new recovery pages retain the original full-image input boundary before projection", () => {
+test("new recovery pages admit selected image routes and keep original bytes", () => {
   for (const manual of [false, true]) {
     const canonical = request([{ role: "user", content: Array.from({ length: 12 }, () => ({ type: "image" as const, imageUrl: png })), timestamp: 1 }]);
     if (manual) canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
@@ -485,27 +485,25 @@ test("new recovery pages retain the original full-image input boundary before pr
     const full = compileChatGptWebPrompt(canonical, capabilities, token, manual ? { manualControl: true } : {});
     expect(() => assertContinuityCompiledInput(full, canonical, capabilities)).toThrow("original single-input boundary");
     expect(() => preflightContinuityInput(canonical, capabilities)).not.toThrow();
-    expect(() => preflightFullRecoveryContinuityInput(canonical, capabilities)).toThrow("original single-input boundary");
     expect(canonical).toEqual(before);
   }
 });
 
-test("proved recovery inputs that fit the full contract still support subsequent planning", () => {
+test("small proved recovery inputs preserve their selected inline contract", () => {
   for (const manual of [false, true]) {
     const canonical = logRequest("accepted exact tool result\n".repeat(300));
     canonical.context.messages[0]!.content = [{ type: "text", text: "Continue the accepted instruction." }, { type: "image", imageUrl: png }];
     if (manual) canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
     const before = structuredClone(canonical);
-    expect(() => preflightFullRecoveryContinuityInput(canonical, capabilities)).not.toThrow();
     expect(() => preflightContinuityInput(canonical, capabilities)).not.toThrow();
     expect(canonical).toEqual(before);
   }
 });
 
-test("full recovery capacity cannot be raised by externalizing its oversized original tool history", () => {
+test("oversized recovery tool history is admitted by the selected on-demand plan", () => {
   const canonical = logRequest("original recovery log\n".repeat(80_000)), before = structuredClone(canonical);
   expect(() => preflightContinuityInput(canonical, capabilities)).not.toThrow();
-  expect(() => preflightFullRecoveryContinuityInput(canonical, capabilities)).toThrow("original single-input boundary");
+  expect(() => assertContinuityCompiledInput(compileChatGptWebPrompt(canonical, capabilities, token), canonical, capabilities)).toThrow();
   expect(canonical).toEqual(before);
 }, 30_000);
 

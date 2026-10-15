@@ -7,7 +7,7 @@ import { responseRequest } from "../src/server";
 const localKey = `cgw_${"a".repeat(43)}`;
 
 // Shape emitted by Codex TUI's temporary recap thread, including its output schema.
-function recapBody(model = "chatgpt-web-continuity/zero-risk-pro", stream = true) {
+function recapBody(model = "chatgpt-web/zero-risk-pro", stream = true) {
   return {
     model, stream,
     client_metadata: {

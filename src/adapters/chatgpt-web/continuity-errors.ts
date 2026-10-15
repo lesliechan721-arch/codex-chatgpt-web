@@ -28,7 +28,7 @@ const messages: Record<ContinuityErrorCode, string> = {
   continuity_session_lost: "The previous conversation is unavailable. Recovery requires settled execution and valid current context.",
   continuity_source_unproven: "The current instruction, history revision, or exact compaction source cannot be proved.",
   continuity_manual_handoff_required: "Zero Risk finished before a compaction handoff was delivered. The completed answer and tool results are preserved; no new prompt was copied or sent.",
-  continuity_configuration_conflict: "Session continuity first is incompatible with the current configuration or component versions.",
+  continuity_configuration_conflict: "Task continuity is unavailable with the current configuration or component versions.",
   continuity_input_limit: "The actual next ChatGPT prompt exceeds the original single-input boundary. The larger execution history budget does not increase this boundary.",
   continuity_resource_capacity: "Session continuity storage or browser capacity is full. Existing tasks were not evicted.",
 };
@@ -41,4 +41,13 @@ export function continuityError(code: ContinuityErrorCode, reason?: string): Cha
     code,
     retryable: code === "continuity_unverified",
   });
+}
+
+/** Keep the original error contract; the reason only selects proven final readback. */
+export function withRetiredWriterReason<T extends Error>(error: T): T & { reason: "writer_retired" } {
+  return Object.assign(error, { reason: "writer_retired" as const });
+}
+
+export function isRetiredWriterError(error: unknown): error is Error & { reason: "writer_retired" } {
+  return error instanceof Error && "reason" in error && error.reason === "writer_retired";
 }

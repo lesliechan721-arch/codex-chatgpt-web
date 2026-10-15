@@ -1,9 +1,9 @@
 export const CHATGPT_WEB_MODEL_PREFIX = "chatgpt-web/";
-export const CHATGPT_WEB_CONTINUITY_MODEL_PREFIX = "chatgpt-web-continuity/";
-export type ChatGptConversationPolicy = "recoverable" | "continuity-first";
+const REMOVED_CHATGPT_WEB_MODEL_PREFIX = "chatgpt-web-continuity/";
+export type ChatGptConversationPolicy = "recoverable" | "task";
 /** Canonical execution history, not the context or input limit of the ChatGPT website. */
-export const CHATGPT_WEB_CONTINUITY_CONTEXT_WINDOW = 1_000_000;
-export const CHATGPT_WEB_CONTINUITY_AUTO_COMPACT_TOKEN_LIMIT = 900_000;
+export const CHATGPT_WEB_TASK_HISTORY_CONTEXT_WINDOW = 1_000_000;
+export const CHATGPT_WEB_TASK_HISTORY_AUTO_COMPACT_TOKEN_LIMIT = 900_000;
 /** Shared automatic transport profile; exact browser version is carried by modelFamily. */
 export const CHATGPT_WEB_BACKEND_MODEL = "gpt-5.6-sol";
 /** Internal Luna transport identity; the Free UI does not expose a selectable model version. */
@@ -547,21 +547,6 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] 
   },
 ];
 
-/** Only published, supported base identities have a continuity counterpart. */
-export const CHATGPT_WEB_CONTINUITY_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
-  ...CHATGPT_WEB_MODEL_ROUTES,
-  CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
-  CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
-].map(route => ({
-  ...route,
-  slug: route.slug.replace(CHATGPT_WEB_MODEL_PREFIX, CHATGPT_WEB_CONTINUITY_MODEL_PREFIX),
-  displayName: `${route.displayName} — Continuity first`,
-  description: "Session continuity first. Prefers the original conversation across work and compaction; "
-    + "can recover a lost page from current context after the previous writer and tools settle. "
-    + "The 1,000,000-token execution history budget does not increase the single-input limit.",
-  conversationPolicy: "continuity-first" as const,
-}));
-
 const routesBySlug = new Map(
   [
     CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
@@ -571,31 +556,33 @@ const routesBySlug = new Map(
     CHATGPT_WEB_LEGACY_LUNA_MODEL_ROUTE,
     CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE,
     ...CHATGPT_WEB_LEGACY_MODEL_ROUTES,
-    ...CHATGPT_WEB_CONTINUITY_MODEL_ROUTES,
   ]
     .map(route => [route.slug, route]),
 );
 
 export function isChatGptWebModelSlug(modelId: string): boolean {
   return modelId.startsWith(CHATGPT_WEB_MODEL_PREFIX)
-    || modelId.startsWith(CHATGPT_WEB_CONTINUITY_MODEL_PREFIX);
+    || modelId.startsWith(REMOVED_CHATGPT_WEB_MODEL_PREFIX);
 }
 
-export function chatGptWebContinuityAvailable(capabilities: ChatGptWebAccountCapabilities): boolean {
-  return capabilities.mode === "full"
-    && capabilities.browserHost === "launcher"
-    && !capabilities.experimentalFreshConversationPerTurn;
+export function assertCurrentChatGptWebModelName(modelId: string): void {
+  if (modelId.startsWith(REMOVED_CHATGPT_WEB_MODEL_PREFIX)) {
+    throw new Error("The chatgpt-web-continuity/ model names were removed. Change your configured model to "
+      + modelId.replace(REMOVED_CHATGPT_WEB_MODEL_PREFIX, CHATGPT_WEB_MODEL_PREFIX) + ". Existing task records are preserved.");
+  }
 }
 
-function withContinuityRoutes(
-  routes: readonly ChatGptWebModelRoute[],
+export function chatGptWebTaskContinuityAvailable(capabilities: ChatGptWebAccountCapabilities): boolean {
+  return capabilities.mode === "full" && capabilities.browserHost === "launcher";
+}
+
+function withTaskPolicy(
+  route: ChatGptWebModelRoute,
   capabilities: ChatGptWebAccountCapabilities,
-): readonly ChatGptWebModelRoute[] {
-  if (!chatGptWebContinuityAvailable(capabilities)) return routes;
-  const slugs = new Set(routes.filter(route => !route.legacy)
-    .map(route => route.slug.replace(CHATGPT_WEB_MODEL_PREFIX, CHATGPT_WEB_CONTINUITY_MODEL_PREFIX)));
-  // Append, never displace an existing default or reproduce hidden legacy names.
-  return [...routes, ...CHATGPT_WEB_CONTINUITY_MODEL_ROUTES.filter(route => slugs.has(route.slug))];
+): ChatGptWebModelRoute {
+  return chatGptWebTaskContinuityAvailable(capabilities) && route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL
+    ? { ...route, conversationPolicy: "task" }
+    : route;
 }
 
 /** Model catalog budget. Browser preflight must keep using resolveChatGptWebContextLimits. */
@@ -604,8 +591,8 @@ export function resolveChatGptWebHistoryLimits(
     & { modelFamily?: ChatGptWebModelFamily },
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebContextLimits {
-  return route.conversationPolicy === "continuity-first"
-    ? contextLimits(CHATGPT_WEB_CONTINUITY_CONTEXT_WINDOW, CHATGPT_WEB_CONTINUITY_AUTO_COMPACT_TOKEN_LIMIT)
+  return chatGptWebTaskContinuityAvailable(capabilities) && route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL
+    ? contextLimits(CHATGPT_WEB_TASK_HISTORY_CONTEXT_WINDOW, CHATGPT_WEB_TASK_HISTORY_AUTO_COMPACT_TOKEN_LIMIT)
     : resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, capabilities, route.modelFamily);
 }
 
@@ -617,9 +604,9 @@ export function availableChatGptWebModelRoutes(
     if (capabilities.experimentalBiggerContext) {
       throw new Error("Zero Risk does not support Bigger Context");
     }
-    return withContinuityRoutes(capabilities.zeroRiskProEnabled
+    return (capabilities.zeroRiskProEnabled
       ? [CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
-      : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE], capabilities);
+      : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE]).map(route => withTaskPolicy(route, capabilities));
   }
   if (!capabilities.solAvailable) return includeLegacy
     ? [...CHATGPT_WEB_LUNA_MODEL_ROUTES, CHATGPT_WEB_LEGACY_LUNA_MODEL_ROUTE, CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE]
@@ -627,9 +614,9 @@ export function availableChatGptWebModelRoutes(
   const candidates = includeLegacy
     ? [...CHATGPT_WEB_MODEL_ROUTES, ...CHATGPT_WEB_LEGACY_MODEL_ROUTES]
     : CHATGPT_WEB_MODEL_ROUTES;
-  return withContinuityRoutes(candidates.filter(route =>
+  return candidates.filter(route =>
     (!route.requiresPro || capabilities.proAvailable)
-    && (!route.requiresExtraHigh || capabilities.extraHighAvailable)), capabilities);
+    && (!route.requiresExtraHigh || capabilities.extraHighAvailable)).map(route => withTaskPolicy(route, capabilities));
 }
 
 export function chatGptWebRouteEfforts(
@@ -648,16 +635,10 @@ export function requireChatGptWebModelRoute(
   if (capabilities.browserInteractionMode === "manual" && capabilities.experimentalBiggerContext) {
     throw new Error("Zero Risk does not support Bigger Context");
   }
-  const route = routesBySlug.get(modelId);
-  if (!route) throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
-  if (route.conversationPolicy === "continuity-first") {
-    if (capabilities.experimentalFreshConversationPerTurn) {
-      throw new Error("Session continuity first requires Fresh Conversation Per Turn to be disabled");
-    }
-    if (!chatGptWebContinuityAvailable(capabilities)) {
-      throw new Error("Session continuity first is not enabled: Launcher and Native-tool support are required");
-    }
-  }
+  assertCurrentChatGptWebModelName(modelId);
+  const known = routesBySlug.get(modelId);
+  if (!known) throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
+  const route = withTaskPolicy(known, capabilities);
   if (capabilities.browserInteractionMode === "manual") {
     if (route.interactionMode !== "manual") {
       throw new Error(`${route.displayName} is not available while Zero Risk is enabled`);

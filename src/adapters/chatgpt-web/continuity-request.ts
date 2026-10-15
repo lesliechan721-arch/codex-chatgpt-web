@@ -3,6 +3,7 @@ import { continuityProcessInstance, continuityProcessInstanceStatus, type Recove
 import { recoveryContext, recoveryDigest, recoveryIdentity, retireRecoveryWriter, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import { resolve } from "node:path";
+import { estimateTokens } from "../../lib/token-estimate";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { expandUserPath } from "../../config";
 import {
@@ -10,24 +11,28 @@ import {
   readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
 } from "../../launcher-browser-host";
 import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
-import { contextCandidateCanonicalSource, continuityAcceptedContextCandidate, continuityContextCandidate, continuityRecoveredContextCandidate } from "./context-candidate-mapping";
+import { ChatGptWebAdapterError } from "./adapter-error";
+import { canonicalJson } from "./canonical-json";
+import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, continuityAcceptedContextCandidate, continuityContextCandidate, continuityRecoveredContextCandidate } from "./context-candidate-mapping";
+import { CompactionSourceCoverage } from "./compaction-context";
+import { createContextSnapshot } from "./context-snapshot";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import {
-  continuityBindingsFor, continuityCheckpoint, continuityDigest,
+  continuityBindingsFor, continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest,
   selectContinuityCheckpoint, type ContinuityCheckpointCommit, type ContinuityCheckpointSelection, type ContinuityBinding, type ContinuityBindings,
 } from "./continuity-binding";
-import { isContinuityLease, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
+import { isContinuityLease, sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
 import { continuityToolRegistry } from "./continuity-tools";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
 import { existingStructuredCompactionRun } from "./compaction-handoff";
-import { preflightContinuityInput, preflightFullRecoveryContinuityInput } from "./continuity-input";
+import { preflightContinuityInput } from "./continuity-input";
 import { chatGptConversationKey } from "./conversation-key";
 import {
   chatGptCurrentInstructionIndex, chatGptInstructionContent, chatGptInstructionEnvelope,
-  continuityCurrentEnvironmentInput, continuityCurrentInstructionInput, extractChatGptTurnIdentity,
-  hasInitialChatGptTurnInstruction, hasNativeChatGptInstruction,
+  continuityCurrentEnvironmentInput, continuityCurrentInstructionInput, extractChatGptTurnIdentity, requestCarriedChatGptInstructionRevision,
+  hasInitialChatGptTurnInstruction, hasNativeChatGptInstruction, continuityCheckpointSiblings, continuityCheckpointSiblingGroup, continuityCheckpointSiblingProof, bindContinuityCheckpointSourceIndex, CONTINUITY_CHECKPOINT_SIBLING_PROOF,
 } from "./environment";
 import { CHATGPT_WEB_MODEL_ID, type ChatGptWebCapabilities } from "./model";
 import {
@@ -66,10 +71,31 @@ function sameLease(left: ContinuityLease | undefined, right: ContinuityLease | u
   return left?.owner === right?.owner && left?.leaseId === right?.leaseId && left?.traceId === right?.traceId;
 }
 
+/** Request or retained bytes must cover the accepted source ledger before any
+ * execution handoff. A canonical object alone is not proof of complete history. */
+function assertRecoveredSource(parsed: CodexParsedRequest, input: CodexParsedRequest,
+  record: RecoveryThreadRecord, work: RecoveryThreadRecord["works"][string], historyRevision: number): void {
+  const entries = (record.contextCoverage ?? []).filter(entry => entry.workLineageId === work.workLineageId
+    && entry.metadata.delivered);
+  if (!entries.length) return;
+  if (entries.some(entry => entry.metadata.historyRevision !== historyRevision || entry.sourceTaskRevision > work.acceptedTaskRevision)) {
+    throw continuityError("continuity_source_unproven", "The recovered source omits an accepted history or instruction revision.");
+  }
+  const canonical = contextCandidateCanonicalSource(parsed, input) ?? input;
+  const snapshot = createContextSnapshot(canonical, { imageStoragePolicy: "bounded",
+    provenanceByMessage: contextCandidateSourceProvenance(canonical, input) });
+  CompactionSourceCoverage.assertRecordedSource(snapshot, entries.map(entry => entry.metadata), historyRevision);
+}
+
 export function bindContinuityRequestScope(parsed: CodexParsedRequest, namespace: string): void {
-  if (parsed._conversationPolicy === "continuity-first") {
-    parsed._continuityScope = continuityDigest([namespace, parsed.modelId, parsed._chatgptModelFamily ?? null, parsed.options.reasoning ?? null]);
-  } else delete parsed._continuityScope;
+  if (parsed._conversationPolicy === "task") {
+    const canonical = continuityDigest([namespace, parsed.modelId, parsed._chatgptModelFamily ?? null, parsed.options.reasoning ?? null]);
+    if (parsed._continuityCanonicalScope !== canonical || !parsed._continuityScope) parsed._continuityScope = canonical;
+    parsed._continuityCanonicalScope = canonical;
+  } else {
+    delete parsed._continuityScope;
+    delete parsed._continuityCanonicalScope;
+  }
 }
 
 function ordinaryResumeInput(
@@ -128,19 +154,20 @@ function checkpointResumeInput(
   binding: ContinuityBinding,
   checkpoint: ContinuityCheckpointCommit | undefined,
   proof: ReturnType<typeof continuityCheckpoint>,
+  continuation?: { suffix: unknown[]; instructionPrevious: ChatGptContinuityInstructionPrevious },
 ): {
   input: CodexParsedRequest;
   instructionPrevious: ChatGptContinuityInstructionPrevious;
   allowRetainedSourceInstructionPayload: boolean;
   finalReplaySource?: ChatGptTurnSession;
 } {
-  if (!checkpoint?.sourceInstructionReplay || proof.index < 0) throw continuityError("continuity_source_unproven");
+  if (!checkpoint || (!checkpoint.sourceInstructionReplay && !continuation) || proof.index < 0) throw continuityError("continuity_source_unproven");
   const instructionPrevious = {
-    instructionIdentity: checkpoint.sourceInstructionReplay.instructionIdentity,
-    nativeTurnId: checkpoint.sourceInstructionReplay.nativeTurnId,
+    instructionIdentity: continuation?.instructionPrevious.instructionIdentity ?? checkpoint.sourceInstructionReplay!.instructionIdentity,
+    nativeTurnId: continuation?.instructionPrevious.nativeTurnId ?? checkpoint.sourceInstructionReplay?.nativeTurnId,
     checkpointDigest: proof.digest,
   };
-  const suffix = continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
+  const suffix = continuation?.suffix ?? continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
   const hasNewInstruction = hasInitialChatGptTurnInstruction(parsed) && hasNativeChatGptInstruction(parsed, suffix);
   if (hasNewInstruction) chatGptTurnSessions.assertUnconsumedContinuityInstruction(binding, parsed);
   else if (continuityInstructionIdentity(parsed) !== instructionPrevious.instructionIdentity) {
@@ -191,12 +218,14 @@ function assertCheckpointSourceReplay(parsed: CodexParsedRequest, identity: Retu
 
 /** A stopped instruction is terminal even when a newer instruction owns the live binding. */
 export function assertContinuityStoppedReceipt(parsed: CodexParsedRequest): void {
-  if (parsed._conversationPolicy !== "continuity-first" || parsed._compactionRequest
+  if (parsed._conversationPolicy !== "task" || parsed._compactionRequest
     || !parsed._continuityStateDirectory || !parsed._continuityScope) return;
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId || !identity.turnId) return;
   const record = continuityBindingsFor(parsed._continuityStateDirectory).recoveryStore.get(continuityDigest(identity.threadId));
-  if (!record || record.scope !== parsed._continuityScope || record.legacyUnproven) return;
+  if (!record || record.legacyUnproven || !(record.scope === parsed._continuityScope
+    || record.canonicalScope === parsed._continuityCanonicalScope
+    || parsed._continuityLegacyScopes?.includes(record.scope))) return;
   // Resolver-established aliases are not available yet. Use only direct native IDs,
   // without caching any checkpoint or instruction interpretation before verification.
   if (continuityCheckpoint(parsed).index >= 0) return;
@@ -223,9 +252,8 @@ export async function prepareContinuityRequest(
   abortSignal?.throwIfAborted();
   const config = provider.chatgptWeb;
   const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
-  if (parsed._conversationPolicy !== "continuity-first" || !config?.continuityStateDirectory
+  if (parsed._conversationPolicy !== "task" || !config?.continuityStateDirectory
     || !config.localToolsEnabled || config.browserHost !== "launcher" || !config.browserHostDescriptorPath
-    || config.experimentalFreshConversationPerTurn
     || (config.browserInteractionMode === "manual") !== manual
     || (!manual && parsed.modelId !== CHATGPT_WEB_MODEL_ID)) throw continuityError("continuity_configuration_conflict");
   const descriptor = resolve(expandUserPath(config.browserHostDescriptorPath));
@@ -234,10 +262,19 @@ export async function prepareContinuityRequest(
   const bindings = continuityBindingsFor(resolve(expandUserPath(config.continuityStateDirectory)));
   const thread = continuityDigest(identity.threadId);
   bindContinuityRequestScope(parsed, namespace);
-  const scope = parsed._continuityScope!;
   parsed._continuityStateDirectory = bindings.registrations.directory;
+  let durable = bindings.recoveryStore.get(thread);
+  if (durable && durable.scope !== parsed._continuityScope) {
+    const canonicalScope = parsed._continuityCanonicalScope!;
+    if (durable.canonicalScope !== canonicalScope && !parsed._continuityLegacyScopes?.includes(durable.scope)) {
+      throw continuityError("continuity_configuration_conflict");
+    }
+    if (durable.canonicalScope !== canonicalScope) durable = bindings.recoveryStore.bindCanonicalScope(thread,
+      { expectedScope: durable.scope, canonicalScope, expectedVersion: durable.version });
+    parsed._continuityScope = durable.scope;
+  }
+  const scope = parsed._continuityScope!;
   let binding = bindings.lookup(thread, scope);
-  const durable = bindings.recoveryStore.get(thread);
   if (durable?.scope !== undefined && durable.scope !== scope) throw continuityError("continuity_configuration_conflict");
   if (durable?.legacyUnproven) throw continuityError("continuity_legacy_unproven");
   let compatible = false;
@@ -252,16 +289,60 @@ export async function prepareContinuityRequest(
     }
   };
   if (parsed._compactionRequest) {
-    const { prepareRecoveryCompaction } = await import("./continuity-recovery-compaction");
+    const retained = binding && durable ? {
+      executionKey: binding.executionKey, owner: binding.owner, epoch: binding.epoch,
+      leaseDigest: continuityDigest(binding.lease ?? null),
+      leaseRecovery: binding.lease?.recovery && structuredClone(binding.lease.recovery),
+      identity: durable.transaction ? recoveryIdentity(durable, bindings.recoveryStore.installationId()) : undefined,
+    } : undefined;
+    const { prepareRecoveryCompaction, recoveryCompactionTarget } = await import("./continuity-recovery-compaction");
     const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     if (prepared) return prepared;
+    // Retained-source preview yields while reading page usage and source bounds.
+    // Its old healthy decision cannot survive a loss callback or a new writer.
+    // Recheck here, after the async return, before entering synchronous retained routing.
+    abortSignal?.throwIfAborted();
+    const current = bindings.recoveryStore.get(thread);
+    const source = durable?.currentWorkId ? current?.works[durable.currentWorkId] : undefined;
+    if (source?.state === "stopped" || current?.state === "stopped") throw continuityError("continuity_stopped");
+    if (!binding || !retained || !durable || !current || bindings.observed(thread) !== binding
+      || binding.executionKey !== retained.executionKey || binding.owner !== retained.owner || binding.epoch !== retained.epoch
+      || continuityDigest(binding.lease ?? null) !== retained.leaseDigest
+      || current.scope !== durable.scope || current.owner.id !== durable.owner.id || current.epoch !== durable.epoch
+      || current.historyRevision !== durable.historyRevision || current.currentWorkId !== durable.currentWorkId
+      || source?.acceptedTaskRevision !== durable.works[durable.currentWorkId!]?.acceptedTaskRevision
+      || source?.workPayloadDigest !== durable.works[durable.currentWorkId!]?.workPayloadDigest
+      || retained.identity && (!current.transaction || !sameContinuityRecoveryIdentity(retained.identity,
+        recoveryIdentity(current, bindings.recoveryStore.installationId())))) {
+      const target = recoveryCompactionTarget(parsed)?.target;
+      // The same compaction can advance the writer while this preview is suspended.
+      // Only observe that exact target; a newer ordinary task or foreign owner stays fenced.
+      if (target && durable && current && target.sourceLogicalWorkId === durable.currentWorkId
+        && current.currentWorkId === `compaction:${target.compactionTargetId}`
+        && current.owner.id === durable.owner.id && current.owner.id === bindings.owner
+        && source?.acceptedTaskRevision === durable.works[durable.currentWorkId!]?.acceptedTaskRevision
+        && source?.workPayloadDigest === durable.works[durable.currentWorkId!]?.workPayloadDigest) {
+        const observed = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, current,
+          descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability, target.compactionTargetId);
+        if (observed) return observed;
+      }
+      throw continuityError("continuity_source_unproven");
+    }
+    if (binding.state === "lost" || current.state === "lost") {
+      if (!retained.identity || !retained.leaseRecovery
+        || !sameContinuityRecoveryIdentity(retained.identity, retained.leaseRecovery)) throw continuityError("continuity_source_unproven");
+      const recovered = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, current,
+        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+      if (recovered) return recovered;
+      throw continuityError("continuity_session_lost");
+    }
   }
   const initialLocalOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
   if (!parsed._compactionRequest && initialLocalOwner?.nativeTurnId === identity.turnId) initialLocalOwner.bindContinuityResultSource(parsed);
   if (!parsed._compactionRequest && durable) {
-    const checkpointPrepared = await prepareDurableContinuation(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    const checkpointPrepared = await prepareDurableContinuation(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, Boolean(config.experimentalFreshConversationPerTurn), config.experimentalBiggerContext);
     if (checkpointPrepared) return checkpointPrepared;
-    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
+    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, config.experimentalBiggerContext);
     if (recovered) return recovered;
     binding = bindings.lookup(thread, scope);
   }
@@ -327,7 +408,7 @@ export async function prepareContinuityRequest(
       : [...binding?.checkpoints.values() ?? []].find(value => value.revision === revision) : undefined;
   if (!appendSource?.taskUpdatesEnabled()) assertCheckpointSourceReplay(parsed, identity, selectedCheckpoint);
   parsed._continuityHistoryRevision = revision;
-  const conversationKey = chatGptConversationKey(parsed, namespace)!;
+  let conversationKey = chatGptConversationKey(parsed, namespace)!;
   let existing = chatGptTurnSessions.find(executionKey);
   if (binding && !parsed._compactionRequest && !existing
     && binding.ordinaryReplayTombstones.get(executionKey)?.revision === revision) {
@@ -349,6 +430,13 @@ export async function prepareContinuityRequest(
   // Keep the existing history and round selectors ahead of browser dependency checks.
   const readonlyReplay = parsed._compactionRequest ? binding?.checkpoints.has(executionKey)
     : existing?.roundCompleted(existing.continuityRoundKey(parsed));
+  // Pin the source before compatibility, page inspection, usage sync and capacity
+  // checks yield. A cold-page decision may retire only this observed writer.
+  const ordinarySourceObservation = !parsed._compactionRequest && binding && !existing ? {
+    record: bindings.recoveryStore.get(thread), owner: binding.owner, epoch: binding.epoch,
+    revision: binding.revision, executionKey: binding.executionKey,
+    lease: binding.lease ? structuredClone(binding.lease) : undefined,
+  } : undefined;
   if (!readonlyReplay) await assertExecutionCompatible();
   let expected = binding?.lease ? { ...binding.lease } : undefined;
   const sourceExecutionKey = binding?.executionKey;
@@ -389,6 +477,8 @@ export async function prepareContinuityRequest(
     verifiedSourceGeneration = source.continuityGenerationValue();
   }
   if (binding && expected && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
+    const compactionLossIdentity = parsed._compactionRequest && expected.recovery
+      ? { ownerId: binding.owner, identity: structuredClone(expected.recovery) } : undefined;
     try { await inspectLauncherContinuityConversation(descriptor, conversationKey, expected); }
     catch (inspectionError) {
       if ((inspectionError as { code?: string }).code === "continuity_unverified" && sameLease(binding.lease, expected)) {
@@ -407,10 +497,25 @@ export async function prepareContinuityRequest(
           throw continuityError("continuity_session_lost");
         }
       } else {
-        bindings.lose(binding, sourceExecutionKey);
+        const exactPageLost = inspectionError instanceof ChatGptWebAdapterError
+          && inspectionError.code === "continuity_session_lost";
+        const recoverCompaction = parsed._compactionRequest && exactPageLost
+          ? (await import("./continuity-recovery-compaction")).prepareRecoveryCompaction : undefined;
+        if (parsed._compactionRequest && (bindings.observed(thread) !== binding
+          || !sameLease(binding.lease, expected) || binding.executionKey !== sourceExecutionKey)) {
+          throw continuityError("continuity_source_unproven");
+        }
+        if (recoverCompaction && !compactionLossIdentity) throw continuityError("continuity_source_unproven");
+        bindings.lose(binding, sourceExecutionKey, recoverCompaction ? compactionLossIdentity : undefined);
         const current = bindings.recoveryStore.get(thread);
+        if (recoverCompaction && current) {
+          // The retained preview preceded the physical check. Re-evaluate this exact
+          // request against the current journal through the existing cold admission.
+          const recovered = await recoverCompaction(parsed, provider, namespace, capabilities, worker, bindings, current, descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+          if (recovered) return recovered;
+        }
         if (!parsed._compactionRequest && current) {
-          const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, current, descriptor, abortSignal);
+          const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, current, descriptor, abortSignal, assertExecutionCompatible, config.experimentalBiggerContext);
           if (recovered) return recovered;
         }
         throw continuityError("continuity_session_lost");
@@ -429,6 +534,7 @@ export async function prepareContinuityRequest(
   let allowRetainedSourceInstructionPayload = false;
   let finalReplaySource: ChatGptTurnSession | undefined;
   let checkpointTransition: ContinuityCheckpointSelection | undefined;
+  let coldPage = false;
   if (!parsed._compactionRequest && !existing && appendSource) {
     if (!appendSource.taskUpdatesEnabled()) {
       throw taskUpdateSourceError("task_update_upgrade_required", "This append was not accepted because the active response did not negotiate task-updates-v1. Its current work continues.");
@@ -463,7 +569,30 @@ export async function prepareContinuityRequest(
       }
       input = continuityAcceptedContextCandidate(parsed, binding.initialAcceptedInput);
     } else input = parsed;
-    if (!finalReplaySource) preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, Boolean(expected));
+    if (!finalReplaySource && expected) {
+      await toolSource?.runtime.syncContextUsage?.();
+      const coverage = toolSource?.runtime.compactionSourceCoverage;
+      const previousFinal = toolSource?.settledOutcome();
+      const retainedTokens = coverage || binding?.retainedPageTokens !== undefined
+        ? Math.max(binding?.retainedPageTokens ?? 0, (coverage?.pageTokenReserve() ?? 0)
+          + (previousFinal?.type === "final" ? estimateTokens(previousFinal.answer) : 0)) : undefined;
+      let retainedFailure = false;
+      if (!config.experimentalFreshConversationPerTurn && retainedTokens !== undefined) {
+        try { preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, true,
+          { retainedTokens, experimentalBiggerContext: config.experimentalBiggerContext }); }
+        catch (error) {
+          if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
+          retainedFailure = true;
+        }
+      }
+      if (config.experimentalFreshConversationPerTurn || retainedTokens === undefined || retainedFailure) {
+        input = parsed;
+        expected = undefined;
+        coldPage = true;
+      }
+    }
+    if (!finalReplaySource) preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, Boolean(expected),
+      { experimentalBiggerContext: config.experimentalBiggerContext });
   } else if (binding?.state === "compacting" && !parsed._compactionRequest
     && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     throw continuityError("continuity_source_unproven");
@@ -492,6 +621,17 @@ export async function prepareContinuityRequest(
   binding.conversation ??= { key: conversationKey, descriptor };
   let recovery: ContinuityRecoveryIdentity | undefined;
   if (!parsed._compactionRequest && input && !finalReplaySource) {
+    if (coldPage) {
+      await assertLauncherContinuityCapacity(descriptor);
+      abortSignal?.throwIfAborted();
+      if (!ordinarySourceObservation?.record || bindings.observed(thread) !== binding
+        || binding.owner !== ordinarySourceObservation.owner || binding.epoch !== ordinarySourceObservation.epoch
+        || binding.revision !== ordinarySourceObservation.revision || binding.executionKey !== ordinarySourceObservation.executionKey
+        || continuityDigest(binding.lease ?? null) !== continuityDigest(ordinarySourceObservation.lease ?? null)) {
+        throw continuityError("continuity_source_unproven", "The cold-page source observation is stale; inspect the current writer again.");
+      }
+      await retireRecoveryWriter(bindings, ordinarySourceObservation.record, descriptor);
+    }
     const logicalWorkId = recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary"]);
     if (instructionPrevious && !instructionPrevious.instructionIdentity) throw continuityError("continuity_source_unproven");
     const record = bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
@@ -500,6 +640,17 @@ export async function prepareContinuityRequest(
       instructionPrevious: instructionPrevious ? { ...instructionPrevious, instructionIdentity: instructionPrevious.instructionIdentity! } : undefined,
       allowRetainedSourceFallback: allowRetainedSourceInstructionPayload,
       snapshotDigest: recoveryDigest(input.context), createPage: !expected, dispatchProtocolComplete: true });
+    if (coldPage) {
+      parsed._continuityEpoch = record.epoch;
+      parsed._continuityAttempt = record.works[logicalWorkId]!.attempts.at(-1)!.attempt;
+      input._continuityEpoch = record.epoch;
+      input._continuityAttempt = parsed._continuityAttempt;
+      conversationKey = chatGptConversationKey(parsed, namespace)!;
+      binding = bindings.installRecovered(record, executionKey, checkpoint, identity.turnId);
+      binding.initialAcceptedInput = continuityAcceptedContextCandidate(parsed, input);
+      binding.initialInstructionPayloadDigest = record.works[logicalWorkId]!.workPayloadDigest;
+      binding.conversation = { key: conversationKey, descriptor };
+    }
     binding.recovery = { directory: bindings.registrations.directory, thread, logicalWorkId, attempt: record.works[logicalWorkId]!.attempts.at(-1)!.attempt, ownerId: record.owner.id };
     recovery = recoveryIdentity(record, bindings.recoveryStore.installationId());
   }
@@ -563,6 +714,7 @@ async function prepareDurableOrdinary(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
   attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
   descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
+  experimentalBiggerContext = false,
 ): Promise<PreparedContinuityRequest | undefined> {
   const identity = extractChatGptTurnIdentity(parsed);
   const liveBinding = bindings.observed(observed.thread);
@@ -595,15 +747,21 @@ async function prepareDurableOrdinary(
   }
   await assertExecutionCompatible?.();
   if (binding?.state === "unverified" && binding.lease && binding.conversation) {
+    const inspectedLease = { ...binding.lease };
     try {
-      const physical = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, binding.lease);
+      const physical = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, inspectedLease);
       binding.state = physical.state === "ready" ? "ready" : "running";
     } catch (error) {
-      if ((error as { code?: string }).code === "continuity_unverified") throw error;
+      if (!sameLease(binding.lease, inspectedLease)) throw continuityError("continuity_source_unproven");
+      // A repeated inspection failure only disproves reuse. The durable Send,
+      // settlement and execution-isolation checks below decide cold recovery.
       bindings.lose(binding, binding.executionKey);
     }
   }
   if (binding && !["lost", "ended"].includes(binding.state) && record.owner.id === bindings.owner) return undefined;
+  if (work && store.get(record.thread)!.works[logicalWorkId]?.attempts.at(-1)?.stage === "send-possible") {
+    throw continuityError("continuity_execution_unsettled", "The original Send has no verified submission result.");
+  }
   // Historical discovery cannot define new capabilities while rebuilding a lost page.
   parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
   // Preflight precedes every new page. The old call set remains authoritative even when
@@ -630,8 +788,8 @@ async function prepareDurableOrdinary(
       (input._rawBody as { input: unknown[] }).input), recoverySource?.canonicalInput(),
       recoverySource?.compactionObjectArgumentCallIds());
   }
-  preflightFullRecoveryContinuityInput(input, capabilities, attachments);
-  preflightContinuityInput(input, capabilities, attachments, false);
+  if (work) assertRecoveredSource(parsed, input, store.get(record.thread)!, work, work.attempts.at(-1)!.historyRevision);
+  preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
   const current = store.get(record.thread)!;
@@ -651,20 +809,20 @@ async function prepareDurableOrdinary(
       // Stop fences the old Broker. Retire the exact physical tag that the host
       // retained, then preserve both tags as a retirement receipt for a new task.
       let receipt;
-      try { receipt = await retireLauncherContinuityWriter(descriptor, target); }
-      catch { receipt = await retireLauncherContinuityWriter(descriptor, expected); }
+      try { receipt = await retireLauncherContinuityWriter(descriptor, target, bindings.registrations.directory); }
+      catch { receipt = await retireLauncherContinuityWriter(descriptor, expected, bindings.registrations.directory); }
       if (!receipt.writerRetired) throw continuityError("continuity_unverified");
       record = store.retirePreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, pending.preparationId);
     } else {
       let missing = false;
       try {
-        const receipt = await updateLauncherContinuityPreparation(descriptor, { expected, recovery: target });
+        const receipt = await updateLauncherContinuityPreparation(descriptor, { expected, recovery: target }, bindings.registrations.directory);
         if (receipt.state !== "prepared") throw continuityError("continuity_execution_unsettled");
       } catch (error) {
         // A host restart may erase both tags, but an absent table alone is not a
         // retirement proof. This branch can only close the unsent migration after
         // the original Broker process and the original Launcher are proved gone.
-        const receipt = await queryLauncherContinuityTransaction(descriptor, target).catch(() => undefined);
+        const receipt = await queryLauncherContinuityTransaction(descriptor, target, bindings.registrations.directory).catch(() => undefined);
         if (!receipt || !["missing", "retired"].includes(receipt.state) || !receipt.writerRetired
           || (receipt.state === "missing" && !receipt.hostNoWriter)
           || continuityProcessInstanceStatus(pending.expected.owner) !== "exited") {
@@ -680,20 +838,38 @@ async function prepareDurableOrdinary(
     work = record.works[logicalWorkId];
   }
   const attemptBefore = work?.attempts.at(-1);
+  const acquisition = attemptBefore?.acquisitionEvidence;
+  const knownUnacquired = work && record.currentWorkId === logicalWorkId && record.owner.id === bindings.owner
+    && attemptBefore?.stage === "prepared" && !attemptBefore.writerRetired
+    && acquisition?.status === "not-acquired" && Boolean(acquisition.receiptId);
+  if (knownUnacquired && (acquisition!.identityDigest !== recoveryDigest(canonicalJson(recoveryIdentity(record, store.installationId())))
+    || attemptBefore!.snapshotDigest !== recoveryDigest(input.context))) {
+    throw continuityError("continuity_source_unproven", "The known unacquired retry no longer matches its original input and reservation.");
+  }
   const unsentCandidate = work && attemptBefore && ["prepared", "page-possible", "page-acquired"].includes(attemptBefore.stage)
     && work.retryBudget?.lastFailureAt === undefined
     && !binding?.initialAcceptedInput
     && (record.owner.id === bindings.owner || continuityProcessInstanceStatus(record.owner) === "exited");
-  let sameAttempt = false;
-  if (unsentCandidate) {
+  let sameAttempt = Boolean(knownUnacquired);
+  if (!sameAttempt && unsentCandidate) {
     const previousIdentity = recoveryIdentity(record, store.installationId());
-    const receipt = await queryLauncherContinuityTransaction(descriptor, previousIdentity);
+    const receipt = await queryLauncherContinuityTransaction(descriptor, previousIdentity, bindings.registrations.directory);
     // Creating is still the original acquisition. Keep its sole queryable identity
     // and wait for a prepared receipt; do not create a migration or another page.
     if (receipt.state === "creating") throw continuityError("continuity_unverified", "The original page acquisition is still in progress.");
     if (!["missing", "prepared", "retired"].includes(receipt.state)) throw continuityError("continuity_execution_unsettled");
+    // A backend can exit after persisting acquisition authority but before its
+    // first RPC reaches this exact live host. No Send was authorized. Missing
+    // alone does not revoke that authority: fall through to durable retirement
+    // and exact host isolation before reserving a successor; never reuse it.
+    const exitedBeforeAcquisition = receipt.state === "missing" && receipt.hostNoWriter
+      && attemptBefore.stage === "page-possible" && !attemptBefore.sendEvidence && !attemptBefore.pageReceiptId
+      && acquisition?.status === "possible"
+      && acquisition.identityDigest === recoveryDigest(canonicalJson(previousIdentity))
+      && sameContinuityLauncherInstance(attemptBefore.launcherInstance, receipt.launcherInstance)
+      && continuityProcessInstanceStatus(record.owner) === "exited";
     if (receipt.state === "missing" && (!receipt.hostNoWriter
-      || (attemptBefore.launcherInstance ? !receipt.writerRetired : attemptBefore.stage !== "prepared"))) throw continuityError("continuity_unverified");
+      || (attemptBefore.launcherInstance ? !receipt.writerRetired && !exitedBeforeAcquisition : attemptBefore.stage !== "prepared"))) throw continuityError("continuity_unverified");
     if (receipt.state === "prepared") {
       if (!receipt.launcherInstance) throw continuityError("continuity_unverified");
       if (record.owner.id !== bindings.owner || record.transaction!.snapshotDigest !== recoveryDigest(input.context)) {
@@ -703,7 +879,7 @@ async function prepareDurableOrdinary(
         });
         const pending = record.pendingPreparation!;
         const prepared = await updateLauncherContinuityPreparation(descriptor, { expected: previousIdentity,
-          recovery: recoveryIdentity({ ...record, ...pending.target }, store.installationId()) });
+          recovery: recoveryIdentity({ ...record, ...pending.target }, store.installationId()) }, bindings.registrations.directory);
         if (prepared.state !== "prepared") throw continuityError("continuity_execution_unsettled");
         record = store.completePreparation(record.thread, { scope: record.scope, expectedVersion: record.version }, pending.preparationId);
       }
@@ -757,11 +933,11 @@ async function prepareDurableOrdinary(
 async function prepareDurableContinuation(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
   attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
-  descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
+  descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>, freshConversationPerTurn = false,
+  experimentalBiggerContext = false,
 ): Promise<PreparedContinuityRequest | undefined> {
   const proof = continuityCheckpoint(parsed);
-  if (proof.index < 0 || hasNativeChatGptInstruction(parsed,
-    continuityCurrentInstructionInput(parsed, { trustedLowerBound: proof.index }))) return undefined;
+  if (proof.index < 0) return undefined;
   const identity = extractChatGptTurnIdentity(parsed);
   const selection = selectRecoveryContinuation(parsed, observed, identity);
   if (!selection) return undefined;
@@ -773,6 +949,53 @@ async function prepareDurableContinuation(
   parsed._continuityHistoryRevision = record.historyRevision;
   parsed._continuityEpoch = record.epoch;
   const localCheckpoint = [...binding?.checkpoints.values() ?? []].find(value => value.revision === checkpoint.targetHistoryRevision);
+  const source = observed.works[checkpoint.sourceLogicalWorkId]!;
+  if (source.nativeTurnId !== identity.turnId && hasNativeChatGptInstruction(parsed,
+    continuityCurrentInstructionInput(parsed, { trustedLowerBound: proof.index }))) return undefined;
+  const raw = (parsed._rawBody as { input: unknown[] }).input;
+  const primaryIndices = raw.flatMap((value, index) => {
+    const item = value as { id?: unknown; internal_chat_message_metadata_passthrough?: { turn_id?: unknown } } | undefined;
+    const matchesId = typeof item?.id === "string" && (parsed._chatGptMessageIdAliases?.[item.id] ?? item.id) === checkpoint.sourceIdentity;
+    const matchesTurn = !item?.id && checkpoint.sourceIdentity === `turn:${source.nativeTurnId}`
+      && item?.internal_chat_message_metadata_passthrough?.turn_id === source.nativeTurnId && hasNativeChatGptInstruction(parsed, [value]);
+    return matchesId || matchesTurn ? [index] : [];
+  });
+  if (primaryIndices.length > 1) return undefined; // Existing source-echo/new-instruction routing owns this layout.
+  if (primaryIndices.length) {
+    const primary = requestCarriedChatGptInstructionRevision({ ...parsed,
+      _rawBody: { ...(parsed._rawBody as object), input: [raw[primaryIndices[0]!]] } }, source.nativeTurnId);
+    if (!primary || !checkpoint.representationDigests.includes(continuitySourceRepresentationDigest(parsed, primary))) {
+      throw continuityError("continuity_source_unproven", "The checkpoint primary conflicts with its accepted source.");
+    }
+  }
+  const sourceIndex = primaryIndices[0] ?? chatGptCurrentInstructionIndex(parsed);
+  for (const value of raw) {
+    const sibling = continuityCheckpointSiblingProof(parsed, value);
+    if (sibling?.identity && checkpoint.representationDigests.includes(sibling.identity)
+      && !checkpoint.representationDigests.includes(sibling.representation)) {
+      throw continuityError("continuity_source_unproven", "The checkpoint sibling conflicts with its accepted source.");
+    }
+  }
+  const siblings = continuityCheckpointSiblings(parsed, source.instructionPrevious, sourceIndex);
+  const acceptedSiblings = siblings.filter(sibling => checkpoint.representationDigests.includes(sibling.representation));
+  const newInstructions = siblings.filter(sibling => !checkpoint.representationDigests.includes(sibling.representation)
+    && hasNativeChatGptInstruction(parsed, [sibling.value]));
+  // Older single-instruction checkpoints have no sibling proof. An exact primary
+  // can still use their original source proof; they cannot authenticate siblings.
+  const requiresGroup = siblings.length || (primaryIndices.length && checkpoint.representationDigests.includes(CONTINUITY_CHECKPOINT_SIBLING_PROOF));
+  if (requiresGroup && (!checkpoint.representationDigests.includes(continuityCheckpointSiblingGroup(acceptedSiblings))
+    || newInstructions.some(sibling => sibling.index < (acceptedSiblings.at(-1)?.index ?? -1)))) {
+    throw continuityError("continuity_source_unproven", "The checkpoint sibling group differs from its accepted source.");
+  }
+  if (newInstructions.length) {
+    return undefined;
+  }
+  if (primaryIndices.length) bindContinuityCheckpointSourceIndex(parsed, sourceIndex);
+  // Only the selected checkpoint proves the prefix belongs to this source. The
+  // marker can precede that prefix, while native text summaries follow it.
+  const suffix = continuityCurrentInstructionInput(parsed, { nativeTurnId: work.nativeTurnId,
+    trustedLowerBound: Math.max(proof.index, chatGptCurrentInstructionIndex(parsed)) });
+  if (hasNativeChatGptInstruction(parsed, suffix)) return undefined;
   assertCheckpointSourceReplay(parsed, identity, localCheckpoint);
   if (selection.action === "stopped") throw continuityError("continuity_stopped");
   if (selection.action === "replay") {
@@ -814,7 +1037,7 @@ async function prepareDurableContinuation(
   }
   const beforeRecovery = store.get(record.thread)!;
   if (beforeRecovery.version !== record.version) {
-    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, beforeRecovery, descriptor, abortSignal);
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, beforeRecovery, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
   }
   let input = recoveryContext(parsed, { directory: bindings.registrations.directory, thread: record.thread,
     logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt }, checkpoint.commitId);
@@ -823,11 +1046,16 @@ async function prepareDurableContinuation(
   // recoveryContext can accept a first real result synchronously. Observe that write
   // before waiting on the page; later version changes still require reconciliation.
   record = store.get(record.thread)!;
-  let expected = selection.action === "admit" && binding?.state === "ready" ? binding.lease : undefined;
+  const wasUnverified = binding?.state === "unverified";
+  let expected = !freshConversationPerTurn && selection.action === "admit" && binding
+    && ["ready", "unverified"].includes(binding.state) ? binding.lease : undefined;
   if (expected && binding?.conversation) {
     try { await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, expected); }
     catch (error) {
-      if ((error as { code?: string }).code === "continuity_unverified") throw error;
+      if ((error as { code?: string }).code === "continuity_unverified" && !wasUnverified) {
+        binding.state = "unverified";
+        throw error;
+      }
       expected = undefined;
     }
   }
@@ -835,9 +1063,22 @@ async function prepareDurableContinuation(
   // inspection is in flight. Reconcile that receipt before retiring any writer.
   const afterInspection = store.get(record.thread)!;
   if (afterInspection.version !== record.version) {
-    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, afterInspection, descriptor, abortSignal);
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, afterInspection, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
   }
-  if (expected && binding && localCheckpoint) input = checkpointResumeInput(parsed, binding, localCheckpoint, proof).input;
+  if (expected && binding && localCheckpoint) input = checkpointResumeInput(parsed, binding, localCheckpoint, proof, { suffix,
+    instructionPrevious: { instructionIdentity: work.instructionIdentity, nativeTurnId: work.nativeTurnId } }).input;
+  const retainedTokens = binding?.retainedPageTokens;
+  if (expected) {
+    let retainedFailure = retainedTokens === undefined;
+    if (!retainedFailure) {
+      try { preflightContinuityInput(input, capabilities, attachments, true, { experimentalBiggerContext, retainedTokens }); }
+      catch (error) {
+        if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
+        retainedFailure = true;
+      }
+    }
+    if (retainedFailure) { expected = undefined; input = recoveredInput; }
+  }
   parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
   input.context.tools = parsed.context.tools;
   if (input === recoveredInput) {
@@ -845,8 +1086,8 @@ async function prepareDurableContinuation(
       (input._rawBody as { input: unknown[] }).input), recoverySource?.canonicalInput(),
       recoverySource?.compactionObjectArgumentCallIds());
   }
-  if (!expected) preflightFullRecoveryContinuityInput(input, capabilities, attachments);
-  preflightContinuityInput(input, capabilities, attachments, Boolean(expected));
+  if (!expected) assertRecoveredSource(parsed, input, store.get(record.thread)!, work, parsed._continuityHistoryRevision!);
+  preflightContinuityInput(input, capabilities, attachments, Boolean(expected), { experimentalBiggerContext });
   if (!expected) {
     await assertLauncherContinuityCapacity(descriptor);
     record = await retireRecoveryWriter(bindings, record, descriptor);
@@ -858,7 +1099,7 @@ async function prepareDurableContinuation(
       const currentCheckpoint = current.checkpoints[checkpoint.commitId];
       if (currentCheckpoint?.continuation.state === "consumed"
         && currentCheckpoint.continuation.consumerLogicalWorkId === consumerLogicalWorkId) {
-        return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, current, descriptor, abortSignal);
+        return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, current, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
       }
     }
     record = store.consumeContinuation(record.thread, { scope: record.scope, expectedVersion: record.version }, checkpoint.commitId, {

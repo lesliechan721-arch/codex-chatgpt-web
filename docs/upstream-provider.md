@@ -6,7 +6,7 @@ This document maintains the routing, model-selection, credential, and Codex meta
 
 API Key access mode supports one OpenAI-compatible upstream provider. The upstream becomes available after a valid Base URL and proxy policy are configured and the current runtime can read an upstream key whose digest matches the configuration. Deleting the configuration disables the upstream. OpenAI forwarding mode does not read this configuration. There is no multi-provider mode, load balancing, or provider failover after a request failure.
 
-The local Web namespaces are `chatgpt-web/*` and `chatgpt-web-continuity/*`. They always belong to local models and browser routing; an upstream model with the same name cannot override them. The continuity prefix uses the same namespace isolation. For its session contract, see [Session continuity](session-continuity.md).
+The local Web namespace is `chatgpt-web/*`. It always belongs to local models and browser routing; an upstream model with the same name cannot override it. For the unified task contract and old-name migration, see [Session continuity](session-continuity.md).
 
 | Request | When upstream is available | When upstream is unavailable |
 | --- | --- | --- |

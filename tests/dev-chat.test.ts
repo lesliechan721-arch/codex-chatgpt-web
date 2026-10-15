@@ -174,24 +174,23 @@ test("new DEV chats default to the cheapest account-supported browser model", ()
   expect(DEV_CHAT_MODELS).toContain("chatgpt-web/zero-risk-pro");
 });
 
-test("DEV persistence preserves full continuity slugs without changing the default model", () => {
-  const root = scratch("cgw-dev-continuity-model");
+test("DEV persistence uses standard model names and rejects removed models", () => {
+  const root = scratch("cgw-dev-task-model");
   const store = new DevChatStore(join(root, "chats"));
-  const { state } = store.loadOrCreate("continuity", "chatgpt-web-continuity/gpt-5.6-sol", root);
-  store.save(state);
-  expect(store.load("continuity")?.model).toBe("chatgpt-web-continuity/gpt-5.6-sol");
   for (const suffix of ["sol-instant", "sol"] as const) {
-    const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
-    expect(DEV_CHAT_MODELS).toContain(model);
-    const { state: six } = store.loadOrCreate(`six-${suffix}`, model, root);
-    store.save(six);
+    const model = `chatgpt-web/gpt-6-${suffix}` as const;
+    const { state } = store.loadOrCreate(`six-${suffix}`, model, root);
+    store.save(state);
     expect(store.load(`six-${suffix}`)?.model).toBe(model);
   }
-  expect(defaultDevChatModel(defaultConfig("full"))).not.toContain("continuity");
+  expect(DEV_CHAT_MODELS.every(model => model.startsWith("chatgpt-web/"))).toBe(true);
+  const { state } = store.loadOrCreate("removed", "chatgpt-web/gpt-5.6-sol", root);
+  expect(() => store.save({ ...state, model: "chatgpt-web-continuity/gpt-5.6-sol" as never }))
+    .toThrow("Change it to chatgpt-web/gpt-5.6-sol");
 });
 
-test("GPT-6 continuity DEV status uses the canonical history budget", () => {
-  const root = scratch("cgw-dev-six-continuity-context");
+test("GPT-6 DEV status uses the canonical task history budget", () => {
+  const root = scratch("cgw-dev-six-task-context");
   for (const experimentalBiggerContext of [false, true]) {
     const driver = new DevChatDriver(
       { ...defaultConfig("full"), browserHost: "launcher", experimentalBiggerContext },
@@ -200,7 +199,7 @@ test("GPT-6 continuity DEV status uses the canonical history budget", () => {
       root,
     );
     for (const suffix of ["sol-instant", "sol"] as const) {
-      const model = `chatgpt-web-continuity/gpt-6-${suffix}` as const;
+      const model = `chatgpt-web/gpt-6-${suffix}` as const;
       const { state } = driver.open(suffix, model);
       expect(driver.status(state)).toMatchObject({
         model, contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
@@ -424,7 +423,7 @@ test("DEV chat attaches its broker to the launcher-owned tunnel without a Respon
     });
     expect(transport.config).toBe(config);
     expect(await callTurnBroker(transport.config.brokerSocketPath, { method: "owner_status" }))
-      .toMatchObject({ protocolVersion: 12, nativeWaitProtocol: 1, taskUpdateProtocol: 1 });
+      .toMatchObject({ protocolVersion: 13, nativeWaitProtocol: 1, taskUpdateProtocol: 1 });
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("normal Codex route");
   } finally {
     await transport?.close();

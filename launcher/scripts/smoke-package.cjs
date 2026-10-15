@@ -27,7 +27,8 @@ function run(command, args, options = {}) {
   if (result.error) throw result.error;
   if (result.status !== 0) {
     throw new Error(
-      `${command} failed with status ${result.status}: ${result.stderr?.trim() || result.stdout?.trim() || "no output"}`,
+      `${command} failed with status ${result.status}: stdout=${JSON.stringify(result.stdout?.trim() || "")}`
+      + `; stderr=${JSON.stringify(result.stderr?.trim() || "")}`,
     );
   }
 }
@@ -142,6 +143,16 @@ try {
     throw new Error(`Packaged launcher installed the wrong durable runtime: ${JSON.stringify(installedManifest)}`);
   }
   process.stdout.write(`PACKAGED_LAUNCHER_SMOKE_OK ${process.platform}/${process.arch}\n`);
+} catch (error) {
+  const logs = path.join(scratch, "launcher-data", "logs");
+  for (const file of [markerPath, ...["launcher.jsonl", "launcher-fatal.log", "process-stream-errors.log"]
+    .map(name => path.join(logs, name))]) {
+    try {
+      const contents = fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(-64 * 1024) : "missing";
+      console.error(`[package smoke] ${path.relative(scratch, file)}\n${contents}`);
+    } catch {}
+  }
+  throw error;
 } finally {
   try {
     if (macAppBundle) {

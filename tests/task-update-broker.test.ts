@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import { TASK_UPDATE_TOTAL_BYTES, TASK_UPDATE_TRANSFER_LIMIT, type TaskUpdateAckResult, type TaskUpdateOwnerContext, type TaskUpdateTransfer } from "../src/adapters/chatgpt-web/task-update-protocol";
@@ -50,6 +51,81 @@ async function fixture(remote: boolean, safe = false, tools?: CodexTool[]) {
 }
 
 for (const remote of [false, true]) describe(`${remote ? "Remote" : "Local"} task update state`, () => {
+  test("append admission checks the live boundary before binding the transfer identity", async () => {
+    const f = await fixture(remote);
+    try {
+      for (const digest of ["first-payload", "retry-payload"]) {
+        await expect(Promise.resolve().then(() => f.owner.reserveTaskUpdate(f.token, "append", digest, context(0), true)))
+          .rejects.toMatchObject({ code: "task_update_no_boundary" });
+        expect(await f.owner.taskUpdateTransferOutcome(f.token, "append")).toMatchObject({ status: "unknown" });
+      }
+      await f.start(1, 0);
+      const [call] = await f.owner.nextToolBatch(f.token, undefined, context(0));
+      const transfer = f.transfer("append", 0, [{ callId: call!.callId, result: raw }]);
+      expect(await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true))
+        .toMatchObject({ status: "unknown" });
+      expect(await f.owner.acceptTaskUpdate(f.token, transfer)).toMatchObject({ status: "committed" });
+      // A committed retry recovers its own receipt even after the live boundary closes.
+      expect(await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true))
+        .toMatchObject({ status: "committed" });
+    } finally { await f.close(); }
+  });
+
+  for (const safe of [false, true]) for (const mode of ["continuity", "replay"] as const)
+  test(`${safe ? "Zero Risk" : "Automatic"} ${mode} reservation keeps its admission after ACK`, async () => {
+    const f = await fixture(remote, safe);
+    try {
+      await f.start(1, 0);
+      const [call] = await f.owner.nextToolBatch(f.token, undefined, context(0));
+      const results = [{ callId: call!.callId, result: raw }];
+      await f.accept(f.transfer("first", 0, results));
+      const first = await f.wait(1);
+      const transfer = { ...f.transfer("second", 1, mode === "replay" ? results : []), mode };
+      await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(1), true);
+      await f.ack(first.taskUpdate!.deliveryId, 1);
+      await expect(Promise.resolve().then(() => f.owner.beginFinalOutput(f.token, context(1))))
+        .rejects.toMatchObject({ code: "task_update_transfer_pending" });
+      const committed = await f.owner.acceptTaskUpdate(f.token, transfer);
+      expect(committed).toMatchObject({ status: "committed", state: { acceptedRevision: 2, driverGeneration: 2 } });
+      expect(await f.owner.acceptTaskUpdate(f.token, transfer)).toEqual(committed);
+      expect(await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(1), true)).toEqual(committed);
+      expect(await f.owner.taskUpdateState(f.token)).toMatchObject({ acceptedRevision: 2, driverGeneration: 2 });
+      const reply = await f.wait(1);
+      expect(reply.kind === "result" && reply.result).toEqual(raw);
+      expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["message-second"]);
+    } finally { await f.close(); }
+  });
+
+  test("trusted cancellation still retires an append admitted at a live boundary", async () => {
+    const f = await fixture(remote);
+    try {
+      await f.start(1, 0);
+      const [call] = await f.owner.nextToolBatch(f.token, undefined, context(0));
+      const transfer = f.transfer("cancel-admitted", 0, [{ callId: call!.callId, result: raw }]);
+      await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true);
+      await f.owner.revokeTrusted(f.token);
+      expect(await f.owner.acceptTaskUpdate(f.token, transfer)).toMatchObject({ status: "not_committed", code: "codex_tool_operation_retired" });
+    } finally { await f.close(); }
+  });
+
+  test("draining preserves unknown reservations and committed receipt recovery on an existing token", async () => {
+    const f = await fixture(remote);
+    try {
+      await f.start(1, 0);
+      const [call] = await f.owner.nextToolBatch(f.token, undefined, context(0));
+      const transfer = f.transfer("draining-append", 0, [{ callId: call!.callId, result: raw }]);
+      const unknown = await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true);
+      f.broker.setExternalOwnersAccepted(false);
+      await expect(new RemoteTurnBroker(f.socket).assertCompatible()).rejects.toThrow("draining");
+      expect(await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true)).toEqual(unknown);
+      const committed = await f.owner.acceptTaskUpdate(f.token, transfer);
+      expect(committed).toMatchObject({ status: "committed", state: { acceptedRevision: 1, driverGeneration: 1 } });
+      expect(await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context(0), true)).toEqual(committed);
+      expect(await f.owner.acceptTaskUpdate(f.token, transfer)).toEqual(committed);
+      expect(await f.owner.taskUpdateState(f.token)).toMatchObject({ acceptedRevision: 1, driverGeneration: 1 });
+    } finally { await f.close(); }
+  });
+
   test("a captured pre-ACK candidate remains rejected after ACK without locking the output window", async () => {
     const f = await fixture(remote);
     try {
@@ -464,6 +540,34 @@ for (const remote of [false, true]) describe(`${remote ? "Remote" : "Local"} tas
       await expect(f.ack(delivery.deliveryId, 1)).rejects.toMatchObject({ code: "codex_tool_operation_retired" });
     } finally { await f.close(); }
   });
+});
+
+test("Remote append reservation rejects an older Broker before binding an ID", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-old-broker-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  mkdirSync(join(root, "runtime"), { recursive: true });
+  const methods: string[] = [];
+  const server = createServer(socket => {
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", chunk => {
+      buffer += chunk;
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.slice(0, buffer.indexOf("\n"))) as { id: string; method: string };
+      methods.push(request.method);
+      socket.end(`${JSON.stringify({ id: request.id, result: { protocolVersion: 12, acceptingExternalOwners: true } })}\n`);
+    });
+  });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); });
+  try {
+    const remote = new RemoteTurnBroker(socketPath);
+    await expect(remote.reserveTaskUpdate("old-token", "append", "payload", context(0), true))
+      .rejects.toMatchObject({ code: "task_update_upgrade_required" });
+    expect(methods).toEqual(["owner_status"]);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("the bounded transfer journal rejects a new reservation before preparation", async () => {

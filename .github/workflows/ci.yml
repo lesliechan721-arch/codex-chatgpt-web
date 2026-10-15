@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      test_workers:
+        description: "Server test workers (auto = Windows 2, other OSes 1; 1 = serial; 2 = parallel)"
+        type: choice
+        options: ["auto", "1", "2"]
+        default: "auto"
 
 permissions:
   contents: read
@@ -32,6 +39,8 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CGW_TEST_WORKERS: ${{ inputs.test_workers != 'auto' && inputs.test_workers || (matrix.os == 'windows-latest' && '2' || '1') }}
     steps:
       - uses: actions/checkout@v6
       - name: Validate launcher installer with Windows PowerShell 5.1
@@ -69,7 +78,17 @@ jobs:
         if: runner.os == 'Linux'
         run: bun run launcher/scripts/prepare-linux-appimage-tools.cjs
       - run: bun run verify
+        env:
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+      - name: Upload test performance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-performance-${{ matrix.os }}-workers-${{ env.CGW_TEST_WORKERS }}
+          path: ${{ runner.temp }}/test-performance
+          if-no-files-found: ignore
       - run: bun run app:package
+        if: runner.os != 'Windows'
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux'
         run: |
@@ -81,6 +100,35 @@ jobs:
         if: runner.os == 'Linux'
         run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
       - run: bun run app:smoke
+        if: runner.os != 'Windows'
+
+  windows-package:
+    name: Windows package and smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: launcher
+      - name: Prepare AVX2-independent Windows runtime
+        shell: pwsh
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.2 -GitHubEnv $env:GITHUB_ENV
+      - run: bun run app:package
+      - run: bun run app:smoke
+      - name: Upload Windows package diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package-${{ github.sha }}
+          path: |
+            launcher/artifacts/*.exe
+            launcher/artifacts/*.yml
+            launcher/artifacts/*.yaml
+            launcher/artifacts/*.json
+          if-no-files-found: ignore
 
   actionlint:
     runs-on: ubuntu-latest

@@ -20,7 +20,7 @@ const capture = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/session-
 const request = (label: string) => {
   const recorded = capture.captured.find(value => value.label === label && !value.replay)!;
   const parsed = parseRequest({ ...structuredClone(recorded.body), model: "gpt-5.6-sol" });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   return parsed;
 };
 const previous = () => {
@@ -119,9 +119,9 @@ test("synthetic deletion of old history keeps the real client's complete owned n
 test("real Codex steering retains the current window's persistent developer and AGENTS group", () => {
   const steering = capture.captured.filter(value => value.label === "steering" && !value.replay);
   const parsed = parseRequest({ ...structuredClone(steering[1]!.body), model: "gpt-5.6-sol" });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   const first = parseRequest({ ...structuredClone(steering[0]!.body), model: "gpt-5.6-sol" });
-  first._conversationPolicy = "continuity-first";
+  first._conversationPolicy = "task";
   const selected = continuityCurrentInstructionInput(parsed, {
     instructionIdentity: continuityInstructionIdentity(first), nativeTurnId: extractChatGptTurnIdentity(first).turnId,
     trustedLowerBound: steering[1]!.body.input.findIndex(item => item.type === "compaction"),
@@ -139,7 +139,7 @@ for (const withAgents of [true, false]) test(withAgents
   const api = JSON.parse(readFileSync(join(import.meta.dir, "fixtures/session-continuity/current-work-protocol-api-key.json"), "utf8")) as typeof capture;
   const continued = api.captured.find(value => value.label === "continue" && !value.replay)!;
   const source = parseRequest({ ...structuredClone(api.captured.find(value => value.label === "new-turn")!.body), model: "gpt-5.6-sol" });
-  source._conversationPolicy = "continuity-first";
+  source._conversationPolicy = "task";
   const body = structuredClone(continued.body);
   if (!withAgents) {
     for (const item of body.input) {
@@ -149,7 +149,7 @@ for (const withAgents of [true, false]) test(withAgents
     }
   }
   const parsed = parseRequest({ ...body, model: "gpt-5.6-sol" });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   const checkpointIndex = continued.body.input.findIndex(item => item.content?.some?.((part: any) => part.text?.startsWith("Another language model")));
   expect(checkpointIndex).toBeGreaterThan(0);
   const selected = continuityCurrentInstructionInput(parsed, {

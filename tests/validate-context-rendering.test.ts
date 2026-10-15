@@ -11,19 +11,21 @@ import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-ren
 import { ChatGptThreadEnvironmentStore, type ChatGptEnvironmentResolutionDiagnostics } from "../src/adapters/chatgpt-web/thread-environment";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, hasCurrentChatGptEnvironmentContext } from "../src/adapters/chatgpt-web/environment";
 import { chromium, type Page } from "playwright-core";
-import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import type { ContinuityLease } from "../src/adapters/chatgpt-web/continuity-contract";
+import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { createChatGptWebAdapter, chatGptWebExecutionNamespace } from "../src/adapters/chatgpt-web";
 import { chatGptTurnSessions, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
-import { captureCompactionSource, prepareFreshCompactionSource } from "../src/adapters/chatgpt-web/compaction-context";
+import { captureCompactionSource, prepareFreshCompactionSource, type CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
 import { canonicalizeCompactionHandoff, LATEST_USER_PROMPT_MARKER } from "../src/adapters/chatgpt-web/compaction-handoff";
-import { defaultConfig, defaultBrokerEndpoint } from "../src/config";
+import { defaultConfig } from "../src/config";
 import { TurnBroker, callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { compactRequest } from "../src/server";
-import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
 import type { CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -31,28 +33,19 @@ async function sourceWiringHarness(run: (fixture: {
   config: ReturnType<typeof defaultConfig>; broker: TurnBroker;
   factory: NonNullable<Parameters<typeof compactRequest>[2]>;
   configureProvider: (provider: CodexProviderConfig) => CodexProviderConfig;
+  store: ReturnType<typeof retainedTaskFixture>["store"];
   source: () => { parsed: CodexParsedRequest; provider: CodexProviderConfig };
   setBrowser: (implementation: (turn: BrowserTurn) => Promise<string>) => void;
 }) => Promise<void>) {
-  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-live-source-"));
-  const host = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request =>
-    new URL(request.url).pathname === "/v1/turn/release" ? Response.json({ released: 1 }) : Response.json({}, { status: 404 }) });
-  const descriptor = join(root, "launcher.json");
-  writeFileSync(descriptor, JSON.stringify({ version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development", pid: process.pid,
-    launcherInstance: { pid: process.pid, startIdentity: "local-source-test", instanceId: "0".repeat(64) },
-    endpoint: "http://127.0.0.1:39110", control: { endpoint: `http://127.0.0.1:${host.port}`, token: "local-control-token-0123456789abcdefghijklmnop" },
-    helper: { executable: process.execPath, script: import.meta.path }, partition: "persist:codex-web-gpt-dev-chatgpt",
-    idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "launcher_surface_id_0123456789AB",
-    surfaceTargets: { launcher_surface_id_0123456789AB: "local-target" }, createdAt: new Date().toISOString() }), { mode: 0o600 });
-  const config = { ...defaultConfig("full"), browserHost: "launcher" as const, browserHostDescriptorPath: descriptor,
-    brokerSocketPath: defaultBrokerEndpoint(root), extraHighAvailable: true, proAvailable: true };
+  const f = retainedTaskFixture();
+  const config = { ...f.config, browserHostDescriptorPath: f.provider.chatgptWeb!.browserHostDescriptorPath,
+    brokerSocketPath: f.provider.chatgptWeb!.brokerSocketPath!, extraHighAvailable: true, proAvailable: true };
   const broker = TurnBroker.forSocket(config.brokerSocketPath); await broker.listen();
-  const originalRun = ChatGptBrowserWorker.prototype.run;
-  const originalTaskUpdates = ChatGptBrowserWorker.prototype.supportsTaskUpdates;
-  // This local transport fixture has no cloud helper or dynamic task-update protocol.
-  ChatGptBrowserWorker.prototype.supportsTaskUpdates = async () => false;
-  const configureProvider = (provider: CodexProviderConfig): CodexProviderConfig => ({ ...provider,
-    chatgptWeb: { ...provider.chatgptWeb, threadEnvironmentStatePath: join(root, "environments.json") } });
+  const worker = ChatGptBrowserWorker.forProvider(f.provider);
+  const originalRun = worker.run;
+  const configureProvider = (provider: CodexProviderConfig): CodexProviderConfig => ({ ...provider, baseUrl: f.provider.baseUrl,
+    chatgptWeb: { ...f.provider.chatgptWeb, toolAuthorityMode: provider.chatgptWeb?.toolAuthorityMode,
+      extraHighAvailable: true, proAvailable: true, threadEnvironmentStatePath: join(f.root, "environments.json") } });
   let accepted: { parsed: CodexParsedRequest; provider: CodexProviderConfig } | undefined;
   const factory: NonNullable<Parameters<typeof compactRequest>[2]> = provider => {
     const adapter = createChatGptWebAdapter(provider, { broker,
@@ -61,32 +54,45 @@ async function sourceWiringHarness(run: (fixture: {
     const original = adapter.runTurn!;
     return { ...adapter, runTurn: (...parameters) => { accepted = { parsed: parameters[0], provider }; return original.apply(adapter, parameters); } };
   };
-  try { await run({ config, broker, factory, configureProvider, source: () => accepted!,
-    setBrowser: implementation => { ChatGptBrowserWorker.prototype.run = async turn => {
-      const answer = await implementation(turn);
-      if (!turn.compaction) turn.onTextDelta(answer);
-      return answer;
+  try { await run({ config, broker, factory, configureProvider, store: f.store, source: () => accepted!,
+    setBrowser: implementation => { worker.run = async turn => {
+      const claim = turn.continuity!, old = f.pages.get(turn.conversationKey!);
+      if (claim.expected) expect(old).toEqual({ continuity: claim.expected, state: "ready" });
+      const lease: ContinuityLease = { owner: claim.owner, traceId: turn.traceId,
+        leaseId: old?.continuity.leaseId ?? "1".repeat(32), ...(claim.recovery ? { recovery: claim.recovery } : {}) };
+      f.pages.set(turn.conversationKey!, { continuity: lease, state: "running" });
+      turn.onContinuityLease!(lease);
+      try {
+        const answer = await implementation(turn);
+        if (!turn.compaction) turn.onTextDelta(answer);
+        return answer;
+      } finally { f.pages.set(turn.conversationKey!, { continuity: lease, state: "ready" }); }
     }; } }); }
-  finally { ChatGptBrowserWorker.prototype.run = originalRun; ChatGptBrowserWorker.prototype.supportsTaskUpdates = originalTaskUpdates; chatGptTurnSessions.clear();
-    await closeChatGptBrowserWorkers(); await broker.close(); host.stop(true); rmSync(root, { recursive: true, force: true }); }
+  finally { worker.run = originalRun; await f.dispose(); }
 }
 
-test("compaction pipeline refuses a completed primer without original submission evidence", async () => {
-  await sourceWiringHarness(async ({ config, factory, configureProvider, setBrowser }) => {
-    let starts = 0; const stages: string[] = [];
+test("compaction pipeline refuses a primer without original submission evidence", async () => {
+  await sourceWiringHarness(async ({ config, factory, configureProvider, source, setBrowser }) => {
+    let starts = 0, preparations = 0; const stages: string[] = [];
+    let coverage: CompactionSourceCoverage | undefined;
     setBrowser(async turn => { starts++; const prepared = await turn.prepare();
       if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
+      preparations++;
+      const accepted = source(), key = `${chatGptWebExecutionNamespace(accepted.provider)}:${chatGptTurnExecutionKey(accepted.parsed)}`;
+      coverage = chatGptTurnSessions.find(key)!.runtime.compactionSourceCoverage!;
       prepared.release(); return "Source was not sent."; });
     const body = createLiveRequestBody(createLiveFixture("mcp-partial"), { purpose: "compaction", model: "chatgpt-web/gpt-6-sol-instant",
       cwd: process.cwd(), threadId: "missing_send_thread", turnId: "missing_send_turn" });
     await expect(executeLiveRequestPipeline(body, "compaction", config, factory, { signal: new AbortController().signal, configureProvider,
-      onStage: stage => stages.push(stage) })).rejects.toThrow("Send 已确认");
+      onStage: stage => stages.push(stage) })).rejects.toThrow();
+    expect(preparations).toBe(1);
+    expect(coverage!.latest()?.delivered).toBeFalse();
     expect(starts).toBe(1); expect(stages).toEqual(["primer"]);
   });
 });
 
 test("compaction pipeline reuses real accepted source and settlement for every fixed fixture", async () => {
-  for (const name of LIVE_CASES) await sourceWiringHarness(async ({ config, broker, factory, configureProvider, source, setBrowser }) => {
+  for (const name of LIVE_CASES) await sourceWiringHarness(async ({ config, broker, factory, configureProvider, store, source, setBrowser }) => {
     const fixture = createLiveFixture(name), body = createLiveRequestBody(fixture, { purpose: "compaction", model: "chatgpt-web/gpt-6-sol-instant",
       cwd: process.cwd(), threadId: `source_thread_${name}`, turnId: `source_turn_${name}` });
     const stages: string[] = [], reports: Record<string, any>[] = [];
@@ -100,6 +106,7 @@ test("compaction pipeline reuses real accepted source and settlement for every f
         const coverage = chatGptTurnSessions.find(key)!.runtime.compactionSourceCoverage!;
         expect(coverage.latest()?.delivered).toBe(false);
         expect(() => captureCompactionSource(accepted.parsed, coverage)).toThrow("pending");
+        await turn.onSendActivated?.();
         await turn.onSubmitted?.();
         expect(coverage.latest()?.delivered).toBe(true);
         expect(captureCompactionSource(accepted.parsed, coverage).targets.length).toBeGreaterThan(0);
@@ -107,6 +114,7 @@ test("compaction pipeline reuses real accepted source and settlement for every f
       }
       expect(reports.at(-1)?.source).toMatchObject({ delivered: true, physicallySettled: true });
       expect(turn.requireRetainedConversation).toBe(true);
+      await turn.onSendActivated?.();
       await turn.onSubmitted?.();
       const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
       const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
@@ -116,15 +124,29 @@ test("compaction pipeline reuses real accepted source and settlement for every f
     });
     const response = await executeLiveRequestPipeline(body, "compaction", config, factory, { signal: new AbortController().signal,
       configureProvider,
-      onStage: stage => stages.push(stage), onPrimer: report => reports.push(report) });
+      onStage: stage => stages.push(stage), onPrimer: report => {
+        reports.push(report);
+        if (!report.source) return;
+        const accepted = source(), record = store.get(continuityDigest(extractChatGptTurnIdentity(accepted.parsed).threadId!))!;
+        const sourceWork = record.works[record.currentWorkId!]!;
+        expect(record.legacyUnproven).toBeFalse();
+        expect(sourceWork.state).toBe("completed");
+        expect(sourceWork.attempts.at(-1)!.stage).toBe("completed");
+        expect(record.contextCoverage!.some(entry => entry.metadata.delivered)).toBeTrue();
+      } });
+    const envelope = await response.json();
+    expect(envelope.error).toBeUndefined();
     expect(response.status).toBe(200);
-    const checkpoint = extractLiveCompletion(await response.json(), "compaction");
+    const checkpoint = extractLiveCompletion(envelope, "compaction");
     expect(checkpoint).toBe(canonicalizeCompactionHandoff(source().parsed, summary));
     expect(inspectLiveResult(fixture, checkpoint).passed).toBe(false); // The bound task itself contains literal result tags.
     expect(extractLiveCompactionSummary(checkpoint, fixture.task)).toBe(`${summary}\n`);
     expect(inspectLiveResult(fixture, extractLiveCompactionSummary(checkpoint, fixture.task))).toMatchObject({ passed: true });
     expect(starts).toBe(2); expect(stages).toEqual(["primer", "compaction"]);
     expect(reports.at(-1)?.source?.coverageRecords).toBe(1);
+    const committed = store.get(continuityDigest(extractChatGptTurnIdentity(source().parsed).threadId!))!;
+    expect(committed.historyRevision).toBe(1);
+    expect(Object.keys(committed.checkpoints)).toHaveLength(1);
   });
 });
 
@@ -153,6 +175,7 @@ test("original compaction gate rejects changed source bytes and another thread a
     let starts = 0, sends = 0;
     setBrowser(async turn => { starts++; const prepared = await turn.prepare();
       if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
+      await turn.onSendActivated?.();
       await turn.onSubmitted?.(); sends++; prepared.release(); return "Source accepted."; });
     const response = await executeLiveRequestPipeline(body, "ordinary", config, factory, { signal: new AbortController().signal, configureProvider });
     const envelope = await response.json();
@@ -171,7 +194,7 @@ test("original compaction gate rejects changed source bytes and another thread a
     const denied = await compactRequest(new Request("http://local/v1/responses/compact", { method: "POST", headers: {
       "content-type": "application/json", "x-codex-turn-metadata": JSON.stringify(metadata) }, body: JSON.stringify(wrongThread) }), config, provider => factory(configureProvider(provider)));
     expect((await denied.json()).error.code).toBe("continuity_source_unproven");
-    expect(starts).toBe(2); // The fresh runtime fails during prepare, before its Send callback.
+    expect(starts).toBe(1); // Public task continuity rejects the unowned thread before browser acquisition.
     expect(sends).toBe(1);
   });
 });

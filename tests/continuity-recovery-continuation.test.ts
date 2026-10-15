@@ -20,7 +20,7 @@ const text = "Accepted task is unfinished; its real results are already known.";
 function request(input: unknown[] = [{ type: "compaction", encrypted_content: encodeCompactionSummary(text) }]) {
   const parsed = parseRequest({ model: "gpt-5.6-sol", input,
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: native.threadId, turn_id: native.turnId }) } });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   parsed._continuityScope = scope;
   return parsed;
 }

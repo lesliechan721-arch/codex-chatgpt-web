@@ -7,8 +7,10 @@ import { bindContextFullCandidate, bindContextInstructionInputSource, contextCan
   continuityContextCandidate, continuityRecoveredContextCandidate } from "../src/adapters/chatgpt-web/context-candidate-mapping";
 import { continuityCurrentEnvironmentInput, continuityCurrentInstructionInput } from "../src/adapters/chatgpt-web/environment";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
-import { preflightFullRecoveryContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
+import { preflightContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { defaultConfig } from "../src/config";
+import { routeChatGptWebRequest } from "../src/server";
 
 const previous = { instructionIdentity: "previous", nativeTurnId: "prior" };
 const instruction = (id: string, turnId: string, content: unknown) => ({
@@ -20,7 +22,7 @@ function request(input: unknown[], metadata: Record<string, unknown> = {}): Code
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({
       thread_id: "thread", turn_id: "current", request_kind: "turn", ...metadata,
     }) } });
-  parsed._conversationPolicy = "continuity-first";
+  parsed._conversationPolicy = "task";
   return parsed;
 }
 function candidate(parsed: CodexParsedRequest, prior: typeof previous | undefined = previous): CodexParsedRequest {
@@ -34,6 +36,103 @@ function recovered(parsed: CodexParsedRequest, results: unknown[] = []): CodexPa
   result.context.systemPrompt = [...result.context.systemPrompt ?? [], "Trusted recovery status."];
   return result;
 }
+
+function routedSource(model: string, input: unknown[]): CodexParsedRequest {
+  const parsed = parseRequest({ model, instructions: "Base instructions.", input,
+    reasoning: { effort: model.endsWith("-instant") || model.includes("zero-risk") || model.endsWith("/light") ? "low" : "medium" },
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread", turn_id: "current" }) } });
+  routeChatGptWebRequest(parsed, { ...defaultConfig("full"), browserHost: "launcher", solAvailable: true,
+    browserInteractionMode: model.includes("zero-risk") ? "manual" : "automatic",
+    zeroRiskProEnabled: model.endsWith("zero-risk-pro") });
+  return parsed;
+}
+
+describe("routed recovery source projection", () => {
+  const models = ["chatgpt-web/gpt-6-sol-instant", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
+    "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/zero-risk", "chatgpt-web/zero-risk-pro"];
+  const current = instruction("current", "current", "Read the accepted source.");
+  const call = { type: "function_call", call_id: "issued", name: "exec_command", arguments: ' { "cmd": "read source" } ' };
+  const result = { type: "function_call_output", call_id: "issued", output: "Completed original source return." };
+  const commentary = { type: "message", id: "commentary", role: "assistant", phase: "commentary",
+    content: [{ type: "output_text", text: "The original return is available." }] };
+
+  for (const model of models) test(`full native call echo keeps its original projection after routing (${model})`, () => {
+    const parsed = routedSource(model, [current, call, result, commentary]);
+    const original = structuredClone(parsed);
+    const selected = continuityRecoveredContextCandidate(parsed, recovered(parsed));
+    const source = contextCandidateCanonicalSource(parsed, selected)!;
+    expect(parsed.modelId).not.toBe(model);
+    expect(source.modelId).toBe(parsed.modelId);
+    expect((source._rawBody as { model: string }).model).toBe(model);
+    expect(source.context.messages.filter(message => message.role === "assistant").map(message => message.model)).toEqual([model, model]);
+    expect(contextCandidateMessageIndices(source, selected)).toEqual([0, 1, 2, 3]);
+    expect(contextCandidateRawInputIndices(source, selected)).toEqual([0, 1, 2, 3]);
+    expect(source.context.systemPrompt).toEqual(["Base instructions."]);
+    expect(selected.context.systemPrompt!.at(-1)).toBe("Trusted recovery status.");
+    expect(parsed).toEqual(original);
+    const snapshot = createContextSnapshot(source);
+    expect(snapshot.getText(snapshot.targets.find(target => target.kind === "tool_arguments")!.read_ref!)).toBe(call.arguments);
+    expect(snapshot.getText(snapshot.targets.find(target => target.kind === "tool_result")!.read_ref!)).toBe(result.output);
+    const saved = continuityAcceptedContextCandidate(parsed, selected);
+    expect(contextCandidateCanonicalSource(parsed, saved)).toBe(source);
+  });
+
+  test("retained task text and missing issuing parameters use the same original public model", () => {
+    const system = { type: "message", id: "system", role: "system", content: "Retained source system." };
+    const parsed = routedSource("chatgpt-web/gpt-6-sol-instant", [current, result]);
+    const original = structuredClone(parsed);
+    const selected = continuityRecoveredContextCandidate(parsed, recovered(parsed), [current, call, result],
+      [system, current, commentary, call], new Set([call.call_id]));
+    const source = contextCandidateCanonicalSource(parsed, selected)!;
+    expect((source._rawBody as { input: unknown[] }).input).toEqual([system, current, commentary, call, result]);
+    expect(source.context.systemPrompt).toEqual(["Base instructions.", system.content]);
+    expect(selected.context.systemPrompt).toEqual(["Base instructions.", system.content, "Trusted recovery status."]);
+    expect(source.context.messages.filter(message => message.role === "assistant").map(message => message.model))
+      .toEqual(["chatgpt-web/gpt-6-sol-instant", "chatgpt-web/gpt-6-sol-instant"]);
+    expect(contextCandidateMessageIndices(source, selected)).toEqual([0, 1, 3]);
+    const provenance = contextCandidateSourceProvenance(source, selected)!;
+    const snapshot = createContextSnapshot(source, { provenanceByMessage: provenance });
+    const argumentsTarget = snapshot.targets.find(target => target.kind === "tool_arguments")!;
+    expect(argumentsTarget).toMatchObject({ provenance: "verified_restoration", encoding: "deterministic-json" });
+    expect(snapshot.getText(argumentsTarget.read_ref!)).toBe('{"cmd":"read source"}');
+    expect(snapshot.targets.find(target => target.kind === "tool_result")!.provenance).toBe("verified_raw");
+    expect(parsed).toEqual(original);
+  });
+
+  test("equivalent aliases cannot exchange original source envelopes", () => {
+    const named = routedSource("chatgpt-web/gpt-5.6-sol-instant", [current, call, result]);
+    const alias = routedSource("chatgpt-web/light", [current, call, result]);
+    expect(named.modelId).toBe(alias.modelId);
+    const selected = continuityRecoveredContextCandidate(named, recovered(named));
+    expect(contextCandidateCanonicalSource(alias, selected)).toBeUndefined();
+    expect(() => continuityRecoveredContextCandidate(named, recovered(alias))).toThrow("exact canonical message source");
+  });
+
+  for (const change of ["message model", "raw model", "instruction", "result", "arguments", "retained result", "duplicate anchor", "reordered anchor"] as const) {
+    test(`routing preserves strict recovery rejection for changed ${change}`, () => {
+      const parsed = routedSource("chatgpt-web/gpt-6-sol-instant", [current, call, result]);
+      const selected = recovered(parsed);
+      const retained = structuredClone([current, call, result]);
+      if (change === "message model") {
+        const assistant = selected.context.messages.find(message => message.role === "assistant")!;
+        assistant.model = parsed.modelId;
+      } else if (change === "raw model") {
+        (selected._rawBody as { model: string }).model = parsed.modelId;
+      } else if (change === "instruction") {
+        selected.context.messages[0]!.content = "Changed accepted instruction.";
+      } else if (change === "result") {
+        selected.context.messages[2]!.content = "Changed accepted return.";
+      } else if (change === "arguments") {
+        (retained[1] as typeof call).arguments = '{"cmd":"different"}';
+      } else if (change === "retained result") {
+        (retained[2] as typeof result).output = "Different original result.";
+      } else if (change === "duplicate anchor") retained.push(structuredClone(call));
+      else retained.reverse();
+      expect(() => continuityRecoveredContextCandidate(parsed, selected, undefined, retained, new Set([call.call_id])))
+        .toThrow("exact canonical message source");
+    });
+  }
+});
 
 describe("continuity candidate source mapping", () => {
   test("identical instruction text selects the actual newer native input, including cached selection", () => {
@@ -292,16 +391,16 @@ describe("continuity candidate source mapping", () => {
     expect(selected).toEqual(original);
   });
 
-  test("full recovery capacity includes task text restored from the retained page", () => {
+  test("cold recovery capacity includes required task text restored from the retained page", () => {
     const current = instruction("current", "current", "Current task.");
     const parsed = request([current]);
     parsed.modelId = CHATGPT_WEB_MODEL_ID;
     const selected = continuityRecoveredContextCandidate(parsed, recovered(parsed), undefined,
       [instruction("previous", "prior", "Original active task. ".repeat(60_000)), current]);
     expect(selected.context.messages).toHaveLength(2);
-    expect(() => preflightFullRecoveryContinuityInput(selected, {
+    expect(() => preflightContinuityInput(selected, {
       localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false,
-    })).toThrow("original single-input boundary");
+    })).toThrow();
     expect((parsed._rawBody as { input: unknown[] }).input).toHaveLength(1);
   });
 
@@ -343,7 +442,7 @@ describe("continuity candidate source mapping", () => {
     const parsed = request([instruction("previous", "prior", "Old task."), instruction("current", "current", "Current task.")]);
     const selected = candidate(parsed);
     const other = parseRequest(parsed._rawBody);
-    other._conversationPolicy = "continuity-first";
+    other._conversationPolicy = "task";
     expect(contextCandidateMessageIndices(other, selected)).toBeUndefined();
     expect(contextCandidateRawInputIndices(other, selected)).toBeUndefined();
     expect(contextCandidateMessageIndices(parsed, structuredClone(selected))).toBeUndefined();

@@ -2988,8 +2988,10 @@ test("five browser tabs are a hard account-safety limit", async () => {
   );
 });
 
-test("a full browser host evicts only its oldest ready tab", () => {
+test("a full browser host evicts only its oldest ready tab", async () => {
   const oldest = { id: "oldest", ordinal: 1, status: "ready", lastHeartbeatAt: 10 };
+  let destroyed = false;
+  oldest.view = { webContents: { isDestroyed: () => destroyed, close() { destroyed = true; } } };
   const newer = { id: "newer", ordinal: 2, status: "ready", lastHeartbeatAt: 20 };
   const running = [3, 4, 5].map((ordinal) => ({
     id: `running-${ordinal}`,
@@ -3002,6 +3004,7 @@ test("a full browser host evicts only its oldest ready tab", () => {
     turnTabs: new Map([oldest, newer, ...running].map(tab => [tab.id, tab])),
     removeTurnTab(tab, abortRunning) {
       removed.push([tab.id, abortRunning]);
+      require("../electron/continuity-page-cleanup.cjs").cleanupTurnPage(this, tab);
       this.turnTabs.delete(tab.id);
     },
     window: {
@@ -3009,7 +3012,7 @@ test("a full browser host evicts only its oldest ready tab", () => {
     },
   };
 
-  assert.equal(BrowserHost.prototype.evictOldestRetainedTurnTab.call(fixture), true);
+  assert.equal(await BrowserHost.prototype.evictOldestRetainedTurnTab.call(fixture), true);
   assert.deepEqual(removed, [["oldest", false]]);
   assert.equal(fixture.turnTabs.has("running-3"), true);
 });
@@ -3325,13 +3328,13 @@ test("failed pages free capacity before reusable conversations without evicting 
   const activeError = { id: "active-error", status: "error", interactionMode: "automatic", lastHeartbeatAt: 1 };
   fixture.turnTabs.set(reusable.id, reusable);
   fixture.turnTabs.set(activeError.id, activeError);
-  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.equal(await fixture.evictOldestReclaimableTurnTab(), true);
   assert.deepEqual(closed, [tab.id]);
   assert.equal(fixture.turnTabs.get(reusable.id), reusable);
   assert.equal(fixture.turnTabs.get(activeError.id), activeError);
 });
 
-test("a failed continuity page keeps its physical recovery identity until destruction completes", async () => {
+test("a failed continuity page with unknown Send is not reclaimed as an idle page", async () => {
   const { fixture, tab, closed } = failedAutomaticTurnFixture();
   const recovery = { schemaVersion: 2, installationId: "a".repeat(64), threadKey: "b".repeat(64),
     epoch: 1, transactionId: "failed-transaction", transactionVersion: 2, logicalWorkId: "failed-work", attempt: 1,
@@ -3346,7 +3349,9 @@ test("a failed continuity page keeps its physical recovery identity until destru
   });
   tab.view.webContents = contents;
   await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
-  assert.equal(fixture.evictOldestReclaimableTurnTab(), false, "a close request does not free a physical slot");
+  assert.equal(await fixture.evictOldestReclaimableTurnTab(), false, "failed presentation does not prove settlement");
+  assert.deepEqual(closed, []);
+  fixture.removeTurnTab(tab, false);
   assert.deepEqual(closed, [tab.id]);
   assert.deepEqual(fixture.closingTurnTabs.get(contents).continuityRecovery, recovery);
   assert.equal(record.writerRetired, false);
@@ -3785,14 +3790,21 @@ test("connector confirmation has its own deadline when Sent confirmation is disa
   assert.equal(tab.manualState, "timed-out");
 });
 
-test("terminal Zero Risk tabs are reclaimed before retained conversations", () => {
+test("terminal Zero Risk tabs are reclaimed before retained conversations", async () => {
   const { fixture } = manualTurnFixture();
+  let destroyed = false;
+  const remove = fixture.removeTurnTab;
+  fixture.removeTurnTab = function (tab) {
+    require("../electron/continuity-page-cleanup.cjs").cleanupTurnPage(this, tab);
+    remove.call(this, tab);
+  };
   fixture.turnTabs.set("manual-timeout", {
     id: "manual-timeout",
     interactionMode: "manual",
     status: "error",
     manualState: "timed-out",
     lastHeartbeatAt: 1,
+    view: { webContents: { isDestroyed: () => destroyed, close() { destroyed = true; } } },
   });
   fixture.turnTabs.set("manual-retained", {
     id: "manual-retained",
@@ -3802,7 +3814,7 @@ test("terminal Zero Risk tabs are reclaimed before retained conversations", () =
     lastHeartbeatAt: 0,
   });
 
-  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.equal(await fixture.evictOldestReclaimableTurnTab(), true);
   assert.equal(fixture.turnTabs.has("manual-timeout"), false);
   assert.equal(fixture.turnTabs.has("manual-retained"), true);
 });

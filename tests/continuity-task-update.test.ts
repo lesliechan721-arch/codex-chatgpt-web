@@ -13,18 +13,20 @@ import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, sameContinuityRecoveryIdentity, type ContinuityLease, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
 import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnExecutionKey, chatGptTurnSessions, TASK_UPDATE_SESSION_JOURNAL_BYTES } from "../src/adapters/chatgpt-web/turn-execution";
-import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { callTurnBroker, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import type { TaskUpdateTransfer, TaskUpdateTransferOutcome, UpdateDelivery } from "../src/adapters/chatgpt-web/task-update-protocol";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { defaultBrokerEndpoint } from "../src/config";
-import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
+import { CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { parseRequest } from "../src/responses/parser";
 import { encodeCompactionSummary } from "../src/responses/compaction";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 
 const cleanup: Array<() => Promise<void>> = [];
+const faultRestorations: Array<() => void> = [];
 afterEach(async () => {
+  for (const restore of faultRestorations.splice(0).reverse()) restore();
   // A backend exit drops its memory. Calling clear() in the child would instead persist
   // an explicit user stop for the interrupted work and would test a different event.
   if (!process.env.CGW_CONTINUITY_CHILD_SCENARIO) chatGptTurnSessions.clear();
@@ -57,7 +59,8 @@ function resultStorage(session: ReturnType<Awaited<ReturnType<typeof fixture>>["
 }
 
 async function fixture(manual = false, protocol = true, search = false,
-  options: { root?: string; preserveRoot?: boolean } = {}) {
+  options: { root?: string; preserveRoot?: boolean; remote?: boolean;
+    completionInspection?: { entered(): void; release: Promise<void> } } = {}) {
   // Keep Unix socket paths short; Windows uses its system temp directory and named pipes.
   const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-update-"));
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
@@ -77,14 +80,21 @@ async function fixture(manual = false, protocol = true, search = false,
   const coordination: Array<{ action: string; recovery: ContinuityRecoveryIdentity }> = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
-    if (path.endsWith("continuity-capacity")) return Response.json({ ok: true, available: true });
+    if (path.endsWith("continuity-capacity")) return Response.json({ ok: true, executionProtocol: 1, available: true });
     const body = await request.json() as { conversationKey: string; expected: ContinuityLease; recovery?: ContinuityLease["recovery"] };
+    if (options.completionInspection) {
+      const record = new ContinuityRecoveryStore(statePath).get(continuityDigest(root));
+      if (record?.currentWorkId && record.works[record.currentWorkId]?.state === "completed") {
+        options.completionInspection.entered();
+        await options.completionInspection.release;
+      }
+    }
     if (path.includes("continuity-") && body.recovery) {
       const action = path.slice(path.lastIndexOf("continuity-") + "continuity-".length);
       coordination.push({ action, recovery: structuredClone(body.recovery) });
       const receipt = receipts.find(value => sameContinuityRecoveryIdentity(value.recovery, body.recovery!));
       if (!receipt) return action === "query"
-        ? Response.json({ ok: true, recovery: body.recovery, launcherInstance, hostNoWriter: pages.size === 0,
+        ? Response.json({ ok: true, executionProtocol: 1, recovery: body.recovery, launcherInstance, hostNoWriter: pages.size === 0,
           state: "unknown", writerRetired: false, toolsSettled: false })
         : Response.json({ ok: false, code: "continuity_source_unproven" }, { status: 409 });
       let sendAuthorized: boolean | undefined;
@@ -96,9 +106,9 @@ async function fixture(manual = false, protocol = true, search = false,
         receipt.state = "send-possible";
       }
       saveReceipts();
-      return Response.json({ ok: true, recovery: receipt.recovery, state: receipt.state,
+      return Response.json({ ok: true, executionProtocol: 1, recovery: receipt.recovery, state: receipt.state,
         launcherInstance, hostNoWriter: receipt.writerRetired && !pages.has(receipt.key),
-        writerRetired: receipt.writerRetired, toolsSettled: false, ...(sendAuthorized === undefined ? {} : { sendAuthorized }) });
+        writerRetired: receipt.writerRetired, executionIsolated: receipt.writerRetired, physicalCleanup: receipt.writerRetired ? "destroyed" : "pending", toolsSettled: false, ...(sendAuthorized === undefined ? {} : { sendAuthorized }) });
     }
     const page = pages.get(body.conversationKey);
     if (new URL(request.url).pathname.endsWith("release")) { pages.delete(body.conversationKey); return Response.json({ ok: true, released: 1 }); }
@@ -107,7 +117,7 @@ async function fixture(manual = false, protocol = true, search = false,
   } });
   const descriptorPath = join(root, "launcher.json");
   writeFileSync(descriptorPath, JSON.stringify({ version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development",
-    pid: process.pid, launcherInstance, features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
+    pid: process.pid, launcherInstance, features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
     control: { endpoint: `http://127.0.0.1:${server.port}`, token: "a".repeat(43) },
     helper: { executable: process.execPath, script: import.meta.path }, partition: "persist:codex-web-gpt-dev-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "a".repeat(32), surfaceTargets: {}, createdAt: new Date().toISOString() }), { mode: 0o600 });
@@ -208,14 +218,15 @@ async function fixture(manual = false, protocol = true, search = false,
   };
   const originalAccept = broker.acceptTaskUpdate;
   if (!protocol) broker.acceptTaskUpdate = undefined as never;
-  const adapter = createChatGptWebAdapter(provider, { broker, zeroRiskManualControl: manualControl });
+  if (options.remote) await broker.listen();
+  const adapter = createChatGptWebAdapter(provider, { broker: options.remote ? new RemoteTurnBroker(socket) : broker, zeroRiskManualControl: manualControl });
   const request = (input: unknown[] = [user("initial-user", "Inspect the project.")], requestId = "request") => {
     const parsed = parseRequest({ model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : "gpt-5.6-sol",
       stream: false, input, tools: [{ type: "function", name: "exec_command", description: "Simulated tool",
         parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } },
       ...(search ? [{ type: "tool_search", description: "Simulated discovery", parameters: { type: "object" } }] : [])],
       client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: root, turn_id: "turn", request_id: requestId }) } });
-    parsed._conversationPolicy = "continuity-first";
+    parsed._conversationPolicy = "task";
     return parsed;
   };
   const initial = request();
@@ -228,14 +239,14 @@ async function fixture(manual = false, protocol = true, search = false,
   const start = (operationId: number, taskRevision = 0, command = "simulated only") => callTurnBroker<NativeOperationReply & { taskUpdate?: UpdateDelivery }>(socket, {
     method: "native_operation_start", token, contract, nativeWaitProtocol: 1, ...(protocol ? { taskUpdateProtocol: 1, taskRevision } : {}),
     operationId, entry: "codex_exec", nativeInput: { cmd: command }, waitMs: 1,
-  });
+  }, null);
   const wait = (operationId: number) => callTurnBroker<NativeOperationReply & { taskUpdate?: UpdateDelivery }>(socket, {
     method: "native_operation_wait", token, contract, nativeWaitProtocol: 1, operationId, waitMs: 1,
-  });
+  }, null);
   const startTool = (operationId: number, wireName: string, taskRevision = 0) => callTurnBroker<NativeOperationReply & { taskUpdate?: UpdateDelivery }>(socket, {
     method: "native_operation_start", token, contract, nativeWaitProtocol: 1, taskUpdateProtocol: 1, taskRevision,
     operationId, entry: "codex_tool_call", nativeInput: { wire_name: wireName, arguments: {} }, waitMs: 1,
-  });
+  }, null);
   const ack = (delivery: UpdateDelivery) => broker.acknowledgeTaskUpdate(token, delivery.deliveryId, delivery.throughRevision, contract);
   const session = () => chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(initial)}`)!;
   const finish = async () => {
@@ -448,7 +459,7 @@ for (const blockReadback of [false, true]) test(`recovery E3: atomic B replaceme
     insideAcceptance = true; transfers.push(structuredClone(transfer));
     try { return accept(token, transfer); } finally { insideAcceptance = false; }
   });
-  cleanup.push(async () => { accepting.mockRestore(); confirming.mockRestore(); reading.mockRestore(); transaction.mockRestore(); });
+  faultRestorations.push(() => { accepting.mockRestore(); confirming.mockRestore(); reading.mockRestore(); transaction.mockRestore(); });
   await expect(f.run(f.request(input))).rejects.toMatchObject({ code: blockReadback ? "task_update_transfer_unknown" : "task_update_transfer_pending" });
   expect(replaced).toBeTrue();
   const durable = get.call(new ContinuityRecoveryStore(f.statePath), continuityDigest(f.root))!;
@@ -465,17 +476,30 @@ for (const blockReadback of [false, true]) test(`recovery E3: atomic B replaceme
   expect(f.broker.taskUpdateTransferOutcome(f.token(), transferId).status).toBe(blockReadback ? "unknown" : "committed");
   expect(f.session().hasPendingTaskUpdate()).toBeTrue();
   expect(f.session().driverGeneration()).toBe(0);
-  expect(await f.wait(1)).toMatchObject({ kind: "pending" });
-  await expect(f.broker.nextToolBatch(f.token(), undefined, { expectedDriverGeneration: blockReadback ? 0 : 1,
-    taskRevision: blockReadback ? 0 : 1 })).rejects.toMatchObject({ code: "task_update_transfer_pending" });
-  const blockedDecision = await f.start(2, blockReadback ? 0 : 1);
-  expect(blockedDecision).toMatchObject({ kind: "result", result: { isError: true } });
-  expect(blockedDecision.kind === "result" && blockedDecision.result.content[0]).toMatchObject({ type: "text",
-    text: expect.stringContaining('"reason":"transfer_pending"') });
+  if (blockReadback) {
+    await expect(f.wait(1)).rejects.toThrow("Readback temporarily unavailable");
+    await expect(f.broker.nextToolBatch(f.token(), undefined, { expectedDriverGeneration: 0, taskRevision: 0 }))
+      .rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+    await expect(f.start(2, 0)).rejects.toThrow("Readback temporarily unavailable");
+  } else {
+    expect(await f.wait(1)).toMatchObject({ kind: "pending" });
+    await expect(f.broker.nextToolBatch(f.token(), undefined, { expectedDriverGeneration: 1, taskRevision: 1 }))
+      .rejects.toMatchObject({ code: "task_update_transfer_pending" });
+    const blockedDecision = await f.start(2, 1);
+    expect(blockedDecision).toMatchObject({ kind: "result", result: { isError: true } });
+    expect(blockedDecision.kind === "result" && blockedDecision.result.content[0]).toMatchObject({ type: "text",
+      text: expect.stringContaining('"reason":"transfer_pending"') });
+  }
   blocked = false;
   const events: AdapterEvent[] = [];
   const running = f.run(f.request(input, "same-atomic-transfer"), events);
   void running.catch(() => {});
+  const reconcileDeadline = Date.now() + 2_000;
+  while (f.session().driverGeneration() !== 1
+    || f.broker.taskUpdateTransferOutcome(f.token(), transferId).status !== "committed") {
+    if (Date.now() >= reconcileDeadline) throw new Error("The original append transfer did not reconcile.");
+    await Bun.sleep(1);
+  }
   let reply = await f.wait(1);
   while (reply.kind !== "result") reply = await f.wait(1);
   f.ack(reply.taskUpdate!);
@@ -765,6 +789,194 @@ test("A6 continuity rejects a current result type and an accepted appended text 
   expect(f.session().isTaskUpdateCancelled()).toBeFalse();
 });
 
+for (const manual of [false, true]) for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} ${manual ? "Zero Risk" : "Automatic"} retains a reserved append across ACK and a lost commit receipt`, async () => {
+  const f = await fixture(manual, true, false, { remote });
+  const [call] = await batch(f);
+  const firstRunning = f.run(f.request([user("first-append", "First update."), output(call!.id)], "first-append"));
+  let firstReply = await f.wait(1);
+  while (firstReply.kind !== "result") firstReply = await f.wait(1);
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  let transferId: string | undefined;
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    const receipt = originalReserve(...args);
+    transferId = args[1];
+    f.ack(firstReply.taskUpdate!);
+    return receipt;
+  });
+  const originalAccept = f.broker.acceptTaskUpdate.bind(f.broker);
+  let receiptLost = false;
+  const accept = spyOn(f.broker, "acceptTaskUpdate").mockImplementation((...args) => {
+    const receipt = originalAccept(...args);
+    if (!receiptLost && receipt.status === "committed") {
+      receiptLost = true;
+      throw new Error("Lost committed append receipt after ACK");
+    }
+    return receipt;
+  });
+  cleanup.push(async () => { reserve.mockRestore(); accept.mockRestore(); });
+  const second = f.request([user("second-append", "Second update.")], "second-append");
+  const secondRunning = f.run(second);
+  expect((await firstRunning).at(-1)).toMatchObject({ type: "incomplete", reason: "task_update_handoff" });
+  const reply = await f.wait(1);
+  expect(receiptLost).toBeTrue();
+  expect(reply.kind).toBe("result");
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["second-append"]);
+  expect(f.broker.taskUpdateTransferOutcome(f.token(), transferId!)).toMatchObject({ status: "committed" });
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 2, driverGeneration: 2, acknowledgedRevision: 1 });
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await secondRunning).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect((await f.run(f.request([user("second-append", "Second update.")], "second-append-retry"))).at(-1))
+    .toMatchObject({ type: "done", endTurn: true });
+  expect(f.session().taskRevision()).toBe(2);
+  expect(f.session().driverGeneration()).toBe(2);
+  expect(f.submissions()).toBe(1);
+});
+
+for (const manual of [false, true]) test(`Remote ${manual ? "Zero Risk" : "Automatic"} recovers a lost reservation receipt while draining`, async () => {
+  const f = await fixture(manual, true, false, { remote: true });
+  const [call] = await batch(f);
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  let receiptLost = false;
+  const transferIds: string[] = [];
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    transferIds.push(args[1]);
+    const receipt = originalReserve(...args);
+    if (!receiptLost) {
+      receiptLost = true;
+      f.broker.setExternalOwnersAccepted(false);
+      throw new Error("Lost reservation receipt while entering drain");
+    }
+    return receipt;
+  });
+  cleanup.push(async () => { reserve.mockRestore(); });
+  const running = f.run(f.request([user("append", "Include validation."), output(call!.id)], "append"));
+  let reply = await f.wait(1);
+  while (reply.kind !== "result") reply = await f.wait(1);
+  expect(receiptLost).toBeTrue();
+  expect(transferIds).toHaveLength(2);
+  expect(new Set(transferIds).size).toBe(1);
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.session().taskRevision()).toBe(1);
+  expect(f.session().driverGeneration()).toBe(1);
+  expect(f.session().hasPendingTaskUpdate()).toBeFalse();
+  expect(f.submissions()).toBe(1);
+});
+
+for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} Zero Risk drains its owner tool wait after durable completion without restoring writer authority`, async () => {
+  const inspected = deferred<void>();
+  const inspectionRelease = deferred<void>();
+  const f = await fixture(true, true, false, { remote,
+    completionInspection: { entered: () => inspected.resolve(), release: inspectionRelease.promise } });
+  const [call] = await batch(f);
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  const transferIds: string[] = [];
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    transferIds.push(args[1]);
+    const receipt = originalReserve(...args);
+    if (transferIds.length === 1) {
+      f.broker.setExternalOwnersAccepted(false);
+      throw new Error("Lost reservation receipt while entering drain");
+    }
+    return receipt;
+  });
+  const originalNext = f.broker.nextToolBatch.bind(f.broker);
+  const originalObserve = f.broker.waitForTaskUpdateState.bind(f.broker);
+  let observationCalls = 0;
+  const observe = spyOn(f.broker, "waitForTaskUpdateState").mockImplementation((...args) => {
+    observationCalls += 1;
+    return originalObserve(...args);
+  });
+  const nextEntered = deferred<void>();
+  const nextResult = deferred<unknown>();
+  const next = spyOn(f.broker, "nextToolBatch").mockImplementation((...args) => {
+    nextEntered.resolve();
+    const result = inspected.promise.then(() => originalNext(...args));
+    void result.then(nextResult.resolve, nextResult.reject);
+    return result;
+  });
+  cleanup.push(async () => { next.mockRestore(); reserve.mockRestore(); observe.mockRestore(); });
+  try {
+    const running = f.run(f.request([user("append", "Include validation."), output(call!.id)], "append"));
+    let reply = await f.wait(1);
+    while (reply.kind !== "result") reply = await f.wait(1);
+    expect(transferIds).toHaveLength(2);
+    expect(new Set(transferIds).size).toBe(1);
+    expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+    f.ack(reply.taskUpdate!);
+    await nextEntered.promise;
+    await f.finish();
+    await inspected.promise;
+    const completed = f.record();
+    const work = completed.works[completed.currentWorkId!]!;
+    expect(work.state).toBe("completed");
+    expect(work.attempts.at(-1)).toMatchObject({ stage: "completed", writerRetired: true });
+    expect(work.taskUpdateJournal).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 1, driverGeneration: 1 });
+    const completedObservationCalls = observationCalls;
+    const taskObservers = (f.broker as unknown as { channels: Map<string, { taskUpdates: { observers: Set<unknown> } }> })
+      .channels.get(f.token())!.taskUpdates.observers;
+    expect(taskObservers.size).toBe(0);
+    expect(await nextResult.promise).toEqual([]);
+    await expect(originalNext(f.token(), undefined, { expectedDriverGeneration: 0, taskRevision: 0 }))
+      .rejects.toMatchObject({ code: "task_update_driver_stale" });
+    await expect(originalNext(f.token(), undefined, { expectedDriverGeneration: 1, taskRevision: 0 }))
+      .rejects.toMatchObject({ code: "task_update_revision_stale" });
+    expect(() => f.ack(reply.taskUpdate!)).toThrow("An obsolete execution cannot write to the current recovery attempt");
+    await expect(f.start(2, 1)).rejects.toThrow("An obsolete execution cannot write to the current recovery attempt");
+    expect(f.record()).toEqual(completed);
+    expect(f.broker.taskOutputReceipt(f.token())).toMatchObject({ kind: "completed", taskRevision: 1, driverGeneration: 1 });
+    expect(observationCalls).toBe(completedObservationCalls);
+    expect(taskObservers.size).toBe(0);
+    inspectionRelease.resolve();
+    expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(f.submissions()).toBe(1);
+  } finally { inspectionRelease.resolve(); }
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} rejects a completed tool boundary without binding an update ID and accepts the append at the next boundary`, async () => {
+  const f = await fixture(manual);
+  const [firstCall] = await batch(f);
+  const resultEvents: AdapterEvent[] = [];
+  const resultRound = f.run(f.request([user("initial-user", "Inspect the project."), output(firstCall!.id)], "first-result"), resultEvents);
+  let firstReply = await f.wait(1);
+  while (firstReply.kind !== "result") firstReply = await f.wait(1);
+  expect(f.session().outstanding()).toHaveLength(0);
+  const rejectedIds: string[] = [];
+  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
+  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
+    rejectedIds.push(args[1]);
+    return originalReserve(...args);
+  });
+  cleanup.push(async () => { reserve.mockRestore(); });
+  for (let retry = 0; retry < 2; retry++) {
+    const appended = f.request([user("append", "Also inspect tests.")], `append-${retry}`);
+    for (const message of appended.context.messages) message.timestamp += retry;
+    await expect(f.run(appended)).rejects.toMatchObject({ code: "task_update_no_boundary" });
+    expect(f.session().isActive()).toBeTrue();
+    expect(f.session().isTaskUpdateCancelled()).toBeFalse();
+    expect(f.session().hasPendingTaskUpdate()).toBeFalse();
+    expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+  }
+  expect(rejectedIds).toHaveLength(2);
+  expect(new Set(rejectedIds).size).toBe(1);
+  expect(f.broker.taskUpdateTransferOutcome(f.token(), rejectedIds[0]!)).toMatchObject({ status: "unknown" });
+  expect(await f.start(2)).toMatchObject({ kind: "pending" });
+  await resultRound;
+  const nextCall = resultEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
+  expect(nextCall).toBeDefined();
+  const running = f.run(f.request([user("append", "Also inspect tests."), output(nextCall!.id)], "append-next-boundary"));
+  let reply = await f.wait(2);
+  while (reply.kind !== "result") reply = await f.wait(2);
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions()).toBe(1);
+});
+
 test("A7-A9 continuity reports no boundary and old protocol without cancelling their physical response", async () => {
   for (const protocol of [true, false]) {
     const f = await fixture(false, protocol);
@@ -898,6 +1110,7 @@ type BackendChainEvidence = {
   sends: number; dispatches: number; pageKey: string; summary?: string; checkpointId?: string;
   failedTransfer?: Pick<TaskUpdateTransfer, "transferId" | "payloadDigest" | "batchFingerprint">;
   sourceSnapshotDigest?: string; headSnapshotDigest?: string;
+  oldDelivery?: UpdateDelivery;
 };
 const backendScenario = process.env.CGW_CONTINUITY_CHILD_SCENARIO;
 if (backendScenario) test("recovery fixture: backend source chain", async () => {
@@ -1068,7 +1281,8 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
   expect(f.submissions()).toBe(1);
   writeFileSync(join(root, "backend-chain-evidence.json"), JSON.stringify({ sourceLogicalWorkId,
     headLogicalWorkId, lineageId, callId: call.id, argumentsText, originalInput, appendInput, firstResult,
-    sends: f.sends(), dispatches: calls.length, pageKey: f.browserRuns[0]!.key } satisfies BackendChainEvidence));
+    sends: f.sends(), dispatches: calls.length, pageKey: f.browserRuns[0]!.key,
+    oldDelivery: delivery.taskUpdate } satisfies BackendChainEvidence));
 }, 15_000);
 
 async function exitedBackendChain(scenario: "recover" | "stop" | "checkpoint" | "publication-exit") {
@@ -1103,11 +1317,10 @@ function recoveredCallInput(evidence: BackendChainEvidence): unknown[] {
 }
 
 for (const scenario of ["recover", "publication-exit"] as const) test(`recovery refuses missing issued arguments after actual backend exit: ${scenario}`, async () => {
-  const { f, evidence: e, ownerStatus } = await exitedBackendChain(scenario);
+  const { f, evidence: e } = await exitedBackendChain(scenario);
   const input = scenario === "recover" ? [...e.appendInput, e.firstResult!] : e.appendInput;
   const before = f.record();
-  await expect(f.run(f.request(input))).rejects.toMatchObject({ code: ownerStatus === "unverified"
-    ? "continuity_execution_unsettled" : "continuity_source_unproven" });
+  await expect(f.run(f.request(input))).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(f.submissions()).toBe(0);
   expect(f.sends()).toBe(0);
   expect(Object.keys(f.record().calls)).toEqual([e.callId]);
@@ -1116,7 +1329,7 @@ for (const scenario of ["recover", "publication-exit"] as const) test(`recovery 
 }, 30_000);
 
 test("recovery v3: B retains A's real first result and source chain after the backend exits", async () => {
-  const { f, evidence: e, ownerStatus } = await exitedBackendChain("recover");
+  const { f, evidence: e } = await exitedBackendChain("recover");
   const before = f.record();
   expect(before.calls[e.callId]).toMatchObject({ logicalWorkId: e.sourceLogicalWorkId,
     workLineageId: e.lineageId, attempt: 0, state: "settled", firstResultDigest: recoveryResultDigest(e.firstResult!) });
@@ -1131,14 +1344,6 @@ test("recovery v3: B retains A's real first result and source chain after the ba
   expect(f.submissions()).toBe(0);
   expect(f.pages.size).toBe(0);
 
-  if (ownerStatus === "unverified") {
-    await expect(f.run(f.request([...e.appendInput, e.firstResult!]))).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
-    expect(f.submissions()).toBe(0);
-    expect(f.record().calls).toEqual(before.calls);
-    expect(readFileSync(join(f.root, "harmless-command-count"), "utf8")).toBe("x");
-    return;
-  }
-
   const recoveredEvents: AdapterEvent[] = [];
   const recovered = f.run(f.request([...recoveredCallInput(e), e.firstResult!]), recoveredEvents);
   await f.waitSubmission(1);
@@ -1152,17 +1357,27 @@ test("recovery v3: B retains A's real first result and source chain after the ba
   expect(head.attempts[1]).toMatchObject({ attempt: 1, epoch: 1, stage: "accepted", writerRetired: false, snapshotVersion: 1 });
   expect(active.lineages[e.lineageId]).toEqual(before.lineages[e.lineageId]);
   expect(callEvidence(active.calls)).toEqual(callEvidence(before.calls));
+  const previousCacheOwner = before.calls[e.callId]!.resultBodyOwner;
+  const previousCacheUnverified = previousCacheOwner !== undefined && continuityProcessInstanceStatus(previousCacheOwner) === "unverified";
   expect(active.calls[e.callId]).toMatchObject({ resultBodyBytes: Buffer.byteLength(JSON.stringify(e.firstResult)),
-    resultBodyOwner: { pid: process.pid, startIdentity: active.owner.startIdentity } });
-  expect(continuityProcessInstanceStatus(active.calls[e.callId]!.resultBodyOwner!)).toBe("live");
+    resultBodyOwner: previousCacheUnverified ? previousCacheOwner : { pid: process.pid, startIdentity: active.owner.startIdentity } });
+  // Execution retirement does not prove that an optional cached-body process exited.
+  expect(continuityProcessInstanceStatus(active.calls[e.callId]!.resultBodyOwner!)).toBe(previousCacheUnverified
+    ? "unverified" : continuityProcessInstanceStatus(active.owner));
   expect(f.browserRuns[0]!.key).not.toBe(e.pageKey);
   expect(f.browserRuns[0]!.turn.continuity!.recovery).toMatchObject({ logicalWorkId: e.headLogicalWorkId, attempt: 1, epoch: 1 });
   expect(f.browserRuns[0]!.prompt).toContain(e.firstResult!.output);
+  expect(f.browserRuns[0]!.prompt).toContain('"protocol":"task-updates-v1","task_revision":1,"accepted_revision":1');
+  expect(head.taskUpdateJournal).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 1 });
+  expect(e.oldDelivery).toBeDefined();
+  expect(() => f.ack(e.oldDelivery!)).toThrow("must exactly match a delivered range");
+  expect(f.record().works[e.headLogicalWorkId]!.taskUpdateJournal!.deliveries).toEqual(head.taskUpdateJournal!.deliveries);
   expect(f.coordination.some(value => value.action === "retire" && value.recovery.epoch === 0)).toBeTrue();
   expect(f.coordination.filter(value => value.action === "send-possible")).toHaveLength(1);
   await f.finish();
   expect((await recovered).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(recoveredEvents.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+  expect(f.record().works[e.headLogicalWorkId]!.taskUpdateJournal!.deliveries).toEqual(head.taskUpdateJournal!.deliveries);
   expect(Object.keys(f.record().calls)).toEqual([e.callId]);
   expect(e.sends + f.sends()).toBe(2);
   expect(e.dispatches).toBe(1);
@@ -1170,13 +1385,15 @@ test("recovery v3: B retains A's real first result and source chain after the ba
 }, 30_000);
 
 test("recovery E3: backend exit after durable B acceptance recovers B without replaying A's settled call", async () => {
-  const { f, evidence: e, ownerStatus } = await exitedBackendChain("publication-exit");
+  const { f, evidence: e } = await exitedBackendChain("publication-exit");
   const before = f.record();
   expect(e.failedTransfer).toMatchObject({ transferId: expect.any(String), payloadDigest: expect.any(String),
     batchFingerprint: expect.any(String) });
   expect(before.currentWorkId).toBe(e.headLogicalWorkId);
   const source = before.works[e.sourceLogicalWorkId]!;
   const head = before.works[e.headLogicalWorkId]!;
+  expect(head.taskUpdateJournal).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 0,
+    updates: [{ revision: 1, sourceMessageId: "append" }] });
   expect(source.attempts).toHaveLength(1);
   expect(source.attempts[0]).toMatchObject({ snapshotDigest: e.sourceSnapshotDigest, writerRetired: true });
   expect(head).toMatchObject({ predecessorLogicalWorkId: source.logicalWorkId, workLineageId: e.lineageId,
@@ -1185,24 +1402,6 @@ test("recovery E3: backend exit after durable B acceptance recovers B without re
   expect(head.attempts[0]).toMatchObject({ snapshotDigest: e.headSnapshotDigest, attempt: 0, epoch: 0 });
   expect(before.calls[e.callId]).toMatchObject({ logicalWorkId: e.sourceLogicalWorkId, attempt: 0,
     state: "settled", firstResultDigest: recoveryResultDigest(e.firstResult!) });
-  if (ownerStatus === "unverified") {
-    await expect(f.run(f.request(e.appendInput))).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
-    expect(f.submissions()).toBe(0);
-    expect(f.sends()).toBe(0);
-    expect(f.pages.size).toBe(0);
-    expect(f.browserRuns).toHaveLength(0);
-    const { version: beforeVersion, calls: beforeCalls, ...beforeAuthority } = before;
-    const { version: afterVersion, calls: afterCalls, ...afterAuthority } = f.record();
-    // A matching accepted result can charge optional cached body bytes during preflight.
-    // That accounting must not grant a writer or change any source/attempt/stop evidence.
-    expect(afterAuthority).toEqual(beforeAuthority);
-    expect(callEvidence(afterCalls)).toEqual(callEvidence(beforeCalls));
-    expect(afterVersion).toBeGreaterThanOrEqual(beforeVersion);
-    expect(afterCalls[e.callId]).toMatchObject({ resultBodyBytes: Buffer.byteLength(JSON.stringify(e.firstResult)),
-      resultBodyOwner: { pid: process.pid, startIdentity: "unverified" } });
-    expect(continuityProcessInstanceStatus(afterCalls[e.callId]!.resultBodyOwner!)).toBe("unverified");
-    return;
-  }
   const events: AdapterEvent[] = [];
   const recovered = f.run(f.request(recoveredCallInput(e)), events);
   await f.waitSubmission(1);
@@ -1217,11 +1416,28 @@ test("recovery E3: backend exit after durable B acceptance recovers B without re
   expect(active.works[e.sourceLogicalWorkId]).toEqual(source);
   expect(active.lineages[e.lineageId]).toEqual(before.lineages[e.lineageId]);
   expect(callEvidence(active.calls)).toEqual(callEvidence(before.calls));
+  const previousCacheOwner = before.calls[e.callId]!.resultBodyOwner;
+  const previousCacheUnverified = previousCacheOwner !== undefined && continuityProcessInstanceStatus(previousCacheOwner) === "unverified";
   expect(active.calls[e.callId]).toMatchObject({ resultBodyBytes: Buffer.byteLength(JSON.stringify(e.firstResult)),
-    resultBodyOwner: { pid: process.pid, startIdentity: active.owner.startIdentity } });
-  expect(continuityProcessInstanceStatus(active.calls[e.callId]!.resultBodyOwner!)).toBe("live");
+    resultBodyOwner: previousCacheUnverified ? previousCacheOwner : { pid: process.pid, startIdentity: active.owner.startIdentity } });
+  expect(continuityProcessInstanceStatus(active.calls[e.callId]!.resultBodyOwner!)).toBe(previousCacheUnverified
+    ? "unverified" : continuityProcessInstanceStatus(active.owner));
   expect(f.browserRuns[0]!.key).not.toBe(e.pageKey);
   expect(f.browserRuns[0]!.prompt).toContain(e.firstResult!.output);
+  expect(f.browserRuns[0]!.prompt).toContain('"protocol":"task-updates-v1","task_revision":0,"accepted_revision":1');
+  expect(active.works[e.headLogicalWorkId]!.taskUpdateJournal).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 0 });
+  const delivery = await f.start(900, 0);
+  expect(delivery.taskUpdate).toMatchObject({ fromRevision: 1, throughRevision: 1,
+    updates: [{ revision: 1, sourceMessageId: "append", content: "Continue with the predecessor result." }] });
+  const delivered = f.record().works[e.headLogicalWorkId]!.taskUpdateJournal!;
+  expect(delivered.acceptedRevision).toBe(1);
+  expect(delivered.acknowledgedRevision).toBe(0);
+  expect(delivered.updates).toHaveLength(1);
+  expect(delivered.deliveries.find(receipt => receipt.deliveryId === delivery.taskUpdate!.deliveryId))
+    .toMatchObject({ attempt: 1, epoch: 1, acknowledged: false });
+  expect(f.ack(delivery.taskUpdate!)).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 1 });
+  expect(f.record().works[e.headLogicalWorkId]!.taskUpdateJournal).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 1,
+    updates: [{ revision: 1, sourceMessageId: "append" }] });
   expect(f.coordination.some(item => item.action === "retire" && item.recovery.epoch === 0)).toBeTrue();
   await f.finish();
   expect((await recovered).at(-1)).toMatchObject({ type: "done", endTurn: true });

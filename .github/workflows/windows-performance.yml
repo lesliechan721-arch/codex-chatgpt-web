@@ -1,0 +1,42 @@
+name: Windows test performance comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "Repetitions for each worker count"
+        type: choice
+        options: ["1", "2", "3"]
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: launcher
+      - name: Prepare AVX2-independent Windows runtime
+        shell: pwsh
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.2 -GitHubEnv $env:GITHUB_ENV
+      - name: Compare one and two test workers
+        shell: pwsh
+        run: bun run scripts/compare-test-performance.ts "--repetitions=$env:COMPARISON_REPETITIONS"
+        env:
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/windows-test-performance
+          COMPARISON_REPETITIONS: ${{ inputs.repetitions }}
+      - name: Upload all performance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-performance-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-test-performance
+          if-no-files-found: warn

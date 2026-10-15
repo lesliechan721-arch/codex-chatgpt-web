@@ -8,7 +8,18 @@ import { get_encoding, type Tiktoken } from "tiktoken";
  */
 
 const TOKENIZER_CHUNK_CHARS = 4_096;
+// At most 4 MiB of UTF-16 chunk contents, released when a synchronous preparation returns.
+const MAX_CACHED_TOKENIZER_CHUNKS = 512;
 let tokenizer: Tiktoken | undefined;
+let preparationChunks: Map<string, number> | undefined;
+
+/** Share exact chunk counts across a synchronous preparation, including nested compilations. */
+export function withTokenEstimateCache<T>(prepare: () => T): T {
+  if (preparationChunks) return prepare();
+  preparationChunks = new Map();
+  try { return prepare(); }
+  finally { preparationChunks = undefined; }
+}
 
 function chatGptTokenizer(): Tiktoken {
   tokenizer ??= get_encoding("o200k_base");
@@ -25,6 +36,7 @@ export function estimateTokens(text: string, modelId?: string): number {
   if (!text) return 0;
 
   const encoding = chatGptTokenizer();
+  const chunks = preparationChunks ?? new Map<string, number>();
   let count = 0;
   for (let start = 0; start < text.length;) {
     let end = Math.min(start + TOKENIZER_CHUNK_CHARS, text.length);
@@ -35,7 +47,16 @@ export function estimateTokens(text: string, modelId?: string): number {
         end -= 1;
       }
     }
-    count += encoding.encode_ordinary(text.slice(start, end)).length;
+    const chunk = text.slice(start, end);
+    let tokens = chunks.get(chunk);
+    if (tokens === undefined) {
+      tokens = encoding.encode_ordinary(chunk).length;
+      if (chunks.size >= MAX_CACHED_TOKENIZER_CHUNKS) chunks.delete(chunks.keys().next().value!);
+    } else {
+      chunks.delete(chunk);
+    }
+    chunks.set(chunk, tokens);
+    count += tokens;
     start = end;
   }
   return count;

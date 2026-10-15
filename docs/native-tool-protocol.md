@@ -131,42 +131,32 @@ renaming polling as business progress would not preserve the same failure bounda
 ## User updates during tool work
 
 New compatible Full Native Automatic and started Zero Risk runtimes negotiate `task-updates-v1`.
-A new ordinary turn on a retained continuity page also negotiates this protocol with a new
-tool capability and task revision 0. It keeps the page owner and lease; it does not reuse the
-previous turn's tool authority or task revision. Compaction requests do not negotiate this protocol.
-The Adapter may retain one physical ChatGPT response when the same native thread and turn append
-trusted plain user text. In the ordinary policy, prior instructions, environment, model, options,
-and permissions must remain unchanged. The prior Responses round must have journaled its complete real tool batch,
-`done(tool_use, endTurn:false)`, and source observation proof before sending the batch to the
-HTTP observer. An exact reconnect replays that same source round. A known outstanding or
-handed-off batch lacking its source proof fails with `task_update_source_unproven`.
-With no current batch, raw results must exactly match accepted historical results before
-fallback is allowed; unknown or changed results fail before retiring the existing owner.
-Pure text work, changed instructions, unsupported source shapes, and initial Zero Risk requests
-awaiting Sent use their existing behavior.
+A new ordinary turn on a retained page negotiates the protocol with fresh tool authority and
+revision 0. Compaction does not negotiate it. All eligible routes use the same local work/source
+records for active text-only appends. The same trusted thread, turn, scope, owner and page lease,
+and a live tool boundary or update-confirmation window, must be identifiable. Initial Zero Risk
+requests awaiting Sent remain outside this active-append contract.
 
-Continuity-first work uses local source records instead of the ordinary policy's full-prefix and
-complete-result-batch proof. The same active thread, turn, scope, owner, and page lease must be
-identifiable. A current tool boundary or open update-confirmation window is required. Completed
-history may be trimmed or reserialized; changed old text is not sent back to the page. Stable
-new user item IDs preserve order and prevent duplicate acceptance. Equal text with different IDs
-remains separate input; changing the text of an already accepted new item is a conflict.
-
-A continuity append may contain zero or some pending results. Known pending call IDs retain their
-expected result-type check. The first accepted result completes each call once; duplicates,
-completed historical results, and unknown IDs do not complete current calls or authorize tools.
-Later result-only requests can fill the remaining calls without another update or generation.
-Result bodies and full history are not source proofs. A replay with a new HTTP request ID recovers
-the original update outcome, and any new pending results can still be accepted independently.
+Completed history may be trimmed or reserialized; edited old text is not sent back to a healthy
+page. Stable new user item IDs preserve order and prevent duplicate acceptance. Equal text under
+different IDs remains distinct input; changing an already accepted item's text is a conflict.
+An append can contain zero or some pending results. Pending call IDs retain their expected type
+and first-real-result checks. Later result-only requests fill remaining calls without another
+update. Historical echoes, unknown IDs and repeated results cannot complete a new call or grant
+execution authority. HTTP retry recovers the same accepted update outcome.
 
 The Broker tracks accepted, delivered, and acknowledged revisions independently, beginning at 0.
 Each appended user item has a stable source ID; equal text in different items remains distinct.
-An owner-only transfer binds its ID to immutable local commit data. For the ordinary policy this
-includes the exact updates, registry, and original result batch. Continuity retries recover that
-local data without requiring the client to repeat the original batch or history.
+An owner-only transfer binds its ID to immutable local commit data. It includes immutable accepted updates and the registry/source relationship. Retries recover
+that local data without requiring the client to repeat completed history or the original batch.
 Reservation precedes the short Session preparation barrier; atomic acceptance installs the new
-revision and driver generation before waking real result promises. Outcomes are immutable:
-`committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
+revision and driver generation before waking real result promises.
+Append reservation checks the live tool or confirmation boundary before binding its ID. The
+reservation retains that admission for the same immutable transfer if an ACK closes the window
+before commit; driver, revision, final output, compaction and result-batch checks still apply.
+Remote append reservation checks Broker compatibility before sending the reservation request.
+Draining rejects new external owners; existing tokens can still update and recover transfer receipts.
+Outcomes are immutable: `committed`, `not_committed`, or `unknown`. Recover an unknown outcome by querying or retrying the
 same transfer. A timeout or absent lookup is not evidence that it failed to commit.
 
 Native query replies retain their original `pending` or `result` plus a separate `taskUpdate`
@@ -178,9 +168,8 @@ No update is stored in the Native result cache or sent through the browser compo
 Apply delivered updates in order, then call `codex_task_update_ack` with the same capability,
 `delivery_id`, and `through_revision`. One immutable delivery is outstanding at a time; retries
 return it unchanged. A further append during the ACK gap stays queued and can be delivered in
-that ACK response. In the ordinary policy, without a new real batch an append after the gap closes
-uses the existing replacement path. An active continuity response without an available boundary
-rejects the append as not accepted and preserves the running work. ACK is confirmation, not Native
+that ACK response. An active response without an available boundary rejects the append as not accepted and preserves
+the running work. ACK is confirmation, not Native
 execution or extra business progress.
 
 Every Native start on a negotiated capability declares a nonnegative safe integer `task_revision`,
@@ -203,11 +192,10 @@ the completion CAS before text is sent; sending then reuses that immutable recei
 are never upgraded to a later head. Automatic unacknowledged final output fails explicitly;
 Zero Risk completion requires the acknowledged revision after an update and can return the
 pending delivery on refusal. Its initial revision 0 remains the compatible default. After the
-lock, ordinary-policy appends use the existing replacement path and late ACKs cannot change the
-answer. Continuity appends are not accepted while that locked response is still running; wait for
+lock, late ACKs cannot change the answer. Active appends are not accepted while that locked response is still running; wait for
 it to finish before sending a normal continuation. A response that did not negotiate the update
 protocol cannot be upgraded by an append. Compaction refuses unresolved updates or prepared
-transfers and requires the latest exact source. Continuity compaction reuses locally accepted
+transfers and requires the latest exact source. Compaction reuses locally accepted
 results, without requiring their old bodies again. Appends advance task revision and driver
 generation, while only committed compaction advances history revision.
 
@@ -243,13 +231,16 @@ Queued, waiting, and unread result-ready operations block both Automatic complet
 Zero Risk completion. Delivered cached results may still replay without blocking completion
 forever. A queued compaction-control terminal stops blocking after its public delivery.
 
-Configured fresh compaction and recoverable-mode delegated source fallback retire the old browser
-and tool owner, including that owner's queued, waiting, and result-ready operations. The fresh
-owner cannot adopt or reexecute them. Continuity-first admits a replacement page only from durable writer-retirement and tool-settlement
-evidence, with actual current request context; see [session continuity](session-continuity.md).
+Non-applicable recoverable paths retain their configured fresh-compaction and delegated-source
+fallback retirement rules for the old browser/tool owner and its queued, waiting and result-ready
+operations. They do not gain the unified task recovery guarantee. Applicable Full Native + Launcher
+recovery admits a successor only after durable project isolation, real dispatched-call settlement,
+confirmed Send state, legal sources and the actual selected plan. It never repeats a dispatched
+operation to reconstruct history, and physical page cleanup is separate from successor authority.
+See [session continuity](session-continuity.md).
 
 There is no operation-object or capability recovery across Broker or owner-process restart.
-Continuity's durable admission journal records issued calls and their possible delivery before
+The durable task admission journal records issued calls and their possible delivery before
 external dispatch, then accepts real results before exposing their receipts. It permits a new
 execution after settlement; it does not revive the old operation or replay its batch. A queued
 call can be cancelled only with proof it was not delivered. Process exit or revocation alone does
@@ -289,7 +280,7 @@ for cleanup before saving inherited candidates. If that storage exhausts the jou
 and capability revocation still occur; a rejected non-owning or older-generation round cannot
 gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 12. Native waiting and task update protocols are 1; the context
+The implemented Broker protocol is 13. Native waiting and task update protocols are 1; the context
 protocol is 2 and requires `context-text-read-v2` for successful text pages.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
@@ -353,3 +344,36 @@ Task-update behavior is covered by the [Local/Remote Broker tests](../tests/task
 [Zero Risk Adapter tests](../tests/task-update-zero-risk-adapter.test.ts).
 Real-platform coverage is separate from those tests; see
 [release validation](release-validation.md#native-tool-waiting-validation).
+
+## Execution transfer and trusted settlement
+
+Task identity, attempt, execution generation, page generation, task revision and history revision
+have distinct roles. Durable revocation must precede successor activation and be checked at the
+actual dispatch/commit boundary, including queued Native calls, helper Send/acquisition, inventory,
+context reads, task transfer/ACK, final answers and checkpoint commits. Static configuration and
+navigation verification cannot establish that running Broker, helper and Launcher instances share
+this enforcement. The current runtime feature is `execution-generation-fencing-v1`: helper ready
+and authenticated Launcher `executionProtocol: 1` checks prove the running instances advertise
+it, and Broker `owner_status` uses `recoveryProtocol: 2` alongside main protocol 13. These execution
+checks are separate from context-navigation Verify runtime. The recovery journal atomically
+migrates document version 2 to 3, preserving prior facts; the migration marker remains version 2
+for interrupted-migration compatibility. Older readers must reject unsupported document versions. An incompatible old instance must actually retire with dispatch settlement,
+or the transfer must fail with an upgrade diagnostic.
+
+Dispatch registration and revocation have one atomic order. Calls registered before revocation
+remain pending settlement; revocation first rejects new old-generation dispatches. The trusted
+outer result channel can still register real results by original scope, work/attempt, call ID,
+expected type and first digest after revocation or stop. This channel cannot grant business rights,
+ACK an update or submit an answer. A returned running-process handle is not process termination.
+Unknown results and possibly-sent input cannot be resolved by resending in another page.
+
+One transfer reserves one successor. Accepted unacknowledged updates are preserved with their
+logical IDs and revision and require successor ACK; old ACKs cannot confirm them. Compaction
+successors retain logical target, original deadline and retry budget, with fresh attempt-bound
+read/submission credentials. Old credentials, reads, Sends and late commits remain old-attempt
+facts. Stop committed before activation prevents it; stop after activation targets the current
+execution. Replays and capacity waits do not create additional business attempts.
+
+These rules isolate project-controlled operations and state commits. They do not prove that
+ChatGPT-owned platform activity has stopped or globally deduplicate semantically equal operations
+with different IDs. See [session continuity](session-continuity.md).

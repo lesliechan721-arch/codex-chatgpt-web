@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { requireChatGptWebModelRoute, resolveChatGptWebHistoryLimits } from "../src/chatgpt-web-models";
 
 // P0 only: real Codex, a private catalog, and short requests to a loopback model stub.
 // Reported usage is synthetic. This does not measure million-token memory or browser capacity.
@@ -22,7 +23,10 @@ const bundled = spawnSync(codex, ["debug", "models", "--bundled"], {
 assert.equal(bundled.status, 0, bundled.stderr);
 const template = JSON.parse(bundled.stdout).models.find((model: any) => model.slug === "gpt-5.6-sol");
 assert.ok(template, "The target binary must contain the Sol model template");
-const model = "chatgpt-web-continuity/gpt-5.6-sol";
+const model = "chatgpt-web/gpt-5.6-sol";
+const capabilities = { mode: "full" as const, browserHost: "launcher" as const, solAvailable: true, proAvailable: false };
+const publicLimits = resolveChatGptWebHistoryLimits(requireChatGptWebModelRoute(model, capabilities), capabilities);
+assert.deepEqual(publicLimits, { contextWindow: 1_000_000, autoCompactTokenLimit: 900_000, effectiveContextWindowPercent: 90 });
 const checkpoint = "P0_CHECKPOINT: Prior synthetic work is complete. Continue the short validation task.";
 
 interface Scenario {
@@ -34,18 +38,18 @@ interface Scenario {
 }
 const scenarios: Scenario[] = [
   { name: "short", window: 20_000, limit: 12_000 },
-  { name: "target-default", window: 1_000_000, limit: 900_000 },
-  { name: "lower-window", window: 1_000_000, limit: 900_000, windowOverride: 100_000 },
-  { name: "lower-limit", window: 1_000_000, limit: 900_000, limitOverride: 25_000 },
-  { name: "lower-both", window: 1_000_000, limit: 900_000, windowOverride: 100_000, limitOverride: 25_000 },
-  { name: "higher-window", window: 1_000_000, limit: 900_000, windowOverride: 2_000_000 },
-  { name: "higher-limit", window: 1_000_000, limit: 900_000, limitOverride: 2_000_000 },
-  { name: "higher-both", window: 1_000_000, limit: 900_000, windowOverride: 2_000_000, limitOverride: 2_000_000 },
+  { name: "target-default", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit },
+  { name: "lower-window", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, windowOverride: 100_000 },
+  { name: "lower-limit", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, limitOverride: 25_000 },
+  { name: "lower-both", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, windowOverride: 100_000, limitOverride: 25_000 },
+  { name: "higher-window", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, windowOverride: 2_000_000 },
+  { name: "higher-limit", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, limitOverride: 2_000_000 },
+  { name: "higher-both", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, windowOverride: 2_000_000, limitOverride: 2_000_000 },
 ];
 const report = {
   startedAt: new Date().toISOString(), codex, version: version.stdout.trim(),
   sha256: createHash("sha256").update(readFileSync(codex)).digest("hex"),
-  model, root, syntheticUsage: true, cases: [] as any[],
+  model, root, publicLimits, syntheticUsage: true, cases: [] as any[],
 };
 mkdirSync(join(output, ".."), { recursive: true });
 const save = () => writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);

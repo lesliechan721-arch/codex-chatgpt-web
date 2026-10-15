@@ -216,7 +216,7 @@ export async function settleActiveCompactionSource(
       throw abortReason(signal);
     }
     if (!source.isActive() || source.runtime.mode !== "tools") {
-      if (parsed._conversationPolicy === "continuity-first" && !source.isActive()) {
+      if (parsed._conversationPolicy === "task" && !source.isActive()) {
         const outcome = await source.browserOutcome;
         if (outcome.type === "error") throw outcome.error;
         await withCompactionAbort(source.physicalSettlement, signal);
@@ -227,7 +227,7 @@ export async function settleActiveCompactionSource(
     const outstanding = source.outstanding();
     if (source.hasPendingTaskUpdate()) throw taskUpdateSourceError("task_update_pending", "Resolve the task update transfer before starting compaction.");
     const driverContext = source.taskUpdatesEnabled() ? source.taskUpdateOwnerContext() : undefined;
-    const results = parsed._conversationPolicy === "continuity-first"
+    const results = parsed._conversationPolicy === "task"
       ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
       : source.taskUpdatesEnabled()
         ? new Map(source.acceptTaskUpdateToolResults(parsed).map(message => [message.toolCallId, message]))
@@ -298,7 +298,7 @@ export async function settleActiveZeroRiskCompactionSource(
       throw abortReason(signal);
     }
     if (!source.isActive() || source.runtime.mode !== "tools" || !source.runtime.manualControl) {
-      if (parsed._conversationPolicy === "continuity-first" && !source.isActive()) {
+      if (parsed._conversationPolicy === "task" && !source.isActive()) {
         const outcome = await source.browserOutcome;
         if (outcome.type === "error") throw outcome.error;
         await withCompactionAbort(source.physicalSettlement, signal);
@@ -309,7 +309,7 @@ export async function settleActiveZeroRiskCompactionSource(
     const outstanding = source.outstanding();
     if (source.hasPendingTaskUpdate()) throw taskUpdateSourceError("task_update_pending", "Resolve the task update transfer before starting compaction.");
     const driverContext = source.taskUpdatesEnabled() ? source.taskUpdateOwnerContext() : undefined;
-    const results = parsed._conversationPolicy === "continuity-first"
+    const results = parsed._conversationPolicy === "task"
       ? new Map(source.acceptContinuityToolResults(parsed).map(message => [message.toolCallId, message]))
       : source.taskUpdatesEnabled()
         ? new Map(source.acceptTaskUpdateToolResults(parsed).map(message => [message.toolCallId, message]))
@@ -400,7 +400,7 @@ export async function requestRetainedCompactionHandoff(
     onAcceptedHandoff: (summary: string) => void;
     onPrepared?: (instruction: string) => Promise<ContinuityClaim>;
     onSendActivated?: () => Promise<void>;
-    onSubmitted?: () => void;
+    onSubmitted?: () => boolean | void;
   },
 ): Promise<string> {
   const conversationKey = source.conversationKey();
@@ -460,7 +460,7 @@ export async function requestRetainedCompactionHandoff(
         retainConversation: true,
       } : {}),
       onSubmitted: () => {
-        continuity?.onSubmitted?.();
+        if (continuity?.onSubmitted?.() === false) return;
         broker.markCompactionContextDelivered(sourceToken!);
       },
       // The retained connector exposes only the one-shot control token embedded above. It does

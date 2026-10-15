@@ -211,6 +211,11 @@ interface ChatGptTurnRuntimeBase {
   usageInput?: CodexParsedRequest;
   /** The live binding owns the ready-page clock; replay and queries never renew it. */
   continuityBinding?: ContinuityBinding;
+  /** Captured from the verified writer when this physical execution starts. */
+  readonly recoveryOrigin?: Readonly<{
+    directory: string; thread: string; scope: string; logicalWorkId: string;
+    ownerId: string; attempt: number; epoch: number;
+  }>;
   /** Captured at durable completion; the page binding can later accept another work. */
   readonly recoveryFinal?: RuntimeRecoveryFinalReceipt;
   recoveryBaselineResults?: Readonly<Record<string, string>>;
@@ -241,14 +246,14 @@ export type ChatGptTurnRuntime =
   | (ChatGptTurnRuntimeBase & { mode: "read-only" });
 
 function executionKey(parsed: CodexParsedRequest, payload: unknown): string {
-  const continuity = parsed._conversationPolicy === "continuity-first";
+  const continuity = parsed._conversationPolicy === "task";
   if (continuity && (!Number.isSafeInteger(parsed._continuityHistoryRevision)
     || parsed._continuityHistoryRevision! < 0)) throw continuityError("continuity_source_unproven");
   return createHash("sha256").update(canonicalJson({
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
     ...(continuity ? {
-      policy: "continuity-first", historyRevision: parsed._continuityHistoryRevision,
+      policy: "task", historyRevision: parsed._continuityHistoryRevision,
       ...(parsed._continuityAttempt ? { attempt: parsed._continuityAttempt } : {}),
       modelFamily: parsed._chatgptModelFamily,
     } : {}),
@@ -353,8 +358,19 @@ export function chatGptContinuityInstructionPayloadDigest(
 }
 
 function continuityInstructionPayloadDigestForContents(parsed: CodexParsedRequest, contents: unknown[]): string {
-  const { reasoning: _reasoning, promptCacheKey: _promptCacheKey, ...options } = parsed.options;
   const raw = rawRecord(parsed._rawBody);
+  const sourceOptions = parsed._compactionRequest ? { ...(parsed._compactionSourceOptions ?? parsed.options) } : parsed.options;
+  if (parsed._compactionRequest && raw
+    && (!Object.hasOwn(raw, "tool_choice") || !Object.hasOwn(raw, "parallel_tool_calls"))) {
+    // Native compact omits execution controls. Fill only from a real accepted source;
+    // these values participate in its digest and never grant compaction tool authority.
+    const retained = chatGptTurnSessions.retainedCompactionSourceOptions(parsed);
+    if (retained) {
+      if (!Object.hasOwn(raw, "tool_choice") && sourceOptions.toolChoice === undefined && retained.toolChoice !== undefined) sourceOptions.toolChoice = structuredClone(retained.toolChoice);
+      if (!Object.hasOwn(raw, "parallel_tool_calls") && sourceOptions.parallelToolCalls === undefined && retained.parallelToolCalls !== undefined) sourceOptions.parallelToolCalls = retained.parallelToolCalls;
+    }
+  }
+  const { reasoning: _reasoning, promptCacheKey: _promptCacheKey, ...options } = sourceOptions;
   const instructions = typeof raw?.instructions === "string" && raw.instructions.length > 0
     ? raw.instructions
     : null;
@@ -520,7 +536,7 @@ interface ContinuityToolBatch {
 export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     if (parsed._compactionRequest) {
       const source = extractChatGptCompactionSourceRevision(parsed);
       return executionKey(parsed, {
@@ -566,7 +582,7 @@ export function chatGptInstructionLineage(parsed: CodexParsedRequest): ChatGptIn
 export function chatGptTurnRoundKey(parsed: CodexParsedRequest): string {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for round replay");
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     return executionKey(parsed, {
       threadId: identity.threadId,
       turnId: identity.turnId,
@@ -618,7 +634,7 @@ export function chatGptCompactionSourceExecutionKey(parsed: CodexParsedRequest):
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.turnId) throw new Error("ChatGPT web requires native Codex turn_id metadata for browser-session replay");
   const source = extractChatGptCompactionSourceRevision(parsed);
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     return executionKey({ ...parsed, _continuityHistoryRevision: parsed._continuityHistoryRevision }, {
       threadId: identity.threadId,
       turnId: source.turnId ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId,
@@ -647,7 +663,7 @@ export function chatGptDelegatedCompactionSourceExecutionKey(parsed: CodexParsed
     return undefined;
   }
   if (!source.turnId || !source.itemId) return undefined;
-  if (parsed._conversationPolicy === "continuity-first") {
+  if (parsed._conversationPolicy === "task") {
     return executionKey(parsed, {
       threadId: identity.threadId,
       turnId: source.turnId,
@@ -907,6 +923,22 @@ export class ChatGptTurnSession {
     if (sourceBytes + existingJournalBytes + this.compactionCoverageBytes() + TASK_UPDATE_SESSION_ERROR_TERMINAL_BYTES > TASK_UPDATE_SESSION_JOURNAL_BYTES) {
       throw taskUpdateSourceError("task_update_capacity", "Task update source history capacity is exhausted.");
     }
+    const binding = this.runtime.continuityBinding;
+    const recovery = binding?.recovery;
+    if (binding && recovery) {
+      const record = recoveryRecord(recovery);
+      const work = record.works[recovery.logicalWorkId]!;
+      if (record.scope !== binding.scope || record.currentWorkId !== work.logicalWorkId
+        || work.attempts[recovery.attempt]?.epoch !== binding.epoch) {
+        throw continuityError("continuity_source_unproven", "Task update initialization does not identify the selected current task.");
+      }
+      // A new browser restores the accepted protocol numbers. Execution authority
+      // remains tied to its separate durable attempt and epoch.
+      if (work.taskUpdateJournal) {
+        this.taskUpdateRevision = work.taskUpdateJournal.acceptedRevision;
+        this.taskUpdateDriverGeneration = work.taskUpdateJournal.driverGeneration;
+      }
+    }
     this.taskUpdateSource = { ...structuredClone(source), input: [] };
     this.taskUpdateExecutionDigest = this.readonlyExecutionDigest(parsed, execution);
     this.taskUpdateCanonicalAliases = { ...parsed._chatGptMessageIdAliases };
@@ -920,7 +952,7 @@ export class ChatGptTurnSession {
     const route: ChatGptTaskUpdateRoute = {
       executionKey: chatGptTurnExecutionKey(parsed), roundKey: chatGptTurnRoundKey(parsed),
       requestIdentity: source.requestIdentity, requestFingerprint: source.requestFingerprint,
-      acceptedRevision: 0, driverGeneration: 0,
+      acceptedRevision: this.taskUpdateRevision, driverGeneration: this.taskUpdateDriverGeneration,
     };
     this.recordTaskUpdateRoute(route);
     this.taskUpdateOutputRoundKey = route.roundKey;
@@ -977,7 +1009,7 @@ export class ChatGptTurnSession {
     const preserved = this.preservedCompactionFinal;
     const input = rawRecord(parsed._rawBody)?.input;
     if (!preserved || !Array.isArray(input) || parsed._compactionRequest
-      || parsed._conversationPolicy === "continuity-first"
+      || parsed._conversationPolicy === "task"
       || !input.some(isChatGptReadonlyCompactionBoundary)) return undefined;
     const identity = extractChatGptTurnIdentity(parsed);
     if (preserved.executionKey !== executionKey || this.conversationKey() || this.isActive()
@@ -2539,6 +2571,26 @@ export class ChatGptTurnSessions {
     private readonly maxEntries = 256,
   ) {}
 
+  /** Missing compact selectors can borrow values only from this exact retained source. */
+  retainedCompactionSourceOptions(parsed: CodexParsedRequest): CodexParsedRequest["options"] | undefined {
+    if (!parsed._compactionRequest || !parsed._continuityScope) return undefined;
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (!identity.threadId || !identity.turnId) return undefined;
+    const instruction = continuityInstructionIdentity(parsed);
+    const candidates = [...new Set(this.entries.values())].filter(session => {
+      const binding = session.runtime.continuityBinding;
+      const source = session.runtime.usageInput;
+      return binding !== undefined && binding.scope === parsed._continuityScope && binding.thread === continuityDigest(identity.threadId)
+        && session.nativeThreadId === identity.threadId && session.nativeTurnId === identity.turnId
+        && session.acceptedContinuityInstructionIdentity() === instruction && !session.supersededError
+        && source && source._compactionRequest !== true && source.modelId === parsed.modelId
+        && continuityInstructionIdentity(source) === instruction
+        && Array.isArray(rawRecord(source._rawBody)?.input);
+    });
+    if (candidates.length !== 1) return undefined;
+    return structuredClone(candidates[0]!.runtime.usageInput!.options);
+  }
+
   getOrCreate(
     key: string,
     start: () => ChatGptTurnRuntime,
@@ -2696,13 +2748,33 @@ export class ChatGptTurnSessions {
     return session;
   }
 
-  /** Continuity cannot adopt an in-flight owner from another route/provider namespace. */
+  /** A client history is not the dispatch or completion journal of a former ordinary owner. */
+  assertTaskAdoptionEvidence(parsed: CodexParsedRequest): void {
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (!identity.threadId || !identity.turnId) throw continuityError("continuity_source_unproven");
+    for (const session of new Set(this.entries.values())) {
+      if (session.nativeThreadId !== identity.threadId || session.runtime.continuityBinding) continue;
+      if (!session.isPhysicallySettled() || session.outstanding().length > 0 || session.isActive()) {
+        throw continuityError("continuity_source_unproven", "The former ordinary task has no complete durable execution-generation and dispatch evidence. Settle its actual owner before continuing.");
+      }
+      const source = session.runtime.usageInput;
+      if (!source) {
+        if (session.nativeTurnId === identity.turnId) throw continuityError("continuity_source_unproven", "The former ordinary task's accepted instruction evidence is unavailable.");
+        continue;
+      }
+      if (continuityInstructionIdentity(source) === continuityInstructionIdentity(parsed)) {
+        throw continuityError("continuity_source_unproven", "This instruction already belongs to a former ordinary task. Its terminal execution evidence cannot be reconstructed from client history.");
+      }
+    }
+  }
+
+  /** A live owner requires the exact task binding and its execution evidence. */
   assertContinuityThreadAvailable(nativeThreadId: string, executionKey: string): void {
     this.prune();
     for (const [key, session] of this.entries) {
       if (key !== executionKey && this.logicalRoutes.get(executionKey) !== session && session.nativeThreadId === nativeThreadId
         && (!session.isPhysicallySettled() || session.outstanding().length > 0)) {
-        throw continuityError("continuity_source_unproven", "Finish or explicitly cancel the existing native-thread owner before changing modes.");
+        throw continuityError("continuity_source_unproven", "The native thread already has an owner whose execution evidence does not match this request.");
       }
     }
     if (!this.entries.has(executionKey) && !this.logicalRoutes.has(executionKey)) {
