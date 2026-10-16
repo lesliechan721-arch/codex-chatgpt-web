@@ -1836,7 +1836,8 @@ test.each([false, true])("fresh compaction sends one bounded entry within the or
     usageInput: sourceRequest, compactionSourceCoverage: deliveredCoverage(sourceRequest), cancel() {} }));
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
   const events: AdapterEvent[] = [];
-  mock.timers.enable({ apis: ["setTimeout"] });
+  // Keep deadline checks and timers on the same clock for this simulated phase.
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
   try {
     await createChatGptWebAdapter(provider).runTurn!(
       request(true),

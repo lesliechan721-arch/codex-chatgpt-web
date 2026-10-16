@@ -1,0 +1,1310 @@
+import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
+import { afterEach, expect, spyOn } from "bun:test";
+import { controlledClock } from "./helpers/controlled-clock";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cancelStructuredCompactionNativeTurn, existingStructuredCompactionRun } from "../src/adapters/chatgpt-web/compaction-handoff";
+import { isAcceptedCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
+import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
+import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
+import { leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
+import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
+import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
+import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { COMPACT_PROMPT, encodeCompactionSummary } from "../src/responses/compaction";
+import { routeChatGptWebRequest } from "../src/server";
+import { parseRequest } from "../src/responses/parser";
+import type { AdapterEvent, CodexParsedRequest } from "../src/types";
+import { performanceTest } from "./helpers/performance-test";
+import { createSessionContinuityFixtures, recordedCall } from "./helpers/session-continuity-fixture";
+
+const test = performanceTest(import.meta.path);
+const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
+afterEach(disposeTestFixtures);
+
+const compactionBudgetCases = [
+  { name: "completes source settlement and checkpoint within the original budget", sourceDelay: 300, checkpointDelay: 300, succeeds: true },
+  { name: "preserves the original deadline across source settlement and checkpoint", sourceDelay: 700, checkpointDelay: 700, succeeds: false },
+  { name: "still times out during source settlement", sourceDelay: 1600, checkpointDelay: 0, succeeds: false },
+  { name: "still times out during the checkpoint", sourceDelay: 0, checkpointDelay: 1600, succeeds: false },
+] as const;
+
+async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds }: typeof compactionBudgetCases[number], preparationDelayMs = 0): Promise<void> {
+  const f = fixture(false, { turnTimeoutMs: 1000, waitForRetirement: true });
+  const first = f.request();
+  await f.run(first);
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const bindings = continuityBindingsFor(f.statePath);
+  const binding = bindings.lookup(continuityDigest(f.threadId), stored.scope)!;
+  const source = chatGptTurnSessions.find(binding.executionKey!)!;
+  const ordinary = f.automatic.getMockImplementation()!;
+  let compactionStarted!: () => void;
+  const started = new Promise<void>(resolve => { compactionStarted = resolve; });
+  const beginCompaction = bindings.beginCompaction.bind(bindings);
+  const begin = spyOn(bindings, "beginCompaction").mockImplementation((...args) => {
+    const claim = beginCompaction(...args);
+    compactionStarted();
+    return claim;
+  });
+  let settleSource!: () => void;
+  Object.defineProperty(source, "physicalSettlement", { value: new Promise<void>(resolve => { settleSource = resolve; }) });
+  let checkpoint: Promise<string> | undefined;
+  const clock = controlledClock();
+  f.automatic.mockImplementation(turn => {
+    if (!turn.nativeConnector) return ordinary(turn);
+    checkpoint = (async () => {
+      clock.tick(checkpointDelay);
+      turn.abortSignal?.throwIfAborted();
+      return ordinary(turn);
+    })();
+    return checkpoint;
+  });
+  const compact = structuredClone(first);
+  compact._compactionRequest = true;
+  // Deadline arithmetic and timer delivery must share the same clock; real I/O
+  // must not consume the simulated budget or grant the checkpoint a fresh one.
+  let run: Promise<AdapterEvent[]> | undefined;
+  try {
+    run = f.run(compact);
+    void run.catch(() => {});
+    await Promise.race([
+      started,
+      run.then(() => { throw new Error("Compaction finished before source settlement"); }),
+    ]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(binding.state).toBe("compacting");
+    if (preparationDelayMs) {
+      const realStart = process.hrtime.bigint();
+      const wallStart = Date.now();
+      const monotonicStart = performance.now();
+      await Bun.sleep(preparationDelayMs);
+      expect(Number(process.hrtime.bigint() - realStart) / 1e6).toBeGreaterThan(1_000);
+      expect(Date.now()).toBe(wallStart);
+      expect(performance.now()).toBe(monotonicStart);
+    }
+    clock.tick(sourceDelay);
+    settleSource();
+    if (!succeeds) {
+      await expect(run).rejects.toMatchObject({ code: "continuity_session_lost", message: expect.stringContaining("The handoff exceeded its original deadline.") });
+      expect(binding.state).toBe("lost");
+      if (sourceDelay > 1000) expect(checkpoint).toBeUndefined();
+      else expect(checkpoint).toBeDefined();
+      return;
+    }
+    const events = await run;
+    expect(events.find(event => event.type === "text_delta")).toMatchObject({
+      type: "text_delta", text: expect.stringContaining(f.controls.handoffSummary),
+    });
+    expect(binding.state).toBe("ready");
+    expect(f.submissions).toHaveLength(2);
+  } finally {
+    clock.restore();
+    settleSource();
+    await run?.catch(() => {});
+    await source.physicalSettlement;
+    await checkpoint?.catch(() => {});
+    begin.mockRestore();
+    await disposeTestFixtures();
+    await new Promise<void>(resolve => setTimeout(resolve, 1));
+  }
+}
+
+for (const scenario of compactionBudgetCases) {
+  test(`continuity compaction ${scenario.name}`, () => compactionBudgetScenario(scenario));
+  test(`controlled clock slow source settlement: ${scenario.name}`, () => compactionBudgetScenario(scenario, 1_100));
+}
+
+test("Automatic completed compaction retains the exact page and concurrent retries share one structured handoff", async () => {
+  const f = fixture();
+  const first = f.request();
+  await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  const [left, right] = await Promise.all([f.run(compact), f.run(structuredClone(compact))]);
+  expect(left.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(right.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(left.find(event => event.type === "text_delta")).toEqual(right.find(event => event.type === "text_delta"));
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
+  expect(f.pages.size).toBe(1);
+  expect([...f.pages.values()][0]?.state).toBe("ready");
+  const replay = await f.run(structuredClone(compact));
+  expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`);
+  expect(source?.settledOutcome()).toEqual({ type: "final", answer: "Completed response 1." });
+  expect(source?.conversationKey()).toBeUndefined();
+  f.pages.clear();
+  expect((await f.run(structuredClone(compact))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(3);
+});
+
+test("Automatic shared compaction is cancelled by a later request's native turn identity", async () => {
+  const f = fixture();
+  const first = f.request();
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  let release!: () => void;
+  const gate = source.runExclusive(() => new Promise<void>(resolve => { release = resolve; }));
+  await Bun.sleep(0);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  const pending = f.run(compact).catch(error => error);
+  const key = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(compact)}`;
+  while (!existingStructuredCompactionRun(key)) await Bun.sleep(1);
+  const retry = f.request("", "turn-compaction-retry", (first._rawBody as { input: unknown[] }).input);
+  retry._compactionRequest = true;
+  const adapter = f.adapter();
+  await adapter.preflight!(retry, { headers: new Headers() });
+  const retried = adapter.runTurn!(retry, { headers: new Headers() }, () => {}).catch(error => error);
+  const cancellation = cancelStructuredCompactionNativeTurn(f.threadId, "turn-compaction-retry", new DOMException("User interrupted compaction", "AbortError"));
+  release();
+  await gate;
+  const [left, right] = await Promise.all([pending, retried]);
+  await cancellation.settlement;
+  expect(cancellation.cancelled).toBe(1);
+  expect(left).toBeInstanceOf(Error);
+  expect(right).toBeInstanceOf(Error);
+  expect(f.submissions).toHaveLength(1);
+});
+
+test("completed compaction rejects canonical history with unowned execution records", async () => {
+  const f = fixture();
+  const first = f.request();
+  await f.run(first);
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const compact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Unowned execution record." }] },
+    { type: "function_call", name: "exec_command", call_id: "foreign-call", arguments: '{"cmd":"not-owned"}' },
+    { type: "function_call_output", call_id: "foreign-call", output: "Unowned tool result." },
+  ]);
+  compact._compactionRequest = true;
+  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(binding.revision).toBe(0);
+  expect(binding.checkpoints.size).toBe(0);
+  expect(f.submissions).toHaveLength(1);
+});
+
+test("leaving after compaction clears the committed physical page and checkpoint", async () => {
+  const f = fixture(), first = f.request();
+  await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  await f.run(compact);
+  const bindings = continuityBindingsFor(f.statePath), thread = continuityDigest(f.threadId);
+  await leaveContinuityMode(f.statePath, f.threadId);
+  expect(bindings.recoveryStore.get(thread)).toBeUndefined();
+  expect(bindings.observed(thread)).toBeUndefined();
+  expect(f.pages.size).toBe(0);
+  expect((await f.run(compact)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(3);
+});
+
+test("Zero Risk completed explicit compaction prepares a manual checkpoint and preserves its ordinary answer", async () => {
+  const f = fixture(true);
+  const first = f.request();
+  await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  expect((await f.run(compact)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.pages.size).toBe(1);
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("entered");
+});
+
+test("a rejected structured handoff on an unavailable page retries current input in a new generation", async () => {
+  const f = fixture(), first = f.request(); await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  f.controls.handoffSummary = 'Invalid checkpoint.\nCODEX_LATEST_USER_PROMPT_JSON\n"A different instruction"';
+  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const store = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId), old = store.get(thread)!;
+  f.controls.handoffSummary = "Current retry checkpoint.";
+  expect((await f.run(compact)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const current = store.get(thread)!;
+  expect(current.epoch).not.toBe(old.epoch);
+  for (const key of Object.keys(old.works)) expect(current.works[key]).toBeUndefined();
+  expect(Object.values(current.checkpoints)).toHaveLength(1);
+  expect(f.submissions).toHaveLength(3);
+  expect(f.controls.toolResults).toHaveLength(0);
+});
+
+test("an accepted handoff with failed page settlement does not authorize replay on a new page", async () => {
+  const f = fixture(), first = f.request(); await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  f.controls.failHandoffSettlement = true;
+  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_session_lost" });
+  const store = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId), old = store.get(thread)!;
+  f.controls.failHandoffSettlement = false;
+  f.controls.handoffSummary = "Summary produced by the current page.";
+  const events = await f.run(compact);
+  expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(events.find(event => event.type === "text_delta" && event.phase === "final_answer")).toMatchObject({ text: expect.stringContaining("Summary produced by the current page.") });
+  expect(store.get(thread)!.epoch).not.toBe(old.epoch);
+  const replay = await f.run(compact);
+  expect(replay.find(event => event.type === "text_delta" && event.phase === "final_answer"))
+    .toEqual(events.find(event => event.type === "text_delta" && event.phase === "final_answer"));
+  expect(replay.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(3);
+});
+
+test("a committed compaction is cleared with its page before a compact reconnect", async () => {
+  const f = fixture(), first = f.request(); await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  await f.run(compact);
+  const store = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId), old = store.get(thread)!;
+  f.pages.clear(); f.controls.handoffSummary = "Replacement page checkpoint.";
+  const events = await f.run(compact);
+  expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(events.find(event => event.type === "text_delta" && event.phase === "final_answer")).toMatchObject({ text: expect.stringContaining("Replacement page checkpoint.") });
+  const current = store.get(thread)!;
+  expect(current.epoch).not.toBe(old.epoch);
+  for (const key of Object.keys(old.checkpoints)) expect(current.checkpoints[key]).toBeUndefined();
+  expect(f.submissions).toHaveLength(3);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active compaction preserves delivered tool results and resumes with fresh authority on the same page`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const call = source.outstanding()[0]!;
+  expect(call.wireName).toBe("exec_command");
+  const compact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "function_call", name: call.wireName, call_id: call.callId, arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+    { type: "function_call_output", call_id: call.callId, output: "Actual completed tool result: 42." },
+  ]);
+  compact._compactionRequest = true;
+  const compactEvents = await f.run(compact);
+  expect(compactEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(source.outstanding()).toHaveLength(0);
+  expect(JSON.stringify(f.controls.toolResults[0])).toContain("Actual completed tool result: 42.");
+  expect(f.controls.toolResults).toHaveLength(manual ? 1 : 2);
+  if (!manual) expect(f.controls.toolResults[1]?.isError).toBe(true);
+  expect(source.supersededError).toMatchObject({ code: "continuity_source_unproven" });
+  const summary = compactEvents.find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing active handoff");
+  const token = f.controls.sourceToken;
+  f.controls.invokeSourceTools = false;
+  const resumed = f.request("", "turn-first", [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }]);
+  expect((await f.run(resumed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(resumed._continuityHistoryRevision).toBe(1);
+  expect(f.submissions).toHaveLength(manual ? 2 : 3);
+  const prompt = f.submissions.at(-1)!.prompt;
+  expect(prompt).not.toContain("Verified checkpoint.");
+  expect(prompt).not.toContain("Actual completed tool result: 42.");
+  expect(prompt).not.toContain(token);
+  expect(prompt).toContain("continue only unfinished authorized work");
+  expect(new Set(f.submissions.map(submission => submission.key)).size).toBe(1);
+  expect(f.pages.size).toBe(1);
+  await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) }))
+    .rejects.toThrow();
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active compaction rejects foreign execution records before checkpoint commit`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const call = source.outstanding()[0]!;
+  const owned = [
+    { type: "function_call", name: call.wireName, call_id: call.callId, arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+    { type: "function_call_output", call_id: call.callId, output: "Actual completed tool result: 42." },
+  ];
+  const compact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    ...owned,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Foreign execution record." }] },
+    { type: "function_call", name: "exec_command", call_id: "foreign-call", arguments: '{"cmd":"not-owned"}' },
+    { type: "function_call_output", call_id: "foreign-call", output: "Unowned tool result." },
+  ]);
+  compact._compactionRequest = true;
+  await expect(f.run(compact)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  expect(binding.revision).toBe(0);
+  expect(binding.checkpoints.size).toBe(0);
+  const valid = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    ...owned,
+  ]);
+  valid._compactionRequest = true;
+  expect((await f.run(valid)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(binding.revision).toBe(1);
+  expect(binding.checkpoints.size).toBe(1);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} compaction rejects source history superseded after preflight`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const call = source.outstanding()[0]!;
+  const toolCall = {
+    type: "function_call", name: call.wireName, call_id: call.callId,
+    arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}',
+  };
+  const staleCompact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    toolCall,
+    { type: "function_call_output", call_id: call.callId, output: "Preflight tool result A." },
+  ]);
+  staleCompact._compactionRequest = true;
+  const compactAdapter = f.adapter();
+  const sourceCoverage = source.runtime.compactionSourceCoverage!;
+  const canonicalBeforePreflight = structuredClone(source.canonicalInput());
+  const coverageBeforePreflight = sourceCoverage.metadata();
+  const recoveryStore = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId);
+  const durableBeforePreflight = recoveryStore.get(thread)!;
+  await compactAdapter.preflight!(staleCompact, { headers: new Headers() });
+  expect(source.canonicalInput()).toEqual(canonicalBeforePreflight);
+  expect(sourceCoverage.metadata()).toEqual(coverageBeforePreflight);
+  expect(recoveryStore.get(thread)!.contextCoverage).toEqual(durableBeforePreflight.contextCoverage);
+  expect(recoveryStore.get(thread)!.calls[call.callId]!.firstResultDigest).toBeUndefined();
+
+  const newerCanonical = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    structuredClone(toolCall),
+    { type: "function_call_output", call_id: call.callId, output: "Canonical tool result B." },
+  ]);
+  expect((await f.run(newerCanonical)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(source.canonicalInput()).toEqual((newerCanonical._rawBody as { input: unknown[] }).input);
+  expect(recoveryStore.get(thread)!.calls[call.callId]!.firstResultDigest)
+    .toBe(recoveryResultDigest({ type: "function_call_output", call_id: call.callId, output: "Canonical tool result B." }));
+
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const submissions = f.submissions.length;
+  const acceptedCoverage = sourceCoverage.metadata();
+  const acceptedDurableCoverage = recoveryStore.get(thread)!.contextCoverage;
+  await expect(compactAdapter.runTurn!(staleCompact, { headers: new Headers() }, () => {}))
+    .rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
+  expect(sourceCoverage.metadata()).toEqual(acceptedCoverage);
+  expect(recoveryStore.get(thread)!.contextCoverage).toEqual(acceptedDurableCoverage);
+  expect(binding.revision).toBe(0);
+  expect(binding.checkpoints.size).toBe(0);
+  expect(binding.acceptedHandoff).toBeUndefined();
+  expect(f.submissions).toHaveLength(submissions);
+});
+
+test("Automatic stale compaction CAS failure preserves an active running source", async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const firstCall = source.outstanding()[0]!;
+  const toolCall = {
+    type: "function_call", name: firstCall.wireName, call_id: firstCall.callId,
+    arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}',
+  };
+  const staleCompact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    toolCall,
+    { type: "function_call_output", call_id: firstCall.callId, output: "Preflight tool result A." },
+  ]);
+  staleCompact._compactionRequest = true;
+  const compactAdapter = f.adapter();
+  const sourceCoverage = source.runtime.compactionSourceCoverage!;
+  const canonicalBeforePreflight = structuredClone(source.canonicalInput());
+  const coverageBeforePreflight = sourceCoverage.metadata();
+  const recoveryStore = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId);
+  const durableBeforePreflight = recoveryStore.get(thread)!;
+  await compactAdapter.preflight!(staleCompact, { headers: new Headers() });
+  expect(source.canonicalInput()).toEqual(canonicalBeforePreflight);
+  expect(sourceCoverage.metadata()).toEqual(coverageBeforePreflight);
+  expect(recoveryStore.get(thread)!.contextCoverage).toEqual(durableBeforePreflight.contextCoverage);
+  expect(recoveryStore.get(thread)!.calls[firstCall.callId]!.firstResultDigest).toBeUndefined();
+
+  const newerCanonical = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    structuredClone(toolCall),
+    { type: "function_call_output", call_id: firstCall.callId, output: "Canonical tool result B." },
+  ]);
+  const previousBatchRevision = source.runtime.mode === "tools"
+    ? source.runtime.externalProgress.snapshot().lastToolBatchRevision
+    : 0;
+  const newerRun = f.run(newerCanonical);
+  const deadline = Date.now() + 1_000;
+  let nextBatchRevision = previousBatchRevision;
+  while (nextBatchRevision === previousBatchRevision && Date.now() < deadline) {
+    await Bun.sleep(1);
+    if (source.runtime.mode === "tools") {
+      nextBatchRevision = source.runtime.externalProgress.snapshot().lastToolBatchRevision;
+    }
+  }
+  if (source.runtime.mode === "tools") {
+    await source.runtime.externalProgress.acknowledgeToolBatch(nextBatchRevision);
+  }
+  expect((await newerRun).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  expect(recoveryStore.get(thread)!.calls[firstCall.callId]!.firstResultDigest)
+    .toBe(recoveryResultDigest({ type: "function_call_output", call_id: firstCall.callId, output: "Canonical tool result B." }));
+  expect(source.outstanding()).toHaveLength(1);
+  expect(source.outstanding()[0]?.callId).not.toBe(firstCall.callId);
+  const acceptedCanonical = structuredClone(source.canonicalInput());
+  expect(acceptedCanonical).toEqual([
+    ...(newerCanonical._rawBody as { input: unknown[] }).input,
+    recordedCall(source.outstanding()[0]!),
+  ]);
+
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  expect(binding.state).toBe("running");
+  const submissions = f.submissions.length;
+  const acceptedCoverage = sourceCoverage.metadata();
+  const acceptedDurableCoverage = recoveryStore.get(thread)!.contextCoverage;
+  await expect(compactAdapter.runTurn!(staleCompact, { headers: new Headers() }, () => {}))
+    .rejects.toMatchObject({ code: "continuity_source_unproven", retryable: false });
+  expect(sourceCoverage.metadata()).toEqual(acceptedCoverage);
+  expect(recoveryStore.get(thread)!.contextCoverage).toEqual(acceptedDurableCoverage);
+  expect(binding.state).toBe("running");
+  expect(binding.revision).toBe(0);
+  expect(binding.checkpoints.size).toBe(0);
+  expect(binding.acceptedHandoff).toBeUndefined();
+  expect(source.outstanding()).toHaveLength(1);
+  expect(source.canonicalInput()).toEqual(acceptedCanonical);
+  expect(f.submissions).toHaveLength(submissions);
+  source.cancel(continuityError("continuity_session_lost"));
+});
+
+test("an active Zero Risk ordinary final that wins before control delivery is preserved without a second prompt", async () => {
+  const f = fixture(true);
+  f.controls.deferCompletion = true;
+  const first = f.request();
+  const ordinary = f.run(first);
+  while (!f.controls.started) await Bun.sleep(1);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  const stored = f.registrations.get(continuityDigest(f.threadId))!;
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), stored.scope)!;
+  const source = chatGptTurnSessions.find(binding.executionKey!)!;
+  const sync = source.runtime.syncContextUsage;
+  let entered!: () => void, release!: () => void;
+  const preview = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  source.runtime.syncContextUsage = async () => { await sync?.call(source.runtime); entered(); await held; };
+  const handoff = f.run(compact).catch(error => error);
+  await preview;
+  // Compaction validation is serialized behind the active ordinary owner. It must not claim
+  // the compaction state until the source lock can prove which local work actually won.
+  expect(binding.state).toBe("running");
+  f.broker.completeSafeTurn(f.controls.safeToken, "Ordinary final wins.");
+  expect((await ordinary).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  release(); source.runtime.syncContextUsage = sync;
+  expect(await handoff).toMatchObject({ code: "continuity_manual_handoff_required" });
+  expect(binding.revision).toBe(0);
+  expect(binding.state).toBe("ready");
+  expect(f.submissions).toHaveLength(1);
+  expect((await f.run(first)).find(event => event.type === "text_delta" && event.phase === "final_answer"))
+    .toEqual({ type: "text_delta", text: "Ordinary final wins.", phase: "final_answer" });
+});
+
+test("completed delegated compaction retry rejects changed source content under the same source identity", async () => {
+  const f = fixture();
+  const first = f.request();
+  await f.run(first);
+  const compact = structuredClone(first); compact._compactionRequest = true;
+  await f.run(compact);
+  const changed = f.request("A different source instruction."); changed._compactionRequest = true;
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(2);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active delegated source content conflict preserves the accepted source owner`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  expect(source.outstanding()).toHaveLength(1);
+  const token = f.controls.sourceToken;
+  const changed = f.request("Changed delegated source content.", "turn-first");
+  changed._compactionRequest = true;
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  expect(binding.state).toBe("running");
+  expect(source.isActive()).toBe(true);
+  expect(source.supersededError).toBeUndefined();
+  expect(source.outstanding()).toHaveLength(1);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.controls.toolResults).toHaveLength(0);
+  const claim = await callTurnBroker<{ bindingId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
+    method: "claim", token, ...(manual ? { contract: "safe" } : {}),
+  });
+  expect(claim.bindingId).toBeDefined();
+});
+
+for (const manual of [false, true]) for (const reclamation of ["retained", "capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation} committed compaction replay rejects changed accepted tool-result payload`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const call = source.outstanding()[0]!;
+  const compact = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "function_call", name: call.wireName, call_id: call.callId,
+      arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+    { type: "function_call_output", call_id: call.callId, output: "Accepted compact result A." },
+  ]);
+  compact._compactionRequest = true;
+  const compactEvents = await f.run(compact);
+  expect(compactEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const summary = compactEvents.find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  f.controls.invokeSourceTools = false;
+  const resumed = f.request("", "turn-first", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+  ]);
+  await f.run(resumed);
+  await f.run(f.next(resumed, "turn-after-compaction-result"));
+  if (reclamation === "capacity") {
+    const registry = chatGptTurnSessions as unknown as { maxEntries: number; entries: Map<string, unknown> };
+    const originalMaxEntries = registry.maxEntries;
+    registry.maxEntries = registry.entries.size;
+    try {
+      chatGptTurnSessions.assertContinuityThreadAvailable(f.threadId, "compaction-result-replay-capacity-probe");
+    } finally {
+      registry.maxEntries = originalMaxEntries;
+    }
+  } else if (reclamation === "ttl") {
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now + 31 * 60_000);
+    try { chatGptTurnSessions.activeCount(); }
+    finally { clock.mockRestore(); }
+  }
+  if (reclamation === "retained") expect(chatGptTurnSessions.find(sourceKey)).toBeDefined();
+  else expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
+  const submissions = f.submissions.length;
+  const results = f.controls.toolResults.length;
+  const changed = structuredClone(compact);
+  const changedInput = (changed._rawBody as { input: Array<Record<string, unknown>> }).input;
+  changedInput.find(item => item.type === "function_call_output")!.output = "Conflicting compact result B.";
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_result_conflict", retryable: false });
+  expect(f.submissions).toHaveLength(submissions);
+  expect(f.controls.toolResults).toHaveLength(results);
+});
+
+test("completed local compaction retry rejects a changed control payload", async () => {
+  const f = fixture();
+  const first = f.request();
+  await f.run(first);
+  const raw = structuredClone(first._rawBody) as Record<string, unknown> & { input: unknown[] };
+  const compactRaw = {
+    ...raw,
+    input: [...raw.input, { type: "message", role: "user", content: COMPACT_PROMPT }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+      thread_id: f.threadId, turn_id: "turn-first", request_kind: "compaction",
+      compaction: { implementation: "responses", trigger: "manual", phase: "standalone_turn", strategy: "memento" },
+    }) },
+  };
+  const compact = parseRequest(compactRaw);
+  compact._conversationPolicy = "task";
+  expect((await f.run(compact)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const changedRaw = structuredClone(compactRaw);
+  (changedRaw.input.at(-1) as { content: string }).content += "\nChanged control payload.";
+  const changed = parseRequest(changedRaw);
+  changed._conversationPolicy = "task";
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(2);
+});
+
+for (const manual of [false, true]) for (const reclamation of ["retained", "capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation} cached compaction binds all source instructions after steering`, async () => {
+  const f = fixture(manual);
+  const prior = f.request("Earlier steering instruction.");
+  await f.run(prior);
+  const a = { type: "message", role: "user", id: "constraint-a", content: "Accepted constraint A.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  const b = { type: "message", role: "user", id: "task-b", content: "Stable task B.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  if (manual) {
+    f.controls.invokeSourceTools = true;
+    f.controls.singleSourceTool = true;
+  }
+  const first = f.request("", "turn-first", [...(prior._rawBody as { input: unknown[] }).input, a, b]);
+  await f.run(first);
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  let compact = structuredClone(first);
+  if (manual) {
+    const call = source.outstanding()[0]!;
+    compact = f.request("", "turn-first", [
+      ...(first._rawBody as { input: unknown[] }).input,
+      { type: "function_call", name: call.wireName, call_id: call.callId,
+        arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+      { type: "function_call_output", call_id: call.callId, output: "Accepted result." },
+    ]);
+  }
+  compact._compactionRequest = true;
+  const compactEvents = await f.run(compact);
+  expect(compactEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const summary = compactEvents.find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
+  f.controls.invokeSourceTools = false;
+  const next = f.request("", "turn-after-compact", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    { type: "message", role: "user", id: "next-task", content: "New work after compaction.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-after-compact" } },
+  ]);
+  await f.run(next);
+  if (reclamation === "capacity") {
+    const registry = chatGptTurnSessions as unknown as { maxEntries: number; entries: Map<string, unknown> };
+    const originalMaxEntries = registry.maxEntries;
+    registry.maxEntries = registry.entries.size;
+    try {
+      // Admission can reclaim the earlier steering execution before this source.
+      chatGptTurnSessions.assertContinuityThreadAvailable(f.threadId, "source-payload-capacity-probe");
+      registry.maxEntries = registry.entries.size;
+      chatGptTurnSessions.assertContinuityThreadAvailable(f.threadId, "source-payload-capacity-probe");
+    } finally {
+      registry.maxEntries = originalMaxEntries;
+    }
+  } else if (reclamation === "ttl") {
+    const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 60_000);
+    try { chatGptTurnSessions.activeCount(); }
+    finally { clock.mockRestore(); }
+  }
+  if (reclamation === "retained") expect(chatGptTurnSessions.find(sourceKey)).toBeDefined();
+  else expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
+  const submissions = f.submissions.length;
+  const results = f.controls.toolResults.length;
+  const snapshot = source.canonicalInput();
+  const changedRaw = structuredClone(compact._rawBody) as { input: Array<Record<string, unknown>> };
+  changedRaw.input.find(item => item.id === "constraint-a")!.content = "Conflicting constraint A'.";
+  const changed = parseRequest(changedRaw);
+  changed._conversationPolicy = "task";
+  changed._compactionRequest = true;
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const historicalRaw = structuredClone(compact._rawBody) as { input: Array<Record<string, unknown>> };
+  historicalRaw.input[0]!.content = "Changed earlier steering history.";
+  const historicalReplay = parseRequest(historicalRaw);
+  historicalReplay._conversationPolicy = "task";
+  historicalReplay._compactionRequest = true;
+  expect((await f.run(historicalReplay)).find(event => event.type === "text_delta")).toEqual(summary);
+  expect(f.submissions).toHaveLength(submissions);
+  expect(f.controls.toolResults).toHaveLength(results);
+  expect(source.canonicalInput()).toEqual(snapshot);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} concurrent compaction rejects changed results before initial acceptance`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`;
+  const source = chatGptTurnSessions.find(sourceKey)!;
+  const call = source.outstanding()[0]!;
+  const makeCompact = (output: string) => {
+    const parsed = f.request("", "turn-first", [
+      ...(first._rawBody as { input: unknown[] }).input,
+      { type: "function_call", name: call.wireName, call_id: call.callId, arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+      { type: "function_call_output", call_id: call.callId, output },
+    ]);
+    parsed._compactionRequest = true;
+    return parsed;
+  };
+  const a = makeCompact("Result A");
+  const b = makeCompact("Result B");
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const lock = source.runExclusive(async () => { entered(); await gate; });
+  await enteredPromise;
+  try {
+    const runA = f.run(a).then(events => ({ ok: true as const, events }), error => ({ ok: false as const, error }));
+    let cached: Promise<string> | undefined;
+    for (let i = 0; i < 200; i++) {
+      if (a._continuityHistoryRevision !== undefined) {
+        const key = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(a)}`;
+        cached = existingStructuredCompactionRun<string>(key);
+      }
+      if (cached) break;
+      await Bun.sleep(5);
+    }
+    expect(cached).toBeDefined();
+    const resultB = await f.run(b).then(events => ({ ok: true as const, events }), error => ({ ok: false as const, error }));
+    expect(resultB.ok).toBe(false);
+    release();
+    const resultA = await runA;
+    expect(resultA.ok).toBe(true);
+    expect(resultB.ok).toBe(false);
+    if (!resultB.ok) expect(resultB.error).toMatchObject({ code: "continuity_source_unproven" });
+    if (resultA.ok) {
+      expect(resultA.events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+      expect(f.submissions).toHaveLength(manual ? 1 : 2);
+    }
+  } finally {
+    release();
+    await lock;
+  }
+});
+
+for (const manual of [false, true]) for (const sameTurn of [false, true]) for (const retainPredecessor of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} moved checkpoint rejects ambiguous ${sameTurn ? "same-turn" : "ID-only"} history with predecessor ${retainPredecessor ? "before checkpoint" : "absent"}`, async () => {
+  const f = fixture(manual);
+  const old = { type: "message", role: "user", id: "old-a", content: "Old instruction A.",
+    ...(sameTurn ? { internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } } : {}) };
+  const current = { type: "message", role: "user", id: "source-b", content: "Source instruction B.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  if (manual) {
+    f.controls.invokeSourceTools = true;
+    f.controls.singleSourceTool = true;
+  }
+  const first = f.request("", "turn-first", [old, current]);
+  await f.run(first);
+  let compact = structuredClone(first);
+  if (manual) {
+    const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+    const call = source.outstanding()[0]!;
+    compact = f.request("", "turn-first", [old, current,
+      { type: "function_call", name: call.wireName, call_id: call.callId, arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+      { type: "function_call_output", call_id: call.callId, output: "Accepted result." },
+    ]);
+  }
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing summary");
+  f.controls.invokeSourceTools = false;
+  const submissions = f.submissions.length;
+  const turnId = sameTurn ? "turn-first" : "turn-next";
+  const next = f.request("", turnId, [
+    ...(retainPredecessor ? [current] : []),
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }, old,
+    { type: "message", role: "user", id: "new-c", content: "New instruction C.", internal_chat_message_metadata_passthrough: { turn_id: turnId } },
+  ]);
+  await expect(f.run(next)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(submissions);
+  const proved = f.request("", turnId, [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }, old, current,
+    { type: "message", role: "user", id: "proved-new", content: "Proved new work.",
+      internal_chat_message_metadata_passthrough: { turn_id: turnId } },
+  ]);
+  expect((await f.run(proved)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions.at(-1)!.prompt).toContain("Proved new work.");
+  expect(f.submissions.at(-1)!.prompt).not.toContain("Old instruction A.");
+});
+
+for (const manual of [false, true]) test(`Round 7: accepted foreign-source tail cannot mask consumed current instruction ${manual}`, async () => {
+  const f = fixture(manual);
+  const a = f.request("Consumed instruction A.", "turn-a");
+  await f.run(a);
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = false;
+  const b = f.next(a, "turn-b");
+  expect((await f.run(b)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(b)}`)!;
+  const call = source.outstanding()[0]!;
+  const compact = f.request("", "turn-c", [
+    ...(b._rawBody as { input: unknown[] }).input,
+    { type: "function_call", name: call.wireName, call_id: call.callId, arguments: '{"cmd":"fixture-command-not-executed-by-this-test"}' },
+    { type: "function_call_output", call_id: call.callId, output: "Completed B result." },
+  ]);
+  compact._compactionRequest = true;
+  const events = await f.run(compact);
+  const summary = events.find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing summary");
+  f.controls.invokeSourceTools = false;
+  const originalB = structuredClone((b._rawBody as { input: unknown[] }).input.at(-1));
+  const masked = f.request("", "turn-c", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    { type: "message", role: "user", id: "msg-turn-a", content: "Changed work under consumed instruction A ID.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-c" } },
+    originalB,
+  ]);
+  const before = f.submissions.length;
+  const unmasked = f.request("", "turn-c", (masked._rawBody as { input: unknown[] }).input.slice(0,-1));
+  await expect(f.run(unmasked)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(chatGptCurrentInstructionIndex(masked)).toBe(1);
+  expect(chatGptCurrentInstructionRevision(masked)?.itemId).toBe("msg-turn-a");
+  const result = await f.run(masked).then(events => ({ accepted: true, events }), error => ({ accepted: false, code: error.code }));
+  expect(result).toMatchObject({ accepted: false, code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(before);
+});
+
+test("Round 7: accepted source tail cannot mask new instruction after completed-source checkpoint", async () => {
+  const f=fixture();
+  const source = f.request("Source A.", "turn-a");
+  await f.run(source);
+  const compact=f.request("", "turn-b", (source._rawBody as {input: unknown[]}).input);
+  compact._compactionRequest=true;
+  const events=await f.run(compact);
+  const summary=events.find(event=>event.type==="text_delta");
+  if(summary?.type!=="text_delta") throw new Error("Missing summary");
+  const next=f.request("", "turn-b", [
+    {type:"compaction", encrypted_content:encodeCompactionSummary(summary.text)},
+    {type:"message",role:"user",id:"msg-turn-new",content:"A new current task.",internal_chat_message_metadata_passthrough:{turn_id:"turn-b"}},
+    ...(source._rawBody as {input: unknown[]}).input,
+  ]);
+  const before=f.submissions.length;
+  const result=await f.run(next).then(events=>({accepted:true,events}),error=>({accepted:false,code:error.code}));
+  expect(result).toMatchObject({ accepted: true });
+  expect(f.submissions).toHaveLength(before + 1);
+  expect(f.submissions.at(-1)?.prompt).toContain("A new current task.");
+});
+
+for (const manual of [false,true]) test(`Round 7: current native cross-task instruction remains usable on ordinary resume ${manual}`, async () => {
+  const f=fixture(manual);
+  const first=f.request("Original task.","turn-a");
+  await f.run(first);
+  const delegation={type:"function_call_output",id:"fco-delegation-current",name:"send_message_to_thread",namespace:"codex_app",
+    output:"<codex_delegation><source_thread_id>parent-thread</source_thread_id><input>Perform the new delegated task.</input></codex_delegation>",
+    internal_chat_message_metadata_passthrough:{turn_id:"turn-b"}};
+  const next=f.request("","turn-b",[
+    ...(first._rawBody as {input:unknown[]}).input,
+    {type:"message",role:"assistant",content:"Completed response 1."},delegation,
+  ]);
+  const before=f.submissions.length;
+  const result=await f.run(next).then(events=>({accepted:true,events}),error=>({accepted:false,code:error.code,message:error.message}));
+  expect(result).toMatchObject({accepted:true});
+  expect(f.submissions).toHaveLength(before+1);
+});
+
+test("Round 7: verified compaction retry honors established source item aliases", async () => {
+  const f=fixture();
+  f.provider.chatgptWeb!.toolAuthorityMode="verified-environment";
+  let restoredAliases = 0;
+  const resolver=spyOn(ChatGptThreadEnvironmentStore.prototype,"resolveWithRolloutPublicationRetry").mockImplementation(async parsed=>{
+    delete parsed._chatGptMessageIdAliases;
+    if ((parsed._rawBody as { input: Array<Record<string, unknown>> }).input.some(item => item.id === "msg-reidentified")) {
+      parsed._chatGptMessageIdAliases = { "msg-reidentified": "msg-turn-first" };
+      restoredAliases++;
+    }
+    return { cwd:"/tmp",roots:["/tmp"],writableRoots:["/tmp"],sandboxPolicy:{type:"workspaceWrite",writableRoots:["/tmp"],networkAccess:true},tools:structuredClone(parsed.context.tools??[]),
+  }; });
+  try {
+    const first=f.request("Source instruction.","turn-first");
+    (first._rawBody as { input: Array<Record<string, unknown>> }).input[0]!.id = "msg-reidentified";
+    await f.run(first);
+    const compact=structuredClone(first); compact._compactionRequest=true;
+    await f.run(compact);
+    const retry=structuredClone(compact);
+    (retry._rawBody as {input:Array<Record<string,unknown>>}).input[0]!.id="msg-turn-first";
+    const before=f.submissions.length;
+    const result=await f.run(retry).then(events=>({accepted:true,events}),error=>({accepted:false,code:error.code,message:error.message}));
+    expect(restoredAliases).toBe(1);
+    expect(result).toMatchObject({accepted:true});
+    expect(f.submissions).toHaveLength(before);
+  } finally {resolver.mockRestore();}
+});
+
+for (const manual of [false,true]) test(`Round 7: completed foreign tool search history cannot expand current capability ${manual}`, async ()=>{
+  const f=fixture(manual);
+  const first=f.request();
+  await f.run(first);
+  const injectedTool={type:"function",name:"not_currently_advertised",description:"Historical foreign tool, no Native execution in this fixture.",parameters:{type:"object",properties:{cmd:{type:"string"}},required:["cmd"]}};
+  const next=f.request("","turn-b",[
+    ...(first._rawBody as {input:unknown[]}).input,
+    {type:"tool_search_call",call_id:"foreign-old-call",arguments:{query:"old"}},
+    {type:"tool_search_output",call_id:"foreign-old-call",status:"completed",tools:[injectedTool]},
+    {type:"message",role:"assistant",content:"Foreign completed historical answer."},
+    {type:"message",role:"user",id:"msg-turn-b",content:"New current task.",internal_chat_message_metadata_passthrough:{turn_id:"turn-b"}},
+  ]);
+  f.controls.deferCompletion = true;
+  f.controls.started = false;
+  const pending = f.run(next);
+  while (!f.controls.started) await Bun.sleep(1);
+  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+  const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
+    f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
+  await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+    method: "invoke", bindingId: claim.bindingId, wireName: "not_currently_advertised", freeform: false,
+    registryGeneration: claim.environment.registryGeneration, arguments: { cmd: "fixture" },
+  })).rejects.toThrow("does not advertise");
+  if (claim.activityId) await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+    method: "activity_complete", token, activityId: claim.activityId,
+  });
+  if (manual) f.broker.completeSafeTurn(token, "Completed current task.");
+  else f.controls.releaseDeferredCompletion!();
+  expect((await pending).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(next.context.tools?.map(tool => tool.name)).toEqual(["exec_command"]);
+});
+
+test("Round 7: verified Zero Risk compaction retry honors resolver-established source item aliases", async () => {
+  const f=fixture(true);
+  f.controls.invokeSourceTools=true;
+  f.provider.chatgptWeb!.toolAuthorityMode="verified-environment";
+  let restoredAliases=0;
+  const resolver=spyOn(ChatGptThreadEnvironmentStore.prototype,"resolveWithRolloutPublicationRetry").mockImplementation(async parsed=>{
+    delete parsed._chatGptMessageIdAliases;
+    const input=(parsed._rawBody as {input:Array<Record<string,unknown>>}).input;
+    if (input.some(item=>item.id==="msg-reidentified")) {
+      parsed._chatGptMessageIdAliases={"msg-reidentified":"msg-turn-first"};
+      restoredAliases++;
+    }
+    return {cwd:"/tmp",roots:["/tmp"],writableRoots:["/tmp"],sandboxPolicy:{type:"workspaceWrite",writableRoots:["/tmp"],networkAccess:true},tools:structuredClone(parsed.context.tools??[])};
+  });
+  try {
+    const first=f.request("Source instruction.","turn-first");
+    await f.run(first);
+    const source=chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+    const call=source.outstanding()[0]!;
+    const compact=f.request("","turn-compaction",[
+      ...(first._rawBody as {input:unknown[]}).input,
+      {type:"function_call",name:call.wireName,call_id:call.callId,arguments:'{"cmd":"fixture-command-not-executed-by-this-test"}'},
+      {type:"function_call_output",call_id:call.callId,output:"Completed source result."},
+    ]); compact._compactionRequest=true;
+    await f.run(compact);
+    const retry=structuredClone(compact);
+    (retry._rawBody as {input:Array<Record<string,unknown>>}).input[0]!.id="msg-reidentified";
+    const before=f.submissions.length;
+    const result=await f.run(retry).then(events=>({accepted:true,events}),error=>({accepted:false,code:error.code,message:error.message}));
+    expect(restoredAliases).toBe(1);
+    expect(result).toMatchObject({accepted:true});
+    expect(f.submissions).toHaveLength(before);
+  } finally {resolver.mockRestore();}
+});
+
+for (const manual of [false, true]) test(`Round 7: queued active-source compaction cancellation has no unhandled rejection ${manual}`, async () => {
+  const f=fixture(manual); f.controls.invokeSourceTools=true; f.controls.singleSourceTool=true;
+  const first=f.request(); await f.run(first);
+  const source=chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call=source.outstanding()[0]!;
+  const compact=f.request('', 'turn-compaction',[...(first._rawBody as {input:unknown[]}).input,{type:'function_call_output',call_id:call.callId,output:'Genuine source result.'}]);
+  compact._compactionRequest=true;
+  let release!:()=>void;
+  const gate=source.runExclusive(()=>new Promise<void>(resolve=>{release=resolve;}));
+  await Bun.sleep(0);
+  compact._continuityHistoryRevision=0;
+  const pending=f.run(compact).catch(error=>error);
+  while (compact._continuityPageGeneration === undefined) await Bun.sleep(1);
+  const key=`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(compact)}`;
+  while(!existingStructuredCompactionRun(key)) await Bun.sleep(1);
+  const reason=new DOMException('Cancel queued active-source compaction','AbortError');
+  const cancellation=cancelStructuredCompactionNativeTurn(f.threadId,'turn-compaction',reason);
+  release(); await gate;
+  expect(await pending).toBeInstanceOf(Error); await cancellation.settlement;
+  expect(cancellation.cancelled).toBe(1);
+  expect(f.controls.toolResults).toHaveLength(0);
+  expect(f.submissions).toHaveLength(1);
+  expect(source.isActive()).toBe(true);
+  expect(source.supersededError).toBeUndefined();
+  await Bun.sleep(5);
+});
+
+for (const manual of [false, true]) test(`Round 7: current native cross-task instruction resumes after checkpoint ${manual}`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  const compact = f.request("", "turn-checkpoint", [
+    ...(first._rawBody as { input: unknown[] }).input,
+    recordedCall(call),
+    { type: "function_call_output", call_id: call.callId, output: "Completed source result." },
+  ]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing summary");
+  f.controls.invokeSourceTools = false;
+  const next = f.request("", "turn-delegation", [
+    { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    { type: "function_call_output", id: "fco-checkpoint-delegation", name: "send_message_to_thread", namespace: "codex_app",
+      output: "<codex_delegation><source_thread_id>parent-thread</source_thread_id><input>Perform the checkpoint delegated task.</input></codex_delegation>",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-delegation" } },
+  ]);
+  const before = f.submissions.length;
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(before + 1);
+  expect(f.submissions.at(-1)?.prompt).toContain("Perform the checkpoint delegated task.");
+  await f.run(next);
+  expect(f.submissions).toHaveLength(before + 1);
+});
+
+for (const manual of [false, true]) test(`Round 7: conflicting queued compaction result cannot register cancellation authority ${manual}`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  const first = f.request();
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  const make = (turnId: string, output: string) => {
+    const parsed = f.request("", turnId, [
+      ...(first._rawBody as { input: unknown[] }).input,
+      recordedCall(call),
+      { type: "function_call_output", call_id: call.callId, output },
+    ]);
+    parsed._compactionRequest = true;
+    return parsed;
+  };
+  let release!: () => void;
+  const gate = source.runExclusive(() => new Promise<void>(resolve => { release = resolve; }));
+  await Bun.sleep(0);
+  const original = make("compact-original", "Accepted result A.");
+  const conflict = make("compact-conflict", "Conflicting result B.");
+  const pending = f.run(original);
+  original._continuityHistoryRevision = 0;
+  while (original._continuityPageGeneration === undefined) await Bun.sleep(1);
+  const key = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`;
+  while (!existingStructuredCompactionRun(key)) await Bun.sleep(1);
+  await expect(f.run(conflict)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const cancelled = cancelStructuredCompactionNativeTurn(f.threadId, "compact-conflict", new Error("Cancel unaccepted request"));
+  expect(cancelled.cancelled).toBe(0);
+  await cancelled.settlement;
+  release();
+  await gate;
+  expect((await pending).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.controls.toolResults).toHaveLength(manual ? 1 : 2);
+  expect(JSON.stringify(f.controls.toolResults[0])).toContain("Accepted result A.");
+});
+
+for (const manual of [false, true]) test(`Round 7: approved discovery survives checkpoint and current registry removal ${manual}`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = true;
+  f.controls.reviewWireName = "tool_search";
+  const raw = structuredClone(f.request()._rawBody) as { input: unknown[]; tools: unknown[] };
+  const spec = { type: "function", name: "discovered_checkpoint_tool", description: "Approved fixture tool",
+    parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
+  raw.tools = [{ type: "tool_search", description: "Fixture search", parameters: { type: "object" } }];
+  const first = parseRequest(raw);
+  first._conversationPolicy = "task";
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  const search = { type: "tool_search_output", call_id: call.callId, status: "completed", tools: [spec] };
+  const compact = parseRequest({ ...raw, input: [...raw.input, recordedCall(call), search],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-search-compact" }) } });
+  compact._conversationPolicy = "task";
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing summary");
+  const nextRaw = { ...raw, input: [search, { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) },
+    { type: "message", role: "user", id: "msg-after-search-checkpoint", content: "Use the approved checkpoint tool.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-after-search-checkpoint" } }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-after-search-checkpoint" }) } };
+  const next = parseRequest(nextRaw);
+  next._conversationPolicy = "task";
+  f.controls.reviewWireName = "discovered_checkpoint_tool";
+  f.controls.singleSourceTool = true;
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const current = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(next)}`)!;
+  const nextCall = current.outstanding()[0]!;
+  expect(nextCall.wireName).toBe("discovered_checkpoint_tool");
+  // A currently removed tool still delivers its already admitted result exactly once.
+  const removedRaw = { ...nextRaw, tools: [], input: [...nextRaw.input.slice(1),
+    { type: "function_call_output", call_id: nextCall.callId, output: "Result from the previously admitted call." }] };
+  const removed = parseRequest(removedRaw);
+  removed._conversationPolicy = "task";
+  expect((await f.run(removed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(removed.context.tools).toEqual([]);
+  const binding = current.runtime.continuityBinding!;
+  expect(binding.discoveredTools).toEqual([]);
+  const count = f.controls.toolResults.length;
+  await f.run(removed);
+  expect(f.controls.toolResults).toHaveLength(count);
+  // An old discovery copy cannot restore a permission that the current registry removed.
+  f.controls.invokeSourceTools = false;
+  const later = parseRequest({ ...raw, tools: [], input: [search,
+    ...removedRaw.input.slice(0, -1), { type: "message", role: "assistant", content: "Completed previous work." },
+    { type: "message", role: "user", id: "msg-after-removal", content: "Continue after removal.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-after-removal" } }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-after-removal" }) } });
+  later._conversationPolicy = "task";
+  await f.run(later);
+  expect(later.context.tools).toEqual([]);
+});
+
+for (const manual of [false, true]) test(`Round 8: older accepted discovery cannot restore removed tools during compaction ${manual}`, async () => {
+  const f = fixture(manual);
+  f.controls.repeatManualSourceTool = manual;
+  f.controls.invokeSourceTools = true;
+  f.controls.reviewWireName = "tool_search";
+  const raw = structuredClone(f.request()._rawBody) as Record<string, unknown> & { input: unknown[]; tools: unknown[] };
+  raw.tools = [{ type: "tool_search", description: "Fixture search", parameters: { type: "object" } }];
+  const parse = (body: unknown) => {
+    const parsed = parseRequest(body);
+    parsed._conversationPolicy = "task";
+    return parsed;
+  };
+  const first = parse(raw);
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const firstCall = source.outstanding()[0]!;
+  const spec = { type: "function", name: "removed_discovery_tool", description: "Removed fixture tool",
+    parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
+  const search = { type: "tool_search_output", call_id: firstCall.callId, status: "completed", tools: [spec] };
+  const resultRun = f.run(parse({ ...raw, input: [...raw.input, search] }));
+  if (!manual && source.runtime.mode === "tools") {
+    const progress = source.runtime.externalProgress;
+    let snapshot = progress.snapshot();
+    const prior = snapshot.lastToolBatchRevision;
+    while (snapshot.lastToolBatchRevision === prior) snapshot = await progress.waitForChange(snapshot.revision);
+    await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
+  }
+  expect((await resultRun).at(-1)).toMatchObject({ type: "done", endTurn: false });
+  const secondCall = source.outstanding()[0]!;
+  const removal = { type: "tool_search_output", call_id: secondCall.callId, status: "completed", tools: [] };
+  const acceptedHistory = [...raw.input, recordedCall(firstCall), search, recordedCall(secondCall), removal];
+  expect((await f.run(parse({ ...raw, tools: [], input: [...raw.input, removal] }))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const binding = source.runtime.continuityBinding!;
+  expect(binding.discoveredTools).toEqual([]);
+  const compact = parse({ ...raw, tools: [], input: acceptedHistory });
+  compact._compactionRequest = true;
+  let marker: unknown;
+  {
+    if (manual) f.controls.invokeSourceTools = false;
+    const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+    if (summary?.type !== "text_delta") throw new Error("Missing summary");
+    marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  }
+  expect(binding.discoveredTools).toEqual([]);
+  const prefix = [search, marker];
+  const next = parse({ ...raw, tools: [], input: [...prefix,
+    { type: "message", role: "user", id: "msg-after-removal", content: "Continue with current tools.",
+      internal_chat_message_metadata_passthrough: { turn_id: "turn-after-removal" } }],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-after-removal" }) },
+  });
+  f.controls.invokeSourceTools = false;
+  f.controls.deferCompletion = true;
+  f.controls.started = false;
+  const pending = f.run(next);
+  while (!f.controls.started) await Bun.sleep(1);
+  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+  const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
+    f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
+  await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+    method: "invoke", bindingId: claim.bindingId, wireName: "removed_discovery_tool", freeform: false,
+    registryGeneration: claim.environment.registryGeneration, arguments: { cmd: "fixture" },
+  })).rejects.toThrow("does not advertise");
+  if (claim.activityId) await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
+    method: "activity_complete", token, activityId: claim.activityId,
+  });
+  if (manual) f.broker.completeSafeTurn(token, "Completed current work.");
+  else f.controls.releaseDeferredCompletion!();
+  expect((await pending).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(next.context.tools).toEqual([]);
+  expect(f.controls.toolResults).toHaveLength(2);
+});
+
+for (const manual of [false, true]) for (const aliasedSource of (manual ? [false, true] : [false])) test(`Round 8: real verified source alias replays checkpoint continuation ${manual} original alias ${aliasedSource}`, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "cgw-cont-alias-home-"));
+  cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
+  const f = fixture(manual, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410711" });
+  const turnId = "019cbcc7-31b2-7028-a632-7f8118410712";
+  mkdirSync(join(codexHome, "sessions", "2026", "09", "30"), { recursive: true });
+  const rolloutPath = join(codexHome, "sessions", "2026", "09", "30", `rollout-2026-09-30T09-00-00-${f.threadId}.jsonl`);
+  const append = (items: unknown[]) => writeFileSync(rolloutPath,
+    readFileSync(rolloutPath, "utf8") + items.map(item => JSON.stringify(item)).join("\n") + "\n");
+  writeFileSync(rolloutPath, [
+    { type: "session_meta", payload: { id: f.threadId, source: "vscode" } },
+    { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+    { type: "turn_context", payload: { turn_id: turnId, cwd: "/tmp", workspace_roots: ["/tmp"], approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" }, permission_profile: { type: "disabled" } } },
+  ].map(item => JSON.stringify(item)).join("\n") + "\n");
+  f.provider.chatgptWeb!.toolAuthorityMode = "verified-environment";
+  const request = (input: unknown[]): CodexParsedRequest => {
+    const parsed = parseRequest({ ...f.request("", turnId, input)._rawBody as object,
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn", thread_id: f.threadId, turn_id: turnId,
+        agent_name: "/root", sandbox_mode: "danger-full-access", workspaces: { "/tmp": {} } }) },
+    });
+    parsed._conversationPolicy = "task";
+    return parsed;
+  };
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  const sourceItem = { type: "message", role: "user", id: "msg-canonical-source", content: "Source instruction.",
+    internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ["user.text"] } };
+  const nativeSource = aliasedSource ? { ...sourceItem, id: "msg-initial-alias" } : sourceItem;
+  // Both paths prove their original human source before compaction; turn permissions alone
+  // cannot authenticate the canonical message. The aliased path also publishes its replacement.
+  append([{ type: "response_item", payload: sourceItem }]);
+  if (aliasedSource) append([{ type: "compacted", payload: { replacement_history: [nativeSource] } }]);
+  const first = request([nativeSource]);
+  await f.run(first);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const call = source.outstanding()[0]!;
+  if (aliasedSource) expect(first._chatGptMessageIdAliases).toEqual({ "msg-initial-alias": sourceItem.id });
+  const compact = request([nativeSource, recordedCall(call), { type: "function_call_output", call_id: call.callId, output: "Accepted source result." }]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing summary");
+  f.controls.invokeSourceTools = false;
+  const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  const accepted = await f.run(request([marker, sourceItem]));
+  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const submissions = f.submissions.length;
+  const renamed = { ...sourceItem, id: "msg-reidentified" };
+  append([{ type: "response_item", payload: sourceItem }, { type: "compacted", payload: { replacement_history: [marker, renamed] } }]);
+  const alias = request([marker, renamed]);
+  expect(await f.run(alias)).toEqual(accepted);
+  expect(alias._chatGptMessageIdAliases).toEqual({ "msg-reidentified": sourceItem.id });
+  expect(f.submissions).toHaveLength(submissions);
+  const conflicting = request([marker, { ...renamed, content: "Different current work." }]);
+  await expect(f.run(conflicting)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(submissions);
+});
+
+// Allow slower CI runners to complete all 600 sequential compaction requests.
+for (const manual of [false, true]) test(`Round 10: cached compact codecs do not retain rewritten historical source evidence ${manual}`, async () => {
+  const f = httpFixture(manual);
+  f.controls.invokeSourceTools = manual;
+  f.controls.singleSourceTool = manual;
+  const parent = { type: "agent_message", id: "parent-current", author: "/root", recipient: "/root/child",
+    content: "Current parent task.", internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
+  const oldUser = (index: number) => ({ type: "message", role: "user", id: "old-user",
+    content: [{ type: "input_text", text: `Older human text ${index}.` }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-older" } });
+  const metadata = { thread_id: f.threadId, turn_id: "turn-first", subagent_kind: "thread_spawn", request_kind: "turn",
+    parent_thread_id: "thread-parent", agent_name: "/root/child" };
+  const body = { ...f.body, input: [oldUser(0), parent],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
+  const first = await (await f.send(body)).json() as { output: Array<Record<string, unknown>> };
+  const call = first.output.find(item => item.type === "function_call");
+  const result = call ? [call, { type: "function_call_output", call_id: call.call_id, output: "Accepted parent source result." }] : [];
+  let checkpoint: unknown;
+  let v1Output: unknown[] = [];
+  for (let index = 0; index < 600; index += 1) {
+    const format = index % 3;
+    const compactBody = { ...body, input: [oldUser(index), parent, ...result,
+      ...(format === 0 ? [{ type: "compaction_trigger" }]
+        : format === 2 ? [{ type: "message", role: "user", content: COMPACT_PROMPT }] : [])],
+      ...(format === 2 ? { client_metadata: { "x-codex-turn-metadata": JSON.stringify({ ...metadata,
+        request_kind: "compaction", compaction: { implementation: "responses", trigger: "manual", phase: "standalone_turn", strategy: "memento" },
+      }) } } : {}),
+    };
+    const response = await f.send(compactBody, format === 1);
+    expect(response.status).toBe(200);
+    const output = (await response.json() as { output: unknown[] }).output;
+    if (index === 0) checkpoint = output[0];
+    if (index === 1) v1Output = output;
+  }
+  const probe = parseRequest({ ...body, input: [checkpoint] });
+  routeChatGptWebRequest(probe, f.config);
+  bindContinuityRequestScope(probe, chatGptWebExecutionNamespace(f.provider));
+  const identity = extractChatGptTurnIdentity(probe);
+  expect(isAcceptedCompactionContinuation(probe, identity, {
+    itemId: parent.id, turnId: "turn-first", content: parent.content,
+    instructionEnvelope: { role: "agent_message", author: parent.author, recipient: parent.recipient },
+  })).toBe(true);
+  for (let index = 0; index < 600; index += 1) {
+    expect(isAcceptedCompactionContinuation(probe, identity, { itemId: "old-user", turnId: "turn-older",
+      content: oldUser(index).content, instructionEnvelope: { role: "user" },
+    })).toBe(index === 0);
+  }
+  const binding = continuityBindingsFor(f.statePath).lookup(continuityDigest(f.threadId), probe._continuityScope!)!;
+  expect(binding.revision).toBe(1);
+  expect(binding.checkpoints.size).toBe(1);
+  expect(f.submissions).toHaveLength(manual ? 1 : 2);
+  expect(f.controls.toolResults).toHaveLength(manual ? 1 : 0);
+  // A later codec replay can change its wire output, but it cannot enlarge committed evidence.
+  expect(JSON.stringify(v1Output)).toContain("Older human text 1.");
+}, 30_000);

@@ -115,6 +115,7 @@ for (const version of [2, 3]) test(`page-lifetime promotion preserves format ${v
   const installation = store.installationId();
   const identity = recoveryIdentity(original, installation);
   const file = join(path, "recovery.json");
+  expect(store.promotePageLifetime()).toBe(false);
   const document = JSON.parse(readFileSync(file, "utf8")); document.version = version;
   writeFileSync(file, JSON.stringify(document));
   // Old task facts can be read for page classification, but cannot authorize a new-format executor.
@@ -169,6 +170,7 @@ for (const damaged of ["missing-journal", "corrupt-journal", "corrupt-marker"] a
   const original = store.admitWork(input());
   const installation = store.installationId();
   const identity = recoveryIdentity(original, installation);
+  expect(store.promotePageLifetime()).toBe(false);
   if (damaged === "missing-journal") rmSync(join(path, "recovery.json"));
   else writeFileSync(join(path, damaged === "corrupt-marker" ? "recovery-initialized.json" : "recovery.json"), "{");
   store.promotePageLifetime();

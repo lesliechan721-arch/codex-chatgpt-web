@@ -746,7 +746,29 @@ export class ContinuityRecoveryStore {
   }
   /** Promote authority atomically. Old executors reject format 4 instead of retaining permits. */
   promotePageLifetime(): boolean {
-    return withContinuityStorageLock(join(this.directory, "write.lock"), () => this.exclusive(() => {
+    const registrationLock = join(this.directory, "write.lock");
+    const writing = () => [registrationLock, this.lock].some(lock => {
+      try { lstatSync(lock); return true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    });
+    try {
+      // Fresh reads can establish that no maintenance is needed, never execution
+      // authority. Do not cache this result: a later request must detect damage
+      // or retry an orphan whose admission lock was previously held.
+      if (!writing()) {
+        const document = this.read();
+        if (document.version === 4 && Object.values(document.threads).every(record => !record.legacyUnproven)) {
+          const { registry, repaired } = this.pageRegistrations(document);
+          if (!repaired && Object.keys(registry.entries).every(thread => document.threads[thread]) && !writing()) return false;
+        }
+      }
+    } catch { /* The locked path handles repairs and preserves infrastructure errors. */ }
+    // Re-read under both locks before changing anything. The optimistic reads
+    // above are not an atomic snapshot and must not supply a repair's inputs.
+    return withContinuityStorageLock(registrationLock, () => this.exclusive(() => {
       // The installation identity remains mandatory; task journals are disposable
       // when unreadable. Filesystem/permission failures are infrastructure failures.
       const installation = this.installation();

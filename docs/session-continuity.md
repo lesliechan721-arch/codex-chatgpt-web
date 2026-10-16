@@ -342,6 +342,10 @@ Implementation boundaries are in [continuity binding](../src/adapters/chatgpt-we
 [Adapter integration](../src/adapters/chatgpt-web/index.ts). The
 [input](../tests/session-continuity-input.test.ts),
 [state](../tests/session-continuity-state.test.ts), and
-[Adapter regressions](../tests/session-continuity-adapter.test.ts) preserve those contracts.
+[Adapter](../tests/session-continuity-adapter.test.ts),
+[HTTP](../tests/session-continuity-http.test.ts),
+[compaction](../tests/session-continuity-compaction.test.ts),
+[recovery](../tests/session-continuity-recovery.test.ts), and
+[checkpoint regressions](../tests/session-continuity-checkpoint.test.ts) preserve those contracts.
 See also the [security model](security-model.md), [Native tool protocol](native-tool-protocol.md),
 and [release evidence](release-validation.md#recorded-continuity-evidence).

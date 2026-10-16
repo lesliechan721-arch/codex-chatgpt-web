@@ -13,7 +13,10 @@ export const MEASUREMENT_FILES = [
   "scripts/test-performance-reports.ts", "scripts/test-performance-children.ts", "scripts/runtime-performance-preload.ts",
   "scripts/compare-test-performance.ts", "scripts/compare-test-versions.ts", "tests/helpers/performance-test.ts",
   "tests/helpers/retained-fixture-cleanup.ts", "tests/helpers/retained-compaction-fixture.ts",
-  "tests/session-continuity-adapter.test.ts", "tests/server-lifecycle.test.ts", "tests/continuity-recovery-compaction.test.ts",
+  "tests/helpers/session-continuity-fixture.ts", "tests/session-continuity-adapter.test.ts",
+  "tests/session-continuity-http.test.ts", "tests/session-continuity-compaction.test.ts",
+  "tests/session-continuity-recovery.test.ts", "tests/session-continuity-checkpoint.test.ts",
+  "tests/server-lifecycle.test.ts", "tests/continuity-recovery-compaction.test.ts",
 ] as const;
 export function measurementFingerprint(cwd: string) {
   const tool = createHash("sha256");

@@ -8,6 +8,10 @@ is `auto`; selecting `1` or `2` overrides the worker count on every OS in that r
 Launcher type checks and tests run first, so a Launcher failure does not wait for the full
 server suite. Each verification command prints its elapsed time and exit code.
 
+Continuity integration tests are split into adapter, HTTP, compaction, recovery and checkpoint
+files. Each file owns its fixture cleanup. Bun can distribute these files across workers;
+tests within each file remain serial, including the 600-request compaction stress cases.
+
 CI uploads `test-performance-<OS>-workers-<N>`, and release builds upload
 `test-performance-release-<runner>`, even when tests fail. `CGW_TEST_PROFILE_DIR` selects the
 report output directory; it does not change the test entry point or worker count. A run contains:
@@ -75,9 +79,16 @@ transition validation. A bounded process-local proof can avoid another flush onl
 same complete contents, file identity/change metadata and canonical parent directory identity.
 It does not cache authority or process liveness. Replacement, an uncertain write or a process
 restart requires confirmation again. Unsupported file identity falls back to flushing.
-Version 2 format promotion still writes version 3. Real state changes still commit before
+Version 2/3 format promotion still writes version 4. Real state changes still commit before
 external effects. Optional tool-result body accounting is batched after the durable terminal
 results; a rejected batch falls back to independent reservations without undoing those results.
+
+Page-lifetime maintenance reads and validates the current journal and registrations on every
+call. Healthy version 4 state needs no maintenance locks or writes when no writer is observed
+before or after the reads. This is not an execution permit or an atomic snapshot. Migration,
+damage, legacy entries, orphan registrations and observed writers use the original locked
+path and read the evidence again. Admission, execution and state-changing transactions keep
+their locks and authority checks.
 
 Counters are disabled unless the profiler sets `CGW_RUNTIME_PERFORMANCE_DIR`. The profiler
 flushes before a test file's isolated global is discarded and at normal process exit. A
@@ -120,8 +131,8 @@ Reports go to separate run directories under ignored `output/test-performance/`.
 `CGW_TEST_PROFILE_DIR` to choose another output directory. To profile the recovery tests:
 
 ```sh
-bun run test --parallel=1 tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
-bun run test --parallel=2 tests/session-continuity-adapter.test.ts tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
+bun run test --parallel=1 tests/session-continuity tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
+bun run test --parallel=2 tests/session-continuity tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
 ```
 
 For hosted measurements, manually run the CI workflow on the same revision with
@@ -131,9 +142,10 @@ as wall time. Keep failures in the comparison. A faster local macOS run does not
 a Windows improvement.
 
 Each run starts with an empty timing file, so earlier measurements do not change file
-scheduling. Splitting a large test file is a separate experiment after the two-worker
-measurements. Do not remove durability checks, cache PID liveness, or skip recovery tests
-to improve a benchmark.
+scheduling. The `tests/session-continuity` path filter selects all continuity test files,
+including the split integration suite. Compare the complete selected set when evaluating
+file distribution. Do not remove durability checks, cache PID liveness, or skip recovery
+tests to improve a benchmark.
 
 ## Repeat a comparison on one runner
 
@@ -160,7 +172,7 @@ This worker-count comparison is not a version A/B comparison. For two prepared c
 with the accepted clock repair and identical profiling support, use:
 
 ```sh
-bun run scripts/compare-test-versions.ts --baseline=/path/to/A --candidate=/path/to/B tests/session-continuity-adapter.test.ts
+bun run scripts/compare-test-versions.ts --baseline=/path/to/A --candidate=/path/to/B tests/session-continuity
 ```
 
 The driver fixes two workers and runs `A, B, B, A`. Both checkouts need frozen root and

@@ -134,7 +134,8 @@ test("measurement fingerprint includes every production and fixture probe file",
     const original = measurementFingerprint(directory);
     expect(original.measurementFiles.map(entry => entry.file)).toEqual([...MEASUREMENT_FILES]);
     for (const file of ["src/adapters/chatgpt-web/continuity-recovery-store.ts", "src/adapters/chatgpt-web/recovery-durability.ts",
-      "tests/session-continuity-adapter.test.ts", "tests/helpers/retained-compaction-fixture.ts", "tests/helpers/retained-fixture-cleanup.ts"]) {
+      "tests/session-continuity-adapter.test.ts", "tests/helpers/session-continuity-fixture.ts",
+      "tests/helpers/retained-compaction-fixture.ts", "tests/helpers/retained-fixture-cleanup.ts"]) {
       const contents = readFileSync(join(directory, file));
       writeFileSync(join(directory, file), Buffer.concat([contents, Buffer.from("\n// different measurement patch\n")]));
       expect(measurementFingerprint(directory).toolDigest).not.toBe(original.toolDigest);

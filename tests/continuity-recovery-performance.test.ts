@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ContinuityRecoveryStore, continuityProcessInstance, type AdmitRecoveryWorkInput } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { acquireContinuityStorageLock, ContinuityRecoveryStore, continuityProcessInstance, type AdmitRecoveryWorkInput } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 import { acceptRecoveryResults, evictOptionalRecoveryResults, recoveryContext, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { parseRequest } from "../src/responses/parser";
@@ -48,6 +48,60 @@ function child(path: string, code: string): string {
 afterEach(() => {
   for (const path of runtimeRoots.splice(0)) evictOptionalRecoveryResults(path);
   for (const path of roots.splice(0)) fs.rmSync(path, { recursive: true, force: true });
+});
+
+test("healthy page-lifetime reconciliation reads current evidence without filesystem mutations", () => {
+  const { path, file, store, record } = fixture();
+  const original = fs.readFileSync(file, "utf8");
+  const mkdir = spyOn(fs, "mkdirSync"), write = spyOn(fs, "writeFileSync");
+  try {
+    expect(store.promotePageLifetime()).toBe(false);
+    expect(new ContinuityRecoveryStore(path).promotePageLifetime()).toBe(false);
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, "utf8")).toBe(original);
+    expect(store.get(thread)).toEqual(record);
+  } finally { mkdir.mockRestore(); write.mockRestore(); }
+});
+
+for (const name of ["write.lock", "recovery.write.lock"]) test(`page-lifetime reconciliation still rejects a held ${name}`, () => {
+  const { path, store } = fixture();
+  expect(store.promotePageLifetime()).toBe(false);
+  const release = acquireContinuityStorageLock(join(path, name));
+  try { expect(() => store.promotePageLifetime()).toThrow("busy"); }
+  finally { release(); }
+  expect(store.promotePageLifetime()).toBe(false);
+});
+
+test("page-lifetime reconciliation detects a writer that starts during its read-only check", () => {
+  const { path, store } = fixture();
+  const readFile = fs.readFileSync;
+  let release: (() => void) | undefined;
+  const read = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+    const contents = readFile(...args);
+    if (args[0] === join(path, "threads.json") && !release) {
+      release = acquireContinuityStorageLock(join(path, "write.lock"));
+    }
+    return contents;
+  }) as typeof fs.readFileSync);
+  try { expect(() => store.promotePageLifetime()).toThrow("busy"); }
+  finally { read.mockRestore(); release?.(); }
+  expect(store.promotePageLifetime()).toBe(false);
+});
+
+test("page-lifetime reconciliation retries a new orphan after its admission lock is released", () => {
+  const { path, store, record } = fixture();
+  expect(store.promotePageLifetime()).toBe(false);
+  const orphan = "7".repeat(64), registrations = new ContinuityRegistrationStore(path);
+  registrations.claim(orphan, scope, owner.id);
+  const release = acquireContinuityStorageLock(join(path, `${orphan}.admission.lock`));
+  try {
+    expect(store.promotePageLifetime()).toBe(false);
+    expect(registrations.get(orphan)).toBeDefined();
+  } finally { release(); }
+  expect(store.promotePageLifetime()).toBe(true);
+  expect(registrations.get(orphan)).toBeUndefined();
+  expect(store.get(thread)).toEqual(record);
 });
 
 test("empty transactions, repeated admission and confirmation reuse a completed commit across store instances", () => {
