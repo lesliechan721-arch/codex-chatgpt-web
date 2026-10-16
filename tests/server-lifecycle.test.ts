@@ -2,6 +2,7 @@ import { expect, spyOn } from "bun:test";
 import { performanceTest } from "./helpers/performance-test";
 const test = performanceTest(import.meta.path);
 import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3264,6 +3265,78 @@ test("a full-mode runtime exposes its broker endpoint before any turn registers"
   } finally {
     await server.stop(true);
     await closeTurnBrokers();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("slow broker checks preserve health identity and controlled launcher stop", async () => {
+  const { RuntimeSupervisor } = createRequire(import.meta.url)("../launcher/electron/runtime-supervisor.cjs");
+  const root = mkdtempSync(join(tmpdir(), "cgw-health-slow-"));
+  const config = { ...defaultConfig("full"), port: 0, brokerSocketPath: defaultBrokerEndpoint(root) };
+  const server = startServer(config, { accessPolicy: OPENAI_ACCESS });
+  const broker = TurnBroker.forSocket(config.brokerSocketPath);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let restore = () => {};
+  let waiting: Promise<void> | undefined;
+  let waitingState = "pending";
+  try {
+    await broker.listen();
+    const token = await broker.registerSafe({
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" }, tools: [],
+    }, "surface_nonce_slow_health_stop_0123456789");
+    waiting = broker.waitForSafeStart(token).then(
+      () => { waitingState = "resolved"; },
+      error => { waitingState = error.message; },
+    );
+    const endpoint = broker as unknown as {
+      dispatch(request: { method: string }, signal?: AbortSignal): Promise<unknown>;
+    };
+    const originalDispatch = endpoint.dispatch.bind(broker);
+    const dispatch = spyOn(endpoint, "dispatch").mockImplementation(async (request, signal) => {
+      if (request.method === "owner_status") await gate;
+      return originalDispatch(request, signal);
+    });
+    restore = () => dispatch.mockRestore();
+    const checking = broker.checkHealth();
+    const baseUrl = `http://127.0.0.1:${server.port}`;
+    const health = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(2_000) });
+    expect(health.status).toBe(503);
+    expect(await health.json()).toMatchObject({
+      status: "degraded", service: "codex-chatgpt-web", pid: process.pid,
+      broker_available: false, accepting_turns: false,
+    });
+
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => config.releaseVersion, isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: root, coreHome: root, browserDescriptorPath: join(root, "launcher.json"),
+    });
+    supervisor.readConfig = () => ({ ...config, port: server.port });
+    supervisor.readState = () => null;
+    supervisor.clearState = () => {};
+    supervisor.tryWriteState = () => true;
+    supervisor.adoptConfiguredTunnelForStop = async () => {};
+    let shutdowns = 0;
+    supervisor.shutdownDaemon = async () => { shutdowns++; supervisor.daemon = null; };
+    supervisor.daemon = { pid: process.pid, exitCode: null, signalCode: null };
+    expect(await supervisor.performStopForSetup()).toEqual({ status: "stopped" });
+    expect(shutdowns).toBe(1);
+    expect(waitingState).toBe("pending");
+
+    release();
+    expect(await checking).toBe(true);
+    const recovered = await fetch(`${baseUrl}/healthz`);
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toMatchObject({ broker_available: true, accepting_turns: false });
+    expect(waitingState).toBe("pending");
+  } finally {
+    release();
+    restore();
+    await server.stop(true);
+    await broker.close();
+    await waiting;
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -1771,7 +1771,20 @@ export function startServer(
         );
       }
       if (req.method === "GET" && url.pathname === "/healthz") {
-        const available = turnBroker ? await brokerAvailable() : null;
+        let available: boolean | null = null;
+        if (turnBroker) {
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            // Identity consumers have a 2-second deadline. Report degraded while
+            // the full broker check continues, without retiring its waiting turns.
+            available = await Promise.race([
+              brokerAvailable(),
+              new Promise<false>(resolve => { timeout = setTimeout(() => resolve(false), 500); }),
+            ]);
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
         const healthy = available !== false;
         return Response.json({
           status: healthy ? "ok" : "degraded",

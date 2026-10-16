@@ -343,6 +343,46 @@ test("reapplying safe socket permissions keeps the same broker owner and waiting
   }
 });
 
+test("slow owner-status responses keep waiting turns and their active owners alive", async () => {
+  const { root, broker, environment } = fixture();
+  let waiting: Promise<void> | undefined;
+  let waitingState = "pending";
+  try {
+    const token = await broker.registerSafe(
+      environment,
+      "surface_nonce_slow_health_check_0123456789",
+      undefined,
+      "slow_health_check_trace",
+      true,
+    );
+    waiting = broker.waitForSafeStart(token).then(
+      () => { waitingState = "resolved"; },
+      error => { waitingState = error.message; },
+    );
+    const endpoint = broker as unknown as {
+      dispatch(request: { method: string }, signal?: AbortSignal): Promise<unknown>;
+    };
+    const originalDispatch = endpoint.dispatch.bind(broker);
+    const dispatch = spyOn(endpoint, "dispatch").mockImplementation(async (request, signal) => {
+      if (request.method === "owner_status") await Bun.sleep(750);
+      return originalDispatch(request, signal);
+    });
+    try {
+      const health = [];
+      for (let index = 0; index < 3; index += 1) health.push(await broker.checkHealth());
+      expect(health).toEqual([true, true, true]);
+      expect(broker.externalOwnerActiveCount()).toBe(1);
+      expect(waitingState).toBe("pending");
+    } finally {
+      dispatch.mockRestore();
+    }
+  } finally {
+    await broker.close();
+    await waiting;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("repeated protocol transport failures retire existing waits and release active owners", async () => {
   if (process.platform === "win32") return;
   const { root, path, broker, environment } = fixture();

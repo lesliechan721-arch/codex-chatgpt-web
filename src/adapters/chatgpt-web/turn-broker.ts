@@ -2304,8 +2304,10 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private async verifyProtocolOwner(): Promise<void> {
+    // Use the normal RPC timeout: synchronous recovery writes can delay a healthy
+    // broker's response beyond 500 ms, especially on Windows.
     const status = await callTurnBroker<{ protocolVersion: number; owner: string }>(
-      this.socketPath, { method: "owner_status" }, 500,
+      this.socketPath, { method: "owner_status" },
     );
     if (status?.protocolVersion !== TURN_BROKER_PROTOCOL_VERSION || status.owner !== this.ownerId) {
       this.failEndpoint(new Error("ChatGPT web turn broker endpoint owner mismatch; a runtime restart is required"));
