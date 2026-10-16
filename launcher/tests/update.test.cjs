@@ -196,7 +196,8 @@ test("startup check runs once and exposes only a newer complete release", async 
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
 
-test("a failed startup check is retried on a bounded schedule; a successful one is not repeated", async () => {
+test("a failed startup check is retried on a bounded schedule; a successful one is not repeated", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const release = {
     tag_name: "v1.2.0",
     assets: ["codex-web-gpt-1.2.0-linux-x64.AppImage", "checksums.txt"].map(name => ({
@@ -216,7 +217,11 @@ test("a failed startup check is retried on a bounded schedule; a successful one 
     logger: { info() {}, warn: (event, detail) => logged.push({ event, detail }) },
     dependencies: { fetchRelease },
   });
-  const settle = () => new Promise(resolve => setTimeout(resolve, 60));
+  const advance = async (ms) => {
+    t.mock.timers.tick(ms);
+    // Let each asynchronous check finish before advancing to the next retry.
+    await new Promise(resolve => setImmediate(resolve));
+  };
 
   let calls = 0;
   const logged = [];
@@ -228,11 +233,18 @@ test("a failed startup check is retried on a bounded schedule; a successful one 
     return release;
   }, logged);
   assert.equal((await recovering.checkOnce()).status, "error");
-  await settle();
+  assert.equal(calls, 1);
+  await advance(4);
+  assert.equal(calls, 1);
+  await advance(1);
+  assert.equal(calls, 2);
+  assert.equal(recovering.getState().status, "error");
+  await advance(5);
   assert.deepEqual(recovering.getState(), { status: "available", version: "1.2.0" });
   assert.equal(calls, 3);
   assert.deepEqual(logged.map(entry => entry.detail.retryInMs), [5, 5]);
-  await settle();
+  await advance(60_000);
+  assert.deepEqual(await recovering.checkOnce(), { status: "available", version: "1.2.0" });
   assert.equal(calls, 3);
 
   let failures = 0;
@@ -241,8 +253,13 @@ test("a failed startup check is retried on a bounded schedule; a successful one 
     throw new Error("offline");
   });
   await exhausted.checkOnce();
-  await settle();
+  assert.equal(failures, 1);
+  await advance(4);
+  assert.equal(failures, 1);
+  await advance(1);
   assert.deepEqual(exhausted.getState(), { status: "error", message: "offline" });
+  assert.equal(failures, 2);
+  await advance(60_000);
   assert.equal(failures, 2);
   assert.equal((await exhausted.checkOnce()).status, "error");
   assert.equal(failures, 2);

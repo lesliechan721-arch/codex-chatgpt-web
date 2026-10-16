@@ -2395,14 +2395,21 @@ export function createChatGptWebAdapter(
                 };
                 const receipt = completedReceipt();
                 if (!receipt) return false;
+                const confirmReceipt = (): void => {
+                  const confirmed = completedReceipt();
+                  if (!confirmed || continuityDigest(confirmed) !== continuityDigest(receipt)) {
+                    throw continuityError("continuity_source_unproven", "The completed response no longer matches its accepted final receipt.");
+                  }
+                };
                 // The durable final can precede Launcher cleanup and the browser outcome.
                 // Reconnect consumes that original final; it cannot update its retired writer.
                 const outcome = await withAbort(session.browserOutcome, incoming.abortSignal);
+                // A late browser error cannot bypass ownership checks after a replacement.
+                confirmReceipt();
                 if (outcome.type === "error") throw outcome.error;
                 await withAbort(session.physicalSettlement, incoming.abortSignal);
-                const confirmed = completedReceipt();
-                if (!confirmed || continuityDigest(confirmed) !== continuityDigest(receipt)
-                  || continuityDigest(outcome.answer) !== receipt.terminalDigest) {
+                confirmReceipt();
+                if (continuityDigest(outcome.answer) !== receipt.terminalDigest) {
                   throw continuityError("continuity_source_unproven", "The completed response does not match its accepted final receipt.");
                 }
                 await ensureDriver();

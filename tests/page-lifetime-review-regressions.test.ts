@@ -1085,7 +1085,8 @@ test("page lifetime R3: registry-only migration frees 10000 admission slots with
   expect(f.pages.size).toBe(1);
 }, 30000);
 
-test("page lifetime R3: another thread retries naturally interrupted orphan cleanup after its admission lock releases", async () => {
+// This interruption requires POSIX permission bits on the registry and admission lock.
+test.skipIf(process.platform === "win32")("page lifetime R3: another thread retries naturally interrupted orphan cleanup after its admission lock releases", async () => {
   const { acquireContinuityStorageLock } = await import("../src/adapters/chatgpt-web/continuity-recovery-store");
   const f = fixture(); await f.run(f.request());
   const thread = continuityDigest(f.threadId), store = new ContinuityRecoveryStore(f.statePath), before = store.get(thread)!;
@@ -1105,10 +1106,8 @@ test("page lifetime R3: another thread retries naturally interrupted orphan clea
   const orphanLock = join(f.statePath, `${thread}.admission.lock`), unsafeUnlock = acquireContinuityStorageLock(orphanLock);
   try {
     chmodSync(orphanLock, 0o755);
-    if (process.platform !== "win32") {
-      await expect(other.run(other.request())).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
-      expect(JSON.parse(readFileSync(file, "utf8")).entries[thread]).toBeDefined();
-    }
+    await expect(other.run(other.request())).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+    expect(JSON.parse(readFileSync(file, "utf8")).entries[thread]).toBeDefined();
   } finally { chmodSync(orphanLock, 0o700); unsafeUnlock(); }
   expect((await other.run(other.request())).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(JSON.parse(readFileSync(file, "utf8")).entries[thread]).toBeUndefined();

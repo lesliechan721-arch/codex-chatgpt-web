@@ -3186,7 +3186,7 @@ async function completedInspectionFixture(manual: boolean) {
   return { ...f, parsed, source, store, thread, before, releaseInspection };
 }
 
-for (const manual of [false, true]) for (const boundary of ["settles", "observer-aborts", "business-deadline", "source-conflict", "stops", "successor"] as const) {
+for (const manual of [false, true]) for (const boundary of ["settles", "observer-aborts", "business-deadline", "source-conflict", "stops", "successor", "successor-browser-error"] as const) {
   test(`review repair3: ${manual ? "Zero Risk" : "Automatic"} exact completed reconnect ${boundary}`, async () => {
     const f = await completedInspectionFixture(manual);
     const update = spyOn(f.broker, "updateEnvironment");
@@ -3229,7 +3229,7 @@ for (const manual of [false, true]) for (const boundary of ["settles", "observer
         expect(f.store.get(f.thread)!.works[f.before.currentWorkId!]!.attempts).toEqual(f.before.works[f.before.currentWorkId!]!.attempts);
         f.releaseInspection();
         await f.source.physicalSettlement;
-      } else if (boundary === "stops" || boundary === "successor") {
+      } else if (boundary === "stops" || boundary === "successor" || boundary === "successor-browser-error") {
         if (boundary === "stops") f.store.stopWork(f.thread, { scope: f.before.scope }, f.before.currentWorkId!, "user-stop");
         else {
           const next = f.next(f.parsed, "turn-after-durable-final");
@@ -3238,6 +3238,9 @@ for (const manual of [false, true]) for (const boundary of ["settles", "observer
             nativeTurnId: "turn-after-durable-final", workPayloadDigest: recoveryDigest(next._rawBody),
             snapshotDigest: recoveryDigest(next._rawBody), dispatchProtocolComplete: true, createPage: true });
           expect(f.store.get(f.thread)!.epoch).toBe(f.before.epoch + 1);
+        }
+        if (boundary === "successor-browser-error") {
+          f.source.runtime.cancel(new Error("The original browser failed after its task was replaced."));
         }
         f.releaseInspection();
         expect(await reconnect).toMatchObject({ code: "continuity_source_unproven" });
