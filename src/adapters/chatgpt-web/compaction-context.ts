@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { estimateTokens } from "../../lib/token-estimate";
+import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, type ChatGptWebBackendModel, type ChatGptWebAdapterEffort } from "../../chatgpt-web-models";
 import type { CodexParsedRequest } from "../../types";
 import { parseRequest } from "../../responses/parser";
@@ -387,19 +387,23 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
     if (performance.now() - started > limits.totalProcessingMs) {
       throw continuityError("continuity_resource_capacity", "Compaction source admission exceeded its bounded processing deadline.");
     }
-    const entry = navigator.preflightListEntry(index);
-    const entryCost = measureContextResponse(entry, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
-    if (entry.isError || entryCost.total_tokens + directory.text_tokens + errors.tokens > budget.tokens - COMPACTION_SUMMARY_RESERVE
-      || entryCost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
-      unavailable("A compaction source cannot be discovered within a bounded directory page.");
-    }
-    const result = navigator.preflightRead({ context_id: snapshot.context_id, read_ref: target.read_ref ?? "" });
-    const cost = measureContextResponse(result, { wireReserveBytes: limits.wireReserveBytes,
-      tokenReserve: limits.tokenReserve, visualTokens: target.kind === "image" ? target.visual_token_reserve ?? 0 : 0 });
-    if (result.isError || cost.total_tokens + directory.text_tokens + directory.visual_token_reserve + errors.tokens
-      > budget.tokens - COMPACTION_SUMMARY_RESERVE || cost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
-      unavailable("A compaction source cannot be returned within a bounded read.");
-    }
+    // Page sizing and admission measure the same response. Share exact token
+    // counts only during this synchronous check; release them before yielding.
+    withTokenEstimateCache(() => {
+      const entry = navigator.preflightListEntry(index);
+      const entryCost = measureContextResponse(entry, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
+      if (entry.isError || entryCost.total_tokens + directory.text_tokens + errors.tokens > budget.tokens - COMPACTION_SUMMARY_RESERVE
+        || entryCost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+        unavailable("A compaction source cannot be discovered within a bounded directory page.");
+      }
+      const result = navigator.preflightRead({ context_id: snapshot.context_id, read_ref: target.read_ref ?? "" });
+      const cost = measureContextResponse(result, { wireReserveBytes: limits.wireReserveBytes,
+        tokenReserve: limits.tokenReserve, visualTokens: target.kind === "image" ? target.visual_token_reserve ?? 0 : 0 });
+      if (result.isError || cost.total_tokens + directory.text_tokens + directory.visual_token_reserve + errors.tokens
+        > budget.tokens - COMPACTION_SUMMARY_RESERVE || cost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+        unavailable("A compaction source cannot be returned within a bounded read.");
+      }
+    });
     if (performance.now() - yieldedAt >= 8) {
       await new Promise<void>(resolve => setImmediate(resolve)); yieldedAt = performance.now();
     }

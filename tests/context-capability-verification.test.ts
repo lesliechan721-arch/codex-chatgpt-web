@@ -45,6 +45,12 @@ function tools(mode: "automatic" | "manual" = "automatic") {
     required: ["context_id"], oneOf: [{ required: [key], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [key] } }],
   } }));
 }
+function verificationStopped(signal: AbortSignal): Promise<string> {
+  return new Promise(resolveStopped => {
+    if (signal.aborted) resolveStopped("Stopped");
+    else signal.addEventListener("abort", () => resolveStopped("Stopped"), { once: true });
+  });
+}
 describe("context capability evidence", () => {
   test("installed runtime has both current public read contracts, without proving remote callability", async () => {
     const f = fixture(); const automatic = await installedContextCapabilitySchemaDigest(f.config);
@@ -223,17 +229,57 @@ describe("context capability evidence", () => {
   test("a typed success reply does not verify and a failed retry clears the previous proof", async () => {
     const f = fixture(); const schema = await installedContextCapabilitySchemaDigest(f.config);
     saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
-    await expect(runContextCapabilityVerification(f.config, { home: f.home, timeoutMs: 2_000,
+    await expect(runContextCapabilityVerification(f.config, { home: f.home, timeoutMs: 15_000,
       automaticRun: async turn => { await turn.onSubmitted?.(); return "All six tools succeeded"; } })).rejects.toThrow("without all six");
     expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
   });
   test("cancelled verification clears old evidence and cannot save partial transport success", async () => {
     const f = fixture(), schema = await installedContextCapabilitySchemaDigest(f.config);
     saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+    const broker = TurnBroker.forSocket(f.config.brokerSocketPath);
+    const client = new Client({ name: "cancelled-verification-test", version: "1" });
     const controller = new AbortController();
-    await expect(runContextCapabilityVerification(f.config, { home: f.home, timeoutMs: 2_000, abortSignal: controller.signal,
-      automaticRun: async turn => { await turn.onSubmitted?.(); controller.abort(new Error("User cancelled verification")); return "Cancelled"; } })).rejects.toThrow("cancelled");
-    expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+    let partialSuccess!: () => void;
+    const partialReady = new Promise<void>(resolveReady => { partialSuccess = resolveReady; });
+    let outcome: Promise<unknown> | undefined;
+    try {
+      await broker.listen();
+      await client.connect(new StdioClientTransport({ command: process.execPath,
+        args: [resolve("src/cli.ts"), "mcp", "--contract", "native", "--broker-socket", f.config.brokerSocketPath], stderr: "pipe" }));
+      outcome = runContextCapabilityVerification(f.config, { home: f.home, broker, timeoutMs: 15_000, abortSignal: controller.signal,
+        automaticRun: async turn => {
+          const prompt = await turn.prepare();
+          await turn.onSubmitted?.();
+          const firstCall = prompt.text.split("\n").find(line => line.startsWith("Call "))!;
+          const match = /^Call (codex_context_\w+) with (\{.*\})\.$/.exec(firstCall)!;
+          expect((await client.callTool({ name: match[1]!, arguments: JSON.parse(match[2]!) })).isError).not.toBe(true);
+          partialSuccess();
+          return verificationStopped(turn.abortSignal!);
+        } }).then(() => undefined, error => error);
+      await Promise.race([partialReady,
+        outcome.then(error => { throw new Error("Verification ended before partial transport success", { cause: error }); })]);
+      expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+      const cancellation = new Error("User cancelled verification");
+      controller.abort(cancellation);
+      expect(await outcome).toBe(cancellation);
+      expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+    } finally {
+      controller.abort(new Error("Cancellation test cleanup"));
+      await outcome;
+      await client.close();
+      await broker.close();
+    }
+  });
+  test("verification timeout clears old evidence without saving incomplete receipts", async () => {
+    const f = fixture(), schema = await installedContextCapabilitySchemaDigest(f.config);
+    saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+    const broker = TurnBroker.forSocket(f.config.brokerSocketPath);
+    try {
+      await broker.listen();
+      await expect(runContextCapabilityVerification(f.config, { home: f.home, broker, timeoutMs: 100,
+        automaticRun: turn => verificationStopped(turn.abortSignal!) })).rejects.toThrow("timed out");
+      expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+    } finally { await broker.close(); }
   });
   test("verify-context --json keeps a self-owned Broker's diagnostics outside its single JSON stdout", async () => {
     const f = fixture();

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { inflateSync } from "node:zlib";
+import { crc32, inflateSync } from "node:zlib";
 import { chatGptWebImageTokenReserve } from "../../chatgpt-web-models";
 import { parseRequest } from "../../responses/parser";
 import { contextSourceParserModel } from "./context-source-parser";
@@ -25,14 +25,6 @@ const MAX_WEBP_FRAMES = 256;
 const invalidImage = (): never => { throw new Error("Invalid or unsupported fixed context image"); };
 function dimensions(width: number, height: number): void {
   if (!width || !height || width * height > MAX_IMAGE_PIXELS) invalidImage();
-}
-function crc32(bytes: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
 }
 function validatePng(bytes: Buffer): void {
   if (bytes.length < 57 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) invalidImage();
@@ -384,7 +376,7 @@ export class ContextSnapshot {
   readonly #targetsByReadRef = new Map<string, ContextTarget>();
 
   /** Use createContextSnapshot or restoreContextSnapshot; this constructor validates the wire. */
-  constructor(wire: ContextSnapshotWire, maxStorageBytes = CONTEXT_LIMITS.maxStorageBytes) {
+  constructor(wire: unknown, maxStorageBytes = CONTEXT_LIMITS.maxStorageBytes) {
     validateWire(wire, maxStorageBytes);
     this.#wire = freeze(structuredClone(wire));
     this.context_id = wire.context_id;
@@ -415,8 +407,7 @@ export class ContextSnapshot {
 
 export function serializeContextSnapshot(snapshot: ContextSnapshot): ContextSnapshotWire { return snapshot.toWire(); }
 export function restoreContextSnapshot(wire: unknown, options: { maxStorageBytes?: number } = {}): ContextSnapshot {
-  validateWire(wire, options.maxStorageBytes ?? CONTEXT_LIMITS.maxStorageBytes);
-  return new ContextSnapshot(wire as ContextSnapshotWire, options.maxStorageBytes);
+  return new ContextSnapshot(wire, options.maxStorageBytes);
 }
 
 function normalizedContext(parsed: CodexParsedRequest): string {

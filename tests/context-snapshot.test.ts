@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { parseRequest } from "../src/responses/parser";
 import { encodeCompactionSummary } from "../src/responses/compaction";
-import { assertSupportedContextImage, contextSnapshotPriorityImageLocators, createContextSnapshot, restoreContextSnapshot, serializeContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
+import { assertSupportedContextImage, ContextSnapshot, contextSnapshotPriorityImageLocators, createContextSnapshot, restoreContextSnapshot, serializeContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import type { CodexParsedRequest } from "../src/types";
 import { defaultConfig } from "../src/config";
@@ -195,6 +195,19 @@ describe("immutable context source contract", () => {
     expect(restoreContextSnapshot(wire, { maxStorageBytes: snapshot.storage_bytes }).storage_bytes).toBe(snapshot.storage_bytes);
   });
 
+  test("public construction revalidates unknown and previously accepted wire after mutation", () => {
+    const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: "Original fixed source" }));
+    const wire = serializeContextSnapshot(snapshot);
+    const restored = restoreContextSnapshot(wire), direct = new ContextSnapshot(wire);
+    expect(direct.targets).toEqual(restored.targets);
+    expect(() => new ContextSnapshot(null)).toThrow();
+    expect(() => restoreContextSnapshot(null)).toThrow();
+    (wire.payloads[0] as { text: string }).text = "Changed after successful validation";
+    expect(() => new ContextSnapshot(wire)).toThrow("text payload");
+    expect(() => restoreContextSnapshot(wire)).toThrow("text payload");
+    for (const accepted of [direct, restored]) expect(accepted.getText(accepted.targets[0]!.read_ref!)).toBe("Original fixed source");
+  });
+
   test("keeps raw system images, including image-only sources, and file IDs have no false read reference", () => {
     const parsed = parseRequest({ model: "gpt-6", instructions: "system instructions", input: [
       { role: "system", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] },
@@ -344,24 +357,25 @@ describe("immutable context source contract", () => {
 
   test("bounded normal preparation preserves current required images ahead of oversized historical storage", () => {
     const valid = Buffer.from(png, "base64");
-    const history = Buffer.concat([valid.subarray(0, -12), pngChunk("ruSt", Buffer.alloc(3 * 1024 * 1024 - valid.length - 12)), valid.subarray(-12)]);
-    expect(history.length).toBe(3 * 1024 * 1024);
+    const history = Buffer.concat([valid.subarray(0, -12), pngChunk("ruSt", Buffer.alloc(3 * 1024 - valid.length - 12)), valid.subarray(-12)]);
+    expect(history.length).toBe(3 * 1024);
     const historyUrl = `data:image/png;base64,${history.toString("base64")}`;
     const parsed = parseRequest({ model: "gpt-6", input: [
       ...Array.from({ length: 9 }, (_, index) => ({ type: "function_call_output", call_id: `old-${index}`, output: [{ type: "input_image", image_url: historyUrl }] })),
       { role: "user", content: [{ type: "input_text", text: "Current instruction remains complete" }, { type: "input_image", image_url: `data:image/png;base64,${png}` }] },
     ] });
-    const snapshot = createContextSnapshot(parsed, { imageStoragePolicy: "bounded", priorityImageLocators: contextSnapshotPriorityImageLocators(parsed, { messageIndices: [9], rawInputIndices: [9] }) });
+    const maxStorageBytes = 32 * 1024;
+    const snapshot = createContextSnapshot(parsed, { maxStorageBytes, imageStoragePolicy: "bounded", priorityImageLocators: contextSnapshotPriorityImageLocators(parsed, { messageIndices: [9], rawInputIndices: [9] }) });
     const current = snapshot.targets.find(t => t.original_role === "user" && t.kind === "image")!;
     expect(current.read_ref).toBeString(); expect(Buffer.from(snapshot.getImage(current.read_ref!)!.bytes)).toEqual(valid);
-    expect(snapshot.storage_bytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(snapshot.storage_bytes).toBeLessThanOrEqual(maxStorageBytes);
     const historical = snapshot.targets.filter(t => t.original_role === "toolResult");
     expect(historical).toHaveLength(9); expect(historical.some(t => t.read_ref === null)).toBe(true);
     expect(historical.filter(t => !t.read_ref).every(t => t.unavailable_reason!.includes("storage"))).toBe(true);
     expect(snapshot.getText(snapshot.targets.find(t => t.kind === "message_text")!.read_ref!)).toBe("Current instruction remains complete");
-    expect(restoreContextSnapshot(serializeContextSnapshot(snapshot)).targets).toEqual(snapshot.targets);
-    expect(() => createContextSnapshot(parsed)).toThrow("storage budget"); // Complete compaction preparation stays strict.
-  }, 30000);
+    expect(restoreContextSnapshot(serializeContextSnapshot(snapshot), { maxStorageBytes }).targets).toEqual(snapshot.targets);
+    expect(() => createContextSnapshot(parsed, { maxStorageBytes })).toThrow("storage budget"); // Complete compaction preparation stays strict.
+  });
 
   test("bounded priority is a candidate locator policy and does not gate unselected images", () => {
     const parsed = parseRequest({ model: "gpt-6", input: [{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] }, { role: "user", content: [{ type: "input_image", file_id: "unselected" }] }] });

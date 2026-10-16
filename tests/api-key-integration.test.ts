@@ -78,7 +78,7 @@ async function unusedPort(): Promise<number> {
 }
 
 function cli(args: string[]) {
-  return Bun.spawnSync(
+  const result = Bun.spawnSync(
     [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "--home", process.env.CODEX_CHATGPT_WEB_HOME!, ...args],
     {
       env: {
@@ -87,8 +87,14 @@ function cli(args: string[]) {
       },
       stdout: "pipe",
       stderr: "pipe",
+      timeout: 15_000,
     },
   );
+  if (result.exitCode !== 0) {
+    throw new Error(`CLI ${args.join(" ")} failed: exit=${result.exitCode}; signal=${result.signalCode}`
+      + `\nstdout: ${result.stdout.toString().slice(-8_192)}\nstderr: ${result.stderr.toString().slice(-8_192)}`);
+  }
+  return result;
 }
 test("API cleanup removes recorded routes/features/hooks but retains the user's provider", () => {
   injected(); expect(cleanupApiKeyCodexIntegration().changed).toBe(true);
@@ -134,7 +140,6 @@ test("API preflight accepts manual providers and creates no Codex injection", ()
   api(); preflightSetup({ mode: "browser-only", browserHostDescriptorPath: join(home, "browser.json"), acknowledgedUnofficial: true });
   expect(existsSync(getCodexConfigPath())).toBe(false); expect(existsSync(getCodexJournalPath())).toBe(false);
 });
-// Three CLI commands and one server startup share the test timeout.
 test("manual server mode leaves recorded Codex client files byte-for-byte unchanged on API enable, rotate and serve", async () => {
   const port = await unusedPort();
   saveApiAccessPolicy(OPENAI_ACCESS);
@@ -172,25 +177,54 @@ test("manual server mode leaves recorded Codex client files byte-for-byte unchan
       stderr: "pipe",
     },
   );
+  const logs = { stdout: "", stderr: "" };
+  const drain = async (stream: ReadableStream<Uint8Array>, name: keyof typeof logs) => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        logs[name] = (logs[name] + decoder.decode(value, { stream: true })).slice(-8_192);
+      }
+      logs[name] = (logs[name] + decoder.decode()).slice(-8_192);
+    } finally { reader.releaseLock(); }
+  };
+  const output = Promise.allSettled([drain(serve.stdout, "stdout"), drain(serve.stderr, "stderr")]);
+  let exitCode: number | undefined;
+  const exited = serve.exited.then(code => { exitCode = code; });
+  let failure: unknown;
   try {
-    let healthy = false;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    const deadline = performance.now() + 15_000;
+    let lastFailure = "no health response";
+    for (;;) {
+      if (exitCode !== undefined) throw new Error("Server exited before becoming healthy");
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error(`Server health deadline exceeded: ${lastFailure}`);
       try {
-        const response = await fetch(`http://127.0.0.1:${port}/healthz`);
-        if (response.ok) {
-          healthy = true;
-          break;
-        }
-      } catch {}
-      await Bun.sleep(20);
+        const response = await fetch(`http://127.0.0.1:${port}/healthz`, {
+          signal: AbortSignal.timeout(Math.max(1, Math.min(1_000, Math.ceil(remaining)))),
+        });
+        await response.body?.cancel();
+        if (response.ok) break;
+        lastFailure = `HTTP ${response.status}`;
+      } catch (error) { lastFailure = String(error); }
+      await Promise.race([Bun.sleep(Math.min(50, Math.max(0, deadline - performance.now()))), exited]);
     }
-    expect(healthy).toBeTrue();
     expect(clientFileSnapshot()).toEqual(before);
+  } catch (error) {
+    failure = error;
   } finally {
-    serve.kill();
-    await serve.exited;
+    if (serve.exitCode === null) serve.kill();
+    const forceStop = setTimeout(() => serve.kill("SIGKILL"), 3_000);
+    try { await exited; await output; }
+    finally { clearTimeout(forceStop); }
   }
-}, 15_000);
+  if (failure) {
+    throw new Error(`${String(failure)}; server exit=${exitCode}; signal=${serve.signalCode}`
+      + `\nstdout: ${logs.stdout}\nstderr: ${logs.stderr}`, { cause: failure });
+  }
+}, 90_000);
 test("export shares V1 feature defaults and Interrupt command but omits conflicting auth/voice/trust", () => {
   const config = defaultConfig();
   const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json", model: "chatgpt-web/high",

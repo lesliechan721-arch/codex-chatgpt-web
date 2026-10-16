@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { chromium } from "playwright-core";
 import {
   browserLoginStateExists,
   captureSystemBrowserLogin,
@@ -12,20 +13,58 @@ import {
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
 
-test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
+async function waitForLoginPhase(path: string, outcome: Promise<unknown>, phase: string, browserReady = Promise.resolve()): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const fileReady = (async () => {
+    while (!existsSync(path) && !stopped) await Bun.sleep(10);
+  })();
+  try {
+    await Promise.race([
+      Promise.all([browserReady, fileReady]),
+      outcome.then(error => { throw new Error(`${phase}: login ended before readiness`, { cause: error }); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out during ${phase}`)), 10_000); }),
+    ]);
+  } finally {
+    stopped = true;
+    clearTimeout(timer);
+    await fileReady;
+  }
+}
+
+test("login waits for normal Chrome to exit before headed Keychain-aware capture", async () => {
   if (process.platform === "win32") return;
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-login-"));
   const executable = join(root, "fake-chrome");
   const argsLog = join(root, "args.log");
-  writeFileSync(executable, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CODEX_LOGIN_ARG_LOG\"\n", { mode: 0o700 });
+  const pidLog = join(root, "pid.log");
+  const exitRequest = join(root, "exit-request");
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    "printf '%s\\n' \"$*\" >> \"$CODEX_LOGIN_ARG_LOG\"",
+    "printf '%s\\n' \"$$\" > \"$CODEX_LOGIN_PID_LOG\"",
+    "while [ ! -f \"$CODEX_LOGIN_EXIT_REQUEST\" ]; do sleep 0.01; done",
+    "",
+  ].join("\n"), { mode: 0o700 });
   chmodSync(executable, 0o700);
   const previousLog = process.env.CODEX_LOGIN_ARG_LOG;
+  const previousPid = process.env.CODEX_LOGIN_PID_LOG;
+  const previousExit = process.env.CODEX_LOGIN_EXIT_REQUEST;
   process.env.CODEX_LOGIN_ARG_LOG = argsLog;
+  process.env.CODEX_LOGIN_PID_LOG = pidLog;
+  process.env.CODEX_LOGIN_EXIT_REQUEST = exitRequest;
+  const captureFailure = new Error("Controlled browser capture failure");
+  const capture = spyOn(chromium, "launchPersistentContext").mockRejectedValue(captureFailure);
+  let outcome: Promise<unknown> | undefined;
   try {
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "browser", "storage-state.json");
-    await loginToChatGpt(config, { timeoutMs: 100 }).catch(() => {});
+    outcome = loginToChatGpt(config).then(() => undefined, error => error);
+    await waitForLoginPhase(pidLog, outcome, "normal Chrome startup");
+    expect(capture).not.toHaveBeenCalled();
+    writeFileSync(exitRequest, "");
+    expect(await outcome).toBe(captureFailure);
 
     const launches = readFileSync(argsLog, "utf8").trim().split("\n");
     const firstLaunch = launches[0] ?? "";
@@ -33,10 +72,24 @@ test("login starts with normal Chrome and captures state in a headed Keychain-aw
     expect(firstLaunch).toContain("--user-data-dir=");
     expect(firstLaunch).toContain(CHATGPT_TEMPORARY_CHAT_URL);
     expect(firstLaunch).not.toContain("--remote-debugging-pipe");
-    expect(launches[1]).not.toContain("--headless");
+    expect(launches).toHaveLength(1);
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(capture.mock.calls[0]?.[0]).toBe(join(root, "browser", "login-profile"));
+    expect(capture.mock.calls[0]?.[1]).toMatchObject({
+      executablePath: executable,
+      headless: false,
+      ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
+    });
   } finally {
+    writeFileSync(exitRequest, "");
+    await outcome;
+    capture.mockRestore();
     if (previousLog === undefined) delete process.env.CODEX_LOGIN_ARG_LOG;
     else process.env.CODEX_LOGIN_ARG_LOG = previousLog;
+    if (previousPid === undefined) delete process.env.CODEX_LOGIN_PID_LOG;
+    else process.env.CODEX_LOGIN_PID_LOG = previousPid;
+    if (previousExit === undefined) delete process.env.CODEX_LOGIN_EXIT_REQUEST;
+    else process.env.CODEX_LOGIN_EXIT_REQUEST = previousExit;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -55,7 +108,7 @@ test("passkey login authenticates in normal Chrome before isolated offline pipe 
     "esac",
     "printf '%s\\n' \"$$\" > \"$CODEX_LOGIN_PID_LOG\"",
     "trap 'exit 0' TERM INT HUP",
-    "while :; do sleep 1; done",
+    "while :; do sleep 0.05; done",
     "",
   ].join("\n"), { mode: 0o700 });
   chmodSync(executable, 0o700);
@@ -63,23 +116,23 @@ test("passkey login authenticates in normal Chrome before isolated offline pipe 
   const previousPid = process.env.CODEX_LOGIN_PID_LOG;
   process.env.CODEX_LOGIN_ARG_LOG = argsLog;
   process.env.CODEX_LOGIN_PID_LOG = pidLog;
+  let cancelLogin: ((error: Error) => void) | undefined;
+  let outcome: Promise<unknown> | undefined;
   try {
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "transfer", "storage-state.json");
     let continueLogin!: () => void;
-    const continuation = new Promise<void>(resolve => { continueLogin = resolve; });
-    let browserReady = false;
-    const capture = captureSystemBrowserLogin(config, { continuation, timeoutMs: 5_000,
-      onBrowserReady: () => { browserReady = true; } });
-    for (let attempt = 0; attempt < 100 && !existsSync(pidLog); attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    expect(existsSync(pidLog)).toBe(true);
-    expect(browserReady).toBe(true);
+    const continuation = new Promise<void>((resolve, reject) => { continueLogin = resolve; cancelLogin = reject; });
+    let ready!: () => void;
+    const browserReady = new Promise<void>(resolve => { ready = resolve; });
+    outcome = captureSystemBrowserLogin(config, { continuation, timeoutMs: 15_000,
+      onBrowserReady: ready }).then(() => undefined, error => error);
+    await waitForLoginPhase(pidLog, outcome, "passkey Chrome startup", browserReady);
     continueLogin();
-    const error = await capture.then(() => undefined, caught => caught as Error);
+    const error = await outcome;
     expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("launchPersistentContext");
 
     const launches = readFileSync(argsLog, "utf8").trim().split("\n");
     expect(launches).toHaveLength(2);
@@ -93,6 +146,8 @@ test("passkey login authenticates in normal Chrome before isolated offline pipe 
     expect(launches[1]).toContain("--disable-background-networking");
     expect(readdirSync(join(root, "transfer")).filter(name => name.startsWith("login-profile-"))).toEqual([]);
   } finally {
+    cancelLogin?.(new Error("Passkey test cleanup"));
+    await outcome;
     if (previousArgs === undefined) delete process.env.CODEX_LOGIN_ARG_LOG;
     else process.env.CODEX_LOGIN_ARG_LOG = previousArgs;
     if (previousPid === undefined) delete process.env.CODEX_LOGIN_PID_LOG;
