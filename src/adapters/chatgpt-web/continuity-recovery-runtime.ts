@@ -30,6 +30,10 @@ export interface RuntimeRecoveryFinalReceipt {
 const resultBodies = new Map<string, Map<string, Record<string, unknown>>>();
 const resultBodyReferences = new Map<string, RuntimeRecoveryReference>();
 const resultBodyOwner = continuityProcessInstance();
+export function forgetRecoveryPage(directory: string, thread: string): void {
+  const key = `${directory}:${thread}`;
+  resultBodies.delete(key); resultBodyReferences.delete(key);
+}
 export function recoveryDigest(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
@@ -440,8 +444,12 @@ export function completeRecoveryWork(ref: RuntimeRecoveryReference, answer: stri
   return recoveryFinalReceipt(ref.directory, completed, ref.logicalWorkId);
 }
 export function stopRecoveryWork(ref: RuntimeRecoveryReference, reason: RecoveryWorkRecord["stopReason"] = "user-stop"): void {
-  const record = recoveryRecord(ref);
-  recoveryStore(ref).stopWork(ref.thread, { scope: record.scope }, ref.logicalWorkId, reason);
+  const store = recoveryStore(ref);
+  const record = store.get(ref.thread);
+  const work = record?.works[ref.logicalWorkId];
+  if (!record || !work || record.currentWorkId !== ref.logicalWorkId || work.attempts.at(-1)?.attempt !== ref.attempt
+    || ref.ownerId !== undefined && ref.ownerId !== record.owner.id) return;
+  store.stopWork(ref.thread, { scope: record.scope, expectedVersion: record.version, expectedOwner: record.owner.id }, ref.logicalWorkId, reason);
 }
 export function recoveryIdentity(record: RecoveryThreadRecord, installationId: string): ContinuityRecoveryIdentity {
   const transaction = record.transaction;

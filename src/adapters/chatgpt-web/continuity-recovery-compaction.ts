@@ -11,7 +11,7 @@ import { canonicalJson } from "./canonical-json";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { canonicalizeCompactionHandoff, existingStructuredCompactionRun, MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   runStructuredCompactionOnce, withCompactionAbort } from "./compaction-handoff";
-import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest,
+import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest, continuityCompactionSourceHistory,
   type ContinuityBinding, type ContinuityBindings, type ContinuityClaim } from "./continuity-binding";
 import { sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityLease } from "./continuity-contract";
 import { chatGptConversationKey } from "./conversation-key";
@@ -55,6 +55,7 @@ interface RecoveryCompactionPlan extends CompactionSelection {
   preserveFinalResponse: boolean;
 }
 const preparedPlans = new WeakMap<PreparedContinuityRequest, RecoveryCompactionPlan>();
+const freshPageCompactions = new WeakSet<CodexParsedRequest>();
 const requestTargets = new WeakMap<CodexParsedRequest, CompactionSelection>();
 interface HealthyCompactionObserver {
   logicalWorkId: string;
@@ -92,6 +93,10 @@ export function assertHealthyRecoveryCompactionAuthority(prepared: PreparedConti
 
 function sourcePayloadRepresentation(digest: string): string {
   return continuityDigest(["continuity-compaction-source-payload", digest]);
+}
+const REQUEST_CONTEXT_SOURCE = continuityDigest("continuity-request-context-source-v1");
+function requestContextRepresentation(parsed: CodexParsedRequest): string {
+  return continuityDigest(["continuity-request-context", continuityCompactionSourceHistory(parsed)]);
 }
 function registerTarget(store: ContinuityRecoveryStore, directory: string, record: RecoveryThreadRecord,
   input: Parameters<ContinuityRecoveryStore["registerCompactionTarget"]>[2], retainRequiredInput?: () => void,
@@ -148,6 +153,10 @@ function sourceIdentity(parsed: CodexParsedRequest, source: ChatGptTurnUserRevis
     : `turn:${source.turnId ?? identity.turnId}`;
 }
 function sourceRevisions(parsed: CodexParsedRequest, record: RecoveryThreadRecord): number[] {
+  if (freshPageCompactions.has(parsed)) return [0];
+  const contexts = Object.values(record.compactionTargets).filter(target => target.representationDigests.includes(REQUEST_CONTEXT_SOURCE)
+    && target.representationDigests.includes(requestContextRepresentation(parsed)));
+  if (contexts.length) return [...new Set(contexts.map(target => target.sourceHistoryRevision))];
   const checkpoint = continuityCheckpoint(parsed);
   if (checkpoint.index < 0) return [0];
   const matches = Object.values(record.checkpoints).filter(value => value.summaryDigest === checkpoint.digest);
@@ -187,6 +196,10 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
     throw continuityError("continuity_source_unproven", "The compaction target has no accepted source work.");
   }
   assertSourcePayload(parsed, source, target);
+  const requestContextSource = target.representationDigests.includes(REQUEST_CONTEXT_SOURCE);
+  if (requestContextSource && !target.representationDigests.includes(requestContextRepresentation(parsed))) {
+    throw continuityError("continuity_source_unproven", "The current context differs from its accepted compaction source.");
+  }
   for (const value of (parsed._rawBody as { input: unknown[] }).input) {
     const proof = continuityCheckpointSiblingProof(parsed, value);
     if (proof?.identity && target.representationDigests.includes(proof.identity)
@@ -213,7 +226,7 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
     }
   }
   const checkpoint = Object.values(record.checkpoints).find(value => value.compactionTargetId === target.compactionTargetId);
-  if (checkpoint && selectedResults.length) {
+  if (checkpoint && selectedResults.length && !requestContextSource) {
     const sourceCalls = Object.values(record.calls).filter(call => call.workLineageId === target.workLineageId);
     assertContinuityToolResultReplayEvidence(parsed, {
       results: sourceCalls.filter(call => call.batchSequence === target.sourceToolBatchHeadSequence
@@ -274,6 +287,33 @@ export function compileRecoveryCompactionInput(parsed: CodexParsedRequest, capab
   return compiled;
 }
 
+/** A closed/unknown source is supplied by this request, never by an old task ledger. */
+export async function prepareFreshRecoveryCompaction(parsed: CodexParsedRequest, provider: CodexProviderConfig,
+  namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
+  bindings: ContinuityBindings, descriptor: string, abortSignal?: AbortSignal,
+  assertExecutionCompatible?: () => Promise<void>, verifyContextCapability?: () => Promise<void>): Promise<PreparedContinuityRequest> {
+  await assertExecutionCompatible?.();
+  abortSignal?.throwIfAborted();
+  const source = extractChatGptCompactionSourceRevision(parsed);
+  const native = extractChatGptTurnIdentity(parsed);
+  const epoch = Number.parseInt(randomBytes(6).toString("hex"), 16);
+  parsed._continuityPageGeneration = epoch;
+  parsed._continuityEpoch = epoch; parsed._continuityAttempt = 0; parsed._continuityHistoryRevision = 0;
+  const logicalWorkId = recoveryDigest([parsed._continuityScope, sourceIdentity(parsed, source), "source", epoch]);
+  const store = bindings.recoveryStore;
+  let record = store.admitWork({ thread: continuityDigest(native.threadId!), scope: parsed._continuityScope!,
+    owner: continuityProcessInstance(bindings.owner), logicalWorkId, instructionIdentity: sourceIdentity(parsed, source),
+    nativeTurnId: source.turnId ?? native.turnId, workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed),
+    snapshotDigest: recoveryDigest(parsed.context), createPage: false, dispatchProtocolComplete: true, initialEpoch: epoch });
+  // This source is context, never an executable replacement of its historical calls.
+  record = store.retireAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, logicalWorkId, 0);
+  freshPageCompactions.add(parsed);
+  const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, record,
+    descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+  if (!prepared) throw continuityError("continuity_context_missing", "The current request cannot form a readable compaction source.");
+  return prepared;
+}
+
 /** Called before retained-page checks so completed results and confirmed loss remain recoverable. */
 export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, provider: CodexProviderConfig,
   namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
@@ -324,6 +364,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
       acceptedTaskRevision: source.acceptedTaskRevision, sourceHistoryRevision: revisions[0],
       sourceToolBatchHeadSequence: sequence, representationDigests: [continuitySourceRepresentationDigest(parsed, sourceRevision),
         sourcePayloadRepresentation(source.workPayloadDigest), CONTINUITY_CHECKPOINT_SIBLING_PROOF,
+        ...(freshPageCompactions.has(parsed) ? [REQUEST_CONTEXT_SOURCE, requestContextRepresentation(parsed)] : []),
         continuityCheckpointSiblingGroup(siblings), ...siblings.flatMap(proof => proof.identity ? [proof.identity, proof.representation] : [proof.representation])],
       checkpointBytes: MAX_CONTINUITY_RECOVERY_ITEM_BYTES,
     }, () => {
@@ -366,7 +407,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   }
   // A network observer attaches to the existing transaction. It never retires that writer.
   const observedRun = existingStructuredCompactionRun<string>(executionKey, compactionPayloadDigest(parsed, selection.target), {
-    ownerKey: `${namespace}:continuity-recovery:${record.thread}`,
+    ownerKey: `${namespace}:continuity-recovery:${record.thread}:${parsed._continuityPageGeneration}`,
     traceIds: [createHash("sha256").update(`${executionKey}:recovery-handoff`).digest("hex").slice(0, 12)],
     nativeThreadId: identity.threadId, nativeTurnId: identity.turnId,
   });
@@ -406,6 +447,10 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     // Let the caller revalidate the original identity before reading that old source.
     const afterUsage = store.get(record.thread);
     if (afterUsage?.historyRevision !== record.historyRevision || afterUsage.currentWorkId !== record.currentWorkId) return undefined;
+    // The ordinary final can win while this active-source preview waits. Keep
+    // that result on the retained path; this request did not start an ended turn.
+    if (isChatGptWebZeroRiskBackendModel(parsed.modelId)
+      && afterUsage.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
     const preview = previewRetainedCompactionSource(parsed, source);
     const snapshot = preview.snapshot;
     const pageTokens = Math.max(observed.retainedPageTokens ?? 0, preview.coverage.pageTokenReserve());
@@ -425,11 +470,13 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   await assertExecutionCompatible?.();
   abortSignal?.throwIfAborted();
   const afterCompatibility = store.get(record.thread)!;
+  if (isChatGptWebZeroRiskBackendModel(parsed.modelId) && !endedManual
+    && afterCompatibility.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
   if (afterCompatibility.version !== record.version) {
     return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
       descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
   }
-  if (isChatGptWebZeroRiskBackendModel(parsed.modelId) && !endedManual) throw continuityError("continuity_manual_handoff_required");
+  if (isChatGptWebZeroRiskBackendModel(parsed.modelId) && !endedManual && !freshPageCompactions.has(parsed)) throw continuityError("continuity_manual_handoff_required");
   const sourceAttempt = selection.source.attempts.at(-1);
   if (!sourceAttempt) throw continuityError("continuity_source_unproven");
   const accepted = observed?.acceptedHandoff;
@@ -450,7 +497,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   const coveredCheckpoint = Object.values(record.checkpoints).find(checkpoint => checkpoint.summaryDigest === checkpointDigest
     && checkpoint.targetHistoryRevision === selection!.target.sourceHistoryRevision
     && checkpoint.workLineageId === selection!.target.workLineageId);
-  const input = retainedInput ?? recoveryContext(parsed, { directory: bindings.registrations.directory,
+  const input = freshPageCompactions.has(parsed) ? structuredClone(parsed) : retainedInput ?? recoveryContext(parsed, { directory: bindings.registrations.directory,
     thread: record.thread, logicalWorkId: selection.source.logicalWorkId, attempt: sourceAttempt.attempt }, coveredCheckpoint?.commitId);
   let sourceSnapshot: ContextSnapshot | undefined;
   if (!acceptedHandoff) {
@@ -475,7 +522,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
       && coveredCheckpoint.sourceToolBatchHeadSequence === selection.target.sourceToolBatchHeadSequence;
     // A committed checkpoint can represent its exact already-covered range. It does not
     // authorize unknown source material after that accepted revision/tool-batch boundary.
-    if (coverage.length || !fullyCovered) {
+    if (!freshPageCompactions.has(parsed) && (coverage.length || !fullyCovered)) {
       CompactionSourceCoverage.assertRecordedSource(sourceSnapshot, coverage.map(entry => entry.metadata), selection.target.sourceHistoryRevision);
     }
   }
@@ -498,6 +545,11 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     }
   }
   // This coordinator verifies the target thread's retired authority, not merely a live PID.
+  if (!freshPageCompactions.has(parsed) && observed?.lease) {
+    const page = await inspectLauncherContinuityConversation(descriptor,
+      observed.conversation?.key ?? chatGptConversationKey(parsed, namespace)!, observed.lease);
+    if (page.state !== "ready" && page.state !== "running") throw continuityError("continuity_session_lost");
+  }
   const { retireRecoveryWriter } = await import("./continuity-recovery-runtime");
   const currentCompaction = record.works[`compaction:${selection.target.compactionTargetId}`];
   const currentAttempt = currentCompaction?.attempts.at(-1);
@@ -508,7 +560,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     !== recoveryDigest(canonicalJson(recoveryIdentity(record, store.installationId())))) {
     throw continuityError("continuity_source_unproven", "The known unacquired retry no longer matches its original reservation.");
   }
-  if (!waitingAcquisition) record = await retireRecoveryWriter(bindings, record, descriptor);
+  if (!waitingAcquisition && !freshPageCompactions.has(parsed)) record = await retireRecoveryWriter(bindings, record, descriptor);
   const shadow = record.works[`compaction:${selection.target.compactionTargetId}`];
   if (shadow?.activationState === "shadow") {
     const attempt = shadow.attempts.at(-1)!;
@@ -812,7 +864,9 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
   const identity = extractChatGptTurnIdentity(parsed);
   const traceId = createHash("sha256").update(`${prepared.executionKey}:recovery-handoff`).digest("hex").slice(0, 12);
   const running = runStructuredCompactionOnce(prepared.executionKey, {
-    ownerKey: `${namespace}:continuity-recovery:${prepared.binding.thread}`, traceIds: [traceId],
+    ownerKey: `${namespace}:continuity-recovery:${prepared.binding.thread}:${prepared.binding.pageGeneration ?? parsed._continuityPageGeneration}`, traceIds: [traceId],
+    page: { directory: prepared.bindings.registrations.directory, thread: prepared.binding.thread,
+      epoch: prepared.binding.pageGeneration ?? parsed._continuityPageGeneration! },
     nativeThreadId: identity.threadId, nativeTurnId: identity.turnId,
     requestDigest: compactionPayloadDigest(parsed, plan.target),
   }, async (operatorSignal, retainOwnershipUntil) => {
@@ -899,7 +953,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       const check = (): RecoveryThreadRecord => checkAttempt(prepared, logicalWorkId!, attempt.attempt, attempt.epoch, attempt.snapshotVersion);
       let summary: string;
       if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
-        if (!startManual || !plan.preserveFinalResponse) throw continuityError("continuity_manual_handoff_required");
+        if (!startManual || !plan.preserveFinalResponse && !freshPageCompactions.has(parsed)) throw continuityError("continuity_manual_handoff_required");
         // The manual runtime owns a new start/Sent token and this durable attempt.
         // It never refreshes the completed ordinary source's Send authorization.
         prepared.input = plan.input;
@@ -913,7 +967,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
               && checkpoint.workLineageId === plan.target.workLineageId
               && checkpoint.acceptedTaskRevision === plan.target.acceptedTaskRevision
               && checkpoint.sourceToolBatchHeadSequence === plan.target.sourceToolBatchHeadSequence);
-            if (coverage.length || !covered) CompactionSourceCoverage.assertRecordedSource(snapshot,
+            if (!freshPageCompactions.has(parsed) && (coverage.length || !covered)) CompactionSourceCoverage.assertRecordedSource(snapshot,
               coverage.map(entry => entry.metadata), plan.target.sourceHistoryRevision);
           } });
         browser = manualRuntime.browser;
@@ -983,6 +1037,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
               store.markAttempt(current.thread, { scope: current.scope, expectedVersion: current.version }, {
                 logicalWorkId: logicalWorkId!, attempt: attempt.attempt, stage: "page-acquired", pageReceiptId: lease.leaseId });
               prepared.bindings.acceptLease(prepared.binding, lease);
+              prepared.releaseAdmission?.();
             },
             async onSendActivated() {
               check();
@@ -1034,6 +1089,19 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       const physical = browser?.then(() => undefined, () => undefined);
       if (physical) retainOwnershipUntil(physical);
       if (transaction) owner.abortCompactionTransaction(transaction.token);
+      if (cleanupIdentity && prepared.binding.lease) {
+        let alive = false;
+        try {
+          const page = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, prepared.binding.lease);
+          alive = page.state === "ready" || page.state === "running";
+        } catch { /* Closed and unknown pages revoke this exact generation. */ }
+        if (!alive) {
+          try { prepared.bindings.forgetPage(prepared.binding, prepared.executionKey,
+            { ownerId: prepared.bindings.owner, identity: cleanupIdentity }); }
+          catch { /* A successor already owns the thread. */ }
+          throw error;
+        }
+      }
       if (logicalWorkId && attemptNumber !== undefined) {
         const ref = { directory: prepared.bindings.registrations.directory, thread: prepared.binding.thread,
           logicalWorkId, attempt: attemptNumber };

@@ -1,7 +1,8 @@
+import { inspectLauncherContinuityConversation } from "../../launcher-browser-host";
 import { recoveryTaskUpdateSources } from "./task-update-source";
 import { restoreRecoveryTaskUpdates } from "./continuity-task-update-journal";
 import { continuityBindingsFor, continuityDigest } from "./continuity-binding";
-import { beginRecoveryAcquisition, settleRecoveryKnownUnsent, beginRecoverySend, settleRecoverySend, type RuntimeRecoverySendReference, assertRecoveryWriter, bindRecoveryContextCoverage, restoreRecoveryContextCoverage, reserveRecoveryContextCoverage, releaseRecoveryContextCoverageReservation, completeRecoveryWork, recoveryIdentity, recoveryStore, settleRecoveryFailure, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
+import { recoveryCanonicalResults, recoveryResultDigest, beginRecoveryAcquisition, settleRecoveryKnownUnsent, beginRecoverySend, settleRecoverySend, type RuntimeRecoverySendReference, assertRecoveryWriter, bindRecoveryContextCoverage, restoreRecoveryContextCoverage, reserveRecoveryContextCoverage, releaseRecoveryContextCoverageReservation, completeRecoveryWork, recoveryIdentity, recoveryStore, settleRecoveryFailure, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { observedTaskAcknowledgement } from "./task-update-ack";
 import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
@@ -613,7 +614,6 @@ export function createChatGptWebAdapter(
     bindTaskRoute(parsed);
     bindContinuityRequestScope(parsed, executionNamespace);
     if (provider.chatgptWeb?.continuityStateDirectory) parsed._continuityStateDirectory = resolve(expandUserPath(provider.chatgptWeb.continuityStateDirectory));
-    assertContinuityStoppedReceipt(parsed);
     preparedEnvironment = undefined;
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) return;
@@ -708,12 +708,19 @@ export function createChatGptWebAdapter(
         trace.push({ kind: "commentary", text: "This task continues in a new ChatGPT conversation. The previous conversation can no longer perform project operations. ChatGPT's own activities may still be running." });
         continuity!.recovered = false;
       } else if (continuity?.recovered) {
-        trace.push({ kind: "commentary", text: "A new ChatGPT conversation was created with the current context." });
+        trace.push({ kind: "commentary", text: "A new ChatGPT conversation was created with the current context. Previous project permissions were revoked. Previous external effects may remain; historical tool calls are context only." });
         continuity.recovered = false;
       }
     };
     const acceptContinuityLease = (lease: unknown): void => {
       continuityLease = acceptContinuityResponseLease(continuity!, traceId, lease);
+    };
+    const forgetContinuityPage = (): void => {
+      if (!continuity) return;
+      const expected = continuityLease?.recovery ?? continuity.recovery;
+      if (!expected) return;
+      try { continuity.bindings.forgetPage(continuity.binding, continuity.executionKey,
+        { ownerId: continuity.bindings.owner, identity: expected }); } catch { /* A successor owns this binding. */ }
     };
     const loseContinuity = (): void => {
       if (!continuity) return;
@@ -738,6 +745,11 @@ export function createChatGptWebAdapter(
     } : undefined;
     const recoveryBaselineResults: Record<string, string> = {};
     const recoveryCoveredCallIds = new Set<string>();
+    if (continuity?.recovered && continuity.input) {
+      // Request-carried historical returns are context for the fresh generation.
+      // They never create issued calls or grant Broker dispatch authority.
+      for (const item of recoveryCanonicalResults(continuity.input)) recoveryBaselineResults[String(item.call_id)] = recoveryResultDigest(item);
+    }
     if (continuity?.binding.recovery) {
       const ref = continuity.binding.recovery;
       const record = recoveryStore(ref).get(ref.thread)!;
@@ -828,10 +840,14 @@ export function createChatGptWebAdapter(
     const releaseRetainedConversation = conversationKey && retainedLauncherDescriptor
       ? async () => {
         if (continuity && !continuityLease) return;
-        if (continuity) await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey, undefined, continuityLease);
+        if (continuity) {
+          await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey, undefined, continuityLease);
+          forgetContinuityPage();
+        }
         else await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey);
       }
       : undefined;
+    const freshPageContext = Boolean(continuity?.recovered);
     const compileOptionsFor = (input: CodexParsedRequest) => {
       if (manualRequest) return contextPresentation;
       const experimentalMultipartParts = experimentalBiggerContext
@@ -843,6 +859,7 @@ export function createChatGptWebAdapter(
         experimentalSkillAttachments,
         ...(taskUpdates ? { taskUpdateProtocol: 1 as const, ...taskUpdateRecoveryOptions(input) } : {}),
         ...(continuityClaim?.expected ? { retainedContinuity: true as const } : {}),
+        ...(freshPageContext ? { recoveredContinuity: true as const } : {}),
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -884,8 +901,18 @@ export function createChatGptWebAdapter(
         }
         return answer;
       },
-      error => {
+      async error => {
         if (acquisitionKnownUnsent) throw error;
+        const currentBinding = continuity.binding;
+        if ((continuityLease ?? continuity.expected) && conversationKey) {
+          let alive = false;
+          try { const page = await inspectLauncherContinuityConversation(continuity.descriptor, conversationKey!, (continuityLease ?? continuity.expected)!);
+            alive = page.state === "ready" || page.state === "running"; } catch {}
+          if (!alive) {
+            forgetContinuityPage();
+            throw error;
+          }
+        }
         if (continuity.binding.recovery) {
           // A late helper outcome belongs to its original attempt. It cannot fail or stop
           // the successor, overwrite an accepted terminal, or mark the successor binding lost.
@@ -1721,6 +1748,11 @@ export function createChatGptWebAdapter(
                 compactionExecutionKey,
                 {
                   ownerKey: `${executionNamespace}:${chatGptThreadOwnershipKey(parsed)}`,
+                  ...(preparedContinuity.get(parsed) ? { page: {
+                    directory: preparedContinuity.get(parsed)!.bindings.registrations.directory,
+                    thread: preparedContinuity.get(parsed)!.binding.thread,
+                    epoch: parsed._continuityPageGeneration!,
+                  } } : {}),
                   traceIds: [
                     compactionTraceId,
                     handoffTraceId,
@@ -2814,6 +2846,8 @@ export function createChatGptWebAdapter(
       try {
         await runChatGptWebTurn();
       } finally {
+        const prepared = preparedContinuity.get(parsed);
+        if (prepared && prepared.bindings.observed(prepared.binding.thread) === prepared.binding) prepared.releaseAdmission?.();
         stopHeartbeat();
       }
     },

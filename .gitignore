@@ -20,4 +20,5 @@ notes.md
 .worktrees/
 .idea/
 /.dev-workflows/
+/.browser-use/
 /.agents/skills/github-pairing/

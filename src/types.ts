@@ -13,8 +13,12 @@ export interface CodexParsedRequest {
   _continuityHistoryRevision?: number;
   /** Local recovery identity, never parsed from request JSON. */
   _continuityEpoch?: number;
+  /** Internal first epoch of the current page task; stable across live compaction. */
+  _continuityPageGeneration?: number;
   _continuityStateDirectory?: string;
   _continuityAttempt?: number;
+  /** Trusted current-request summary source after closed-page admission. */
+  _continuityRequestInstruction?: { content: unknown; turnId?: string; itemId?: string; instructionEnvelope?: Record<string, unknown> };
   /** Provider/model scope bound by the Adapter before resolving local checkpoint evidence. */
   _continuityScope?: string;
   /** Canonical provider scope and exact old keys, computed from trusted local configuration. */

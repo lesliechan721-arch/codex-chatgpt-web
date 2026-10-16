@@ -1,6 +1,6 @@
 export const CONTINUITY_IDLE_TTL_MS = 86_400_000;
 export const CONTINUITY_FEATURE = "session-continuity-v1";
-export const CONTINUITY_RECOVERY_FEATURE = "session-continuity-recovery-v3";
+export const CONTINUITY_RECOVERY_FEATURE = "session-continuity-recovery-v4";
 
 export interface ContinuityLauncherInstance {
   pid: number;

@@ -330,6 +330,9 @@ interface BrokerResponse {
 
 const brokers = new Map<string, TurnBroker>();
 const closingBrokers = new Map<string, Promise<void>>();
+// Full close results remain visible to shutdown until each caller has settled,
+// including older closes whose endpoint barrier has a queued replacement.
+const pendingBrokerCloses = new Set<Promise<void>>();
 const MAX_BROKER_LINE_CHARS = 67_108_864;
 const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
@@ -385,10 +388,10 @@ function retirementDiagnostics(channel: TurnChannel): BrokerRetirementDiagnostic
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
-  const results = await Promise.allSettled([...closingBrokers.values(), ...active.map(broker => broker.close())]);
-  const failures = results
+  const results = await Promise.allSettled(new Set([...pendingBrokerCloses, ...closingBrokers.values(), ...active.map(broker => broker.close())]));
+  const failures = [...new Set(results
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-    .map(result => result.reason);
+    .map(result => result.reason))];
   if (failures.length > 0) {
     throw new AggregateError(failures, `${failures.length} ChatGPT turn broker(s) failed to close`);
   }
@@ -655,6 +658,8 @@ export class TurnBroker implements TurnBrokerOwner {
   private readonly retiredBindings = new Map<string, BrokerRetirementDiagnostics>();
   private readonly retiredTokens = new Map<string, string>();
   private readonly retiredTaskUpdates = new Map<string, TaskUpdateControl>();
+  // Failed file removal retains only a cleanup path, never a task or capability.
+  private readonly pendingAcknowledgementCleanup = new Set<string>();
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
@@ -1989,16 +1994,20 @@ export class TurnBroker implements TurnBrokerOwner {
         delete record.synchronize;
       }
       this.rejectSafeWaiters(updates.observers, reason);
-      // Only recovery receipts survive retirement; user text and delivery payloads are released.
+      // User text and delivery payloads are released on every route.
       updates.updates = [];
       updates.deliveries.clear();
       updates.fences.clear();
-      this.retiredTaskUpdates.set(token, updates);
-      while (this.retiredTaskUpdates.size > MAX_RETIRED_TURN_HANDLES) {
-        const oldest = this.retiredTaskUpdates.keys().next().value!;
-        const directory = this.retiredTaskUpdates.get(oldest)?.state.acknowledgementDirectory;
-        if (directory) rmSync(directory, { recursive: true, force: true });
-        this.retiredTaskUpdates.delete(oldest);
+      // Admitted page transports own cloned replies, so their retired capability
+      // needs no receipt journal. Other routes retain the bounded replay protocol.
+      if (!channel.recovery) {
+        this.retiredTaskUpdates.set(token, updates);
+        while (this.retiredTaskUpdates.size > MAX_RETIRED_TURN_HANDLES) {
+          const oldest = this.retiredTaskUpdates.keys().next().value!;
+          const directory = this.retiredTaskUpdates.get(oldest)?.state.acknowledgementDirectory;
+          if (directory) this.removeAcknowledgementDirectory(directory);
+          this.retiredTaskUpdates.delete(oldest);
+        }
       }
     }
     this.pending.delete(token);
@@ -2025,6 +2034,19 @@ export class TurnBroker implements TurnBrokerOwner {
     if (reason instanceof NativeOperationError) this.rejectSafeWaiters(channel.retirementWaiters, reason);
     else this.resolveSafeWaiters(channel.retirementWaiters, failure);
     this.rejectChannel(channel, reason);
+    if (channel.recovery && channel.taskUpdates?.state.acknowledgementDirectory) {
+      this.removeAcknowledgementDirectory(channel.taskUpdates.state.acknowledgementDirectory);
+    }
+  }
+
+  private removeAcknowledgementDirectory(directory: string): void {
+    try {
+      rmSync(directory, { recursive: true, force: true });
+      this.pendingAcknowledgementCleanup.delete(directory);
+    } catch (error) {
+      this.pendingAcknowledgementCleanup.add(directory);
+      console.error(`[chatgpt-web] broker_ack_cleanup_failed ${JSON.stringify({ code: (error as NodeJS.ErrnoException).code ?? "unknown" })}`);
+    }
   }
 
   externalOwnerActiveCount(): number {
@@ -2165,23 +2187,32 @@ export class TurnBroker implements TurnBrokerOwner {
       this.compactionTransactions.close();
       for (const token of [...this.channels.keys()]) this.revokeTrusted(token, this.endpointFailure);
       for (const updates of this.retiredTaskUpdates.values()) {
-        if (updates.state.acknowledgementDirectory) rmSync(updates.state.acknowledgementDirectory, { recursive: true, force: true });
+        if (updates.state.acknowledgementDirectory) this.removeAcknowledgementDirectory(updates.state.acknowledgementDirectory);
       }
+      this.retiredTaskUpdates.clear();
+      for (const directory of this.pendingAcknowledgementCleanup) this.removeAcknowledgementDirectory(directory);
       await this.closeEndpoint();
     }).then(() => {
       if (closingBrokers.get(this.socketPath) === closing) closingBrokers.delete(this.socketPath);
       if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
-    }, error => {
+    });
+    // Successors wait for endpoint and lock settlement. A file cleanup error
+    // belongs to this caller and must not poison a queued successor's close.
+    this.closePromise = closing.then(() => {
+      if (this.pendingAcknowledgementCleanup.size) throw new Error(`Broker shutdown could not remove ${this.pendingAcknowledgementCleanup.size} ACK publication directories`);
+    }).catch(error => {
       this.closeFailure = errorOf(error);
       for (const socket of this.sockets) socket.destroy();
       this.server?.unref();
       this.lifecycle("close_failed", { reason: this.closeFailure.message, lockRetained: Boolean(this.releaseSocketLock) });
       throw error;
     });
-    this.closePromise = closing;
+    const result = this.closePromise;
+    pendingBrokerCloses.add(result);
+    void result.then(() => pendingBrokerCloses.delete(result), () => pendingBrokerCloses.delete(result));
     closingBrokers.set(this.socketPath, closing);
     if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
-    return closing;
+    return this.closePromise;
   }
 
   private async closeEndpoint(): Promise<void> {

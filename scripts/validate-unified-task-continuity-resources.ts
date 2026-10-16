@@ -64,10 +64,10 @@ export function resourceLivePlan() {
         steps: ["create five independent synthetic tasks sequentially; retain their healthy ready pages", "sixth allocation must destroy the earliest successful idle page before targetCreated", "observe CDP targetCreated/targetDestroyed from before first send through final cleanup", "re-read every completed journal after pressure and cleanup", "release only exact case-owned conversation leases"],
         boundary: "Requires a clean DEV task-page baseline; original home surface stays present. CDP covers native target existence, not platform activity." },
       "old-live-fencing": { expectedInitialModelSends: 2, expectedResponsesRequests: 3,
-        steps: ["real model calls the inert receipt; capture original runtime and accepted Send", "same public Responses history returns the actual result and appends one real plain-text instruction", "when the model submits ACK, verify its deliveryId against the real Broker delivery and hold the request", "persist retireAttempt for that exact current original-page attempt, without page close or Broker revoke", "while the native target is still present, request original Broker Native tool, that real ACK and final-output admission", "release the held real model ACK into the original rejecting method", "retry the accepted appended public task; production recovery authorizes the successor", "optional exact target close-failure hold keeps original page present through real successor completion"],
+        steps: ["real model calls the inert receipt; capture original runtime and accepted Send", "same public Responses history returns the actual result and appends one real plain-text instruction", "when the model submits ACK, verify its deliveryId against the real Broker delivery and hold the request", "persist retireAttempt for that exact current original-page attempt, without page close or Broker revoke", "while the native target is still present, request original Broker Native tool, that real ACK and final-output admission", "release the held real model ACK into the original rejecting method", "retry the current appended public task; production recovery revokes the old page task and authorizes a fresh successor", "optional exact target close-failure hold keeps original page present through real successor completion"],
         boundary: "Without --launcher-inspector the physical overlap may be partial. With the bounded exact-target hold, pass requires original target presence through successor completion, real pending ACK rejection, successor completion and real final cleanup. The injected close failures are labelled controlled DEV faults, never natural browser faults." },
-      "user-close-stop": { expectedInitialModelSends: 1, expectedResponsesRequests: 2,
-        steps: ["real model calls inert receipt; task remains running", "human closes only the named task tab using DEV Launcher UI", "observe persistent page-close stop", "return the real inert result, retry the same public task, observe rejection and no new target"],
+      "user-close-stop": { expectedInitialModelSends: 2, expectedResponsesRequests: 2,
+        steps: ["real model calls inert receipt; task remains running", "human closes only the named task tab using DEV Launcher UI", "observe physical page destruction and cleared page task state", "return the real inert result, retry the current public task, complete on exactly one new page without repeating the tool"],
         boundary: "No automated close, crash or signal substitutes for the human action; waits at most five minutes." },
     },
     cleanupHold: { optIn: "old-live-fencing only: --launcher-inspector=http://127.0.0.1:9239", ttlMs: CLEANUP_HOLD_TTL_MS,
@@ -193,13 +193,14 @@ export function inspectResourcePressureEvidence(evidence: { events: PhysicalEven
   for (let task = 1; task <= 6; task++) {
     const before = evidence.journals.find(row => row.task === task && row.label === "completed");
     const after = evidence.journals.findLast(row => row.task === task && row.label === "after-cleanup");
-    if (!before || !after || before.state !== "completed" || after.state !== "completed" || !before.terminalDigest || !before.terminalReceiptDigest
-      || before.workDigest !== after.workDigest || before.terminalDigest !== after.terminalDigest || before.terminalReceiptDigest !== after.terminalReceiptDigest
-      || before.historyRevision !== after.historyRevision || before.taskRevision !== after.taskRevision || before.epoch !== after.epoch
-      || JSON.stringify(before.attempts) !== JSON.stringify(after.attempts) || JSON.stringify(before.calls) !== JSON.stringify(after.calls)) failures.push(`任务 ${task} 的 journal 终态或执行关系没有完整保留`);
+    if (!before || !after || before.state !== "completed" || after.state !== "cleared"
+      || !before.terminalDigest || !before.terminalReceiptDigest || after.calls.length || after.attempts.length
+      || after.epoch !== -1 || after.historyRevision !== 0 || after.taskRevision !== 0
+      || after.terminalDigest !== null || after.terminalReceiptDigest !== null || after.taskUpdates !== undefined)
+      failures.push(`任务 ${task} 的活页终态或销毁清理证据不完整`);
     if (evidence.journals.filter(row => row.task === task).some(row => row.stopReason !== null || row.state === "stopped")) failures.push(`任务 ${task} 产生了非用户停止事实`);
     const result = evidence.results.filter(row => row.task === task);
-    if (result.length !== 1 || !after || after.calls.length !== 1 || !after.calls.some(call => call.callId === result[0]?.callId && call.state === "settled" && call.firstResultDigest === result[0]?.firstResultDigest)) failures.push(`任务 ${task} 缺少唯一真实派发和结果结算`);
+    if (result.length !== 1 || !before || before.calls.length !== 1 || !before.calls.some(call => call.callId === result[0]?.callId && call.state === "settled" && call.firstResultDigest === result[0]?.firstResultDigest)) failures.push(`任务 ${task} 缺少唯一真实派发和结果结算`);
   }
   if (!evidence.baselinePreserved) failures.push("原有页面身份发生变化");
   if (new Set(evidence.cleanupTargets).size !== 5 || evidence.cleanupTargets.some(target => !evidence.targets.slice(1).includes(target))) failures.push("清理目标不是本 case 剩余的五个页面");
@@ -209,7 +210,7 @@ export function inspectResourcePressureEvidence(evidence: { events: PhysicalEven
 
 export function inspectOldLiveFencingEvidence(evidence: { pending: { real: boolean; throughRevision: number; beforeAcknowledgedRevision: number; afterOldProbesAcknowledgedRevision: number };
   probes: Array<{ boundary: string; rejected: boolean; obsolete: boolean; presentBefore: boolean; presentAfter: boolean }>;
-  successor: { originalTarget: string; target: string; oldPresentAtCompletion: boolean; revisions: ReturnType<typeof resourceSuccessorRevisionEvidence>; state: string; stopped: boolean; sameRetiredWork: boolean; historyPreserved: boolean; epochAdvanced: boolean };
+  successor: { originalTarget: string; target: string; oldPresentAtCompletion: boolean; revisions: ReturnType<typeof resourceSuccessorRevisionEvidence>; state: string; stopped: boolean; newWork: boolean; historyCleared: boolean; epochChanged: boolean; oldWorkAbsent: boolean; preparedProtocolFresh: boolean };
   closeFault: { controlled: boolean; attempts: number; state: string } }) {
   const failures: string[] = [];
   if (!evidence.pending.real || evidence.pending.throughRevision <= evidence.pending.beforeAcknowledgedRevision
@@ -221,12 +222,12 @@ export function inspectOldLiveFencingEvidence(evidence: { pending: { real: boole
   const next = evidence.successor;
   if (!next.originalTarget || !next.target || next.target === next.originalTarget || !next.oldPresentAtCompletion) failures.push("后继完成时没有真实新旧页面重叠");
   const revisions = next.revisions;
-  if (!revisions || !Number.isSafeInteger(revisions.logicalWorkAcceptedTaskRevision) || revisions.logicalWorkAcceptedTaskRevision! <= 0
-    || revisions.logicalWorkAcceptedTaskRevision !== revisions.retiredLogicalWorkAcceptedTaskRevision) failures.push("后继没有保留原逻辑工作 acceptedTaskRevision");
+  if (!revisions || revisions.logicalWorkAcceptedTaskRevision !== 1) failures.push("新代没有从初始任务 revision 开始");
   if (!revisions || [revisions.connectorAcceptedRevision, revisions.connectorAcknowledgedRevision,
-    revisions.protocolAcceptedRevision, revisions.protocolAcknowledgedRevision].some(revision => revision !== evidence.pending.throughRevision))
-    failures.push("后继实际 ACK 与持久 task-update 协议 revision 不一致");
-  if (next.state !== "completed" || next.stopped || !next.sameRetiredWork || !next.historyPreserved || !next.epochAdvanced) failures.push("后继任务关系、完成或停止状态不符合合同");
+    revisions.protocolAcceptedRevision, revisions.protocolAcknowledgedRevision].some(revision => revision !== null && revision !== 0))
+    failures.push("新代保留了旧 task-update revision 或 ACK");
+  if (next.state !== "completed" || next.stopped || !next.newWork || !next.historyCleared || !next.epochChanged
+    || !next.oldWorkAbsent || !next.preparedProtocolFresh) failures.push("后继页面任务、清理或初始协议不符合合同");
   if (!evidence.closeFault.controlled || evidence.closeFault.attempts !== 3 || evidence.closeFault.state !== "failed") failures.push("没有真实三次有界目标页清理故障");
   return { passed: failures.length === 0, failures };
 }
@@ -324,7 +325,12 @@ async function runResourceLive(options: RunOptions) {
   };
   const event = (kind: PhysicalEvent["kind"], targetId?: string) => { report.events.push({ sequence: ++sequence, at: new Date().toISOString(), kind, task, targetId, physicalCount: physical.size }); save(); };
   const journal = (item: typeof owned[number], label: string): JournalEvidence => {
-    const record = recoveryRecord(item.ref), work = record.works[item.ref.logicalWorkId]!;
+    const record = recoveryStore(item.ref).get(item.ref.thread), work = record?.works[item.ref.logicalWorkId];
+    if (!record || !work) {
+      const row: JournalEvidence = { task: item.task, label, workDigest: digest(item.ref.logicalWorkId), epoch: -1,
+        historyRevision: 0, taskRevision: 0, state: "cleared", stopReason: null, terminalDigest: null, terminalReceiptDigest: null, attempts: [], calls: [] };
+      report.journal.push(row); save(); return row;
+    }
     for (const attempt of work.attempts) if (attempt.sendEvidence) secrets.push(attempt.sendEvidence.authorizationId);
     if (work.taskUpdateJournal) secrets.push(work.taskUpdateJournal.streamId, ...work.taskUpdateJournal.deliveries.map(delivery => delivery.deliveryId));
     const row: JournalEvidence = { task: item.task, label, workDigest: digest(work.logicalWorkId), epoch: record.epoch, historyRevision: record.historyRevision,
@@ -488,16 +494,27 @@ async function runResourceLive(options: RunOptions) {
         if (!inspector) report.limitations.push("没有受控物理清理 hold；原页存在时撤权及拒绝已观测，但后继继续时的旧页重叠需要单独证明。");
       }
       if (options.case === "user-close-stop") {
-        console.log(`人工步骤：在 DEV Launcher 关闭本任务标签页。task=${task} surfaceId=${surfaceId} targetId=${targetId}。不要关闭其他页。脚本等待持久 page-close 停止。`);
+        console.log(`人工步骤：在 DEV Launcher 关闭本任务标签页。task=${task} surfaceId=${surfaceId} targetId=${targetId}。不要关闭其他页。脚本等待旧页销毁及本地记录清理。`);
+        const oldRef = structuredClone(item.ref);
         const deadline = Date.now() + 5 * 60_000;
-        while (Date.now() < deadline && !controller.signal.aborted && recoveryRecord(item.ref).works[item.ref.logicalWorkId]!.state !== "stopped") await Bun.sleep(250);
-        const stopped = journal(item, "after-human-close"); assert.equal(stopped.state, "stopped"); assert.equal(stopped.stopReason, "page-close");
-        acceptRecoveryResults(item.ref, [result]); body.input.push(result);
+        while (Date.now() < deadline && !controller.signal.aborted
+          && (!destroyed.has(targetId) || recoveryStore(oldRef).get(oldRef.thread))) await Bun.sleep(250);
+        assert.ok(destroyed.has(targetId), "没有观测到旧页实际销毁");
+        assert.equal(journal(item, "after-human-close").state, "cleared");
+        body.input.push(result);
         const targetsBefore = report.events.filter((row: PhysicalEvent) => row.kind === "created").length;
-        const retry = await request(); const after = journal(item, "after-stop-retry");
-        assert.equal(after.state, "stopped"); assert.equal(after.stopReason, "page-close");
-        assert.ok(!retry.response.ok && /stopped/.test(String(retry.envelope.error?.code ?? "")), "同一停止工作没有明确拒绝重试");
-        assert.equal(report.events.filter((row: PhysicalEvent) => row.kind === "created").length, targetsBefore, "停止工作重试创建了新页");
+        const retry = await request();
+        assert.ok(retry.response.ok); assert.equal(retry.envelope.status, "completed");
+        assert.equal((retry.envelope.output ?? []).filter((value: Row) => value.type === "function_call").length, 0, "恢复重复派发业务工具");
+        assert.equal(extractContinuityFinalResponseText(retry.envelope).trim(), answer);
+        assert.equal(report.events.filter((row: PhysicalEvent) => row.kind === "created").length, targetsBefore + 1, "恢复没有创建一个新页");
+        assert.ok(session?.runtime.continuityBinding?.recovery, "新页缺少本地权限");
+        item.session = session!; item.ref = structuredClone(session!.runtime.continuityBinding!.recovery!);
+        assert.notEqual(item.ref.logicalWorkId, oldRef.logicalWorkId);
+        assert.equal(recoveryStore(item.ref).get(item.ref.thread)?.works[oldRef.logicalWorkId], undefined);
+        const replacement = Object.entries(sameLauncher().surfaceTargets).filter(([id]) => id !== descriptor.surfaceId);
+        assert.equal(replacement.length, 1); item.surfaceId = replacement[0]![0]; item.targetId = replacement[0]![1];
+        journal(item, "after-page-recovery");
         report.status = "passed"; break;
       }
       if (options.case !== "old-live-fencing") body.input.push(result);
@@ -516,23 +533,18 @@ async function runResourceLive(options: RunOptions) {
         const finalToken = await item.session.runtime.token; secrets.push(finalToken);
         const finalIdentity = { workDigest: digest(item.ref.logicalWorkId), traceDigest: digest(item.session.traceId), tokenDigest: digest(finalToken),
           attempt: item.ref.attempt, epoch: finalAttempt.epoch };
-        assert.equal(finalIdentity.workDigest, report.retiredAttempt.workDigest); assert.ok(finalIdentity.epoch > report.retiredAttempt.epoch);
+        assert.notEqual(finalIdentity.workDigest, report.retiredAttempt.workDigest); assert.notEqual(finalIdentity.epoch, report.retiredAttempt.epoch);
         report.successor.finalIdentity = finalIdentity;
         const sameFinalIdentity = (row: Row) => row.workDigest === finalIdentity.workDigest && row.traceDigest === finalIdentity.traceDigest
           && row.epoch === finalIdentity.epoch && row.attempt === finalIdentity.attempt;
         const selected = report.plans.findLast((row: Row) => row.selected && sameFinalIdentity(row));
         const acceptedSend = report.sends.findLast((row: Row) => row.kind === "accepted-receipt" && sameFinalIdentity(row));
-        report.successor.controlEvidence = resourceSuccessorControlEvidence(report.brokerControls, report.originalBrokerTokenDigest,
-          report.pendingUpdate.throughRevision, finalIdentity, selected, acceptedSend);
-        report.successor.pendingUpdateAcknowledged = report.acknowledgements.some((row: Row) => row.accepted && row.origin === "connector"
-          && sameFinalIdentity(row) && row.tokenDigest === finalIdentity.tokenDigest && row.deliveryDigest === report.successor.controlEvidence.deliveryDigest
-          && row.acknowledgedRevision === report.pendingUpdate.throughRevision);
+        report.successor.controlEvidence = { preparedSendBound: Boolean(selected && acceptedSend
+          && selected.observationSequence < acceptedSend.observationSequence), selected, acceptedSend };
         report.successor.preparedProtocolVerified = Boolean(selected?.protocol.unique && selected.protocol.protocol === "task-updates-v1"
-          && selected.protocol.initialAcceptedRevision === report.pendingUpdate.throughRevision
-          && selected.protocol.initialAcknowledgedRevision === report.pendingUpdate.acknowledgedRevision && selected.protocol.instructionsPresent
-          && report.successor.controlEvidence.preparedSendBound);
-        assert.ok(report.successor.controlEvidence.passed && report.successor.preparedProtocolVerified, "后继缺少准确 prepared 协议或实际新代 control delivery/ACK 证据");
-        if (!report.successor.pendingUpdateAcknowledged) report.limitations.push("后继没有可核对的原待 ACK 更新确认；仅完成回答不能证明未 ACK 更新移交通过。");
+          && selected.protocol.initialAcceptedRevision === 0 && selected.protocol.initialAcknowledgedRevision === 0
+          && selected.protocol.instructionsPresent && report.successor.controlEvidence.preparedSendBound);
+        assert.ok(report.successor.preparedProtocolVerified, "后继缺少准确初始 prepared 协议或实际新代 Send 证据");
         if (inspector && heldPage) {
           const deadline = Date.now() + 20_000;
           let receipt: Awaited<ReturnType<typeof queryLauncherContinuityTransaction>>;
@@ -545,20 +557,22 @@ async function runResourceLive(options: RunOptions) {
           assert.ok((await cdp.send("Target.getTargets")).targetInfos.some(target => target.targetId === targetId), "原页在后继完成后已不再存在");
         }
       }
-      const done = journal(item, "completed"); assert.equal(done.state, "completed"); assert.equal(done.calls.length, 1);
+      const done = journal(item, "completed"); assert.equal(done.state, "completed"); assert.equal(done.calls.length, options.case === "old-live-fencing" ? 0 : 1);
       if (options.case === "old-live-fencing" && inspector) {
         const finalIdentity = report.successor.finalIdentity;
         const newAck = report.acknowledgements.findLast((row: Row) => row.accepted && row.origin === "connector" && row.workDigest === finalIdentity.workDigest
           && row.traceDigest === finalIdentity.traceDigest && row.attempt === finalIdentity.attempt && row.epoch === finalIdentity.epoch
-          && row.tokenDigest === finalIdentity.tokenDigest && row.deliveryDigest === report.successor.controlEvidence.deliveryDigest);
+          && row.tokenDigest === finalIdentity.tokenDigest);
         report.successor.revisions = resourceSuccessorRevisionEvidence(done.taskRevision, report.retiredAttempt.taskRevision, done.taskUpdates, newAck);
         report.checks = inspectOldLiveFencingEvidence({ pending: { real: report.pendingUpdate.provenance === "real-public-Responses-append-and-model-ACK",
           throughRevision: report.pendingUpdate.throughRevision, beforeAcknowledgedRevision: report.pendingUpdate.acknowledgedRevision,
           afterOldProbesAcknowledgedRevision: report.pendingUpdate.afterOldProbesAcknowledgedRevision },
           probes: report.probes.map((row: Row) => ({ boundary: row.boundary, rejected: row.rejected, obsolete: row.obsolete, presentBefore: row.originalTargetPresentBefore, presentAfter: row.originalTargetPresentAfter })),
           successor: { originalTarget: targetId, target: item.targetId, oldPresentAtCompletion: report.successor.oldTargetStillPresent, revisions: report.successor.revisions,
-            state: done.state, stopped: done.stopReason !== null, sameRetiredWork: done.workDigest === report.retiredAttempt.workDigest,
-            historyPreserved: done.historyRevision === report.retiredAttempt.historyRevision, epochAdvanced: done.epoch > report.retiredAttempt.epoch },
+            state: done.state, stopped: done.stopReason !== null, newWork: done.workDigest !== report.retiredAttempt.workDigest,
+            historyCleared: done.historyRevision === 0, epochChanged: done.epoch !== report.retiredAttempt.epoch,
+            oldWorkAbsent: !Object.values(recoveryRecord(item.ref).works).some(work => digest(work.logicalWorkId) === report.retiredAttempt.workDigest),
+            preparedProtocolFresh: report.successor.preparedProtocolVerified },
           closeFault: { controlled: report.cleanupHold.controlledFault, state: report.cleanupHold.beforeRestoration.physicalCleanup,
             attempts: Math.max(0, ...report.cleanupHold.beforeRestoration.cleanup.map((row: Row) => row.attempts)) } });
       }
@@ -588,7 +602,8 @@ async function runResourceLive(options: RunOptions) {
       try {
         if (destroyed.has(item.targetId)) continue;
         const binding = item.session.runtime.continuityBinding!;
-        const record = recoveryRecord(item.ref), work = record.works[item.ref.logicalWorkId]!;
+        const record = recoveryStore(item.ref).get(item.ref.thread), work = record?.works[item.ref.logicalWorkId];
+        if (!record || !work) continue;
         if (work.state === "completed") await releaseLauncherRetainedConversation(paths.descriptorPath, binding.conversation!.key, 15_000, binding.lease!);
         else {
           recoveryStore(item.ref).retireAttempt(item.ref.thread, { scope: record.scope, expectedVersion: record.version }, item.ref.logicalWorkId, item.ref.attempt);

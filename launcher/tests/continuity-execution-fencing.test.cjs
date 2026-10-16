@@ -15,7 +15,7 @@ function identity(overrides = {}) {
 function documentFor(recovery) {
   const attempt = { ...recovery, writerRetired: false };
   const work = { logicalWorkId: recovery.logicalWorkId, purpose: "ordinary", workLineageId: "lineage", state: "active", attempts: [attempt] };
-  return { version: 3, installation: recovery.installationId, threads: { [recovery.threadKey]: {
+  return { version: 4, installation: recovery.installationId, threads: { [recovery.threadKey]: {
     epoch: recovery.epoch, owner: recovery.ownerProcess, currentWorkId: recovery.logicalWorkId, state: "running",
     legacyUnproven: false, works: { [work.logicalWorkId]: work }, calls: {},
   } } };
@@ -84,7 +84,12 @@ for (const archived of [false, true]) test(`a stopped preparation proves isolati
   for (const changed of [{ transactionVersion: 2 }, { snapshotVersion: 2 }, { snapshotDigest: "f".repeat(64) },
     { epoch: 1 }, { attempt: 1 }, { transactionId: "other" }, { logicalWorkId: "other" },
     { ownerProcess: f.original.ownerProcess }, { launcherInstance: { ...f.instance, instanceId: "1".repeat(64) } }]) {
-    assert.throws(() => assertExecutionIsolation(host, { ...f.target, ...changed }), { code: "continuity_unverified" });
+    const identity = { ...f.target, ...changed };
+    assert.throws(() => assertExecutionAuthority(host, identity), { code: "continuity_unverified" });
+    // Missing generations permit exact physical cleanup but never execution.
+    if (identity.epoch === f.record.epoch && f.record.works[identity.logicalWorkId]?.attempts?.[identity.attempt]) {
+      assert.throws(() => assertExecutionIsolation(host, identity), { code: "continuity_unverified" });
+    }
   }
 });
 

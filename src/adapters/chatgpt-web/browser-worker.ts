@@ -840,12 +840,20 @@ const chatGptTerminalErrorAlert = (scope: ChatGptTextScope): Locator => scope
 // ChatGPT can reject an input with either HTTP 413 or a terminal error event inside HTTP 200 SSE.
 // Observe only browser-issued submissions from this owned page after Send is activated;
 // an old response, another tab, or a background endpoint cannot classify this turn.
+interface ChatGptSubmittedUserMessage {
+  messageId?: string;
+  ambiguous?: boolean;
+  unavailable?: boolean;
+}
+
 export class ChatGptSubmissionRejectionObserver {
   private page?: Page;
   private generation = 0;
   private readonly requests = new Set<Request>();
   private readonly streams = new Map<Request, Response>();
   private checks: Array<Promise<ChatGptWebAdapterError | undefined>> = [];
+  private submittedUserMessage?: ChatGptSubmittedUserMessage;
+  private initialTurnIdentities = new Set<string>();
 
   constructor(private readonly onRejected?: (error: ChatGptWebAdapterError) => void) {}
 
@@ -854,6 +862,24 @@ export class ChatGptSubmissionRejectionObserver {
       || request.url() !== "https://chatgpt.com/backend-api/f/conversation"
       || request.frame() !== this.page.mainFrame()) return;
     this.requests.add(request);
+    const submitted = this.submittedUserMessage;
+    if (!submitted) return;
+    try {
+      const messages = request.postDataJSON()?.messages;
+      const message = Array.isArray(messages) && messages.length === 1 ? messages[0] : undefined;
+      const id = message?.id;
+      if (message?.author?.role !== "user" || typeof id !== "string"
+        || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(id)) {
+        submitted.unavailable = true;
+        return;
+      }
+      if (this.initialTurnIdentities.has(`group:user:${id}`)) return;
+      if (submitted.messageId && submitted.messageId !== id) submitted.ambiguous = true;
+      else submitted.messageId = id;
+    } catch {
+      // Unknown request shapes provide no identity evidence. Preserve strict DOM proof.
+      submitted.unavailable = true;
+    }
   };
 
   private readonly onResponse = (response: Response): void => {
@@ -922,10 +948,12 @@ export class ChatGptSubmissionRejectionObserver {
       .catch(() => undefined));
   }
 
-  begin(page: Page): void {
+  begin(page: Page, submittedUserMessage?: ChatGptSubmittedUserMessage, initialTurnIdentities: readonly string[] = []): void {
     this.dispose();
     this.checks = [];
     this.page = page;
+    this.submittedUserMessage = submittedUserMessage;
+    this.initialTurnIdentities = new Set(initialTurnIdentities);
     page.on("request", this.onRequest);
     page.on("response", this.onResponse);
     page.on("requestfinished", this.onRequestFinished);
@@ -941,6 +969,11 @@ export class ChatGptSubmissionRejectionObserver {
     return this.streams.size > 0 && this.page !== undefined && !this.page.isClosed();
   }
 
+  endSubmissionIdentity(): void {
+    this.submittedUserMessage = undefined;
+    this.initialTurnIdentities.clear();
+  }
+
   dispose(): void {
     this.generation += 1;
     this.page?.off("request", this.onRequest);
@@ -948,6 +981,7 @@ export class ChatGptSubmissionRejectionObserver {
     this.page?.off("requestfinished", this.onRequestFinished);
     this.page?.off("requestfailed", this.onRequestFailed);
     this.page = undefined;
+    this.endSubmissionIdentity();
     this.requests.clear();
     this.streams.clear();
   }
@@ -1462,7 +1496,14 @@ interface ChatGptSubmissionBaseline {
   domCache: ChatGptSubmissionDomCache;
   submittedText?: string;
   acceptedUserIdentity?: string;
+  submittedUserMessage?: ChatGptSubmittedUserMessage;
   acknowledgedStages?: readonly ChatGptAcknowledgedMultipartStage[];
+}
+
+function chatGptSubmittedUserIdentity(baseline: ChatGptSubmissionBaseline): string | undefined {
+  const submitted = baseline.submittedUserMessage;
+  if (submitted?.ambiguous) throw new Error("ChatGPT exposed multiple user messages during the physical Send");
+  return submitted?.messageId && !submitted.unavailable ? `group:user:${submitted.messageId}` : undefined;
 }
 
 interface ChatGptSubmissionObservationRecovery {
@@ -3309,6 +3350,7 @@ export class ChatGptBrowserWorker {
     baseline: ChatGptSubmissionBaseline,
     signal?: AbortSignal,
   ): Promise<ChatGptSubmissionEvidence | undefined> {
+    const submittedUserIdentity = chatGptSubmittedUserIdentity(baseline);
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     await this.reconcileMultipartHistory(page, baseline, state, signal);
     const evidence = chatGptSubmissionEvidence({
@@ -3321,6 +3363,10 @@ export class ChatGptBrowserWorker {
       // Activity can temporarily replace this group before the assistant is mounted.
       // Preserve the identity that acknowledged Send, independently of rendered text.
       const identity = chatGptNewTurnIdentity(baseline.initialTurnIdentities, state.userIdentities)!;
+      if (submittedUserIdentity && identity.startsWith("group:user:")
+        && !/^group:user:fallback-turn-\d+$/.test(identity) && identity !== submittedUserIdentity) {
+        throw new Error("ChatGPT changed the user turn that acknowledged the submission");
+      }
       if (baseline.acceptedUserIdentity && baseline.acceptedUserIdentity !== identity) {
         throw new Error("ChatGPT changed the user turn that acknowledged the submission");
       }
@@ -3504,6 +3550,17 @@ export class ChatGptBrowserWorker {
         observationBaseline.initialTurnIdentities,
         state.responseIdentities,
       );
+      const submittedUserIdentity = chatGptSubmittedUserIdentity(observationBaseline);
+      const user = identity?.startsWith("group:assistant:") ? identity.replace("group:assistant:", "group:user:") : undefined;
+      const acceptedUser = observationBaseline.acceptedUserIdentity;
+      if (acceptedUser && !/^group:user:fallback-turn-\d+$/.test(acceptedUser)
+        && user && state.userIdentities.includes(user) && user !== acceptedUser) {
+        throw new Error("ChatGPT changed the user turn that acknowledged the submission");
+      }
+      if (submittedUserIdentity && user && state.userIdentities.includes(user) && !/^group:user:fallback-turn-\d+$/.test(user)) {
+        if (user !== submittedUserIdentity) throw new Error("ChatGPT changed the user turn that acknowledged the submission");
+        observationBaseline.acceptedUserIdentity = user;
+      }
       if (progress
         && externalProgress
         && completionTracker?.needsToolBatchObservation(progress.lastToolBatchRevision)) {
@@ -3556,6 +3613,7 @@ export class ChatGptBrowserWorker {
     signal?: AbortSignal,
     observeBinding?: ChatGptBindingObserver,
   ): Promise<ChatGptAssistantTurnBinding> {
+    const submittedUserIdentity = chatGptSubmittedUserIdentity(baseline);
     const boundCount = await withChatGptBrowserObservationTimeout(
       withBrowserTurnAbort(binding.locator.count(), signal),
     );
@@ -3576,12 +3634,17 @@ export class ChatGptBrowserWorker {
     // an unchanged assistant message ID proves that this is the same response group.
     const sameMessage = identity?.startsWith("group:assistant:")
       && binding.messageIds?.some(id => state.responseMessageIds?.[identity]?.includes(id));
+    if (identity && binding.messageIds?.length && state.responseMessageIds?.[identity]?.length && !sameMessage) {
+      // A user identity proves its group, not every response later rendered in it.
+      // Regeneration or a foreign Activity group cannot replace a known assistant.
+      throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+    }
     const reboundUser = sameMessage ? identity?.replace("group:assistant:", "group:user:") : undefined;
     const newUsers = state.userIdentities.filter(identity => !acceptedTurns.has(identity));
     if (newUsers.length > 0) {
       // Activity can unmount the accepted user group while it renders a temporary
-      // assistant group. Its return must match the ID that acknowledged Send. If no
-      // user ID was observed then, require the entire submitted text instead. A
+      // assistant group. Its return must match the accepted user or the ID observed
+      // during this physical Send. Without either ID, require the entire text. A
       // surviving old group or any competing new turn remains foreign.
       const user = newUsers[0]!;
       const replacement = identity && newUsers.length === 1
@@ -3594,9 +3657,15 @@ export class ChatGptBrowserWorker {
       if (replacement) {
         const locator = page.locator(chatGptAssistantTurnSelector(identity!));
         if (!matches) {
-          matches = baseline.acceptedUserIdentity
+          // A fallback key is a renderer position. Its replacement needs a stable
+          // user/Send identity, or the complete text before any identity is known.
+          const stableAcceptedUser = baseline.acceptedUserIdentity
+            && !/^group:user:fallback-turn-\d+$/.test(baseline.acceptedUserIdentity);
+          // Native Send identity also survives collapsed or escaped user text.
+          matches = stableAcceptedUser
             ? user === baseline.acceptedUserIdentity
-            : Boolean(baseline.submittedText) && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, submitted) => {
+            : submittedUserIdentity ? user === submittedUserIdentity
+            : !binding.messageIds?.length && Boolean(baseline.submittedText) && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, submitted) => {
             const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
             const contents = bubbles.length === 1
               ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]")
@@ -3607,18 +3676,24 @@ export class ChatGptBrowserWorker {
             return contents.length === 1 && normalize(contents[0]!.innerText) === normalize(submitted);
           }, baseline.submittedText!), signal));
         }
-        // The accepted user identity (or exact submitted text) establishes ownership.
+        // The accepted user, native Send identity or exact text establishes ownership.
         // Activity can replace its temporary group while still generating; requiring
         // a completed answer here mistakes that same unfinished turn for a foreign one.
       }
       if (!matches) throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      // Full text is evidence only until the renderer supplies a formal identity.
+      // Keep that identity so a later same-text message cannot replace this turn.
+      if (!/^group:user:fallback-turn-\d+$/.test(user)) baseline.acceptedUserIdentity = user;
     }
     if (!identity || identity === binding.identity) return binding;
+    const messageIds = state.responseMessageIds?.[identity];
     const rebound = {
       identity,
       locator: page.locator(chatGptAssistantTurnSelector(identity)),
       acceptedTurnIdentities: state.turnIdentities,
-      messageIds: state.responseMessageIds?.[identity] ?? [],
+      // Activity can temporarily omit message IDs. Keep the previously proved
+      // identity until the renderer exposes a message again.
+      messageIds: messageIds?.length ? messageIds : binding.messageIds ?? [],
     };
     observeBinding?.(chatGptTurnBindingDiagnostic("rebound", baseline, rebound, state));
     return rebound;
@@ -4123,6 +4198,7 @@ export class ChatGptBrowserWorker {
     completionTracker?: ChatGptCompletionTracker,
     recoverObservation?: ChatGptObservationRecovery,
     observeToolBoundary?: (snapshot: ChatGptResponseDomSnapshot) => void,
+    submissionObserver?: ChatGptSubmissionRejectionObserver,
   ): Promise<ChatGptSubmissionEvidence> {
     const composer = await this.activeComposer(page);
     const sendButton = composer
@@ -4158,7 +4234,13 @@ export class ChatGptBrowserWorker {
     if (sendSignal.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     // Enter can already have submitted the prompt while the renderer blocks its command reply.
     // Observe acceptance concurrently; never press again or wait for that reply after proof.
-    const activate = () => sendButton.press("Enter", { noWaitAfter: true, signal: activationSignal, timeout: 0 });
+    const activate = () => {
+      // Arm only after asynchronous preparation and inside the authority-checked Send.
+      // A native request identifies this submission; acceptance still needs existing proof.
+      baseline.submittedUserMessage = {};
+      submissionObserver?.begin(page, baseline.submittedUserMessage, baseline.initialTurnIdentities);
+      return sendButton.press("Enter", { noWaitAfter: true, signal: activationSignal, timeout: 0 });
+    };
     const activation = withBrowserTurnAbort(
       submissionLifecycle?.dispatchWithExecutionAuthority
         ? submissionLifecycle.dispatchWithExecutionAuthority(activate)
@@ -4186,9 +4268,13 @@ export class ChatGptBrowserWorker {
         acceptance,
         activation.then(() => acceptance),
       ]), abortSignal);
+      // Acceptance closes this physical Send before asynchronous receipt publication.
+      submissionObserver?.endSubmissionIdentity();
+      chatGptSubmittedUserIdentity(baseline);
       await submissionLifecycle?.onSubmitted?.();
       return evidence;
     } finally {
+      submissionObserver?.endSubmissionIdentity();
       sendAbort.abort();
     }
   }
@@ -5767,7 +5853,6 @@ export class ChatGptBrowserWorker {
                 dispatchWithExecutionAuthority: turn.dispatchWithExecutionAuthority,
                 onSubmitted: recordStageUsage, onSendActivated: async () => {
                 await this.assertSelectedEffort(page, mode);
-                submissionRejection.begin(page);
               } },
               undefined,
               launcherObservationRecovery
@@ -5777,6 +5862,8 @@ export class ChatGptBrowserWorker {
                   return recovered;
                 }
                 : undefined,
+              undefined,
+              submissionRejection,
             ),
           );
           console.info(
@@ -5953,7 +6040,6 @@ export class ChatGptBrowserWorker {
             return turn.onSubmitted?.();
           }, onSendActivated: async () => {
             await this.assertSelectedEffort(page, mode);
-            submissionRejection.begin(page);
             await turn.onSendActivated?.();
           } },
           completionTracker,
@@ -5965,6 +6051,7 @@ export class ChatGptBrowserWorker {
             }
             : undefined,
           observeToolBoundary,
+          submissionRejection,
         ),
       );
       console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${finalSubmissionEvidence}`);

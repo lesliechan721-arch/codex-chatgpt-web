@@ -262,9 +262,10 @@ Every actual new manual input still requires its selected plan, Sent and attachm
 An ended Zero Risk response retains the explicit manual checkpoint handoff.
 
 Applicable Automatic lost-page compaction rebuilds complete legal sources and admits the actual
-read-only on-demand plan, without requiring their full inline browser compilation. Old project
-execution isolation, confirmed Send and real dispatch settlement gate successor execution;
-physical cleanup is independent. Non-applicable routes retain their original compaction interval,
+read-only on-demand plan, without requiring their full inline browser compilation. Closed or
+unknown pages use the current request after best-effort old-execution revocation; old Send,
+settlement, checkpoint, and retry records do not gate new-page admission. Current-page commits
+remain single-writer transactions, and physical cleanup is independent. Non-applicable routes retain their original compaction interval,
 page retirement and fresh summarizer/source admission behavior. An invalid or
 ambiguous handoff still fails explicitly. Browser-only mode
 uses the same read-only summarization path, then returns the native replacement-history shape expected
@@ -308,40 +309,54 @@ threshold, including equivalent ordinary aliases. Lower client limits still appl
 history usage remains distinct from actual browser/attachment, source storage, navigation and
 answer-cache budgets. No million-token browser input is implied.
 
-Ordinary unfinished recovery, committed-checkpoint continuation and uncommitted compaction
-share execution, legal-source and actual-plan admission. New pages receive current effective
-instructions, specifically bound checkpoints, uncovered required text/images and fresh on-demand
-entries. Complete eligible tool sources may exceed a full inline browser prompt; they still need
-real readable content within independent HTTP, snapshot and evidence limits. Digests and expired
-references cannot reconstruct content. Submitted summaries are never regenerated on retry.
+Ordinary unfinished recovery, checkpoint continuation, and uncommitted compaction select the
+page-lifecycle branch before historical admission. A current authenticated Launcher must confirm
+both the actual document and its generation for live-page reuse. That branch retains current
+payload, owner, revision, result, and compaction conflict checks. Matching retries can attach or
+replay. A disk receipt alone does not establish a live page.
 
-Durable project revocation precedes successor authorization. Running Broker, trusted result
-receiver, helper and Launcher must enforce the same generation at actual side-effect and commit
-boundaries. Revocation preserves pre-registered dispatched calls for trusted real settlement.
-Unknown Send/results cannot be guessed or repeated. A process handle is preserved with its wait
-path, not described as termination. Concurrent recovery shares one transfer and successor;
-accepted unacknowledged updates retain revision and require fresh-owner ACK. Stop races target
-the current work, and old final output/checkpoint/ACK cannot overwrite the successor.
+Closed or unknown pages use the current expanded request's instructions, summaries, history,
+real results, and required images. They need no old work/checkpoint ledger or equality with old
+history. Complete eligible sources may exceed an inline prompt, but actual readable content and
+the selected plan must fit HTTP, snapshot, navigation, account, and delivery limits. Old tool text
+is context, not dispatch authority. Lost compaction can generate a new summary; it is not an
+exact old-commit replay. Current-page compaction still commits once.
 
-Physical cleanup is a separate fixed-target transaction with at most three automatic attempts.
-Closing or failed-cleanup documents count toward five real pages until precise destruction.
-A logically isolated old page can remain while a successor uses another free slot. No sixth page
-or unrelated Launcher shutdown is permitted. Pressure can reclaim safe idle pages early after
-preserving task facts; active, possibly-sent or unsettled work is not idle. Page TTL, source
-availability, answer replay and durable anti-replay evidence have independent lifetimes.
+Project revocation precedes successor activation. Backend, Broker, helper, and Launcher check the
+current generation at dispatch and commit boundaries. Make a best effort to cancel or close old
+work, without waiting for unavailable Send, tool-settlement, or destruction proof. Serialize
+same-thread selection and recheck after asynchronous queries; matching recoveries share one
+creation and execution. Old results, stops, helper receipts, final output, checkpoints, and ACK
+cannot write the successor or rebuild deleted records. Original in-flight completion channels
+can finish only their old transmission.
 
-Old independent mode names are rejected before admission with an ordinary replacement name.
-Managed exports use ordinary names; user TOML needs explicit replacement. Versioned migration
-preserves work, stop, Send, first results, checkpoints and retry budgets. Equivalent ordinary
-aliases and compatible Fresh changes do not create new work or mode-exit. Missing/corrupt evidence
-cannot be reset into fresh rights. Old incompatible running components need real retirement and
-settlement, or transfer is rejected. Non-Launcher, Browser-only, Luna, Think and upstream API
-paths retain existing behavior; local Web API Key authentication alone is not excluded.
+Closing a page removes its registration, work/call, stop/completion, history/checkpoint/retry,
+binding/index, and task snapshots by exact generation. A late destroyed event cannot remove a
+new page. Do not retain replacement task tombstones or history archives. The independent
+one-hour memory/disk API increment cache remains, including its existing missing-context 409.
+Installation identity and login state also retain their existing lifetimes.
 
-The limited guarantee covers project operations and state commits; old ChatGPT platform-owned
-activity may continue. See [session continuity](session-continuity.md) for durable budgets, source
-reconstruction, manual handoff and failure meanings, and [release validation](release-validation.md)
-for actual evidence and outstanding real-platform checks.
+Physical cleanup is a fixed-target transaction with at most three automatic attempts. Closing
+or failed-cleanup documents count toward five real pages until actual destruction. A revoked
+page can remain while a successor uses a free slot; logical revocation does not release capacity.
+Incomplete cleanup retains minimum physical identity and close-retry data. Pressure can reclaim
+safe idle pages; active or uncertain work is not idle. HTTP disconnect or interrupt alone does
+not establish closure and does not start background recovery.
+
+Old independent names are rejected with an ordinary replacement name. Managed exports use
+ordinary names; user TOML needs explicit replacement. Migration preserves required confirmed-live
+activity, installation/login state, and the increment cache, removes closed-page records, and
+revokes unknown generations. Legacy, missing, or corrupt old journals cannot become a permanent
+deny list. Run compatible backend, Broker, helper, and Launcher versions; files on disk do not
+prove runtime compatibility. Actually unavailable creation interfaces remain service errors.
+Excluded Non-Launcher, Browser-only, Luna, Think, and upstream API paths retain existing behavior;
+local Web API Key authentication alone is not excluded.
+
+Recovery may execute previously stopped or completed work, and an unreachable old execution can
+still produce external effects. Revocation does not undo issued commands or guarantee exactly-once
+business execution. See [session continuity](session-continuity.md) for current-page relationships,
+limits, cleanup, and manual handoff, and [release validation](release-validation.md) for actual
+coverage and outstanding real-platform checks.
 
 ## Local ChatGPT Limits
 

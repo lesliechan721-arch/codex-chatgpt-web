@@ -232,27 +232,25 @@ Zero Risk completion. Delivered cached results may still replay without blocking
 forever. A queued compaction-control terminal stops blocking after its public delivery.
 
 Non-applicable recoverable paths retain their configured fresh-compaction and delegated-source
-fallback retirement rules for the old browser/tool owner and its queued, waiting and result-ready
-operations. They do not gain the unified task recovery guarantee. Applicable Full Native + Launcher
-recovery admits a successor only after durable project isolation, real dispatched-call settlement,
-confirmed Send state, legal sources and the actual selected plan. It never repeats a dispatched
-operation to reconstruct history, and physical page cleanup is separate from successor authority.
-See [session continuity](session-continuity.md).
+fallback retirement rules. Applicable Full Native + Launcher routes first determine the page
+lifecycle. A confirmed live page keeps its current operation, result, owner, and compaction checks.
+A closed or unknown page uses the current authenticated request after revoking old project
+permissions and making a best effort to cancel old work. Old Send, settlement, stop/completion,
+checkpoint, and retry facts do not gate that new execution. Physical cleanup and actual page
+capacity remain separate. See [session continuity](session-continuity.md).
 
 There is no operation-object or capability recovery across Broker or owner-process restart.
-The durable task admission journal records issued calls and their possible delivery before
-external dispatch, then accepts real results before exposing their receipts. It permits a new
-execution after settlement; it does not revive the old operation or replay its batch. A queued
-call can be cancelled only with proof it was not delivered. Process exit or revocation alone does
-not stop a delivered outer tool. Its actual return, including any live command session ID, remains
-necessary for recovery context unless a reliable committed checkpoint covers that settled result.
+The current-page journal records issued calls and possible delivery before external dispatch,
+and accepts real results before exposing receipts. Revocation alone does not stop a delivered
+outer command. An already-admitted result channel can finish its original transmission, but
+cannot write a newer execution, ACK its updates, or submit its answers.
 
-Recovery follows the durable source lineage through accepted user appends and prior attempts.
-Each call keeps its original emitter work/attempt and first accepted result digest. Reconstructing
-empty in-memory maps cannot prove that the lineage has no pending tools. Current authenticated
-requests can supply matching real results after restart. Missing or conflicting results stop
-recovery instead of triggering a second side effect. New model suggestions remain new operations
-subject to current permissions; the bridge does not claim semantic deduplication of all commands.
+The current request may carry historical real results and running-process handles as context.
+It does not need an old durable source chain, and old call text grants no redispatch authority.
+Do not rerun a historical call to resolve an unknown result. Valid new model suggestions are new
+operations under current permissions. They can repeat prior business effects: the bridge does
+not promise exactly-once execution across page loss. On a confirmed live page, existing call-ID,
+expected-type, first-result, and current-writer conflict checks still apply.
 
 ## Capacity and compatibility
 
@@ -292,8 +290,13 @@ whole progress frame cannot bind a new answer to an old owner; a head change dur
 upgrade that read. The asynchronous progress mirror remains responsible for tool activity and
 liveness, rather than negative ACK or version evidence. Candidates retain that result; late ACKs cannot upgrade it during helper
 transport or a delayed Broker check. Publications contain only version counters, never user text, do not lock output, and
-are released with the bounded retired-turn cache or Broker shutdown. Missing or invalid sources
-fail the turn. Helpers
+are released when a page-bound capability retires, after its admitted owner/helper work settles.
+Already admitted transports retain their own immutable replies, without retaining the page's
+transfer journal or ACK directory. Routes without page recovery retain the existing bounded
+retired-turn cache until eviction or Broker shutdown.
+Directory cleanup errors are reported without retaining execution rights; only failed cleanup
+paths survive for a shutdown retry. Shutdown reports any directories it still cannot remove.
+Missing or invalid sources fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
 Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
 context tools with their mutually exclusive credential schemas on the selected connector before
@@ -347,32 +350,41 @@ Real-platform coverage is separate from those tests; see
 
 ## Execution transfer and trusted settlement
 
-Task identity, attempt, execution generation, page generation, task revision and history revision
-have distinct roles. Durable revocation must precede successor activation and be checked at the
-actual dispatch/commit boundary, including queued Native calls, helper Send/acquisition, inventory,
-context reads, task transfer/ACK, final answers and checkpoint commits. Static configuration and
-navigation verification cannot establish that running Broker, helper and Launcher instances share
-this enforcement. The current runtime feature is `execution-generation-fencing-v1`: helper ready
-and authenticated Launcher `executionProtocol: 1` checks prove the running instances advertise
-it, and Broker `owner_status` uses `recoveryProtocol: 2` alongside main protocol 13. These execution
-checks are separate from context-navigation Verify runtime. The recovery journal atomically
-migrates document version 2 to 3, preserving prior facts; the migration marker remains version 2
-for interrupted-migration compatibility. Older readers must reject unsupported document versions. An incompatible old instance must actually retire with dispatch settlement,
-or the transfer must fail with an upgrade diagnostic.
+Task identity, attempt, execution generation, page generation, task revision, and history revision
+have distinct roles. Revocation precedes successor activation and is checked at the actual
+dispatch/commit boundary, including queued Native calls, helper Send/acquisition, inventory,
+context reads, task transfer/ACK, final answers, and checkpoint commits. Static configuration and
+navigation verification do not prove running components share these rules. Keep backend, Broker,
+helper, and Launcher compatible and verify their running capabilities.
 
-Dispatch registration and revocation have one atomic order. Calls registered before revocation
-remain pending settlement; revocation first rejects new old-generation dispatches. The trusted
-outer result channel can still register real results by original scope, work/attempt, call ID,
-expected type and first digest after revocation or stop. This channel cannot grant business rights,
-ACK an update or submit an answer. A returned running-process handle is not process termination.
-Unknown results and possibly-sent input cannot be resolved by resending in another page.
+The recovery journal uses document version 4 for page-lifecycle authority. Existing version 2/3
+documents are promoted under the storage lock; readers that do not support version 4 reject its
+execution permissions. Running components advertise `session-continuity-recovery-v4`; the
+recovery identity schema remains 2. Document-format compatibility does not prove that an old
+external command stopped or that physical page capacity was released.
 
-One transfer reserves one successor. Accepted unacknowledged updates are preserved with their
-logical IDs and revision and require successor ACK; old ACKs cannot confirm them. Compaction
-successors retain logical target, original deadline and retry budget, with fresh attempt-bound
-read/submission credentials. Old credentials, reads, Sends and late commits remain old-attempt
-facts. Stop committed before activation prevents it; stop after activation targets the current
-execution. Replays and capacity waits do not create additional business attempts.
+Dispatch registration and generation changes have one atomic order. The current-page journal
+retains its work, attempt, snapshot, call type/ID, first digest, and Send relationships. Once a
+generation is revoked or removed, old messages cannot recreate its records or affect the new
+page. Original in-flight completion channels can finish only the old transmission; a missing
+old record denies old-message writes, while a new request can start a new generation.
+A running-process handle does not prove process termination. Neither cancellation nor cleanup
+can undo an already-issued external command.
+
+Serialize same-thread recovery and recheck the generation after asynchronous queries. Concurrent
+matching requests share one creation and execution. Different requests keep one current writer;
+once a new page exists, subsequent requests use its live-page checks. Delayed old helper Sends,
+acquisitions, results, stops, task updates/ACK, final answers, and checkpoint commits cannot
+modify the successor. Stop targets its own generation, and a closed page's old stop cannot block
+a later request.
+
+Within a confirmed live page, accepted updates retain their revision, acknowledgement, and
+one-time transfer rules, and a compaction transaction commits once. Closed or unknown-page
+continuation instead uses the current request's readable summary/history without an old
+checkpoint ledger. Lost compaction may regenerate from current sources as a new transaction,
+not an exact replay. Old cumulative retries and missing old Send/results cannot deny that new
+request. Finite per-request attempts and actual service, input, and physical-capacity limits
+remain in effect.
 
 These rules isolate project-controlled operations and state commits. They do not prove that
 ChatGPT-owned platform activity has stopped or globally deduplicate semantically equal operations

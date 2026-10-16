@@ -18,7 +18,7 @@ async function fixture(t, manual) {
   fs.chmodSync(directory, 0o700);
   const work = { logicalWorkId: "work", purpose: "ordinary", workLineageId: "lineage", state: "send-possible",
     attempts: [{ ...recovery, stage: "send-possible", writerRetired: false }] };
-  fs.writeFileSync(path.join(directory, "recovery.json"), JSON.stringify({ version: 3, installation: recovery.installationId,
+  fs.writeFileSync(path.join(directory, "recovery.json"), JSON.stringify({ version: 4, installation: recovery.installationId,
     threads: { [recovery.threadKey]: { epoch: 0, owner: recovery.ownerProcess, currentWorkId: "work", state: "running",
       legacyUnproven: false, works: { work }, calls: {} } } }), { mode: 0o600 });
   const host = Object.assign(Object.create(BrowserHost.prototype), {

@@ -98,7 +98,7 @@ test("Fresh, Bigger, timeout, and presentation changes do not alter execution id
   }
 });
 
-for (const fresh of [false, true]) test(`legacy stop remains terminal with Fresh=${fresh} and a Bigger preference change`, async () => {
+for (const fresh of [false, true]) test(`unknown legacy page clears its stop before configuration checks with Fresh=${fresh}`, async () => {
   const config = provider(); const parsed = request();
   const directory = config.chatgptWeb!.continuityStateDirectory!;
   new ContinuityRegistrationStore(directory).initialize();
@@ -111,9 +111,11 @@ for (const fresh of [false, true]) test(`legacy stop remains terminal with Fresh
     workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed), snapshotDigest: continuityDigest(parsed.context),
     createPage: true, dispatchProtocolComplete: true });
   store.stopWork(thread, { scope }, work, "user-stop");
-  const before = store.get(thread)!;
+  expect(store.get(thread)!.works[work]!.stopReason).toBe("user-stop");
   Object.assign(config.chatgptWeb!, { experimentalFreshConversationPerTurn: fresh, experimentalBiggerContext: true });
   expect(chatGptWebLegacyExecutionScopes(config, parsed)).toContain(scope);
-  await expect(createChatGptWebAdapter(config).preflight!(parsed, { headers: new Headers() })).rejects.toMatchObject({ code: "continuity_stopped" });
-  expect(store.get(thread)).toEqual(before);
+  // This routing fixture has no Launcher descriptor. The old stop must not hide
+  // that current configuration error or survive as a future recovery gate.
+  await expect(createChatGptWebAdapter(config).preflight!(parsed, { headers: new Headers() })).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
+  expect(store.get(thread)).toBeUndefined();
 });

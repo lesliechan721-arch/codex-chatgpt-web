@@ -168,7 +168,7 @@ test("compaction model summary extraction requires the exact production appendix
   expect(inspectLiveResult(fixture, extractLiveCompactionSummary(forged, fixture.task)).passed).toBe(false);
 });
 
-test("original compaction gate rejects changed source bytes and another thread after real submission", async () => {
+test("live compaction rejects changed source while an unknown thread uses its current readable input", async () => {
   await sourceWiringHarness(async ({ config, broker, factory, configureProvider, source, setBrowser }) => {
     const body = createLiveRequestBody(createLiveFixture("mcp-partial"), { purpose: "compaction", model: "chatgpt-web/gpt-6-sol-instant",
       cwd: process.cwd(), threadId: "negative_source_thread", turnId: "negative_source_turn" });
@@ -176,7 +176,16 @@ test("original compaction gate rejects changed source bytes and another thread a
     setBrowser(async turn => { starts++; const prepared = await turn.prepare();
       if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
       await turn.onSendActivated?.();
-      await turn.onSubmitted?.(); sends++; prepared.release(); return "Source accepted."; });
+      await turn.onSubmitted?.(); sends++;
+      if (turn.compaction) {
+        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
+        const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
+        prepared.release();
+        await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId,
+          summary: "The current request contains the source and the original tool result." });
+        return "Checkpoint handed off.";
+      }
+      prepared.release(); return "Source accepted."; });
     const response = await executeLiveRequestPipeline(body, "ordinary", config, factory, { signal: new AbortController().signal, configureProvider });
     const envelope = await response.json();
     expect(envelope).toMatchObject({ status: "completed" });
@@ -191,11 +200,13 @@ test("original compaction gate rejects changed source bytes and another thread a
     const wrongThread = structuredClone(body), metadata = JSON.parse(wrongThread.client_metadata["x-codex-turn-metadata"]);
     metadata.thread_id = "other_source_thread"; wrongThread.prompt_cache_key = metadata.thread_id;
     wrongThread.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
-    const denied = await compactRequest(new Request("http://local/v1/responses/compact", { method: "POST", headers: {
+    expect(starts).toBe(1); expect(sends).toBe(1);
+    const recovered = await compactRequest(new Request("http://local/v1/responses/compact", { method: "POST", headers: {
       "content-type": "application/json", "x-codex-turn-metadata": JSON.stringify(metadata) }, body: JSON.stringify(wrongThread) }), config, provider => factory(configureProvider(provider)));
-    expect((await denied.json()).error.code).toBe("continuity_source_unproven");
-    expect(starts).toBe(1); // Public task continuity rejects the unowned thread before browser acquisition.
-    expect(sends).toBe(1);
+    const recoveredEnvelope = await recovered.json();
+    expect(recovered.status).toBe(200); expect(recoveredEnvelope.error).toBeUndefined();
+    expect(extractLiveCompletion(recoveredEnvelope, "compaction")).toContain("The current request contains the source");
+    expect(starts).toBe(2); expect(sends).toBe(2);
   });
 });
 

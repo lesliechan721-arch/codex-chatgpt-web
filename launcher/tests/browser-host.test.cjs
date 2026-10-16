@@ -3454,6 +3454,8 @@ test("a failed continuity page with unknown Send is not reclaimed as an idle pag
     snapshotVersion: 2, snapshotDigest: "e".repeat(64), ownerProcess: { pid: process.pid, startIdentity: "test-owner" } };
   tab.continuityOwner = "f".repeat(64);
   tab.continuityRecovery = recovery;
+  tab.continuityCreationRecovery = structuredClone(recovery);
+  tab.continuityLeaseId = "1".repeat(32);
   const record = { identity: structuredClone(recovery), state: "send-possible", tabId: tab.id };
   fixture.continuityTransactions = new Map([[`${recovery.installationId}:${recovery.threadKey}`, record]]);
   let destroyed = false;
@@ -3467,12 +3469,15 @@ test("a failed continuity page with unknown Send is not reclaimed as an idle pag
   fixture.removeTurnTab(tab, false);
   assert.deepEqual(closed, [tab.id]);
   assert.deepEqual(fixture.closingTurnTabs.get(contents).continuityRecovery, recovery);
+  assert.deepEqual(fixture.closingTurnTabs.get(contents).continuityCreationRecovery, recovery);
+  assert.equal(fixture.closingTurnTabs.get(contents).continuityLeaseId, tab.continuityLeaseId);
   assert.equal(record.writerRetired, false);
   tab.continuityRecovery.snapshotVersion++;
   destroyed = true;
   contents.emit("destroyed");
   assert.equal(fixture.closingTurnTabs.size, 0);
-  assert.equal(record.writerRetired, true, "destruction belongs to the frozen recovery identity");
+  assert.equal(fixture.continuityTransactions.has(`${recovery.installationId}:${recovery.threadKey}`), false,
+    "destruction removes the frozen page generation instead of retaining an execution receipt");
 });
 
 function manualTurnFixture() {

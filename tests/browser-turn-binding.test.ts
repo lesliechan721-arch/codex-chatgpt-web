@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { chromium, type Locator, type Page } from "playwright-core";
-import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { readFileSync } from "node:fs";
 
@@ -122,6 +122,164 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("preserves the accepted user 
 
 // Execute the real observation/rebinding code against the reported renderer transition.
 // No account, network requests, or model submissions are used.
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a Send acknowledged under a fallback key rebinds only to its exact submitted prompt", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const prompt = "Read the current source.\nReturn its exact value.";
+    const group = (key: string, text: string) => `<div data-turn-key="${key}">
+      <div data-user-message-bubble><div data-search-result-target style="white-space:pre-wrap">${text}</div></div>
+      <span hidden data-chatgpt-agent-turn-start></span></div>`;
+    for (const scenario of ["same-prompt", "changed-prompt", "competing-turn", "old-group-remains"] as const) {
+      const page = await browser.newPage();
+      await page.setContent("<main></main>");
+      const baseline = await worker.captureSubmissionBaseline(page, prompt);
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, group("fallback-turn-0", prompt));
+      expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      expect(binding.identity).toBe("group:assistant:fallback-turn-0");
+      let replacement = group("persisted", scenario === "changed-prompt" ? "Another instruction." : prompt);
+      if (scenario === "competing-turn") replacement += group("foreign", prompt);
+      if (scenario === "old-group-remains") replacement += group("fallback-turn-0", prompt);
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, replacement);
+      const result = worker.reconcileAssistantTurnBinding(page, baseline, binding);
+      if (scenario === "same-prompt") expect((await result).identity).toBe("group:assistant:persisted");
+      else if (scenario === "old-group-remains") expect((await result).identity).toBe(binding.identity);
+      else await expect(result).rejects.toThrow();
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 15_000);
+
+for (const scenario of ["same-assistant", "foreign-assistant", "temporary-same-assistant", "temporary-foreign-assistant", "second-foreign-user", "same-formal-user"] as const) {
+  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`fallback recovery preserves message identities: ${scenario}`, async () => {
+    const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+    try {
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+      const prompt = "Read the current source.\nReturn its exact value.";
+      const group = (key: string, messageId?: string) => `<div data-turn-key="${key}">
+        <div data-user-message-bubble><div data-search-result-target style="white-space:pre-wrap">${prompt}</div></div>
+        ${messageId ? `<div data-chatgpt-search-message-ids="${messageId}"><div data-conversation-role="assistant"></div></div>`
+          : '<span hidden data-chatgpt-agent-turn-start></span>'}</div>`;
+      const page = await browser.newPage();
+      await page.setContent("<main></main>");
+      const baseline = await worker.captureSubmissionBaseline(page, prompt);
+      const knownAssistant = scenario.includes("assistant");
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, group("fallback-turn-0", knownAssistant ? "accepted-answer" : undefined));
+      expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+      let binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      if (scenario.startsWith("temporary-")) {
+        await page.locator("main").evaluate(node => { node.innerHTML = '<div data-turn-key="fallback-turn-1"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+        binding = await worker.reconcileAssistantTurnBinding(page, baseline, binding);
+        expect(binding.identity).toBe("group:assistant:fallback-turn-1");
+      }
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, group("formal-user", knownAssistant
+        ? scenario.endsWith("same-assistant") ? "accepted-answer" : "foreign-answer" : undefined));
+      const first = worker.reconcileAssistantTurnBinding(page, baseline, binding);
+      if (scenario.endsWith("foreign-assistant")) {
+        await expect(first).rejects.toThrow("another user turn");
+      } else {
+        const formal = await first;
+        expect(formal.identity).toBe("group:assistant:formal-user");
+        if (!knownAssistant) {
+          // Force a fresh DOM observation for the remounted group. The submitted
+          // text is identical even when the replacement belongs to another user.
+          await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, group(scenario === "same-formal-user" ? "formal-user" : "foreign-user"));
+          const second = worker.reconcileAssistantTurnBinding(page, baseline, formal);
+          if (scenario === "same-formal-user") expect((await second).identity).toBe(formal.identity);
+          else await expect(second).rejects.toThrow("another user turn");
+        }
+      }
+      await page.close();
+    } finally { await browser.close(); }
+  }, 15_000);
+}
+
+for (const stage of ["acceptance", "initial binding"] as const) {
+  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`the submitted native user also constrains ${stage}`, async () => {
+    const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+    try {
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+      const page = await browser.newPage();
+      await page.setContent("<main></main>");
+      const baseline = await worker.captureSubmissionBaseline(page, "Same prompt");
+      baseline.submittedUserMessage = { messageId: "11111111-1111-4111-8111-111111111111" };
+      await page.locator("main").evaluate(main => { main.innerHTML = '<div data-turn-key="22222222-2222-4222-8222-222222222222"><div data-user-message-bubble>Same prompt</div><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const result = stage === "acceptance" ? worker.currentSubmissionEvidence(page, baseline)
+        : worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      await expect(result).rejects.toThrow("user turn");
+    } finally { await browser.close(); }
+  }, 15_000);
+}
+
+for (const matchingUser of [true, false]) {
+  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`the physical Send identifies its formal user despite display escaping: match=${matchingUser}`, async () => {
+    const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+    const observer = new ChatGptSubmissionRejectionObserver();
+    try {
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+      const page = await browser.newPage();
+      await page.route("https://chatgpt.com/backend-api/f/conversation", route => route.fulfill({
+        status: 200, headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" }, body: "{}",
+      }));
+      await page.setContent('<main></main><form data-chatgpt-composer><div data-composer-markdown contenteditable="true" role="textbox">Prompt</div><button type="button" data-testid="send-button" aria-label="Send prompt">Send</button></form>');
+      const messageId = "11111111-1111-4111-8111-111111111111";
+      const prompt = 'Read the current source.\\"Keep literal escaping.\\"';
+      const baseline = await worker.captureSubmissionBaseline(page, prompt);
+      await page.locator("button").evaluate((button, id) => button.addEventListener("keydown", async event => {
+        if ((event as KeyboardEvent).key !== "Enter") return;
+        event.preventDefault();
+        await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST",
+          headers: { "content-type": "application/json" }, body: JSON.stringify({ messages: [{ id, author: { role: "user" }, content: { parts: ["Browser serialized text"] } }] }) });
+        document.querySelector("main")!.innerHTML = '<button data-testid="stop-button" aria-label="Stop streaming">Stop</button>';
+      }), messageId);
+      expect(await worker.sendAttachedPrompt(page, baseline, undefined, AbortSignal.timeout(5000),
+        undefined, undefined, undefined, undefined, undefined, observer)).toBe("generation_running");
+      await page.locator("main").evaluate(main => { main.innerHTML = '<div data-turn-key="fallback-turn-0"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      let binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      const key = matchingUser ? messageId : "22222222-2222-4222-8222-222222222222";
+      await page.locator("main").evaluate((main, { key, text }) => {
+        const group = document.createElement("div"); group.setAttribute("data-turn-key", key);
+        group.innerHTML = '<div data-user-message-bubble><div data-search-result-target></div></div><span hidden data-chatgpt-agent-turn-start></span>';
+        group.querySelector("[data-search-result-target]")!.textContent = text;
+        main.replaceChildren(group);
+      }, { key, text: matchingUser ? "The browser renders escaped text differently." : prompt });
+      // Same-page observation recovery copies the baseline and must retain the Send association.
+      const result = worker.reconcileAssistantTurnBinding(page, { ...baseline, domCache: {} }, binding);
+      if (matchingUser) expect((await result).identity).toBe(`group:assistant:${messageId}`);
+      else await expect(result).rejects.toThrow("another user turn");
+    } finally { observer.dispose(); await browser.close(); }
+  }, 15_000);
+}
+
+for (const hasUser of [true, false]) {
+  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`a known assistant cannot be replaced after a formal user was proved: user bubble=${hasUser}`, async () => {
+    const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+    try {
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+      const page = await browser.newPage();
+      const prompt = "Read the current source.";
+      const group = (key: string, user: boolean, id?: string) => `<div data-turn-key="${key}">
+        ${user ? `<div data-user-message-bubble><div data-search-result-target>${prompt}</div></div>` : ""}
+        ${id ? `<div data-chatgpt-search-message-ids="${id}"><div data-conversation-role="assistant"></div></div>`
+          : '<span hidden data-chatgpt-agent-turn-start></span>'}</div>`;
+      await page.setContent("<main></main>");
+      const render = (html: string) => page.locator("main").evaluate((node, value) => { node.innerHTML = value; }, html);
+      const baseline = await worker.captureSubmissionBaseline(page, prompt);
+      await render(group("fallback-turn-0", true, "accepted-answer"));
+      expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+      let binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      await render(group("formal-user", true, "accepted-answer"));
+      binding = await worker.reconcileAssistantTurnBinding(page, baseline, binding);
+      expect(baseline.acceptedUserIdentity).toBe("group:user:formal-user");
+      await render(group("fallback-turn-1", false));
+      binding = await worker.reconcileAssistantTurnBinding(page, baseline, binding);
+      await render(group(hasUser ? "formal-user" : "foreign", hasUser, "foreign-answer"));
+      await expect(worker.reconcileAssistantTurnBinding(page, baseline, binding)).rejects.toThrow("another user turn");
+    } finally { await browser.close(); }
+  }, 15_000);
+}
+
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with the exact submitted prompt and no competing turn", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
@@ -196,3 +354,79 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity befo
     }
   } finally { await browser.close(); server.stop(true); }
 }, 15_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("native identity capture ends before asynchronous submission acknowledgement", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  const firstId = "11111111-1111-4111-8111-111111111111";
+  const laterId = "22222222-2222-4222-8222-222222222222";
+  try {
+    for (const late of [false, true]) {
+      const page = await browser.newPage();
+      const observer = new ChatGptSubmissionRejectionObserver();
+      try {
+        await page.route("https://chatgpt.com/backend-api/f/conversation", route => route.fulfill({ status: 200,
+          headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" }, body: "{}" }));
+        await page.setContent('<main></main><form data-chatgpt-composer><div data-composer-markdown contenteditable="true" role="textbox">Prompt</div><button type="button" data-testid="send-button" aria-label="Send prompt">Send</button></form>');
+        const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+        const baseline = await worker.captureSubmissionBaseline(page, "Prompt");
+        await page.locator("button").evaluate((button, id) => button.addEventListener("keydown", async event => {
+          if ((event as KeyboardEvent).key !== "Enter") return;
+          event.preventDefault();
+          await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ messages: [{ id, author: { role: "user" }, content: { parts: ["Prompt"] } }] }) });
+          document.querySelector("main")!.innerHTML = '<button data-testid="stop-button" aria-label="Stop streaming">Stop</button>';
+        }), firstId);
+        let acknowledged = false;
+        expect(await worker.sendAttachedPrompt(page, baseline, undefined, AbortSignal.timeout(5000), undefined, {
+          async onSubmitted() {
+            acknowledged = true;
+            expect(baseline.submittedUserMessage).toEqual({ messageId: firstId });
+            if (late) await page.evaluate(async id => {
+              await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ messages: [{ id, author: { role: "user" }, content: { parts: ["Later request"] } }] }) });
+            }, laterId);
+          },
+        }, undefined, undefined, undefined, observer)).toBe("generation_running");
+        expect(acknowledged).toBeTrue();
+        expect(baseline.submittedUserMessage).toEqual({ messageId: firstId });
+      } finally { observer.dispose(); await page.close(); }
+    }
+  } finally { await browser.close(); }
+}, 15_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("initial assistant binding preserves the formal user accepted by physical Send", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  const acceptedId = "11111111-1111-4111-8111-111111111111";
+  const foreignId = "22222222-2222-4222-8222-222222222222";
+  try {
+    for (const native of ["known", "absent", "unknown"] as const) for (const foreign of [false, true]) {
+      const page = await browser.newPage();
+      const observer = new ChatGptSubmissionRejectionObserver();
+      try {
+        await page.route("https://chatgpt.com/backend-api/f/conversation", route => route.fulfill({ status: 200,
+          headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" }, body: "{}" }));
+        await page.setContent('<main></main><form data-chatgpt-composer><div data-composer-markdown contenteditable="true" role="textbox">Prompt</div><button type="button" data-testid="send-button" aria-label="Send prompt">Send</button></form>');
+        const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+        const baseline = await worker.captureSubmissionBaseline(page, "Prompt");
+        await page.locator("button").evaluate((button, { id, native }) => button.addEventListener("keydown", async event => {
+          if ((event as KeyboardEvent).key !== "Enter") return;
+          event.preventDefault();
+          if (native !== "absent") await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify(native === "known" ? { messages: [{ id, author: { role: "user" } }] } : { unknownSchema: true }) });
+          document.querySelector("main")!.innerHTML = `<div data-turn-key="${id}"><div data-user-message-bubble>Prompt</div></div>`;
+        }), { id: acceptedId, native });
+        expect(await worker.sendAttachedPrompt(page, baseline, undefined, AbortSignal.timeout(5000), undefined,
+          undefined, undefined, undefined, undefined, observer)).toBe("user_turn");
+        expect(baseline.acceptedUserIdentity).toBe(`group:user:${acceptedId}`);
+        const id = foreign ? foreignId : acceptedId;
+        await page.locator("main").evaluate((main, id) => {
+          main.innerHTML = `<div data-turn-key="${id}"><div data-user-message-bubble>Prompt</div><span hidden data-chatgpt-agent-turn-start></span></div>`;
+        }, id);
+        const binding = worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+        if (foreign) await expect(binding).rejects.toThrow("user turn");
+        else expect((await binding).identity).toBe(`group:assistant:${acceptedId}`);
+        expect(baseline.acceptedUserIdentity).toBe(`group:user:${acceptedId}`);
+      } finally { observer.dispose(); await page.close(); }
+    }
+  } finally { await browser.close(); }
+}, 30_000);

@@ -586,7 +586,7 @@ test("a v2 helper rejects instance recovery before prompt preparation or IPC run
   })).rejects.toMatchObject({ code: "continuity_configuration_conflict" });
   expect(prepared).toBe(0);
   expect(dispatched).toBe(0);
-  expect(CONTINUITY_RECOVERY_FEATURE).toBe("session-continuity-recovery-v3");
+  expect(CONTINUITY_RECOVERY_FEATURE).toBe("session-continuity-recovery-v4");
 });
 
 test("recovery feature alone cannot claim the live helper execution fencing capability", async () => {

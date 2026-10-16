@@ -201,7 +201,7 @@ or completion credential remains necessary to submit. Ordinary credentials canno
 compaction snapshot, and submission credentials cannot substitute for the read credential.
 Historical instructions are summary evidence, not new work to execute.
 
-The control entry must actually be delivered before reads open. Existing owner, generation,
+The control entry must actually be delivered before reads open. Current-page owner, generation,
 revision, ACK, Send, real-result settlement, and checkpoint checks still apply. A healthy retained
 source does not need to fit all source bytes into a new browser input or all reads into the cumulative
 allowance. Fresh-page recovery checks complete legal sources independently from the actual selected plan;
@@ -286,7 +286,9 @@ Snapshots are active-task data, not a permanent history store. New access stops 
 cancellation, retirement, or expiry, and in-flight returns recheck revocation. Restart invalidates
 old context IDs, references, cursors, and read credentials. A legal recovery must obtain and verify
 actual sources before creating new references; digests and old chat URLs cannot restore content.
-Unknown Send state does not authorize resending. Recovery journals retain bounded identity,
+Unknown Send state on a confirmed live page does not authorize resending. Closed or unknown-page
+recovery can start a new current-request execution without resolving that old Send, but does not
+automatically redispatch historical tools. Current-page journals retain bounded identity,
 coverage, digest, budget, and receipt metadata, not source text, images, or read credentials.
 
 Local contract tests do not prove cloud schema adoption, model understanding, summary quality,
@@ -299,8 +301,10 @@ live image evidence and the remaining acceptance requirements.
 Retired or restarted snapshots do not provide a permanent original-text store. Rebuild from the
 current authenticated request, legal previous-response expansion, or still-held verifiable content.
 A specifically bound checkpoint may cover its earlier history, but cannot recover discarded bytes.
-A digest, URL, expired reference, or result-exists record does not replace source content. Publish a
-fresh bound entry only after execution isolation, real dispatch settlement, confirmed Send state,
-and final source/plan admission. Old in-flight reads cannot contribute delivery or read proof to
-the successor. Physical page cleanup is independent of this permission boundary. See
+A digest, URL, expired reference, or result-exists record does not replace source content. For
+supported closed or unknown-page recovery, revoke old project permissions and make a best effort
+to cancel old work before using the current request and actual source/plan limits. Old Send,
+settlement, checkpoint, or retry records do not gate the new page. Old in-flight reads cannot
+contribute delivery or read proof to the successor. Physical page cleanup and its real capacity
+remain independent of this permission boundary. See
 [session continuity](session-continuity.md) for scope, budgets and cleanup limits.

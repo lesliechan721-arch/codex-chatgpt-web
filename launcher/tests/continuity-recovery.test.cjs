@@ -532,8 +532,17 @@ test("authenticated missing receipts require old Launcher instance exit and no s
     assert.equal(markContinuitySendPossible(f.host, next).sendAuthorized, true);
     assert.equal(markContinuitySendPossible(f.host, next).sendAuthorized, false);
     assert.equal(f.allocations(), 1);
-    // A live same-thread page blocks every missing-old-transaction shortcut.
-    await assert.rejects(post("query", before), /Expected values/);
+    // A live successor prevents a missing old receipt from claiming no writer.
+    // The old identity still has no authority over its document or Send boundary.
+    const current = f.host.continuityTransactions.get(`${next.installationId}:${next.threadKey}`);
+    const oldReceipt = await post("query", before);
+    assert.equal(oldReceipt.state, "unknown");
+    assert.equal(oldReceipt.writerRetired, false);
+    assert.equal(oldReceipt.hostNoWriter, false);
+    assert.deepEqual(oldReceipt.recovery, before);
+    assert.equal(f.host.continuityTransactions.get(`${next.installationId}:${next.threadKey}`), current);
+    assert.deepEqual(current.identity, next);
+    assert.throws(() => markContinuitySendPossible(f.host, before));
   } finally { await old.close(); await server.close(); }
 });
 

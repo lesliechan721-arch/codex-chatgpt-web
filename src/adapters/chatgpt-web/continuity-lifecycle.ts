@@ -43,7 +43,7 @@ export function stopDurableContinuity(
     const unfinished = works.find(value => value.workLineageId === work.workLineageId
       && !["completed", "stopped"].includes(value.state));
     if (!unfinished) continue;
-    store.stopWork(record.thread, { scope: record.scope }, unfinished.logicalWorkId, reason);
+    store.stopWork(record.thread, { scope: record.scope, expectedEpoch: record.epoch, expectedOwner: record.owner.id, expectedVersion: record.version }, unfinished.logicalWorkId, reason);
     lineages.add(work.workLineageId);
   }
   return lineages.size > 0;
@@ -87,6 +87,10 @@ export function leaveContinuityMode(directory: string | undefined, nativeThreadI
     await chatGptTurnSessions.detachContinuityBinding(binding);
     if (lease && conversation) {
       await releaseLauncherRetainedConversation(conversation.descriptor, conversation.key, undefined, lease);
+      if (lease.recovery) {
+        try { bindings.forgetPage(binding, undefined, { ownerId: bindings.owner, identity: lease.recovery }); }
+        catch { /* Exact release may already have completed its callback, or a successor owns the thread. */ }
+      }
     }
   }).catch(() => {
     throw continuityError("continuity_session_lost", "The old continuity owner could not be retired safely. Its task was not restarted.");

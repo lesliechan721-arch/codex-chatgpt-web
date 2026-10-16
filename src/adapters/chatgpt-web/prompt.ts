@@ -72,6 +72,8 @@ export interface CompileChatGptWebPromptOptions {
   manualControl?: true;
   /** Trusted retained-page transport: the selected context is an increment, not replacement history. */
   retainedContinuity?: true;
+  /** Fresh page authority; historical operations are carried context only. */
+  recoveredContinuity?: true;
   /** Negotiated only when creating a new ordinary Full Native execution. */
   taskUpdateProtocol?: 1;
   taskUpdateInitialState?: { acceptedRevision: number; acknowledgedRevision: number };
@@ -579,6 +581,9 @@ function compileChatGptWebPromptCandidate(
     "If a ChatGPT-native capability renders a rich card, widget, chart, or other non-text result, also provide the relevant result as ordinary Markdown in the final answer. A private ChatGPT UI widget never replaces the Markdown answer returned to Codex.",
     "Never copy a ChatGPT widget's HTML, CSS, class names, or DOM markup into the answer unless the user explicitly requested that source markup.",
     "Do not mention this transport contract, context packaging, or capability routing in the user-facing answer unless the user explicitly asks how the bridge works.",
+    ...(options?.recoveredContinuity ? [
+      "This is a new conversation restored from the current request. Historical tool calls and process handles are context only. Never dispatch old calls to prove their results. Previous external effects may remain.",
+    ] : []),
     ...(options?.retainedContinuity ? [
       "This response continues the same retained conversation. The supplied context contains only new inputs and the current execution environment, not replacement history. Prior task messages and completed results remain in this conversation.",
       "Apply the new inputs under their original roles, then continue only unfinished authorized work. A checkpoint is not a new user instruction. Do not repeat completed work or tool calls merely because their history is absent from this increment.",
@@ -588,7 +593,7 @@ function compileChatGptWebPromptCandidate(
     ? manualControl
       ? [
         "This is a Codex history-compaction checkpoint, not a normal task turn.",
-        options?.compactionReadOnly ? "Use only the three context reading tools with the independent compaction credential, and the original checkpoint completion control. Do not execute business or ChatGPT-native tools."
+        options?.compactionReadOnly ? "Complete the original Zero Risk startup control from the MCP metadata before reading compaction sources. Then use only the three context reading tools with the independent compaction credential and the original checkpoint completion control. Do not execute business or ChatGPT-native tools."
           : "Do not call work tools or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
       ]
       : [

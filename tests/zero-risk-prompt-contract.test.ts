@@ -60,6 +60,19 @@ test("Zero Risk compaction prompt stays task-focused while MCP metadata owns com
   expect(compiled.text).not.toContain("codex_turn_complete");
 });
 
+test("Zero Risk read-only compaction permits MCP startup before source navigation", () => {
+  const compiled = compileChatGptWebPrompt(request(true), capabilities, requestId, {
+    manualControl: true,
+    compactionReadOnly: true,
+  });
+  expect(compiled.text).toContain("Complete the original Zero Risk startup control from the MCP metadata before reading compaction sources.");
+  expect(compiled.text).toContain("Then use only the three context reading tools with the independent compaction credential and the original checkpoint completion control.");
+  expect(compiled.text).toContain("Do not execute business or ChatGPT-native tools.");
+  expect(compiled.text).toContain(`\"request_id\":\"${requestId}\"`);
+  expect(compiled.text).not.toContain("codex_turn_start");
+  expect(compiled.text).not.toContain("codex_turn_complete");
+});
+
 test("Zero Risk prompt fails closed without Full harness or an exact manual binding", () => {
   expect(() => compileChatGptWebPrompt(request(), { ...capabilities, localToolsEnabled: false }, requestId, {
     manualControl: true,

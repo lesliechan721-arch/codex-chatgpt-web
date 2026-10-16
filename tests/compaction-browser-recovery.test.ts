@@ -68,6 +68,10 @@ test.each([
       const lifecycle = args[5] as { onSendActivated(): Promise<void>; onSubmitted?: () => void };
       if (stage !== "send") expect(lifecycle.onSubmitted).toBeUndefined();
       await lifecycle.onSendActivated();
+      // This fixture replaces physical Send, which now owns the observer window.
+      // Keep the real rejection observer active for the emitted service responses.
+      const observer = args[9] as { begin(observedPage: typeof page): void; endSubmissionIdentity(): void };
+      observer.begin(page);
       if (cancellationCase || (sizeRejected && stage === "multipart_stage_2_send")) {
         // An observed size rejection must not replace the user's explicit tab-close verdict.
         const request = { method: () => "POST", url: () => "https://chatgpt.com/backend-api/f/conversation", frame: () => frame };
@@ -80,6 +84,7 @@ test.each([
         });
         page.emit("requestfinished", request);
       }
+      observer.endSubmissionIdentity();
       recoveryCallbacks.push(args[7]);
       actions.push("send");
       return "user_turn";

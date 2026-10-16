@@ -192,7 +192,7 @@ test("proof reuse still validates current guards, schema and protected transitio
   }
 });
 
-test("a v2 empty transaction retains the upgrade write and promotes the document to v3", () => {
+test("a v2 empty transaction retains the upgrade write and promotes the document to v4", () => {
   let writes = 0;
   const { file, store, record } = fixture({ beforeWrite: () => { writes++; } });
   const old = JSON.parse(fs.readFileSync(file, "utf8")); old.version = 2; fs.writeFileSync(file, JSON.stringify(old)); writes = 0;
@@ -200,7 +200,7 @@ test("a v2 empty transaction retains the upgrade write and promotes the document
   try {
     const upgraded = store.transact(thread, guard, () => {});
     expect(upgraded).toEqual({ ...record, version: record.version + 1 });
-    expect(writes).toBe(1); expect(JSON.parse(fs.readFileSync(file, "utf8")).version).toBe(3);
+    expect(writes).toBe(1); expect(JSON.parse(fs.readFileSync(file, "utf8")).version).toBe(4);
     expect(sync.mock.calls.length).toBeGreaterThan(0); sync.mockClear();
     expect(store.transact(thread, guard, () => {})).toEqual(upgraded); expect(writes).toBe(1);
     expectReuse(sync.mock.calls.length, file);

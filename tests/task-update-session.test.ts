@@ -807,7 +807,7 @@ test("a recovered session restores durable accepted revision and the next append
     const thread = continuityDigest("thread"), scope = continuityDigest("same-real-provider");
     const workId = "accepted-head-work";
     store.admitWork({ thread, scope, logicalWorkId: workId, instructionIdentity: "two", nativeTurnId: "turn",
-      owner: continuityProcessInstance(), workPayloadDigest: continuityDigest(parsed._rawBody), snapshotDigest: continuityDigest(parsed.context),
+      owner: continuityProcessInstance(bindings.owner), workPayloadDigest: continuityDigest(parsed._rawBody), snapshotDigest: continuityDigest(parsed.context),
       createPage: true, dispatchProtocolComplete: true });
     const source = captureTaskUpdateSource(parsed, execution)!;
     const restored = store.transact(thread, { scope }, record => {

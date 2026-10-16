@@ -2002,14 +2002,14 @@ class BrowserHost {
       // Keep only physical identity and capacity data. A close request may return before
       // Electron destroys the document; delayed events must never adopt a newer tag.
       const closing = { id: tab.id, ordinal: tab.ordinal, traceId: tab.traceId, helperPid: tab.helperPid,
-        physicalPageId: tab.physicalPageId, view: tab.view, closing: true,
+        physicalPageId: tab.physicalPageId, continuityLeaseId: tab.continuityLeaseId, view: tab.view, closing: true,
         ...(tab.continuityCreationRecovery ? { continuityCreationRecovery: structuredClone(tab.continuityCreationRecovery) } : {}),
         ...(tab.continuityRecovery ? { continuityRecovery: structuredClone(tab.continuityRecovery) } : {}) };
       this.closingTurnTabs.set(contents, closing);
       contents.once?.("destroyed", () => {
         if (!contents.isDestroyed() || this.closingTurnTabs.get(contents) !== closing) return;
         this.closingTurnTabs.delete(contents);
-        removedContinuityTab(this, closing);
+        removedContinuityTab(this, closing, contents);
       });
     }
     return contents;

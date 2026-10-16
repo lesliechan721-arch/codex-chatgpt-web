@@ -533,11 +533,13 @@ interface CachedCompactionRun {
   promise: Promise<unknown>;
   settlement: Promise<void>;
   retainFailedResult?: true;
+  page?: StructuredCompactionOwner["page"];
 }
 
 interface StructuredCompactionInterruption {
   createdAt: number;
   reason: Error;
+  pages: Set<string>;
 }
 
 export interface StructuredCompactionOwner {
@@ -551,11 +553,14 @@ export interface StructuredCompactionOwner {
   requestDigest?: string;
   /** A strict failure is replay evidence, never permission to generate another summary. */
   retainFailedResult?: true;
+  /** Page authority is separate from the native turn, which can survive closing a page. */
+  page?: { directory: string; thread: string; epoch: number };
 }
 
 const structuredCompactionRuns = new Map<string, CachedCompactionRun>();
 const structuredCompactionOwners = new Map<string, Promise<void>>();
 const structuredCompactionInterruptions = new Map<string, StructuredCompactionInterruption>();
+const structuredCompactionPages = new Map<string, Map<string, NonNullable<StructuredCompactionOwner["page"]>>>();
 const STRUCTURED_COMPACTION_RUN_TTL_MS = 30 * 60_000;
 const MAX_STRUCTURED_COMPACTION_IDENTITIES = 256;
 
@@ -566,6 +571,17 @@ function nativeTurnIdentityKey(threadId: string, turnId: string): string {
   return JSON.stringify([threadId, turnId]);
 }
 
+function compactionPageKey(page: NonNullable<StructuredCompactionOwner["page"]>): string {
+  return JSON.stringify([page.directory, page.thread, page.epoch]);
+}
+
+export function registerStructuredCompactionPage(threadId: string, turnId: string, page: NonNullable<StructuredCompactionOwner["page"]>): void {
+  const identity = nativeTurnIdentityKey(threadId, turnId);
+  const pages = structuredCompactionPages.get(identity) ?? new Map();
+  pages.set(compactionPageKey(page), page);
+  structuredCompactionPages.set(identity, pages);
+}
+
 function rememberStructuredCompactionInterruption(threadId: string, turnId: string, reason: Error): void {
   const identity = nativeTurnIdentityKey(threadId, turnId);
   const now = Date.now();
@@ -573,17 +589,39 @@ function rememberStructuredCompactionInterruption(threadId: string, turnId: stri
   const existing = structuredCompactionInterruptions.get(identity);
   if (existing) {
     existing.createdAt = now;
+    for (const key of structuredCompactionPages.get(identity)?.keys() ?? []) existing.pages.add(key);
     return;
   }
-  structuredCompactionInterruptions.set(identity, { createdAt: now, reason });
+  structuredCompactionInterruptions.set(identity, { createdAt: now, reason,
+    pages: new Set(structuredCompactionPages.get(identity)?.keys()) });
 }
 
 function structuredCompactionInterruption(owner: StructuredCompactionOwner): Error | undefined {
   if (owner.nativeThreadId === undefined && owner.nativeTurnId === undefined) return undefined;
   pruneStructuredCompactionInterruptions();
-  return structuredCompactionInterruptions.get(
+  const interruption = structuredCompactionInterruptions.get(
     nativeTurnIdentityKey(owner.nativeThreadId ?? "", owner.nativeTurnId ?? ""),
-  )?.reason;
+  );
+  // Task page admission and durable stop fence its exact generation. A previous
+  // page's native-turn tombstone cannot cancel a newly admitted page.
+  return owner.page && !interruption?.pages.has(compactionPageKey(owner.page)) ? undefined : interruption?.reason;
+}
+
+/** Remove lookup ownership; in-flight transports keep only their own run reference. */
+export function forgetStructuredCompactionPage(directory: string, thread: string, epoch: number | undefined): void {
+  const pageKey = epoch === undefined ? undefined : compactionPageKey({ directory, thread, epoch });
+  for (const [key, run] of structuredCompactionRuns) {
+    if (run.page?.directory !== directory || run.page.thread !== thread || run.page.epoch !== epoch) continue;
+    structuredCompactionRuns.delete(key);
+    if (structuredCompactionOwners.get(run.ownerKey) === run.settlement) structuredCompactionOwners.delete(run.ownerKey);
+  }
+  for (const [identity, pages] of structuredCompactionPages) {
+    if (pageKey) pages.delete(pageKey);
+    if (pages.size === 0) structuredCompactionPages.delete(identity);
+    const interruption = structuredCompactionInterruptions.get(identity);
+    if (pageKey) interruption?.pages.delete(pageKey);
+    if (interruption?.pages.size === 0) structuredCompactionInterruptions.delete(identity);
+  }
 }
 
 function registerStructuredCompactionOwner(
@@ -637,6 +675,11 @@ export function existingStructuredCompactionRun<T = string>(
   }
   if (run && owner) registerStructuredCompactionOwner(run, owner);
   return run?.promise as Promise<T> | undefined;
+}
+
+export function hasActiveStructuredCompactionRun(key: string): boolean {
+  pruneStructuredCompactionRuns();
+  return structuredCompactionRuns.get(key)?.active === true;
 }
 
 /** Preserve a failed run only after the caller crossed its irreversible control boundary. */
@@ -695,6 +738,7 @@ export function runStructuredCompactionOnce<T = string>(
     promise,
     settlement: ownerSettlement,
     ...(owner.retainFailedResult ? { retainFailedResult: true } : {}),
+    ...(owner.page ? { page: { ...owner.page } } : {}),
   };
   structuredCompactionRuns.set(key, run);
   structuredCompactionOwners.set(owner.ownerKey, ownerSettlement);

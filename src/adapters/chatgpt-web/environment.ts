@@ -633,6 +633,7 @@ export function requestCarriedChatGptInstructionRevision(parsed: CodexParsedRequ
 
 /** Index of the latest native instruction that is physically present in this request. */
 export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): number {
+  if (parsed._continuityRequestInstruction) return -1;
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const identity = extractChatGptTurnIdentity(parsed);
@@ -678,6 +679,7 @@ export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): numb
 
 /** Use the same native instruction for work identity and incremental input selection. */
 export function chatGptCurrentInstructionRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision | undefined {
+  if (parsed._continuityRequestInstruction) return parsed._continuityRequestInstruction;
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const index = chatGptCurrentInstructionIndex(parsed);
@@ -760,6 +762,11 @@ export function continuityCurrentInstructionInput(
   includeRetainedSource = false,
   sourceInstructionIndex?: number,
 ): unknown[] {
+  if (parsed._continuityRequestInstruction) {
+    const source = parsed._continuityRequestInstruction;
+    return [{ type: "message", ...source.instructionEnvelope, id: source.itemId, content: source.content,
+      internal_chat_message_metadata_passthrough: { turn_id: source.turnId } }];
+  }
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const index = sourceInstructionIndex ?? chatGptCurrentInstructionIndex(parsed);
@@ -996,6 +1003,7 @@ function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record
 
 /** Canonical instruction order distinguishes new steering from a delayed older request. */
 export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): ChatGptTurnUserRevision[] {
+  if (parsed._continuityRequestInstruction) return [parsed._continuityRequestInstruction];
   const body = record(parsed._rawBody);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const metadata = clientTurnMetadata(parsed);

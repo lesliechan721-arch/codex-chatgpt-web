@@ -161,10 +161,10 @@ test("real durable Broker/MCP observes successor delivery and ACK without dispat
       probes: ["tool", "ACK", "final"].map(boundary => ({ boundary, rejected: true, obsolete: true, presentBefore: true, presentAfter: true })),
       successor: { originalTarget: "synthetic-old", target: "synthetic-new", oldPresentAtCompletion: true,
         revisions,
-        state: after.works.B!.state, stopped: false, sameRetiredWork: true, historyPreserved: true, epochAdvanced: true },
+        state: after.works.B!.state, stopped: false, newWork: false, historyCleared: false, epochChanged: true, oldWorkAbsent: false, preparedProtocolFresh: false },
       closeFault: { controlled: true, attempts: 3, state: "failed" } };
     // Physical probes are oracle fixtures; revisions are actual Broker/MCP/journal facts.
-    expect(inspectOldLiveFencingEvidence(evidence).passed).toBe(true);
+    expect(inspectOldLiveFencingEvidence(evidence).passed).toBe(false);
     const inspectRevisions = (facts: typeof revisions) => inspectOldLiveFencingEvidence({ ...evidence, successor: { ...evidence.successor, revisions: facts } }).passed;
     for (const field of ["connectorAcceptedRevision", "connectorAcknowledgedRevision", "protocolAcceptedRevision", "protocolAcknowledgedRevision"] as const) {
       expect(inspectRevisions({ ...revisions, [field]: null })).toBe(false);

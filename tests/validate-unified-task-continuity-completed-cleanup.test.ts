@@ -35,8 +35,8 @@ function fixture(completed = true, purpose: "ordinary" | "compaction" = "ordinar
       summaryDigest: "7".repeat(64), coveredCallIds: ["actual-fixture-call"], retainedBodyBytes: 0 });
   } else if (completed) store.completeWork(thread, { scope }, "work", { receiptId: "actual-fixture-final", digest: "7".repeat(64) });
   const ref = { directory, thread, logicalWorkId: currentWork, attempt: 0, ownerId: owner.id };
-  let observed = store.get(thread)!, instance = structuredClone(launcherInstance);
-  const identity = recoveryIdentity(observed, store.installationId());
+  let observed: RecoveryThreadRecord | undefined = store.get(thread)!, instance = structuredClone(launcherInstance);
+  const identity = recoveryIdentity(observed!, store.installationId());
   const lease: ContinuityLease = { owner: "fixture-owner", leaseId: "fixture-lease", traceId: "fixture-trace", recovery: identity };
   const counts = { settlement: 0, query: 0, inspect: 0, release: 0, targets: 0 };
   // Match the actual onContinuityLease capture: ownership plus its original
@@ -46,6 +46,7 @@ function fixture(completed = true, purpose: "ordinary" | "compaction" = "ordinar
   let physical: ContinuityTransactionReceipt["physicalCleanup"] = "pending";
   const source: CompletedCleanupSource = {
     ref, installationId: store.installationId(), readRecord: () => structuredClone(observed),
+    registrationPresent: () => Boolean(JSON.parse(readFileSync(join(directory, "threads.json"), "utf8")).entries?.[thread]),
     owned: workerPage, ownedTargets: new Set(["owned-old-target"]),
     expectedResults: [{ callId: "actual-fixture-call", firstResultDigest: "6".repeat(64) }],
     originalLauncher: { pid: launcherInstance.pid, launcherInstance, surfaceTargets: { home: "home-target" } },
@@ -55,30 +56,30 @@ function fixture(completed = true, purpose: "ordinary" | "compaction" = "ordinar
       executionProtocol: 1, executionIsolated: true, toolsSettled: false, hostNoWriter: true, launcherInstance,
       continuity: structuredClone(lease), tabId: "owned-tab", surfaceId: "owned-surface", physicalCleanup: physical }; },
     inspect: async (conversation, expected) => { counts.inspect++; expect(conversation).toBe(source.owned!.conversation); expect(expected).toEqual(lease); return { continuity: lease, state: "ready" }; },
-    release: async (conversation, expected, timeoutMs) => { counts.release++; expect(conversation).toBe(source.owned!.conversation); expect(expected).toEqual(lease); expect(timeoutMs).toBeGreaterThan(0); physical = "destroyed"; return 1; },
+    release: async (conversation, expected, timeoutMs) => { counts.release++; expect(conversation).toBe(source.owned!.conversation); expect(expected).toEqual(lease); expect(timeoutMs).toBeGreaterThan(0); physical = "destroyed"; store.removePage(thread, store.get(thread)!); observed = undefined; return 1; },
     targetsAbsent: async targets => { counts.targets++; expect([...targets].sort()).toEqual(["owned-current-target", "owned-old-target"]); return true; },
   };
   const path = join(directory, "recovery.json"), original = readFileSync(path);
   return { source, counts, directory, path, original, store, thread, scope, lease, workerPage,
-    mutate: (change: (record: RecoveryThreadRecord) => void) => { change(observed); },
+    mutate: (change: (record: RecoveryThreadRecord) => void) => { change(observed!); },
     changeInstance: () => { instance = { ...instance, instanceId: "9".repeat(64) }; },
     setPhysical: (state: typeof physical) => { physical = state; },
     dispose: () => rmSync(directory, { recursive: true, force: true }) };
 }
 const limits = { deadlineMs: 1000, settlementMs: 100, pollMs: 1 };
 
-test("exact completed page release preserves the real terminal journal and observes physical absence", async () => {
+test("exact completed page release removes page tasks and observes physical absence", async () => {
   const f = fixture();
   try {
     const result = await cleanupCompletedContinuityPage(f.source, limits);
-    expect(result).toMatchObject({ attempted: true, released: true, physicalSettlementConfirmed: true, cleanupConfirmed: true, journalUnchanged: true });
+    expect(result).toMatchObject({ attempted: true, released: true, physicalSettlementConfirmed: true, cleanupConfirmed: true, journalUnchanged: false, pageTaskRemoved: true, registryEntryRemoved: true });
     expect(result.error).toBeUndefined(); expect(f.counts.release).toBe(1); expect(f.counts.targets).toBe(1);
-    expect(readFileSync(f.path)).toEqual(f.original); expect(f.store.get(f.thread)!.works.work!.state).toBe("completed");
+    expect(f.store.get(f.thread)).toBeUndefined();
     expect(completedCleanupDisposition("passed", result)).toEqual({ status: "passed", keepPrivateRuntime: false });
   } finally { f.dispose(); }
 });
 
-test("completed standalone compaction releases its exact page while preserving the unfinished source and checkpoint", async () => {
+test("completed standalone compaction releases its page and removes the source and checkpoint task records", async () => {
   const f = fixture(true, "compaction");
   try {
     const before = f.store.get(f.thread)!;
@@ -87,8 +88,8 @@ test("completed standalone compaction releases its exact page while preserving t
     expect(before.works["compaction-work"]!.attempts[0]!.stage).toBe("interrupted-settled");
     expect(Object.keys(before.checkpoints)).toHaveLength(1);
     const result = await cleanupCompletedContinuityPage(f.source, limits);
-    expect(result).toMatchObject({ cleanupConfirmed: true, journalUnchanged: true }); expect(f.counts.release).toBe(1);
-    expect(f.store.get(f.thread)).toEqual(before); expect(readFileSync(f.path)).toEqual(f.original);
+    expect(result).toMatchObject({ cleanupConfirmed: true, journalUnchanged: false, pageTaskRemoved: true, registryEntryRemoved: true }); expect(f.counts.release).toBe(1);
+    expect(f.store.get(f.thread)).toBeUndefined();
   } finally { f.dispose(); }
 });
 
@@ -195,15 +196,14 @@ test.each(["obsolete", "wrong-lease", "not-ready", "baseline-target"])("%s Launc
   } finally { f.dispose(); }
 });
 
-test("late destroyed receipt is observed after the one exact release, never replaced by a release count", async () => {
+test("delayed physical absence is observed after one exact release without requiring a completed tombstone", async () => {
   const f = fixture();
   try {
-    const release = f.source.release, query = f.source.query;
-    f.source.release = async (...args) => { const result = await release(...args); f.setPhysical("pending"); return result; };
-    f.source.query = async identity => { if (f.counts.query >= 3) f.setPhysical("destroyed"); return query(identity); };
+    const targetsAbsent = f.source.targetsAbsent;
+    f.source.targetsAbsent = async targets => { const absent = await targetsAbsent(targets, 100); return absent && f.counts.targets > 3; };
     const result = await cleanupCompletedContinuityPage(f.source, limits);
-    expect(result.cleanupConfirmed).toBe(true); expect(f.counts.query).toBeGreaterThan(3); expect(f.counts.release).toBe(1);
-    expect(readFileSync(f.path)).toEqual(f.original);
+    expect(result.cleanupConfirmed).toBe(true); expect(f.counts.targets).toBeGreaterThan(3); expect(f.counts.release).toBe(1);
+    expect(f.counts.query).toBe(1); expect(f.store.get(f.thread)).toBeUndefined();
   } finally { f.dispose(); }
 });
 
@@ -224,22 +224,23 @@ test.each(["release-error", "release-timeout", "destroy-failed", "target-present
     if (kind === "release-timeout") f.source.release = () => { f.counts.release++; return new Promise(done => { lateRelease = () => done(1); }); };
     if (kind === "destroy-failed") f.source.release = async () => { f.counts.release++; f.setPhysical("failed"); return 1; };
     if (kind === "target-present") f.source.targetsAbsent = async () => false;
-    const result = await cleanupCompletedContinuityPage(f.source, { ...limits, deadlineMs: kind === "release-timeout" ? 20 : 1000 });
+    const result = await cleanupCompletedContinuityPage(f.source, { ...limits, deadlineMs: ["release-timeout", "destroy-failed", "target-present"].includes(kind) ? 30 : 1000 });
     expect(result.cleanupConfirmed).toBe(false); expect(result.error).toBeDefined(); expect(f.counts.release).toBe(1);
     const queryCount = f.counts.query; lateRelease?.(); await Bun.sleep(10);
     expect(f.counts.release).toBe(1); expect(f.counts.query).toBe(queryCount);
-    expect(readFileSync(f.path)).toEqual(f.original);
+    if (kind === "target-present") expect(f.store.get(f.thread)).toBeUndefined();
+    else expect(readFileSync(f.path)).toEqual(f.original);
   } finally { f.dispose(); }
 });
 
-test("an earlier oracle failure retains the failed verdict and private journal after precise successful cleanup", async () => {
+test("an earlier oracle failure retains the failed verdict after successful page task removal", async () => {
   const f = fixture();
   try {
     const result = await cleanupCompletedContinuityPage(f.source, limits);
     const disposition = completedCleanupDisposition("failed", result);
     expect(result.cleanupConfirmed).toBe(true); expect(f.counts.release).toBe(1);
     expect(disposition).toEqual({ status: "failed", keepPrivateRuntime: true });
-    expect(existsSync(f.path)).toBe(true); expect(readFileSync(f.path)).toEqual(f.original);
+    expect(existsSync(f.path)).toBe(true); expect(f.store.get(f.thread)).toBeUndefined();
     expect(completedCleanupDisposition("passed", result, true)).toEqual({ status: "failed", keepPrivateRuntime: true });
   } finally { f.dispose(); }
 });
@@ -248,10 +249,10 @@ test("real runtime capture with its original settlement Promise and callback cle
   const f = fixture();
   try {
     const result = await cleanupCompletedContinuityPage(f.source, limits);
-    expect(result).toMatchObject({ attempted: true, released: true, physicalSettlementConfirmed: true, cleanupConfirmed: true, journalUnchanged: true });
-    expect(result.error).toBeUndefined(); expect(f.counts.settlement).toBe(1); expect(f.counts.query).toBe(2);
+    expect(result).toMatchObject({ attempted: true, released: true, physicalSettlementConfirmed: true, cleanupConfirmed: true, journalUnchanged: false, pageTaskRemoved: true, registryEntryRemoved: true });
+    expect(result.error).toBeUndefined(); expect(f.counts.settlement).toBe(1); expect(f.counts.query).toBe(1);
     expect(f.counts.inspect).toBe(1); expect(f.counts.release).toBe(1); expect(f.counts.targets).toBe(1);
-    expect(readFileSync(f.path)).toEqual(f.original);
+    expect(f.store.get(f.thread)).toBeUndefined();
     expect(completedCleanupDisposition("failed", result)).toEqual({ status: "failed", keepPrivateRuntime: true });
   } finally { f.dispose(); }
 });
@@ -266,8 +267,8 @@ test("the captured pending settlement must resolve before any exact query or rel
     resolve();
     const result = await running;
     expect(result.cleanupConfirmed).toBe(true); expect(result.physicalSettlementConfirmed).toBe(true);
-    expect(f.counts.query).toBe(2); expect(f.counts.release).toBe(1);
-    expect(readFileSync(f.path)).toEqual(f.original);
+    expect(f.counts.query).toBe(1); expect(f.counts.release).toBe(1);
+    expect(f.store.get(f.thread)).toBeUndefined();
   } finally { f.dispose(); }
 });
 
@@ -284,5 +285,15 @@ test("the captured rejected settlement never starts exact query or release and r
     expect(completedCleanupDisposition("passed", result)).toEqual({ status: "failed", keepPrivateRuntime: true });
     expect(completedCleanupDisposition("failed", result)).toEqual({ status: "failed", keepPrivateRuntime: true });
     expect(readFileSync(f.path)).toEqual(f.original);
+  } finally { f.dispose(); }
+});
+
+for (const retained of ["journal", "registration"]) test(`physical absence cannot hide a retained ${retained}`, async () => {
+  const f = fixture();
+  try {
+    if (retained === "journal") f.source.release = async () => { f.counts.release++; return 1; };
+    else f.source.registrationPresent = () => true;
+    const result = await cleanupCompletedContinuityPage(f.source, { ...limits, deadlineMs: 30 });
+    expect(result.cleanupConfirmed).toBe(false); expect(result.error).toBeDefined(); expect(f.counts.release).toBe(1);
   } finally { f.dispose(); }
 });

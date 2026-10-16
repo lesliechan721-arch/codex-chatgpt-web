@@ -8,7 +8,8 @@ type LauncherIdentity = { pid: number; launcherInstance?: ContinuityLauncherInst
 export interface CompletedCleanupSource {
   ref: RuntimeRecoveryReference;
   installationId: string;
-  readRecord(): RecoveryThreadRecord;
+  readRecord(): RecoveryThreadRecord | undefined;
+  registrationPresent(): boolean;
   owned?: { lease: ContinuityLease; conversation: string };
   originalLauncher: LauncherIdentity;
   ownedTargets: Set<string>;
@@ -22,7 +23,7 @@ export interface CompletedCleanupSource {
 }
 export interface CompletedCleanupResult {
   attempted: boolean; released: boolean; physicalSettlementConfirmed: boolean; cleanupConfirmed: boolean;
-  journalUnchanged: boolean; reason?: string; error?: string;
+  journalUnchanged: boolean; pageTaskRemoved?: boolean; registryEntryRemoved?: boolean; reason?: string; error?: string;
 }
 export const COMPLETED_CLEANUP_DEADLINE_MS = 30_000;
 export const COMPLETED_SETTLEMENT_DEADLINE_MS = 15_000;
@@ -52,9 +53,9 @@ export async function cleanupCompletedContinuityPage(source: CompletedCleanupSou
     assert.ok(limits.deadlineMs > 0 && limits.deadlineMs <= COMPLETED_CLEANUP_DEADLINE_MS
       && limits.settlementMs > 0 && limits.settlementMs <= COMPLETED_SETTLEMENT_DEADLINE_MS
       && limits.pollMs > 0 && limits.pollMs <= 100, "invalid cleanup limits");
-    const record = structuredClone(source.readRecord()), work = record.works[source.ref.logicalWorkId];
+    const record = structuredClone(source.readRecord()), work = record?.works[source.ref.logicalWorkId];
     // Incomplete, stopped and unknown tasks must not even start waiting on physical settlement.
-    if (work?.state !== "completed") { result.reason = "work not completed; no wait or release"; return result; }
+    if (!record || work?.state !== "completed") { result.reason = "work not completed; no wait or release"; return result; }
     result.attempted = true;
     assert.equal(record.thread, source.ref.thread);
     if (source.ref.ownerId) assert.equal(record.owner.id, source.ref.ownerId, "completed owner changed");
@@ -98,7 +99,7 @@ export async function cleanupCompletedContinuityPage(source: CompletedCleanupSou
       assert.equal(receipt.state, "completed", "cleanup transaction is no longer completed");
       assert.ok(isDeepStrictEqual(receipt.launcherInstance, source.originalLauncher.launcherInstance), "receipt Launcher instance mismatch");
     };
-    let receipt = await observe(() => source.query(identity), "completed query"); validateReceipt(receipt); unchanged();
+    const receipt = await observe(() => source.query(identity), "completed query"); validateReceipt(receipt); unchanged();
     if (receipt.physicalCleanup !== "destroyed") {
       assert.ok(isDeepStrictEqual(receipt.continuity, owned.lease), "query does not own original lease");
       assert.ok(receipt.surfaceId && receipt.tabId, "query lacks exact physical page");
@@ -109,18 +110,23 @@ export async function cleanupCompletedContinuityPage(source: CompletedCleanupSou
       source.ownedTargets.add(target);
       const released = await observe(() => source.release(owned.conversation, owned.lease, Math.min(15_000, remaining())), "completed release");
       assert.ok(Number.isSafeInteger(released) && released >= 0, "invalid release receipt");
-      result.released = released > 0; unchanged();
-      do {
-        receipt = await observe(() => source.query(identity), "destruction query"); validateReceipt(receipt); unchanged();
-        if (receipt.physicalCleanup === "destroyed" || receipt.physicalCleanup === "failed") break;
-        await observe(() => Bun.sleep(Math.min(limits.pollMs, remaining())), "destruction wait");
-      } while (remaining() > 0);
+      result.released = released > 0;
     }
-    assert.equal(receipt.physicalCleanup, "destroyed", "physical destruction unconfirmed");
     assert.ok(source.ownedTargets.size > 0, "case has no exact physical target observation");
-    const absent = await observe(() => source.targetsAbsent(source.ownedTargets, remaining()), "exact target absence");
-    assert.ok(absent, "case-owned target remains physically present"); unchanged();
-    result.cleanupConfirmed = true; result.journalUnchanged = true;
+    // A destroyed page has no retained completed transaction. Observe the exact
+    // targets and both task stores, without requiring a historical tombstone.
+    for (;;) {
+      remaining();
+      const current = source.currentLauncher();
+      assert.equal(current.pid, source.originalLauncher.pid, "Launcher PID changed during cleanup");
+      assert.ok(isDeepStrictEqual(current.launcherInstance, source.originalLauncher.launcherInstance), "Launcher instance changed during cleanup");
+      const currentRecord = source.readRecord();
+      assert.ok(!currentRecord || isDeepStrictEqual(currentRecord, record), "completed journal changed during cleanup");
+      const absent = await observe(() => source.targetsAbsent(source.ownedTargets, remaining()), "exact target absence");
+      if (absent && !source.readRecord() && !source.registrationPresent()) break;
+      await observe(() => Bun.sleep(Math.min(limits.pollMs, remaining())), "page task cleanup wait");
+    }
+    result.cleanupConfirmed = true; result.pageTaskRemoved = true; result.registryEntryRemoved = true;
   } catch (error) { result.error = error instanceof Error ? error.message : String(error); }
   return result;
 }

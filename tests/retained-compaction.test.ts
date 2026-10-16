@@ -2318,7 +2318,7 @@ test.each([false, true])("public Full Launcher task commits a retained checkpoin
   } finally { await f.dispose(); }
 });
 
-test("public Full Launcher task rejects a v1 retained registration without dispatch evidence before Send", async () => {
+test("public Full Launcher task recovers a v1 registration from the current request when no page is confirmed", async () => {
   const f = retainedTaskFixture();
   try {
     const parsed = parseRequest(f.body);
@@ -2327,7 +2327,7 @@ test("public Full Launcher task rejects a v1 retained registration without dispa
     const thread = continuityDigest(f.threadId);
     f.registrations.claim(thread, parsed._continuityScope!, "b".repeat(64));
     // Recreate the actual v1 storage shape: registration exists, but no recovery journal.
-    // Controlled migration must keep this as unproved; it cannot invent a no-call history.
+    // Migration does not invent old dispatch evidence. Unknown pages admit the current request.
     const marker = JSON.parse(readFileSync(join(f.statePath, "initialized.json"), "utf8"));
     delete marker.recoveryVersion;
     writeFileSync(join(f.statePath, "initialized.json"), JSON.stringify(marker));
@@ -2338,11 +2338,15 @@ test("public Full Launcher task rejects a v1 retained registration without dispa
     expect(before.legacyUnproven).toBe(true);
     expect(before.works).toEqual({});
 
-    const rejected = await f.send(f.body);
-    expect(rejected.status).toBe(409);
-    expect(await rejected.json()).toMatchObject({ error: { code: "continuity_legacy_unproven" } });
-    expect(f.submissions).toHaveLength(0);
-    expect(f.pages.size).toBe(0);
-    expect(f.store.get(thread)).toEqual(before);
+    const recovered = await f.send(f.body);
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toMatchObject({ status: "completed" });
+    expect(f.submissions).toHaveLength(1);
+    expect(f.pages.size).toBe(1);
+    const after = f.store.get(thread)!;
+    expect(after.legacyUnproven).toBe(false);
+    expect(after.epoch).not.toBe(before.epoch);
+    expect(after.owner.id).not.toBe(before.owner.id);
+    expect(after.works[after.currentWorkId!]!.state).toBe("completed");
   } finally { await f.dispose(); }
 });

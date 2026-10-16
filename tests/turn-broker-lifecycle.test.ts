@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
@@ -453,6 +454,93 @@ test("closing an unstarted replacement preserves the previous close barrier", as
     await closingAll?.catch(() => {});
     await replacementListen?.catch(() => {});
     await replacement?.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const queued of [false, true])
+test(`ACK cleanup failure releases the endpoint close barrier (queued replacement: ${queued})`, async () => {
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-broker-ack-close-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const retired = TurnBroker.forSocket(socketPath);
+  let replacement: TurnBroker | undefined;
+  let closingRetired: Promise<void> | undefined;
+  let closingUnused: Promise<void> | undefined;
+  let restore = () => {};
+  try {
+    const token = await retired.register({ authorityMode: "delegated", threadId: "cleanup-thread", turnId: "cleanup-turn", tools: [] },
+      undefined, "ack-cleanup-close", { taskUpdateProtocol: 1 });
+    const directory = retired.taskUpdateState(token)!.acknowledgementDirectory!;
+    expect(existsSync(directory)).toBeTrue();
+    const remove = fs.rmSync;
+    const failure = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+      if (path === directory) throw Object.assign(new Error("ACK directory permission denied"), { code: "EACCES" });
+      return remove(path, options);
+    });
+    restore = () => failure.mockRestore();
+    closingRetired = retired.close();
+    if (queued) {
+      const unused = TurnBroker.forSocket(socketPath);
+      closingUnused = unused.close();
+      // Observe either outcome before awaiting the older close to avoid an unhandled rejection.
+      void closingUnused.catch(() => {});
+    }
+    await expect(closingRetired).rejects.toThrow("ACK publication directories");
+    if (closingUnused) await closingUnused;
+    expect(retired.taskUpdateState(token)).toBeUndefined();
+    await expect(callTurnBroker(socketPath, { method: "owner_status" })).rejects.toThrow("unavailable");
+    restore();
+    replacement = TurnBroker.forSocket(socketPath);
+    await replacement.listen();
+    await expect(callTurnBroker(socketPath, { method: "owner_status" })).resolves.toHaveProperty("protocolVersion");
+    await expect(callTurnBroker(socketPath, { method: "native_operation_start", token, contract: "native",
+      nativeWaitProtocol: 1, taskUpdateProtocol: 1, taskRevision: 0, operationId: 1,
+      entry: "codex_exec", nativeInput: { cmd: "never executed" }, waitMs: 1 }))
+      .rejects.toMatchObject({ code: "codex_tool_operation_retired" });
+  } finally {
+    restore();
+    await closingRetired?.catch(() => {});
+    await closingUnused?.catch(() => {});
+    await replacement?.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const alreadyClosing of [false, true])
+test(`global shutdown reports ACK cleanup failures (already closing: ${alreadyClosing})`, async () => {
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-broker-global-ack-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  let localClose: Promise<void> | undefined;
+  let unusedClose: Promise<void> | undefined;
+  let restore = () => {};
+  try {
+    const token = await broker.register({ authorityMode: "delegated", threadId: "cleanup-thread", turnId: "cleanup-turn", tools: [] },
+      undefined, "global-ack-cleanup", { taskUpdateProtocol: 1 });
+    const directory = broker.taskUpdateState(token)!.acknowledgementDirectory!;
+    const remove = fs.rmSync;
+    const failure = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+      if (path === directory) throw Object.assign(new Error("ACK directory permission denied"), { code: "EACCES" });
+      return remove(path, options);
+    });
+    restore = () => failure.mockRestore();
+    if (alreadyClosing) {
+      localClose = broker.close();
+      void localClose.catch(() => {});
+      unusedClose = TurnBroker.forSocket(socketPath).close();
+      void unusedClose.catch(() => {});
+    }
+    const shutdown = closeTurnBrokers();
+    await expect(shutdown).rejects.toBeInstanceOf(AggregateError);
+    if (localClose) await expect(localClose).rejects.toThrow("ACK publication directories");
+    if (unusedClose) await unusedClose;
+    expect(existsSync(directory)).toBeTrue();
+    await expect(callTurnBroker(socketPath, { method: "owner_status" })).rejects.toThrow("unavailable");
+  } finally {
+    restore();
+    await localClose?.catch(() => {});
+    await unusedClose?.catch(() => {});
+    await broker.close().catch(() => {});
     rmSync(root, { recursive: true, force: true });
   }
 });

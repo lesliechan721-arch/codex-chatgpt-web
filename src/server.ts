@@ -1309,7 +1309,7 @@ export async function responseRequest(
     if (!message.includes("requires native Codex turn_id metadata")
       && !message.includes("requires a current-turn user message")) throw error;
   }
-  const cancelledError = traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
+  const cancelledError = parsed._conversationPolicy !== "task" && traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
   if (cancelledError) {
     // Codex retries unknown streamed response.failed codes. A replay after the user explicitly
     // closed the only browser document is instead a terminal client state: repeating that exact

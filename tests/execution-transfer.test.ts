@@ -85,7 +85,7 @@ test("v2 migration preserves facts, promotes atomically, and rejects a conflicti
     writeFileSync(path, JSON.stringify(v2), { mode: 0o600 });
     f.store.initialize();
     const v3 = JSON.parse(readFileSync(path, "utf8"));
-    expect(v3.version).toBe(3); expect(v3.threads).toEqual(v2.threads);
+    expect(v3.version).toBe(4); expect(v3.threads).toEqual(v2.threads);
     const aliased = f.store.bindCanonicalScope(thread, { expectedScope: scope, canonicalScope: "5".repeat(64) });
     expect(aliased.scope).toBe(scope); expect(aliased.works).toEqual(f.record.works);
     expect(() => f.store.bindCanonicalScope(thread, { expectedScope: scope, canonicalScope: "6".repeat(64) })).toThrow("another identity");

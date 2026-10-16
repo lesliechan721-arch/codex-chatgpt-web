@@ -5,7 +5,7 @@ import { defaultConfig } from "../src/config";
 import { responseRequest } from "../src/server";
 import { buildResponseJSON } from "../src/bridge";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
-import { RESOURCE_SYNTHETIC_INSTRUCTIONS, resourceResponseObservation, summarizeResourcePreparedProtocol } from "../scripts/unified-task-continuity-resource-control";
+import { RESOURCE_SYNTHETIC_INSTRUCTIONS, resourceResponseObservation, summarizeResourcePreparedProtocol, summarizeResourceTaskUpdateJournal } from "../scripts/unified-task-continuity-resource-control";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -149,7 +149,10 @@ function evidence() {
   const row = (task: number, label: string): JournalEvidence => ({ task, label, workDigest: `work-${task}`, epoch: 0, historyRevision: 0,
     taskRevision: 0, state: "completed", stopReason: null, terminalDigest: `answer-${task}`, terminalReceiptDigest: `receipt-${task}`,
     attempts: [{ attempt: 0, epoch: 0, stage: "completed", writerRetired: true }], calls: [{ callId: `call-${task}`, state: "settled", firstResultDigest: `result-${task}` }] });
-  const journals = Array.from({ length: 6 }, (_, index) => [row(index + 1, "completed"), row(index + 1, "after-cleanup")]).flat();
+  const journals = Array.from({ length: 6 }, (_, index) => [row(index + 1, "completed"), {
+    ...row(index + 1, "after-cleanup"), epoch: -1, state: "cleared", terminalDigest: null,
+    terminalReceiptDigest: null, attempts: [], calls: [],
+  }]).flat();
   return { targets, events, journals, results: Array.from({ length: 6 }, (_, index) => ({ task: index + 1, callId: `call-${index + 1}`, firstResultDigest: `result-${index + 1}` })), cleanupTargets: targets.slice(1), baselinePreserved: true };
 }
 
@@ -169,14 +172,21 @@ test("capacity oracle requires exact destruction before sixth creation, five ret
   expect(inspectResourcePressureEvidence(originalChanged).passed).toBe(false);
 });
 
-test("capacity oracle retains completed journal, stop, revisions, attempt and real first-result facts", () => {
+test("capacity oracle requires completed live-page results and removes task facts after destruction", () => {
   for (const mutate of [
-    (value: ReturnType<typeof evidence>) => { value.journals[1]!.terminalDigest = "reset"; },
+    (value: ReturnType<typeof evidence>) => { value.journals[0]!.terminalDigest = null; },
+    (value: ReturnType<typeof evidence>) => { value.journals[0]!.terminalReceiptDigest = null; },
+    (value: ReturnType<typeof evidence>) => { value.journals[0]!.calls[0]!.firstResultDigest = "different"; },
+    (value: ReturnType<typeof evidence>) => { value.journals[0]!.calls[0]!.state = "delivery-possible"; },
+    (value: ReturnType<typeof evidence>) => { value.journals[1]!.terminalDigest = "retained"; },
+    (value: ReturnType<typeof evidence>) => { value.journals[1]!.terminalReceiptDigest = "retained"; },
     (value: ReturnType<typeof evidence>) => { value.journals[1]!.state = "active"; },
     (value: ReturnType<typeof evidence>) => { value.journals[1]!.stopReason = "page-close"; },
+    (value: ReturnType<typeof evidence>) => { value.journals[1]!.epoch = 0; },
+    (value: ReturnType<typeof evidence>) => { value.journals[1]!.historyRevision++; },
     (value: ReturnType<typeof evidence>) => { value.journals[1]!.taskRevision++; },
+    (value: ReturnType<typeof evidence>) => { value.journals[1]!.taskUpdates = summarizeResourceTaskUpdateJournal({ acceptedRevision: 0, acknowledgedRevision: 0, driverGeneration: 0, updates: [], deliveries: [] }); },
     (value: ReturnType<typeof evidence>) => { value.journals[1]!.attempts.push({ attempt: 1, epoch: 1, stage: "prepared", writerRetired: false }); },
-    (value: ReturnType<typeof evidence>) => { value.journals[1]!.calls[0]!.firstResultDigest = "different"; },
     (value: ReturnType<typeof evidence>) => { value.results.push(value.results[0]!); },
     (value: ReturnType<typeof evidence>) => { value.journals[1]!.calls.push({ callId: "reexecuted", state: "settled", firstResultDigest: "extra" }); },
   ]) {
@@ -234,28 +244,36 @@ test("local safety check: mismatched identity or newer close owner cannot be ove
   expect(replaced.context.testHold.restoreReason).toBe("target-close-owner-changed");
 });
 
-test("old-live oracle requires real pending ACK, exact successor revision/ACK, physical overlap and actual bounded cleanup fault", () => {
+test("old-live oracle requires old ACK rejection, an independent successor and bounded physical cleanup", () => {
   const valid = () => ({ pending: { real: true, throughRevision: 1, beforeAcknowledgedRevision: 0, afterOldProbesAcknowledgedRevision: 0 },
     probes: ["tool", "ACK", "final"].map(boundary => ({ boundary, rejected: true, obsolete: true, presentBefore: true, presentAfter: true })),
     successor: { originalTarget: "native-old", target: "native-new", oldPresentAtCompletion: true,
-      revisions: { logicalWorkAcceptedTaskRevision: 2 as number | null, retiredLogicalWorkAcceptedTaskRevision: 2 as number | null,
-        connectorAcceptedRevision: 1 as number | null, connectorAcknowledgedRevision: 1 as number | null,
-        protocolAcceptedRevision: 1 as number | null, protocolAcknowledgedRevision: 1 as number | null },
-      state: "completed", stopped: false, sameRetiredWork: true, historyPreserved: true, epochAdvanced: true },
+      revisions: { logicalWorkAcceptedTaskRevision: 1 as number | null, retiredLogicalWorkAcceptedTaskRevision: 2 as number | null,
+        connectorAcceptedRevision: null as number | null, connectorAcknowledgedRevision: null as number | null,
+        protocolAcceptedRevision: null as number | null, protocolAcknowledgedRevision: null as number | null },
+      state: "completed", stopped: false, newWork: true, historyCleared: true, epochChanged: true,
+      oldWorkAbsent: true, preparedProtocolFresh: true },
     closeFault: { controlled: true, attempts: 3, state: "failed" } });
   expect(inspectOldLiveFencingEvidence(valid()).passed).toBe(true);
+  const emptyProtocol = valid(); emptyProtocol.successor.revisions.protocolAcceptedRevision = 0;
+  emptyProtocol.successor.revisions.protocolAcknowledgedRevision = 0;
+  expect(inspectOldLiveFencingEvidence(emptyProtocol).passed).toBe(true);
   for (const mutate of [
     (value: ReturnType<typeof valid>) => { value.pending.real = false; },
     (value: ReturnType<typeof valid>) => { value.pending.afterOldProbesAcknowledgedRevision = 1; },
     (value: ReturnType<typeof valid>) => { value.probes[1]!.obsolete = false; },
     (value: ReturnType<typeof valid>) => { value.successor.oldPresentAtCompletion = false; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.connectorAcknowledgedRevision = null; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.connectorAcceptedRevision = 2; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.protocolAcknowledgedRevision = 0; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.protocolAcceptedRevision = null; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.logicalWorkAcceptedTaskRevision = 1; },
+    (value: ReturnType<typeof valid>) => { value.successor.revisions.connectorAcknowledgedRevision = 1; },
+    (value: ReturnType<typeof valid>) => { value.successor.revisions.connectorAcceptedRevision = 1; },
+    (value: ReturnType<typeof valid>) => { value.successor.revisions.protocolAcknowledgedRevision = 1; },
+    (value: ReturnType<typeof valid>) => { value.successor.revisions.protocolAcceptedRevision = 1; },
+    (value: ReturnType<typeof valid>) => { value.successor.revisions.logicalWorkAcceptedTaskRevision = 2; },
     (value: ReturnType<typeof valid>) => { value.successor.revisions.logicalWorkAcceptedTaskRevision = null; },
-    (value: ReturnType<typeof valid>) => { value.successor.revisions.retiredLogicalWorkAcceptedTaskRevision = null; },
+    (value: ReturnType<typeof valid>) => { value.successor.newWork = false; },
+    (value: ReturnType<typeof valid>) => { value.successor.historyCleared = false; },
+    (value: ReturnType<typeof valid>) => { value.successor.epochChanged = false; },
+    (value: ReturnType<typeof valid>) => { value.successor.oldWorkAbsent = false; },
+    (value: ReturnType<typeof valid>) => { value.successor.preparedProtocolFresh = false; },
     (value: ReturnType<typeof valid>) => { value.successor.stopped = true; },
     (value: ReturnType<typeof valid>) => { value.closeFault.attempts = 4; },
   ]) { const value = valid(); mutate(value); expect(inspectOldLiveFencingEvidence(value).passed).toBe(false); }

@@ -1,6 +1,8 @@
 import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryCheckpointRecord } from "./continuity-recovery-store";
-import { recoveryIdentity, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
+import { forgetRecoveryPage, recoveryIdentity, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, watch, type FSWatcher } from "node:fs";
+import { forgetStructuredCompactionPage } from "./compaction-handoff";
 import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest, CodexTool } from "../../types";
 import { canonicalJson } from "./canonical-json";
@@ -154,11 +156,14 @@ export interface ContinuityBinding {
   readonly owner: string;
   readonly initialExecutionKey: string;
   epoch?: number;
+  pageGeneration?: number;
   recovery?: RuntimeRecoveryReference;
   readonly initialNativeTurnId?: string;
   /** First request accepted after initial preflight. Retained only while creation is retryable. */
   initialAcceptedInput?: CodexParsedRequest;
   initialInstructionPayloadDigest?: string;
+  /** Present only while the exact page creation still owns its admission lock. */
+  pendingCreation?: () => void;
   /** Current locally approved discovery only; released with this live binding. */
   discoveredTools?: CodexTool[];
   state: "creating" | "running" | "ready" | "compacting" | "unverified" | "lost" | "ended";
@@ -301,6 +306,25 @@ export class ContinuityBindings {
   private readonly bindings = new Map<string, ContinuityBinding>();
   private checkpointBytes = 0;
   private checkpointCount = 0;
+  private watcher?: FSWatcher;
+
+  private observePages(): void {
+    if (this.watcher || this.bindings.size === 0) return;
+    this.watcher = watch(this.registrations.directory, { persistent: false }, (_event, file) => {
+      if (existsSync(this.registrations.directory) && file && !["recovery.json", "threads.json"].includes(String(file))) return;
+      for (const binding of [...this.bindings.values()]) {
+        let record: RecoveryThreadRecord | undefined;
+        try { record = this.recoveryStore.get(binding.thread); }
+        catch { continue; } // A failed read does not prove that this page was destroyed.
+        const retainedWork = binding.recovery && record?.works[binding.recovery.logicalWorkId];
+        if (!record || record.owner.id !== binding.owner || record.epoch !== binding.epoch && !retainedWork) {
+          this.forget(binding);
+          forgetRecoveryPage(this.registrations.directory, binding.thread);
+        }
+      }
+    });
+    this.watcher.on("error", () => { this.watcher?.close(); this.watcher = undefined; });
+  }
 
   constructor(
     readonly registrations: ContinuityRegistrationStore,
@@ -310,7 +334,11 @@ export class ContinuityBindings {
 
   lookup(thread: string, scope: string): ContinuityBinding | undefined {
     const registration = this.registrations.get(thread);
-    if (!registration) return undefined;
+    if (!registration) {
+      const obsolete = this.bindings.get(thread);
+      if (obsolete) this.forget(obsolete);
+      return undefined;
+    }
     if (registration.scope !== scope) throw continuityError("continuity_configuration_conflict", "This native thread is already bound to a different model or provider scope.");
     const binding = this.bindings.get(thread);
     if (!binding) return undefined;
@@ -326,7 +354,10 @@ export class ContinuityBindings {
   installRecovered(record: RecoveryThreadRecord, executionKey: string, checkpoint: string, nativeTurnId?: string): ContinuityBinding {
     const registration = this.registrations.get(record.thread);
     if (registration) this.registrations.compareAndSwap(record.thread, registration, { owner: this.owner, state: "entered", epoch: record.epoch, transactionId: record.transaction?.transactionId });
-    else this.registrations.claim(record.thread, record.scope, this.owner);
+    else {
+      const claimed = this.registrations.claim(record.thread, record.scope, this.owner);
+      this.registrations.compareAndSwap(record.thread, claimed, { owner: this.owner, state: "entered", epoch: record.epoch, transactionId: record.transaction?.transactionId });
+    }
     const previous = this.bindings.get(record.thread);
     const work = record.works[record.currentWorkId!];
     if (!work) throw continuityError("continuity_source_unproven");
@@ -341,7 +372,24 @@ export class ContinuityBindings {
     binding.revisionDigests.set(record.historyRevision, checkpoint);
     binding.revisions.set(checkpoint, record.historyRevision);
     this.bindings.set(record.thread, binding);
+    this.observePages();
     return binding;
+  }
+
+  /** A destroyed or revoked page has no retained task history. */
+  forget(binding: ContinuityBinding): void {
+    if (this.bindings.get(binding.thread) !== binding) return;
+    binding.pendingCreation?.();
+    forgetStructuredCompactionPage(this.registrations.directory, binding.thread, binding.pageGeneration ?? binding.epoch);
+    chatGptTurnSessions.forgetContinuityBinding(binding);
+    if (binding.compactionKey && !binding.acceptedHandoff) { this.checkpointCount--; this.checkpointBytes -= MAX_CHECKPOINT_BYTES; }
+    if (binding.acceptedHandoff) { this.checkpointCount--; this.checkpointBytes -= binding.acceptedHandoff.bytes; }
+    for (const checkpoint of binding.checkpoints.values()) { this.checkpointCount--; this.checkpointBytes -= checkpoint.bytes; }
+    binding.checkpoints.clear(); binding.revisions.clear(); binding.revisionDigests.clear(); binding.ordinaryReplayTombstones.clear();
+    delete binding.initialAcceptedInput; delete binding.initialInstructionPayloadDigest; delete binding.discoveredTools;
+    binding.state = "lost";
+    this.bindings.delete(binding.thread);
+    if (this.bindings.size === 0) { this.watcher?.close(); this.watcher = undefined; }
   }
 
   observed(thread: string): ContinuityBinding | undefined {
@@ -374,6 +422,7 @@ export class ContinuityBindings {
       ordinaryReplayTombstones: new Map(),
     };
     this.bindings.set(thread, binding);
+    this.observePages();
     return binding;
   }
 
@@ -568,7 +617,7 @@ export class ContinuityBindings {
   }): void {
     if (expectedRecovery) {
       if (this.bindings.get(binding.thread) !== binding
-        || executionKey !== undefined && binding.executionKey !== executionKey) {
+        || !expectedRecovery && executionKey !== undefined && binding.executionKey !== executionKey) {
         throw continuityError("continuity_source_unproven");
       }
       const store = this.recoveryStore, installationId = store.installationId();
@@ -603,6 +652,43 @@ export class ContinuityBindings {
       if (record.epoch === binding.epoch && record.state !== "stopped") record.state = "lost";
     });
     this.registrations.finish(binding.thread, this.owner, "lost");
+  }
+
+
+  /** Old cleanup can only retire the execution that still owns this binding. */
+  forgetPage(binding: ContinuityBinding, executionKey?: string, expectedRecovery?: {
+    ownerId: string; identity: ContinuityRecoveryIdentity;
+  }): void {
+    if (this.bindings.get(binding.thread) !== binding
+      || !expectedRecovery && executionKey !== undefined && binding.executionKey !== executionKey) {
+      if (expectedRecovery) throw continuityError("continuity_source_unproven");
+      return;
+    }
+    const store = this.recoveryStore;
+    const record = store.get(binding.thread);
+    if (record) {
+      const ref = binding.recovery;
+      const current = record.owner.id === this.owner && record.epoch === binding.epoch
+        && (expectedRecovery || !ref || record.currentWorkId === ref.logicalWorkId
+          && record.works[ref.logicalWorkId]?.attempts.at(-1)?.attempt === ref.attempt);
+      const expected = expectedRecovery?.identity;
+      const attempt = expected && record.works[expected.logicalWorkId]?.attempts.find(value => value.attempt === expected.attempt);
+      const exact = !expectedRecovery || record.owner.id === expectedRecovery.ownerId && expected !== undefined
+        && record.epoch === expected.epoch && record.transaction?.transactionId === expected.transactionId
+        && record.transaction.version === expected.transactionVersion && attempt !== undefined
+        && ["epoch", "snapshotVersion", "snapshotDigest", "transactionId", "transactionVersion"].every(key =>
+          (attempt as unknown as Record<string, unknown>)[key] === (expected as unknown as Record<string, unknown>)[key]);
+      if (current && exact) {
+        if (!store.removePage(binding.thread, record)) {
+          if (expectedRecovery) throw continuityError("continuity_source_unproven");
+          return;
+        }
+      } else if (expectedRecovery) throw continuityError("continuity_source_unproven");
+    }
+    // The transport may still hold this object. Remove every lookup route now;
+    // a late event from that transport cannot find or modify the next page.
+    this.forget(binding);
+    forgetRecoveryPage(this.registrations.directory, binding.thread);
   }
 
   end(binding: ContinuityBinding): void {

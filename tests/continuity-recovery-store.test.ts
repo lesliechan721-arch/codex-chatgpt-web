@@ -12,7 +12,7 @@ import {
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 import { parseRequest } from "../src/responses/parser";
 import { chatGptContinuityInstructionPayloadDigest } from "../src/adapters/chatgpt-web/turn-execution";
-import { recoveryContext, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
+import { recoveryContext, recoveryIdentity, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 
 const roots: string[] = [];
 const thread = "1".repeat(64), scope = "2".repeat(64), owner = continuityProcessInstance("3".repeat(64));
@@ -106,6 +106,82 @@ function checkpoint(store: ContinuityRecoveryStore, sourceWork = "work-A", compa
     summaryDigest: result, coveredCallIds, nativeTurnId });
 }
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
+
+for (const version of [2, 3]) test(`page-lifetime promotion preserves format ${version} live-page facts and installation`, () => {
+  const { path, store, registrations } = fixture();
+  registrations.claim(thread, scope, owner.id);
+  store.admitWork(input()); batch(store); settle(store);
+  const original = store.get(thread)!;
+  const installation = store.installationId();
+  const identity = recoveryIdentity(original, installation);
+  const file = join(path, "recovery.json");
+  const document = JSON.parse(readFileSync(file, "utf8")); document.version = version;
+  writeFileSync(file, JSON.stringify(document));
+  // Old task facts can be read for page classification, but cannot authorize a new-format executor.
+  expect(() => store.withExecutionAuthority(identity, () => "dispatched")).toThrow("obsolete");
+  store.promotePageLifetime();
+  const reopened = new ContinuityRecoveryStore(path);
+  expect(JSON.parse(readFileSync(file, "utf8")).version).toBe(4);
+  expect(reopened.installationId()).toBe(installation);
+  expect(reopened.get(thread)).toEqual(original);
+  expect(registrations.get(thread)).toEqual({ scope, owner: owner.id, state: "entered" });
+  expect(reopened.withExecutionAuthority(identity, () => "dispatched")).toBe("dispatched");
+});
+
+test("exact page removal revokes old writers and late cleanup preserves a new generation", () => {
+  const { path, store, registrations } = fixture();
+  registrations.claim(thread, scope, owner.id);
+  const observed = store.admitWork(input());
+  const oldIdentity = recoveryIdentity(observed, store.installationId());
+  const latest = batch(store);
+  expect(store.removePage(thread, observed)).toBe(false);
+  expect(store.get(thread)).toEqual(latest);
+  expect(registrations.get(thread)).toBeDefined();
+  expect(store.removePage(thread, latest)).toBe(true);
+  expect(store.get(thread)).toBeUndefined();
+  expect(registrations.get(thread)).toBeUndefined();
+  expect(readFileSync(join(path, "recovery.json"), "utf8")).not.toContain("work-A");
+  expect(readFileSync(join(path, "recovery.json"), "utf8")).not.toContain("call-A");
+  expect(store.removePage(thread, latest)).toBe(true);
+  // Use the same work name and owner to prove generation identity, rather than a missing name, denies old messages.
+  registrations.claim(thread, scope, owner.id);
+  const next = store.admitWork(input("work-A", { initialEpoch: 72 }));
+  const currentIdentity = recoveryIdentity(next, store.installationId());
+  let effects = 0;
+  expect(() => store.withExecutionAuthority(oldIdentity, () => effects++)).toThrow("obsolete");
+  expect(effects).toBe(0);
+  expect(store.withExecutionAuthority(currentIdentity, () => ++effects)).toBe(1);
+  expect(store.removePage(thread, latest)).toBe(false);
+  expect(store.get(thread)).toEqual(next);
+  expect(registrations.get(thread)).toBeDefined();
+  const code = `import {ContinuityRecoveryStore} from ${JSON.stringify(join(import.meta.dir, "../src/adapters/chatgpt-web/continuity-recovery-store.ts"))};
+    const store=new ContinuityRecoveryStore(${JSON.stringify(path)});
+    try { store.withExecutionAuthority(${JSON.stringify(oldIdentity)},()=>process.stdout.write("dispatched")); }
+    catch(error) { process.stdout.write(error.code); }`;
+  const child = spawnSync(process.execPath, ["--eval", code], { encoding: "utf8", timeout: 10_000 });
+  expect(child.status).toBe(0); expect(child.stderr).toBe("");
+  expect(child.stdout).toBe("continuity_source_unproven");
+});
+
+for (const damaged of ["missing-journal", "corrupt-journal", "corrupt-marker"] as const) test(`page-lifetime promotion revokes unreadable task evidence without replacing installation (${damaged})`, () => {
+  const { path, store, registrations } = fixture();
+  registrations.claim(thread, scope, owner.id);
+  const original = store.admitWork(input());
+  const installation = store.installationId();
+  const identity = recoveryIdentity(original, installation);
+  if (damaged === "missing-journal") rmSync(join(path, "recovery.json"));
+  else writeFileSync(join(path, damaged === "corrupt-marker" ? "recovery-initialized.json" : "recovery.json"), "{");
+  store.promotePageLifetime();
+  expect(store.installationId()).toBe(installation);
+  expect(store.get(thread)).toBeUndefined();
+  expect(registrations.get(thread)).toBeUndefined();
+  let effects = 0;
+  expect(() => store.withExecutionAuthority(identity, () => effects++)).toThrow("obsolete");
+  expect(effects).toBe(0);
+  const next = store.admitWork(input("work-B", { initialEpoch: 73 }));
+  expect(next.works["work-B"]!.state).toBe("prepared");
+  expect(store.withExecutionAuthority(recoveryIdentity(next, installation), () => ++effects)).toBe(1);
+});
 
 for (const covered of [false, true]) for (const history of ["omitted", "edited"] as const) test(`recovery context checks only required results covered=${covered} history=${history}`, () => {
   const { path, store } = fixture();

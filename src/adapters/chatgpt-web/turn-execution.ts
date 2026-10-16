@@ -255,6 +255,7 @@ function executionKey(parsed: CodexParsedRequest, payload: unknown): string {
     ...(continuity ? {
       policy: "task", historyRevision: parsed._continuityHistoryRevision,
       ...(parsed._continuityAttempt ? { attempt: parsed._continuityAttempt } : {}),
+      ...(parsed._continuityPageGeneration ? { generation: parsed._continuityPageGeneration } : {}),
       modelFamily: parsed._chatgptModelFamily,
     } : {}),
     payload,
@@ -2846,6 +2847,21 @@ export class ChatGptTurnSessions {
       || [...this.entries.values()].some(session => session.runtime.continuityBinding === binding
         && (session.isActive() || !session.isPhysicallySettled() || session.outstanding().length > 0))) {
       throw continuityError("continuity_source_unproven", "Finish or explicitly cancel the current continuity work before selecting another route.");
+    }
+  }
+
+  /** Drop page task indexes immediately; admitted transports keep only their own references. */
+  forgetContinuityBinding(binding: ContinuityBinding): void {
+    const sessions = new Set([...this.entries.values()].filter(session => session.runtime.continuityBinding === binding));
+    const failed = this.failedCreationWriters.get(binding);
+    if (failed) sessions.add(failed);
+    this.failedCreationWriters.delete(binding);
+    for (const session of sessions) {
+      this.removePhysicalSession(session);
+      this.forgetConversationHead(session);
+      session.supersededError = continuityError("continuity_session_lost", "The previous page generation has been retired.");
+      if (session.isActive()) session.cancel(Object.assign(new Error("The previous page generation has been retired."), { code: "continuity_recovery_retired" }));
+      void Promise.resolve().then(() => session.runtime.retireCapability?.()).catch(() => {});
     }
   }
 

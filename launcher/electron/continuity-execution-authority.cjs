@@ -14,7 +14,7 @@ function readDocument(directory) {
   const bytes = fs.readFileSync(file);
   if (bytes.length > MAX_AUTHORITY_BYTES) throw failure();
   const document = JSON.parse(bytes.toString("utf8"));
-  if (document.version !== 3 || !document.threads || typeof document.threads !== "object") throw failure();
+  if (document.version !== 4 || !document.threads || typeof document.threads !== "object") throw failure();
   return document;
 }
 
@@ -110,6 +110,17 @@ function assertExecutionAuthority(host, recovery, { preparation = false } = {}) 
 
 function assertExecutionIsolation(host, recovery) {
   require("./continuity-recovery.cjs").validateRecovery(recovery);
+  // An absent/replaced generation has no project execution authority. Cleanup is
+  // still allowed for that exact physical identity, without recreating its journal.
+  if (!host.continuityAuthorityReader) {
+    const directory = host.continuityAuthorityDirectories?.get(recovery.installationId);
+    if (!directory) throw failure();
+    const document = readDocument(directory);
+    if (document.installation !== recovery.installationId) throw failure();
+    const current = document.threads[recovery.threadKey];
+    const oldAttempt = current?.works?.[recovery.logicalWorkId]?.attempts?.[recovery.attempt];
+    if (!current || current.epoch !== recovery.epoch || !oldAttempt) return;
+  }
   const { record, attempt } = authority(host, recovery, { isolation: true });
   if (attempt.writerRetired !== true) throw failure();
   const current = record.works[record.currentWorkId];

@@ -61,7 +61,9 @@ function retainedCompactionAdmission(parsed: CodexParsedRequest, prepared: Prepa
   const identity = extractChatGptTurnIdentity(parsed);
   const handoffTraceId = createHash("sha256").update(`${executionKey}:continuity-handoff`).digest("hex").slice(0, 12);
   const owner = {
-    ownerKey: `${namespace}:${chatGptThreadOwnershipKey(parsed)}`,
+    ownerKey: `${namespace}:${chatGptThreadOwnershipKey(parsed)}:${binding.pageGeneration ?? parsed._continuityPageGeneration}`,
+    page: { directory: bindings.registrations.directory, thread: binding.thread,
+      epoch: binding.pageGeneration ?? parsed._continuityPageGeneration! },
     traceIds: [createHash("sha256").update(executionKey).digest("hex").slice(0, 12), handoffTraceId],
     nativeThreadId: identity.threadId, nativeTurnId: identity.turnId,
     requestDigest,
@@ -168,7 +170,14 @@ export function runContinuityCompaction(
           throw continuityError("continuity_source_unproven");
         }
         if (source.taskUpdatesEnabled() && source.runtime.mode === "tools") {
-          const state = await broker.taskUpdateState?.(await source.runtime.token);
+          const liveState = await broker.taskUpdateState?.(await source.runtime.token);
+          // A completed source retains its admitted completion receipt in the page
+          // Session; its retired Broker no longer owns an update journal or ACK files.
+          const receipt = !source.isActive() ? source.runtime.taskUpdates?.outputReceipt : undefined;
+          const state = liveState ?? (receipt?.kind === "completed" ? {
+            acceptedRevision: receipt.taskRevision, acknowledgedRevision: receipt.taskRevision,
+            driverGeneration: receipt.driverGeneration,
+          } : undefined);
           if (source.hasPendingTaskUpdate() || !state || state.acknowledgedRevision !== state.acceptedRevision) {
             throw taskUpdateSourceError("task_update_pending", "Confirm the accepted task updates before starting compaction. Current work continues.");
           }

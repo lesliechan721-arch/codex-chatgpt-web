@@ -12,7 +12,7 @@ import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continu
 import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessInstanceStatus, continuityProcessStartIdentity } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { bindContinuityRequestScope, prepareContinuityRequest } from "../src/adapters/chatgpt-web/continuity-request";
 import { admitHealthyRecoveryCompaction, assertHealthyRecoveryCompactionAuthority, beginHealthyRecoveryCompaction,
-  commitRecoveryCompaction, failHealthyRecoveryCompaction, prepareRecoveryCompaction, recoveryCompactionTarget,
+  commitRecoveryCompaction, failHealthyRecoveryCompaction, prepareRecoveryCompaction, prepareFreshRecoveryCompaction, recoveryCompactionTarget,
   selectRecoveryCompactionTarget, compileRecoveryCompactionInput } from "../src/adapters/chatgpt-web/continuity-recovery-compaction";
 import { assertContinuityCompactionResult, runContinuityCompaction } from "../src/adapters/chatgpt-web/continuity-compaction";
 import { cancelStructuredCompactionNativeTurn, canonicalizeCompactionHandoff, existingStructuredCompactionRun } from "../src/adapters/chatgpt-web/compaction-handoff";
@@ -829,10 +829,10 @@ for (const completedSource of [false, true]) test(`authenticated interrupt stops
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: "turn-C" }) } });
   fresh._conversationPolicy = "task";
   const next = await prepareContinuityRequest(fresh, f.provider, f.namespace, capabilities, f.worker);
-  expect(next.binding.epoch).toBe(stopped.epoch + 1);
+  expect(next.binding.epoch).not.toBe(stopped.epoch);
   const retry = await prepareContinuityRequest(structuredClone(fresh), f.provider, f.namespace, capabilities, f.worker);
-  expect(retry.binding.epoch).toBe(next.binding.epoch);
-  expect(new ContinuityRecoveryStore(f.state).get(f.thread)!.epoch).toBe(stopped.epoch + 1);
+  expect(retry.binding.epoch).toBe(next.binding.epoch!);
+  expect(new ContinuityRecoveryStore(f.state).get(f.thread)!.epoch).toBe(next.binding.epoch!);
   expect(f.starts).toHaveLength(1);
 });
 
@@ -1030,8 +1030,8 @@ test("checkpoint capacity retry releases optional bodies after preserving the re
 
 const processExitTest = continuityProcessStartIdentity(process.pid) ? test : test.skip;
 for (const unknownSend of [false, true]) processExitTest(unknownSend
-  ? "a compaction with an unknown Send stays unsettled after the actual old component process exits"
-  : "a compaction with no Launcher receipt recovers once after the actual old component process exits", async () => {
+  ? "public compaction restores current input after unknown old Send and actual component exit"
+  : "public compaction restores current input after missing old receipt and actual component exit", async () => {
   const f = fixture();
   await f.prepare();
   const target = Object.values(f.store.get(f.thread)!.compactionTargets)[0]!;
@@ -1071,25 +1071,25 @@ for (const unknownSend of [false, true]) processExitTest(unknownSend
   expect(receipt).toMatchObject({ state: "missing", writerRetired: true, hostNoWriter: true });
   expect(receipt.launcherInstance).toEqual(f.launcherInstance);
   f.actualRetirement();
-  if (unknownSend) {
-    await expect(f.prepare()).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
-    expect(f.store.get(f.thread)).toEqual(old);
-    expect(f.starts).toHaveLength(0);
-    expect(f.sends()).toBe(0);
-    expect(Object.values(f.store.get(f.thread)!.checkpoints)).toHaveLength(0);
-    return;
-  }
-  const prepared = (await f.prepare())!;
-  const summary = await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace);
+  // Exercise page selection before the private live-page coordinator. Missing pages
+  // discard the exited component's task facts, including an unknown old Send.
+  const compatible = spyOn(f.worker, "assertContinuityCompatible").mockResolvedValue(undefined);
+  cleanup.push(async () => { compatible.mockRestore(); });
+  const prepared = await prepareContinuityRequest(f.request, f.provider, f.namespace, capabilities, f.worker);
+  let summary: string;
+  try { summary = await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace); }
+  finally { prepared.releaseAdmission?.(); }
   expect(summary).toContain("Checkpoint with the completed results");
   expect(f.starts).toHaveLength(1);
   expect(f.sends()).toBe(1);
   const current = f.store.get(f.thread)!;
-  expect(current.works[current.currentWorkId!]!.attempts).toHaveLength(2);
+  expect(current.works[old.currentWorkId!]).toBeUndefined();
+  expect(current.epoch).not.toBe(old.epoch);
+  expect(current.works[current.currentWorkId!]!.attempts).toHaveLength(1);
   expect(current.historyRevision).toBe(1);
   expect(Object.values(current.checkpoints)).toHaveLength(1);
   expect(current.transaction!.launcherInstance).toEqual(f.launcherInstance);
-  const replay = (await f.prepare())!;
+  const replay = await prepareContinuityRequest(f.request, f.provider, f.namespace, capabilities, f.worker);
   expect(await runContinuityCompaction(f.request, replay, f.worker, f.broker, capabilities, f.namespace)).toBe(summary);
   expect(f.sends()).toBe(1);
 });
@@ -1136,7 +1136,7 @@ test("a crash after durable commit cannot cause another summary when the result 
   expect(f.store.get(f.thread)!.historyRevision).toBe(1);
 });
 
-test("checkpoint-only admission and a stop retry retain one durable consumer after losing the original body", async () => {
+test("checkpoint-only cold admission and stopped retry each use the current request", async () => {
   const f = fixture();
   const compact = (await f.prepare())!;
   const summary = await runContinuityCompaction(f.request, compact, f.worker, f.broker, capabilities, f.namespace);
@@ -1150,20 +1150,18 @@ test("checkpoint-only admission and a stop retry retain one durable consumer aft
   continuation._conversationPolicy = "task";
   const first = await prepareContinuityRequest(continuation, f.provider, f.namespace, capabilities, f.worker);
   const record = f.store.get(f.thread)!;
-  const checkpoint = Object.values(record.checkpoints)[0]!;
-  expect(checkpoint.continuation.state).toBe("consumed");
-  const consumer = checkpoint.continuation.consumerLogicalWorkId!;
-  expect(first.binding.recovery!.logicalWorkId).toBe(consumer);
+  expect(Object.keys(record.checkpoints)).toHaveLength(0);
+  const consumer = first.binding.recovery!.logicalWorkId;
   expect(first.input!.context.messages.some(message => message.role === "user" && typeof message.content === "string"
     && message.content.includes("Checkpoint with the completed results"))).toBe(true);
   f.store.stopWork(f.thread, { scope: f.scope }, consumer, "user-stop");
-  const retry = structuredClone(continuation);
-  await expect(prepareContinuityRequest(retry, f.provider, f.namespace, capabilities, f.worker)).rejects.toMatchObject({ code: "continuity_stopped" });
-  expect(Object.values(f.store.get(f.thread)!.checkpoints)[0]!.continuation.consumerLogicalWorkId).toBe(consumer);
+  const retry = await prepareContinuityRequest(structuredClone(continuation), f.provider, f.namespace, capabilities, f.worker);
+  expect(retry.binding.recovery!.logicalWorkId).not.toBe(consumer);
+  expect(Object.keys(f.store.get(f.thread)!.checkpoints)).toHaveLength(0);
   expect(f.starts).toHaveLength(1);
 });
 
-test("checkpoint-only retry before Send reserves the next attempt for its already consumed work", async () => {
+test("checkpoint-only retry before Send revokes the retired generation", async () => {
   const f = fixture();
   const compact = (await f.prepare())!;
   const summary = await runContinuityCompaction(f.request, compact, f.worker, f.broker, capabilities, f.namespace);
@@ -1180,15 +1178,14 @@ test("checkpoint-only retry before Send reserves the next attempt for its alread
   f.store.retireAttempt(f.thread, { scope: f.scope }, consumer, 0);
   f.store.recordFailure(f.thread, { scope: f.scope }, consumer);
   const next = await prepareContinuityRequest(structuredClone(continuation), f.provider, f.namespace, capabilities, f.worker);
-  expect(next.binding.recovery!.logicalWorkId).toBe(consumer);
-  expect(next.binding.recovery!.attempt).toBe(1);
-  const checkpoint = Object.values(f.store.get(f.thread)!.checkpoints)[0]!;
-  expect(checkpoint.continuation).toMatchObject({ state: "consumed", consumerLogicalWorkId: consumer });
-  expect(Object.values(f.store.get(f.thread)!.works).filter(work => work.purpose === "ordinary")).toHaveLength(2);
+  expect(next.binding.recovery!.logicalWorkId).not.toBe(consumer);
+  expect(next.binding.recovery!.attempt).toBe(0);
+  expect(Object.keys(f.store.get(f.thread)!.checkpoints)).toHaveLength(0);
+  expect(Object.values(f.store.get(f.thread)!.works).filter(work => work.purpose === "ordinary")).toHaveLength(1);
   expect(f.starts).toHaveLength(1);
 });
 
-for (const history of ["omitted", "edited"] as const) test(`a selected durable checkpoint covers ${history} old tool bodies when the next compaction uses a new page`, async () => {
+for (const history of ["omitted", "edited"] as const) test(`a closed checkpoint page uses ${history} historical tool bodies only as current context`, async () => {
   const f = fixture({ delivered: true });
   const result = { type: "function_call_output", call_id: "real-call", output: "The original actual result." };
   (f.request._rawBody as { input: unknown[] }).input.push(result);
@@ -1196,7 +1193,7 @@ for (const history of ["omitted", "edited"] as const) test(`a selected durable c
   const first = (await f.prepare())!;
   const summary = await runContinuityCompaction(f.request, first, f.worker, f.broker, capabilities, f.namespace);
   const original = Object.values(f.store.get(f.thread)!.compactionTargets)[0]!;
-  const firstResultDigest = f.store.get(f.thread)!.calls["real-call"]!.firstResultDigest;
+  const previousEpoch = f.store.get(f.thread)!.epoch;
   f.store.registerCompactionTarget(f.thread, { scope: f.scope }, {
     sourceLogicalWorkId: f.sourceWorkId, sourceIdentity: original.sourceIdentity, sourceHistoryRevision: 1,
     sourceToolBatchHeadSequence: 1, representationDigests: original.representationDigests,
@@ -1211,15 +1208,20 @@ for (const history of ["omitted", "edited"] as const) test(`a selected durable c
   next._conversationPolicy = "task"; next._compactionRequest = true;
   bindContinuityRequestScope(next, f.namespace);
   const live = f.bindings.observed(f.thread)!;
-  f.bindings.lose(live); f.pages.clear();
-  const prepared = (await f.prepare(next))!;
+  f.pages.clear();
+  expect(f.store.removePage(f.thread, f.store.get(f.thread)!)).toBe(true);
+  f.bindings.forget(live);
+  const prepared = await prepareFreshRecoveryCompaction(next, f.provider, f.namespace, capabilities, f.worker,
+    f.bindings, f.descriptor);
   const nextSummary = await runContinuityCompaction(next, prepared, f.worker, f.broker, capabilities, f.namespace);
   expect(f.starts).toHaveLength(2);
   expect(f.sources[1]).not.toContain("The original actual result.");
-  expect(f.store.get(f.thread)!.historyRevision).toBe(2);
-  const checkpoint = Object.values(f.store.get(f.thread)!.checkpoints).find(value => value.targetHistoryRevision === 2)!;
-  expect(checkpoint.coveredCallIds).toEqual(["real-call"]);
-  expect(f.store.get(f.thread)!.calls["real-call"]!.firstResultDigest).toBe(firstResultDigest);
+  expect(f.store.get(f.thread)!.historyRevision).toBe(1);
+  expect(f.store.get(f.thread)!.epoch).not.toBe(previousEpoch);
+  const checkpoint = Object.values(f.store.get(f.thread)!.checkpoints).find(value => value.targetHistoryRevision === 1)!;
+  expect(checkpoint.coveredCallIds).toEqual([]);
+  expect(f.store.get(f.thread)!.calls).toEqual({});
+  expect(f.store.get(f.thread)!.works[f.sourceWorkId]).toBeUndefined();
   const committed = f.store.get(f.thread)!;
   const replay = (await f.prepare(structuredClone(next)))!;
   expect(await runContinuityCompaction(structuredClone(next), replay, f.worker, f.broker, capabilities, f.namespace)).toBe(nextSummary);

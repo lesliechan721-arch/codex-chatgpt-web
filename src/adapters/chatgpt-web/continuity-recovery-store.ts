@@ -103,7 +103,7 @@ export interface RecoveryThreadRecord {
   contextCoverage?: ContextCoverageJournalEntry[];
   contextCoverageReservations?: ContextCoverageReservation[];
 }
-interface RecoveryDocument { version: 2 | 3; installation: string; threads: Record<string, RecoveryThreadRecord> }
+interface RecoveryDocument { version: 2 | 3 | 4; installation: string; threads: Record<string, RecoveryThreadRecord> }
 export interface RecoveryGuard { scope: string; expectedVersion?: number; expectedEpoch?: number; expectedOwner?: string }
 export interface RecoveryWriterReference { thread: string; logicalWorkId: string; attempt: number; ownerId?: string }
 export interface AdmitRecoveryWorkInput {
@@ -114,6 +114,8 @@ export interface AdmitRecoveryWorkInput {
   instructionPrevious?: RecoveryInstructionPrevious; allowRetainedSourceFallback?: boolean;
   /** A healthy compaction control is recorded without replacing its source writer. */
   activate?: boolean;
+  /** A fresh page uses a new generation even when the previous journal was deleted. */
+  initialEpoch?: number;
 }
 export interface RecoveryCompactionActivationIdentity {
   attempt: number; snapshotVersion: number; transactionId: string; transactionVersion: number;
@@ -245,6 +247,10 @@ function removeLockOwner(directory: string, owner: string): void {
 }
 /** A nonempty directory is published atomically; an unknown or live owner is never removed. */
 export function withContinuityStorageLock<T>(lock: string, operation: () => T): T {
+  const release = acquireContinuityStorageLock(lock);
+  try { return measureRuntimeOperation("recovery.transaction", operation); } finally { release(); }
+}
+export function acquireContinuityStorageLock(lock: string): () => void {
   const owner = `${process.pid}-${randomBytes(16).toString("hex")}`;
   const staging = `${lock}.${owner}`;
   mkdirSync(staging, { mode: 0o700 });
@@ -290,7 +296,7 @@ export function withContinuityStorageLock<T>(lock: string, operation: () => T): 
       }
       if (!acquired) throw invalid("Continuity storage is busy; ownership changed during acquisition.");
     });
-    try { return measureRuntimeOperation("recovery.transaction", operation); } finally { removeLockOwner(lock, owner); }
+    return () => removeLockOwner(lock, owner);
   } finally { removeLockOwner(staging, owner); }
 }
 function syncStoredFile(path: string): void {
@@ -715,13 +721,13 @@ export class ContinuityRecoveryStore {
       }
       if (existsSync(this.marker)) {
         const existing = this.read();
-        if (existing.version === 2) this.write(existing);
+        if (existing.version !== 4) this.write(existing);
         if (registrationMarker.recoveryVersion !== 2) { this.options.beforeWrite?.(); durableWrite(join(this.directory, "initialized.json"), JSON.stringify({ ...registrationMarker, recoveryVersion: 2 })); }
         return;
       }
       if (existsSync(this.file)) throw invalid("Continuity recovery initialization is incomplete; existing evidence was not replaced.");
       if (registrationMarker.recoveryVersion === 2) throw invalid("Previously initialized recovery evidence is missing; it was not reset.");
-      const document: RecoveryDocument = { version: 3, installation, threads: {} };
+      const document: RecoveryDocument = { version: 4, installation, threads: {} };
       for (const [thread, value] of Object.entries(registry.entries)) {
         const entry = value as { scope: string; owner: string; state: string };
         hash(thread); hash(entry.scope); hash(entry.owner);
@@ -736,6 +742,117 @@ export class ContinuityRecoveryStore {
       this.options.beforeWrite?.();
       durableWrite(this.marker, JSON.stringify({ version: 2, installation }));
       this.write(document);
+    }));
+  }
+  /** Promote authority atomically. Old executors reject format 4 instead of retaining permits. */
+  promotePageLifetime(): boolean {
+    return withContinuityStorageLock(join(this.directory, "write.lock"), () => this.exclusive(() => {
+      // The installation identity remains mandatory; task journals are disposable
+      // when unreadable. Filesystem/permission failures are infrastructure failures.
+      const installation = this.installation();
+      let document: RecoveryDocument;
+      try {
+        document = this.read();
+      } catch (error) {
+        if ((error as { code?: string }).code === "continuity_resource_capacity") throw error;
+        for (const file of [this.file, this.marker]) {
+          let stat;
+          try { stat = lstatSync(file); }
+          catch (readError) { if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue; throw readError; }
+          if (!stat.isFile() || process.platform !== "win32" && (stat.mode & 0o077) !== 0
+            || typeof process.getuid === "function" && stat.uid !== process.getuid()) throw error;
+          readFileSync(file); // Do not turn denied access into an empty installation.
+        }
+        // Without a readable journal no component can prove a current generation.
+        // Revoke all old permits under both locks. No historical backup is retained.
+        const { registry } = this.pageRegistrations({ version: 4, installation, threads: {} });
+        this.write({ version: 4, installation, threads: {} });
+        durableWrite(this.marker, JSON.stringify({ version: 2, installation }));
+        registry.entries = {}; durableWrite(join(this.directory, "threads.json"), JSON.stringify(registry));
+        return true;
+      }
+      const migrated = document.version !== 4;
+      const { registry, repaired } = this.pageRegistrations(document);
+      let removedLegacy = false;
+      for (const [thread, record] of Object.entries(document.threads)) {
+        if (!record.legacyUnproven) continue;
+        delete document.threads[thread]; delete registry.entries[thread]; removedLegacy = true;
+      }
+      let removedOrphans = false;
+      for (const thread of Object.keys(registry.entries)) {
+        if (document.threads[thread]) continue;
+        // A creator may hold its admission lock before publishing its journal.
+        // Never remove that registration; every promotion retries these orphans.
+        let release: () => void;
+        try { release = acquireContinuityStorageLock(join(this.directory, `${thread}.admission.lock`)); }
+        catch (error) {
+          if (/Continuity storage is busy; /.test(String((error as Error).message))) continue;
+          throw error;
+        }
+        try { delete registry.entries[thread]; removedOrphans = true; }
+        finally { release(); }
+      }
+      if (migrated || removedLegacy) this.write(document);
+      if (repaired || removedLegacy || removedOrphans) durableWrite(join(this.directory, "threads.json"), JSON.stringify(registry));
+      return migrated || repaired || removedLegacy || removedOrphans;
+    }));
+  }
+  /** Installation identity is mandatory; registration task content is reconstructible. */
+  private pageRegistrations(document: RecoveryDocument): { registry: {
+    version: number; installation: string; entries: Record<string, unknown>;
+  }; repaired: boolean } {
+    const file = join(this.directory, "threads.json");
+    try {
+      const registry = safeFile(file, 4 * 1024 * 1024);
+      exact(registry, ["version", "installation", "entries"]); dictionary(registry.entries);
+      if (registry.version !== 1 || registry.installation !== this.installation()) throw new Error("invalid registration installation");
+      for (const [thread, value] of Object.entries(registry.entries)) {
+        hash(thread); exact(value, ["scope", "owner", "state"], ["epoch", "transactionId"]);
+        hash(value.scope); hash(value.owner);
+        if (!["entered", "lost", "ended"].includes(String(value.state))) throw new Error("invalid registration state");
+        if (value.epoch !== undefined) integer(value.epoch);
+        if (value.transactionId !== undefined) hash(value.transactionId);
+      }
+      return { registry: registry as unknown as { version: number; installation: string; entries: Record<string, unknown> }, repaired: false };
+    } catch (error) {
+      let stat;
+      try { stat = lstatSync(file); }
+      catch (readError) { if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError; }
+      if (stat) {
+        if (!stat.isFile() || process.platform !== "win32" && (stat.mode & 0o077) !== 0
+          || typeof process.getuid === "function" && stat.uid !== process.getuid()) throw error;
+        if (stat.size > 4 * 1024 * 1024) throw capacity("Continuity registration capacity is 4 MiB.");
+        readFileSync(file);
+      }
+      return { registry: { version: 1, installation: this.installation(), entries: Object.fromEntries(
+        Object.values(document.threads).map(record => [record.thread, { scope: record.scope, owner: record.owner.id,
+          state: record.state === "stopped" ? "ended" : "entered", epoch: record.epoch,
+          ...(record.transaction ? { transactionId: record.transaction.transactionId } : {}) }])) }, repaired: true };
+    }
+  }
+  pageRecords(): RecoveryThreadRecord[] { return Object.values(this.read().threads); }
+  removeOrphanRegistration(thread: string): void {
+    hash(thread);
+    withContinuityStorageLock(join(this.directory, "write.lock"), () => this.exclusive(() => {
+      const document = this.read();
+      if (document.threads[thread]) return;
+      const file = join(this.directory, "threads.json");
+      const { registry, repaired } = this.pageRegistrations(document);
+      if (registry.entries[thread] || repaired) { delete registry.entries[thread]; durableWrite(file, JSON.stringify(registry)); }
+    }));
+  }
+  /** Delete only the observed page generation. Missing records revoke old messages. */
+  removePage(thread: string, expected: RecoveryThreadRecord): boolean {
+    hash(thread);
+    return withContinuityStorageLock(join(this.directory, "write.lock"), () => this.exclusive(() => {
+      const document = this.read(); const current = document.threads[thread];
+      if (current && (current.version !== expected.version || current.epoch !== expected.epoch || current.owner.id !== expected.owner.id
+        || current.transaction?.transactionId !== expected.transaction?.transactionId
+        || current.transaction?.version !== expected.transaction?.version)) return false;
+      if (current) { delete document.threads[thread]; this.write(document); }
+      const { registry } = this.pageRegistrations(document);
+      delete registry.entries[thread]; durableWrite(join(this.directory, "threads.json"), JSON.stringify(registry));
+      return true;
     }));
   }
   installationId(): string { this.read(); return this.installation(); }
@@ -798,7 +915,7 @@ export class ContinuityRecoveryStore {
       cursor = record!.works[cursor.predecessorLogicalWorkId];
     }
     const healthyAppend = current !== work && cursor === work && work?.purpose === "ordinary";
-    if (document.version !== 3 || document.installation !== identity.installationId || !record || record.legacyUnproven
+    if (document.version !== 4 || document.installation !== identity.installationId || !record || record.legacyUnproven
       || record.pendingPreparation || record.epoch !== identity.epoch
       || record.owner.pid !== identity.ownerProcess.pid || record.owner.startIdentity !== identity.ownerProcess.startIdentity
       || !current || terminal(current) || !active || active.writerRetired || active.epoch !== identity.epoch
@@ -906,7 +1023,7 @@ export class ContinuityRecoveryStore {
       if (result && typeof (result as unknown as { then?: unknown }).then === "function") throw invalid("Continuity recovery transactions must be synchronous.");
       // The store owns this version. Replays do not constitute a new state change.
       record.version = previous.version;
-      const unchanged = document.version === 3 && canonicalJson(record) === canonicalJson(previous);
+      const unchanged = document.version === 4 && canonicalJson(record) === canonicalJson(previous);
       if (!unchanged) record.version++;
       validateThread(record); transition(previous, record);
       if (unchanged) {
@@ -945,12 +1062,12 @@ export class ContinuityRecoveryStore {
       const document = this.read(); let record = document.threads[input.thread]; const previous = record && structuredClone(record);
       if (!record) {
         if (Object.keys(document.threads).length >= MAX_THREADS) throw capacity("Continuity recovery capacity is 10,000 threads.");
-        record = { thread: input.thread, scope: input.scope, version: 0, epoch: 0, historyRevision: 0, owner: input.owner, state: "creating", legacyUnproven: false,
+        record = { thread: input.thread, scope: input.scope, version: 0, epoch: input.initialEpoch ?? 0, historyRevision: 0, owner: input.owner, state: "creating", legacyUnproven: false,
           works: {}, lineages: {}, calls: {}, compactionTargets: {}, checkpoints: {} };
         document.threads[input.thread] = record;
       }
       this.guard(record, { scope: input.scope }); this.admit(record, input);
-      const unchanged = document.version === 3 && previous && canonicalJson(record) === canonicalJson(previous);
+      const unchanged = document.version === 4 && previous && canonicalJson(record) === canonicalJson(previous);
       if (!unchanged) record.version++;
       validateThread(record); if (previous) transition(previous, record);
       if (unchanged) {
@@ -1380,6 +1497,7 @@ export class ContinuityRecoveryStore {
     optionalIdentity(input.nativeTurnId); optionalIdentity(input.predecessorLogicalWorkId); optionalIdentity(input.continuationCommitId); optionalIdentity(input.compactionTargetId);
     validateInstructionPrevious(input.instructionPrevious); if (input.allowRetainedSourceFallback !== undefined) boolean(input.allowRetainedSourceFallback);
     if (input.activate !== undefined) boolean(input.activate);
+    if (input.initialEpoch !== undefined) integer(input.initialEpoch);
     if (input.activate === false && (input.purpose !== "compaction" || input.createPage !== false || input.predecessorLogicalWorkId || input.continuationCommitId
       || !input.compactionTargetId || !input.dispatchProtocolComplete)) throw unproven("Shadow admission is restricted to a proved, tool-free compaction on the current source page.");
   }
@@ -1543,7 +1661,7 @@ export class ContinuityRecoveryStore {
       let encoded = "";
       const document = safeFile(this.file, MAX_CONTINUITY_RECOVERY_BYTES, value => { encoded = value; });
       exact(document, ["version", "installation", "threads"]); dictionary(document.threads);
-      if (marker.version !== 2 || (document.version !== 2 && document.version !== 3) || document.installation !== marker.installation || document.installation !== this.installation()
+      if (marker.version !== 2 || (document.version !== 2 && document.version !== 3 && document.version !== 4) || document.installation !== marker.installation || document.installation !== this.installation()
         || Object.keys(document.threads).length > MAX_THREADS) throw new Error("invalid installation");
       measureRuntimeOperation("recovery.validate", () => {
         dictionary(document.threads);
@@ -1611,7 +1729,7 @@ export class ContinuityRecoveryStore {
     // Even a failed write attempt must not leave a proof usable by another store instance.
     forgetRecoveryDurability(this.file);
     // Atomic format promotion preserves all facts and makes old v2 writers fail closed.
-    document.version = 3;
+    document.version = 4;
     this.checkCapacity(document);
     let replaced = false;
     try {

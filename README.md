@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-1/codex-web-gpt-6.1.10-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-1/codex-web-gpt-6.1.10-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-1/codex-web-gpt-6.1.10-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-2/codex-web-gpt-6.1.10-2-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-2/codex-web-gpt-6.1.10-2-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-2/codex-web-gpt-6.1.10-2-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-1/codex-web-gpt-6.1.10-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.10-2/codex-web-gpt-6.1.10-2-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -221,7 +221,7 @@ bun run app:package
 
 `dev:launcher` uses a separate profile and account under `~/.codex-chatgpt-web-dev`. `dev:chat` exercises the real browser and compaction paths with explicit simulated tool results, without changing your normal Codex route. See the [DEV chat harness](docs/dev-chat.md) for setup and commands.
 
-[Session continuity](docs/session-continuity.md) uses one task mechanism on supported Full Native + Launcher routes with ordinary `chatgpt-web/` models. It reuses healthy compatible pages and can recover unfinished work, checkpoint continuation, or uncommitted compaction on a new page after project execution isolation, real tool settlement, legal-source and actual-plan checks. Unknown Send/results and stops remain binding. Fresh Conversation Per Turn changes page selection only; Bigger Context keeps existing supported paths and Zero Risk restrictions. The 1,000,000 / 900,000-token Codex history budget does not enlarge the ChatGPT window. Five physical pages and bounded cleanup still apply. Existing old-prefix configuration must use the corresponding ordinary name; migration preserves work, stop, checkpoint and retry facts. Real-platform validation remains tracked in the guide.
+[Session continuity](docs/session-continuity.md) uses one task mechanism on supported Full Native + Launcher routes with ordinary `chatgpt-web/` models. Confirmed live pages retain current-request conflict checks. Closed or unknown pages recover from the current request after best-effort old-execution revocation; old stops, unknown Send/results, checkpoints, and retry budgets cannot block a new page. External work may execute again or continue on an unreachable old page. Closed-page task records are removed, while the independent one-hour `previous_response_id` cache remains. Fresh Conversation Per Turn affects logical sends; Bigger Context and Zero Risk keep existing capabilities and manual-send restrictions. The 1,000,000 / 900,000-token history budget does not enlarge the ChatGPT window. Five physical pages and bounded cleanup still apply. Old-prefix configuration must use the corresponding ordinary name. The guide records outstanding real-platform validation.
 
 </details>
 

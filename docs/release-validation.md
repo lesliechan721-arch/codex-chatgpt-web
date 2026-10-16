@@ -31,7 +31,7 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.10-1` integrates upstream `6.1.9` with this fork's continuity, context, API access,
+Version `6.1.10-2` integrates upstream `6.1.9` with this fork's continuity, context, API access,
 provider, proxy, and remote-runtime contracts. The service, Launcher, installer, and download
 metadata use the same version. Next-message suggestions are available as an explicit opt-in;
 new installations and existing configurations without this setting leave them disabled.
@@ -54,7 +54,7 @@ capture cookies, tunnel IDs, API keys, bearer tokens, or private task prompt con
 For controlled synthetic fixtures, retain only the fixture input and output needed to assess the
 result, with credentials redacted.
 
-For `6.1.10-1`, Native protocol compatibility targets the latest stable
+For `6.1.10-2`, Native protocol compatibility targets the latest stable
 [Codex `0.162.1`](https://github.com/openai/codex/releases/tag/rust-v0.162.1).
 Run `bun run smoke:compaction` with no flags, `--auto`, `--zero-risk`, and
 `--auto --zero-risk`. The smoke uses the real installed Codex and a local deterministic model
@@ -198,75 +198,78 @@ configuration does not prove that an installed Launcher uses that runtime.
 
 ## Session continuity validation
 
-Supported ordinary `chatgpt-web/` Full Native + Launcher routes now have one task contract.
-The historical evidence below covers earlier contracts only. The unified-task real DEV acceptance
-is **not yet complete**; script presence, local fixtures and an older live pass do not establish it.
-Keep Automatic and Zero Risk evidence separate. Navigation's outstanding platform matrix above
-remains outstanding unless a new recorded run actually covers an item.
+Supported ordinary `chatgpt-web/` Full Native + Launcher routes use page-lifecycle recovery.
+The historical evidence below covers earlier contracts. It does not establish this change's
+real Launcher acceptance. Keep Automatic and Zero Risk observations separate, and keep the
+navigation platform matrix above outstanding until a new run covers it.
 
-Record the following before claiming the unified contract validated:
+Record the following before claiming page-lifecycle recovery validated:
 
-1. Recover a legal tool log whose full inline compilation exceeds the old browser window while its
-   source storage and actual on-demand plan fit. Read a unique previously unread tail value from
-   the new page's actually delivered entry. Cover ordinary unfinished work, committed-checkpoint
-   continuation and uncommitted compaction; do not inject test answers or credentials into the
-   model to bypass delivery. Compare a healthy-page incremental continuation.
-2. Use fault page loss that does not invoke user stop, and record original page identity and stop
-   state. Contrast explicit user close of a running page: its work retries stay stopped. Idle
-   reclamation and recovery cleanup must not fabricate stop or erase an existing stop.
-3. Verify missing sources, unknown checkpoint relations, oversized non-externalizable instructions,
-   required-image failure, storage/evidence exhaustion and complete-read-reply limits fail before
-   Send or business dispatch. Check actual full/resume selection and fresh-page image coverage.
-4. Keep an old page or process alive while durable revocation rejects actual old-generation tools,
-   reads, ACK, final output, checkpoint and delayed helper Send/acquisition. Exercise real cross-
-   process dispatch/revocation ordering, trusted late result settlement, first-result conflicts,
-   running-process handles, storage write failures and incompatible running components. Navigation
-   six-call verification does not substitute for this execution capability proof.
-5. Race recovery, stop, task append, checkpoint and lost control receipts. One transfer reserves one
-   successor. Pending accepted updates retain their source/revision and need successor ACK. An
-   uncommitted compaction preserves target, deadline and retry count; old attempts cannot supply
-   new-attempt Send/read/commit proof. A valid accepted handoff settles once; committed summaries
-   only replay, and unavailable committed bodies do not authorize regeneration.
-6. Verify unknown Send and dispatched-result uncertainty block new execution without probing by
-   resend. Crash/restart backend, helper and Launcher around creation, admission, dispatch, result,
-   stop and checkpoint commits. Empty memory, missing transaction tables, reused PID, URLs and
-   digests are not execution or source evidence. Real original content must be rebuilt legally.
-7. Exercise five physical pages, safe idle reclamation, active/uncertain exclusions, late exact
-   destruction and cleanup that never succeeds. At most three automatic closes occur per fixed
-   cleanup transaction. Closing/fault pages still occupy slots; durable isolation remains valid
-   while waiting, no sixth page or additional business attempt is created. Include real browser
-   resource pressure and distinguish it from controlled never-destroyed fixtures.
-8. Load the public 1,000,000 / 900,000 history values with the actual target Codex binary. Verify lower
-   client settings and record the effective trigger. Controlled usage can prove compaction triggers,
-   not million-token browser capacity. Measure canonical bytes, actual plan bytes/token estimates,
-   directory and read costs, unique/repeated reads, images, retries, time and real dispatch counts.
-9. Remove old names from catalogs, exports and managed configuration, and reject them before Send
-   with a normal replacement name. User TOML is not silently rewritten. Migrate old work, stop,
-   Send, first results, checkpoints and retries without reset. Equivalent ordinary aliases and
-   compatible Fresh preferences retain task identity. Missing/corrupt or legacy-unproven evidence
-   stays unknown; interrupted migration does not produce two owners.
-10. Check Automatic, Zero Risk, local Web API Key access and excluded Browser-only, non-Launcher,
-    Luna, Think and upstream API paths. New Zero Risk pages require manual Send, Sent and attachment
-    confirmation; ended compaction retains the explicit manual handoff. Fresh affects only actual
-    new logical sends; Bigger Context keeps existing capabilities and Zero Risk prohibition.
-11. Preserve bounded replay/journal behavior: 24 MiB shared recovery/checkpoint evidence, 2 MiB per
-    item, 256 checkpoints/tombstones, 512 rounds, and 10,000-thread/4 MiB registration bounds.
-    Reserve terminal/stop evidence before side effects. Page retention, source availability, answer
-    bodies and durable execution receipts have distinct lifetimes; cache expiry never grants new
-    execution. Exercise the real 24-hour successful-work clock separately from mocked-clock checks.
-12. Confirm one user notice and bounded logs describe only project-operation isolation when old-page
-    inspection is unavailable. Do not claim ChatGPT-owned platform activities stopped, or global
-    deduplication of equal operations with different identities. Preserve accepted results on all
-    failure paths and do not store prompt/source bodies, images or credentials in runtime journals.
+1. Interrupt a request, manually close its page, then continue the same request through the full
+   HTTP endpoint and Adapter preflight to normal new-page preparation. Old stopped, revision, or
+   source state must not return 409, and old cancellation cache must not return 400
+   `client_cancelled`. Zero Risk must still wait for manual Send and confirmation.
+2. With the old page closed, vary stopped, completed-without-body, consumed checkpoint, unknown
+   Send/tool result, legacy metadata, missing/corrupt journals, and exhausted old budgets. All
+   must permit current-request recovery. Do not automatically redispatch old tool calls. Include
+   request-carried real results, process handles, summaries, and rolled-back history.
+3. Disconnect, time out, or restart Launcher so old-page state is unknown, then restore the normal
+   creation interface. Observe best-effort old-generation revocation and a new page without old
+   Send, settlement, or destruction proof. An actually unavailable interface remains a service
+   failure. Record that unreachable old commands may continue producing effects.
+4. Keep a page confirmed alive and test rollback, same identity with changed payload, unknown or
+   conflicting result groups, incorrect compaction source, and owner conflicts. Reject specific
+   conflicts while preserving its valid writer. Matching retries must still attach or replay.
+   HTTP disconnect or interrupt alone must not start background recovery.
+5. Race matching recoveries, distinct requests, stop, task append, and checkpoint. Change page
+   state after query: closed becomes recovery; an already-created new page becomes live-page
+   validation. Observe one current execution, one corresponding Send, and no stale replacement.
+6. After new-page activation, deliver old destroyed callbacks, stops, Send receipts, helper
+   acquisition/dispatch, tool results, task updates/ACK, final answers, and checkpoint commits.
+   Observe actual old-generation denial at cross-process entry points. No old callback may
+   delete the new page, write its state, rebuild deleted records, or issue new tools. Test
+   storage/lock failures and late completion of original in-flight transmissions separately.
+7. Close a real page and restart backend. Confirm its registration, work/attempt/call,
+   stop/completion, history/checkpoint/retry data, binding/index, and task snapshots are removed,
+   without TTL or replacement tombstones. The independent one-hour input/output cache must
+   remain compatible. Independently referenced in-flight bodies may remain only until completion.
+8. Migrate current and old formats, missing/corrupt closed-page records, and interrupted migration.
+   Preserve confirmed-live activity, installation/login state, and increment cache; revoke unknown
+   generations and remove closed-page task records. No permanent deny list, long-term quarantine
+   archive, or two current writers. Verify running backend, helper, Broker, and Launcher; new
+   files on disk alone do not prove compatibility or old-process termination.
+9. Cover ordinary unfinished work, checkpoint continuation, and uncommitted compaction, including
+   local/v1/v2 wrappers and ordinary aliases. New-page recovery does not require old checkpoint
+   proof. Regenerated compaction is a new transaction, not exact old replay; current-page
+   compaction still commits once. Cover a legal tool log whose inline form exceeds the old
+   window but whose real on-demand plan fits, and read a unique unread tail through actual
+   delivery. Compare healthy-page incremental continuation without injecting test answers.
+10. Test increment-cache hit and expiry, unreadable ciphertext, missing current source bytes,
+    non-externalizable instructions, image/attachment, input/output, snapshot, and navigation
+    limits. Report actual source/read/plan budgets and preserve required bodies. A missing
+    `previous_response_id` cache keeps its API-context 409. Corrected requests retain recovery
+    eligibility. Load the public 1,000,000 / 900,000 history settings with the target Codex binary
+    and lower client limits; this is not proof of million-token browser capacity.
+11. Exercise five physical pages, safe idle reclamation, and cleanup that never destroys a page.
+    Closing/fault documents still occupy slots, with at most three automatic closes per fixed
+    cleanup transaction. Logical revocation cannot permit a sixth page. Retain only minimum
+    physical cleanup information after task revocation. Exercise the real 24-hour successful-work
+    clock separately from controlled-clock tests. Current-page journal/cache bounds still apply.
+12. Cover Automatic, Zero Risk, local Web API Key access, and excluded Browser-only, non-Launcher,
+    Luna, Think, and upstream API paths. Fresh affects logical sends rather than tool round trips,
+    retries, or updates, and cannot bypass live-page conflicts. Preserve Zero Risk Send, Sent,
+    attachment and ended-response handoff boundaries and Bigger Context prohibition. Confirm one
+    accurate recovery notice and bounded logs without prompt bodies, tool results, or credentials.
 
-**Currently unverified for this change:** the new-page unique-tail main acceptance in both sending
-modes; all three real recovery entrances; a live old-generation execution-denial observation;
-real physical-page pressure/cleanup; running-component migration
-and the remaining navigation/platform combinations. Record completed local checks separately with
-exact coverage. This list must change only when new evidence exists.
+Real Launcher pages must cover items 1, 3, 5, and 6 in Automatic and Zero Risk, in addition to
+local regression tests. Controlled fake pages and old live evidence are separate observations.
+**Currently unverified for this change:** full HTTP manual-close recovery, unknown-page recovery,
+concurrent real-page recovery and late-generation events in both sending modes; cross-process
+running-component migration; physical-page pressure/cleanup; the new-page unique-tail acceptance
+and remaining navigation/platform combinations. Update this list only when new evidence exists.
 
-The maintained contract is [current work and committed relationships](session-continuity.md#current-work-and-committed-relationships).
-Keep raw controlled task output in the local ignored workspace, not as another public specification.
+The maintained contract is [session continuity](session-continuity.md).
+Keep raw controlled output and acceptance records in the local ignored task workspace.
 
 ### Current unified-budget evidence
 

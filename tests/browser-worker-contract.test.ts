@@ -265,13 +265,13 @@ test("power turn identity separates roles and keeps virtualized groups in the su
 });
 
 test("a changed power group can rebind only with the same assistant message and no unrelated new user", async () => {
-  const baseline = { initialTurnIdentities: [], domCache: {} };
   const binding = {
     identity: "group:assistant:fallback-turn-0", locator: { count: async () => 0 },
     acceptedTurnIdentities: ["group:user:fallback-turn-0", "group:assistant:fallback-turn-0"],
     messageIds: ["stable-answer"],
   };
   for (const scenario of ["same-message", "different-message", "no-message-id", "extra-user"]) {
+    const baseline = { initialTurnIdentities: [], domCache: {} };
     const state = {
       userTurnCount: 1, assistantTurnCount: 1, visibleStopButtonCount: 0,
       turnIdentities: ["group:user:resolved", "group:assistant:resolved"],
@@ -3162,6 +3162,46 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     retryable: true,
   });
   expect(fixture.pressed).toEqual([]);
+});
+
+test("submission identity is scoped to the physical Send window and cannot select an ambiguous or unreadable request", () => {
+  const frame = {};
+  const page = Object.assign(new EventEmitter(), { mainFrame: () => frame });
+  const observer = new ChatGptSubmissionRejectionObserver();
+  const currentId = "11111111-1111-4111-8111-111111111111";
+  const otherId = "22222222-2222-4222-8222-222222222222";
+  const emit = (id = currentId, owner = frame, url = "https://chatgpt.com/backend-api/f/conversation", body?: unknown) => page.emit("request", {
+    method: () => "POST", url: () => url, frame: () => owner,
+    postDataJSON: () => body ?? { messages: [{ id, author: { role: "user" } }] },
+  });
+  type Identity = { messageId?: string; ambiguous?: boolean; unavailable?: boolean };
+  try {
+    const first: Identity = {};
+    emit(otherId);
+    observer.begin(page as unknown as Page, first, [`group:user:${otherId}`]);
+    emit(otherId); // A known earlier stage is not this submission.
+    emit(otherId, {});
+    emit(otherId, frame, "https://other.example/backend-api/f/conversation");
+    expect(first).toEqual({});
+    emit(); emit();
+    expect(first).toEqual({ messageId: currentId });
+    observer.endSubmissionIdentity();
+    emit(otherId);
+    expect(first).toEqual({ messageId: currentId });
+    const ambiguous: Identity = {};
+    observer.begin(page as unknown as Page, ambiguous);
+    emit(); emit(otherId);
+    expect(ambiguous.ambiguous).toBe(true);
+    expect(ambiguous.messageId).toBe(currentId);
+    const unknown: Identity = {};
+    observer.begin(page as unknown as Page, unknown);
+    emit(currentId, frame, undefined, { messages: [{ id: currentId, author: { role: "user" } }, { id: otherId, author: { role: "user" } }] });
+    emit();
+    expect(unknown.unavailable).toBe(true);
+    expect(first).toEqual({ messageId: currentId });
+    expect(ambiguous.ambiguous).toBe(true);
+  } finally { observer.dispose(); }
+  expect(page.listenerCount("request")).toBe(0);
 });
 
 test("only a size rejection of the current owned browser submission is non-retryable", async () => {

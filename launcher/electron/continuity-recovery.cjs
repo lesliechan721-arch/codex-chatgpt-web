@@ -1,6 +1,6 @@
 const { validLauncherInstance, sameLauncherInstance, launcherProcessInstanceStatus, launcherInstance,
   knownProcessStart } = require("./continuity-process-instance.cjs");
-const RECOVERY_FEATURE = "session-continuity-recovery-v3";
+const RECOVERY_FEATURE = "session-continuity-recovery-v4";
 const MAX_RECOVERY_THREADS = 10_000;
 const MAX_RECEIPTS = 256;
 const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -42,14 +42,14 @@ function remember(host, record) {
   host.continuityTransactionReceipts.set(`${threadKey(record.identity)}:${record.identity.transactionId}`, record);
   while (host.continuityTransactionReceipts.size > MAX_RECEIPTS) host.continuityTransactionReceipts.delete(host.continuityTransactionReceipts.keys().next().value);
 }
-function exactRecord(host, recovery) {
+function exactRecord(host, recovery, allowMissing = false) {
   validateRecovery(recovery);
   const current = tables(host).get(threadKey(recovery));
   if (current && sameRecovery(current.identity, recovery)) return current;
   // Old observations can query their own receipt, but cannot mutate the current owner.
   const previous = host.continuityTransactionReceipts.get(`${threadKey(recovery)}:${recovery.transactionId}`);
   if (previous && sameRecovery(previous.identity, recovery)) return previous;
-  if (current) throw failure();
+  if (current && (!allowMissing || current.identity.epoch === recovery.epoch)) throw failure();
   return undefined;
 }
 /** UI removal is not physical destruction. Closing documents retain their frozen identity. */
@@ -167,7 +167,7 @@ function missingReceipt(host, recovery) {
       : cleanupReceipts(host, recovery).length === 0 ? "pending" : cleanupState(host, recovery), cleanup: cleanupReceipts(host, recovery),
     launcherInstance: current, hostNoWriter };
 }
-function queryContinuityTransaction(host, recovery) { return receipt(host, exactRecord(host, recovery), recovery); }
+function queryContinuityTransaction(host, recovery) { return receipt(host, exactRecord(host, recovery, true), recovery); }
 
 /** Reserve synchronously, before an async Electron allocation. Caller disconnect never cancels it. */
 function reserve(host, claim, traceId, helperPid, conversationKey, mode) {
@@ -204,23 +204,35 @@ function reserve(host, claim, traceId, helperPid, conversationKey, mode) {
   }
   if (record) {
     const previous = record.identity;
-    const sameTransaction = previous.transactionId === identity.transactionId;
-    const nextAttempt = sameTransaction && record.state === "retired" && record.writerRetired === true
-      && identity.logicalWorkId === previous.logicalWorkId && identity.epoch >= previous.epoch
-      && identity.attempt === previous.attempt + 1 && identity.snapshotVersion > previous.snapshotVersion
-      && identity.transactionVersion > previous.transactionVersion;
-    const newWork = !sameTransaction && ((record.state === "retired" && record.writerRetired === true && identity.epoch > previous.epoch)
-      || (record.state === "completed" && identity.epoch === previous.epoch && claim.expected
-        && sameRecovery(claim.expected.recovery, previous)));
-    const healthyReuse = newWork && record.state === "completed" && identity.epoch === previous.epoch
-      && !physicalTurnTabs(host).some(tab => tab.closing && tab.continuityRecovery && threadKey(tab.continuityRecovery) === key);
-    if ((!nextAttempt && !newWork) || acquisitionPending(record) && !record.executionIsolated
-      || (!healthyReuse && !record.executionIsolated && hasPhysicalWriter(host, identity, true))) throw failure("continuity_execution_unsettled");
+    const retained = claim.expected && sameRecovery(claim.expected.recovery, previous)
+      && record.state === "completed" && identity.epoch === previous.epoch;
+    if (!retained) {
+      let previousAuthorized = false;
+      try { assertExecutionAuthority(host, previous); previousAuthorized = true; } catch {}
+      if (identity.epoch === previous.epoch || previousAuthorized) throw failure("continuity_execution_unsettled");
+      // Current durable authority already revoked the old generation. Close its
+      // exact documents; their physical slots remain occupied until destroyed.
+      for (const tab of physicalTurnTabs(host).filter(tab => tab.continuityRecovery
+        && threadKey(tab.continuityRecovery) === key && !sameRecovery(tab.continuityRecovery, identity))) {
+        tab.continuityInvalidated = true;
+        try { host.removeTurnTab(tab, true); } catch {}
+        cleanupTurnPage(host, tab, { executionIsolated: true });
+      }
+      record.retirementRequested = true; record.executionIsolated = true; record.writerRetired = true; record.state = "retired";
+    }
     remember(host, record);
   } else {
     if (records.size >= MAX_RECOVERY_THREADS) throw failure("continuity_resource_capacity");
-    // A new trace/transaction must not bypass a surviving page whose table entry was lost.
-    if (hasPhysicalWriter(host, identity, true)) throw failure("continuity_execution_unsettled");
+    if (hasPhysicalWriter(host, identity)) throw failure("continuity_execution_unsettled");
+    for (const tab of physicalTurnTabs(host).filter(tab => tab.continuityRecovery
+      && threadKey(tab.continuityRecovery) === key && !sameRecovery(tab.continuityRecovery, identity))) {
+      let previousAuthorized = false;
+      try { assertExecutionAuthority(host, tab.continuityRecovery); previousAuthorized = true; } catch {}
+      if (previousAuthorized) throw failure("continuity_execution_unsettled");
+      tab.continuityInvalidated = true;
+      try { host.removeTurnTab(tab, true); } catch {}
+      cleanupTurnPage(host, tab, { executionIsolated: true });
+    }
   }
   record = { identity: structuredClone(identity), owner: claim.owner, traceId, helperPid,
     conversationKey, mode, state: "creating", writerRetired: false };
@@ -336,14 +348,15 @@ function markContinuitySendPossible(host, recovery) {
   return { ...receipt(host, record), sendAuthorized };
 }
 async function retireContinuityWriter(host, recovery) {
-  let existing = exactRecord(host, recovery);
+  let existing;
+  try { existing = exactRecord(host, recovery, true); } catch { /* A successor owns the current table. */ }
   if (!existing) {
     const missing = missingReceipt(host, recovery);
-    if (!missing.executionIsolated || !sameLauncherInstance(recovery.launcherInstance, launcherInstance(host))) return missing;
+    try { assertExecutionIsolation(host, recovery); } catch { return missing; }
     if (tables(host).size >= MAX_RECOVERY_THREADS) throw failure("continuity_resource_capacity");
     // An authenticated durable fence can restore the target's lost local cleanup record.
     existing = { identity: structuredClone(recovery), state: "retired", writerRetired: true, executionIsolated: true, physicalTargetUnknown: true };
-    tables(host).set(threadKey(recovery), existing);
+    if (!tables(host).has(threadKey(recovery))) tables(host).set(threadKey(recovery), existing);
   }
   assertExecutionIsolation(host, recovery);
   const record = existing;
@@ -378,8 +391,30 @@ function completeContinuityTransaction(host, tab, completed) {
   record.tabId = tab.id;
   if (completed) record.state = "completed";
 }
-function removedContinuityTab(host, tab) {
-  if (!tab.continuityRecovery) return;
+function removedContinuityTab(host, tab, contents = tab.view?.webContents) {
+  if (!tab.continuityRecovery || !contents) return;
+  if (contents.isDestroyed()) {
+    let removed;
+    try { removed = require("./continuity-page-store.cjs").removeDestroyedPage(host, tab.continuityRecovery, tab, contents); }
+    catch (error) {
+      host.logger?.warn?.("browser.page_task_cleanup_pending", { reason: error.message });
+      tab.continuityStoreCleanupAttempts = (tab.continuityStoreCleanupAttempts ?? 0) + 1;
+      if (tab.continuityStoreCleanupAttempts < 100) {
+        const retry = setTimeout(() => removedContinuityTab(host, tab, contents), 50); retry.unref?.();
+      }
+      return;
+    }
+    const key = threadKey(tab.continuityRecovery);
+    const belongsToDestroyedPage = identity => sameRecovery(identity, tab.continuityRecovery)
+      || removed && identity.installationId === tab.continuityRecovery.installationId
+        && identity.threadKey === tab.continuityRecovery.threadKey && identity.epoch === tab.continuityRecovery.epoch;
+    const current = tables(host).get(key);
+    if (current && belongsToDestroyedPage(current.identity)) tables(host).delete(key);
+    for (const [receiptKey, item] of host.continuityTransactionReceipts) {
+      if (belongsToDestroyedPage(item.identity)) host.continuityTransactionReceipts.delete(receiptKey);
+    }
+    return;
+  }
   const record = tables(host).get(threadKey(tab.continuityRecovery));
   if (!record || !sameRecovery(record.identity, tab.continuityRecovery)) return;
   record.tabId = tab.id;
