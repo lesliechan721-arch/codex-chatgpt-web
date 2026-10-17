@@ -13,6 +13,7 @@ import {
 } from "./compaction-handoff";
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
+import { compactionSourceWasDelegation, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isDurableCompactionSourceIdentity } from "./compaction-continuation";
 import { taskUpdateSourceError } from "./task-update-source";
 import { assertCompactionReadable, captureRetainedCompactionSource, compactionAvailableTokens, compactionSourcePageCost } from "./compaction-context";
 import {
@@ -137,6 +138,8 @@ export function runContinuityCompaction(
     if (!manual && !(broker instanceof TurnBroker)) throw continuityError("continuity_configuration_conflict");
     const sourceRevision = extractChatGptCompactionSourceRevision(parsed);
     if (sourceRevision.itemId) sourceRevision.itemId = parsed._chatGptMessageIdAliases?.[sourceRevision.itemId] ?? sourceRevision.itemId;
+    const sourceWasDelegation = compactionSourceWasDelegation(parsed, sourceRevision);
+    const sourceIdentityOnly = isDurableCompactionSourceIdentity(parsed, sourceRevision);
     const sourceInstructionReplay = source.continuitySourceInstructionReplayEvidence();
     let sourceResultReplay: ContinuityToolResultReplayEvidence | undefined;
     let sourceSnapshot: ContextSnapshot | undefined;
@@ -321,8 +324,12 @@ export function runContinuityCompaction(
         sourceResultReplay,
         sourceInstructionReplay,
         sourceRevision,
-        [...new Set([sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]
-          .map(revision => continuitySourceRepresentationDigest(parsed, revision)))],
+        [...new Set([
+          ...[sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]
+            .map(revision => continuitySourceRepresentationDigest(parsed, revision)),
+          ...(sourceWasDelegation ? [CONTINUITY_DELEGATION_SOURCE] : []),
+          ...(sourceIdentityOnly ? [CONTINUITY_IDENTITY_ONLY_SOURCE] : []),
+        ])],
         identity.turnId,
       );
       binding.retainedPageTokens = compactionPageTokens === undefined ? undefined

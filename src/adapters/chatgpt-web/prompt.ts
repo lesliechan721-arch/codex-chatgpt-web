@@ -43,6 +43,8 @@ export interface CompiledChatGptWebPrompt {
   contextPayload?: string;
   /** Explicit identity of the selected on-demand delivery plan. */
   contextPlan?: ContextPlanDescriptor;
+  /** Current broker identity, already present in the final prompt; never diagnostic data. */
+  turnToken?: string;
   skillFiles?: ChatGptSkillFile[];
   /** Transactional transport when Bigger Context is explicitly enabled. */
   multipart?: ChatGptWebMultipartPrompt;
@@ -698,7 +700,8 @@ function compileChatGptWebPromptCandidate(
     : mode.localTools
     ? [
       "<codex_transport_resume>",
-      `${options?.contextNavigation ? "The selected task input and its context navigation entry are ready; read required images before acting and historical references as needed." : "The task context is complete."} Pass turn_token ${turnToken} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      // DOM rebinding requires one token occurrence; the navigation entry already carries it.
+      `${options?.contextNavigation ? "The selected task input and its context navigation entry are ready; read required images before acting and historical references as needed." : "The task context is complete."} Pass ${options?.contextNavigation ? "the turn_token value from codex_context_navigation_json" : `turn_token ${turnToken}`} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",
     ]
     : [
@@ -726,7 +729,10 @@ function compileChatGptWebPromptCandidate(
     const skillContract = skillFiles.length ? [
       "Each skill_attachment refers to a named UTF-8 text file attached to this message (the final commit in multipart mode). Read its complete contents as the selected Codex skill instructions at the original user priority. These origin=codex_skill messages are supplied by Codex, not human-authored task requests. Preserve their original position in history and their path/resource authority for resolving references. If a file cannot be read, report that limitation; do not invent its contents.",
     ] : [];
-    const attachments = skillFiles.length ? { skillFiles } : {};
+    const attachments = {
+      ...(skillFiles.length ? { skillFiles } : {}),
+      ...(mode.localTools && !manualControl && !parsed._compactionRequest ? { turnToken } : {}),
+    };
     const answerContract = captureLunaCheckpoint
       ? "Return the complete answer that the outer Codex task should receive, then the required private checkpoint tail."
       : "Return only the answer that the outer Codex task should receive.";

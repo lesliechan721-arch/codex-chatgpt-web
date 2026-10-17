@@ -41,7 +41,7 @@ for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "
     expect(submission.prompt).toContain('"protocol":"task-updates-v1","task_revision":0');
     const token = manual
       ? JSON.parse(submission.prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id
-      : submission.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+      : submission.turnToken!;
     expect(tokens.has(token)).toBe(false);
     tokens.add(token);
     expect(f.broker.taskOutputReceipt(token)).toBeUndefined();
@@ -164,7 +164,7 @@ for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk
   try {
     const pending = adapter.runTurn!(retry, { headers: new Headers() }, () => {});
     while (update.mock.calls.length === 0) await Bun.sleep(1);
-    const token = manual ? f.controls.safeToken : f.submissions[0]!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+    const token = manual ? f.controls.safeToken : f.submissions[0]!.turnToken!;
     expect(await callTurnBroker<NativeOperationReply>(f.provider.chatgptWeb!.brokerSocketPath!, {
       method: "native_operation_start", token, contract: manual ? "safe" : "native", nativeWaitProtocol: 1,
       operationId: 1, entry: "codex_exec", nativeInput: { cmd: "not-executed" }, waitMs: 1,

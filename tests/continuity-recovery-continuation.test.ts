@@ -8,7 +8,7 @@ import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { selectRecoveryContinuation } from "../src/adapters/chatgpt-web/continuity-recovery-continuation";
-import { recoverCompactionInstruction, isAcceptedCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { recoverCompactionInstruction, isAcceptedCompactionContinuation, CONTINUITY_DELEGATION_SOURCE } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { extractChatGptTurnIdentity, extractChatGptTurnUserRevision, isChatGptCompactionContinuation } from "../src/adapters/chatgpt-web/environment";
 
 const roots: string[] = [];
@@ -24,7 +24,7 @@ function request(input: unknown[] = [{ type: "compaction", encrypted_content: en
   parsed._continuityScope = scope;
   return parsed;
 }
-function fixture(completed = false) {
+function fixture(completed = false, delegation = false) {
   const directory = mkdtempSync(join(tmpdir(), "continuity-consumer-")); roots.push(directory);
   new ContinuityRegistrationStore(directory).initialize();
   const store = new ContinuityRecoveryStore(directory);
@@ -36,7 +36,9 @@ function fixture(completed = false) {
   if (completed) store.completeWork(thread, { scope }, "source", { receiptId: "answer-receipt", digest: continuityDigest("original answer") });
   else store.retireAttempt(thread, { scope }, "source", 0);
   let record = store.registerCompactionTarget(thread, { scope }, { sourceLogicalWorkId: "source", sourceIdentity: "original-item",
-    representationDigests: [continuityDigest([native.turnId, "original-item", "Same source text.", { role: "user" }])] });
+    representationDigests: [continuityDigest([native.turnId, "original-item", "Same source text.", { role: "user" }]),
+      ...(delegation ? [CONTINUITY_DELEGATION_SOURCE,
+        continuityDigest(["older-turn", "older-human", "Retained human history.", { role: "user" }])] : [])] });
   const target = Object.values(record.compactionTargets)[0]!;
   store.admitWork({ thread, scope, owner, logicalWorkId: "compact", instructionIdentity: "compact-item", nativeTurnId: native.turnId,
     workPayloadDigest: continuityDigest("compact"), snapshotDigest: continuityDigest(text), purpose: "compaction",
@@ -225,4 +227,33 @@ for (const newInstruction of [false, true]) test(`live checkpoint environment re
   }
   expect(binding.checkpoints.size).toBe(1);
   expect(binding.checkpoints.get("live-checkpoint")!.continuationExecutionKey).toBeUndefined();
+});
+
+for (const format of ["v1", "v2"] as const) test(`${format} durable delegated checkpoint does not replace the source with retained human history`, () => {
+  const { directory } = fixture(false, true);
+  // Restart reads only the journal's identity and representation evidence, with no source body.
+  const restarted = new ContinuityRecoveryStore(directory);
+  expect(restarted.get(thread)!.checkpoints["commit-one"]!.representationDigests).toContain(CONTINUITY_DELEGATION_SOURCE);
+  continuityBindingsFor(directory);
+  const human = { type: "message", role: "user", id: "older-human", content: "Retained human history.",
+    internal_chat_message_metadata_passthrough: { turn_id: "older-turn" } };
+  const checkpoint = format === "v1"
+    ? { type: "message", role: "user", content: `${SUMMARY_PREFIX}\n${text}` }
+    : { type: "compaction", encrypted_content: encodeCompactionSummary(text) };
+  const parsed = request([human, checkpoint]);
+  parsed._continuityStateDirectory = directory;
+  const recovered = recoverCompactionInstruction(parsed, native)!;
+  expect(recovered.sourceWasDelegation).toBe(true);
+  expect(recovered.source.itemId).toBe("original-item");
+  expect(recovered.source.content).toEqual([]);
+  expect(isAcceptedCompactionContinuation(parsed, native, recovered.source)).toBe(true);
+  expect(extractChatGptTurnUserRevision(parsed)).toEqual([]);
+  expect(isChatGptCompactionContinuation(parsed)).toBe(true);
+  const changed = request([{ ...human, content: "Rewritten history." }, checkpoint]);
+  changed._continuityStateDirectory = directory;
+  expect(() => extractChatGptTurnUserRevision(changed)).toThrow("conflicts with native Codex turn_id");
+  const steering = request([human, checkpoint, sourceItem("new-steering", "New instruction wins.")]);
+  steering._continuityStateDirectory = directory;
+  expect(extractChatGptTurnUserRevision(steering)).toBe("New instruction wins.");
+  expect(recoverCompactionInstruction(steering, native)).toBeUndefined();
 });

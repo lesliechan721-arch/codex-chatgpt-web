@@ -81,6 +81,9 @@ test("large history fields use the real compiler and exact pagination without ch
   expect(result.externalizedTargetIds).toHaveLength(1);
   expect(result.costs.netSavedPromptBytes).toBeGreaterThan(0);
   expect(result.compiled.text).toContain("codex_context_ref");
+  expect(entry(result).first_call.arguments.turn_token).toBe(token);
+  expect(result.compiled.turnToken).toBe(token);
+  expect(result.compiled.text.split(token)).toHaveLength(2);
   expect(canonical).toEqual(before);
   expect(snapshot.toWire()).toEqual(sourceBefore);
   const field = entries(result).find(value => value.kind === "tool_result")!;

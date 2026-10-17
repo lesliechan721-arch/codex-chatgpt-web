@@ -346,24 +346,30 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number, parse
   };
 }
 
-function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment, allowAdditionalWritableRoots = false): boolean {
+function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment): string[] {
   const left = claim.environment;
-  const samePaths = (a: string[], b: string[]): boolean => {
-    const expected = new Set(b.map(pathIdentity));
-    return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
-  };
-  return pathIdentity(left.cwd) === pathIdentity(right.cwd)
-    && samePaths(left.roots, right.roots)
-    // Filesystem envelopes can omit Codex's extra output directories. The current
-    // native rollout remains the authority returned to the caller, never the claim.
-    && (allowAdditionalWritableRoots
-      ? left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))
-      : samePaths(left.writableRoots, right.writableRoots))
-    && left.sandboxPolicy.type === right.sandboxPolicy.type
-    // An envelope that does not state its network policy cannot contradict the rollout on it.
-    && (left.sandboxPolicy.type === "dangerFullAccess" || !claim.statesNetworkAccess
-      || (right.sandboxPolicy.type !== "dangerFullAccess"
-        && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
+  const claimedRoots = new Set(left.roots.map(pathIdentity));
+  const nativeRoots = new Set(right.roots.map(pathIdentity));
+  const nativeGrants = new Set([...right.roots, ...right.writableRoots].map(pathIdentity));
+  const fields: string[] = [];
+  if (pathIdentity(left.cwd) !== pathIdentity(right.cwd)) fields.push("cwd");
+  // Codex 0.163 omits workspace_roots in some rollouts while its envelope still
+  // lists output directories. Every extra claimed root must be an exact native
+  // grant, and no native workspace may disappear. Return only native authority.
+  if ([...nativeRoots].some(root => !claimedRoots.has(root))
+    || [...claimedRoots].some(root => !nativeGrants.has(root))) fields.push("workspace_roots");
+  // Filesystem envelopes omit Codex's extra output directories, including after
+  // compaction. Only the current native rollout supplies the returned grants.
+  if (!left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))) {
+    fields.push("writable_roots");
+  }
+  if (left.sandboxPolicy.type !== right.sandboxPolicy.type) fields.push("sandbox_policy");
+  // An envelope that does not state its network policy cannot contradict the rollout on it.
+  if (left.sandboxPolicy.type !== "dangerFullAccess" && right.sandboxPolicy.type !== "dangerFullAccess"
+    && claim.statesNetworkAccess && left.sandboxPolicy.networkAccess !== right.sandboxPolicy.networkAccess) {
+    fields.push("network_access");
+  }
+  return fields;
 }
 
 /**
@@ -443,7 +449,7 @@ export class ChatGptThreadEnvironmentStore {
         ...(messages.current ? { currentEnvironmentMessage: messages.current } : {}),
         historicalEnvironmentMessages: messages.historical,
         validateCurrentEnvironmentMessage(message, environment) {
-          if (!sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, message), environment, true)) {
+          if (conflictingAuthorityFields(extractChatGptEnvironmentMessageClaim(parsed, message), environment).length > 0) {
             throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
           }
         },
@@ -453,7 +459,7 @@ export class ChatGptThreadEnvironmentStore {
         if (publicationPendingIsTransient) throw new CodexRolloutPublicationPendingError("Codex compaction rollout is not published yet");
         throw new TrustedCodexEnvironmentValidationError("The trusted Codex environment has no authenticated native compaction source rollout");
       }
-      if (messages.current && !sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, messages.current), native, true)) {
+      if (messages.current && conflictingAuthorityFields(extractChatGptEnvironmentMessageClaim(parsed, messages.current), native).length > 0) {
         throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
       }
     }
@@ -516,7 +522,7 @@ export class ChatGptThreadEnvironmentStore {
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
           ...(initialClaim?.sourceMessage ? { currentEnvironmentMessage: initialClaim.sourceMessage } : {}),
           validateCurrentEnvironmentMessage(message, nativeEnvironment) {
-            if (!sameAuthority(extractChatGptEnvironmentMessageClaim(parsed, message), nativeEnvironment, true)) {
+            if (conflictingAuthorityFields(extractChatGptEnvironmentMessageClaim(parsed, message), nativeEnvironment).length > 0) {
               throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
             }
           },
@@ -538,8 +544,11 @@ export class ChatGptThreadEnvironmentStore {
               throw new TrustedCodexEnvironmentValidationError("Calendar environment delta conflicts with its current Codex rollout");
             }
           }
-          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, initialClaim !== undefined || steeringClaim !== undefined)) {
+          const conflicts = currentClaim ? conflictingAuthorityFields(currentClaim, rolloutEnvironment) : [];
+          if (conflicts.length > 0) {
             const source = currentCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
+            // Export fixed field names only; keep paths and permission contents private.
+            console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);
             throw new TrustedCodexEnvironmentValidationError(
               `${source} environment conflicts with its current Codex rollout`,
             );

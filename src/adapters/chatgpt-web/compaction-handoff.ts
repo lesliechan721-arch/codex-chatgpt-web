@@ -5,8 +5,9 @@ import type {
   CodexParsedRequest,
   CodexToolResultMessage,
 } from "../../types";
-import { COMPACT_PROMPT } from "../../responses/compaction";
-import { extractChatGptCompactionSourceRevision } from "./environment";
+import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
+import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "./environment";
+import { isDurableCompactionSourceIdentity, recoverCompactionInstruction } from "./compaction-continuation";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
@@ -123,7 +124,24 @@ export function canonicalizeCompactionHandoff(
 ): string {
   const normalized = summary.trim();
   if (!normalized) throw new Error("ChatGPT returned an empty structured compaction handoff");
-  const latestUserPrompt = userPromptText(extractChatGptCompactionSourceRevision(parsed).content);
+  const source = extractChatGptCompactionSourceRevision(parsed);
+  let latestUserPrompt = userPromptText(source.content);
+  if (latestUserPrompt === undefined && isDurableCompactionSourceIdentity(parsed, source)) {
+    // The identity proof contains no body. Reuse only canonical prompt bytes already
+    // present in the exact committed summary carried by this request.
+    const accepted = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))!;
+    const item = (parsed._rawBody as { input: Array<Record<string, unknown>> }).input[accepted.summaryIndex]!;
+    const text = typeof item.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content)
+      : userPromptText(item.content)?.slice(SUMMARY_PREFIX.length + 1);
+    const marker = `\n${LATEST_USER_PROMPT_MARKER}\n`;
+    const offset = text?.lastIndexOf(marker) ?? -1;
+    if (offset >= 0) {
+      try {
+        const retained = JSON.parse(text!.slice(offset + marker.length));
+        if (typeof retained === "string") latestUserPrompt = retained;
+      } catch { /* A legacy summary without a canonical string cannot reconstruct it. */ }
+    }
+  }
   if (latestUserPrompt === undefined) {
     throw new Error("ChatGPT compaction source has no canonical latest user prompt");
   }

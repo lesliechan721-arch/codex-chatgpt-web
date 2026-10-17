@@ -31,7 +31,7 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.10-2` integrates upstream `6.1.9` with this fork's continuity, context, API access,
+Version `6.1.10-3` integrates upstream `6.1.10` with this fork's continuity, context, API access,
 provider, proxy, and remote-runtime contracts. The service, Launcher, installer, and download
 metadata use the same version. Next-message suggestions are available as an explicit opt-in;
 new installations and existing configurations without this setting leave them disabled.
@@ -54,8 +54,8 @@ capture cookies, tunnel IDs, API keys, bearer tokens, or private task prompt con
 For controlled synthetic fixtures, retain only the fixture input and output needed to assess the
 result, with credentials redacted.
 
-For `6.1.10-2`, Native protocol compatibility targets the latest stable
-[Codex `0.162.1`](https://github.com/openai/codex/releases/tag/rust-v0.162.1).
+For `6.1.10-3`, Native protocol compatibility targets
+[Codex `0.163.0`](https://github.com/openai/codex/releases/tag/rust-v0.163.0).
 Run `bun run smoke:compaction` with no flags, `--auto`, `--zero-risk`, and
 `--auto --zero-risk`. The smoke uses the real installed Codex and a local deterministic model
 with temporary homes. Check every actual compaction response, the canonical replacement history,

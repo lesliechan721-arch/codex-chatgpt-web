@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { observeChatGptAttachmentUploads } from "./attachment-upload";
 import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "./browser-response-structure";
 import { BrowserDiagnosticHistory } from "./browser-diagnostic-history";
+import { readChatGptUserMessage } from "./browser-user-message";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, supportsChatGptUsageTracking, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
@@ -1495,6 +1496,7 @@ interface ChatGptSubmissionBaseline {
   initialTurnIdentities: readonly string[];
   domCache: ChatGptSubmissionDomCache;
   submittedText?: string;
+  turnToken?: string;
   acceptedUserIdentity?: string;
   submittedUserMessage?: ChatGptSubmittedUserMessage;
   acknowledgedStages?: readonly ChatGptAcknowledgedMultipartStage[];
@@ -1673,8 +1675,12 @@ export async function setChatGptThinkMode(
   if (pressed !== target) {
     const composerState = () => composer.evaluate(element => {
       const copy = element.cloneNode(true) as HTMLElement;
-      const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword]')];
-      const connectors = pills.map(pill => pill.getAttribute("data-keyword")).sort();
+      const pills = [...copy.querySelectorAll(
+        '[data-id^="plugin:"][data-keyword], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]',
+      )];
+      const connectors = pills.map(pill => (
+        pill.getAttribute("data-id") ?? pill.getAttribute("app-mention-path")
+      )).sort();
       for (const pill of pills) pill.remove();
       const text = element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
         ? element.value : copy.textContent ?? "";
@@ -3418,12 +3424,11 @@ export class ChatGptBrowserWorker {
       // not exist yet. Inspect the existing group; waiting for an assistant here turns
       // normal response startup into repeated DOM observation timeouts.
       const locator = page.locator(`[data-turn-key=${JSON.stringify(identity.slice("group:assistant:".length))}]`);
-      const text = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate(group => {
-        const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
-        const contents = bubbles.length === 1
-          ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]") : [];
-        return contents.length === 1 ? contents[0]!.innerText.replace(/\r\n?/g, "\n") : undefined;
-      }), signal));
+      const content = await this.expandedUserMessageContent(locator, signal);
+      const observed = content && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(
+        content.evaluate(readChatGptUserMessage), signal,
+      ));
+      const text = observed?.text.replace(/\r\n?/g, "\n");
       // Only this transaction's already completed stages may acquire a new identity. A
       // matching acknowledgement alone cannot prove that the uploaded context survived.
       const snapshot = await this.responseDomSnapshot(locator, {});
@@ -3432,6 +3437,13 @@ export class ChatGptBrowserWorker {
       if (!stage && !ackStage) continue;
       if (!stage || stage !== ackStage || !snapshot.completionActionVisible) {
         throw new Error("ChatGPT changed an acknowledged Bigger Context exchange");
+      }
+      // Expanding the message yields to the page. A concurrent new/duplicated turn
+      // must not disappear from the caller's earlier submission snapshot.
+      const current = await this.submissionDomState(page, baseline.domCache, signal);
+      if (current.turnIdentities.length !== state.turnIdentities.length
+        || current.turnIdentities.some(turn => !state.turnIdentities.includes(turn))) {
+        throw new Error("ChatGPT changed conversation turns while verifying an acknowledged Bigger Context exchange");
       }
       if (stage.identities.some(previous => state.turnIdentities.includes(previous))) {
         throw new Error("ChatGPT duplicated an acknowledged Bigger Context exchange");
@@ -3447,7 +3459,11 @@ export class ChatGptBrowserWorker {
     page: Page,
     submittedText?: string,
     acknowledgedStages: readonly ChatGptAcknowledgedMultipartStage[] = [],
+    turnToken?: string,
   ): Promise<ChatGptSubmissionBaseline> {
+    if (turnToken !== undefined && (!/^turn_[A-Za-z0-9_-]{32}$/.test(turnToken) || !submittedText?.includes(turnToken))) {
+      throw new Error("ChatGPT submission identity does not match its prepared prompt");
+    }
     const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR);
     const responseTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR);
     const domCache: ChatGptSubmissionDomCache = {};
@@ -3458,6 +3474,7 @@ export class ChatGptBrowserWorker {
       initialTurnIdentities: [],
       domCache,
       submittedText,
+      turnToken,
       acknowledgedStages: [...acknowledgedStages],
     };
     // A stage can persist under its new key before the next baseline is captured.
@@ -3644,7 +3661,7 @@ export class ChatGptBrowserWorker {
     if (newUsers.length > 0) {
       // Activity can unmount the accepted user group while it renders a temporary
       // assistant group. Its return must match the accepted user or the ID observed
-      // during this physical Send. Without either ID, require the entire text. A
+      // during this physical Send. Without either ID, verify the broker token or full text. A
       // surviving old group or any competing new turn remains foreign.
       const user = newUsers[0]!;
       const replacement = identity && newUsers.length === 1
@@ -3658,29 +3675,29 @@ export class ChatGptBrowserWorker {
         const locator = page.locator(chatGptAssistantTurnSelector(identity!));
         if (!matches) {
           // A fallback key is a renderer position. Its replacement needs a stable
-          // user/Send identity, or the complete text before any identity is known.
+          // user/Send identity, or broker token/full text before any identity is known.
           const stableAcceptedUser = baseline.acceptedUserIdentity
             && !/^group:user:fallback-turn-\d+$/.test(baseline.acceptedUserIdentity);
           // Native Send identity also survives collapsed or escaped user text.
           matches = stableAcceptedUser
             ? user === baseline.acceptedUserIdentity
             : submittedUserIdentity ? user === submittedUserIdentity
-            : !binding.messageIds?.length && Boolean(baseline.submittedText) && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, submitted) => {
-            const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
-            const contents = bubbles.length === 1
-              ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]")
-              : [];
-            const normalize = (text: string) => text.replace(/\r\n?/g, "\n");
-            // The bubble also contains Show more and accessibility spacing. Only its
-            // observed message-content target represents the submitted prompt.
-            return contents.length === 1 && normalize(contents[0]!.innerText) === normalize(submitted);
-          }, baseline.submittedText!), signal));
+            : !binding.messageIds?.length && Boolean(baseline.submittedText)
+              && await this.userMessageMatchesSubmission(locator, baseline.submittedText!, signal, baseline.turnToken);
         }
-        // The accepted user, native Send identity or exact text establishes ownership.
+        // The accepted user, native Send identity, broker token or exact text proves ownership.
         // Activity can replace its temporary group while still generating; requiring
         // a completed answer here mistakes that same unfinished turn for a foreign one.
       }
       if (!matches) throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      // Expanding a truncated bubble can yield to another DOM update. Keep the
+      // no-competing-turn check valid after that action, not just before it.
+      const current = await this.submissionDomState(page, baseline.domCache, signal);
+      if (!current.userIdentities.includes(user) || !current.responseIdentities.includes(identity!)
+        || current.turnIdentities.includes(binding.identity)
+        || current.turnIdentities.some(turn => !acceptedTurns.has(turn) && turn !== user && turn !== identity)) {
+        throw new Error("ChatGPT changed conversation turns while verifying the submitted message");
+      }
       // Full text is evidence only until the renderer supplies a formal identity.
       // Keep that identity so a later same-text message cannot replace this turn.
       if (!/^group:user:fallback-turn-\d+$/.test(user)) baseline.acceptedUserIdentity = user;
@@ -3697,6 +3714,48 @@ export class ChatGptBrowserWorker {
     };
     observeBinding?.(chatGptTurnBindingDiagnostic("rebound", baseline, rebound, state));
     return rebound;
+  }
+
+  private async expandedUserMessageContent(group: Locator, signal?: AbortSignal): Promise<Locator | undefined> {
+    const bubble = group.locator("[data-user-message-bubble]");
+    if (await bubble.count() !== 1) return undefined;
+    // Inline links have their own search targets. Only the outer message target
+    // identifies the complete user content.
+    const content = bubble.locator("[data-search-result-target]:not([data-search-result-target] [data-search-result-target])");
+    if (await content.count() !== 1) return undefined;
+    // Captured on 2026-10-15: long messages are truncated in the DOM, not just
+    // clipped by CSS. Expand the message using its semantic control in any locale.
+    const expand = bubble.locator('button[type="button"][aria-expanded][data-thread-find-skip="true"][data-markdown-copy="exclude"]');
+    const count = await expand.count();
+    if (count > 1) return undefined;
+    if (count === 1 && await expand.getAttribute("aria-expanded") === "false") {
+      await expand.press("Enter", { signal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
+      await expand.locator('xpath=self::*[@aria-expanded="true"]').waitFor({
+        state: "attached", signal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
+      });
+    }
+    return content;
+  }
+
+  private async userMessageMatchesSubmission(group: Locator, submitted: string, signal?: AbortSignal, turnToken?: string): Promise<boolean> {
+    const content = await this.expandedUserMessageContent(group, signal);
+    if (!content) return false;
+    if (turnToken !== undefined) {
+      // The composer was already checked byte-for-byte before Send. ChatGPT's
+      // rich-text renderer can rewrite JSON/link labels afterwards, so use the
+      // exact broker identity for this turn, never a shared prompt prefix or a
+      // token inferred from the rendered message. Expand first to expose its tail.
+      return withChatGptBrowserObservationTimeout(withBrowserTurnAbort(content.evaluate((element, token) => {
+        const tokens = (element.textContent ?? "").match(/(?<![A-Za-z0-9_-])turn_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/g) ?? [];
+        return tokens.length === 1 && tokens[0] === token;
+      }, turnToken), signal));
+    }
+    const observed = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(
+      content.evaluate(readChatGptUserMessage, this.config?.appName), signal,
+    ));
+    return observed !== undefined && this.promptTextEquivalent(
+      submitted.replace(/\r\n?/g, "\n"), observed.text.replace(/\r\n?/g, "\n"),
+    );
   }
 
   private async attachedPromptText(page: Page, abortSignal?: AbortSignal): Promise<string> {
@@ -4095,12 +4154,6 @@ export class ChatGptBrowserWorker {
         await this.assertPromptAttached(page, prompt, abortSignal);
         return;
       }
-      if (requireThink) {
-        const composer = await this.activeComposer(page, 30_000, abortSignal);
-        composerMutationStarted = true;
-        await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
-        await setChatGptThinkMode(composer, true, captureDiagnostic, abortSignal);
-      }
       // A retained tab preserves history, but ChatGPT can require the plugin on each new
       // message. Reuse an existing selected pill only when selectConnector verifies it here.
       const selectedComposer = await this.selectConnector(
@@ -4114,12 +4167,9 @@ export class ChatGptBrowserWorker {
       // attachment owns the selected pill and prompt text as one transaction.
       composerMutationStarted = true;
       if (requireThink) {
-        const controls = chatGptThinkButtons(selectedComposer);
-        if (await controls.count() !== 1 || await controls.first().getAttribute("aria-pressed", {
-          signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
-        }) !== "true") {
-          throw new Error("ChatGPT connector selection did not preserve Think mode");
-        }
+        // Selecting a plugin resets Think on Free accounts. Select it first, then
+        // enable Think and verify that the selected plugin survives the toggle.
+        await setChatGptThinkMode(selectedComposer, true, captureDiagnostic, abortSignal);
       }
       await selectedComposer.focus({ signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
       await selectedComposer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, {
@@ -5944,7 +5994,7 @@ export class ChatGptBrowserWorker {
         finalPrompt = multipartFinalPrompt;
       }
 
-      let submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, acknowledgedStages);
+      let submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, acknowledgedStages, prepared.turnToken);
       let catalogRefreshAvailable = mode.localTools && !reuseConversation && !prepared.multipart;
       const connectorAttemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 };
       for (;;) {
@@ -6000,7 +6050,7 @@ export class ChatGptBrowserWorker {
                 trackUsage,
                 turn.modelFamily,
               );
-              submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt);
+              submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, [], prepared.turnToken);
             },
           );
           await diagnostics.capture(page, "connector-catalog-refreshed");

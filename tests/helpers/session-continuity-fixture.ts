@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../../src/adapters/chatgpt-web/browser-worker";
 import { continuityDigest } from "../../src/adapters/chatgpt-web/continuity-binding";
-import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityClaim, type ContinuityLease } from "../../src/adapters/chatgpt-web/continuity-contract";
+import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityClaim, type ContinuityLease, type ContinuityLauncherInstance } from "../../src/adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "../../src/adapters/chatgpt-web/continuity-errors";
 import { ContinuityRegistrationStore } from "../../src/adapters/chatgpt-web/continuity-registration";
 import { chatGptWebExecutionNamespace, createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./chatgpt-web-adapter";
@@ -84,7 +84,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       () => measureRuntimeOperation("fixture.prepare", () => createFixture(...args)));
   }
 
-  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean } = {}) {
+  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance } = {}) {
     const profileContext = runtimePerformanceContext();
     const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
     const statePath = join(root, "continuity");
@@ -92,9 +92,9 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       const store = new ContinuityRegistrationStore(statePath); store.initialize(); return store;
     });
     const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
-    const submissions: Array<{ prompt: string; claim: ContinuityClaim; key: string; reused: boolean }> = [];
+    const submissions: Array<{ prompt: string; turnToken?: string; claim: ContinuityClaim; key: string; reused: boolean }> = [];
     // Fixture identity has the protocol shape; it is not evidence of a real Launcher process.
-    const launcherInstance = { pid: process.pid, startIdentity: continuityProcessInstance().startIdentity === "unverified"
+    const launcherInstance = options.launcherInstance ?? { pid: process.pid, startIdentity: continuityProcessInstance().startIdentity === "unverified"
       ? "darwin:Sat Oct 10 00:00:00 2026" : continuityProcessInstance().startIdentity, instanceId: "a".repeat(64) };
     const recoveryHost = { continuityLauncherInstance: launcherInstance, turnTabs: new Map<string, any>(),
       removeTurnTab: (tab: any) => { tab.destroyed = true; recoveryHost.turnTabs.delete(tab.id); } };
@@ -133,10 +133,13 @@ export function createSessionContinuityFixtures(testFilePath: string) {
           }
           const retired = new URL(request.url).pathname.endsWith("retire");
           const preparing = new URL(request.url).pathname.endsWith("prepare");
+          const queriedPage = controls.queryIncludesContinuity && new URL(request.url).pathname.endsWith("query")
+            ? [...pages.values()].find(page => continuityDigest(page.continuity.recovery) === continuityDigest(body.recovery)) : undefined;
           if (retired && controls.retirementCleanup === "destroyed") {
             for (const [key, page] of pages) if (continuityDigest(page.continuity.recovery) === continuityDigest(body.recovery)) pages.delete(key);
           }
-          return Response.json({ ok: true, executionProtocol: 1, recovery: body.recovery, ...(preparing ? { preparationExpected: body.expected } : {}), launcherInstance, hostNoWriter: retired || controls.queryPhase === "missing", state: retired ? "retired" : preparing ? "prepared" : new URL(request.url).pathname.endsWith("query") ? controls.queryPhase : "send-possible", writerRetired: retired, executionIsolated: retired, physicalCleanup: retired ? controls.retirementCleanup : "pending", toolsSettled: false, sendAuthorized: true });
+          return Response.json({ ok: true, executionProtocol: 1, recovery: body.recovery, ...(preparing ? { preparationExpected: body.expected } : {}),
+            ...(queriedPage ? { continuity: queriedPage.continuity } : {}), launcherInstance, hostNoWriter: retired || controls.queryPhase === "missing", state: retired ? "retired" : preparing ? "prepared" : new URL(request.url).pathname.endsWith("query") ? controls.queryPhase : "send-possible", writerRetired: retired, executionIsolated: retired, physicalCleanup: retired ? controls.retirementCleanup : "pending", toolsSettled: false, sendAuthorized: true });
         }
         if (new URL(request.url).pathname === "/v1/turn/continuity" && controls.completionInspection) {
           const record = new ContinuityRecoveryStore(statePath).get(continuityDigest(threadId));
@@ -166,7 +169,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
     })));
     const descriptorPath = join(root, "launcher.json");
     const descriptor = {
-      version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development", pid: process.pid,
+      version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "development", pid: launcherInstance.pid,
       launcherInstance,
       features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
       control: { endpoint: `http://127.0.0.1:${server.port}`, token: "a".repeat(43) },
@@ -217,6 +220,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       command: "fixture-command-not-executed-by-this-test",
       sourceArguments: undefined as Record<string, unknown> | undefined,
       queryPhase: "send-possible" as "send-possible" | "prepared" | "missing",
+      queryIncludesContinuity: false,
       loseStartAcknowledgementOnce: false,
       failHandoffSettlement: false,
       endFailure: false, deferCompletion: false, safeToken: "", started: false,
@@ -336,7 +340,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
       if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
       expect(compiled.multipart).toBeUndefined();
-      submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
+      submissions.push({ prompt: compiled.text, turnToken: compiled.turnToken, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
       await turn.onSendActivated?.();
       if (turn.nativeConnector) {
         await turn.onSubmitted?.();
@@ -369,7 +373,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         controls.releaseDeferredCompletion = undefined;
       }
       if (controls.invokeSourceTools) {
-        const token = compiled.text.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)?.[1];
+        const token = compiled.turnToken;
         expect(token).toBeDefined();
         const calls = sourceTools(token!);
         void calls.catch(() => {});
@@ -390,7 +394,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       const answer = controls.invokeSourceTools ? "Stopped at the accepted tool boundary." : `Completed response ${submissions.length}.`;
       let completionCandidate = { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 };
       if (controls.acknowledgePendingUpdate) {
-        const token = compiled.text.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+        const token = compiled.turnToken!;
         const state = broker.taskUpdateState(token);
         expect(state).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 0, driverGeneration: 1 });
         const reply = await callTurnBroker<{ taskUpdate: { deliveryId: string; throughRevision: number; updates: unknown[] } }>(provider.chatgptWeb!.brokerSocketPath!, {

@@ -1267,6 +1267,7 @@ export async function responseRequest(
     // v1 installs the bounded user-message output, whereas v2 retains the original source.
     // Authenticate both exact producer-defined representations, never arbitrary rewrites.
     const v1Source = extractChatGptCompactV1SourceRevision(parsed, summary);
+
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
   if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {

@@ -37,7 +37,7 @@ function repair6SourceHelper(f: ReturnType<typeof httpFixture>, boundary: "respo
         return this.sendAttachedPrompt({ isClosed: () => true }, {});
       }
       await turn.onSubmitted();
-      const token = compiled.text.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)[1];
+      const token = compiled.turnToken;
       const claim = await callTurnBroker(${JSON.stringify(f.provider.chatgptWeb!.brokerSocketPath)}, { method: "claim", token });
       const result = callTurnBroker(${JSON.stringify(f.provider.chatgptWeb!.brokerSocketPath)}, {
         method: "invoke", bindingId: claim.bindingId, registryGeneration: claim.environment.registryGeneration,

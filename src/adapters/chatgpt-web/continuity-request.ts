@@ -1,9 +1,10 @@
 import { isReadableCompactionSummaryText } from "../../responses/compaction";
+import { parseRequest } from "../../responses/parser";
 import { chatGptCurrentInstructionRevision } from "./environment";
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
-import { acquireContinuityStorageLock, continuityProcessInstance, continuityProcessInstanceStatus, type RecoveryThreadRecord } from "./continuity-recovery-store";
+import { acquireContinuityStorageLock, continuityProcessInstance, continuityProcessInstanceStatus, type RecoveryThreadRecord, type RecoveryWorkRecord } from "./continuity-recovery-store";
 import { recoveryContext, recoveryDigest, recoveryIdentity, retireRecoveryWriter, forgetRecoveryPage, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import { join, resolve } from "node:path";
@@ -18,6 +19,7 @@ import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { canonicalJson } from "./canonical-json";
 import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, continuityAcceptedContextCandidate, continuityContextCandidate, continuityRecoveredContextCandidate } from "./context-candidate-mapping";
+import { contextSourceParserModel } from "./context-source-parser";
 import { CompactionSourceCoverage } from "./compaction-context";
 import { createContextSnapshot } from "./context-snapshot";
 import type { ChatGptBrowserWorker } from "./browser-worker";
@@ -197,6 +199,71 @@ function checkpointResumeInput(
     throw continuityError("continuity_source_unproven", "The accepted ordinary answer is no longer available for replay.");
   }
   return { input, instructionPrevious, allowRetainedSourceInstructionPayload: true, finalReplaySource: source };
+}
+
+/** A new task needs the committed boundary's identity, not the lost source's replay body. */
+function recoveredCheckpointNewInstruction(
+  parsed: CodexParsedRequest, bindings: ContinuityBindings, binding: ContinuityBinding,
+  checkpoint: ContinuityCheckpointCommit | undefined, proof: ReturnType<typeof continuityCheckpoint>,
+): { suffix: unknown[]; instructionPrevious: ChatGptContinuityInstructionPrevious } | undefined {
+  if (!checkpoint || checkpoint.sourceInstructionReplay) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const instruction = chatGptCurrentInstructionRevision(parsed);
+  const record = bindings.recoveryStore.get(binding.thread);
+  const matches = Object.values(record?.checkpoints ?? {}).filter(value => value.targetHistoryRevision === binding.revision
+    && value.sourceHistoryRevision === checkpoint.sourceRevision && value.summaryDigest === proof.digest);
+  const committed = matches.length === 1 ? matches[0] : undefined;
+  const source = committed && record?.works[committed.sourceLogicalWorkId];
+  if (!record || !committed || !source || proof.index < 0 || checkpoint.revision !== binding.revision
+    || continuityDigest(checkpoint.summary) !== proof.digest || record.historyRevision !== binding.revision
+    || record.scope !== binding.scope || parsed._continuityScope !== binding.scope
+    || !identity.threadId || record.thread !== continuityDigest(identity.threadId)
+    || record.owner.id !== binding.owner || record.owner.id !== bindings.owner || record.epoch !== binding.epoch
+    || record.currentWorkId !== `compaction:${committed.compactionTargetId}`
+    || record.lineages[source.workLineageId]?.headLogicalWorkId !== source.logicalWorkId
+    || source.instructionIdentity !== committed.sourceIdentity || source.acceptedTaskRevision !== committed.acceptedTaskRevision
+    || !binding.lease?.recovery || !sameContinuityRecoveryIdentity(binding.lease.recovery,
+      recoveryIdentity(record, bindings.recoveryStore.installationId()))
+    || !instruction || (instruction.turnId !== undefined && instruction.turnId !== identity.turnId)
+    || chatGptCurrentInstructionIndex(parsed) <= proof.index || !hasInitialChatGptTurnInstruction(parsed)
+    || Object.values(record.works).some(work => work.purpose === "ordinary"
+      && work.instructionIdentity === continuityInstructionIdentity(parsed))) {
+    throw continuityError("continuity_source_unproven", "The new instruction has no exact current committed checkpoint boundary.");
+  }
+  // Compare only request-carried producer bytes. This read-only projection grants no
+  // writer and does not fill the identity-only source with invented instruction text.
+  const raw = parsed._rawBody as { input: unknown[] };
+  const prefixBody = { ...raw, input: raw.input.slice(0, proof.index + 1) };
+  const prefix = { ...parsed, _compactionRequest: true, _rawBody: prefixBody,
+    context: parseRequest({ ...prefixBody, model: contextSourceParserModel(parsed) }).context };
+  const carried = requestCarriedChatGptInstructionRevision(prefix, source.nativeTurnId);
+  if (carried && !committed.representationDigests.includes(continuitySourceRepresentationDigest(prefix, carried))) {
+    throw continuityError("continuity_source_unproven", "The checkpoint producer conflicts with its accepted source.");
+  }
+  const summaryTurn = (raw.input[proof.index] as { internal_chat_message_metadata_passthrough?: { turn_id?: unknown } })
+    .internal_chat_message_metadata_passthrough?.turn_id;
+  if (summaryTurn !== undefined && summaryTurn !== source.nativeTurnId && summaryTurn !== checkpoint.sourceInstruction?.turnId
+    && summaryTurn !== committed.continuation.nativeTurnId && summaryTurn !== identity.turnId) {
+    throw continuityError("continuity_source_unproven", "The checkpoint representation belongs to a different native source.");
+  }
+  for (const value of (prefix._rawBody as { input: unknown[] }).input) {
+    const sibling = continuityCheckpointSiblingProof(prefix, value);
+    if (sibling?.identity && committed.representationDigests.includes(sibling.identity)
+      && !committed.representationDigests.includes(sibling.representation)) {
+      throw continuityError("continuity_source_unproven", "The checkpoint sibling conflicts with its accepted source.");
+    }
+  }
+  const sourceIndex = (prefix._rawBody as { input: unknown[] }).input.findLastIndex(value => hasNativeChatGptInstruction(prefix, [value]));
+  const siblings = continuityCheckpointSiblings(prefix, source.instructionPrevious, sourceIndex);
+  if (committed.representationDigests.includes(CONTINUITY_CHECKPOINT_SIBLING_PROOF)
+    && !committed.representationDigests.includes(continuityCheckpointSiblingGroup(siblings))) {
+    throw continuityError("continuity_source_unproven", "The checkpoint sibling group differs from its accepted source.");
+  }
+  const instructionPrevious = { instructionIdentity: source.instructionIdentity, nativeTurnId: source.nativeTurnId,
+    checkpointDigest: proof.digest };
+  const suffix = continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
+  if (!hasNativeChatGptInstruction(parsed, suffix)) throw continuityError("continuity_source_unproven");
+  return { suffix, instructionPrevious };
 }
 
 function assertCheckpointSourceReplay(parsed: CodexParsedRequest, identity: ReturnType<typeof extractChatGptTurnIdentity>, checkpoint?: ContinuityCheckpointCommit): void {
@@ -561,6 +628,7 @@ async function prepareContinuityRequestUnlocked(
     .flatMap(work => work.attempts.map(attempt => attempt.epoch))) : 0;
   parsed._continuityEpoch = durable?.epoch ?? 0;
   assertContinuityStoppedReceipt(parsed);
+  let continuedDelegationSource: RecoveryWorkRecord | undefined;
   if (parsed._compactionRequest) {
     const retained = binding && durable ? {
       executionKey: binding.executionKey, owner: binding.owner, epoch: binding.epoch,
@@ -571,6 +639,10 @@ async function prepareContinuityRequestUnlocked(
     const { prepareRecoveryCompaction, recoveryCompactionTarget } = await import("./continuity-recovery-compaction");
     const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     if (prepared) return prepared;
+    const target = recoveryCompactionTarget(parsed);
+    if (target?.source.allowRetainedSourceFallback && target.sourceRevision.instructionEnvelope?.role === "tool_result") {
+      continuedDelegationSource = target.source;
+    }
     // Retained-source preview yields while reading page usage and source bounds.
     // Its old healthy decision cannot survive a loss callback or a new writer.
     // Recheck here, after the async return, before entering synchronous retained routing.
@@ -726,7 +798,14 @@ async function prepareContinuityRequestUnlocked(
         : chatGptCompactionSourceExecutionKey(parsed);
     } catch { /* A missing or malformed source is not a retained-page creation authority. */ }
     const source = sourceExecutionKey ? chatGptTurnSessions.find(sourceExecutionKey) : undefined;
-    if (!candidate || `${namespace}:${candidate}` !== (binding.logicalExecutionKey ?? sourceExecutionKey) || !source
+    // A consumed delegation checkpoint binds the original source instruction to a new
+    // native consumer turn. Its proven work relation identifies the current execution.
+    const matchesContinuedDelegation = continuedDelegationSource
+      && binding.recovery?.logicalWorkId === continuedDelegationSource.logicalWorkId
+      && source?.nativeTurnId === continuedDelegationSource.nativeTurnId
+      && source?.acceptedContinuityInstructionIdentity() === continuedDelegationSource.instructionIdentity;
+    if (((!candidate || `${namespace}:${candidate}` !== (binding.logicalExecutionKey ?? sourceExecutionKey))
+      && !matchesContinuedDelegation) || !source
       || source !== chatGptTurnSessions.findConversationHead(conversationKey)
       || source.supersededError || (binding.state === "compacting" && binding.compactionKey !== executionKey)) {
       if (config.toolAuthorityMode === "delegated" && source && source.taskRevision() === 0) {
@@ -802,6 +881,7 @@ async function prepareContinuityRequestUnlocked(
         binding!,
         selectedCheckpoint,
         checkpointProof,
+        recoveredCheckpointNewInstruction(parsed, bindings, binding!, selectedCheckpoint, checkpointProof),
       ));
       if (allowRetainedSourceInstructionPayload) {
         if (!checkpointSelection || checkpointSelection.checkpoint.revision !== revision) {

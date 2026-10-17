@@ -1,15 +1,17 @@
 import { createHash } from "node:crypto";
 import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest } from "../../types";
-import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
+import { extractChatGptTurnIdentity, requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
 import { continuityError } from "./continuity-errors";
 import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest, findContinuityRecoveryRecord, selectContinuityCheckpoint } from "./continuity-binding";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
+import type { RecoveryThreadRecord, RecoveryWorkRecord } from "./continuity-recovery-store";
 
 interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
   source: ChatGptTurnUserRevision;
+  sourceWasDelegation: boolean;
 }
 
 // Evidence of a checkpoint actually returned by this daemon, not authority inferred from text
@@ -19,7 +21,7 @@ const MAX_CHECKPOINTS = 256;
 const reservations = new Set<string>();
 // Missing instruction content is never reconstructed from a digest. This identity-only
 // object supports recognition; the recovery caller compiles the actual current context.
-const durableSources = new WeakMap<CodexParsedRequest, { commitId: string; workId: string; source: ChatGptTurnUserRevision }>();
+const durableSources = new WeakMap<CodexParsedRequest, { commitId: string; workId: string; identityOnly: boolean; source: ChatGptTurnUserRevision }>();
 // Like instruction selection, this scan belongs to one parsed input. Rebuilt input
 // has a new identity. Cache only its shape, never durable source or writer authority.
 const checkpointPresence = new WeakMap<CodexParsedRequest, { input: unknown[]; length: number; present: boolean }>();
@@ -37,7 +39,33 @@ function hasCarriedCheckpoint(parsed: CodexParsedRequest): boolean {
 function durableContinuation(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
   if (!parsed._continuityScope || !identity.threadId || !identity.turnId) return undefined;
   const record = findContinuityRecoveryRecord(continuityDigest(identity.threadId), parsed._continuityScope, parsed._continuityStateDirectory);
-  return record ? selectRecoveryContinuation(parsed, record, identity) : undefined;
+  if (!record) return undefined;
+  const selected = selectRecoveryContinuation(parsed, record, identity);
+  if (!selected) return undefined;
+  let sourceWork = record.works[selected.checkpoint.sourceLogicalWorkId]!;
+  if (selected.checkpoint.representationDigests.includes(CONTINUITY_DELEGATION_SOURCE)) {
+    sourceWork = originalDelegationWork(record, sourceWork, selected.checkpoint.sourceIdentity);
+  }
+  return { ...selected, sourceWork };
+}
+
+function originalDelegationWork(record: RecoveryThreadRecord, source: RecoveryWorkRecord, identity: string): RecoveryWorkRecord {
+  const seen = new Set<string>();
+  while (source.allowRetainedSourceFallback) {
+    if (seen.has(source.logicalWorkId)) throw continuityError("continuity_source_unproven");
+    seen.add(source.logicalWorkId);
+    const previous = source.predecessorLogicalWorkId ? record.works[source.predecessorLogicalWorkId] : undefined;
+    if (!previous || previous.purpose !== "ordinary" || previous.workLineageId !== source.workLineageId
+      || previous.instructionIdentity !== identity || source.instructionIdentity !== identity
+      || previous.workPayloadDigest !== source.workPayloadDigest || previous.acceptedTaskRevision !== source.acceptedTaskRevision
+      || !Object.values(record.checkpoints).some(checkpoint => checkpoint.sourceLogicalWorkId === previous.logicalWorkId
+        && checkpoint.sourceIdentity === identity && checkpoint.workLineageId === source.workLineageId
+        && checkpoint.continuation.state === "consumed" && checkpoint.continuation.consumerLogicalWorkId === source.logicalWorkId)) {
+      throw continuityError("continuity_source_unproven", "The delegated source has no exact retained predecessor relation.");
+    }
+    source = previous;
+  }
+  return source;
 }
 
 function liveCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
@@ -82,6 +110,27 @@ export function reserveCompactionContinuation(parsed: CodexParsedRequest, identi
   return () => { reservations.delete(key); };
 }
 
+// This digest is metadata in an exact checkpoint relation. It contains no source body and
+// never selects a source by itself, so existing durable records remain readable.
+export const CONTINUITY_DELEGATION_SOURCE = continuityDigest(["continuity-compaction-source-delegation-v1"]);
+export const CONTINUITY_IDENTITY_ONLY_SOURCE = continuityDigest(["continuity-compaction-source-identity-only-v1"]);
+
+export function compactionSourceWasDelegation(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): boolean {
+  const input = (parsed._rawBody as { input?: Array<Record<string, unknown>> } | undefined)?.input;
+  const canonicalId = (id: unknown): unknown => typeof id === "string" ? parsed._chatGptMessageIdAliases?.[id] ?? id : id;
+  if (source.itemId !== undefined && Array.isArray(input)
+    && (!source.instructionEnvelope || source.instructionEnvelope.role === "tool_result")
+    && input.some(item => canonicalId(item?.id) === canonicalId(source.itemId) && item.type === "function_call_output"
+      && item.name === "send_message_to_thread" && item.namespace === "codex_app" && item.call_id === undefined
+      && (item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined)?.turn_id === source.turnId
+      && item.output === source.content)) return true;
+  // Later compactions can omit the synthetic item. Only the exact earlier completed
+  // checkpoint carries its provenance; a later steering instruction keeps its own source.
+  const previous = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
+  return previous?.sourceWasDelegation === true && canonicalId(previous.source.itemId) === canonicalId(source.itemId)
+    && sourceDigest(previous.source) === sourceDigest(source);
+}
+
 export function rememberCompactionContinuation(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
@@ -92,13 +141,18 @@ export function rememberCompactionContinuation(
   if (!key || !parsed._compactionRequest || !summary || !sources[0]) return;
   makeCheckpointRoom(key);
   const prior = checkpoints.get(key);
-  const acceptedSource = structuredClone(sources[0]);
-  const sourceHashes = prior?.summaryHash === digest(summary) ? new Set(prior.sourceHashes) : new Set<string>();
+  const summaryHash = digest(summary);
+  const sameSummary = prior?.summaryHash === summaryHash;
+  const sourceHashes = sameSummary ? new Set(prior.sourceHashes) : new Set<string>();
   for (const source of sources) sourceHashes.add(sourceDigest(source));
+  const sourceWasDelegation = compactionSourceWasDelegation(parsed, sources[0]);
   checkpoints.delete(key);
   checkpoints.set(key, {
-    summaryHash: digest(summary), sourceHashes,
-    source: prior?.summaryHash === digest(summary) ? prior.source : acceptedSource,
+    summaryHash, sourceHashes,
+    // Equal summary text can cover a newer steering instruction. Keep its actual source
+    // and provenance while the accepted producer representations continue to accumulate.
+    source: structuredClone(sources[0]),
+    sourceWasDelegation,
   });
 }
 
@@ -120,14 +174,29 @@ export function isAcceptedCompactionContinuation(
   return acceptedCheckpoint(parsed, identity)?.checkpoint.sourceHashes.has(sourceDigest(source)) === true;
 }
 
+/** Exact checkpoint identity, including a durable placeholder published into live state. */
+export function isDurableCompactionSourceIdentity(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): boolean {
+  const live = liveCheckpoint(parsed, extractChatGptTurnIdentity(parsed));
+  if (live?.checkpoint.sourceInstruction === source
+    && live.checkpoint.sourceRepresentationDigests?.includes(CONTINUITY_IDENTITY_ONLY_SOURCE)) return true;
+  const retained = durableSources.get(parsed);
+  if (retained?.source !== source || !retained.identityOnly) return false;
+  const durable = durableContinuation(parsed, extractChatGptTurnIdentity(parsed));
+  return Boolean(durable && retained.commitId === durable.checkpoint.commitId
+    && retained.workId === durable.work.logicalWorkId);
+}
+
 /** Native compaction may retain only its summary; recover the task solely from our completed handoff. */
 export function recoverCompactionInstruction(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
-): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
+): { source: ChatGptTurnUserRevision; summaryIndex: number; sourceWasDelegation: boolean } | undefined {
   if (parsed._conversationPolicy === "task") {
     const selected = liveCheckpoint(parsed, identity);
-    if (selected?.checkpoint.sourceInstruction) return { source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex };
+    if (selected?.checkpoint.sourceInstruction) return {
+      source: selected.checkpoint.sourceInstruction, summaryIndex: selected.summaryIndex,
+      sourceWasDelegation: selected.checkpoint.sourceRepresentationDigests?.includes(CONTINUITY_DELEGATION_SOURCE) === true,
+    };
     // The durable selector distinguishes an exact carried source from a new
     // instruction. Presence alone cannot reject the source after backend restart.
     if (!hasCarriedCheckpoint(parsed)) return undefined;
@@ -135,17 +204,27 @@ export function recoverCompactionInstruction(
     if (!durable) return undefined;
     const carried = requestCarriedChatGptInstructionRevision(parsed, identity.turnId);
     if (carried && !durable.checkpoint.representationDigests.includes(continuitySourceRepresentationDigest(parsed, carried))) return undefined;
+    const sourceWasDelegation = durable.checkpoint.representationDigests.includes(CONTINUITY_DELEGATION_SOURCE);
     let retained = durableSources.get(parsed);
     if (!retained || retained.commitId !== durable.checkpoint.commitId || retained.workId !== durable.work.logicalWorkId) {
-      retained = { commitId: durable.checkpoint.commitId, workId: durable.work.logicalWorkId,
-        source: carried ?? { itemId: durable.work.instructionIdentity,
-          ...(durable.work.nativeTurnId ? { turnId: durable.work.nativeTurnId } : {}), content: [] } };
+      const carriedId = carried?.itemId ? parsed._chatGptMessageIdAliases?.[carried.itemId] ?? carried.itemId : undefined;
+      const sourceWork = sourceWasDelegation ? durable.sourceWork : durable.work;
+      const hasCarriedSource = Boolean(carried && (!sourceWasDelegation || carriedId === durable.checkpoint.sourceIdentity));
+      retained = { commitId: durable.checkpoint.commitId, workId: durable.work.logicalWorkId, identityOnly: !hasCarriedSource,
+        source: hasCarriedSource ? carried!
+          : { itemId: sourceWasDelegation ? durable.checkpoint.sourceIdentity : sourceWork.instructionIdentity,
+            ...(sourceWork.nativeTurnId ? { turnId: sourceWork.nativeTurnId } : {}), content: [],
+            ...(sourceWasDelegation ? { instructionEnvelope: { role: "tool_result" } } : {}) } };
       durableSources.set(parsed, retained);
     }
-    return { source: retained.source, summaryIndex: durable.summaryIndex };
+    return { source: retained.source, summaryIndex: durable.summaryIndex, sourceWasDelegation };
   }
+
   const accepted = acceptedCheckpoint(parsed, identity);
-  return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;
+  return accepted ? {
+    source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex,
+    sourceWasDelegation: accepted.checkpoint.sourceWasDelegation,
+  } : undefined;
 }
 
 /** A new instruction after compaction keeps its own consumer identity. Only recognize the

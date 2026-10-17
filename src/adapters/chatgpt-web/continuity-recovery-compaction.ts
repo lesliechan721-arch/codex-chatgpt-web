@@ -16,6 +16,8 @@ import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationD
 import { sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityLease } from "./continuity-contract";
 import { chatGptConversationKey } from "./conversation-key";
 import { continuityError } from "./continuity-errors";
+import { compactionSourceWasDelegation, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity } from "./compaction-continuation";
+import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import type { PreparedContinuityRequest } from "./continuity-request";
 import { beginRecoveryAcquisition, beginRecoverySend, evictOptionalRecoveryResults, recoveryCanonicalResults, recoveryContext, recoveryDigest, recoveryFinalReceipt, recoveryIdentity, recoveryResultDigest, settleRecoveryKnownUnsent, settleRecoverySend, type RuntimeRecoverySendReference } from "./continuity-recovery-runtime";
@@ -128,7 +130,33 @@ function currentCompactionResults(parsed: CodexParsedRequest): Record<string, un
   const input = (parsed._rawBody as { input: unknown[] }).input;
   return recoveryCanonicalResults({ ...parsed, _rawBody: { input: input.slice(chatGptCurrentInstructionIndex(parsed) + 1) } });
 }
+function sourceSiblingPrevious(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: RecoveryWorkRecord) {
+  const previous = source.instructionPrevious;
+  if (!previous?.checkpointDigest || source.allowRetainedSourceFallback
+    || extractChatGptCompactionSourceRevision(parsed).turnId !== undefined) return previous;
+  const proof = continuityCheckpoint(parsed);
+  if (proof.index < 0 || proof.digest !== previous.checkpointDigest) return previous;
+  const matches = Object.values(record.checkpoints).filter(checkpoint => checkpoint.summaryDigest === previous.checkpointDigest
+    && checkpoint.targetHistoryRevision === source.attempts[0]?.historyRevision
+    && checkpoint.sourceIdentity === previous.instructionIdentity);
+  const checkpoint = matches.length === 1 ? matches[0] : undefined;
+  const predecessor = checkpoint && record.works[checkpoint.sourceLogicalWorkId];
+  if (!checkpoint || !predecessor || predecessor.instructionIdentity !== previous.instructionIdentity
+    || predecessor.nativeTurnId !== previous.nativeTurnId || predecessor.acceptedTaskRevision !== checkpoint.acceptedTaskRevision
+    || predecessor.workLineageId !== checkpoint.workLineageId || source.instructionIdentity === checkpoint.sourceIdentity
+    || proof.index >= chatGptCurrentInstructionIndex(parsed)) {
+    return previous;
+  }
+  // The accepted work records this boundary. A matching request summary alone
+  // cannot authorize an unowned native window or hide additional task siblings.
+  return { ...previous, trustedLowerBound: proof.index };
+}
 function sourcePayloadDigest(parsed: CodexParsedRequest, source: RecoveryWorkRecord): string {
+  if (source.allowRetainedSourceFallback && isDurableCompactionSourceIdentity(parsed, extractChatGptCompactionSourceRevision(parsed))) {
+    // Hash only the actual request-carried producer projection. Removing recognition
+    // from this read-only projection prevents the identity placeholder becoming body.
+    return chatGptContinuityInstructionPayloadDigest({ ...parsed, _continuityScope: undefined });
+  }
   return chatGptContinuityInstructionPayloadDigest(parsed, source.instructionPrevious, source.allowRetainedSourceFallback ?? false);
 }
 function assertEndedManualResults(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: RecoveryWorkRecord): void {
@@ -140,9 +168,13 @@ function assertEndedManualResults(parsed: CodexParsedRequest, record: RecoveryTh
     }
   }
 }
-function assertSourcePayload(parsed: CodexParsedRequest, source: RecoveryWorkRecord, target?: RecoveryCompactionTarget): void {
+function assertSourcePayload(parsed: CodexParsedRequest, source: RecoveryWorkRecord, record: RecoveryThreadRecord, target?: RecoveryCompactionTarget): void {
   const payload = sourcePayloadDigest(parsed, source);
   if (payload !== source.workPayloadDigest && !target?.representationDigests.includes(sourcePayloadRepresentation(payload))) {
+    const revision = extractChatGptCompactionSourceRevision(parsed);
+    const continuation = continuedDelegation(parsed, record, revision);
+    if (isDurableCompactionSourceIdentity(parsed, revision) && continuation?.work.logicalWorkId === source.logicalWorkId
+      && continuation.checkpoint.representationDigests.includes(sourcePayloadRepresentation(payload))) return;
     throw continuityError("continuity_source_unproven", "The source instruction group conflicts with its first accepted payload.");
   }
 }
@@ -195,7 +227,7 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
     || source.acceptedTaskRevision !== target.acceptedTaskRevision) {
     throw continuityError("continuity_source_unproven", "The compaction target has no accepted source work.");
   }
-  assertSourcePayload(parsed, source, target);
+  assertSourcePayload(parsed, source, record, target);
   const requestContextSource = target.representationDigests.includes(REQUEST_CONTEXT_SOURCE);
   if (requestContextSource && !target.representationDigests.includes(requestContextRepresentation(parsed))) {
     throw continuityError("continuity_source_unproven", "The current context differs from its accepted compaction source.");
@@ -207,7 +239,7 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
       throw continuityError("continuity_source_unproven", "The compaction sibling conflicts with its first accepted source.");
     }
   }
-  const siblings = continuityCheckpointSiblings(parsed, source.instructionPrevious);
+  const siblings = continuityCheckpointSiblings(parsed, sourceSiblingPrevious(parsed, record, source));
   if (siblings.length && !target.representationDigests.includes(continuityCheckpointSiblingGroup(siblings))) {
     throw continuityError("continuity_source_unproven", "The compaction sibling group differs from its first accepted source.");
   }
@@ -240,9 +272,25 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
   return { target, source, sourceRevision, ...(checkpoint ? { checkpoint } : {}) };
 }
 
+function continuedDelegation(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: ChatGptTurnUserRevision) {
+  const identity = sourceIdentity(parsed, source);
+  if (compactionSourceWasDelegation(parsed, source)) {
+    const continuation = selectRecoveryContinuation(parsed, record, extractChatGptTurnIdentity(parsed));
+    // The exact checkpoint selects its source, or its recorded consumer once consumed.
+    // That execution can keep the original delegated source's different native turn.
+    if (continuation?.checkpoint.sourceIdentity === identity
+      && isAcceptedCompactionContinuation(parsed, extractChatGptTurnIdentity(parsed), source)) {
+      return continuation;
+    }
+  }
+  return undefined;
+}
+
 function selectSource(parsed: CodexParsedRequest, record: RecoveryThreadRecord): RecoveryWorkRecord {
   const source = extractChatGptCompactionSourceRevision(parsed);
   const identity = sourceIdentity(parsed, source);
+  const continuation = continuedDelegation(parsed, record, source);
+  if (continuation) return continuation.work;
   let matching = Object.values(record.works).filter(work => work.purpose === "ordinary"
     && work.instructionIdentity === identity && (!source.turnId || work.nativeTurnId === source.turnId));
   if (matching.length > 1) {
@@ -333,7 +381,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   if (existingTargetId && selection?.target.compactionTargetId !== existingTargetId) return undefined;
   if (!selection) {
     const source = selectSource(parsed, record);
-    assertSourcePayload(parsed, source);
+    assertSourcePayload(parsed, source, record);
     assertEndedManualResults(parsed, record, source);
     const lineage = record.lineages[source.workLineageId];
     const revisions = sourceRevisions(parsed, record);
@@ -358,12 +406,12 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
       return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
         descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
     }
-    const siblings = continuityCheckpointSiblings(parsed, source.instructionPrevious);
+    const siblings = continuityCheckpointSiblings(parsed, sourceSiblingPrevious(parsed, record, source));
     record = registerTarget(store, bindings.registrations.directory, record, {
       sourceLogicalWorkId: source.logicalWorkId, sourceIdentity: sourceIdentity(parsed, sourceRevision),
       acceptedTaskRevision: source.acceptedTaskRevision, sourceHistoryRevision: revisions[0],
       sourceToolBatchHeadSequence: sequence, representationDigests: [continuitySourceRepresentationDigest(parsed, sourceRevision),
-        sourcePayloadRepresentation(source.workPayloadDigest), CONTINUITY_CHECKPOINT_SIBLING_PROOF,
+        sourcePayloadRepresentation(source.workPayloadDigest), sourcePayloadRepresentation(sourcePayloadDigest(parsed, source)), CONTINUITY_CHECKPOINT_SIBLING_PROOF,
         ...(freshPageCompactions.has(parsed) ? [REQUEST_CONTEXT_SOURCE, requestContextRepresentation(parsed)] : []),
         continuityCheckpointSiblingGroup(siblings), ...siblings.flatMap(proof => proof.identity ? [proof.identity, proof.representation] : [proof.representation])],
       checkpointBytes: MAX_CONTINUITY_RECOVERY_ITEM_BYTES,
@@ -441,30 +489,37 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   if (healthy && !endedManual) {
     const source = observed.executionKey ? chatGptTurnSessions.find(observed.executionKey) : undefined;
     const coverage = source?.runtime.compactionSourceCoverage;
-    if (!source || !coverage) return undefined;
-    await source.runtime.syncContextUsage?.();
-    // A concurrent commit can reclaim the source coverage during the usage wait.
-    // Let the caller revalidate the original identity before reading that old source.
-    const afterUsage = store.get(record.thread);
-    if (afterUsage?.historyRevision !== record.historyRevision || afterUsage.currentWorkId !== record.currentWorkId) return undefined;
-    // The ordinary final can win while this active-source preview waits. Keep
-    // that result on the retained path; this request did not start an ended turn.
-    if (isChatGptWebZeroRiskBackendModel(parsed.modelId)
-      && afterUsage.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
-    const preview = previewRetainedCompactionSource(parsed, source);
-    const snapshot = preview.snapshot;
-    const pageTokens = Math.max(observed.retainedPageTokens ?? 0, preview.coverage.pageTokenReserve());
-    const available = compactionAvailableTokens(parsed, capabilities, pageTokens);
-    try {
-      const control = structuredCompactionHandoffInstruction({ token: `control_${"0".repeat(32)}`,
-        handoffId: `handoff_${"0".repeat(32)}` }, compactPrompt(parsed));
-      const instruction = compactionSourceInstruction(snapshot, control, available);
-      await assertCompactionReadable(snapshot, available - Math.max(8_192, estimateTokens(instruction)));
-      return undefined;
-    } catch (error) {
-      if ((error as { code?: string }).code !== "continuity_input_limit") throw error;
-      // An otherwise healthy page may fit ordinary work but lack the independent
-      // checkpoint reading and summary allowance. Admit the actual cold plan below.
+    // A recovered checkpoint retires its ordinary writer and clears the live key.
+    // Only its exact identity-only delegation relation can use recovery again here.
+    const retiredDelegation = !observed.executionKey
+      && isDurableCompactionSourceIdentity(parsed, selection.sourceRevision)
+      && continuedDelegation(parsed, record, selection.sourceRevision)?.work.logicalWorkId === selection.source.logicalWorkId;
+    if ((!source || !coverage) && !retiredDelegation) return undefined;
+    if (source && coverage) {
+      await source.runtime.syncContextUsage?.();
+      // A concurrent commit can reclaim the source coverage during the usage wait.
+      // Let the caller revalidate the original identity before reading that old source.
+      const afterUsage = store.get(record.thread);
+      if (afterUsage?.historyRevision !== record.historyRevision || afterUsage.currentWorkId !== record.currentWorkId) return undefined;
+      // The ordinary final can win while this active-source preview waits. Keep
+      // that result on the retained path; this request did not start an ended turn.
+      if (isChatGptWebZeroRiskBackendModel(parsed.modelId)
+        && afterUsage.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
+      const preview = previewRetainedCompactionSource(parsed, source);
+      const snapshot = preview.snapshot;
+      const pageTokens = Math.max(observed.retainedPageTokens ?? 0, preview.coverage.pageTokenReserve());
+      const available = compactionAvailableTokens(parsed, capabilities, pageTokens);
+      try {
+        const control = structuredCompactionHandoffInstruction({ token: `control_${"0".repeat(32)}`,
+          handoffId: `handoff_${"0".repeat(32)}` }, compactPrompt(parsed));
+        const instruction = compactionSourceInstruction(snapshot, control, available);
+        await assertCompactionReadable(snapshot, available - Math.max(8_192, estimateTokens(instruction)));
+        return undefined;
+      } catch (error) {
+        if ((error as { code?: string }).code !== "continuity_input_limit") throw error;
+        // An otherwise healthy page may fit ordinary work but lack the independent
+        // checkpoint reading and summary allowance. Admit the actual cold plan below.
+      }
     }
   }
   await assertExecutionCompatible?.();
@@ -570,7 +625,15 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     });
   }
   abortSignal?.throwIfAborted();
-  const binding = observed ?? bindings.installRecovered(record, executionKey, continuityCheckpoint(parsed).digest, identity.turnId);
+  // A foreign backend's retired source is not this process's durable admission.
+  // Keep preparation private until runRecoveryCompaction admits the new attempt,
+  // then installRecovered publishes that exact owner/epoch through registration CAS.
+  const binding: ContinuityBinding = observed ?? (record.owner.id === bindings.owner
+    ? bindings.installRecovered(record, executionKey, continuityCheckpoint(parsed).digest, identity.turnId)
+    : { thread: record.thread, scope: record.scope, owner: record.owner.id, epoch: record.epoch,
+      initialExecutionKey: executionKey, executionKey, initialNativeTurnId: identity.turnId,
+      state: "creating", revision: record.historyRevision, lastUsedAt: Date.now(),
+      revisionDigests: new Map(), revisions: new Map(), checkpoints: new Map(), ordinaryReplayTombstones: new Map() });
   const prepared: PreparedContinuityRequest = { bindings, binding, descriptor, executionKey,
     conversationKey: chatGptConversationKey(parsed, namespace)!, nativeThreadId: identity.threadId,
     revision: selection.target.sourceHistoryRevision, sourceExecutionKey: observed?.executionKey };
@@ -619,6 +682,8 @@ function representations(parsed: CodexParsedRequest, selection: CompactionSelect
     ...[selection.sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]
       .map(source => continuitySourceRepresentationDigest(parsed, source)),
     ...payloads,
+    ...(compactionSourceWasDelegation(parsed, selection.sourceRevision) ? [CONTINUITY_DELEGATION_SOURCE] : []),
+    ...(isDurableCompactionSourceIdentity(parsed, selection.sourceRevision) ? [CONTINUITY_IDENTITY_ONLY_SOURCE] : []),
   ])];
 }
 
@@ -856,7 +921,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       && prepared.binding.epoch === record.epoch) {
       // A durable commit may outlive local publication. Repair only its still-current head.
       prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, plan.checkpoint!, result,
-          plan.sourceRevision, representations(parsed, plan, result), plan.preserveFinalResponse, plan.sourceExecutionKey);
+          plan.sourceRevision, plan.checkpoint!.representationDigests, plan.preserveFinalResponse, plan.sourceExecutionKey);
     }
     return result;
   }
@@ -904,7 +969,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
         const checkpoint = commitRecoveryCompaction(parsed, prepared, plan, logicalWorkId,
           plan.acceptedHandoff, plan.preserveFinalResponse);
         prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, checkpoint, plan.acceptedHandoff,
-          plan.sourceRevision, representations(parsed, plan, plan.acceptedHandoff), plan.preserveFinalResponse, plan.sourceExecutionKey);
+          plan.sourceRevision, checkpoint.representationDigests, plan.preserveFinalResponse, plan.sourceExecutionKey);
         return plan.acceptedHandoff;
       }
       const priorBudget = oldRecord.works[logicalWorkId]?.retryBudget;
@@ -1077,7 +1142,7 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       signal.throwIfAborted(); check();
       const checkpoint = commitRecoveryCompaction(parsed, prepared, plan, logicalWorkId, summary, plan.preserveFinalResponse);
       prepared.bindings.installRecoveryCheckpoint(prepared.binding, prepared.executionKey, checkpoint, summary,
-        plan.sourceRevision, representations(parsed, plan, summary), plan.preserveFinalResponse, plan.sourceExecutionKey);
+        plan.sourceRevision, checkpoint.representationDigests, plan.preserveFinalResponse, plan.sourceExecutionKey);
       const pageCost = await compactionSourcePageCost(owner, plan.sourceSnapshot!);
       prepared.binding.retainedPageTokens = pageCost === undefined ? undefined : pageCost + estimateTokens(summary);
       onProgress?.();

@@ -278,25 +278,130 @@ for (const format of ["v1", "v2"] as const) test(`${format} pre-turn compaction 
   expect(starts).toBe(2);
 });
 
-test("v1 goal compaction authorizes the human instruction that native Codex retains", async () => {
+for (const format of ["v1", "v2"] as const) test(`${format} native continuation preserves a dropped delegation past an interrupted human turn`, async () => {
   const config = defaultConfig("full");
-  const metadata = { thread_id: "thread_goal_compaction", turn_id: "turn_goal_continuation" };
+  const metadata = { thread_id: `thread_dropped_delegation_${format}`, turn_id: "turn_after_delegation" };
+  const previous = { type: "message", role: "user", id: "msg_interrupted_human", content: [{ type: "input_text", text: "Earlier human task" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_interrupted_human" } };
+  const aborted = { type: "message", role: "user", id: "msg_human_abort",
+    content: "<turn_aborted>The user interrupted this turn.</turn_aborted>",
+    internal_chat_message_metadata_passthrough: previous.internal_chat_message_metadata_passthrough };
+  const delegation = { type: "function_call_output", id: "fco_delegated_task", name: "send_message_to_thread",
+    namespace: "codex_app", output: "<codex_delegation><source_thread_id>source_thread</source_thread_id><input>Finish the new delegated task.</input></codex_delegation>",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_delegated_task" } };
+  const original = { model, stream: false, input: [previous, aborted, delegation],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
+  const compact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify(original),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...original.input, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
+  expect(compact.status).toBe(200);
+  const compacted = await compact.json() as { output: unknown[] };
+  const installed = format === "v1" ? compacted.output : [previous, aborted, ...compacted.output];
+  let starts = 0;
+  const send = (input: unknown[]) => responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", body: JSON.stringify({ ...original, input }),
+  }), config, () => ({ name: "restored-delegated-task", async runTurn(parsed, _incoming, emit) {
+    starts += 1;
+    expect(extractChatGptTurnUserRevision(parsed)).toBe(delegation.output);
+    emit({ type: "text_delta", text: "Delegated task continued", phase: "final_answer" });
+    emit({ type: "done", stopReason: "stop", endTurn: true });
+  } }));
+  const continued = await send(installed);
+  expect(continued.status).toBe(200);
+  expect((await continued.json()).status).toBe("completed");
+  // A long-running delegated task can compact again after its synthetic source was dropped.
+  const recompact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify({ ...original, input: installed }),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...installed, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
+  expect(recompact.status).toBe(200);
+  const recompacted = await recompact.json() as { output: unknown[] };
+  const reinstalled = format === "v1" ? recompacted.output : [previous, aborted, ...recompacted.output];
+  const continuedAgain = await send(reinstalled);
+  expect(continuedAgain.status).toBe(200);
+  expect((await continuedAgain.json()).status).toBe("completed");
+  // Recovery of a different task never revives an explicitly interrupted delegation.
+  expect((await send([...reinstalled, { ...aborted, id: "msg_delegation_abort",
+    internal_chat_message_metadata_passthrough: delegation.internal_chat_message_metadata_passthrough }])).status).toBe(400);
+  expect(starts).toBe(2);
+});
+
+for (const format of ["v1", "v2"] as const) for (const addSteering of [false, true]) {
+  test(`${format} equal-summary recompaction keeps ${addSteering ? "new user steering" : "the same delegated instruction"} as its source`, async () => {
+    const config = defaultConfig("full");
+    const metadata = { thread_id: `thread_equal_summary_${format}_${addSteering}`, turn_id: "turn_current" };
+    const previous = { type: "message", role: "user", id: "msg_older_human", content: [{ type: "input_text", text: "Earlier human task." }],
+      internal_chat_message_metadata_passthrough: { turn_id: "turn_previous" } };
+    const delegation = { type: "function_call_output", id: "fco_equal_summary_delegation", name: "send_message_to_thread", namespace: "codex_app",
+      output: "<codex_delegation><source_thread_id>source_thread</source_thread_id><input>Finish the delegated task.</input></codex_delegation>",
+      internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id } };
+    const steering = { type: "message", role: "user", id: "msg_equal_summary_steering",
+      content: [{ type: "input_text", text: "Use the newly requested task scope." }],
+      internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id } };
+    const original = { model, stream: false, client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
+    const compact = (input: unknown[]) => format === "v1"
+      ? compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+        method: "POST", body: JSON.stringify({ ...original, input }),
+      }), config, compactionAdapterFactory())
+      : responseRequest(new Request("http://127.0.0.1/v1/responses", {
+        method: "POST", body: JSON.stringify({ ...original, input: [...input, { type: "compaction_trigger" }] }),
+      }), config, compactionAdapterFactory());
+    const first = await compact([previous, delegation]);
+    expect(first.status).toBe(200);
+    const firstOutput = (await first.json()).output as unknown[];
+    const installed = format === "v1" ? firstOutput : [previous, ...firstOutput];
+    const second = await compact([...installed, ...(addSteering ? [steering] : [])]);
+    expect(second.status).toBe(200);
+    const secondOutput = (await second.json()).output as unknown[];
+    const reinstalled = format === "v1" ? secondOutput : [previous, ...(addSteering ? [steering] : []), ...secondOutput];
+    const resumed = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: reinstalled }),
+    }), config, () => ({ name: "equal-summary-continuation", async runTurn(parsed, _incoming, emit) {
+      expect(extractChatGptTurnUserRevision(parsed)).toEqual(addSteering ? steering.content : delegation.output);
+      emit({ type: "text_delta", text: "Continued the accepted instruction.", phase: "final_answer" });
+      emit({ type: "done", stopReason: "stop", endTurn: true });
+    } }));
+    expect(resumed.status).toBe(200);
+    expect((await resumed.json()).status).toBe("completed");
+  });
+}
+
+for (const format of ["v1", "v2"] as const) test(`${format} goal compaction authorizes the human instruction past a standalone AGENTS preamble`, async () => {
+  const config = defaultConfig("full");
+  const metadata = { thread_id: `thread_goal_compaction_${format}`, turn_id: "turn_goal_continuation" };
   const source = { type: "message", role: "user", id: "msg_human",
     content: [{ type: "input_text", text: "Finish the requested work" }],
     internal_chat_message_metadata_passthrough: { turn_id: "turn_human", content_item_kinds: ["user.text"] } };
   const goal = { type: "message", role: "user", id: "msg_goal_context",
     content: [{ type: "input_text", text: '<codex_internal_context source="goal">\nContinue the active goal.\n</codex_internal_context>' }],
     internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id, content_item_kinds: ["goal.internal_context"] } };
-  const original = { model, stream: false, input: [source, goal],
+  // Instruction refreshes can be standalone user-role context, without an environment tag.
+  // Native compaction drops these and rebuilds the preamble before the last real user.
+  const instructions = { type: "message", role: "user", id: "msg_agents_refresh",
+    content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>Use the repository rules.</INSTRUCTIONS>" }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn_previous_goal", content_item_kinds: ["agents_md.instructions"] } };
+  const original = { model, stream: false, input: [source, instructions, goal],
     client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) } };
-  const compact = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
-    method: "POST", body: JSON.stringify(original),
-  }), config, compactionAdapterFactory());
+  const compact = format === "v1"
+    ? await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
+      method: "POST", body: JSON.stringify(original),
+    }), config, compactionAdapterFactory())
+    : await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST", body: JSON.stringify({ ...original, input: [...original.input, { type: "compaction_trigger" }] }),
+    }), config, compactionAdapterFactory());
   expect(compact.status).toBe(200);
   const compacted = await compact.json() as { output: Array<{ id?: string }> };
   // Codex 0.152.1 process_annotated_compacted_history drops internal model context.
   // The fixture preserves the wire behavior even if our v1 producer accidentally returns it.
-  const installed = compacted.output.filter(item => item.id !== goal.id);
+  const retained = compacted.output.filter(item => item.id !== goal.id && item.id !== instructions.id);
+  const installed = format === "v1" ? retained : [source, ...retained];
   const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
     method: "POST", body: JSON.stringify({ ...original, input: installed }),
   }), config, () => ({ name: "native-goal-continuation", async runTurn(parsed, _incoming, emit) {
@@ -307,6 +412,7 @@ test("v1 goal compaction authorizes the human instruction that native Codex reta
   expect(response.status).toBe(200);
   expect((await response.json() as { status: string }).status).toBe("completed");
   expect(compacted.output).not.toContainEqual(expect.objectContaining({ id: goal.id }));
+  expect(compacted.output).not.toContainEqual(expect.objectContaining({ id: instructions.id }));
 });
 
 test("v1 post-compaction continuation retains the producer's bounded source representation", async () => {

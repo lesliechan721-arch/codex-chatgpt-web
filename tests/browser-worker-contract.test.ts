@@ -2857,7 +2857,7 @@ test("Think waits for its button to mount without typing a command", async () =>
   expect(ui.state.keys).toEqual([]);
 });
 
-test("Think attachment enables Think before fresh connector selection and rechecks retained and Browser-only turns", async () => {
+test("Think attachment enables Think after connector selection and rechecks retained and Browser-only turns", async () => {
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
   for (const [localTools, retained] of [[true, false], [true, true], [false, false]]) {
     const ui = thinkButtonFixture();
@@ -2920,14 +2920,14 @@ test("Think attachment preserves the plugin on first and follow-up messages and 
   }
 });
 
-test("Think attachment does not select a plugin or insert a prompt when its button is unavailable", async () => {
+test("Think attachment clears the selected plugin without inserting a prompt when its button is unavailable", async () => {
   const ui = thinkButtonFixture();
   ui.state.controlCount = 0;
   let insertions = 0;
   let selections = 0;
   const worker = {
     activeComposer: async () => ui.composer,
-    selectConnector: async () => { selections += 1; return ui.composer; },
+    selectConnector: async () => { selections += 1; ui.state.connectors = ["Codex Native2"]; return ui.composer; },
     insertPromptText: async () => { insertions += 1; },
     assertPromptAttached: async () => {},
     clearChatGptComposerState: async () => { ui.state.draft = ""; ui.state.connectors = []; },
@@ -2938,23 +2938,46 @@ test("Think attachment does not select a plugin or insert a prompt when its butt
   expect(ui.state.pressed).toBeFalse();
   expect(ui.state.commands).toEqual([]);
   expect(ui.state.keys).toEqual([]);
-  expect(selections).toBe(0);
+  expect(selections).toBe(1);
+  expect(ui.state.connectors).toEqual([]);
   expect(insertions).toBe(0);
 });
 
-test("Think attachment rolls back when connector selection disables Think", async () => {
+test("Think attachment enables Think after plugin selection resets it, on every message", async () => {
   const ui = thinkButtonFixture();
-  let insertions = 0;
+  const insertions: { pressed: boolean; connectors: string[] }[] = [];
   let cleanup = 0;
   const worker = {
     activeComposer: async () => ui.composer,
-    selectConnector: async () => { ui.state.pressed = false; ui.state.connectors = ["Codex Native4"]; return ui.composer; },
+    selectConnector: async () => { ui.state.pressed = false; ui.state.connectors = ["Codex Native2"]; return ui.composer; },
+    insertPromptText: async () => { insertions.push({ pressed: ui.state.pressed, connectors: [...ui.state.connectors] }); },
+    assertPromptAttached: async () => {},
+    clearChatGptComposerState: async () => { cleanup += 1; ui.state.draft = ""; ui.state.connectors = []; },
+  };
+  const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
+  await attach.call(worker, ui.page, "first task", true, undefined, undefined, false, undefined, false, true);
+  await attach.call(worker, ui.page, "follow-up", true, undefined, undefined, false, undefined, false, true);
+  expect(insertions).toEqual([
+    { pressed: true, connectors: ["Codex Native2"] },
+    { pressed: true, connectors: ["Codex Native2"] },
+  ]);
+  expect(ui.state.clicks).toBe(2);
+  expect(cleanup).toBe(0);
+});
+
+test("Think attachment rolls back if enabling Think removes the selected plugin", async () => {
+  const ui = thinkButtonFixture();
+  let insertions = 0;
+  let cleanup = 0;
+  ui.control.click = async () => { ui.state.pressed = true; ui.state.connectors = []; };
+  const worker = {
+    selectConnector: async () => { ui.state.connectors = ["Codex Native2"]; return ui.composer; },
     insertPromptText: async () => { insertions += 1; },
     clearChatGptComposerState: async () => { cleanup += 1; ui.state.draft = ""; ui.state.connectors = []; },
   };
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
   await expect(attach.call(worker, ui.page, "must not be inserted", true, undefined, undefined, false, undefined, false, true))
-    .rejects.toThrow("did not preserve Think mode");
+    .rejects.toThrow("did not preserve the empty draft and selected connectors");
   expect(insertions).toBe(0);
   expect(cleanup).toBe(1);
 });

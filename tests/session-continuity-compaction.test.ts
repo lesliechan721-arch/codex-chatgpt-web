@@ -1,22 +1,22 @@
-import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessInstanceStatus } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn } from "bun:test";
 import { controlledClock } from "./helpers/controlled-clock";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cancelStructuredCompactionNativeTurn, existingStructuredCompactionRun } from "../src/adapters/chatgpt-web/compaction-handoff";
-import { isAcceptedCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
-import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
+import { cancelStructuredCompactionNativeTurn, existingStructuredCompactionRun, canonicalizeCompactionHandoff, LATEST_USER_PROMPT_MARKER } from "../src/adapters/chatgpt-web/compaction-handoff";
+import { compactionSourceWasDelegation, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
+import { continuityBindingsFor, continuityCheckpoint, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
 import { leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
-import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, extractChatGptCompactV1SourceRevision, extractChatGptCompactionSourceRevision } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
-import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { chatGptContinuityInstructionPayloadDigest, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
-import { COMPACT_PROMPT, encodeCompactionSummary } from "../src/responses/compaction";
+import { buildCompactV1Output, COMPACT_PROMPT, encodeCompactionSummary, extractCompactUserMessages, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { routeChatGptWebRequest } from "../src/server";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
@@ -922,7 +922,7 @@ for (const manual of [false,true]) test(`Round 7: completed foreign tool search 
   f.controls.started = false;
   const pending = f.run(next);
   while (!f.controls.started) await Bun.sleep(1);
-  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.turnToken!;
   const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
     f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
   await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
@@ -1178,7 +1178,7 @@ for (const manual of [false, true]) test(`Round 8: older accepted discovery cann
   f.controls.started = false;
   const pending = f.run(next);
   while (!f.controls.started) await Bun.sleep(1);
-  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.prompt.match(/turn_token (turn_[A-Za-z0-9_-]{32})/)![1]!;
+  const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.turnToken!;
   const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
     f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
   await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
@@ -1308,3 +1308,379 @@ for (const manual of [false, true]) test(`Round 10: cached compact codecs do not
   // A later codec replay can change its wire output, but it cannot enlarge committed evidence.
   expect(JSON.stringify(v1Output)).toContain("Older human text 1.");
 }, 30_000);
+
+for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint preserves the delegated source when native history retains an older human instruction`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  const previous = { type: "message", role: "user", id: "msg-older-human", content: [{ type: "input_text", text: "Earlier human task." }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-older-human" } };
+  const delegation = { type: "function_call_output", id: "fco-current-delegation", name: "send_message_to_thread", namespace: "codex_app",
+    output: "<codex_delegation><source_thread_id>parent-thread</source_thread_id><input>Finish the delegated audit.</input></codex_delegation>",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-delegation" } };
+  const source = f.request("", "turn-delegation", [previous, delegation]);
+  await f.run(source);
+  const active = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(source)}`)!;
+  const call = active.outstanding()[0]!;
+  const compact = f.request("", "turn-checkpoint", [previous, delegation, recordedCall(call),
+    { type: "function_call_output", call_id: call.callId, output: "Completed audit input." }]);
+  compact._compactionRequest = true;
+  const events = await f.run(compact);
+  const summary = events.find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing delegated checkpoint");
+  const installed = format === "v1"
+    ? buildCompactV1Output(extractCompactUserMessages([previous, delegation]), summary.text)
+    : [previous, { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }];
+  f.controls.invokeSourceTools = false;
+  const resumed = f.request("", "turn-checkpoint", installed);
+  bindContinuityRequestScope(resumed, chatGptWebExecutionNamespace(f.provider));
+  expect(extractChatGptTurnUserRevision(resumed)).toBe(delegation.output);
+  expect(chatGptCurrentInstructionRevision(resumed)?.itemId).toBe(delegation.id);
+  expect(recoverCompactionInstruction(resumed, extractChatGptTurnIdentity(resumed))?.sourceWasDelegation).toBe(true);
+  expect((await f.run(resumed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(3);
+
+  // Producer extraction reads retained human bytes even when the summary repeats.
+  const repeated = f.request("", "turn-checkpoint", installed);
+  repeated._compactionRequest = true;
+  bindContinuityRequestScope(repeated, chatGptWebExecutionNamespace(f.provider));
+  expect(extractChatGptCompactV1SourceRevision(repeated, summary.text).itemId).toBe(previous.id);
+  expect((await f.run(repeated)).find(event => event.type === "text_delta")).toEqual(summary);
+  expect(f.submissions).toHaveLength(4);
+  const steering = f.request("", "turn-new-scope", [...installed, {
+    type: "message", role: "user", id: "msg-new-steering", content: "Use the new scope.",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-new-scope" },
+  }]);
+  bindContinuityRequestScope(steering, chatGptWebExecutionNamespace(f.provider));
+  expect(extractChatGptTurnUserRevision(steering)).toBe("Use the new scope.");
+  expect((await f.run(steering)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(5);
+  expect(f.submissions.at(-1)?.prompt).toContain("Use the new scope.");
+});
+
+test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed", async () => {
+  const root = process.env.DELEGATION_RESTART_ROOT!;
+  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  f.controls.invokeSourceTools = true;
+  const human = { type: "message", role: "user", id: "older-human", content: [{ type: "input_text", text: "Earlier human task." }],
+    internal_chat_message_metadata_passthrough: { turn_id: "older-human-turn" } };
+  const delegation = { type: "function_call_output", id: "delegated-task", name: "send_message_to_thread", namespace: "codex_app",
+    output: "<codex_delegation><source_thread_id>parent</source_thread_id><input>Complete delegated work.</input></codex_delegation>",
+    internal_chat_message_metadata_passthrough: { turn_id: "delegated-turn" } };
+  const original = f.request("", "delegated-turn", [human, delegation]);
+  await f.run(original);
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
+  const call = source.outstanding()[0]!;
+  const compact = f.request("", "consumer-turn", [human, delegation, recordedCall(call),
+    { type: "function_call_output", call_id: call.callId, output: "Accepted delegated result." }]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing delegated summary");
+  const installed = process.env.DELEGATION_RESTART_FORMAT === "v1"
+    ? buildCompactV1Output(extractCompactUserMessages([human, delegation]), summary.text)
+    : [human, { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }];
+  f.controls.invokeSourceTools = false;
+  expect((await f.run(f.request("", "consumer-turn", installed))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  writeFileSync(join(root, "delegation-seed.json"), JSON.stringify({ installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
+    consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] }));
+}, 30000);
+
+async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number) {
+  const bindings = continuityBindingsFor(f.statePath);
+  const before = bindings.recoveryStore.get(continuityDigest(f.threadId))!;
+  const submissions = f.submissions.length;
+  for (const change of ["human", "source", "summary", "payload", "steering"] as const) {
+    const input = structuredClone(seed.installed);
+    if (change === "human") input[0].content = [{ type: "input_text", text: "Changed retained human task." }];
+    if (change === "source") input[0].id = "foreign-source";
+    if (change === "summary") {
+      if (format === "v2") input.at(-1).encrypted_content = encodeCompactionSummary(`${seed.summary}\nChanged accepted summary.`);
+      else input.at(-1).content = [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${seed.summary}\nChanged accepted summary.` }];
+    }
+    if (change === "steering") input.push({ type: "message", role: "user", id: "new-steering", content: "Stop the delegated task.",
+      internal_chat_message_metadata_passthrough: { turn_id: "consumer-turn" } });
+    const invalid = f.request("", "consumer-turn", input);
+    invalid._compactionRequest = true;
+    if (change === "payload") (invalid._rawBody as Record<string, unknown>).instructions = "Changed current execution constraints.";
+    if (change === "steering") expect(extractChatGptTurnUserRevision(invalid)).toBe("Stop the delegated task.");
+    await expect(f.run(invalid), `${round}:${change}`).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(bindings.recoveryStore.get(before.thread)!.version, `${round}:${change}`).toBe(before.version);
+    expect(f.submissions, `${round}:${change}`).toHaveLength(submissions);
+  }
+  const repeated = f.request("", "consumer-turn", seed.installed);
+  repeated._compactionRequest = true;
+  repeated._continuityStateDirectory = f.statePath;
+  bindContinuityRequestScope(repeated, chatGptWebExecutionNamespace(f.provider));
+  const recovered = recoverCompactionInstruction(repeated, extractChatGptTurnIdentity(repeated))!;
+  expect(recovered.sourceWasDelegation).toBe(true);
+  expect(recovered.source).toMatchObject({ itemId: "delegated-task", turnId: "delegated-turn", content: [] });
+  expect(isDurableCompactionSourceIdentity(repeated, recovered.source)).toBe(true);
+  expect(isDurableCompactionSourceIdentity(repeated, { ...recovered.source })).toBe(false);
+  expect(canonicalizeCompactionHandoff(repeated, seed.summary)).toBe(seed.summary);
+  expect(() => canonicalizeCompactionHandoff(repeated, `Wrong prompt.\n\n${LATEST_USER_PROMPT_MARKER}\n"Forged task."`))
+    .toThrow("conflicting latest-user marker");
+  f.controls.handoffSummary = `Delegated progress, checkpoint ${round}.`;
+  const expected = canonicalizeCompactionHandoff(repeated, f.controls.handoffSummary);
+  const events = await f.run(repeated);
+  expect(events.find(event => event.type === "text_delta" && event.text === expected)).toBeDefined();
+  const after = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  expect(Object.values(after.compactionTargets).some(target => target.sourceLogicalWorkId === seed.consumerId
+    && target.sourceHistoryRevision === round - 1)).toBe(true);
+  expect(seed.consumerId).not.toBe(seed.sourceId);
+  expect(after.historyRevision).toBe(round);
+  expect(after.owner.id).toBe(bindings.owner);
+  if (before.owner.id !== bindings.owner) {
+    expect(after.owner.id).not.toBe(seed.owner.id);
+    expect(after.epoch).toBeGreaterThan(seed.epoch);
+  }
+  expect(after.works[seed.consumerId]!.attempts.at(-1)!.writerRetired).toBe(true);
+  expect(after.works[before.currentWorkId!]!.attempts.at(-1)!.writerRetired).toBe(true);
+  expect(after.transaction!.writerRetired).toBe(true);
+  expect(f.registrations.get(after.thread)).toMatchObject({ owner: bindings.owner, epoch: after.epoch,
+    transactionId: after.transaction!.transactionId });
+  expect(f.submissions).toHaveLength(submissions + 1);
+  return { ...seed, installed: format === "v1" ? buildCompactV1Output(extractCompactUserMessages(seed.installed), expected)
+    : [seed.installed[0], { type: "compaction", encrypted_content: encodeCompactionSummary(expected) }],
+    summary: expected, owner: after.owner, epoch: after.epoch, pages: [...f.pages] };
+}
+
+test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child repeat", async () => {
+  const root = process.env.DELEGATION_RESTART_ROOT!;
+  const seed = JSON.parse(readFileSync(join(root, "delegation-seed.json"), "utf8"));
+  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  for (const [key, page] of seed.pages) f.pages.set(key, page);
+  f.controls.queryIncludesContinuity = true;
+  expect(continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))).toBeUndefined();
+  const next = await repeatDelegationCheckpoint(f, seed, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2", 2);
+  writeFileSync(join(root, "delegation-next.json"), JSON.stringify(next));
+}, 30000);
+
+for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, true]) test(`${format} delegated continuation can compact again after the backend process exits; second exit=${restartAgain}`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "delegation-restart-"));
+  cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
+  const launcher = continuityProcessInstance();
+  const launcherInstance = { pid: launcher.pid, startIdentity: launcher.startIdentity === "unverified"
+    ? "darwin:Sat Oct 10 00:00:00 2026" : launcher.startIdentity, instanceId: "a".repeat(64) };
+  const log = Bun.file(join(root, "child.log"));
+  const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^delegation restart child seed$"], {
+    env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format,
+      DELEGATION_RESTART_LAUNCHER: JSON.stringify(launcherInstance) }, stdout: log, stderr: log,
+  });
+  expect(await child.exited, await log.text()).toBe(0);
+  let seed = JSON.parse(readFileSync(join(root, "delegation-seed.json"), "utf8"));
+  expect(["exited", "unverified"]).toContain(continuityProcessInstanceStatus(seed.owner));
+  if (restartAgain) {
+    const nextLog = Bun.file(join(root, "repeat-child.log"));
+    const nextChild = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^delegation restart child repeat$"], {
+      env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format,
+        DELEGATION_RESTART_LAUNCHER: JSON.stringify(launcherInstance) }, stdout: nextLog, stderr: nextLog,
+    });
+    expect(await nextChild.exited, await nextLog.text()).toBe(0);
+    const next = JSON.parse(readFileSync(join(root, "delegation-next.json"), "utf8"));
+    expect(["exited", "unverified"]).toContain(continuityProcessInstanceStatus(next.owner));
+    expect(next.owner.id).not.toBe(seed.owner.id);
+    seed = next;
+  }
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  for (const [key, page] of seed.pages) f.pages.set(key, page);
+  f.controls.queryIncludesContinuity = true;
+  const bindings = continuityBindingsFor(f.statePath);
+  expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
+  if (!restartAgain) seed = await repeatDelegationCheckpoint(f, seed, format, 2);
+  await repeatDelegationCheckpoint(f, seed, format, 3);
+}, 30000);
+
+for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const olderPrefix of [false, true]) test(`native AGENTS refresh reaches the healthy increment: manual=${manual} checkpoint=${checkpoint} older-prefix=${olderPrefix}`, async () => {
+  const f = fixture(manual);
+  f.controls.invokeSourceTools = checkpoint;
+  f.controls.singleSourceTool = true;
+  const first = f.request();
+  await f.run(first);
+  let base = (f.next(first)._rawBody as { input: unknown[] }).input;
+  if (checkpoint) {
+    const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+    const call = source.outstanding()[0]!;
+    const compact = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+      recordedCall(call), { type: "function_call_output", call_id: call.callId, output: "Accepted source result." }]);
+    compact._compactionRequest = true;
+    const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+    if (summary?.type !== "text_delta") throw new Error("Missing source summary");
+    base = [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }, base.at(-1)];
+    f.controls.invokeSourceTools = false;
+  }
+  const refresh = { type: "message", role: "user", id: "agents-refresh", content: [
+    { type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>KEEP_NEW_AGENTS_RULE.</INSTRUCTIONS>" },
+  ], internal_chat_message_metadata_passthrough: { turn_id: olderPrefix ? "turn-created-earlier" : "turn-next",
+    content_item_kinds: ["agents_md.instructions"] } };
+  const input = olderPrefix ? checkpoint ? [base[0], refresh, base.at(-1)] : [refresh, ...base]
+    : [...base.slice(0, -1), refresh, base.at(-1)];
+  const next = f.request("", "turn-next", input);
+  expect(chatGptCurrentInstructionRevision(next)?.itemId).toBe("msg-turn-next");
+  const changed = structuredClone(input) as Array<Record<string, any>>;
+  changed.find(item => item.id === refresh.id)!.content[0].text = "# AGENTS.md instructions\n<INSTRUCTIONS>CHANGED_AGENTS_RULE.</INSTRUCTIONS>";
+  const changedRequest = f.request("", "turn-next", changed);
+  const previous = checkpoint ? { instructionIdentity: "msg-turn-first", nativeTurnId: "turn-first",
+    checkpointDigest: continuityCheckpoint(next).digest } : undefined;
+  expect(chatGptContinuityInstructionPayloadDigest(next, previous))
+    .not.toBe(chatGptContinuityInstructionPayloadDigest(changedRequest, previous));
+  const accepted = await f.run(next);
+  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions.at(-1)!.reused).toBe(true);
+  expect(f.submissions.at(-1)!.prompt).toContain("Next continuity instruction.");
+  expect(f.submissions.at(-1)!.prompt.match(/KEEP_NEW_AGENTS_RULE\./g)).toHaveLength(1);
+  const submissions = f.submissions.length;
+  expect(await f.run(structuredClone(next))).toEqual(accepted);
+  await expect(f.run(changedRequest)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(submissions);
+});
+
+for (const format of ["v1", "v2"] as const) for (const ownership of ["item", "turn", "window"] as const) test(`${format} recovered delegation checkpoint admits a new ordinary task; ownership=${ownership}`, async () => {
+  const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-r3-"));
+  cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
+  const launcher = continuityProcessInstance();
+  expect(launcher.startIdentity).not.toBe("unverified");
+  const launcherInstance = { pid: launcher.pid, startIdentity: launcher.startIdentity, instanceId: "a".repeat(64) };
+  const log = Bun.file(join(root, "child.log"));
+  const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^delegation restart child seed$"], {
+    env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format,
+      DELEGATION_RESTART_LAUNCHER: JSON.stringify(launcherInstance) },
+    stdout: log, stderr: log,
+  });
+  expect(await child.exited, await log.text()).toBe(0);
+  const seed = JSON.parse(readFileSync(join(root, "delegation-seed.json"), "utf8"));
+  expect(continuityProcessInstanceStatus(seed.owner)).toBe("exited");
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  for (const [key, page] of seed.pages) f.pages.set(key, page);
+  f.controls.queryIncludesContinuity = true;
+  const bindings = continuityBindingsFor(f.statePath);
+  expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
+  const current = await repeatDelegationCheckpoint(f, seed, format, 2);
+  const binding = bindings.observed(continuityDigest(f.threadId))!;
+  expect(binding.state).toBe("ready");
+  expect(binding.executionKey).toBeUndefined();
+  expect([...binding.checkpoints.values()].every(checkpoint => checkpoint.sourceInstructionReplay === undefined)).toBe(true);
+  const newUser = { type: "message", role: "user", id: "new-ordinary-task", content: [
+    { type: "input_text", text: "Review the second component after recovery." },
+  ], internal_chat_message_metadata_passthrough: { turn_id: "new-ordinary-turn", content_item_kinds: ["user.text"] } };
+  const nativeUser: Record<string, unknown> = { ...newUser };
+  if (ownership === "turn") delete nativeUser.id;
+  if (ownership === "window") delete nativeUser.internal_chat_message_metadata_passthrough;
+  const instructionIdentity = ownership === "turn" ? "turn:new-ordinary-turn" : newUser.id;
+  const agents = { type: "message", role: "user", id: "new-ordinary-agents", content: [
+    { type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>KEEP_RECOVERED_TASK_RULE.</INSTRUCTIONS>" },
+  ], internal_chat_message_metadata_passthrough: { turn_id: "new-ordinary-turn", content_item_kinds: ["agents_md.instructions"] } };
+  const environment = { type: "message", role: "user", id: "new-ordinary-environment", content: [
+    { type: "input_text", text: "<environment_context><cwd>/tmp/recovered-workspace</cwd><shell>zsh</shell></environment_context>" },
+  ], internal_chat_message_metadata_passthrough: { turn_id: "new-ordinary-turn", content_item_kinds: ["environments.environment_context"] } };
+  const context = ownership === "window"
+    ? [{ type: "message", role: "user", id: agents.id, content: [...agents.content, ...environment.content] }]
+    : [agents, environment];
+  const input = [...current.installed, ...context, nativeUser];
+  const before = bindings.recoveryStore.get(binding.thread)!;
+  const sends = f.submissions.length;
+  for (const change of ["stale", "request-turn", "message-turn", "summary-turn", "source", "source-text", "source-turn", "sibling"] as const) {
+    const invalidInput = structuredClone(input);
+    if (change === "stale") invalidInput.splice(0, current.installed.length, ...structuredClone(seed.installed));
+    if (change === "request-turn") invalidInput.at(-1).internal_chat_message_metadata_passthrough = newUser.internal_chat_message_metadata_passthrough;
+    if (change === "message-turn") invalidInput.at(-1).internal_chat_message_metadata_passthrough = { turn_id: "foreign-turn", content_item_kinds: ["user.text"] };
+    if (change === "summary-turn") invalidInput[current.installed.length - 1].internal_chat_message_metadata_passthrough = { turn_id: "foreign-turn" };
+    if (change === "source") invalidInput[0].id = "foreign-source";
+    if (change === "source-text") invalidInput[0].content[0].text += " Changed retained human.";
+    if (change === "source-turn") invalidInput[0].internal_chat_message_metadata_passthrough.turn_id = "foreign-turn";
+    if (change === "sibling") invalidInput.splice(1, 0, { type: "message", role: "user", id: "unaccepted-sibling", content: "A different old task.",
+      internal_chat_message_metadata_passthrough: { turn_id: "consumer-turn" } });
+    await expect(f.run(f.request("", change === "request-turn" ? "foreign-request-turn" : "new-ordinary-turn", invalidInput)), change)
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(bindings.recoveryStore.get(binding.thread)!.version, change).toBe(before.version);
+    expect(f.submissions, change).toHaveLength(sends);
+  }
+  const next = f.request("", "new-ordinary-turn", input);
+  expect(chatGptCurrentInstructionRevision(next)?.itemId).toBe(ownership === "turn" ? undefined : newUser.id);
+  const accepted = await f.run(next);
+  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(sends + 1);
+  expect(f.submissions.at(-1)!.reused).toBe(true);
+  expect(f.submissions.at(-1)!.prompt).toContain(newUser.content[0]!.text);
+  expect(f.submissions.at(-1)!.prompt.match(/KEEP_RECOVERED_TASK_RULE\./g)).toHaveLength(1);
+  expect(f.submissions.at(-1)!.prompt).toContain("/tmp/recovered-workspace");
+  const after = bindings.recoveryStore.get(binding.thread)!;
+  expect(after.owner.id).toBe(bindings.owner);
+  expect(after.epoch).toBe(before.epoch);
+  expect(after.historyRevision).toBe(2);
+  const work = after.works[after.currentWorkId!]!;
+  expect(work).toMatchObject({ instructionIdentity, nativeTurnId: "new-ordinary-turn", purpose: "ordinary", state: "completed" });
+  expect(work.allowRetainedSourceFallback).toBe(false);
+  expect(work.workLineageId).not.toBe(after.works[current.consumerId]!.workLineageId);
+  expect(after.works[before.currentWorkId!]!.attempts.at(-1)!.writerRetired).toBe(true);
+  expect(f.registrations.get(after.thread)).toMatchObject({ owner: bindings.owner, epoch: after.epoch, transactionId: before.transaction!.transactionId });
+  expect(f.submissions.at(-1)!.claim.recovery).toMatchObject({ logicalWorkId: work.logicalWorkId,
+    transactionId: after.transaction!.transactionId, epoch: after.epoch });
+  expect(await f.run(f.request("", "new-ordinary-turn", structuredClone(input)))).toEqual(accepted);
+  expect(bindings.recoveryStore.get(after.thread)!.version).toBe(after.version);
+  for (const change of ["text", "agents"] as const) {
+    const changed = structuredClone(input);
+    const target = change === "text" ? changed.at(-1) : changed.find(item => item.id === agents.id);
+    target.content[0].text += " Changed accepted payload.";
+    await expect(f.run(f.request("", "new-ordinary-turn", changed))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(bindings.recoveryStore.get(after.thread)!.version).toBe(after.version);
+    expect(f.submissions).toHaveLength(sends + 1);
+  }
+  for (const change of ["stale", "text", "agents", "source", "message-turn", "sibling"] as const) {
+    const changed = structuredClone(input);
+    if (change === "stale") changed.splice(0, current.installed.length, ...structuredClone(seed.installed));
+    if (change === "text") changed.at(-1).content[0].text += " Changed compaction source.";
+    if (change === "agents") changed.find(item => item.id === agents.id).content[0].text += " Changed compaction rules.";
+    if (change === "source") changed.at(-1).id = "different-compaction-source";
+    if (change === "message-turn") changed.at(-1).internal_chat_message_metadata_passthrough = {
+      turn_id: "foreign-turn", content_item_kinds: ["user.text"] };
+    if (change === "sibling") changed.splice(changed.length - 1, 0, { type: "message", role: "user", id: "new-unaccepted-sibling",
+      content: "An unaccepted current task.", internal_chat_message_metadata_passthrough: { turn_id: "new-ordinary-turn" } });
+    const invalid = f.request("", "new-ordinary-turn", changed);
+    invalid._compactionRequest = true;
+    await expect(f.run(invalid), change).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(bindings.recoveryStore.get(after.thread)!.version, change).toBe(after.version);
+    expect(f.submissions, change).toHaveLength(sends + 1);
+  }
+  f.controls.handoffSummary = "Checkpoint of the new ordinary task.";
+  const compact = f.request("", "new-ordinary-turn", input);
+  compact._compactionRequest = true;
+  bindContinuityRequestScope(compact, chatGptWebExecutionNamespace(f.provider));
+  const newSource = extractChatGptCompactionSourceRevision(compact);
+  expect(newSource).toMatchObject({ content: newUser.content });
+  expect(compactionSourceWasDelegation(compact, newSource)).toBe(false);
+  expect(isDurableCompactionSourceIdentity(compact, newSource)).toBe(false);
+  const events = await f.run(compact);
+  const summary = events.filter(event => event.type === "text_delta").at(-1);
+  if (summary?.type !== "text_delta") throw new Error("Missing new ordinary checkpoint");
+  expect(summary.text).toContain(JSON.stringify(newUser.content[0]!.text));
+  expect(summary.text).not.toContain("Complete delegated work.");
+  expect(f.submissions).toHaveLength(sends + 2);
+  const committed = bindings.recoveryStore.get(after.thread)!;
+  expect(committed.owner.id).toBe(bindings.owner);
+  expect(committed.transaction!.writerRetired).toBe(true);
+  expect(f.registrations.get(committed.thread)).toMatchObject({ owner: bindings.owner, epoch: committed.epoch,
+    transactionId: ownership === "item" ? before.transaction!.transactionId : committed.transaction!.transactionId });
+  // Delegated retained-source selection requires both item and native-turn metadata.
+  // Its existing fresh-page fallback still compacts the real new task when either is absent.
+  const retainedCompaction = ownership === "item";
+  const revision = retainedCompaction ? 3 : 1;
+  expect(committed.historyRevision).toBe(revision);
+  const checkpoint = Object.values(committed.checkpoints).find(value => value.targetHistoryRevision === revision
+    && value.sourceIdentity === instructionIdentity)!;
+  expect(checkpoint).toBeDefined();
+  expect(committed.works[`compaction:${checkpoint.compactionTargetId}`]!.attempts.at(-1)!.writerRetired).toBe(true);
+  expect(committed.works[checkpoint.sourceLogicalWorkId]).toMatchObject({ instructionIdentity, nativeTurnId: "new-ordinary-turn" });
+  if (retainedCompaction) expect(checkpoint.sourceLogicalWorkId).toBe(work.logicalWorkId);
+  else expect(checkpoint.sourceLogicalWorkId).not.toBe(work.logicalWorkId);
+  const installed = format === "v1" ? buildCompactV1Output(extractCompactUserMessages(input), summary.text)
+    : [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }];
+  const probe = f.request("", "new-ordinary-turn", installed);
+  bindContinuityRequestScope(probe, chatGptWebExecutionNamespace(f.provider));
+  const recovered = recoverCompactionInstruction(probe, extractChatGptTurnIdentity(probe))!;
+  expect(recovered.sourceWasDelegation).toBe(false);
+  expect(recovered.source).toMatchObject({ ...(ownership === "turn" ? {} : { itemId: newUser.id }),
+    ...(ownership === "window" ? {} : { turnId: "new-ordinary-turn" }), content: newUser.content });
+  expect(isDurableCompactionSourceIdentity(probe, recovered.source)).toBe(false);
+}, 30000);
