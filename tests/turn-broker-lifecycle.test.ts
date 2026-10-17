@@ -783,6 +783,115 @@ function unansweredBrokerEndpoint(name: string, onConnection: (socket: Socket) =
   };
 }
 
+async function writeSocketFragments(socket: Socket, fragments: Buffer[]): Promise<void> {
+  for (const fragment of fragments) {
+    // Bound pending writes even when a test exercises the full 64 MiB frame limit.
+    for (let offset = 0; offset < fragment.length; offset += 64 * 1024) {
+      const chunk = fragment.subarray(offset, offset + 64 * 1024);
+      await new Promise<void>((resolve, reject) => socket.write(chunk, error => error ? reject(error) : resolve()));
+    }
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+
+function rawBrokerRequest(socketPath: string, fragments: Buffer[]): Promise<{ id: string; result?: unknown; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    const response: string[] = [];
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => response.push(chunk));
+    socket.once("error", reject);
+    socket.once("end", () => {
+      try { resolve(JSON.parse(response.join(""))); }
+      catch (error) { reject(error); }
+    });
+    socket.once("connect", () => { void writeSocketFragments(socket, fragments).catch(error => socket.destroy(error)); });
+  });
+}
+
+test("broker requests preserve split UTF-8 and dispatch only the first frame", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-utf8-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
+  await broker.listen();
+  try {
+    const id = "request-😀";
+    const frame = Buffer.from(JSON.stringify({ id, method: "owner_status", padding: "前\n后".repeat(32_768) }));
+    const split = frame.indexOf(Buffer.from("😀")) + 1;
+    const response = await rawBrokerRequest(broker.socketPath, [
+      frame.subarray(0, split), frame.subarray(split, split + 2), frame.subarray(split + 2),
+      Buffer.from('\n{"id":"ignored","method":"invalid"}\n'),
+    ]);
+    expect(response.id).toBe(id);
+    expect(response.result).toHaveProperty("protocolVersion");
+    expect(response.error).toBeUndefined();
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("broker responses preserve split UTF-8 and a separate frame delimiter", async () => {
+  const text = "前😀后\n" + "x".repeat(128 * 1024);
+  const broker = unansweredBrokerEndpoint("cgw-broker-utf8-reply-", socket => {
+    socket.on("error", () => {});
+    socket.once("data", chunk => {
+      const { id } = JSON.parse(chunk.toString().trim());
+      const frame = Buffer.from(JSON.stringify({ id, result: { text } }));
+      const split = frame.indexOf(Buffer.from("😀")) + 1;
+      void writeSocketFragments(socket, [frame.subarray(0, split), frame.subarray(split, split + 2), frame.subarray(split + 2)])
+        .then(() => socket.end("\nignored trailing data\n"), error => socket.destroy(error));
+    });
+  });
+  await broker.listen();
+  try {
+    await expect(callTurnBroker(broker.socketPath, { method: "owner_status" })).resolves.toEqual({ text });
+  } finally { await broker.close(); }
+});
+
+test("broker request size counts the first frame without its delimiter", async () => {
+  const limit = 64 * 1024 * 1024;
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-size-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
+  await broker.listen();
+  try {
+    for (const extra of [0, 1]) {
+      const request = { id: "request-size", method: "owner_status", padding: "" };
+      request.padding = "x".repeat(limit - JSON.stringify(request).length + extra);
+      const response = await rawBrokerRequest(broker.socketPath, [Buffer.from(JSON.stringify(request) + "\n")]);
+      if (extra) expect(response.error).toBe("turn broker request exceeds size limit");
+      else {
+        expect(response.id).toBe(request.id);
+        expect(response.result).toHaveProperty("protocolVersion");
+      }
+    }
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("broker response size includes the frame delimiter", async () => {
+  const limit = 64 * 1024 * 1024;
+  for (const extra of [0, 1]) {
+    let resultLength = 0;
+    const broker = unansweredBrokerEndpoint("cgw-broker-size-reply-", socket => {
+      socket.on("error", () => {});
+      socket.once("data", chunk => {
+        const { id } = JSON.parse(chunk.toString().trim());
+        resultLength = limit - JSON.stringify({ id, result: "" }).length - 1 + extra;
+        const frame = Buffer.from(JSON.stringify({ id, result: "x".repeat(resultLength) }) + "\n");
+        void writeSocketFragments(socket, [frame]).then(() => socket.end(), error => socket.destroy(error));
+      });
+    });
+    await broker.listen();
+    try {
+      const result = callTurnBroker<string>(broker.socketPath, { method: "owner_status" }, null);
+      if (extra) await expect(result).rejects.toThrow("response exceeds size limit");
+      else expect((await result).length).toBe(resultLength);
+    } finally { await broker.close(); }
+  }
+}, 30_000);
+
 test("an unbounded broker call fails when the broker closes without answering", async () => {
   const broker = unansweredBrokerEndpoint("cgw-broker-closed-", socket => socket.on("data", () => socket.end()));
   await broker.listen();

@@ -2599,30 +2599,35 @@ export class TurnBroker implements TurnBrokerOwner {
   private handleSocket(socket: Socket): void {
     if (this.endpointFailure || this.closeFailure || this.rejectNewConnections) { socket.destroy(); return; }
     this.sockets.add(socket);
-    let buffered = "";
+    const fragments: string[] = [];
+    let bufferedChars = 0;
     let handled = false;
     const disconnected = new AbortController();
     socket.setEncoding("utf8");
     socket.on("error", () => {});
     socket.once("close", () => {
+      fragments.length = 0;
       this.sockets.delete(socket);
       disconnected.abort();
     });
-    socket.on("data", chunk => {
+    socket.on("data", (chunk: string) => {
       if (handled) return;
-      buffered += chunk;
-      if (buffered.length > MAX_BROKER_LINE_CHARS && !buffered.slice(0, MAX_BROKER_LINE_CHARS + 1).includes("\n")) {
+      // Search each decoded chunk once; join only after the complete frame arrives.
+      const newline = chunk.indexOf("\n");
+      bufferedChars += newline < 0 ? chunk.length : newline;
+      if (bufferedChars > MAX_BROKER_LINE_CHARS) {
         handled = true;
+        fragments.length = 0;
         this.writeSocketResponse(socket, { id: "unknown", error: "turn broker request exceeds size limit" });
         return;
       }
-      const newline = buffered.indexOf("\n");
+      fragments.push(newline < 0 ? chunk : chunk.slice(0, newline));
       if (newline < 0) return;
       handled = true;
-      const line = buffered.slice(0, newline);
+      const line = fragments.join("");
+      fragments.length = 0;
       let request: BrokerRequest | undefined;
       try {
-        if (line.length > MAX_BROKER_LINE_CHARS) throw new Error("turn broker request exceeds size limit");
         request = JSON.parse(line) as BrokerRequest;
         this.validateRequest(request);
       } catch (error) {
@@ -3500,11 +3505,15 @@ export async function callTurnBroker<T>(
     : request;
   return new Promise<T>((resolveCall, rejectCall) => {
     const socket = createConnection(socketPath);
-    let buffered = "";
+    const fragments: string[] = [];
+    let bufferedChars = 0;
     let settled = false;
     let response: BrokerResponse | undefined;
     const onAbort = () => finishError(new DOMException("ChatGPT web turn broker call aborted", "AbortError"));
-    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const cleanup = () => {
+      fragments.length = 0;
+      signal?.removeEventListener("abort", onAbort);
+    };
     const finishError = (error: Error) => {
       if (settled) return;
       settled = true;
@@ -3548,18 +3557,22 @@ export async function callTurnBroker<T>(
     // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
     socket.once("close", finishResponse);
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
-    socket.on("data", chunk => {
+    socket.on("data", (chunk: string) => {
       if (settled || response) return;
-      buffered += chunk;
-      if (buffered.length > MAX_BROKER_LINE_CHARS) {
+      bufferedChars += chunk.length;
+      if (bufferedChars > MAX_BROKER_LINE_CHARS) {
         finishError(new Error("ChatGPT web turn broker response exceeds size limit"));
         return;
       }
-      const newline = buffered.indexOf("\n");
+      // Keep the received-character limit, including the response delimiter.
+      const newline = chunk.indexOf("\n");
+      fragments.push(newline < 0 ? chunk : chunk.slice(0, newline));
       if (newline < 0) return;
+      const line = fragments.join("");
+      fragments.length = 0;
       let parsed: BrokerResponse;
       try {
-        parsed = JSON.parse(buffered.slice(0, newline)) as BrokerResponse;
+        parsed = JSON.parse(line) as BrokerResponse;
       } catch (error) {
         finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
         return;
