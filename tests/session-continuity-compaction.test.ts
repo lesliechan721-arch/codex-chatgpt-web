@@ -23,6 +23,7 @@ import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { performanceTest } from "./helpers/performance-test";
 import { createSessionContinuityFixtures, recordedCall } from "./helpers/session-continuity-fixture";
 import { withContinuitySourceDiagnostics } from "./helpers/continuity-source-diagnostics";
+import * as launcherHost from "../src/launcher-browser-host";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
@@ -1358,10 +1359,7 @@ for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint pres
   expect(f.submissions.at(-1)?.prompt).toContain("Use the new scope.");
 });
 
-test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed", async () => {
-  const root = process.env.DELEGATION_RESTART_ROOT!;
-  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
-  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+async function seedDelegationCheckpoint(f: ReturnType<typeof fixture>, format: "v1" | "v2") {
   f.controls.invokeSourceTools = true;
   const human = { type: "message", role: "user", id: "older-human", content: [{ type: "input_text", text: "Earlier human task." }],
     internal_chat_message_metadata_passthrough: { turn_id: "older-human-turn" } };
@@ -1377,7 +1375,7 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing delegated summary");
-  const installed = process.env.DELEGATION_RESTART_FORMAT === "v1"
+  const installed = format === "v1"
     ? buildCompactV1Output(extractCompactUserMessages([human, delegation]), summary.text)
     : [human, { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }];
   f.controls.invokeSourceTools = false;
@@ -1388,8 +1386,74 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
   expect(Object.values(record.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(summary.text)
     && checkpoint.sourceIdentity === delegation.id && checkpoint.continuation.state === "consumed"
     && checkpoint.continuation.consumerLogicalWorkId === record.currentWorkId)).toBe(true);
-  writeFileSync(join(root, "delegation-seed.json"), JSON.stringify({ installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
-    consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] }));
+  return { installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
+    consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] };
+}
+
+for (const cleanupMode of ["release-page", "backend-exit"] as const) test(`delegation checkpoint fixture cleanup mode=${cleanupMode}`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "delegation-cleanup-"));
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", cleanupMode });
+  let observed: ReturnType<typeof spyOn> | undefined;
+  try {
+    const seed = await seedDelegationCheckpoint(f, "v1");
+    const bindings = continuityBindingsFor(f.statePath);
+    const binding = bindings.observed(continuityDigest(f.threadId))!;
+    const executionKey = binding.executionKey!;
+    const consumer = chatGptTurnSessions.find(executionKey)!;
+    await consumer.physicalSettlement;
+    await consumer.waitForLogicalSettlement();
+    const before = bindings.recoveryStore.get(binding.thread)!;
+    const releases: Promise<number>[] = [];
+    const release = launcherHost.releaseLauncherRetainedConversation;
+    observed = spyOn(launcherHost, "releaseLauncherRetainedConversation").mockImplementation((...args) => {
+      const result = release(...args);
+      if (args[0] === f.descriptorPath) releases.push(result);
+      return result;
+    });
+    cleanups.push(async () => {
+      // clear() schedules release after physical settlement. Drain its real RPC
+      // before stopping Launcher so the deletion cannot depend on socket timing.
+      await Promise.resolve();
+      await Promise.all(releases);
+    });
+    await disposeTestFixtures();
+    await expect(fetch(f.descriptor.endpoint)).rejects.toThrow();
+    if (cleanupMode === "release-page") {
+      expect(releases.length).toBeGreaterThan(0);
+      expect(f.pages.size).toBe(0);
+      expect(bindings.recoveryStore.get(before.thread)).toBeUndefined();
+    } else {
+      const after = bindings.recoveryStore.get(before.thread);
+      expect(after, "Backend exit must preserve its committed checkpoint.").toBeDefined();
+      expect(after).toEqual(before);
+      expect(releases).toHaveLength(0);
+      expect([...f.pages]).toEqual(seed.pages);
+      expect(bindings.observed(before.thread)).toBeUndefined();
+      expect(chatGptTurnSessions.find(executionKey)).toBeUndefined();
+    }
+  } finally {
+    observed?.mockRestore();
+    await disposeTestFixtures();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backend exit fixture cleanup rejects unfinished continuity work", async () => {
+  const f = fixture(false, { cleanupMode: "backend-exit" });
+  f.controls.invokeSourceTools = true;
+  await f.run(f.request());
+  const failure = await disposeTestFixtures().catch(error => error);
+  expect(failure).toBeInstanceOf(AggregateError);
+  expect((failure as AggregateError).errors.some(error => error instanceof Error
+    && error.message === "Backend exit cleanup requires completed continuity work.")).toBe(true);
+});
+
+test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed", async () => {
+  const root = process.env.DELEGATION_RESTART_ROOT!;
+  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance, cleanupMode: "backend-exit" });
+  const seed = await seedDelegationCheckpoint(f, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2");
+  writeFileSync(join(root, "delegation-seed.json"), JSON.stringify(seed));
 }, 30000);
 
 async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number, scenario: string) {
@@ -1468,7 +1532,7 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child repe
   const root = process.env.DELEGATION_RESTART_ROOT!;
   const seed = JSON.parse(readFileSync(join(root, "delegation-seed.json"), "utf8"));
   const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
-  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance, cleanupMode: "backend-exit" });
   for (const [key, page] of seed.pages) f.pages.set(key, page);
   f.controls.queryIncludesContinuity = true;
   expect(continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))).toBeUndefined();
