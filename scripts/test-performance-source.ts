@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 // Include every probe site, not only the collector. Whole-file equality is
@@ -42,8 +42,11 @@ export function performanceSource(cwd: string) {
   let toolDigest: string | null = null;
   let measurementFiles: { file: string; digest: string }[] | null = null;
   try {
-    if ([status, diff, untracked, top].some(result => result.status !== 0 || result.error)
-      || realpathSync(cwd) !== realpathSync(top.stdout.trim())) throw new Error("Unknown source root");
+    if ([status, diff, untracked, top].some(result => result.status !== 0 || result.error)) throw new Error("Unknown source root");
+    // Git and the runtime can spell the same Windows directory differently
+    // (including 8.3 temporary paths). Compare filesystem identity, not spelling.
+    const directory = statSync(cwd, { bigint: true }), root = statSync(top.stdout.trim(), { bigint: true });
+    if (!directory.isDirectory() || directory.dev !== root.dev || directory.ino !== root.ino) throw new Error("Unknown source root");
     const patch = createHash("sha256").update(diff.stdout);
     for (const file of untracked.stdout.split("\0").filter(Boolean).sort()) {
       patch.update(file).update("\0").update(readFileSync(join(cwd, file))).update("\0");

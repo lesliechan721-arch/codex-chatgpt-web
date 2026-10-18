@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { compareTestVersions, externalWallClock, versionComparisonOptions } from "../scripts/compare-test-versions";
@@ -36,6 +36,24 @@ function checkouts(candidateTest?: string) {
   return { directory, A, B, output, files, map, mapPath, saveMap,
     args: [`--baseline=${A}`, `--candidate=${B}`], clean: () => rmSync(directory, { recursive: true, force: true }) };
 }
+
+test("source identity accepts directory aliases but rejects a repository subdirectory", () => {
+  const fixture = checkouts();
+  try {
+    // Missing measurement files must not mask a broken repository-root check.
+    for (const file of MEASUREMENT_FILES) {
+      mkdirSync(dirname(join(fixture.A, "tests", file)), { recursive: true });
+      writeFileSync(join(fixture.A, "tests", file), "export {};\n");
+    }
+    const alias = join(fixture.directory, "alias");
+    symlinkSync(fixture.A, alias, process.platform === "win32" ? "junction" : "dir");
+    const original = performanceSource(fixture.A), aliased = performanceSource(alias);
+    expect(original.known).toBe(true);
+    expect(aliased).toEqual(original);
+    expect(performanceSource(join(fixture.A, "tests")).known).toBe(false);
+    if (process.platform === "win32") expect(performanceSource(fixture.A.toUpperCase())).toEqual(original);
+  } finally { fixture.clean(); }
+});
 
 test("cross-version wall clocks require explicit coverage bound to source and scope", async () => {
   const fixture = checkouts();

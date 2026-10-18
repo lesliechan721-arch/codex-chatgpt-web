@@ -81,8 +81,18 @@ test("repository file discovery follows Bun test/spec suffixes and excludes perf
 for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads the measured first round and starts slow files before fast files (${githubActions ? "GitHub Actions" : "ordinary"} output)`, () => temporary(async root => {
   mkdirSync(join(root, "tests"));
   for (const [name, delay] of [["a-fast", 5], ["b-medium", 80], ["c-medium", 100], ["z-slow", 250]] as const) {
-    writeFileSync(join(root, `tests/${name}.test.ts`), `import {test} from "bun:test"; import {appendFileSync} from "node:fs";
-      test(${JSON.stringify(name)}, async()=> {appendFileSync(process.env.ORDER_LOG, ${JSON.stringify(name + "\n")}); await Bun.sleep(${delay});});`);
+    writeFileSync(join(root, `tests/${name}.test.ts`), `import {test} from "bun:test"; import {appendFileSync, readFileSync} from "node:fs";
+      test(${JSON.stringify(name)}, async()=> {
+        appendFileSync(process.env.ORDER_LOG, ${JSON.stringify(name + "\n")});
+        if (process.env.ORDER_BARRIER === "1") {
+          const deadline = Date.now() + 5000;
+          while (readFileSync(process.env.ORDER_LOG, "utf8").trim().split("\\n").length < 2) {
+            if (Date.now() >= deadline) throw new Error("Second timing worker did not start");
+            await Bun.sleep(5);
+          }
+        }
+        await Bun.sleep(${delay});
+      });`);
   }
   const files = repositoryTestFiles(root);
   const artifactDirectory = join(root, "artifacts");
@@ -94,13 +104,13 @@ for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads th
     expect(prepared.scheduling.source).toBe(round === 1 ? "cold" : "restored");
     const orderLog = join(root, `order-${round}`);
     const command = ["test", "--timings", join(runDirectory, "file-timings.json"),
-      ...(prepared.input ? ["--timings", prepared.input] : []), "--update-timings", "--parallel=2", "--isolate", "./tests"];
-    const env: NodeJS.ProcessEnv = { ...process.env, ORDER_LOG: orderLog };
+      ...(prepared.input ? ["--timings", prepared.input] : []), "--update-timings", "--parallel=2", "--parallel-delay=0", "--isolate", "./tests"];
+    const env: NodeJS.ProcessEnv = { ...process.env, ORDER_LOG: orderLog, ORDER_BARRIER: round === 2 ? "1" : "0" };
     if (githubActions) env.GITHUB_ACTIONS = "true";
     else delete env.GITHUB_ACTIONS;
     const child = spawnSync(process.execPath, command, { cwd: root, encoding: "utf8", timeout: 10_000, env });
     expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
-    expect(child.stderr.includes("::group::tests/")).toBe(githubActions);
+    expect(child.stderr.replaceAll("\\", "/").includes("::group::tests/")).toBe(githubActions);
     const result = finalizeFileTimings({ root, runDirectory, compatibility, metadata: source, expectedFiles: files,
       stderr: child.stderr, exitCode: child.status!, signal: child.signal, spawnError: null, fullSuiteRequested: true,
       logsComplete: true, sourceStable: true, artifactDirectory });
@@ -108,8 +118,12 @@ for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads th
     input = join(runDirectory, "history.json");
     if (round === 2) {
       const order = readFileSync(orderLog, "utf8").trim().split("\n");
-      expect(order.slice(0, 2).sort()).toEqual(["c-medium", "z-slow"]);
-      expect(readFileSync(prepared.input!, "utf8")).toBe(JSON.stringify(JSON.parse(readFileSync(join(root, "run-1/history.json"), "utf8")).timings) + "\n");
+      const measured = (JSON.parse(readFileSync(join(root, "run-1/history.json"), "utf8")) as TimingHistory).timings;
+      const slowest = Object.entries(measured.files).sort((a, b) => b[1] - a[1])[0]![0];
+      // Workers start independently. The slowest measured file must start in
+      // the first pair, before either worker can finish and take another file.
+      expect(order.slice(0, 2)).toContain(slowest.replace(/^tests\//, "").replace(/\.test\.ts$/, ""));
+      expect(readFileSync(prepared.input!, "utf8")).toBe(JSON.stringify(measured) + "\n");
     }
   }
   expect(readdirSync(artifactDirectory)).toEqual([timingHistoryFilename(compatibility)]);
