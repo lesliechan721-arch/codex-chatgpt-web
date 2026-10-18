@@ -19,28 +19,54 @@ export function collectPerformanceReports(directory: string, runId: string, root
   const totals = Object.fromEntries(RUNTIME_PERFORMANCE_OPERATIONS.map(name => [name, empty()])) as Record<string, RuntimePerformanceCounter | null>;
   const contexts = new Map<string, { context: unknown; counters: Record<string, RuntimePerformanceCounter> }>();
   const invalidReports: string[] = [], incompleteReasons: string[] = [];
-  const reports: any[] = [], children: any[] = [];
+  const reports: any[] = [], children: any[] = [], globals: any[] = [];
+  const globalIds = new Set<string>();
   const snapshotIds = new Set<string>(), childIds = new Set<string>();
   let legacySnapshots = 0;
-  for (const file of readdirSync(directory).filter(name => name.endsWith(".json"))) {
+  let files: string[] = [];
+  try { files = readdirSync(directory).filter(name => name.endsWith(".json")); }
+  catch { incompleteReasons.push("report-directory-unavailable"); }
+  for (const file of files) {
     try {
       const report = JSON.parse(readFileSync(join(directory, file), "utf8"));
+      if (file.endsWith(".global.json")) {
+        if (report.version !== 3 || report.kind !== "global" || report.runId !== runId
+          || typeof report.snapshotId !== "string" || globalIds.has(report.snapshotId)
+          || typeof report.processId !== "string" || !Number.isInteger(report.pid) || report.pid < 1
+          || typeof report.complete !== "boolean") throw new Error("Invalid global ledger");
+        globalIds.add(report.snapshotId); globals.push(report); continue;
+      }
       if (file.endsWith(".child.json")) {
-        if (report.version !== 2 || !["child", "worker"].includes(report.kind) || report.runId !== runId || typeof report.id !== "string"
+        if (![2, 3].includes(report.version) || !["child", "worker"].includes(report.kind) || report.runId !== runId || typeof report.id !== "string"
           || typeof report.parentId !== "string" || typeof report.expectsReport !== "boolean") throw new Error("Invalid child ledger");
-        if (childIds.has(report.id)) throw new Error("Duplicate child ledger");
+        if (childIds.has(report.id) || report.id === rootProcessId) throw new Error("Duplicate child ledger");
+        if (report.kind === "worker") {
+          if (!Number.isInteger(report.pid) || report.pid < 1 || typeof report.complete !== "boolean") throw new Error("Invalid worker ledger");
+        } else {
+          if (!["starting", "running", "exited", "spawn-failed", "unknown"].includes(report.status)
+            || (report.pid !== null && (!Number.isInteger(report.pid) || report.pid < 1))
+            || (report.status === "exited" && (!Number.isInteger(report.exitCode) || report.exitCode < 0))
+            || (report.signal !== null && typeof report.signal !== "string" && typeof report.signal !== "number")) throw new Error("Invalid child result");
+          if (report.version === 3 && (typeof report.parentSnapshotId !== "string" || !Array.isArray(report.expectedExitCodes)
+            || report.expectedExitCodes.some((code: unknown) => !Number.isSafeInteger(code) || (code as number) <= 0)
+            || new Set(report.expectedExitCodes).size !== report.expectedExitCodes.length)) throw new Error("Invalid child declaration");
+        }
         childIds.add(report.id);
         children.push(report); continue;
       }
-      if (![1, 2].includes(report.version) || !report.counters || typeof report.counters !== "object" || Array.isArray(report.counters)
+      if (![1, 2, 3].includes(report.version) || !report.counters || typeof report.counters !== "object" || Array.isArray(report.counters)
         || Object.values(report.counters).some(counter => !validCounter(counter))) throw new Error("Invalid counters");
-      if (report.version === 2 && (report.runId !== runId || typeof report.processId !== "string"
+      if (report.version >= 2 && (report.runId !== runId || typeof report.processId !== "string"
         || typeof report.snapshotId !== "string" || snapshotIds.has(report.snapshotId)
         || !Number.isInteger(report.pid) || report.pid < 1 || typeof report.complete !== "boolean" || !Array.isArray(report.contexts))) throw new Error("Invalid report origin");
       if (report.version === 1) legacySnapshots++;
       else {
+        if (report.version === 3 && (!Number.isSafeInteger(report.pendingOperations) || report.pendingOperations < 0
+          || ![null, "flush", "afterAll", "exit"].includes(report.completedBy)
+          || (report.complete && (report.pendingOperations !== 0 || report.completedBy === null)))) throw new Error("Invalid global completion");
         snapshotIds.add(report.snapshotId);
         if (!report.complete) incompleteReasons.push(`unfinished-global:${file}`);
+        if (report.version === 3 && report.pendingOperations > 0) incompleteReasons.push(`pending-operations:${report.snapshotId}:${report.pendingOperations}`);
         if (report.diagnosticErrors !== undefined && (!Array.isArray(report.diagnosticErrors)
           || report.diagnosticErrors.some((reason: unknown) => typeof reason !== "string"))) throw new Error("Invalid diagnostic errors");
         for (const reason of report.diagnosticErrors ?? []) incompleteReasons.push(`diagnostic-error:${reason}`);
@@ -53,16 +79,36 @@ export function collectPerformanceReports(directory: string, runId: string, root
     } catch { invalidReports.push(file); }
   }
   const expected = new Map<string, number | null>([[rootProcessId, rootPid]]);
+  const childResultIssues: string[] = [];
   for (const child of children) {
     expected.set(child.id, child.pid);
-    if (child.kind === "worker" ? !child.complete : child.status !== "exited" || !Number.isInteger(child.exitCode) || child.exitCode !== 0 || child.signal != null) incompleteReasons.push(`child-not-normal:${child.id}`);
-    if (child.expectsReport && !reports.some(report => report.version === 2 && report.processId === child.id && report.pid === child.pid)) incompleteReasons.push(`missing-child-report:${child.id}`);
+    if (child.kind === "worker") {
+      if (!child.complete) incompleteReasons.push(`child-not-normal:${child.id}`);
+    } else {
+      child.outcome = child.signal != null ? "signal" : child.status === "spawn-failed" ? "spawn-failed"
+        : child.status !== "exited" ? "unfinished" : child.exitCode === 0 ? "zero"
+        : child.version === 3 && child.expectedExitCodes.includes(child.exitCode) ? "expected-nonzero" : "unexpected-nonzero";
+      if (child.outcome === "unexpected-nonzero") childResultIssues.push(`unexpected-child-exit:${child.id}:${child.exitCode}`);
+      if (["signal", "spawn-failed", "unfinished"].includes(child.outcome)
+        || (child.version === 2 && child.exitCode !== 0)) incompleteReasons.push(`child-not-normal:${child.id}`);
+    }
+    if (child.expectsReport && child.status !== "spawn-failed" && !reports.some(report => report.version >= 2 && report.processId === child.id && report.pid === child.pid)
+      && !children.some(worker => worker.kind === "worker" && worker.parentId === child.id)) incompleteReasons.push(`missing-child-report:${child.id}`);
   }
-  if (!reports.some(report => report.version === 2 && report.processId === rootProcessId && report.pid === rootPid)
+  if (!reports.some(report => report.version >= 2 && report.processId === rootProcessId && report.pid === rootPid)
     && !children.some(child => child.kind === "worker" && child.parentId === rootProcessId)) incompleteReasons.push("missing-root-report");
   for (const child of children) if (!expected.has(child.parentId)) incompleteReasons.push(`unknown-child-parent:${child.id}`);
+  for (const global of globals) {
+    if (expected.get(global.processId) !== global.pid) incompleteReasons.push(`untracked-global:${global.snapshotId}`);
+    if (!global.complete) incompleteReasons.push(`unfinished-global-ledger:${global.snapshotId}`);
+    if (!reports.some(report => report.version === 3 && report.snapshotId === global.snapshotId
+      && report.processId === global.processId && report.pid === global.pid)) incompleteReasons.push(`missing-global-report:${global.snapshotId}`);
+  }
+  for (const report of reports) if (report.version === 3 && report.completedBy === "afterAll" && !globalIds.has(report.snapshotId)) {
+    incompleteReasons.push(`missing-global-ledger:${report.snapshotId}`);
+  }
   const starts = new Map<string, number>();
-  for (const report of reports) if (report.version === 2) {
+  for (const report of reports) if (report.version >= 2) {
     starts.set(report.processId, (starts.get(report.processId) ?? 0) + (report.counters["process.start"]?.count ?? 0));
   }
   const recordedStarts = new Map<string, number>();
@@ -73,7 +119,12 @@ export function collectPerformanceReports(directory: string, runId: string, root
     if ((starts.get(id) ?? 0) !== (recordedStarts.get(id) ?? 0)) incompleteReasons.push(`child-start-ledger-mismatch:${id}`);
   }
   for (const report of reports) {
-    if (report.version === 2 && expected.get(report.processId) !== report.pid) incompleteReasons.push("untracked-process-report");
+    if (report.version === 3) {
+      const ledgers = children.filter(child => child.kind === "child" && child.version === 3 && child.parentSnapshotId === report.snapshotId);
+      if (ledgers.some(child => child.parentId !== report.processId)) incompleteReasons.push(`child-global-origin-mismatch:${report.snapshotId}`);
+      if ((report.counters["process.start"]?.count ?? 0) !== ledgers.length) incompleteReasons.push(`child-global-start-ledger-mismatch:${report.snapshotId}`);
+    }
+    if (report.version >= 2 && expected.get(report.processId) !== report.pid) incompleteReasons.push("untracked-process-report");
     for (const name of RUNTIME_PERFORMANCE_OPERATIONS) {
       if (report.version === 1 && !legacy.has(name)) { totals[name] = null; continue; }
       const counter = report.counters[name];
@@ -88,6 +139,9 @@ export function collectPerformanceReports(directory: string, runId: string, root
       }
     }
   }
+  for (const child of children) if (child.kind === "child" && child.version === 3 && !snapshotIds.has(child.parentSnapshotId)) {
+    incompleteReasons.push(`missing-child-parent-global:${child.id}`);
+  }
   if (legacySnapshots) incompleteReasons.push("legacy-origin-and-new-metrics-unknown");
   const unassignedParameterTests = [...contexts.values()].reduce((count, bucket) => {
     const context = bucket.context as { file?: unknown; parameterId?: unknown };
@@ -95,5 +149,5 @@ export function collectPerformanceReports(directory: string, runId: string, root
   }, 0);
   return { snapshots: reports.length, legacySnapshots, invalidReports, incompleteReasons: [...new Set(incompleteReasons)],
     complete: reports.length > 0 && invalidReports.length === 0 && incompleteReasons.length === 0,
-    totals, contexts: [...contexts.values()], children, unassignedParameterTests };
+    totals, contexts: [...contexts.values()], children, childResultIssues, unassignedParameterTests };
 }

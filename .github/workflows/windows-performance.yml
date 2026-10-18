@@ -1,20 +1,36 @@
-name: Windows test performance comparison
+name: Release test diagnostics
 
 on:
   workflow_dispatch:
     inputs:
-      repetitions:
-        description: "Repetitions for each worker count"
+      platform:
+        description: "Diagnostic runner"
         type: choice
-        options: ["1", "2", "3"]
-        default: "2"
+        options: ["windows-latest", "macos-15-intel"]
+        default: "windows-latest"
+      suite:
+        description: "Target files (continuity includes two files; cli is a single-file regression)"
+        type: choice
+        options: ["continuity", "cli", "all"]
+        default: "continuity"
+      repetitions:
+        description: "Retain every result for each condition (10 for CLI regression acceptance)"
+        type: choice
+        options: ["1", "2", "3", "10"]
+        default: "3"
+      runtime:
+        description: "Actual test runtime on Windows"
+        type: choice
+        options: ["installed", "baseline"]
+        default: "installed"
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  compare:
-    runs-on: windows-latest
+  diagnose:
+    runs-on: ${{ inputs.platform }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
@@ -25,18 +41,43 @@ jobs:
       - run: bun install --frozen-lockfile
         working-directory: launcher
       - name: Prepare AVX2-independent Windows runtime
+        if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.2 -GitHubEnv $env:GITHUB_ENV
-      - name: Compare one and two test workers
+      - name: Run Windows diagnostic conditions
+        if: runner.os == 'Windows'
         shell: pwsh
-        run: bun run scripts/compare-test-performance.ts "--repetitions=$env:COMPARISON_REPETITIONS"
+        run: |
+          $Runtime = if ($env:DIAGNOSTIC_RUNTIME -eq 'baseline') { $env:CODEX_CHATGPT_WEB_EMBEDDED_BUN } else { (Get-Command bun).Source }
+          & $Runtime run scripts/diagnose-test-performance.ts "--repetitions=$env:DIAGNOSTIC_REPETITIONS" "--suite=$env:DIAGNOSTIC_SUITE"
+          exit $LASTEXITCODE
         env:
-          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/windows-test-performance
-          COMPARISON_REPETITIONS: ${{ inputs.repetitions }}
-      - name: Upload all performance reports
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+          CGW_TEST_RUNNER_CLASS: ${{ inputs.platform }}
+          CGW_TEST_TIMING_ARTIFACT_DIR: ${{ runner.temp }}/test-timing-history
+          DIAGNOSTIC_RUNTIME: ${{ inputs.runtime }}
+          DIAGNOSTIC_REPETITIONS: ${{ inputs.repetitions }}
+          DIAGNOSTIC_SUITE: ${{ inputs.suite }}
+      - name: Run Intel diagnostic conditions
+        if: runner.os == 'macOS'
+        run: bun run scripts/diagnose-test-performance.ts "--repetitions=$DIAGNOSTIC_REPETITIONS" "--suite=$DIAGNOSTIC_SUITE"
+        env:
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+          CGW_TEST_RUNNER_CLASS: ${{ inputs.platform }}
+          CGW_TEST_TIMING_ARTIFACT_DIR: ${{ runner.temp }}/test-timing-history
+          DIAGNOSTIC_REPETITIONS: ${{ inputs.repetitions }}
+          DIAGNOSTIC_SUITE: ${{ inputs.suite }}
+      - name: Upload complete platform file timings
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-test-performance-${{ github.sha }}
-          path: ${{ runner.temp }}/windows-test-performance
+          name: test-timings-${{ inputs.platform }}
+          path: ${{ runner.temp }}/test-timing-history
+          if-no-files-found: ignore
+      - name: Upload every diagnostic result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-diagnostics-${{ inputs.platform }}-${{ inputs.runtime }}-${{ github.sha }}
+          path: ${{ runner.temp }}/test-performance
           if-no-files-found: warn

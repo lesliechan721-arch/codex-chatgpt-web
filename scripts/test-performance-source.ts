@@ -11,9 +11,11 @@ export const MEASUREMENT_FILES = [
   "src/adapters/chatgpt-web/continuity-recovery-store.ts", "src/adapters/chatgpt-web/recovery-durability.ts",
   "scripts/profile-tests.ts", "scripts/test-performance-preload.ts", "scripts/test-performance-source.ts",
   "scripts/test-performance-reports.ts", "scripts/test-performance-children.ts", "scripts/runtime-performance-preload.ts",
+  "scripts/test-timing-history.ts", "scripts/test-timing-history-rest.ts",
   "scripts/compare-test-performance.ts", "scripts/compare-test-versions.ts", "tests/helpers/performance-test.ts",
   "tests/helpers/retained-fixture-cleanup.ts", "tests/helpers/retained-compaction-fixture.ts",
   "tests/helpers/session-continuity-fixture.ts", "tests/session-continuity-adapter.test.ts",
+  "tests/helpers/continuity-source-diagnostics.ts",
   "tests/session-continuity-http.test.ts", "tests/session-continuity-compaction.test.ts",
   "tests/session-continuity-recovery.test.ts", "tests/session-continuity-checkpoint.test.ts",
   "tests/server-lifecycle.test.ts", "tests/continuity-recovery-compaction.test.ts",
@@ -53,6 +55,6 @@ export function performanceSource(cwd: string) {
   return { revision: sha, workflowRevision: process.env.GITHUB_SHA ?? null,
     nodeVersion: node.status === 0 && /^v[\d.]+$/.test(node.stdout.trim()) ? node.stdout.trim() : null,
     workingTreeDirty: status.status === 0 && !status.error ? status.stdout.length > 0 : null,
-    patchDigest, toolVersion: 2, toolDigest, measurementFiles,
+    patchDigest, toolVersion: 3, toolDigest, measurementFiles,
     known: sha !== null && patchDigest !== null && toolDigest !== null };
 }

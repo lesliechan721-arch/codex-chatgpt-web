@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import { compareTestPerformance, comparisonOptions } from "../scripts/compare-test-performance";
+import { compareTestPerformance, comparisonOptions, readPerformanceSummary } from "../scripts/compare-test-performance";
 import { performanceSource, measurementFingerprint, MEASUREMENT_FILES } from "../scripts/test-performance-source";
 
 function summary(workers: number, exitCode = 0) {
@@ -16,13 +17,152 @@ function save(output: string, report: unknown) {
   const run = join(output, "workers-random");
   mkdirSync(run);
   writeFileSync(join(run, "summary.json"), JSON.stringify(report));
+  const current = report as { version?: number; runId?: string; segments?: { reportMs: number; totalMs: number } };
+  if (current.version === 3 && current.segments) writeFileSync(join(run, "completion.json"), JSON.stringify({ version: 1,
+    runId: current.runId, segments: { ...current.segments, reportMs: current.segments.reportMs + 1, totalMs: current.segments.totalMs + 1 },
+    endPoint: "after-summary-and-status-output", excludes: ["completion-write", "process-shutdown"] }));
 }
+
+function fullSummary(workers: number, output: string, files: string[]) {
+  return { ...summary(workers), version: 3, runId: `full-workers-${workers}`, mode: "full", isolation: "isolate", testResult: "success",
+    scheduling: { source: "cold", reason: "no-history-input", lookupMs: 0, inputDigest: null as string | null, from: null },
+    wallValid: true, wallInvalidReasons: [] as string[], childResultIssues: [] as string[], collection: { status: "complete" },
+    segments: { prepareMs: 1, executionMs: workers === 1 ? 20 : 10, logDrainMs: 1, reportMs: 1, totalMs: 30 },
+    command: [process.execPath, "test", "--timeout", "30000", "--preload", resolve(import.meta.dir, "../scripts/test-performance-preload.ts"),
+      "--timings", join(output, "workers-random", "file-timings.json"), "--update-timings", ...(workers === 2 ? ["--parallel=2"] : []),
+      "--isolate", ...(files.length ? files : ["./tests"])] };
+}
+
+for (const history of ["same", "different"] as const) {
+  test(`worker comparison handles ${history} history in separate run snapshots`, async () => {
+    const output = mkdtempSync(join(tmpdir(), "cgw-comparison-history-"));
+    try {
+      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+        const report = fullSummary(workers, path, files), input = join(path, "workers-random", "history-input.json");
+        const contents = JSON.stringify({ version: 1, files: { "tests/example.test.ts": history === "different" ? workers * 10 : 10 } });
+        report.scheduling.source = "restored";
+        report.scheduling.inputDigest = createHash("sha256").update(contents).digest("hex");
+        report.command.splice(report.command.indexOf("--update-timings"), 0, "--timings", input);
+        save(path, report); writeFileSync(input, contents); return 0;
+      } });
+      expect(result.report.valid).toBe(history === "same");
+      expect(result.report.runs.every(run => run.error === null)).toBe(true);
+      const inputs = result.report.runs.flatMap(run => run.schedulingInputs as { path: string; digest: string }[]);
+      expect(new Set(inputs.map(input => input.path)).size).toBe(2);
+      if (history === "different") {
+        expect(result.report.reasons).toContain("different-scheduling-inputs");
+        expect(result.report.speedup).toBeNull();
+      }
+    } finally { rmSync(output, { recursive: true, force: true }); }
+  });
+}
+
+for (const defect of ["source", "digest", "multiple", "missing-input"] as const) {
+  test(`v3 summaries reject ${defect} scheduling evidence`, () => {
+    const output = mkdtempSync(join(tmpdir(), "cgw-scheduling-"));
+    try {
+      const files = ["./tests/example.test.ts"], report = fullSummary(1, output, files);
+      const input = join(output, "workers-random", "history-input.json"), contents = '{"version":1,"files":{"tests/example.test.ts":10}}';
+      report.scheduling.source = defect === "source" ? "cold" : "restored";
+      report.scheduling.inputDigest = defect === "digest" ? "0".repeat(64) : createHash("sha256").update(contents).digest("hex");
+      if (defect !== "missing-input") report.command.splice(report.command.indexOf("--update-timings"), 0, "--timings", input);
+      if (defect === "multiple") report.command.splice(report.command.indexOf("--update-timings"), 0, "--timings", input);
+      save(output, report); writeFileSync(input, contents);
+      expect(() => readPerformanceSummary(output, 1, 0, report, { mode: "full", isolation: "isolate", files })).toThrow(/scheduling/);
+    } finally { rmSync(output, { recursive: true, force: true }); }
+  });
+}
+
+for (const defect of ["missing", "run", "boundary", "phase", "finite"] as const) {
+  test(`v3 summaries reject ${defect} completion evidence`, () => {
+    const output = mkdtempSync(join(tmpdir(), "cgw-completion-"));
+    try {
+      const files = ["./tests/example.test.ts"], report = fullSummary(1, output, files);
+      save(output, report);
+      const path = join(output, "workers-random", "completion.json"), completion = JSON.parse(readFileSync(path, "utf8"));
+      if (defect === "missing") rmSync(path);
+      else {
+        if (defect === "run") completion.runId = "another-run";
+        if (defect === "boundary") completion.endPoint = "before-summary";
+        if (defect === "phase") completion.segments.executionMs += 1;
+        if (defect === "finite") completion.segments.totalMs = null;
+        writeFileSync(path, JSON.stringify(completion));
+      }
+      expect(() => readPerformanceSummary(output, 1, 0, report, { mode: "full", isolation: "isolate", files })).toThrow(/completion/);
+    } finally { rmSync(output, { recursive: true, force: true }); }
+  });
+}
+
+test("controlled worker comparison rejects v2 rather than inferring isolation", async () => {
+  const output = mkdtempSync(join(tmpdir(), "cgw-comparison-legacy-"));
+  try {
+    const result = await compareTestPerformance(["--repetitions=1"], { output, runner: async (workers, path) => {
+      save(path, summary(workers)); return 0;
+    } });
+    expect(result.report.valid).toBe(false);
+    expect(result.report.runs[0]!.invalidReasons).toContain("legacy-summary-requires-full-default");
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
+
+for (const defect of ["none", "mode", "isolation", "scope", "collection", "child-results", "wall-status", "test-result", "exit"] as const) {
+  test(`v3 full comparison validates ${defect} and keeps rejected reports`, async () => {
+    const output = mkdtempSync(join(tmpdir(), "cgw-comparison-v3-"));
+    try {
+      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+        const report = fullSummary(workers, path, files);
+        if (workers === 1) {
+          if (defect === "mode") report.mode = "timing";
+          if (defect === "isolation") report.isolation = "shared";
+          if (defect === "scope") report.command[report.command.length - 1] = "./tests/another.test.ts";
+          if (defect === "collection") report.snapshots = 0;
+          if (defect === "child-results") report.childResultIssues = ["unexpected-child-nonzero"];
+          if (defect === "wall-status") report.wallValid = false;
+          if (defect === "test-result") report.testResult = "assertion-failure";
+          if (defect === "exit") report.exitCode = 17;
+        }
+        save(path, report); return report.exitCode;
+      } });
+      expect(result.report.valid).toBe(defect === "none");
+      expect(result.report.runs[0]!.summaryPath).toBeString();
+      if (defect !== "none") {
+        expect(result.report.speedup).toBeNull();
+        expect(result.report.runs[0]!.invalidReasons.length).toBeGreaterThan(0);
+        expect(JSON.parse(readFileSync(join(dirname(result.reportPath), result.report.runs[0]!.summaryPath!), "utf8")).version).toBe(3);
+      }
+    } finally { rmSync(output, { recursive: true, force: true }); }
+  });
+}
+
+test("timing comparison accepts only successful v3 wall clocks and keeps collection unavailable", async () => {
+  const output = mkdtempSync(join(tmpdir(), "cgw-comparison-timing-"));
+  try {
+    const result = await compareTestPerformance(["--repetitions=1", "--mode=timing", "./tests/example.test.ts"], {
+      output, runner: async (workers, path, files, settings) => {
+        expect(settings).toEqual({ mode: "timing", isolation: "isolate" });
+        const run = join(path, "workers-random");
+        save(path, { ...summary(workers), version: 3, runId: `timing-workers-${workers}`, mode: "timing", isolation: "isolate",
+          scheduling: { source: "cold", reason: "no-history-input", lookupMs: 0, inputDigest: null, from: null },
+          complete: false, incompleteReasons: [], collection: { status: "not-requested" },
+          snapshots: 0, totals: {}, testResult: "success", wallValid: true, wallInvalidReasons: [],
+          segments: { prepareMs: 1, executionMs: workers === 1 ? 20 : 10, logDrainMs: 1, reportMs: 1, totalMs: 30 },
+          command: [process.execPath, "test", "--timeout", "30000", "--timings", join(run, "file-timings.json"),
+            "--update-timings", ...(workers === 2 ? ["--parallel=2"] : []), "--isolate", ...files] });
+        return 0;
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.report.speedup).toBe(2);
+    expect(result.report.groups.map(group => group.medianWallMs)).toEqual([20, 10]);
+    expect(result.report.runs.every(run => run.collection === "not-requested")).toBe(true);
+    expect(result.report.runs.every(run => run.wrapperExitMs! > 0 && run.completionPath !== null)).toBe(true);
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
 
 test("comparison alternates worker order and preserves separate original reports", async () => {
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-"));
   const order: number[] = [];
   try {
-    const result = await compareTestPerformance(["./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+    const result = await compareTestPerformance(["--isolation=default", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
       order.push(workers);
       expect(files).toEqual(["./tests/example.test.ts"]);
       save(path, summary(workers));
@@ -45,7 +185,7 @@ test("comparison continues after test failures and preserves every exit code", a
   const exits = [23, 0, 7, 0];
   let calls = 0;
   try {
-    const result = await compareTestPerformance([], { output, runner: async (workers, path) => {
+    const result = await compareTestPerformance(["--isolation=default"], { output, runner: async (workers, path) => {
       const exitCode = exits[calls++]!;
       save(path, summary(workers, exitCode));
       return exitCode;
@@ -65,7 +205,7 @@ for (const defect of ["missing", "json", "snapshots", "invalidReports", "wallMs"
     const output = mkdtempSync(join(tmpdir(), "cgw-comparison-invalid-"));
     let calls = 0;
     try {
-      const result = await compareTestPerformance(["--repetitions=1"], { output, runner: async (workers, path) => {
+      const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, runner: async (workers, path) => {
         calls++;
         if (calls === 1) {
           const report = summary(workers);
@@ -105,7 +245,7 @@ test("comparison records spawn failure and still runs the remaining measurements
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-spawn-"));
   let calls = 0;
   try {
-    const result = await compareTestPerformance(["--repetitions=1"], { output, runner: async (workers, path) => {
+    const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, runner: async (workers, path) => {
       if (++calls === 1) throw new Error("spawn failed");
       save(path, summary(workers));
       return 0;

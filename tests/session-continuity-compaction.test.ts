@@ -22,6 +22,7 @@ import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { performanceTest } from "./helpers/performance-test";
 import { createSessionContinuityFixtures, recordedCall } from "./helpers/session-continuity-fixture";
+import { withContinuitySourceDiagnostics } from "./helpers/continuity-source-diagnostics";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
@@ -1386,7 +1387,7 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
     consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] }));
 }, 30000);
 
-async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number) {
+async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number, scenario: string) {
   const bindings = continuityBindingsFor(f.statePath);
   const before = bindings.recoveryStore.get(continuityDigest(f.threadId))!;
   const submissions = f.submissions.length;
@@ -1404,7 +1405,9 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
     invalid._compactionRequest = true;
     if (change === "payload") (invalid._rawBody as Record<string, unknown>).instructions = "Changed current execution constraints.";
     if (change === "steering") expect(extractChatGptTurnUserRevision(invalid)).toBe("Stop the delegated task.");
-    await expect(f.run(invalid), `${round}:${change}`).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    await expect(withContinuitySourceDiagnostics(invalid, { scenario, format, round, change, statePath: f.statePath,
+      threadId: f.threadId, submissions: () => f.submissions.length }, () => f.run(invalid)), `${round}:${change}`)
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
     expect(bindings.recoveryStore.get(before.thread)!.version, `${round}:${change}`).toBe(before.version);
     expect(f.submissions, `${round}:${change}`).toHaveLength(submissions);
   }
@@ -1422,7 +1425,8 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
     .toThrow("conflicting latest-user marker");
   f.controls.handoffSummary = `Delegated progress, checkpoint ${round}.`;
   const expected = canonicalizeCompactionHandoff(repeated, f.controls.handoffSummary);
-  const events = await f.run(repeated);
+  const events = await withContinuitySourceDiagnostics(repeated, { scenario, format, round, change: "none", statePath: f.statePath,
+    threadId: f.threadId, submissions: () => f.submissions.length }, () => f.run(repeated));
   expect(events.find(event => event.type === "text_delta" && event.text === expected)).toBeDefined();
   const after = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
   expect(Object.values(after.compactionTargets).some(target => target.sourceLogicalWorkId === seed.consumerId
@@ -1453,7 +1457,7 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child repe
   for (const [key, page] of seed.pages) f.pages.set(key, page);
   f.controls.queryIncludesContinuity = true;
   expect(continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))).toBeUndefined();
-  const next = await repeatDelegationCheckpoint(f, seed, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2", 2);
+  const next = await repeatDelegationCheckpoint(f, seed, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2", 2, "restart-child-repeat");
   writeFileSync(join(root, "delegation-next.json"), JSON.stringify(next));
 }, 30000);
 
@@ -1488,8 +1492,8 @@ for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, t
   f.controls.queryIncludesContinuity = true;
   const bindings = continuityBindingsFor(f.statePath);
   expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
-  if (!restartAgain) seed = await repeatDelegationCheckpoint(f, seed, format, 2);
-  await repeatDelegationCheckpoint(f, seed, format, 3);
+  if (!restartAgain) seed = await repeatDelegationCheckpoint(f, seed, format, 2, `recompact:second-exit=${restartAgain}`);
+  await repeatDelegationCheckpoint(f, seed, format, 3, `recompact:second-exit=${restartAgain}`);
 }, 30000);
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const olderPrefix of [false, true]) test(`native AGENTS refresh reaches the healthy increment: manual=${manual} checkpoint=${checkpoint} older-prefix=${olderPrefix}`, async () => {
@@ -1556,7 +1560,7 @@ for (const format of ["v1", "v2"] as const) for (const ownership of ["item", "tu
   f.controls.queryIncludesContinuity = true;
   const bindings = continuityBindingsFor(f.statePath);
   expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
-  const current = await repeatDelegationCheckpoint(f, seed, format, 2);
+  const current = await repeatDelegationCheckpoint(f, seed, format, 2, `new-ordinary:ownership=${ownership}`);
   const binding = bindings.observed(continuityDigest(f.threadId))!;
   expect(binding.state).toBe("ready");
   expect(binding.executionKey).toBeUndefined();
