@@ -27,6 +27,9 @@ jobs:
 
   build:
     needs: codex-model-gate
+    permissions:
+      contents: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -66,13 +69,24 @@ jobs:
       - run: bun run verify
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+          CGW_TEST_RUNNER_CLASS: ${{ matrix.runner }}
+          CGW_TEST_TIMING_RESTORE: "1"
+          CGW_TEST_TIMING_TOKEN: ${{ github.token }}
+          CGW_TEST_TIMING_ARTIFACT_DIR: ${{ runner.temp }}/test-timing-history
+      - name: Upload complete platform file timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-${{ matrix.runner }}
+          path: ${{ runner.temp }}/test-timing-history
+          if-no-files-found: ignore
       - name: Upload test performance reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-performance-release-${{ matrix.runner }}
           path: ${{ runner.temp }}/test-performance
-          if-no-files-found: ignore
+          if-no-files-found: warn
       - run: bun run app:package
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux' && runner.arch == 'X64'

@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { collectPerformanceReports } from "../scripts/test-performance-reports";
+import { expectTestChildExit } from "../scripts/test-performance-children";
 
 const modulePath = resolve(import.meta.dir, "../src/runtime-performance.ts");
 const counter = { count: 1, errors: 0, totalMs: 4, maxMs: 4, totalBytes: 11 };
@@ -53,6 +54,7 @@ test("disabled diagnostics and failed report writes preserve application results
         flushRuntimePerformance(true);
       `], { env: { ...process.env, CGW_RUNTIME_PERFORMANCE_DIR: reportDirectory }, stdout: "pipe", stderr: "pipe" });
       expect(child.exitCode).toBe(0);
+      if (reportDirectory) expect(child.stderr.toString()).toContain("snapshot-write-failed");
     }
     expect(readdirSync(directory)).toHaveLength(0);
   } finally { rmSync(directory, { recursive: true, force: true }); }
@@ -103,6 +105,166 @@ test("completed native child ledgers match their parent's start counter", () => 
   });
   expect(result.complete).toBe(true);
 });
+
+test("expected child exits accept only explicit finite codes and preserve the call result", () => {
+  for (const codes of [[], [0], [-1], [1.5], [Infinity], [NaN], [1, 1]]) {
+    expect(() => expectTestChildExit(codes, () => 9)).toThrow("positive integers");
+  }
+  const result = {};
+  expect(expectTestChildExit([1, 7], () => result)).toBe(result);
+  const failure = Error("original callback failure");
+  expect(() => expectTestChildExit([1], () => { throw failure; })).toThrow(failure);
+});
+
+for (const defect of ["none", "missing", "pending", "signal", "undeclared", "legacy-v2"]) {
+  test(`expected nonzero results remain separate from collection integrity (${defect})`, () => {
+    const result = collectFixture(directory => {
+      const root = { ...snapshot(), version: 3, pendingOperations: 0, completedBy: "flush",
+        counters: { "process.start": counter } };
+      writeFileSync(join(directory, "root.json"), JSON.stringify(root));
+      writeFileSync(join(directory, "child.child.json"), JSON.stringify({ version: defect === "legacy-v2" ? 2 : 3,
+        kind: "child", runId: "run", id: "child", parentId: "root", parentSnapshotId: root.snapshotId,
+        pid: 456, expectsReport: true, status: "exited", exitCode: 7,
+        signal: defect === "signal" ? "SIGKILL" : null, expectedExitCodes: defect === "undeclared" ? [] : [7] }));
+      if (defect !== "missing") writeFileSync(join(directory, "child.json"), JSON.stringify({ ...root,
+        snapshotId: "child-snapshot", processId: "child", pid: 456, counters: {}, completedBy: "exit",
+        pendingOperations: defect === "pending" ? 1 : 0, complete: defect !== "pending" }));
+    });
+    expect(result.children[0].outcome).toBe(defect === "signal" ? "signal"
+      : ["undeclared", "legacy-v2"].includes(defect) ? "unexpected-nonzero" : "expected-nonzero");
+    expect(result.complete).toBe(["none", "undeclared"].includes(defect));
+    expect(result.childResultIssues.length).toBe(["undeclared", "legacy-v2"].includes(defect) ? 1 : 0);
+    if (defect === "missing") expect(result.incompleteReasons).toContain("missing-child-report:child");
+    if (defect === "pending") expect(result.incompleteReasons).toContain("pending-operations:child-snapshot:1");
+  });
+}
+
+test("child exit declarations cover synchronous startup only, including asynchronous children", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cgw-child-exits-"));
+  const tracker = resolve(import.meta.dir, "../scripts/test-performance-children.ts");
+  try {
+    const child = Bun.spawnSync([process.execPath, "-e", `
+      import { trackTestChildren, expectTestChildExit } from ${JSON.stringify(tracker)};
+      trackTestChildren();
+      const command = [process.execPath, "-e", "process.exit(7)"];
+      const options = { stdout: "pipe", stderr: "pipe" };
+      const sync = expectTestChildExit([7], () => Bun.spawnSync(command, options));
+      if (sync.exitCode !== 7 || sync.signalCode != null) throw Error("sync result changed");
+      const asyncChild = expectTestChildExit([7], () => Bun.spawn(command, options));
+      if (await asyncChild.exited !== 7 || asyncChild.signalCode != null) throw Error("async result changed");
+      const undeclared = await expectTestChildExit([7], async () => {
+        await Promise.resolve();
+        return Bun.spawnSync(command, options);
+      });
+      if (undeclared.exitCode !== 7) throw Error("undeclared result changed");
+    `], { env: { ...process.env, CGW_RUNTIME_PERFORMANCE_DIR: directory, CGW_PERFORMANCE_RUN_ID: "run",
+      CGW_PERFORMANCE_PROCESS_ID: "root", CGW_PERFORMANCE_ROOT_PROCESS_ID: "root", BUN_TEST_WORKER_ID: "" },
+      stdout: "pipe", stderr: "pipe", timeout: 5000 });
+    expect(child.exitCode, child.stderr.toString()).toBe(0);
+    const metrics = collectPerformanceReports(directory, "run", "root", child.pid);
+    expect(metrics.complete).toBe(true);
+    expect(metrics.children.map(record => record.outcome).sort()).toEqual(["expected-nonzero", "expected-nonzero", "unexpected-nonzero"]);
+    expect(metrics.childResultIssues).toHaveLength(1);
+    expect(metrics.totals["process.start"]?.count).toBe(3);
+    const expectedChild = metrics.children.find(record => record.outcome === "expected-nonzero");
+    const reportFile = readdirSync(directory).find(file => file.startsWith(`${expectedChild.pid}-`))!;
+    rmSync(join(directory, reportFile));
+    const missing = collectPerformanceReports(directory, "run", "root", child.pid);
+    expect(missing.complete).toBe(false);
+    expect(missing.incompleteReasons).toContain(`missing-child-report:${expectedChild.id}`);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("failed child startup has a matching attempt and keeps the original error", () => {
+  const directory = mkdtempSync(join(tmpdir(), "cgw-child-start-"));
+  const tracker = resolve(import.meta.dir, "../scripts/test-performance-children.ts");
+  try {
+    const child = Bun.spawnSync([process.execPath, "-e", `
+      import { trackTestChildren } from ${JSON.stringify(tracker)};
+      trackTestChildren();
+      for (const method of ["spawn", "spawnSync"]) {
+        try { Bun[method]([${JSON.stringify(join(directory, "missing-executable"))}], { stdout: "pipe", stderr: "pipe" }); }
+        catch (error) { if (error.code === "ENOENT") continue; throw error; }
+        throw Error("missing executable unexpectedly started");
+      }
+    `], { env: { ...process.env, CGW_RUNTIME_PERFORMANCE_DIR: directory, CGW_PERFORMANCE_RUN_ID: "run",
+      CGW_PERFORMANCE_PROCESS_ID: "root", CGW_PERFORMANCE_ROOT_PROCESS_ID: "root", BUN_TEST_WORKER_ID: "" }, stdout: "pipe", stderr: "pipe" });
+    expect(child.exitCode, child.stderr.toString()).toBe(0);
+    const metrics = collectPerformanceReports(directory, "run", "root", child.pid);
+    expect(metrics.complete).toBe(false);
+    expect(metrics.children.map(record => record.outcome)).toEqual(["spawn-failed", "spawn-failed"]);
+    expect(metrics.totals["process.start"]).toMatchObject({ count: 2, errors: 2 });
+    expect(metrics.incompleteReasons.some(reason => reason.includes("ledger-mismatch"))).toBe(false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+for (const workers of [1, 2]) {
+  test(`${workers} worker globals include file cleanup and cannot hide an earlier missing global`, () => {
+    const directory = mkdtempSync(join(tmpdir(), "cgw-worker-globals-"));
+    const preload = resolve(import.meta.dir, "../scripts/test-performance-preload.ts");
+    try {
+      const reports = join(directory, "reports"); mkdirSync(reports);
+      const files = Array.from({ length: 3 }, (_, index) => {
+        const file = join(directory, `case-${index}.test.ts`);
+        writeFileSync(file, `import {test,afterAll,expect} from "bun:test";
+          test("child startup", async () => {
+            expect(Bun.spawnSync([process.execPath,"--version"],{stdout:"pipe",stderr:"pipe"}).exitCode).toBe(0);
+            await new Promise(resolve => setTimeout(resolve,25));
+          });
+          afterAll(async () => {
+            const child=Bun.spawn([process.execPath,"--version"],{stdout:"pipe",stderr:"pipe"});
+            expect(await child.exited).toBe(0);
+          });`);
+        return file;
+      });
+      const child = Bun.spawnSync([process.execPath, "test", `--parallel=${workers}`, "--preload", preload, ...files], {
+        env: { ...process.env, NO_COLOR: "1", CGW_RUNTIME_PERFORMANCE_DIR: reports, CGW_PERFORMANCE_RUN_ID: "run",
+          CGW_PERFORMANCE_PROCESS_ID: "root", CGW_PERFORMANCE_ROOT_PROCESS_ID: "root", BUN_TEST_WORKER_ID: "" },
+        stdout: "pipe", stderr: "pipe", timeout: 5000,
+      });
+      expect(child.exitCode, child.stderr.toString()).toBe(0);
+      const metrics = collectPerformanceReports(reports, "run", "root", child.pid);
+      expect({ complete: metrics.complete, reasons: metrics.incompleteReasons, invalid: metrics.invalidReports }).toEqual({ complete: true, reasons: [], invalid: [] });
+      expect(metrics.snapshots).toBe(3);
+      expect(metrics.totals["process.start"]?.count).toBe(6);
+      expect(new Set(metrics.children.filter(record => record.kind === "worker").map(record => record.pid)).size).toBe(workers);
+      const globalFile = readdirSync(reports).find(file => file.endsWith(".global.json"))!;
+      const global = JSON.parse(readFileSync(join(reports, globalFile), "utf8"));
+      const snapshotFile = readdirSync(reports).find(file => file === `${global.pid}-${global.snapshotId}.json`)!;
+      rmSync(join(reports, snapshotFile));
+      const missing = collectPerformanceReports(reports, "run", "root", child.pid);
+      expect(missing.children.filter(record => record.kind === "worker").every(record => record.complete)).toBe(true);
+      expect(missing.complete).toBe(false);
+      expect(missing.incompleteReasons).toContain(`missing-global-report:${global.snapshotId}`);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test(`${workers} worker interruption retains the unfinished global and startup counter`, () => {
+    const directory = mkdtempSync(join(tmpdir(), "cgw-worker-interrupt-"));
+    const preload = resolve(import.meta.dir, "../scripts/test-performance-preload.ts");
+    try {
+      const reports = join(directory, "reports"); mkdirSync(reports);
+      const file = join(directory, "interrupt.test.ts");
+      writeFileSync(file, `import {test} from "bun:test"; test("interrupted",()=>{
+        Bun.spawnSync([process.execPath,"--version"],{stdout:"pipe",stderr:"pipe"}); process.exit(23);
+      });`);
+      const sibling = join(directory, "sibling.test.ts");
+      writeFileSync(sibling, 'import {test} from "bun:test";test("sibling",async()=>{await new Promise(resolve=>setTimeout(resolve,30));});');
+      const child = Bun.spawnSync([process.execPath, "test", `--parallel=${workers}`, "--preload", preload, file, sibling], {
+        env: { ...process.env, NO_COLOR: "1", CGW_RUNTIME_PERFORMANCE_DIR: reports, CGW_PERFORMANCE_RUN_ID: "run",
+          CGW_PERFORMANCE_PROCESS_ID: "root", CGW_PERFORMANCE_ROOT_PROCESS_ID: "root", BUN_TEST_WORKER_ID: "" },
+        stdout: "pipe", stderr: "pipe", timeout: 5000,
+      });
+      expect(child.exitCode).not.toBe(0);
+      const metrics = collectPerformanceReports(reports, "run", "root", child.pid);
+      expect(metrics.complete).toBe(false);
+      expect(metrics.incompleteReasons.some(reason => reason.startsWith("unfinished-global-ledger:"))).toBe(true);
+      expect(metrics.incompleteReasons).not.toContain("untracked-process-report");
+      expect(metrics.incompleteReasons.some(reason => reason.includes("ledger-mismatch"))).toBe(false);
+      expect(metrics.totals["process.start"]?.count).toBe(1);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+}
 
 test("failed child ledger writes preserve results and make recovered reports incomplete", () => {
   const directory = mkdtempSync(join(tmpdir(), "cgw-child-ledger-"));

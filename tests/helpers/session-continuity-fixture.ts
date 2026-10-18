@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../../src/adapters/chatgpt-web/browser-worker";
-import { continuityDigest } from "../../src/adapters/chatgpt-web/continuity-binding";
+import { continuityDigest, existingContinuityBindings } from "../../src/adapters/chatgpt-web/continuity-binding";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityClaim, type ContinuityLease, type ContinuityLauncherInstance } from "../../src/adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "../../src/adapters/chatgpt-web/continuity-errors";
 import { ContinuityRegistrationStore } from "../../src/adapters/chatgpt-web/continuity-registration";
@@ -69,10 +69,14 @@ export function codexRoundtrippedOutput(output: Array<Record<string, unknown>>):
 // Each test file owns its cleanup stack and supplies its helper descriptor path.
 export function createSessionContinuityFixtures(testFilePath: string) {
   const cleanups: Array<() => Promise<void>> = [];
+  const backendExits: Array<() => Promise<void>> = [];
 
   async function disposeTestFixtures(): Promise<void> {
-    chatGptTurnSessions.clear();
     const errors: unknown[] = [];
+    for (const exit of backendExits.splice(0).reverse()) {
+      try { await exit(); } catch (error) { errors.push(error); }
+    }
+    chatGptTurnSessions.clear();
     for (const cleanup of cleanups.splice(0).reverse()) {
       try { await cleanup(); } catch (error) { errors.push(error); }
     }
@@ -84,7 +88,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       () => measureRuntimeOperation("fixture.prepare", () => createFixture(...args)));
   }
 
-  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance } = {}) {
+  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit" } = {}) {
     const profileContext = runtimePerformanceContext();
     const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
     const statePath = join(root, "continuity");
@@ -483,6 +487,21 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         () => retire([...pages.keys(), ...submissions.map(submission => submission.key)]))));
     }
     const threadId = options.threadId ?? `thread-${root}`;
+    if (options.cleanupMode === "backend-exit") backendExits.push(async () => {
+      const bindings = existingContinuityBindings(statePath);
+      const binding = bindings?.observed(continuityDigest(threadId));
+      if (!bindings || !binding) return;
+      const source = binding.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
+      if (source) {
+        if (source.isActive() || source.outstanding().length) throw new Error("Backend exit cleanup requires completed continuity work.");
+        await source.physicalSettlement;
+        await source.waitForLogicalSettlement();
+      }
+      // Backend exit keeps the Launcher document. Retire local capabilities and
+      // indexes before clear() can turn a settled session into a page cancellation.
+      await chatGptTurnSessions.detachContinuityBinding(binding);
+      bindings.forget(binding);
+    });
     const request = (text = "First continuity instruction.", turnId = "turn-first", input?: unknown[]): CodexParsedRequest => {
       const parsed = parseRequest({
         model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : "gpt-5.6-sol", stream: false,

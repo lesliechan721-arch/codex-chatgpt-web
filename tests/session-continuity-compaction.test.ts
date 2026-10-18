@@ -22,6 +22,8 @@ import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { performanceTest } from "./helpers/performance-test";
 import { createSessionContinuityFixtures, recordedCall } from "./helpers/session-continuity-fixture";
+import { withContinuitySourceDiagnostics } from "./helpers/continuity-source-diagnostics";
+import * as launcherHost from "../src/launcher-browser-host";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
@@ -1357,10 +1359,7 @@ for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint pres
   expect(f.submissions.at(-1)?.prompt).toContain("Use the new scope.");
 });
 
-test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed", async () => {
-  const root = process.env.DELEGATION_RESTART_ROOT!;
-  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
-  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+async function seedDelegationCheckpoint(f: ReturnType<typeof fixture>, format: "v1" | "v2") {
   f.controls.invokeSourceTools = true;
   const human = { type: "message", role: "user", id: "older-human", content: [{ type: "input_text", text: "Earlier human task." }],
     internal_chat_message_metadata_passthrough: { turn_id: "older-human-turn" } };
@@ -1376,17 +1375,88 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
   compact._compactionRequest = true;
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing delegated summary");
-  const installed = process.env.DELEGATION_RESTART_FORMAT === "v1"
+  const installed = format === "v1"
     ? buildCompactV1Output(extractCompactUserMessages([human, delegation]), summary.text)
     : [human, { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) }];
   f.controls.invokeSourceTools = false;
   expect((await f.run(f.request("", "consumer-turn", installed))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
-  writeFileSync(join(root, "delegation-seed.json"), JSON.stringify({ installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
-    consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] }));
+  expect(record, "The seed process must persist its checkpoint before exit.").toBeDefined();
+  expect(record.historyRevision).toBe(1);
+  expect(Object.values(record.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(summary.text)
+    && checkpoint.sourceIdentity === delegation.id && checkpoint.continuation.state === "consumed"
+    && checkpoint.continuation.consumerLogicalWorkId === record.currentWorkId)).toBe(true);
+  return { installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
+    consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] };
+}
+
+for (const cleanupMode of ["release-page", "backend-exit"] as const) test(`delegation checkpoint fixture cleanup mode=${cleanupMode}`, async () => {
+  const root = mkdtempSync(join(tmpdir(), "delegation-cleanup-"));
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", cleanupMode });
+  let observed: ReturnType<typeof spyOn> | undefined;
+  try {
+    const seed = await seedDelegationCheckpoint(f, "v1");
+    const bindings = continuityBindingsFor(f.statePath);
+    const binding = bindings.observed(continuityDigest(f.threadId))!;
+    const executionKey = binding.executionKey!;
+    const consumer = chatGptTurnSessions.find(executionKey)!;
+    await consumer.physicalSettlement;
+    await consumer.waitForLogicalSettlement();
+    const before = bindings.recoveryStore.get(binding.thread)!;
+    const releases: Promise<number>[] = [];
+    const release = launcherHost.releaseLauncherRetainedConversation;
+    observed = spyOn(launcherHost, "releaseLauncherRetainedConversation").mockImplementation((...args) => {
+      const result = release(...args);
+      if (args[0] === f.descriptorPath) releases.push(result);
+      return result;
+    });
+    cleanups.push(async () => {
+      // clear() schedules release after physical settlement. Drain its real RPC
+      // before stopping Launcher so the deletion cannot depend on socket timing.
+      await Promise.resolve();
+      await Promise.all(releases);
+    });
+    await disposeTestFixtures();
+    await expect(fetch(f.descriptor.endpoint)).rejects.toThrow();
+    if (cleanupMode === "release-page") {
+      expect(releases.length).toBeGreaterThan(0);
+      expect(f.pages.size).toBe(0);
+      expect(bindings.recoveryStore.get(before.thread)).toBeUndefined();
+    } else {
+      const after = bindings.recoveryStore.get(before.thread);
+      expect(after, "Backend exit must preserve its committed checkpoint.").toBeDefined();
+      expect(after).toEqual(before);
+      expect(releases).toHaveLength(0);
+      expect([...f.pages]).toEqual(seed.pages);
+      expect(bindings.observed(before.thread)).toBeUndefined();
+      expect(chatGptTurnSessions.find(executionKey)).toBeUndefined();
+    }
+  } finally {
+    observed?.mockRestore();
+    await disposeTestFixtures();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backend exit fixture cleanup rejects unfinished continuity work", async () => {
+  const f = fixture(false, { cleanupMode: "backend-exit" });
+  f.controls.invokeSourceTools = true;
+  await f.run(f.request());
+  const failure = await disposeTestFixtures().catch(error => error);
+  expect(failure).toBeInstanceOf(AggregateError);
+  expect((failure as AggregateError).errors.some(error => error instanceof Error
+    && error.message === "Backend exit cleanup requires completed continuity work.")).toBe(true);
+});
+
+test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed", async () => {
+  const root = process.env.DELEGATION_RESTART_ROOT!;
+  const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance, cleanupMode: "backend-exit" });
+  const seed = await seedDelegationCheckpoint(f, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2");
+  writeFileSync(join(root, "delegation-seed.json"), JSON.stringify(seed));
 }, 30000);
 
-async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number) {
+async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: any, format: "v1" | "v2", round: number, scenario: string) {
   const bindings = continuityBindingsFor(f.statePath);
   const before = bindings.recoveryStore.get(continuityDigest(f.threadId))!;
   const submissions = f.submissions.length;
@@ -1404,7 +1474,19 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
     invalid._compactionRequest = true;
     if (change === "payload") (invalid._rawBody as Record<string, unknown>).instructions = "Changed current execution constraints.";
     if (change === "steering") expect(extractChatGptTurnUserRevision(invalid)).toBe("Stop the delegated task.");
-    await expect(f.run(invalid), `${round}:${change}`).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    await expect(withContinuitySourceDiagnostics(invalid, { scenario, format, round, change, statePath: f.statePath,
+      threadId: f.threadId, submissions: () => f.submissions.length }, () => {
+        if (change === "human") {
+          // A missing journal selects the supported fresh-page path. Expose the
+          // missing expected retained state before testing retained-source rejection.
+          expect(before, "The restart fixture must retain its committed checkpoint before mutation.").toBeDefined();
+          expect(before).toMatchObject({ owner: seed.owner, epoch: seed.epoch, historyRevision: round - 1 });
+          expect(Object.values(before.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(seed.summary)
+            && checkpoint.targetHistoryRevision === round - 1 && checkpoint.sourceIdentity === "delegated-task")).toBe(true);
+        }
+        return f.run(invalid);
+      }), `${round}:${change}`)
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
     expect(bindings.recoveryStore.get(before.thread)!.version, `${round}:${change}`).toBe(before.version);
     expect(f.submissions, `${round}:${change}`).toHaveLength(submissions);
   }
@@ -1422,7 +1504,8 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
     .toThrow("conflicting latest-user marker");
   f.controls.handoffSummary = `Delegated progress, checkpoint ${round}.`;
   const expected = canonicalizeCompactionHandoff(repeated, f.controls.handoffSummary);
-  const events = await f.run(repeated);
+  const events = await withContinuitySourceDiagnostics(repeated, { scenario, format, round, change: "none", statePath: f.statePath,
+    threadId: f.threadId, submissions: () => f.submissions.length }, () => f.run(repeated));
   expect(events.find(event => event.type === "text_delta" && event.text === expected)).toBeDefined();
   const after = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
   expect(Object.values(after.compactionTargets).some(target => target.sourceLogicalWorkId === seed.consumerId
@@ -1449,11 +1532,11 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child repe
   const root = process.env.DELEGATION_RESTART_ROOT!;
   const seed = JSON.parse(readFileSync(join(root, "delegation-seed.json"), "utf8"));
   const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
-  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance });
+  const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance, cleanupMode: "backend-exit" });
   for (const [key, page] of seed.pages) f.pages.set(key, page);
   f.controls.queryIncludesContinuity = true;
   expect(continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))).toBeUndefined();
-  const next = await repeatDelegationCheckpoint(f, seed, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2", 2);
+  const next = await repeatDelegationCheckpoint(f, seed, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2", 2, "restart-child-repeat");
   writeFileSync(join(root, "delegation-next.json"), JSON.stringify(next));
 }, 30000);
 
@@ -1488,8 +1571,8 @@ for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, t
   f.controls.queryIncludesContinuity = true;
   const bindings = continuityBindingsFor(f.statePath);
   expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
-  if (!restartAgain) seed = await repeatDelegationCheckpoint(f, seed, format, 2);
-  await repeatDelegationCheckpoint(f, seed, format, 3);
+  if (!restartAgain) seed = await repeatDelegationCheckpoint(f, seed, format, 2, `recompact:second-exit=${restartAgain}`);
+  await repeatDelegationCheckpoint(f, seed, format, 3, `recompact:second-exit=${restartAgain}`);
 }, 30000);
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const olderPrefix of [false, true]) test(`native AGENTS refresh reaches the healthy increment: manual=${manual} checkpoint=${checkpoint} older-prefix=${olderPrefix}`, async () => {
@@ -1556,7 +1639,7 @@ for (const format of ["v1", "v2"] as const) for (const ownership of ["item", "tu
   f.controls.queryIncludesContinuity = true;
   const bindings = continuityBindingsFor(f.statePath);
   expect(bindings.observed(continuityDigest(f.threadId))).toBeUndefined();
-  const current = await repeatDelegationCheckpoint(f, seed, format, 2);
+  const current = await repeatDelegationCheckpoint(f, seed, format, 2, `new-ordinary:ownership=${ownership}`);
   const binding = bindings.observed(continuityDigest(f.threadId))!;
   expect(binding.state).toBe("ready");
   expect(binding.executionKey).toBeUndefined();

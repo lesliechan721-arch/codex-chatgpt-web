@@ -4,35 +4,69 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { apiAccessRevision, apiKeyMatches, apiKeyPolicy, MODEL_CATALOG_STATUS_HEADER } from "../src/api-access";
-import { loadApiAccessPolicy, openAiRoutingPendingPath } from "../src/api-access-config";
+import { loadApiAccessPolicy, openAiRoutingPendingPath, saveApiAccessPolicy } from "../src/api-access-config";
 import { defaultConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { buildStandaloneModelCatalog } from "../src/standalone-model-catalog";
 import { upstreamProviderRevision } from "../src/upstream-provider";
+import { expectTestChildExit } from "../scripts/test-performance-children";
 import modelCatalogCommandLock from "../launcher/electron/model-catalog-command-lock.cjs";
 
 const { processStartIdentity } = modelCatalogCommandLock as {
   processStartIdentity: (pid: number) => string | null;
 };
 
-function withHome(run: (home: string) => void): void {
+type CliDiagnostic = { scenario: string; command: string; durationMs: number; exitCode: number | null };
+const homeDiagnostics = new Map<string, { scenario: string; launches: CliDiagnostic[] }>();
+
+function recordCliExit(home: string, command: string, started: number, exitCode: number | null): void {
+  const diagnostics = homeDiagnostics.get(home);
+  diagnostics?.launches.push({ scenario: diagnostics.scenario, command, durationMs: performance.now() - started, exitCode });
+}
+
+function cleanupHome(home: string): void {
+  let cleanup = "failed";
+  try {
+    rmSync(home, { recursive: true, force: true });
+    cleanup = existsSync(home) ? "failed" : "removed";
+  } finally {
+    const diagnostics = homeDiagnostics.get(home);
+    homeDiagnostics.delete(home);
+    if (process.env.CGW_API_KEY_CLI_DIAGNOSTICS === "1") {
+      for (const launch of diagnostics?.launches ?? []) {
+        process.stderr.write(`[api-key-cli] ${JSON.stringify({ ...launch, cleanup })}\n`);
+      }
+    }
+  }
+}
+
+function withHome(scenario: string, run: (home: string) => void): void {
   const home = mkdtempSync(join(tmpdir(), "cgw-api-key-cli-"));
-  try { run(home); } finally { rmSync(home, { recursive: true, force: true }); }
+  homeDiagnostics.set(home, { scenario, launches: [] });
+  try { run(home); } finally { cleanupHome(home); }
 }
 function cli(home: string, args: string[], input?: string, environment: Record<string, string | undefined> = {}) {
+  const started = performance.now();
   const result = Bun.spawnSync([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
     "--home", home, "api-key", ...args], {
     env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: join(home, "codex"), ...environment },
     stdin: input === undefined ? "ignore" : Buffer.from(input),
     stdout: "pipe", stderr: "pipe",
   });
+  recordCliExit(home, args[0]!, started, result.exitCode);
   return { code: result.exitCode, out: result.stdout.toString(), err: result.stderr.toString() };
 }
+function rejectedCli(home: string, args: string[], input?: string, environment: Record<string, string | undefined> = {}) {
+  return expectTestChildExit([1], () => cli(home, args, input, environment));
+}
 function spawnCli(home: string, args: string[], environment: Record<string, string | undefined> = {}) {
-  return Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
+  const started = performance.now();
+  const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../src/cli.ts"),
     "--home", home, "api-key", ...args], {
     env: { ...process.env, CODEX_CHATGPT_WEB_HOME: home, CODEX_HOME: join(home, "codex"), ...environment },
     stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
+  void child.exited.then(code => recordCliExit(home, args[0]!, started, code));
+  return child;
 }
 async function spawnedCliResult(process: ReturnType<typeof spawnCli>) {
   const code = await process.exited;
@@ -55,7 +89,7 @@ function differentProcessStartIdentity(value: string): string {
 }
 
 // Four CLI startups share this timeout; allow for slower Windows CI runners.
-test("CLI generates once, reports redacted status, rotates and explicitly disables", () => withHome(home => {
+test("CLI generates once, reports redacted status, rotates and explicitly disables", () => withHome("generate, status, rotate, disable", home => {
   const enabled = cli(home, ["enable", "--generate"]);
   assert.equal(enabled.code, 0, enabled.err);
   const first = enabled.out.trim();
@@ -76,30 +110,59 @@ test("CLI generates once, reports redacted status, rotates and explicitly disabl
   assert.equal(loadApiAccessPolicy(home).mode, "openai");
 }), 15_000);
 
-// These validation cases start four CLI processes in sequence.
-test("CLI stdin import never echoes the key and rejects ambiguous options", () => withHome(home => {
+test("CLI stdin import never echoes or persists the plaintext key", () => withHome("stdin import", home => {
   const key = "test_imported_key_" + "k".repeat(32);
   const imported = cli(home, ["enable", "--key-stdin"], `${key}\r\n`);
   assert.equal(imported.code, 0, imported.err);
   assert.equal(imported.out, "");
   assert.ok(!imported.err.includes(key));
   assert.deepEqual(loadApiAccessPolicy(home), apiKeyPolicy(key));
-  assert.notEqual(cli(home, ["rotate", "--generate", "--key-stdin"]).code, 0);
-  assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
-  const invalid = cli(home, ["rotate", "--key-stdin"], "short-secret\n");
-  assert.notEqual(invalid.code, 0);
-  assert.ok(!invalid.err.includes("short-secret"));
+  assert.ok(!readFileSync(join(home, "api-access.json"), "utf8").includes(key));
 }), 15_000);
 
-test("CLI fails closed for damaged policy; only explicit disable recovers", () => withHome(home => {
+test("CLI rejects mutually exclusive generation and stdin options", () => withHome("ambiguous options", home => {
+  const rejected = rejectedCli(home, ["rotate", "--generate", "--key-stdin"]);
+  assert.equal(rejected.code, 1);
+  assert.equal(rejected.out, "");
+  assert.match(rejected.err, /requires exactly one of --generate or --key-stdin/);
+  assert.equal(existsSync(join(home, "api-access.json")), false);
+}), 15_000);
+
+test("CLI rejects enable when a key is already configured", () => withHome("already configured", home => {
+  const policy = apiKeyPolicy("existing_key_" + "k".repeat(32));
+  saveApiAccessPolicy(policy, home);
+  const rejected = rejectedCli(home, ["enable", "--generate"]);
+  assert.equal(rejected.code, 1);
+  assert.equal(rejected.out, "");
+  assert.match(rejected.err, /already configured; use rotate/);
+  assert.deepEqual(loadApiAccessPolicy(home), policy);
+}), 15_000);
+
+test("CLI rejects short stdin keys without echoing or replacing the current key", () => withHome("short stdin key", home => {
+  const policy = apiKeyPolicy("existing_key_" + "k".repeat(32));
+  saveApiAccessPolicy(policy, home);
+  const rejected = rejectedCli(home, ["rotate", "--key-stdin"], "short-secret\n");
+  assert.equal(rejected.code, 1);
+  assert.equal(rejected.out, "");
+  assert.match(rejected.err, /API key must contain 32–256/);
+  assert.ok(!rejected.err.includes("short-secret"));
+  assert.deepEqual(loadApiAccessPolicy(home), policy);
+}), 15_000);
+
+test("CLI fails closed for damaged policy; only explicit disable recovers", () => withHome("damaged policy recovery", home => {
   writeFileSync(join(home, "api-access.json"), "{");
-  assert.notEqual(cli(home, ["status"]).code, 0);
-  assert.notEqual(cli(home, ["enable", "--generate"]).code, 0);
+  const status = rejectedCli(home, ["status"]);
+  assert.equal(status.code, 1);
+  assert.match(status.err, /Invalid API access JSON/);
+  const enabled = rejectedCli(home, ["enable", "--generate"]);
+  assert.equal(enabled.code, 1);
+  assert.match(enabled.err, /Invalid API access JSON/);
+  assert.equal(readFileSync(join(home, "api-access.json"), "utf8"), "{");
   assert.equal(cli(home, ["disable"]).code, 0);
   assert.equal(loadApiAccessPolicy(home).mode, "openai");
 }), 15_000);
 
-test("successful CLI reconnect clears the persisted OpenAI routing warning", () => withHome(home => {
+test("successful CLI reconnect clears the persisted OpenAI routing warning", () => withHome("reconnect clears warning", home => {
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
   const pending = openAiRoutingPendingPath(home);
   writeFileSync(pending, '{"version":1}\n');
@@ -108,16 +171,18 @@ test("successful CLI reconnect clears the persisted OpenAI routing warning", () 
   assert.equal(existsSync(pending), false);
 }));
 
-test("CLI Codex export requires the current local key and emits sensitive TOML plus separate proxy environment", () => withHome(home => {
+test("CLI Codex export requires the current local key and emits sensitive TOML plus separate proxy environment", () => withHome("local Codex export", home => {
   const localKey = "cgw_" + "q".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
-  const missing = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: undefined });
-  assert.notEqual(missing.code, 0);
+  const missing = rejectedCli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: undefined });
+  assert.equal(missing.code, 1);
+  assert.match(missing.err, /must contain the current local API key before export/);
   assert.ok(!missing.err.includes(localKey));
   const wrong = "cgw_" + "z".repeat(43);
-  const mismatched = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: wrong });
-  assert.notEqual(mismatched.code, 0);
+  const mismatched = rejectedCli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: wrong });
+  assert.equal(mismatched.code, 1);
+  assert.match(mismatched.err, /must contain the current local API key before export/);
   assert.ok(!mismatched.err.includes(wrong));
   const exported = cli(home, ["codex-config", "--json"], undefined, {
     CODEX_CHATGPT_WEB_API_KEY: localKey,
@@ -137,7 +202,7 @@ test("CLI Codex export requires the current local key and emits sensitive TOML p
   for (const host of ["localhost", "127.0.0.1", "::1"]) assert.ok(payload.environment.NO_PROXY.includes(host));
 }), 15_000);
 
-test("CLI Codex export supports an external HTTPS client without server-local paths or Interrupt hook", () => withHome(home => {
+test("CLI Codex export supports an external HTTPS client without server-local paths or Interrupt hook", () => withHome("external HTTPS Codex export", home => {
   const localKey = "cgw_" + "r".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -161,7 +226,7 @@ test("CLI Codex export supports an external HTTPS client without server-local pa
   assert.equal(existsSync(join(home, "api-key-models.json")), false);
 }));
 
-test("CLI Codex export uses the host-mapped Responses port when public Base URL is empty", () => withHome(home => {
+test("CLI Codex export uses the host-mapped Responses port when public Base URL is empty", () => withHome("host-mapped Codex export", home => {
   const localKey = "cgw_" + "h".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -177,7 +242,7 @@ test("CLI Codex export uses the host-mapped Responses port when public Base URL 
   assert.ok(payload.config.includes('base_url = "http://127.0.0.1:27841/v1"'));
 }));
 
-test("CLI refresh-models rewrites only the model catalog", () => withHome(home => {
+test("CLI refresh-models rewrites only the model catalog", () => withHome("refresh model catalog", home => {
   const localKey = "cgw_" + "r".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -195,7 +260,7 @@ test("CLI refresh-models rewrites only the model catalog", () => withHome(home =
 }));
 
 // Both catalog commands share this timeout; allow for slower Windows CLI startups.
-test("CLI manual remote refresh-models keeps catalog export pending until explicit Codex export", () => withHome(home => {
+test("CLI manual remote refresh-models keeps catalog export pending until explicit Codex export", () => withHome("remote refresh then export", home => {
   const localKey = "cgw_" + "e".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -229,6 +294,7 @@ test("concurrent CLI catalog commands preserve the marker state of the later com
     expectMarker: boolean,
   ): Promise<void> {
     const home = mkdtempSync(join(tmpdir(), "cgw-api-key-cli-race-"));
+    homeDiagnostics.set(home, { scenario: `catalog race: ${firstArgs[0]} then ${secondArgs[0]}`, launches: [] });
     const localKey = "cgw_" + "x".repeat(43);
     const policy = apiKeyPolicy(localKey);
     const config = defaultConfig("browser-only");
@@ -314,7 +380,7 @@ test("concurrent CLI catalog commands preserve the marker state of the later com
       first?.kill();
       second?.kill();
       server.stop(true);
-      rmSync(home, { recursive: true, force: true });
+      cleanupHome(home);
     }
   }
 
@@ -322,7 +388,7 @@ test("concurrent CLI catalog commands preserve the marker state of the later com
   await runRace(["refresh-models"], ["codex-config", "--json"], false);
 }, 15_000);
 
-test("CLI recovers a stale model-catalog lock after the owner PID is reused", () => withHome(home => {
+test("CLI recovers a stale model-catalog lock after the owner PID is reused", () => withHome("reused lock owner PID", home => {
   const currentStart = processStartIdentity(process.pid);
   if (!currentStart) return;
   const localKey = "cgw_" + "r".repeat(43);
@@ -341,7 +407,7 @@ test("CLI recovers a stale model-catalog lock after the owner PID is reused", ()
   assert.equal(existsSync(lockPath), false);
 }));
 
-test("CLI manual remote plain Codex config keeps export pending and preserves complete-refresh enforcement", () => withHome(home => {
+test("CLI manual remote plain Codex config keeps export pending and preserves complete-refresh enforcement", () => withHome("remote plain then JSON export", home => {
   const localKey = "cgw_" + "u".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
@@ -367,12 +433,13 @@ test("CLI manual remote plain Codex config keeps export pending and preserves co
     models: [{ id: "gpt-upstream" }],
     supportsOpenAiServerCompaction: false,
   })}\n`);
-  const json = cli(home, ["codex-config", "--json"], undefined, environment);
-  assert.notEqual(json.code, 0);
+  const json = rejectedCli(home, ["codex-config", "--json"], undefined, environment);
+  assert.equal(json.code, 1);
+  assert.match(json.err, /Upstream model catalog refresh failed|Upstream provider runtime is not synchronized/);
   assert.equal(existsSync(pending), true);
 }));
 
-test("CLI refresh-models includes the Zero Risk Pro row after the profile is enabled", () => withHome(home => {
+test("CLI refresh-models includes the Zero Risk Pro row after the profile is enabled", () => withHome("Zero Risk Pro refresh", home => {
   const localKey = "cgw_" + "p".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   const config = defaultConfig("full");
@@ -399,7 +466,7 @@ test("CLI refresh-models includes the Zero Risk Pro row after the profile is ena
   ]);
 }));
 
-test("CLI Codex export uses saved server-compaction intent for provider naming without exporting the upstream key", () => withHome(home => {
+test("CLI Codex export uses saved server-compaction intent for provider naming without exporting the upstream key", () => withHome("server compaction Codex export", home => {
   const localKey = "cgw_" + "m".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   const config = defaultConfig("browser-only");
@@ -421,7 +488,7 @@ test("CLI Codex export uses saved server-compaction intent for provider naming w
   assert.ok(!text.includes("a".repeat(64)));
 }));
 
-test("CLI Codex export preserves a pending previous catalog when upstream refresh falls back", () => withHome(home => {
+test("CLI Codex export preserves a pending previous catalog when upstream refresh falls back", () => withHome("upstream fallback preserves catalog", home => {
   const localKey = "cgw_" + "n".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
   const config = defaultConfig("browser-only");
@@ -441,8 +508,9 @@ test("CLI Codex export preserves a pending previous catalog when upstream refres
   const pendingPath = join(home, "api-key-models-refresh-pending.json");
   writeFileSync(pendingPath, '{"version":1}\n');
 
-  const exported = cli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: localKey });
-  assert.notEqual(exported.code, 0);
+  const exported = rejectedCli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: localKey });
+  assert.equal(exported.code, 1);
+  assert.match(exported.err, /Upstream model catalog refresh failed|Upstream provider runtime is not synchronized/);
   assert.deepEqual(JSON.parse(readFileSync(catalogPath, "utf8")), previousCatalog);
   assert.equal(existsSync(pendingPath), true);
 }));

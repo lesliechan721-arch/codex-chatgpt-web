@@ -46,6 +46,7 @@ const unassigned: RuntimePerformanceContext = inherited ?? { file: null, scenari
 const attributed = new Map<string, { context: RuntimePerformanceContext; counters: typeof counters }>();
 const startedAt = new Date().toISOString();
 let complete = false;
+let completedBy: "flush" | "afterAll" | "exit" | null = null;
 let inFlight = 0;
 const diagnosticErrors = new Set<string>();
 
@@ -54,6 +55,7 @@ export function markRuntimePerformanceIncomplete(reason: string): void {
 }
 
 export function runtimePerformanceEnabled(): boolean { return reportPath !== undefined; }
+export function runtimePerformanceSnapshotId(): string | undefined { return snapshotId; }
 export function runtimePerformanceContext(): RuntimePerformanceContext {
   return contexts.getStore() ?? unassigned;
 }
@@ -111,22 +113,29 @@ export async function measureRuntimeAsync<T>(operation: RuntimePerformanceOperat
   finally { finish(failed); }
 }
 
-export function flushRuntimePerformance(finished = false): void {
+export function flushRuntimePerformance(finished = false, boundary: "flush" | "afterAll" | "exit" = "flush"): void {
   if (!reportPath) return;
   complete ||= finished;
+  if (finished) completedBy = boundary;
   try {
     // No paths, process start identities, request content or credentials enter the report.
     // Replace this global's snapshot so afterAll + exit cannot count it twice.
-    writeFileSync(reportPath, JSON.stringify({ version: 2, snapshotId, runId: process.env.CGW_PERFORMANCE_RUN_ID ?? null,
+    writeFileSync(reportPath, JSON.stringify({ version: 3, snapshotId, runId: process.env.CGW_PERFORMANCE_RUN_ID ?? null,
       processId: process.env.CGW_PERFORMANCE_PROCESS_ID ?? null, pid: process.pid,
       workerId: process.env.BUN_TEST_WORKER_ID ?? null, platform: process.platform, startedAt,
       complete: complete && inFlight === 0 && diagnosticErrors.size === 0,
+      pendingOperations: inFlight, completedBy,
       diagnosticErrors: [...diagnosticErrors], counters, contexts: [...attributed.values()] }));
-  } catch { markRuntimePerformanceIncomplete("snapshot-write-failed"); }
+  } catch {
+    if (!diagnosticErrors.has("snapshot-write-failed")) {
+      try { console.warn("[test-performance] snapshot-write-failed"); } catch { /* Diagnostics must preserve the application result. */ }
+    }
+    markRuntimePerformanceIncomplete("snapshot-write-failed");
+  }
 }
 
 if (reportPath) {
   // The initial snapshot lets the collector detect interrupted globals as well as bad final reports.
   flushRuntimePerformance();
-  process.on("exit", () => flushRuntimePerformance(true));
+  process.on("exit", () => flushRuntimePerformance(true, "exit"));
 }

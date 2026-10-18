@@ -7,6 +7,8 @@ is `auto`; selecting `1` or `2` overrides the worker count on every OS in that r
 `test:profile` is an alias for `test`, and `test:parallel` explicitly selects two workers.
 Launcher type checks and tests run first, so a Launcher failure does not wait for the full
 server suite. Each verification command prints its elapsed time and exit code.
+`verify-summary.json` preserves stage results, failures and test-report locations. Actions
+also shows a verification summary. Missing report artifacts produce a warning.
 
 Continuity integration tests are split into adapter, HTTP, compaction, recovery and checkpoint
 files. Each file owns its fixture cleanup. Bun can distribute these files across workers;
@@ -92,20 +94,36 @@ their locks and authority checks.
 
 Counters are disabled unless the profiler sets `CGW_RUNTIME_PERFORMANCE_DIR`. The profiler
 flushes before a test file's isolated global is discarded and at normal process exit. A
-version 2 snapshot is also written at startup. A killed process can leave an unfinished
+version 3 snapshot is also written at startup. Each isolated test global has its own
+ledger and completion evidence; a later worker completion cannot finish an earlier global. A killed process can leave an unfinished
 snapshot. Bun child starts and exits, including Bun's `node:child_process` implementation,
 are recorded separately; runtime children receive a runtime-only preload. Native programs
 are tracked for exit status and do not produce backend counters. Tests that explicitly
 use a separate diagnostic report directory keep that directory; the parent records this
-exclusion. Unknown, abnormal or missing children, unfinished globals, corrupt reports and
-unidentified source make metrics incomplete. Expected crash tests can therefore pass while
+exclusion. Missing children, signals, unfinished operations/globals, corrupt reports and
+unidentified source make metrics incomplete. The narrow `expectTestChildExit([1], action)`
+helper can declare a specific negative-case exit when starting a child. The test must still
+assert that status and its rejection semantics. A declaration does not exempt missing reports,
+signals or unfinished operations. Undeclared nonzero exits appear in `childResultIssues`
+and are rejected by successful-path comparisons, even if collection is complete. Expected crash tests can therefore pass while
 their performance report remains incomplete. A successful test exit does not prove complete
 metrics. Report and log I/O failures preserve the test exit code and still wait for the test
 process. Child-start counters must match the ledger for each parent process; a lost ledger
 or failed ledger write makes the evidence incomplete. Comparison refuses incomplete
 metrics and does not report a speedup for them.
 
-Version 2 records the actual checkout SHA, dirty status and patch digest, measurement tool
+Version 3 separates `testResult`, `collection` and `wallValid`. Assertion failure does not
+by itself make collection incomplete, and complete collection does not make a failed run
+valid performance evidence. `wallMs` remains root-process execution time. `segments` adds
+preparation, post-exit log draining and report aggregation. `completion.json` records
+the later point after summary serialization, persistence and status output. It identifies
+the same run and explicitly excludes its own small write and process shutdown. Parent
+comparison/verification processes separately record `wrapperExitMs` through actual child
+exit. Strict v3 comparison rejects a missing or invalid completion record. Log draining has a five-second limit after root exit; this is not worker
+crash detection. The actual executable path/digest and whether it is the prepared embedded
+Bun are recorded. Preparing a Windows packaging runtime does not select it for tests.
+
+Version 3 records the actual checkout SHA, dirty status and patch digest, measurement tool
 digest, Bun and installed Node versions, OS/architecture, runner image, command, timestamps
 and test counts. `workflowRevision` records `GITHUB_SHA` separately. The measurement patch
 must be identical in both versions. `measurementFiles` lists content hashes for the collector,
@@ -113,7 +131,8 @@ drivers and every production/test probe file. `toolDigest` includes this full ma
 The version driver requires whole-file equality for these files. This conservative check
 also rejects a business change in a probe file; such a change needs a separately reviewed
 measurement/coverage comparison before it can support a performance conclusion.
-Version 1 snapshots retain their old counters; added
+Old version 2 summaries retain their original completeness gate; they do not gain v3
+evidence from a successful exit. Version 1 snapshots retain their old counters; added
 phase fields stay unknown (`null`). Their missing provenance/completeness cannot support a
 new formal performance conclusion. Repeated flushes replace the same snapshot; duplicate
 snapshot IDs are rejected.
@@ -123,8 +142,8 @@ totals cover the selected suite; run a single file to attribute those totals to 
 ## Compare serial and two-worker runs
 
 ```sh
-bun run test --parallel=1
-bun run test --parallel=2
+bun run test --parallel=1 --isolation=isolate
+bun run test --parallel=2 --isolation=isolate
 ```
 
 Reports go to separate run directories under ignored `output/test-performance/`. Set
@@ -135,14 +154,16 @@ bun run test --parallel=1 tests/session-continuity tests/continuity-recovery-com
 bun run test --parallel=2 tests/session-continuity tests/continuity-recovery-compaction.test.ts tests/continuity-task-update.test.ts tests/continuity-recovery-store.test.ts
 ```
 
-For hosted measurements, manually run the CI workflow on the same revision with
-`test_workers` set to `1`, then `2`. This selects Bun 1.4.2 file-level parallelism with fresh
-globals; tests within a file stay serial. Repeat each setting and compare failures as well
+For controlled worker measurements, use the manual diagnostic workflow or explicitly
+select `--isolation=isolate` for both worker counts. The ordinary wrapper keeps its prior
+default: one worker omits `--parallel`, while two workers use Bun's default file isolation.
+Those ordinary calls differ in both worker count and isolation; tests within a file stay serial. Repeat each setting and compare failures as well
 as wall time. Keep failures in the comparison. A faster local macOS run does not establish
 a Windows improvement.
 
-Each run starts with an empty timing file, so earlier measurements do not change file
-scheduling. The `tests/session-continuity` path filter selects all continuity test files,
+Each run starts with a new timing output. With no explicit history source, scheduling
+is cold. When history is enabled, a separate fixed input snapshot supplies prior durations;
+only files observed in the current run remain in its output. The `tests/session-continuity` path filter selects all continuity test files,
 including the split integration suite. Compare the complete selected set when evaluating
 file distribution. Do not remove durability checks, cache PID liveness, or skip recovery
 tests to improve a benchmark.
@@ -154,6 +175,11 @@ bun run test:compare
 bun run test:compare --repetitions=1 tests/continuity-recovery-store.test.ts
 ```
 
+Worker comparisons use explicit file isolation by default. `--isolation=default` selects
+the original wrapper behavior and permits old v2 reports without inventing isolation
+evidence. Use `--mode=timing` for a wall-clock-only comparison; default `full` still requires
+complete operation reports.
+
 The default runs workers in the order `1, 2, 2, 1`. `--repetitions=1|2|3` selects the number
 of runs for each worker count. Every run starts with fresh timing data and a separate report
 directory. Tests that fail do not stop the later measurements. `comparison.json` keeps every
@@ -161,8 +187,14 @@ exit code and summary path, and reports failure rates and wall times for both wo
 Missing or invalid reports, and any failed run, make `valid` false and leave `speedup` unset
 (`null`). A shorter failed test run is not a performance improvement.
 
-The manually dispatched **Windows test performance comparison** workflow runs this command
-on one Windows runner and uploads the original reports even when tests fail. Select the same
+The manually dispatched **Release test diagnostics** workflow selects Windows or Intel
+macOS, a continuity pair, the CLI file, or the full server suite. It runs original calls,
+controlled isolated 1/2-worker calls and full/timing collection calls, retaining every
+repetition. Windows can explicitly select the installed or prepared baseline executable.
+The continuity pair is diagnostic input; its order is not claimed to match the historical
+crash. A single CLI file does not prove two workers ran. Full-mode process ledgers show
+observed workers; timing mode does not collect worker identities. The workflow uploads
+original reports even when tests fail. Select the same
 revision when comparing changes. A local report's `revision` is its base HEAD;
 `workingTreeDirty` identifies uncommitted changes, so that revision alone does not identify
 the measured source. Keep individual investigation notes and measurement logs in
@@ -175,13 +207,74 @@ with the accepted clock repair and identical profiling support, use:
 bun run scripts/compare-test-versions.ts --baseline=/path/to/A --candidate=/path/to/B tests/session-continuity
 ```
 
-The driver fixes two workers and runs `A, B, B, A`. Both checkouts need frozen root and
+The driver fixes two workers. The strict operation path requires equal measurement tools. Both checkouts need frozen root and
 launcher dependencies, the same lockfiles, runtime and install/warmup/cache policy. It
 does not create checkouts or reuse mutable fixtures or build products. It checks actual
-source/tool digests and all reports, keeps failures, and requires equal test counts. When
-test layers change, review their coverage mapping before using a different driver. Overlap
+source/tool digests and all reports, keeps failures, and requires equal test counts. For changed fixture or test layers, use the explicit `--wall-clock --coverage-map=/path/map.json`
+path. Its version 1 map binds `sources.A` and `sources.B` (revision, patchDigest, toolDigest),
+`files.A` and `files.B`, nonempty `scenarios` with `id`, `A` and `B` labels, and
+`expectedCounts.A` / `expectedCounts.B` with explicit `pass` and `skip` counts. Each
+side must run at least one passing test and match its reviewed counts on every repetition;
+failures and undeclared skip changes are rejected. Review this
+semantic mapping before use. That path runs the same external timer against both checkouts,
+uses three alternating pairs (AB, BA, AB), records tool-file differences, and permits changed
+pass counts only through the supplied mapping. It does not compare operation counts. Overlap
 between sample ranges produces `insufficient-evidence`; nonoverlap is engineering evidence,
 not a statistical significance claim. A local macOS result is not Windows acceptance.
+
+## Collection and failure diagnosis
+
+```sh
+bun run test --mode=timing --isolation=isolate tests/api-key-cli.test.ts
+bun run scripts/diagnose-test-performance.ts --suite=continuity --repetitions=3
+```
+
+Timing mode records execution, exit, command, file durations and logs. It removes inherited
+profiler variables and does not inject operation preloads into children. Its collection
+status is `not-requested`; absence of operation reports is expected. Full remains the
+Release default. Local runs are cold unless `CGW_TEST_TIMING_HISTORY` names a validated history envelope.
+Release enables artifact restoration; manual diagnosis stays cold so its conditions use
+the same scheduling input.
+
+`--bail=N` accepts a positive integer and passes Bun's native option unchanged. It can
+stop dispatch after ordinary assertion failures; it is not a crash-only policy. Release
+does not enable it. Neither exit code 3 nor matching stderr text proves a native Windows
+crash. Crash-only detection, bounded tree cleanup and cross-platform acceptance remain
+separate experiments.
+
+`CGW_API_KEY_CLI_DIAGNOSTICS=1` enables named CLI startup/exit and cleanup records without
+stdin, output or secret arguments. `CGW_CONTINUITY_SOURCE_DIAGNOSTICS=1` enables test-only
+selector observations for repeat-checkpoint scenarios. These contain hashed identifiers,
+source representations and existing state; they do not create recovery records or alter
+source acceptance rules. Do not enable these diagnostic modes in timing comparisons.
+
+## Timing history
+
+Release can restore the most recent compatible `test-timings-<runner>` artifact from this
+repository's Release or diagnostic workflow. `actions: read` is sufficient. The lookup and
+download have a combined 20-second limit. No permission, expiry, corruption, incompatible
+metadata and a first run all select cold scheduling and record the reason. Downloads contain
+bounded numeric JSON; artifact content is not executed. OS, architecture, exact Bun version,
+runner class, worker count, isolation, collection mode and timing format must match.
+
+`CGW_TEST_TIMING_RESTORE=1` enables remote lookup. CI supplies a dedicated
+`CGW_TEST_TIMING_TOKEN`, which is removed before tests start. `CGW_TEST_RUNNER_CLASS`
+identifies the runner class. `CGW_TEST_TIMING_ARTIFACT_DIR` selects the publication directory.
+Ordinary local tests do not make history requests.
+
+A full successful platform run creates `history.json` and can export a compatible history
+file. Its file gate checks actual file headers, Bun's final file count and fresh measured
+values against the repository's test set. Filtered, bailed, failed, interrupted or incomplete
+runs do not publish full-suite history. Old entries merged by Bun are removed from the current
+output. This gate does not depend on operation-report completeness or other matrix jobs.
+A diagnostic `all` run may publish complete results for its conditions; a CLI or continuity
+subset cannot become full-suite history. New tests still run without history and deleted
+files are ignored.
+
+For a repeatable local input, point `CGW_TEST_TIMING_HISTORY` at a prior compatible
+`history.json`. The wrapper copies and validates it before the run. Reports record the input
+digest and source SHA/run/artifact. Compare `wrapperExitMs`, including preparation and lookup,
+when assessing net scheduling benefit. A restored history is not proof of a performance gain.
 
 ## Windows package checks
 

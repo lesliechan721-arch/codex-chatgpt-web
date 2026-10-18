@@ -86,7 +86,7 @@ jobs:
         with:
           name: test-performance-${{ matrix.os }}-workers-${{ env.CGW_TEST_WORKERS }}
           path: ${{ runner.temp }}/test-performance
-          if-no-files-found: ignore
+          if-no-files-found: warn
       - run: bun run app:package
         if: runner.os != 'Windows'
       - name: Verify Linux AppImage ABI on current Arch
