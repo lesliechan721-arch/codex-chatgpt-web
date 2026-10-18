@@ -174,7 +174,8 @@ export async function profileTests(args: string[]): Promise<number> {
     if (rootPid === null) wallInvalidReasons.push("missing-root-process");
     metrics.incompleteReasons.push(...wallInvalidReasons.filter(reason => !metrics.incompleteReasons.includes(reason)));
     metrics.complete &&= metrics.incompleteReasons.length === 0;
-    const testResult = spawnError ? "spawn-failed" : signal ? "signal" : exitCode === 0 ? "success" : (counts.fail ?? 0) > 0 ? "assertion-failure" : "nonzero-exit";
+    // Bun counts worker exits as failures too; aggregate counts cannot establish the cause.
+    const testResult = spawnError ? "spawn-failed" : signal ? "signal" : exitCode === 0 ? "success" : "nonzero-exit";
     const reportMs = elapsed(reportStart);
     const summary = { version: 3, runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
       nodeCompatibilityVersion: process.versions.node, runnerImage: process.env.ImageOS ?? null, runnerImageVersion: process.env.ImageVersion ?? null,

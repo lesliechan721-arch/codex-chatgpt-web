@@ -8,6 +8,44 @@ import { fileURLToPath } from "node:url";
 const profiler = fileURLToPath(new URL("../scripts/profile-tests.ts", import.meta.url));
 const metrics = new URL("../src/runtime-performance.ts", import.meta.url).href;
 
+for (const outcome of ["worker-exit", "assertion", "success"] as const) test(`parallel profiling classifies ${outcome} from root status without inferring a failure cause`, () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-profile-result-"));
+  const reports = join(root, "reports");
+  const crashOutput = "panic(main thread): Segmentation fault at address 0x6\n✗ tests\\continuity-task-update.test.ts (worker crashed: exit code 3)";
+  try {
+    const files = ["first", "second"].map(name => join(root, `${name}.test.ts`));
+    for (const [index, fixture] of files.entries()) {
+      writeFileSync(fixture, `import {expect,test} from "bun:test";
+        import {existsSync,writeFileSync} from "node:fs";
+        test("parallel result ${index}",async()=>{
+          writeFileSync(${JSON.stringify(join(root, `worker-${index}.json`))},JSON.stringify({pid:process.pid,worker:process.env.BUN_TEST_WORKER_ID}));
+          const deadline=Date.now()+3000;
+          while(!existsSync(${JSON.stringify(join(root, `worker-${1 - index}.json`))})) {
+            if(Date.now()>deadline) throw new Error("Sibling worker did not start");
+            await new Promise(resolve=>setTimeout(resolve,5));
+          }
+          ${index === 0 && outcome === "worker-exit" ? "process.exit(3);" : ""}
+          ${index === 0 && outcome === "assertion" ? "expect(1).toBe(2);" : ""}
+          ${index === 0 && outcome === "success" ? `console.error(${JSON.stringify(crashOutput)});` : ""}
+        });`);
+    }
+    const child = spawnSync(process.execPath, [profiler, "--parallel=2", "--isolation=isolate", ...files], {
+      encoding: "utf8", timeout: 15_000, env: { ...process.env, CGW_TEST_PROFILE_DIR: reports },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(outcome === "success" ? 0 : 1);
+    const run = join(reports, readdirSync(reports)[0]!);
+    const summary = JSON.parse(readFileSync(join(run, "summary.json"), "utf8"));
+    expect(summary).toMatchObject({ workers: 2, isolation: "isolate", signal: null, spawnError: null,
+      exitCode: child.status, testResult: outcome === "success" ? "success" : "nonzero-exit",
+      counts: { pass: outcome === "success" ? 2 : 1, skip: 0, fail: outcome === "success" ? 0 : 1 } });
+    const identities = [0, 1].map(index => JSON.parse(readFileSync(join(root, `worker-${index}.json`), "utf8")));
+    expect(new Set(identities.map(value => value.pid)).size).toBe(2);
+    expect(identities.every(value => value.pid !== summary.rootPid && value.worker !== undefined)).toBe(true);
+    if (outcome === "success") expect(readFileSync(join(run, "stderr.log"), "utf8")).toContain(crashOutput);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const workers of [1, 2]) test(`test profiling preserves counters across files and reports failures (workers=${workers})`, () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-test-profile-"));
   const reports = join(root, "reports");
