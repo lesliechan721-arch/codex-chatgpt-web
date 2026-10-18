@@ -2111,14 +2111,16 @@ for (const generationProgress of [true, false]) {
         expect(handoffId).toBeDefined();
         await turn.onSubmitted?.();
         for (let step = 0; step < 5; step++) {
-          await Bun.sleep(300);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          clock.tick(300);
           if (turn.abortSignal?.aborted) {
             cancelled = true;
             throw turn.abortSignal.reason;
           }
           turn.onHeartbeat?.();
           if (generationProgress) {
-            turn.onGenerationProgress?.();
+            expect(turn.onGenerationProgress).toBeDefined();
+            turn.onGenerationProgress!();
             progressEvents += 1;
           }
         }
@@ -2141,6 +2143,9 @@ for (const generationProgress of [true, false]) {
       compactionSourceCoverage: coverage, conversationKey: chatGptConversationKey(parsed, namespace), cancel() {},
     }), undefined, undefined, sourceTurnId, threadId);
     await source.browserOutcome;
+    // Broker preparation must not consume the simulated idle budget. Advance the lease
+    // clock and its timers together only during browser generation.
+    const clock = controlledClock();
     const identity = { threadId, turnId: compactTurnId };
     const idle = new NativeTurnIdleRegistry(1, (expired, reason) => {
       cancelStructuredCompactionNativeTurn(expired.threadId, expired.turnId, reason);
@@ -2170,6 +2175,7 @@ for (const generationProgress of [true, false]) {
       }
     } finally {
       idle.clear();
+      clock.restore();
       worker.run = originalRun;
       chatGptTurnSessions.clear();
       await broker.close();
