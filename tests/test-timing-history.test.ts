@@ -78,7 +78,7 @@ test("repository file discovery follows Bun test/spec suffixes and excludes perf
   expect(repositoryTestFiles(root)).toEqual(included.map(file => `tests/${file}`).sort());
 }));
 
-test("Bun 1.4.2 second round reads the measured first round and starts slow files before fast files", () => temporary(async root => {
+for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads the measured first round and starts slow files before fast files (${githubActions ? "GitHub Actions" : "ordinary"} output)`, () => temporary(async root => {
   mkdirSync(join(root, "tests"));
   for (const [name, delay] of [["a-fast", 5], ["b-medium", 80], ["c-medium", 100], ["z-slow", 250]] as const) {
     writeFileSync(join(root, `tests/${name}.test.ts`), `import {test} from "bun:test"; import {appendFileSync} from "node:fs";
@@ -95,13 +95,16 @@ test("Bun 1.4.2 second round reads the measured first round and starts slow file
     const orderLog = join(root, `order-${round}`);
     const command = ["test", "--timings", join(runDirectory, "file-timings.json"),
       ...(prepared.input ? ["--timings", prepared.input] : []), "--update-timings", "--parallel=2", "--isolate", "./tests"];
-    const child = spawnSync(process.execPath, command, { cwd: root, encoding: "utf8", timeout: 10_000,
-      env: { ...process.env, ORDER_LOG: orderLog } });
+    const env: NodeJS.ProcessEnv = { ...process.env, ORDER_LOG: orderLog };
+    if (githubActions) env.GITHUB_ACTIONS = "true";
+    else delete env.GITHUB_ACTIONS;
+    const child = spawnSync(process.execPath, command, { cwd: root, encoding: "utf8", timeout: 10_000, env });
     expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
+    expect(child.stderr.includes("::group::tests/")).toBe(githubActions);
     const result = finalizeFileTimings({ root, runDirectory, compatibility, metadata: source, expectedFiles: files,
       stderr: child.stderr, exitCode: child.status!, signal: child.signal, spawnError: null, fullSuiteRequested: true,
       logsComplete: true, sourceStable: true, artifactDirectory });
-    expect(result).toMatchObject({ complete: true, published: true, reportedFiles: 4, measuredFiles: files });
+    expect(result).toMatchObject({ complete: true, published: true, reportedFiles: 4, measuredFiles: files, executedFiles: files });
     input = join(runDirectory, "history.json");
     if (round === 2) {
       const order = readFileSync(orderLog, "utf8").trim().split("\n");
@@ -110,6 +113,15 @@ test("Bun 1.4.2 second round reads the measured first round and starts slow file
     }
   }
   expect(readdirSync(artifactDirectory)).toEqual([timingHistoryFilename(compatibility)]);
+}));
+
+for (const prefix of ["", "::group::"]) test(`file headers normalize Windows paths with ${prefix || "ordinary"} output`, () => temporary(root => {
+  writeFileSync(join(root, "file-timings.json"), JSON.stringify({ version: 1, files: { "tests\\slow.test.ts": 800 } }));
+  const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source,
+    expectedFiles: ["tests/slow.test.ts"], stderr: `\x1b[1m${prefix}.\\tests\\slow.test.ts:\x1b[0m\r\nRan 1 test across 1 file. [1ms]\r\n`,
+    exitCode: 0, signal: null, spawnError: null, fullSuiteRequested: true, logsComplete: true, sourceStable: true });
+  expect(result).toMatchObject({ complete: true, executedFiles: ["tests/slow.test.ts"], measuredFiles: ["tests/slow.test.ts"] });
+  expect(JSON.parse(readFileSync(join(root, "file-timings.json"), "utf8"))).toEqual({ version: 1, files: { "tests/slow.test.ts": 800 } });
 }));
 
 test("partial execution removes merged historical values and never publishes a whole-suite history", () => temporary(root => {

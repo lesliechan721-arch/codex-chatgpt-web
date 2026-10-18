@@ -162,7 +162,7 @@ export function finalizeFileTimings(options: {
   const stderr = options.stderr.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
   const known = new Set(options.expectedFiles);
   const executed = [...new Set(stderr.split("\n").filter(line => line.endsWith(":"))
-    .map(line => line.slice(0, -1).replaceAll("\\", "/").replace(/^\.\//, "")).filter(file => known.has(file)))].sort();
+    .map(line => line.slice(0, -1).replace(/^::group::/, "").replaceAll("\\", "/").replace(/^\.\//, "")).filter(file => known.has(file)))].sort();
   const fileCounts = [...stderr.matchAll(/(?:^|\n)Ran \d+ tests? across (\d+) files?\./g)];
   const reportedFiles = fileCounts.length ? Number(fileCounts.at(-1)![1]) : null;
   if (options.exitCode !== 0 || options.signal !== null || options.spawnError !== null) reasons.push("test-execution-unsuccessful");

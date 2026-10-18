@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as bindingModule from "../../src/adapters/chatgpt-web/continuity-binding";
 import * as continuationModule from "../../src/adapters/chatgpt-web/continuity-recovery-continuation";
+import * as compactionModule from "../../src/adapters/chatgpt-web/continuity-recovery-compaction";
 import * as environmentModule from "../../src/adapters/chatgpt-web/environment";
 import type { RecoveryThreadRecord } from "../../src/adapters/chatgpt-web/continuity-recovery-store";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../../src/responses/compaction";
@@ -51,7 +52,7 @@ function summaryDigests(parsed: CodexParsedRequest): Set<string> {
 
 function durableState(record: RecoveryThreadRecord | undefined) {
   return record ? {
-    version: record.version, epoch: record.epoch, historyRevision: record.historyRevision,
+    thread: id(record.thread), scope: id(record.scope), version: record.version, epoch: record.epoch, historyRevision: record.historyRevision,
     owner: id(record.owner.id), ownerPid: record.owner.pid, ownerStart: id(record.owner.startIdentity),
     currentWork: id(record.currentWorkId), state: record.state,
     transaction: record.transaction ? { id: id(record.transaction.transactionId), version: record.transaction.version,
@@ -63,11 +64,28 @@ function durableState(record: RecoveryThreadRecord | undefined) {
 // selector for observation: those calls can refresh registration or cache evidence.
 function snapshot(context: SourceDiagnosticContext) {
   let record: RecoveryThreadRecord | undefined;
+  let durableRead: { status: string } = { status: "present" };
+  let bytes: string | undefined;
   try {
-    record = JSON.parse(readFileSync(join(context.statePath, "recovery.json"), "utf8")).threads[digest(context.threadId)];
-  } catch { /* A missing snapshot is reported without changing recovery state. */ }
+    bytes = readFileSync(join(context.statePath, "recovery.json"), "utf8");
+  } catch (error) {
+    durableRead = { status: (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "file-missing" : "read-error" };
+  }
+  if (bytes !== undefined) {
+    let document: unknown;
+    try { document = JSON.parse(bytes); }
+    catch { durableRead = { status: "parse-error" }; }
+    if (durableRead.status === "present") {
+      const threads = document && typeof document === "object" && "threads" in document ? document.threads : undefined;
+      if (!threads || typeof threads !== "object" || Array.isArray(threads)) durableRead = { status: "invalid-document" };
+      else {
+        record = (threads as Record<string, RecoveryThreadRecord>)[digest(context.threadId)];
+        if (!record) durableRead = { status: "thread-missing" };
+      }
+    }
+  }
   const live = bindingModule.existingContinuityBindings(context.statePath)?.observed(digest(context.threadId));
-  return { durable: durableState(record), live: live ? { owner: id(live.owner), epoch: live.epoch,
+  return { durableRead, durable: durableState(record), live: live ? { owner: id(live.owner), epoch: live.epoch,
     revision: live.revision, state: live.state, checkpointCount: live.checkpoints.size } : null, submissions: context.submissions() };
 }
 
@@ -91,11 +109,65 @@ export async function withContinuitySourceDiagnostics<T>(
   const originalLive = bindingModule.selectContinuityCheckpoint;
   const originalDurable = continuationModule.selectRecoveryContinuation;
   const originalCarried = environmentModule.requestCarriedChatGptInstructionRevision;
+  const originalTarget = compactionModule.selectRecoveryCompactionTarget;
+  const originalPrepare = compactionModule.prepareRecoveryCompaction;
+  const originalFresh = compactionModule.prepareFreshRecoveryCompaction;
   const requestDigest = observe("request-digest", () => digest(parsed._rawBody));
   const before = observe("before-snapshot", () => snapshot(context));
   const restorers: Array<() => void> = [];
   const restore = () => { for (const undo of restorers.reverse()) observe("restore", undo); };
   try {
+    const targetSpy = spyOn(compactionModule, "selectRecoveryCompactionTarget");
+    restorers.push(() => targetSpy.mockRestore());
+    targetSpy.mockImplementation((request, record) => {
+      const event = observe("compaction-target-candidates", () => {
+        const summaries = summaryDigests(request);
+        const event: Record<string, unknown> = { sequence: ++sequence, path: "compaction-target", state: durableState(record),
+          targets: Object.values(record.compactionTargets).map(target => ({ target: id(target.compactionTargetId),
+            sourceWork: id(target.sourceLogicalWorkId), sourceIdentity: id(target.sourceIdentity),
+            sourceHistoryRevision: target.sourceHistoryRevision, representations: target.representationDigests })),
+          summaryCandidateCount: Object.values(record.checkpoints).filter(checkpoint => summaries.has(checkpoint.summaryDigest)).length };
+        events.push(event);
+        return event;
+      });
+      try {
+        const result = originalTarget(request, record);
+        observe("compaction-target-result", () => {
+          if (event) event.result = result ? { target: id(result.target.compactionTargetId), sourceWork: id(result.source.logicalWorkId),
+            commit: id(result.checkpoint?.commitId), sourceRepresentation: bindingModule.continuitySourceRepresentationDigest(request, result.sourceRevision) } : null;
+        });
+        return result;
+      } catch (error) { if (event) event.error = errorCode(error); throw error; }
+    });
+    const prepareSpy = spyOn(compactionModule, "prepareRecoveryCompaction");
+    restorers.push(() => prepareSpy.mockRestore());
+    prepareSpy.mockImplementation(async (...args) => {
+      const event = observe("compaction-prepare", () => {
+        const event: Record<string, unknown> = { sequence: ++sequence, path: "compaction-prepare", entry: "durable",
+          state: durableState(args[6]), existingTarget: id(args[11]) };
+        events.push(event);
+        return event;
+      });
+      try {
+        const result = await originalPrepare(...args);
+        observe("compaction-prepare-result", () => { if (event) event.result = result ? "prepared" : "retained-routing"; });
+        return result;
+      } catch (error) { if (event) event.error = errorCode(error); throw error; }
+    });
+    const freshSpy = spyOn(compactionModule, "prepareFreshRecoveryCompaction");
+    restorers.push(() => freshSpy.mockRestore());
+    freshSpy.mockImplementation(async (...args) => {
+      const event = observe("fresh-compaction-prepare", () => {
+        const event: Record<string, unknown> = { sequence: ++sequence, path: "compaction-prepare", entry: "fresh" };
+        events.push(event);
+        return event;
+      });
+      try {
+        const result = await originalFresh(...args);
+        observe("fresh-compaction-prepare-result", () => { if (event) event.result = "prepared"; });
+        return result;
+      } catch (error) { if (event) event.error = errorCode(error); throw error; }
+    });
     const carriedSpy = spyOn(environmentModule, "requestCarriedChatGptInstructionRevision");
     restorers.push(() => carriedSpy.mockRestore());
     carriedSpy.mockImplementation((request, turnId) => {
@@ -199,11 +271,12 @@ export async function withContinuitySourceDiagnostics<T>(
         if (index === undefined) { index = observations.length; observationIds.set(key, index); observations.push(observation); }
         return { sequence, observation: index };
       });
-      console.error(`[continuity-source-diagnostic] ${JSON.stringify({ schemaVersion: 1, scenario: context.scenario,
+      console.error(`[continuity-source-diagnostic] ${JSON.stringify({ schemaVersion: 2, scenario: context.scenario,
         format: context.format, round: context.round, change: context.change, pid: process.pid, platform: process.platform, arch: process.arch,
-        bunVersion: Bun.version, requestDigest, before, events: orderedEvents, observations, outcome,
+        bunVersion: Bun.version, stateDirectoryDigest: digest(context.statePath), thread: id(digest(context.threadId)),
+        requestDigest, before, events: orderedEvents, observations, outcome,
         after: observe("after-snapshot", () => snapshot(context)), diagnosticFailures,
-        unobserved: ["selector cache hit or miss", "candidate counts after internal relation filters", "caller branch after selector return"] })}`);
+        unobserved: ["selector cache hit or miss", "candidate counts after internal relation filters", "page reconciliation decisions"] })}`);
     } catch { unavailable("report-output"); }
   }
 }

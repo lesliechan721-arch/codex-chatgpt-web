@@ -1383,6 +1383,11 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
   f.controls.invokeSourceTools = false;
   expect((await f.run(f.request("", "consumer-turn", installed))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  expect(record, "The seed process must persist its checkpoint before exit.").toBeDefined();
+  expect(record.historyRevision).toBe(1);
+  expect(Object.values(record.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(summary.text)
+    && checkpoint.sourceIdentity === delegation.id && checkpoint.continuation.state === "consumed"
+    && checkpoint.continuation.consumerLogicalWorkId === record.currentWorkId)).toBe(true);
   writeFileSync(join(root, "delegation-seed.json"), JSON.stringify({ installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
     consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] }));
 }, 30000);
@@ -1406,7 +1411,17 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
     if (change === "payload") (invalid._rawBody as Record<string, unknown>).instructions = "Changed current execution constraints.";
     if (change === "steering") expect(extractChatGptTurnUserRevision(invalid)).toBe("Stop the delegated task.");
     await expect(withContinuitySourceDiagnostics(invalid, { scenario, format, round, change, statePath: f.statePath,
-      threadId: f.threadId, submissions: () => f.submissions.length }, () => f.run(invalid)), `${round}:${change}`)
+      threadId: f.threadId, submissions: () => f.submissions.length }, () => {
+        if (change === "human") {
+          // A missing journal selects the supported fresh-page path. Expose the
+          // missing expected retained state before testing retained-source rejection.
+          expect(before, "The restart fixture must retain its committed checkpoint before mutation.").toBeDefined();
+          expect(before).toMatchObject({ owner: seed.owner, epoch: seed.epoch, historyRevision: round - 1 });
+          expect(Object.values(before.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(seed.summary)
+            && checkpoint.targetHistoryRevision === round - 1 && checkpoint.sourceIdentity === "delegated-task")).toBe(true);
+        }
+        return f.run(invalid);
+      }), `${round}:${change}`)
       .rejects.toMatchObject({ code: "continuity_source_unproven" });
     expect(bindings.recoveryStore.get(before.thread)!.version, `${round}:${change}`).toBe(before.version);
     expect(f.submissions, `${round}:${change}`).toHaveLength(submissions);
