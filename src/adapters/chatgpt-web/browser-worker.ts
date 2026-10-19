@@ -81,6 +81,8 @@ import {
   LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS,
   LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS,
   notifyLauncherTurn,
+  readLauncherBrowserHostDescriptor,
+  CONTINUITY_PREPARATION_TERMINATION_FEATURE,
 } from "../../launcher-browser-host";
 import {
   CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
@@ -5458,6 +5460,16 @@ export class ChatGptBrowserWorker {
         },
       }, surfaceId, undefined, reused, lease.trackUsage === true);
     } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError") && !turn.abortSignal?.aborted
+        && turn.continuity?.recovery && turn.recoveryStoreDirectory && turn.recoveryRequestId && lease.continuity) {
+        try {
+          if (readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!).features?.includes(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) {
+            new ContinuityRecoveryStore(turn.recoveryStoreDirectory).terminatePreparation(turn.continuity.recovery, {
+              requestId: turn.recoveryRequestId, traceId: turn.traceId, helperPid: process.pid, lease: lease.continuity,
+            });
+          }
+        } catch { /* Failure to persist a fence leaves the original Send state unresolved. */ }
+      }
       if (error instanceof ChatGptBrowserPageClosedError && turn.continuity?.recovery) {
         // The exact Launcher end receipt can still confirm a real user close below.
         // This classification never proves Send, tool settlement or writer isolation.

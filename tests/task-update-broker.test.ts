@@ -51,6 +51,30 @@ async function fixture(remote: boolean, safe = false, tools?: CodexTool[]) {
 }
 
 for (const remote of [false, true]) describe(`${remote ? "Remote" : "Local"} task update state`, () => {
+  test("connection handoff keeps the final candidate and rejects old tool claims", async () => {
+    const f = await fixture(remote);
+    try {
+      const first = { ...context(0), observerGeneration: 1 };
+      const second = { ...context(0), observerGeneration: 2 };
+      await f.owner.attachToolObserver!(f.token, first);
+      const waiting = f.owner.nextToolBatch(f.token, undefined, first).catch(error => error);
+      await f.owner.attachToolObserver!(f.token, second);
+      expect(await waiting).toMatchObject({ code: "task_update_observer_stale" });
+      expect(await f.owner.taskUpdateState(f.token)).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+      await expect(f.owner.nextToolBatch(f.token, undefined, first)).rejects.toMatchObject({ code: "task_update_observer_stale" });
+      await f.start(1, 0);
+      const [call] = await f.owner.nextToolBatch(f.token, undefined, second);
+      await f.owner.completeTool(f.token, call!.callId, raw, first);
+      await f.wait(1);
+      const candidate = { ...context(0), acknowledgedRevision: 0 };
+      await f.owner.checkFinalOutputCandidate(f.token, candidate);
+      await f.owner.attachToolObserver!(f.token, { ...context(0), observerGeneration: 3 });
+      expect(await f.owner.beginFinalOutput(f.token, candidate)).toMatchObject({ driverGeneration: 0, taskRevision: 0 });
+      await f.owner.attachToolObserver!(f.token, { ...context(0), observerGeneration: 4 });
+      expect(await f.owner.beginFinalOutput(f.token, candidate)).toMatchObject({ driverGeneration: 0, taskRevision: 0 });
+    } finally { await f.close(); }
+  });
+
   test("append admission checks the live boundary before binding the transfer identity", async () => {
     const f = await fixture(remote);
     try {

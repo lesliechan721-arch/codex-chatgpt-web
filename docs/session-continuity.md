@@ -10,6 +10,50 @@ actual runtime capability and trusted task identity determine eligibility.
 Implementation presence does not establish a real-platform pass. See the explicit outstanding
 checks in [release validation](release-validation.md#session-continuity-validation).
 
+## Preparation failure and saved inputs
+
+A healthy existing page can survive a failed local preparation attempt. The attempt must be
+proved unsent and terminated at the same durable authority boundary that grants Send. The
+`preparation-termination-v1` receipt binds the actual request, attempt, owner/epoch, page and lease.
+A phase flag, missing response or HTTP abort is insufficient; acquisition-only known-unsent proof
+cannot be reused as a generic preparation receipt. A late preparation ACK cannot authorize Send
+after termination. Backend and Launcher must both confirm the same termination before releasing
+the attempt and preserving the last committed source/history/checkpoint and healthy lease.
+
+The original public error code, message, retryability and cause remain available. A healthy page
+with uncertain termination or a possible Send stays fenced for status recovery; it is never
+silently resent. A closed/unknown page takes current-request recovery without waiting for old
+settlement. Explicit stop and successor ownership still prevent an old attempt from restoring
+itself. The Launcher does not put a confirmed unsent local-preparation failure into generic failed
+page cleanup.
+
+Plain user appends are durably saved during any supported task phase. Receive order is separate
+from model acceptance and ACK. Tool/result/ACK entries deliver finite ordered prefixes; a response
+with no such entry can finish before ordinary continuation processes the queue. Input received
+after final output locks waits for the next physical response and cannot alter earlier text.
+Zero Risk retains manual Send, Sent and required-attachment confirmation for that continuation.
+A confirmed prompt snapshot is immutable when later input arrives.
+
+Activity lists task inputs independently of open tabs. It shows state and local storage use, reads
+and copies actual saved originals, restores a missing body only under its original ID and digest,
+and allows explicit stopped-input retry or cleanup. Unknown receipt means retain the sender's
+original and query/retry the same ID. Queue originals share the existing 24 MiB recovery budget;
+each task can have 128 pending messages totaling 1 MiB. They survive page loss/restart and are not
+silently evicted by a TTL. Completed/discarded originals can be cleared; task deletion stops new
+input delivery before deleting originals. Already started external operations can still complete.
+After a different native turn completes and the historical Session replay window of 30 minutes
+ends, a fully settled older inbox can release its originals and detailed delivery records. A failed
+successor preparation does not start that window. The same turn's physical completion alone does
+not close receipt.
+A compact source fence remains inside the shared budget so a delayed old request cannot create
+new work after cleanup. Cleanup commits that fence before removing any original and can resume
+after a crash. These fences have no silent expiry; a full budget produces an explicit refusal.
+
+Disconnect only detaches an observer. It does not stop an already started physical response or
+authorize a new browser send. Pure observer replacement does not advance driver generation,
+change the physical owner or invalidate its captured final output. The current observer alone can
+claim new tools; already issued calls keep their original completion rights.
+
 ## Intended behavior
 
 A page is a replaceable execution surface. Select its lifecycle branch before checking old work,
@@ -128,12 +172,12 @@ Replay alone does not advance generation, revision, or the successful-work reten
 
 ### User updates during an active response
 
-Compatible Full Native Automatic and already-started Zero Risk responses can accept new plain
-user text at a local tool boundary or while a previous update awaits confirmation. The bridge
-locates the same active thread, native turn, scope, owner, and lease before applying the normal
-thread-occupancy rejection. It retains the original page and physical response, maps the new
-logical instruction to that response, and transfers driver authority before delivering results.
-It does not send a second browser message or repeat Native calls.
+Supported Full Native + Launcher tasks can save new plain user text at any phase. The bridge
+proves the same thread, native turn and scope independently of a tool batch. A compatible active
+Automatic or started Zero Risk capability can receive a finite prefix at a controlled tool or ACK
+entry. That delivery retains the physical response, maps the exact inputs to it, and transfers
+driver authority before delivering results. It adds no browser message and repeats no Native call.
+Other saved input waits for an ordinary continuation with the normal page and manual Send policy.
 
 Local instruction identities, retained source relationships, or issued call IDs must uniquely
 identify the source. Completed history, old user text, and old result bodies need not match an
@@ -155,7 +199,7 @@ work requires the accepted revision to be acknowledged. Another append during co
 queued in order. An HTTP disconnect does not cancel the transferred work, and a late old observer
 cannot overwrite or cancel the current driver. Explicit user stop still ends the physical task.
 
-An append advances task revision and driver generation, not history revision. Only committed
+Receipt advances only S. Active delivery advances task revision and driver generation, not history revision. Only committed
 compaction advances history revision. Compaction uses the latest logical source and locally
 accepted results; it does not request their old bodies again. Unacknowledged updates, prepared
 transfers, and pending calls are not completed work. A stale compaction preflight cannot stop a
@@ -163,12 +207,12 @@ newer driver.
 
 | Active source state | Append outcome |
 | --- | --- |
-| Tool boundary or open confirmation window | Accept and queue the update; delivery and acknowledgement follow separately. |
-| Running without an available boundary | The append is not accepted. Keep the current task and send again when a boundary is available or the response has ended. |
-| Final answer locked but response still running | The append is not accepted. Wait for completion, then send a normal continuation. |
-| Compaction owns the source | The append is not accepted. Report the busy state and preserve the compaction. |
+| Tool boundary or open confirmation window | Save input, then deliver an ordered finite prefix; acknowledgement follows separately. |
+| Running without an available boundary | Save input and preserve the current physical response. Use a later controlled entry or ordinary continuation. |
+| Final answer locked but response still running | Save input for the next ordinary response. Do not change the locked answer's version or coverage. |
+| Compaction owns the source | Save input independently. Preserve the frozen compaction source and wait for a legal continuation. |
 | Earlier transfer outcome unknown | Recover the same transfer identity; do not assume rejection or start another transfer. |
-| Old response without negotiated update support | The append is not accepted. Preserve that response; do not restart or upgrade it. |
+| Old response without negotiated update support | Save input through the supported queue and wait for ordinary continuation. Preserve the old capability without upgrading it. |
 | Response normally completed on a healthy page | Use ordinary continuation with only the new increment. Zero Risk still requires manual sending. |
 
 These checks prevent misrouting, duplicate execution, and competing writers. They do not verify
@@ -251,7 +295,9 @@ Logical revocation does not release that slot. A successor can use another free 
 create a sixth page. Each fixed-target cleanup transaction has at most three automatic close
 attempts with finite timeouts. Exhaustion reports a cleanup fault and waits for explicit further
 cleanup or destruction. Retain only the physical identity and minimum close-retry information;
-do not retain task bodies or work history just because physical cleanup remains incomplete.
+do not retain page work history just because physical cleanup remains incomplete. Independently
+owned pending/stopped task inbox originals remain until explicit handling; page cleanup must not
+delete those inputs or grant execution authority.
 
 Page destruction revokes that execution generation and removes its registration, work, attempts,
 calls, stop/completion, revision/checkpoint/retry data, bindings, execution indexes, and associated

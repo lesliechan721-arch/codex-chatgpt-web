@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { assertLauncherContextDeliveryFeature, CONTINUITY_EXECUTION_FENCING_FEATURE, isLauncherKnownUnsentReceipt,
+import { assertLauncherContextDeliveryFeature, CONTINUITY_EXECUTION_FENCING_FEATURE, CONTINUITY_PREPARATION_TERMINATION_FEATURE, isLauncherKnownUnsentReceipt,
   LauncherKnownUnsentReceiptError, type LauncherKnownUnsentReceipt,
   LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
@@ -12,6 +12,7 @@ import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityLease, isContinuityRecoveryIdentity,
   sameContinuityRecoveryIdentity, type ContinuityLease, type ContinuityRecoveryIdentity } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
+import { ContinuityRecoveryStore } from "./continuity-recovery-store";
 import { isTaskRevision, type TaskUpdateOwnerContext } from "./task-update-protocol";
 import {
   parseChatGptLunaCheckpoint,
@@ -39,6 +40,7 @@ interface PendingTurn {
   abortTimer?: ReturnType<typeof setTimeout>;
   retirement?: Promise<void>;
   exiting?: boolean;
+  lease?: ContinuityLease;
 }
 
 const SUBMISSION_RECEIPT_ACK_FEATURE = "submission-receipt-ack-v1";
@@ -719,6 +721,7 @@ export class LauncherBrowserHelperClient {
             throw continuityError("continuity_session_lost");
           }
           pending.turn.onContinuityLease?.(message.lease);
+          pending.lease = message.lease;
         } catch (error) {
           this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending);
         }
@@ -743,7 +746,7 @@ export class LauncherBrowserHelperClient {
           }
           return Promise.resolve(prepared.contextPlan ? this.assertContextDeliveryCompatible() : undefined)
             .then(() => pending.turn.onPreparedSelected?.(message.reused)).then(() => {
-            if (this.pending.get(message.id) !== pending) return;
+            if (this.pending.get(message.id) !== pending || pending.localFailure || pending.turn.abortSignal?.aborted) return;
             return this.send({
               type: "prepared_selected_ack",
               id: message.id,
@@ -858,6 +861,17 @@ export class LauncherBrowserHelperClient {
   private abortWithLocalFailure(id: string, error: Error, pending: PendingTurn): void {
     if (this.pending.get(id) !== pending || pending.localFailure) return;
     pending.localFailure = error;
+    const recovery = pending.turn.continuity?.recovery;
+    if (pending.preparing && pending.lease && recovery && pending.turn.recoveryStoreDirectory && pending.turn.recoveryRequestId
+      && this.child?.pid && this.helperFeatures.has(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) {
+      try {
+        if (readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!).features?.includes(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) {
+          new ContinuityRecoveryStore(pending.turn.recoveryStoreDirectory).terminatePreparation(recovery, {
+            requestId: pending.turn.recoveryRequestId, traceId: id, helperPid: this.child.pid, lease: pending.lease,
+          });
+        }
+      } catch { /* A failed fence or changed owner is not evidence of an unsent turn. */ }
+    }
     if (pending.exiting) return;
     if (pending.terminalReceived) {
       if (pending.retirement) return;

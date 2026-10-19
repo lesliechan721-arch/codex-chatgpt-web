@@ -493,6 +493,17 @@ function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnI
     ? recovered.source : carried;
 }
 
+const durableQueuedInstructionSelections = new WeakMap<CodexParsedRequest, { input: unknown[]; digest: string; scope?: string; indices: number[] }>();
+
+/** Only the current checkpoint's durable inbox proof may establish this boundary. */
+export function bindDurableQueuedInstructionInput(parsed: CodexParsedRequest, indices: number[]): void {
+  const input = record(parsed._rawBody)?.input;
+  if (!Array.isArray(input) || !indices.length || indices.some(index => !Number.isInteger(index) || index < 0 || index >= input.length)) {
+    throw continuityError("continuity_source_unproven");
+  }
+  durableQueuedInstructionSelections.set(parsed, { input, digest: canonicalJson(input), scope: parsed._continuityScope, indices: [...indices] });
+}
+
 /** Index of the latest native instruction that is physically present in this request. */
 export function chatGptCurrentInstructionIndex(parsed: CodexParsedRequest): number {
   if (parsed._continuityRequestInstruction) return -1;
@@ -639,6 +650,10 @@ export function continuityCurrentInstructionInput(
     selection?.inputs.set(selectionKey, indices);
     return indices.map(clone);
   };
+  const queued = durableQueuedInstructionSelections.get(parsed);
+  if (queued && queued.input === input && queued.scope === parsed._continuityScope && queued.digest === canonicalJson(input)) {
+    return remember(queued.indices);
+  }
   const retainCurrentSource = includeRetainedSource && isRetainedCompactionSourceInstruction(parsed, input[index]);
   const identity = extractChatGptTurnIdentity(parsed);
   if (parsed._compactionRequest) {

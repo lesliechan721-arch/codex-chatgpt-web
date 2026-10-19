@@ -7,7 +7,8 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
+import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, providerConfig, saveConfig } from "./config";
+import { readTaskInputControl, taskInputControl } from "./task-input-control";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -564,6 +565,22 @@ async function main(): Promise<void> {
   if (command === "help") stdout.write(HELP);
   else if (command === "setup") await setupCommand(args);
   else if (command === "api-key") await runApiKeyCommand(args);
+  else if (command === "task-input") {
+    const dev = takeFlag(args, "--dev-profile");
+    if (!takeFlag(args, "--launcher-controlled")) throw new Error("Task input control requires the Launcher");
+    assertNoArgs(args);
+    authorizeLauncherControl("task input control");
+    if (dev) {
+      if (home) throw new Error("--home does not apply to DEV task input control");
+      activateDevProfileEnvironment();
+    }
+    const config = loadConfig();
+    if (dev !== (config.purpose === "dev-harness")) throw new Error("Task input control profile does not match the configured runtime");
+    const directory = providerConfig(config).chatgptWeb?.continuityStateDirectory;
+    if (!directory) throw new Error("Task input control is unavailable");
+    const request = await readTaskInputControl(stdin);
+    stdout.write(`${JSON.stringify(taskInputControl(directory, request))}\n`);
+  }
   else if (command === "login") await loginCommand(args);
   else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "verify-context") {

@@ -1,4 +1,7 @@
-import { inspectLauncherContinuityConversation } from "../../launcher-browser-host";
+import { ContinuityTaskInputStore } from "./continuity-task-input-store";
+import { queuedTaskInputRequest, startTaskInputScheduler } from "./task-input-scheduler";
+import { completeTaskInputPhysicalResponse, taskInputQueue, pendingTaskInputs, synchronizeTaskInputDelivery, type RuntimeTaskInputQueue } from "./continuity-task-input-runtime";
+import { inspectLauncherContinuityConversation, terminateLauncherContinuityPreparation, CONTINUITY_PREPARATION_TERMINATION_FEATURE, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { recoveryTaskUpdateSources } from "./task-update-source";
 import { restoreRecoveryTaskUpdates } from "./continuity-task-update-journal";
 import { continuityBindingsFor, continuityDigest } from "./continuity-binding";
@@ -35,7 +38,7 @@ import {
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptWebAdapterError, chatGptToolTimeoutError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptToolTimeoutError, chatGptBrowserErrorLog } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import {
   extractChatGptDelegatedTurnCapability,
@@ -62,7 +65,7 @@ import {
 import { ChatGptExternalTurnProgress } from "./turn-progress";
 import { NativeOperationError } from "./native-tool-operations";
 import { mirrorLatestTaskUpdateState, tryTaskUpdateHandoff } from "./task-update-handoff";
-import { captureTaskUpdateSource, taskUpdateSourceError, type TaskUpdateExecutionIdentity } from "./task-update-source";
+import { captureTaskUpdateSource, taskUpdateDigest, taskUpdateSourceError, type TaskUpdateExecutionIdentity } from "./task-update-source";
 import { canonicalJson } from "./canonical-json";
 import type { TaskUpdateOwnerContext } from "./task-update-protocol";
 import { continuityError, isRetiredWriterError } from "./continuity-errors";
@@ -661,6 +664,21 @@ export function createChatGptWebAdapter(
       ? lunaCheckpointStore.apply(parsed)
       : { parsed, applied: false };
     const continuity = preparedContinuity.get(parsed);
+    const runtimeInputIdentity = continuity && identity.turnId ? { thread: continuity.binding.thread, scope: continuity.binding.scope,
+      taskId: `task_${taskUpdateDigest([continuity.binding.thread, identity.turnId])}` } : undefined;
+    const runtimeInputStore = continuity?.binding.recovery ? new ContinuityTaskInputStore(continuity.binding.recovery.directory) : undefined;
+    const runtimeInputIntent = runtimeInputIdentity ? runtimeInputStore?.get(runtimeInputIdentity)?.intentGeneration ?? 0 : 0;
+    const assertInputSendIntent = (): void => {
+      const ref = continuity?.binding.recovery;
+      if (ref && runtimeInputIdentity && recoveryStore(ref).taskInputRecord(runtimeInputIdentity)) {
+        recoveryStore(ref).assertTaskInputIntent(runtimeInputIdentity, runtimeInputIntent);
+      }
+    };
+    const inputWaitReason = (reason: "manual-send" | "boundary" | "compaction" | "recovery"): void => {
+      if (runtimeInputIdentity && runtimeInputStore?.get(runtimeInputIdentity)?.state === "active") {
+        runtimeInputStore.setWaitReason(runtimeInputIdentity, reason, { expectedIntentGeneration: runtimeInputIntent });
+      }
+    };
     if (parsed._conversationPolicy === "task" && !continuity) throw continuityError("continuity_source_unproven");
     const continuityClaim = continuity ? beginContinuityResponse(continuity) : undefined;
     let recoveryOrigin: ChatGptTurnRuntime["recoveryOrigin"];
@@ -805,9 +823,12 @@ export function createChatGptWebAdapter(
         initialTaskUpdateOwner, sourceSnapshot) : undefined;
     if (contextSend && continuity?.binding.recovery) bindRecoveryContextCoverage(continuity.binding.recovery, contextSend.coverage);
     const finalizeContextSend = async (browser: Promise<string>): Promise<string> => {
+      let failed = false;
       try { return await browser; }
+      catch (error) { failed = true; throw error; }
       finally {
         try { await contextSend?.syncUsage(); }
+        catch (error) { if (!failed) throw error; }
         finally { contextSend?.retire(); }
       }
     };
@@ -881,6 +902,14 @@ export function createChatGptWebAdapter(
     });
     let recoveryFinal: RuntimeRecoveryFinalReceipt | undefined;
     let acquisitionKnownUnsent = false;
+    // The binding can move to another attempt while an old helper is still returning.
+    const preparationRecovery = continuity?.binding.recovery && { ...continuity.binding.recovery };
+    let retainedContinuityFailure = false;
+    const retainsContinuityAfterFailure = (): boolean => {
+      const ref = preparationRecovery;
+      return acquisitionKnownUnsent || retainedContinuityFailure
+        || Boolean(ref && recoveryStore(ref).get(ref.thread)?.works[ref.logicalWorkId]?.attempts[ref.attempt]?.preparationTermination);
+    };
     const finalizeContinuity = (browser: Promise<string>): Promise<string> => !continuity ? browser : browser.then(
       async answer => {
         const compactionBoundary = continuity.binding.state === "compacting"
@@ -897,21 +926,92 @@ export function createChatGptWebAdapter(
       },
       async error => {
         if (acquisitionKnownUnsent) throw error;
-        const currentBinding = continuity.binding;
+        let ref = preparationRecovery;
+        const record = ref && recoveryStore(ref).get(ref.thread);
+        let attempt = ref && record?.works[ref.logicalWorkId]?.attempts[ref.attempt];
+        const termination = attempt?.preparationTermination;
+        let activeRef = continuity.binding.recovery;
+        const latestWork = record?.currentWorkId ? record.works[record.currentWorkId] : undefined;
+        const capturedWork = ref && record?.works[ref.logicalWorkId];
+        if (!termination && ref && record && activeRef && latestWork && capturedWork
+          && record.epoch === attempt?.epoch && latestWork.workLineageId === capturedWork.workLineageId
+          && capturedWork.taskUpdateJournal?.streamId
+          && latestWork.taskUpdateJournal?.streamId === capturedWork.taskUpdateJournal.streamId) {
+          activeRef = { ...activeRef, logicalWorkId: latestWork.logicalWorkId, attempt: latestWork.attempts.at(-1)!.attempt };
+        }
+        if (!termination && ref && record && activeRef
+          && continuity.binding.executionKey === continuity.executionKey
+          && chatGptTurnSessions.find(continuity.executionKey)?.traceId === traceId
+          && activeRef.thread === ref.thread && activeRef.ownerId === record.owner.id
+          && record.epoch === continuity.binding.epoch && record.currentWorkId === activeRef.logicalWorkId
+          && record.works[activeRef.logicalWorkId]?.workLineageId === record.works[ref.logicalWorkId]?.workLineageId
+          && record.works[activeRef.logicalWorkId]?.attempts.at(-1)?.attempt === activeRef.attempt) {
+          ref = { ...activeRef };
+          attempt = record.works[ref.logicalWorkId]?.attempts[ref.attempt];
+        }
+        const diagnose = (pageCheck: string, terminationEvidence: string, decision: string): void => {
+          console.info(`[chatgpt-web] continuity_preparation ${JSON.stringify({ traceId, attempt: ref?.attempt,
+            stage: attempt?.stage ?? "unknown", pageCheck, terminationEvidence, decision,
+            ...chatGptBrowserErrorLog(error instanceof Error ? error : new Error("Preparation failed")) })}`);
+        };
+        if (ref && (!record || record.owner.id !== ref.ownerId || record.currentWorkId !== ref.logicalWorkId
+          || record.works[ref.logicalWorkId]?.attempts.at(-1) !== attempt || record.state === "stopped")) {
+          diagnose("not-checked", termination ? "fenced" : "unconfirmed", "obsolete-observer");
+          throw error;
+        }
+        if (termination && ref) {
+          // The durable fence is owned by this exact request, never by an error name
+          // or an in-memory submission phase. A successor may already own the record.
+          if (record?.currentWorkId !== ref.logicalWorkId || record.owner.id !== ref.ownerId
+            || record.epoch !== termination.recovery.epoch || record.works[ref.logicalWorkId]?.state === "stopped"
+            || record.works[ref.logicalWorkId]?.attempts.at(-1) !== attempt) throw error;
+          try {
+            const lease = await terminateLauncherContinuityPreparation(continuity.descriptor, termination.recovery, ref.directory, termination);
+            if (recoveryStore(ref).settlePreparationTermination(termination.recovery, termination.receiptId)) {
+              chatGptTurnSessions.restorePreparationConversationHead(conversationKey!, continuity.executionKey, continuity.sourceExecutionKey, continuity.binding);
+              continuity.bindings.preparationTerminated(continuity.binding, continuity.executionKey, continuity.sourceExecutionKey, lease);
+              diagnose("healthy", "confirmed", "retained");
+              trace.push({ kind: "commentary", text: "Preparation failed before Send. The conversation is retained. Correct the input and retry." });
+            }
+          } catch {
+            // Health and termination confirmation have separate receipts. Preserve
+            // the fence and original failure until the same operation can be queried.
+            const current = recoveryStore(ref).get(ref.thread);
+            if (current?.currentWorkId === ref.logicalWorkId && current.owner.id === ref.ownerId
+              && current.works[ref.logicalWorkId]?.attempts.at(-1)?.attempt === ref.attempt
+              && current.works[ref.logicalWorkId]?.state !== "stopped") {
+              continuity.binding.state = "unverified";
+              diagnose("unconfirmed", "pending", "await-confirmation");
+              trace.push({ kind: "commentary", text: "Preparation failed. Recovery is awaiting confirmation. Reconnect to check this same attempt before sending again." });
+            }
+          }
+          throw error;
+        }
+        let healthyPage = false;
         if ((continuityLease ?? continuity.expected) && conversationKey) {
           let alive = false;
           try { const page = await inspectLauncherContinuityConversation(continuity.descriptor, conversationKey!, (continuityLease ?? continuity.expected)!);
             alive = page.state === "ready" || page.state === "running"; } catch {}
           if (!alive) {
+            diagnose("closed-or-unknown", "unconfirmed", "page-recovery");
             forgetContinuityPage();
             throw error;
           }
+          healthyPage = true;
         }
         if (continuity.binding.recovery) {
           // A late helper outcome belongs to its original attempt. It cannot fail or stop
           // the successor, overwrite an accepted terminal, or mark the successor binding lost.
-          try { assertRecoveryWriter(continuity.binding.recovery); }
+          try { assertRecoveryWriter(ref ?? continuity.binding.recovery); }
           catch { throw error; }
+          if (attempt?.sendEvidence?.status === "possible"
+            || (healthyPage && (error as { code?: string }).code !== "client_cancelled")) {
+            retainedContinuityFailure = healthyPage;
+            unverifyContinuity();
+            diagnose("healthy", "unconfirmed", "await-confirmation");
+            trace.push({ kind: "commentary", text: "Preparation or Send status is unresolved. The conversation is retained. Reconnect to verify this attempt before sending again." });
+            throw error;
+          }
         }
         if ((submission.phase === "prepared" || (error as { code?: string }).code === "continuity_resource_capacity")
           && continuity.binding.state === "creating"
@@ -1060,7 +1160,7 @@ export function createChatGptWebAdapter(
           if (continuity?.binding.recovery) {
             const ref = continuity.binding.recovery;
             if (!continuity.recovery) throw continuityError("continuity_source_unproven", "The original Send identity is missing.");
-            originalSend = beginRecoverySend(ref, continuity.recovery, recoveryRequestId);
+            originalSend = beginRecoverySend(ref, continuity.recovery, recoveryRequestId, assertInputSendIntent);
             if (continuity.recovery) await markLauncherContinuitySendPossible(continuity.descriptor, continuity.recovery, ref.directory);
           }
           if (continuity) { delete continuity.binding.initialAcceptedInput; delete continuity.binding.initialInstructionPayloadDigest; }
@@ -1108,6 +1208,7 @@ export function createChatGptWebAdapter(
         launcherEnded = true;
       };
       const runManual = async (): Promise<string> => {
+        let failed = false;
         try {
           activeToken = await broker.registerSafe(
             environment,
@@ -1159,7 +1260,7 @@ export function createChatGptWebAdapter(
             const ref = continuity.binding.recovery;
             if (!continuity.recovery) throw continuityError("continuity_source_unproven");
             beginAcquisition();
-            originalSend = beginRecoverySend(ref, continuity.recovery, recoveryRequestId);
+            originalSend = beginRecoverySend(ref, continuity.recovery, recoveryRequestId, assertInputSendIntent);
             submission.phase = "send_activated";
           }
           const manualLease = await zeroRiskManualControl.start(retainedLauncherDescriptor, {
@@ -1179,6 +1280,8 @@ export function createChatGptWebAdapter(
             ...(parsed._compactionRequest ? { compaction: true as const } : {}),
           });
           launcherStarted = true;
+          inputWaitReason("manual-send");
+          if (continuity) acceptContinuityLease((manualLease as { continuity?: unknown } | undefined)?.continuity);
           const selectedId = (manualLease as { selectedPlanId?: string } | undefined)?.selectedPlanId;
           const chosen = selectedId ? [full.value, resume?.value].find(value => value?.plan && contextSend!.descriptor(value.plan).planId === selectedId)
             : (manualLease as { reused?: boolean } | undefined)?.reused ? resume?.value : full.value;
@@ -1188,7 +1291,6 @@ export function createChatGptWebAdapter(
             }
             await contextSend.select(activeToken, chosen.plan);
           }
-          if (continuity) acceptContinuityLease((manualLease as { continuity?: unknown } | undefined)?.continuity);
           // Do not expose the broker request id to the outer harness until Launcher has captured
           // and accepted the same per-turn Sent policy used by the broker.
           tokenSettled = true;
@@ -1238,6 +1340,7 @@ export function createChatGptWebAdapter(
             reportLoadedRecovery();
             await freshCompaction?.markDelivered();
             await zeroRiskManualControl.markStarted(retainedLauncherDescriptor, owner);
+            inputWaitReason("boundary");
             const mediaPlan = chosen?.compiled.contextPlan;
             const mediaReady = mediaPlan?.requiredAttachments.length ? (async () => {
               if (!zeroRiskManualControl.waitAttachments) throw new Error("Update Launcher to confirm required image attachments");
@@ -1279,8 +1382,19 @@ export function createChatGptWebAdapter(
           }
           return answer;
         } catch (error) {
+          failed = true;
           const normalized = safeManualAdapterError(error);
           settleUnsent(error);
+          if (!launcherStarted && !originalSend && !browserAbort.signal.aborted && continuity?.expected
+            && continuity.recovery && continuity.binding.recovery) {
+            try {
+              if (readLauncherBrowserHostDescriptor(continuity.descriptor).features?.includes(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) {
+                recoveryStore(continuity.binding.recovery).terminatePreparation(continuity.recovery, {
+                  requestId: recoveryRequestId, traceId, helperPid: process.pid, lease: continuity.expected,
+                });
+              }
+            } catch { /* A missing termination receipt cannot prove unsent. */ }
+          }
           // Capture the causal state before our own cleanup revokes the broker capability. The
           // retirement observer also aborts browserAbort, but that self-induced abort must not turn
           // an ordinary launcher/runtime failure into a user cancellation.
@@ -1301,8 +1415,8 @@ export function createChatGptWebAdapter(
           }
           throw normalized;
         } finally {
-          await freshCompaction?.cleanup();
-          try { await contextSend?.syncUsage(); }
+          try { await freshCompaction?.cleanup(); await contextSend?.syncUsage(); }
+          catch (error) { if (!failed) throw error; }
           finally { contextSend?.retire(); }
         }
       };
@@ -1329,6 +1443,7 @@ export function createChatGptWebAdapter(
         get recoveryFinal() { return recoveryFinal; },
         ...(conversationKey ? { conversationKey } : {}),
         ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
+        retainsContinuityAfterFailure,
         retireCapability: async () => {
           if (activeToken) await (broker.revokeTrusted ?? broker.revoke).call(broker, activeToken);
           await contextSend?.syncUsage();
@@ -1547,6 +1662,7 @@ export function createChatGptWebAdapter(
       get recoveryFinal() { return recoveryFinal; },
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
+      retainsContinuityAfterFailure,
       retireCapability: async () => {
         if (activeToken) await (broker.revokeTrusted ?? broker.revoke).call(broker, activeToken);
           await contextSend?.syncUsage();
@@ -1600,6 +1716,9 @@ export function createChatGptWebAdapter(
           throw error;
         }
       };
+      let continuationQueue: RuntimeTaskInputQueue | undefined;
+      let continuationMessageIds: string[] | undefined;
+      let continuationIntentGeneration: number | undefined;
       const runChatGptWebTurn = async (): Promise<void> => {
         if (parsed._conversationPolicy === "task") incoming.abortSignal?.throwIfAborted();
         const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -2100,7 +2219,9 @@ export function createChatGptWebAdapter(
         const taskExecution = environment ? taskUpdateExecutionIdentity(environment, executionNamespace, parsed) : undefined;
         const existingTaskSession = parsed._conversationPolicy !== "task"
           ? chatGptTurnSessions.find(executionKey) : undefined;
-        const updatedTaskSession = !existingTaskSession && taskExecution && environment
+        const ordinaryLegacyReplay = retainedContinuitySession && !retainedContinuitySession.taskUpdatesEnabled()
+          && !retainedContinuitySession.isQueuedTaskInputRequest(parsed);
+        const updatedTaskSession = !existingTaskSession && !ordinaryLegacyReplay && taskExecution && environment
           ? await tryTaskUpdateHandoff({ parsed, executionKey, ownerKey, namespace: executionNamespace,
             environment, execution: taskExecution, broker, result: brokerResult, onProgress: incoming.onProgress })
           : undefined;
@@ -2119,16 +2240,64 @@ export function createChatGptWebAdapter(
           }
           negotiatedTaskUpdates.add(parsed);
         }
+        const startCurrentRuntime = (): ChatGptTurnRuntime => {
+          const retry = preparedContinuity.get(parsed)?.taskInputRetry;
+          if (retry) {
+            const ref = preparedContinuity.get(parsed)!.binding.recovery!;
+            continuationQueue = { identity: retry.identity, store: new ContinuityTaskInputStore(ref.directory), authorize: () => {
+              recoveryStore(ref).assertTaskInputIntent(retry.identity, retry.intentGeneration);
+            } };
+            continuationMessageIds = retry.messageIds;
+            continuationIntentGeneration = retry.intentGeneration;
+          }
+          const admitted = preparedContinuity.get(parsed);
+          if (!continuationQueue && admitted?.input && admitted.binding.recovery && initialTaskSource) {
+            const identity = { thread: admitted.binding.thread, scope: admitted.binding.scope,
+              taskId: `task_${taskUpdateDigest([admitted.binding.thread, initialTaskSource.turnId])}` };
+            const store = new ContinuityTaskInputStore(admitted.binding.recovery.directory);
+            const task = store.get(identity);
+            const pending = task?.state === "active" ? task.messages.filter(message => message.status === "accepted"
+              && !message.deliveryIds.some(id => task.deliveries.some(delivery => delivery.deliveryId === id
+                && !delivery.cancelled && delivery.intentGeneration === task.intentGeneration))) : [];
+            if (pending.length) {
+              const supplied = new Map(initialTaskSource.messages.map(message => [message.sourceMessageId, message.payloadDigest]));
+              const selected = pending.filter(message => supplied.get(message.messageId) === message.digest);
+              if (!selected.length || selected.some((message, index) => message.messageId !== pending[index]!.messageId)) {
+                throw continuityError("continuity_source_unproven", "The current recovery input must cover the next saved input prefix.");
+              }
+              continuationQueue = { identity, store, authorize: () => assertRecoveryWriter(admitted.binding.recovery!) };
+              continuationMessageIds = selected.map(message => message.messageId);
+              continuationIntentGeneration = task!.intentGeneration;
+            }
+          }
+          if (continuationQueue && continuationMessageIds?.length) {
+            const ref = preparedContinuity.get(parsed)?.binding.recovery;
+            if (!ref) throw continuityError("continuity_source_unproven", "Queued continuation has no admitted work.");
+            const record = recoveryStore(ref).get(ref.thread)!;
+            const work = record.works[ref.logicalWorkId]!;
+            continuationQueue.store.reserveDelivery(continuationQueue.identity, {
+              deliveryId: `initial_${traceId}`, mode: "initial", physicalResponseId: traceId,
+              workLineageId: work.workLineageId, logicalWorkId: work.logicalWorkId,
+              acceptedRevision: 0, acceptedTaskRevision: work.acceptedTaskRevision, driverGeneration: 0,
+              historyRevision: record.historyRevision, messageIds: continuationMessageIds,
+            }, { expectedIntentGeneration: continuationIntentGeneration, authorize: () => {
+              incoming.abortSignal?.throwIfAborted();
+              assertRecoveryWriter(ref);
+              if (retry) recoveryStore(ref).assertTaskInputIntent(retry.identity, retry.intentGeneration);
+            } });
+          }
+          return startRuntime(parsed, environment, traceId, turnCapabilities);
+        };
         const session = parsed._conversationPolicy === "task"
           ? updatedTaskSession ?? continuityReplay ?? chatGptTurnSessions.getOrCreate(
             executionKey,
-            () => startRuntime(parsed, environment, traceId, turnCapabilities),
+            startCurrentRuntime,
             traceId, ownerKey, nativeTurnId, nativeIdentity.threadId, chatGptInstructionLineage(parsed).current,
           )
           : existingTaskSession ?? updatedTaskSession ?? await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
           executionKey,
           ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities),
+          startCurrentRuntime,
           traceId,
           incoming.abortSignal,
           nativeTurnId,
@@ -2146,26 +2315,56 @@ export function createChatGptWebAdapter(
         if (taskExecution && session.runtime.taskUpdates && !session.taskUpdatesEnabled()) {
           session.initializeTaskUpdates(parsed, taskExecution);
         }
+        if (taskExecution) session.initializeTaskInputSource(parsed, taskExecution);
         const preservedCompactionFinal = taskExecution
           ? session.preservedCompactionFinalReplay(parsed, taskExecution, executionKey) : undefined;
         const taskRoute = taskExecution && session.taskUpdatesEnabled() && !preservedCompactionFinal
-          ? session.acceptTaskUpdateRound(parsed, taskExecution) : undefined;
-        const driverContext: TaskUpdateOwnerContext | undefined = taskRoute
+          ? session.acceptTaskUpdateRound(parsed, taskExecution)
+          : session.isQueuedTaskInputRequest(parsed) ? session.taskUpdateRoute(chatGptTurnExecutionKey(parsed)) : undefined;
+        const driverContext: TaskUpdateOwnerContext | undefined = taskRoute && session.taskUpdatesEnabled()
           ? { expectedDriverGeneration: taskRoute.driverGeneration, taskRevision: taskRoute.acceptedRevision } : undefined;
-        const roundKey = preservedCompactionFinal?.roundKey ?? taskRoute?.roundKey ?? (parsed._conversationPolicy === "task"
+        let roundKey = preservedCompactionFinal?.roundKey ?? taskRoute?.roundKey ?? (parsed._conversationPolicy === "task"
           ? session.continuityRoundKey(parsed)
           : chatGptTurnRoundKey(parsed));
+        const toolObserver = parsed._conversationPolicy === "task" && session.hasTaskInputSource() && !preservedCompactionFinal
+          ? session.attachToolObserver() : undefined;
+        if (toolObserver && driverContext) driverContext.observerGeneration = toolObserver.generation;
+        // The connection serial also protects old capabilities. It does not
+        // negotiate task-updates-v1 or grant its output/ACK authority.
+        const toolDeliveryContext = driverContext ?? (toolObserver ? {
+          expectedDriverGeneration: 0, taskRevision: 0, observerGeneration: toolObserver.generation,
+        } : undefined);
+        let schedulerFailure: unknown;
+        let inputDeliveryFailure: unknown;
+        const schedulerError = deferred<never>();
+        void schedulerError.promise.catch(() => {});
+        const beginScheduler = () => toolObserver && taskExecution && environment && parsed._conversationPolicy === "task"
+          ? startTaskInputScheduler({ session, parsed, generation: toolObserver.generation, ownerKey,
+            namespace: executionNamespace, environment, execution: taskExecution, broker, result: brokerResult,
+            signal: incoming.abortSignal }) : undefined;
+        let scheduler: ReturnType<typeof startTaskInputScheduler> | undefined;
         let emittedJournalEvents = 0;
         let completedRoundReplay = false;
         const completedRoundEvents: AdapterEvent[] = [];
         const assertOutputOwner = (): void => {
+          if (toolObserver) session.assertToolObserver(toolObserver.generation);
           if (!driverContext) return;
           if (completedRoundReplay) session.assertCompletedTaskUpdateRound(roundKey, driverContext);
           else session.assertDriverGeneration(driverContext.expectedDriverGeneration);
         };
         const ensureDriver = async (): Promise<void> => {
-          if (!driverContext) return;
-          await session.waitForTaskUpdatePreparation(incoming.abortSignal);
+          if (!driverContext) { assertOutputOwner(); return; }
+          do {
+            await Promise.race([session.waitForTaskUpdatePreparation(incoming.abortSignal), schedulerError.promise]);
+          } while (session.hasPendingTaskUpdate());
+          if (toolObserver && session.isCurrentToolObserver(toolObserver.generation)
+            && driverContext.expectedDriverGeneration !== session.driverGeneration()) {
+            driverContext.expectedDriverGeneration = session.driverGeneration();
+            driverContext.taskRevision = session.taskRevision();
+            roundKey = session.currentTaskOutputRound() ?? roundKey;
+            emittedJournalEvents = 0;
+          }
+          if (schedulerFailure && !(schedulerFailure instanceof DOMException && schedulerFailure.name === "AbortError")) throw schedulerFailure;
           assertOutputOwner();
         };
         const emitRoundEvents = (events: readonly AdapterEvent[], afterJournal?: () => void): void => {
@@ -2179,7 +2378,13 @@ export function createChatGptWebAdapter(
           }
           session.appendRoundEvents(roundKey, events);
           afterJournal?.();
-          for (const event of events) { emit(event); emittedJournalEvents += 1; }
+          for (const event of events) {
+            if (event.type === "done" && event.endTurn && taskInputQueue(session)) {
+              completeTaskInputPhysicalResponse(session);
+              if (pendingTaskInputs(session).length) { emittedJournalEvents += 1; continue; }
+            }
+            emit(event); emittedJournalEvents += 1;
+          }
         };
         const emitRoundBatch = (
           produce: (buffer: (event: AdapterEvent) => void) => void,
@@ -2286,25 +2491,147 @@ export function createChatGptWebAdapter(
           ? session.retainTaskUpdateTransaction() : undefined;
         let awaitingRuntime = false;
         let refreshingEnvironment = false;
+        let nextQueuedRequest: CodexParsedRequest | undefined;
         try {
+          if (toolObserver && toolDeliveryContext && session.runtime.mode === "tools" && broker.attachToolObserver && session.isActive()) {
+            await ensureDriver();
+            try { await broker.attachToolObserver(await session.runtime.token, toolDeliveryContext); }
+            catch (error) {
+              // A physical final can retire the writer before browser cleanup
+              // settles. The ordinary continuity check below proves the exact
+              // durable final; a connection cannot resurrect that writer.
+              if (isRetiredWriterError(error) && session.runtime.continuityBinding) {
+                // No new tool claim is made on this read-only path.
+              } else {
+                if (!session.isCurrentToolObserver(toolObserver.generation) || !error || typeof error !== "object"
+                  || !("code" in error) || error.code !== "task_update_driver_stale") throw error;
+                await ensureDriver();
+                await broker.attachToolObserver(await session.runtime.token, toolDeliveryContext);
+              }
+            }
+          }
+          scheduler = beginScheduler();
+          scheduler?.settled.catch(error => {
+            if (!incoming.abortSignal?.aborted && !(error instanceof DOMException && error.name === "AbortError")) {
+              schedulerFailure = error; schedulerError.reject(error);
+            }
+          });
           await session.runExclusive(async () => {
             if (!driverContext && parsed._conversationPolicy === "task"
+              && !session.isQueuedTaskInputRequest(parsed)
               && session.continuityRoundKey(parsed) !== roundKey) {
               throw continuityError("continuity_source_unproven", "The local work identity changed while this request was waiting for the execution lock.");
             }
             let turnToken: string | undefined;
+            const prepared = preparedContinuity.get(parsed);
+            const binding = prepared?.binding;
+            // Read live session ownership at each boundary, including after owner IPC.
+            const ownsPreparedSession = (): boolean => Boolean(binding && prepared
+              && binding.revision === prepared.revision
+              && chatGptTurnSessions.find(binding.executionKey!) === session
+              && chatGptTurnSessions.findConversationHead(prepared.conversationKey) === session
+              && !session.supersededError);
+            const settleCompletedRead = async (): Promise<boolean> => {
+              const completedReceipt = (): RuntimeRecoveryFinalReceipt | undefined => {
+                const ref = session.runtime.continuityBinding?.recovery;
+                if (!binding || !prepared || !ref) return undefined;
+                const record = recoveryStore(ref).get(ref.thread);
+                const work = record?.works[ref.logicalWorkId];
+                if (work?.state !== "completed") return undefined;
+                const attempt = work.attempts[ref.attempt];
+                const sourceInput = session.runtime.usageInput;
+                const origin = session.runtime.recoveryOrigin;
+                const receipt = session.recoveryFinalReceipt();
+                const journal = work.taskUpdateJournal;
+                const rejectIdentity = (): never => {
+                  throw continuityError("continuity_source_unproven", "The completed response no longer retains its original execution identity.");
+                };
+                if (!record || !origin || !receipt) return rejectIdentity();
+
+                // Prove each accepted append back to the work that started this physical runtime.
+                // Attempt numbers belong to their own work, so an append's attempt 0 can retain
+                // a recovered predecessor's attempt 1 without creating a new physical execution.
+                const originWork = record.works[origin.logicalWorkId];
+                const originAttempt = originWork?.attempts[origin.attempt];
+                const appended = ref.logicalWorkId !== origin.logicalWorkId;
+                let cursor = work;
+                const visited = new Set<string>();
+                while (cursor !== originWork) {
+                  if (visited.has(cursor.logicalWorkId) || cursor.purpose !== "ordinary"
+                    || cursor.workLineageId !== originWork?.workLineageId
+                    || cursor.attempts.at(-1)?.epoch !== origin.epoch) return rejectIdentity();
+                  visited.add(cursor.logicalWorkId);
+                  const predecessor = record.works[cursor.predecessorLogicalWorkId ?? ""];
+                  if (!predecessor || predecessor.purpose !== "ordinary"
+                    || predecessor.state === "stopped"
+                    || !predecessor.attempts.at(-1)?.writerRetired
+                    || cursor.acceptedTaskRevision !== predecessor.acceptedTaskRevision + 1
+                    || !cursor.taskUpdateJournal || !predecessor.taskUpdateJournal
+                    || cursor.taskUpdateJournal.streamId !== predecessor.taskUpdateJournal.streamId
+                    || cursor.taskUpdateJournal.driverGeneration !== predecessor.taskUpdateJournal.driverGeneration + 1
+                    || cursor.taskUpdateJournal.acceptedRevision <= predecessor.taskUpdateJournal.acceptedRevision) return rejectIdentity();
+                  cursor = predecessor;
+                }
+                const sameLogicalRequest = appended
+                  ? binding.logicalExecutionKey === executionKey && Boolean(taskRoute && journal
+                    && taskRoute.executionKey === chatGptTurnExecutionKey(parsed)
+                    && taskRoute.acceptedRevision === journal.acceptedRevision
+                    && taskRoute.driverGeneration === journal.driverGeneration)
+                  : binding.executionKey === executionKey && ref.attempt === origin.attempt;
+                const sameTaskSource = record.scope === binding.scope
+                  && record.scope === parsed._continuityScope && record.scope === sourceInput?._continuityScope
+                  && record.scope === origin.scope && ref.directory === origin.directory && ref.thread === origin.thread
+                  && record.thread === binding.thread && sameLogicalRequest;
+
+                if (!sameTaskSource) return rejectIdentity();
+
+                // Completion retires writes. Only the still-current execution may read this final.
+                const sameExecution = record.state !== "stopped" && !record.pendingPreparation
+                  && record.currentWorkId === ref.logicalWorkId
+                  && record.owner.id === ref.ownerId && record.owner.id === prepared.bindings.owner && record.owner.id === origin.ownerId
+                  && originAttempt === originWork?.attempts.at(-1) && originAttempt?.epoch === record.epoch
+                  && attempt === work.attempts.at(-1)
+                  && attempt?.epoch === record.epoch && attempt.epoch === origin.epoch && record.epoch === binding.epoch
+                  && attempt.stage === "completed" && attempt.writerRetired
+                  && prepared.bindings.observed(binding.thread) === binding
+                  && ownsPreparedSession();
+
+                if (!sameExecution) return rejectIdentity();
+
+                const sameFinalReceipt = receipt.directory === ref.directory && receipt.thread === ref.thread
+                  && receipt.logicalWorkId === work.logicalWorkId && receipt.workLineageId === work.workLineageId
+                  && receipt.terminalReceiptId === work.terminalReceiptId
+                  && receipt.terminalReceiptId === continuityDigest([ref.logicalWorkId, "final"])
+                  && receipt.terminalDigest === work.terminalDigest;
+                if (!sameFinalReceipt) return rejectIdentity();
+                return receipt;
+              };
+              const receipt = completedReceipt();
+              if (!receipt) return false;
+              const confirmReceipt = (): void => {
+                const confirmed = completedReceipt();
+                if (!confirmed || continuityDigest(confirmed) !== continuityDigest(receipt)) {
+                  throw continuityError("continuity_source_unproven", "The completed response no longer matches its accepted final receipt.");
+                }
+              };
+              // The durable final can precede Launcher cleanup and the browser outcome.
+              // Reconnect consumes that original final; it cannot update its retired writer.
+              const outcome = await withAbort(session.browserOutcome, incoming.abortSignal);
+              // A late browser error cannot bypass ownership checks after a replacement.
+              confirmReceipt();
+              if (outcome.type === "error") throw outcome.error;
+              await withAbort(session.physicalSettlement, incoming.abortSignal);
+              confirmReceipt();
+              if (continuityDigest(outcome.answer) !== receipt.terminalDigest) {
+                throw continuityError("continuity_source_unproven", "The completed response does not match its accepted final receipt.");
+              }
+              await ensureDriver();
+              return true;
+            };
             const updateTurnEnvironment = async (): Promise<string> => {
               if (session.runtime.mode !== "tools") throw new Error("Read-only ChatGPT Web runtime cannot update tool authority");
               const token = await withAbort(session.runtime.token, incoming.abortSignal);
               if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
-              const prepared = preparedContinuity.get(parsed);
-              const binding = prepared?.binding;
-              // Read live session ownership at each boundary, including after owner IPC.
-              const ownsPreparedSession = (): boolean => Boolean(binding && prepared
-                && binding.revision === prepared.revision
-                && chatGptTurnSessions.find(binding.executionKey!) === session
-                && chatGptTurnSessions.findConversationHead(prepared.conversationKey) === session
-                && !session.supersededError);
               if (binding) {
                 if (!session.isActive()) return token;
                 if (prepared.bindings.lookup(binding.thread, binding.scope) !== binding || !ownsPreparedSession()) {
@@ -2312,103 +2639,6 @@ export function createChatGptWebAdapter(
                 }
                 session.assertCanonicalReplayInput(parsed);
               }
-              const settleCompletedRead = async (): Promise<boolean> => {
-                const completedReceipt = (): RuntimeRecoveryFinalReceipt | undefined => {
-                  const ref = session.runtime.continuityBinding?.recovery;
-                  if (!binding || !prepared || !ref) return undefined;
-                  const record = recoveryStore(ref).get(ref.thread);
-                  const work = record?.works[ref.logicalWorkId];
-                  if (work?.state !== "completed") return undefined;
-                  const attempt = work.attempts[ref.attempt];
-                  const sourceInput = session.runtime.usageInput;
-                  const origin = session.runtime.recoveryOrigin;
-                  const receipt = session.recoveryFinalReceipt();
-                  const journal = work.taskUpdateJournal;
-                  const rejectIdentity = (): never => {
-                    throw continuityError("continuity_source_unproven", "The completed response no longer retains its original execution identity.");
-                  };
-                  if (!record || !origin || !receipt) return rejectIdentity();
-
-                  // Prove each accepted append back to the work that started this physical runtime.
-                  // Attempt numbers belong to their own work, so an append's attempt 0 can retain
-                  // a recovered predecessor's attempt 1 without creating a new physical execution.
-                  const originWork = record.works[origin.logicalWorkId];
-                  const originAttempt = originWork?.attempts[origin.attempt];
-                  const appended = ref.logicalWorkId !== origin.logicalWorkId;
-                  let cursor = work;
-                  const visited = new Set<string>();
-                  while (cursor !== originWork) {
-                    if (visited.has(cursor.logicalWorkId) || cursor.purpose !== "ordinary"
-                      || cursor.workLineageId !== originWork?.workLineageId
-                      || cursor.attempts.at(-1)?.epoch !== origin.epoch) return rejectIdentity();
-                    visited.add(cursor.logicalWorkId);
-                    const predecessor = record.works[cursor.predecessorLogicalWorkId ?? ""];
-                    if (!predecessor || predecessor.purpose !== "ordinary"
-                      || predecessor.state === "stopped"
-                      || !predecessor.attempts.at(-1)?.writerRetired
-                      || cursor.acceptedTaskRevision !== predecessor.acceptedTaskRevision + 1
-                      || !cursor.taskUpdateJournal || !predecessor.taskUpdateJournal
-                      || cursor.taskUpdateJournal.streamId !== predecessor.taskUpdateJournal.streamId
-                      || cursor.taskUpdateJournal.driverGeneration !== predecessor.taskUpdateJournal.driverGeneration + 1
-                      || cursor.taskUpdateJournal.acceptedRevision <= predecessor.taskUpdateJournal.acceptedRevision) return rejectIdentity();
-                    cursor = predecessor;
-                  }
-                  const sameLogicalRequest = appended
-                    ? binding.logicalExecutionKey === executionKey && Boolean(taskRoute && journal
-                      && taskRoute.executionKey === chatGptTurnExecutionKey(parsed)
-                      && taskRoute.acceptedRevision === journal.acceptedRevision
-                      && taskRoute.driverGeneration === journal.driverGeneration)
-                    : binding.executionKey === executionKey && ref.attempt === origin.attempt;
-                  const sameTaskSource = record.scope === binding.scope
-                    && record.scope === parsed._continuityScope && record.scope === sourceInput?._continuityScope
-                    && record.scope === origin.scope && ref.directory === origin.directory && ref.thread === origin.thread
-                    && record.thread === binding.thread && sameLogicalRequest;
-
-                  if (!sameTaskSource) return rejectIdentity();
-
-                  // Completion retires writes. Only the still-current execution may read this final.
-                  const sameExecution = record.state !== "stopped" && !record.pendingPreparation
-                    && record.currentWorkId === ref.logicalWorkId
-                    && record.owner.id === ref.ownerId && record.owner.id === prepared.bindings.owner && record.owner.id === origin.ownerId
-                    && originAttempt === originWork?.attempts.at(-1) && originAttempt?.epoch === record.epoch
-                    && attempt === work.attempts.at(-1)
-                    && attempt?.epoch === record.epoch && attempt.epoch === origin.epoch && record.epoch === binding.epoch
-                    && attempt.stage === "completed" && attempt.writerRetired
-                    && prepared.bindings.observed(binding.thread) === binding
-                    && ownsPreparedSession();
-
-                  if (!sameExecution) return rejectIdentity();
-
-                  const sameFinalReceipt = receipt.directory === ref.directory && receipt.thread === ref.thread
-                    && receipt.logicalWorkId === work.logicalWorkId && receipt.workLineageId === work.workLineageId
-                    && receipt.terminalReceiptId === work.terminalReceiptId
-                    && receipt.terminalReceiptId === continuityDigest([ref.logicalWorkId, "final"])
-                    && receipt.terminalDigest === work.terminalDigest;
-                  if (!sameFinalReceipt) return rejectIdentity();
-                  return receipt;
-                };
-                const receipt = completedReceipt();
-                if (!receipt) return false;
-                const confirmReceipt = (): void => {
-                  const confirmed = completedReceipt();
-                  if (!confirmed || continuityDigest(confirmed) !== continuityDigest(receipt)) {
-                    throw continuityError("continuity_source_unproven", "The completed response no longer matches its accepted final receipt.");
-                  }
-                };
-                // The durable final can precede Launcher cleanup and the browser outcome.
-                // Reconnect consumes that original final; it cannot update its retired writer.
-                const outcome = await withAbort(session.browserOutcome, incoming.abortSignal);
-                // A late browser error cannot bypass ownership checks after a replacement.
-                confirmReceipt();
-                if (outcome.type === "error") throw outcome.error;
-                await withAbort(session.physicalSettlement, incoming.abortSignal);
-                confirmReceipt();
-                if (continuityDigest(outcome.answer) !== receipt.terminalDigest) {
-                  throw continuityError("continuity_source_unproven", "The completed response does not match its accepted final receipt.");
-                }
-                await ensureDriver();
-                return true;
-              };
               if (await settleCompletedRead()) return token;
               const registry = binding ? continuityToolRegistry(parsed, binding, session) : undefined;
               if (registry) {
@@ -2440,7 +2670,7 @@ export function createChatGptWebAdapter(
             // An active ordinary reconnect publishes its current registry before returning its
             // journal. Historical executions remain read-only and keep their original response.
             if (parsed._conversationPolicy === "task" && session.isActive()
-              && session.runtime.mode === "tools") {
+              && !session.isQueuedTaskInputRequest(parsed) && session.runtime.mode === "tools") {
               turnToken = await updateTurnEnvironment();
             }
             continuityAdmissionPending = false;
@@ -2526,20 +2756,30 @@ export function createChatGptWebAdapter(
                 if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its current tool authority");
                 await ensureDriver();
                 refreshingEnvironment = true;
-                await broker.updateEnvironment(turnToken, environment, driverContext);
+                if (!session.isQueuedTaskInputRequest(parsed)) await broker.updateEnvironment(turnToken, environment, driverContext);
                 refreshingEnvironment = false;
                 await ensureDriver();
               }
               const updatedOutcome = session.settledOutcome();
               if (updatedOutcome?.type === "error") throw updatedOutcome.error;
 
+              if (parsed._conversationPolicy === "task" && session.taskUpdatesEnabled() && taskExecution && environment
+                && pendingTaskInputs(session).length && session.acceptContinuityToolResults(parsed).length) {
+                const queued = queuedTaskInputRequest(session, parsed)!;
+                try {
+                  await tryTaskUpdateHandoff({ parsed: queued, executionKey: `${executionNamespace}:${chatGptTurnExecutionKey(queued)}`,
+                    ownerKey, namespace: executionNamespace, environment, execution: taskExecution, broker, result: brokerResult,
+                    controlledBoundary: true, onProgress: incoming.onProgress });
+                } catch (error) { inputDeliveryFailure = error; throw error; }
+                await ensureDriver();
+              }
               const outstanding = session.isActive() ? session.outstanding() : [];
               if (outstanding.length > 0) {
                 const results = parsed._conversationPolicy === "task"
                   ? session.acceptContinuityToolResults(parsed)
                   : session.taskUpdatesEnabled() ? session.acceptTaskUpdateToolResults(parsed)
                   : currentToolResults(parsed, session);
-                if (results.length === 0) {
+                if (results.length === 0 && !session.isQueuedTaskInputRequest(parsed)) {
                   const reasoning = session.reasoningForOutstandingReplay();
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
                   emitRoundBatch(buffer => emitToolBatch(
@@ -2565,7 +2805,7 @@ export function createChatGptWebAdapter(
                   session.runtime.trace.recordProgress();
                   session.markResultDelivered(message.toolCallId);
                 }
-                if (session.outstanding().length > 0) {
+                if (session.outstanding().length > 0 && !session.isQueuedTaskInputRequest(parsed)) {
                   emitRoundBatch(buffer => emitToolBatch(session.outstanding(),
                     estimateChatGptWebUsage(currentUsageInput(parsed), { toolRequests: session.outstanding() }, turnCapabilities,
                       experimentalBiggerContext, experimentalSkillAttachments), buffer));
@@ -2596,7 +2836,8 @@ export function createChatGptWebAdapter(
                 ? session.runtime.externalProgress
                 : undefined;
               const armNextTools = () => turnToken && session.isActive()
-                ? broker.nextToolBatch(turnToken, toolWaitAbort.signal, driverContext).then(async requests => {
+                && !(session.isQueuedTaskInputRequest(parsed) && session.outstanding().length > 0)
+                ? broker.nextToolBatch(turnToken, toolWaitAbort.signal, toolDeliveryContext).then(async requests => {
                   await ensureDriver();
                   if (!externalProgress) {
                     throw new Error("ChatGPT broker returned tools for a read-only browser turn");
@@ -2620,9 +2861,20 @@ export function createChatGptWebAdapter(
                   }
                   await ensureDriver();
                   return { type: "tools" as const, requests };
-                }).catch(error => toolWaitAbort.signal.aborted
-                  ? new Promise<never>(() => {})
-                  : Promise.reject(error))
+                }).catch(async error => {
+                  if (toolWaitAbort.signal.aborted) return new Promise<never>(() => {});
+                  // A final can commit between observer attachment and this wait.
+                  // Prove its original receipt, then read it without opening tool delivery.
+                  if (isRetiredWriterError(error) && await settleCompletedRead()) {
+                    return { type: "browser" as const, outcome: await session.browserOutcome };
+                  }
+                  if (toolObserver && session.isCurrentToolObserver(toolObserver.generation)
+                    && error && typeof error === "object" && "code" in error
+                    && ["task_update_driver_stale", "task_update_revision_stale"].includes(String(error.code))) {
+                    return { type: "tools_refresh" as const };
+                  }
+                  return Promise.reject(error);
+                })
                 : undefined;
               let nextTools = armNextTools();
               const browserOutcome = session.browserOutcome.then(outcome => ({ type: "browser" as const, outcome }));
@@ -2662,6 +2914,8 @@ export function createChatGptWebAdapter(
                 .catch(error => toolWaitAbort.signal.aborted
                   ? new Promise<never>(() => {})
                   : Promise.reject(error));
+              const observerChange = toolObserver ? session.waitForToolObserverChange(toolObserver.generation, toolWaitAbort.signal)
+                .then(() => ({ type: "observer_change" as const })) : undefined;
               let nextTrace = waitForTrace();
               let nextText = waitForText();
               let driverChange = driverContext ? session.waitForDriverChange(driverContext.expectedDriverGeneration, toolWaitAbort.signal)
@@ -2672,13 +2926,24 @@ export function createChatGptWebAdapter(
                   Promise.race([
                     ...(nextTools ? [nextTools] : []),
                     browserOutcome,
+                    schedulerError.promise,
                     nextTrace,
                     nextText,
                     ...(driverChange ? [driverChange] : []),
+                    ...(observerChange ? [observerChange] : []),
                   ]),
                   incoming.abortSignal,
                 );
                 awaitingRuntime = false;
+                if (next.type === "tools_refresh") {
+                  await ensureDriver();
+                  nextTools = armNextTools();
+                  continue;
+                }
+                if (next.type === "observer_change") {
+                  session.assertToolObserver(toolObserver!.generation);
+                  continue;
+                }
                 if (next.type === "driver_change") {
                   await ensureDriver();
                   driverChange = session.waitForDriverChange(driverContext!.expectedDriverGeneration, toolWaitAbort.signal)
@@ -2706,9 +2971,6 @@ export function createChatGptWebAdapter(
                   throw new Error("Read-only ChatGPT Web runtime received a broker tool batch");
                 }
                 if (next.requests.length === 0) {
-                  if (!session.runtime.manualControl) {
-                    throw new Error("ChatGPT tool bridge returned an empty batch");
-                  }
                   await finishBrowserOutcome(await session.browserOutcome);
                   return;
                 }
@@ -2733,7 +2995,42 @@ export function createChatGptWebAdapter(
             }
             } finally { releaseProgressObserver(); releaseObserver?.(); }
           });
+          if (session.settledOutcome()?.type === "final" && toolObserver
+            && session.isCurrentToolObserver(toolObserver.generation) && !incoming.abortSignal?.aborted) {
+            completeTaskInputPhysicalResponse(session);
+            nextQueuedRequest = queuedTaskInputRequest(session, parsed);
+            if (nextQueuedRequest) {
+              await withAbort(session.physicalSettlement, incoming.abortSignal);
+              const binding = session.runtime.continuityBinding;
+              const compactionKey = binding?.state === "compacting" ? binding.compactionKey : undefined;
+              if (binding && compactionKey) {
+                const compaction = existingStructuredCompactionRun<StructuredCompactionResult>(compactionKey);
+                if (!compaction) throw continuityError("continuity_unverified", "The pending compaction must settle before queued input can be sent.");
+                taskInputQueue(session)?.store.setWaitReason(taskInputQueue(session)!.identity, "compaction");
+                await withAbort(compaction, incoming.abortSignal);
+              }
+              if (binding && binding.revision !== preparedContinuity.get(parsed)?.revision) {
+                const checkpoints = [...binding.checkpoints.values()].filter(checkpoint => checkpoint.revision === binding.revision);
+                const checkpoint = checkpoints.length === 1 ? checkpoints[0] : undefined;
+                if (!checkpoint) throw continuityError("continuity_source_unproven", "The queued continuation has no current committed checkpoint.");
+                nextQueuedRequest = queuedTaskInputRequest(session, parsed, checkpoint.summary);
+              }
+              continuationQueue = taskInputQueue(session);
+              continuationMessageIds = pendingTaskInputs(session).slice(0, 16).map(message => message.messageId);
+              continuationIntentGeneration = continuationQueue?.store.get(continuationQueue.identity)?.intentGeneration;
+              chatGptTurnSessions.releaseQueuedTaskInputRoutes(session);
+            }
+          }
         } catch (error) {
+          if (error === inputDeliveryFailure || error === schedulerFailure) throw error;
+          if (toolObserver && !session.isCurrentToolObserver(toolObserver.generation) && !incoming.abortSignal?.aborted) {
+            scheduler?.stop();
+            const final = await session.waitForFinalResponseEvents(incoming.abortSignal);
+            const own = session.roundEvents(roundKey);
+            const completedHere = own.at(-1)?.type === "done" && (own.at(-1) as Extract<AdapterEvent, { type: "done" }>).endTurn;
+            replayEvents(completedHere ? final.slice(emittedJournalEvents) : final, emit);
+            return;
+          }
           if (driverContext && session.hasPendingTaskUpdate()) {
             // A disconnected observer leaves an unresolved transfer owned by its retained
             // transaction; it cannot revoke a possible new driver while awaiting a receipt.
@@ -2776,6 +3073,14 @@ export function createChatGptWebAdapter(
           if (!(turnError instanceof ChatGptWebAdapterError && turnError.retryable)) {
             chatGptWebTurnRetryPolicy.clear(retryKey);
           }
+          // A trusted no-allocation receipt preserves this creation claim. Its rejected
+          // token can reach the observer before browserOutcome publishes the same error.
+          // Wait for that terminal before discarding only the local failed Session.
+          if (session.runtime.retainsContinuityAfterFailure?.()
+            && session.runtime.continuityBinding?.state === "creating"
+            && session.runtime.submission?.phase === "prepared" && !session.settledOutcome()) {
+            await session.browserOutcome;
+          }
           const retryableContinuityCreation = session.runtime.submission?.phase === "prepared"
             && session.runtime.continuityBinding !== undefined
             && chatGptTurnSessions.discardRetryableContinuityCreation(
@@ -2806,7 +3111,7 @@ export function createChatGptWebAdapter(
             const ownsDriver = !driverContext
               || session.ownsTaskUpdateOutputRound(roundKey, driverContext.expectedDriverGeneration);
             try {
-              if (ownsDriver && !retryableContinuityCreation) {
+              if (ownsDriver && !retryableContinuityCreation && !session.runtime.retainsContinuityAfterFailure?.()) {
                 if ((handledError instanceof ChatGptWebAdapterError && !handledError.retryable)
                   || (terminalError?.type === "error" && terminalError.retryable === false)) {
                   // Keep deterministic request failures replayable on their original round.
@@ -2830,7 +3135,24 @@ export function createChatGptWebAdapter(
           chatGptWebTurnRetryPolicy.clear(retryKey);
           throw turnError;
         } finally {
+          scheduler?.stop();
+          toolObserver?.detach();
+          if (toolObserver && session.runtime.mode === "tools") {
+            void session.runtime.token.then(token => broker.detachToolObserver?.(token, toolObserver.generation)).catch(() => {});
+          }
+          const queue = taskInputQueue(session);
+          if (queue && !session.hasCurrentToolObserver() && queue.store.get(queue.identity)?.state === "active") {
+            queue.store.setWaitReason(queue.identity, nextQueuedRequest ? "next-response" : "observer");
+          }
           releaseRoundRegistration?.();
+        }
+        if (nextQueuedRequest) {
+          incoming.abortSignal?.throwIfAborted();
+          const previous = preparedContinuity.get(parsed);
+          previous?.releaseAdmission?.();
+          parsed = nextQueuedRequest;
+          emit({ type: "assistant_boundary" });
+          await runChatGptWebTurn();
         }
       };
 

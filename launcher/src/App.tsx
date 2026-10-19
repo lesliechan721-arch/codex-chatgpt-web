@@ -20,6 +20,7 @@ import { LimitsSurface } from "./LimitsSurface";
 import { limitsCopyFor } from "./limits-copy";
 import { useLimits } from "./useLimits";
 import { describeTurnActivity } from "./turn-activity";
+import { TaskInputsPanel } from "./TaskInputsPanel";
 import type {
   BrowserInteractionMode,
   BrowserState,
@@ -1808,6 +1809,7 @@ function ActivitySurface({
           ))}
         </section>
       ) : null}
+      <TaskInputsPanel language={language} />
       <div className="section-heading activity-heading">
         <span>{copy.recentActivity}</span>
         <SecondaryButton

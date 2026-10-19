@@ -185,4 +185,3 @@ export function userRevision(value: unknown, expectedTurnId?: string, metadata?:
     ...(messageTurnId ? { turnId: messageTurnId } : {}),
     ...(itemId ? { itemId } : {}) };
 }
-

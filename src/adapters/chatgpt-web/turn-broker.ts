@@ -1,3 +1,6 @@
+import { recoveryStore } from "./continuity-recovery-runtime";
+import { taskUpdateDigest } from "./task-update-source";
+import type { TaskInputIdentity } from "./continuity-task-input-types";
 import { restoreRecoveryTaskUpdates, recordRecoveryTaskDelivery, recordRecoveryTaskAck, recoveryTaskUpdateSeed } from "./continuity-task-update-journal";
 import { ContextScope, CONTEXT_PROTOCOL_VERSION, contextError, contextFailure, type ContextPlanRegistration, type ContextAttachmentConfirmation, type ContextStatus, type ContextUsageEvidence, type ContextVerificationRegistration, type ContextVerificationHandle, type ContextVerificationStatus, type CompactionContextRegistration, type CompactionContextHandle, type ContextMethod, type ContextArgs, type ContextPreparedReply } from "./context-runtime";
 import type { ContextTextReadReceipt } from "./context-text-result";
@@ -179,6 +182,11 @@ interface SafeTurnControl {
 }
 
 interface TurnChannel {
+  taskInput?: { identity: TaskInputIdentity; intentGeneration: number };
+  toolObserverGeneration?: number;
+  toolObserverConnected?: boolean;
+  taskInputBoundaryWaiters?: Set<SafeWaiter<boolean>>;
+  taskInputAckBoundary?: boolean;
   verificationPair?: string;
   contextPlans?: Map<string, ContextPlanRegistration>;
   contextScope?: ContextScope;
@@ -235,6 +243,9 @@ interface BrokerRequest {
     | "owner_update"
     | "owner_safe_sent"
     | "owner_next"
+    | "owner_observer_detach"
+    | "owner_observer_attach"
+    | "owner_task_input_boundary"
     | "owner_complete"
     | "owner_completion_fence_begin"
     | "owner_completion_fence_commit"
@@ -338,7 +349,7 @@ const MAX_RETIRED_TURN_HANDLES = 64;
 const BROKER_CLOSE_GRACE_MS = 250;
 const BROKER_ENDPOINT_CHECK_MS = 1_000;
 const BROKER_ENDPOINT_FAILURE_LIMIT = 3;
-const TURN_BROKER_PROTOCOL_VERSION = 13;
+const TURN_BROKER_PROTOCOL_VERSION = 14;
 
 class EndpointMetadataRaceError extends Error {}
 
@@ -586,6 +597,9 @@ export interface TurnBrokerOwner {
     token: string,
     surfaceNonce: string,
   ): { confirmed: true; duplicate: boolean } | Promise<{ confirmed: true; duplicate: boolean }>;
+  waitForTaskInputBoundary?(token: string, signal?: AbortSignal): Promise<boolean>;
+  detachToolObserver?(token: string, generation: number): void | Promise<void>;
+  attachToolObserver?(token: string, context: TaskUpdateOwnerContext): void | Promise<void>;
   nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]>;
   completeTool(token: string, callId: string, result: BrokerToolResult, context?: TaskUpdateOwnerContext): void | Promise<void>;
   waitForSafeStart(token: string, signal?: AbortSignal): Promise<void>;
@@ -732,11 +746,18 @@ export class TurnBroker implements TurnBrokerOwner {
         throw taskUpdateError("task_update_upgrade_required", "Pending accepted updates require the task update ACK protocol on the successor.");
       }
     }
+    const taskInput = options.recovery ? (() => {
+      const record = recoveryRecord(options.recovery);
+      const identity = { thread: record.thread, scope: record.scope,
+        taskId: `task_${taskUpdateDigest([record.thread, record.works[options.recovery.logicalWorkId]!.nativeTurnId])}` };
+      const task = recoveryStore(options.recovery).taskInputRecord(identity);
+      return { identity, intentGeneration: task?.intentGeneration ?? 0 };
+    })() : undefined;
     const restoredUpdates = options.recovery && options.taskUpdateProtocol === TASK_UPDATE_PROTOCOL_VERSION
       ? restoreRecoveryTaskUpdates(options.recovery, options.recoveryTaskUpdateSources) : undefined;
     const token = opaqueId(handlePrefix);
     const channel: TurnChannel = {
-      ...(options.recovery ? { recovery: structuredClone(options.recovery), recoveryOwnerId } : {}),
+      ...(options.recovery ? { recovery: structuredClone(options.recovery), recoveryOwnerId, taskInput } : {}),
       traceId,
       externalOwner,
       authority: {
@@ -1175,12 +1196,76 @@ export class TurnBroker implements TurnBrokerOwner {
     channel.authority.registryGeneration += 1;
   }
 
+  waitForTaskInputBoundary(token: string, signal?: AbortSignal): Promise<boolean> {
+    const channel = this.channels.get(token);
+    if (!channel) return Promise.resolve(false);
+    if (!channel.taskUpdates || channel.completionCommitted || channel.taskUpdates.state.finalOutputRevision !== null) return Promise.resolve(false);
+    if (this.taskInputBoundaryOpen(channel)) return Promise.resolve(true);
+    channel.taskInputBoundaryWaiters ??= new Set();
+    if (channel.taskInputBoundaryWaiters.size >= 8) throw taskUpdateError("task_update_resource_limit", "Too many input boundary observers");
+    return this.waitForSafeState(channel.taskInputBoundaryWaiters, signal, "Task input boundary observation aborted");
+  }
+
+  private taskInputBoundaryOpen(channel: TurnChannel): boolean {
+    const state = channel.taskUpdates?.state;
+    return Boolean(state && state.finalOutputRevision === null && !channel.compactionRequested
+      && (!channel.safe || channel.safe.state === "running")
+      && state.acceptedRevision === state.acknowledgedRevision
+      && (channel.queuedCallIds.length || channel.taskInputAckBoundary));
+  }
+
+  private notifyTaskInputBoundary(channel: TurnChannel): void {
+    if (!channel.taskInputBoundaryWaiters?.size) return;
+    if (channel.completionCommitted || channel.taskUpdates?.state.finalOutputRevision !== null) {
+      this.resolveSafeWaiters(channel.taskInputBoundaryWaiters, false);
+    } else if (this.taskInputBoundaryOpen(channel)) this.resolveSafeWaiters(channel.taskInputBoundaryWaiters, true);
+  }
+
+  /** Replace only the delivery connection; captured output and completion retain M/G. */
+  attachToolObserver(token: string, context: TaskUpdateOwnerContext): void {
+    const channel = this.channels.get(token);
+    if (!channel) throw taskUpdateError("codex_tool_operation_retired", "The physical response is no longer active");
+    const generation = context.observerGeneration;
+    if (!Number.isSafeInteger(generation) || generation! < 1
+      || generation! < (channel.toolObserverGeneration ?? 0)) {
+      throw taskUpdateError("task_update_observer_stale", "The tool delivery connection is no longer current");
+    }
+    // A completed capability can still be observed. This does not restore dispatch rights.
+    if (!channel.completionCommitted && channel.safe?.state !== "completed") this.assertDriver(channel, context);
+    else this.assertCompletedOwnerRead(channel, context, true);
+    channel.toolObserverGeneration = generation;
+    channel.toolObserverConnected = true;
+    this.invalidateToolWaiters(channel);
+  }
+
+  detachToolObserver(token: string, generation: number): void {
+    const channel = this.channels.get(token);
+    if (!channel || channel.toolObserverGeneration !== generation) return;
+    channel.toolObserverConnected = false;
+    this.invalidateToolWaiters(channel);
+  }
+
+  private assertTaskInputIntent(channel: TurnChannel): void {
+    if (!channel.recovery || !channel.taskInput) return;
+    const store = recoveryStore(channel.recovery);
+    if (store.taskInputRecord(channel.taskInput.identity)) {
+      store.assertTaskInputIntent(channel.taskInput.identity, channel.taskInput.intentGeneration);
+    }
+  }
+
+  private assertToolObserver(channel: TurnChannel, context?: TaskUpdateOwnerContext): void {
+    if (channel.toolObserverGeneration !== undefined && (context?.observerGeneration !== channel.toolObserverGeneration || channel.toolObserverConnected === false)) {
+      throw taskUpdateError("task_update_observer_stale", "The tool delivery connection is no longer current");
+    }
+  }
+
   async nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]> {
     this.prune();
     let channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
     if (channel.safe?.state === "completed") { this.assertCompletedOwnerRead(channel, context, true); return []; }
     this.assertDriver(channel, context);
+    this.assertToolObserver(channel, context);
     if (channel.safe?.state === "awaiting_start") {
       // The outer Codex adapter owns this wait. It crosses the start boundary only after the user
       // confirms in the Launcher that the copied prompt was sent in the visible ChatGPT tab.
@@ -1190,6 +1275,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!channel) throw new Error("turn token is invalid or expired");
       if (channel.safe?.state === "completed") { this.assertCompletedOwnerRead(channel, context, true); return []; }
       this.assertDriver(channel, context);
+    this.assertToolObserver(channel, context);
     }
     this.assertSafeHarnessRunning(channel);
     if (channel.compactionRequested) {
@@ -1287,7 +1373,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (control.state.finalOutputRevision !== null || channel.completionCommitted) throw taskUpdateError("task_update_final_output_started", "Final answer output has already started");
     // A completed batch is not a live append boundary. Reject before binding an ID:
     // a later retry can carry fresh parsed timestamps or arrive at the next batch.
-    if (requireOpenBoundary && channel.deliveredCallIds.size === 0 && control.state.acknowledgedRevision === control.state.acceptedRevision) {
+    if (requireOpenBoundary && channel.deliveredCallIds.size === 0 && channel.queuedCallIds.length === 0 && !channel.taskInputAckBoundary && control.state.acknowledgedRevision === control.state.acceptedRevision) {
       throw taskUpdateError("task_update_no_boundary", "This append was not accepted because no tool delivery or confirmation boundary is open");
     }
     const outcome: TaskUpdateTransferOutcome = { status: "unknown", transferId };
@@ -1387,7 +1473,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (Buffer.byteLength(JSON.stringify(transfer.results)) > TASK_UPDATE_BATCH_LIMIT_BYTES) throw taskUpdateError("task_update_resource_limit", "The task update result batch exceeds its bounded transport budget");
       const resultsDigest = taskFingerprint(transfer.results);
       if (transfer.mode === "continuity") {
-        if (!record.openBoundaryReserved && channel.deliveredCallIds.size === 0 && updates.state.acknowledgedRevision === updates.state.acceptedRevision) {
+        if (!record.openBoundaryReserved && channel.deliveredCallIds.size === 0 && channel.queuedCallIds.length === 0 && !channel.taskInputAckBoundary && updates.state.acknowledgedRevision === updates.state.acceptedRevision) {
           throw taskUpdateError("task_update_no_boundary", "This append was not accepted because no tool delivery or confirmation boundary is open");
         }
         if ([...resultIds].some(id => !channel.deliveredCallIds.has(id) || !channel.invocations.has(id))) {
@@ -1448,6 +1534,7 @@ export class TurnBroker implements TurnBrokerOwner {
           channel.authority.registryGeneration += 1;
           updates.updates.push(...acceptedUpdates);
           updates.updateBytes += bytes;
+          channel.taskInputAckBoundary = false;
           updates.state.acceptedRevision = acceptedState.acceptedRevision;
           updates.state.driverGeneration = acceptedState.driverGeneration;
           updates.fences.clear();
@@ -1480,7 +1567,8 @@ export class TurnBroker implements TurnBrokerOwner {
       // failure can only delay this same committed transfer, never restore its old driver.
       if (channel.recovery) {
         if (!transfer.recovery) throw taskUpdateError("task_update_upgrade_required", "Continuity append requires durable predecessor evidence");
-        const acceptance = recordRecoveryAppend(channel.recovery, transfer.recovery, acceptedUpdates, acceptedState.driverGeneration);
+        const acceptance = recordRecoveryAppend(channel.recovery, transfer.recovery, acceptedUpdates, acceptedState.driverGeneration,
+          () => this.assertTaskInputIntent(channel));
         if (acceptance) { confirmDurable = acceptance.confirm; recoveryConfirmed = acceptance.committed; }
       } else {
         publishTaskOutputVersion(updates.state.acknowledgementDirectory!, acceptedState.acceptedRevision, acceptedState.driverGeneration);
@@ -1534,6 +1622,7 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!marker.isFile() || marker.size !== 0) throw error;
       }
       updates.state.acknowledgedRevision = delivery.throughRevision;
+      channel.taskInputAckBoundary = Boolean(channel.taskInput);
       updates.currentDeliveryId = undefined;
       this.taskStateChanged(channel);
     }
@@ -1664,6 +1753,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private taskStateChanged(channel: TurnChannel): void {
+    this.notifyTaskInputBoundary(channel);
     const updates = channel.taskUpdates;
     if (!updates) return;
     updates.revision += 1;
@@ -1677,7 +1767,7 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private invalidateToolWaiters(channel: TurnChannel): void {
     for (const waiter of [...channel.waiters]) {
-      try { this.assertDriver(channel, waiter.context); } catch (error) {
+      try { this.assertDriver(channel, waiter.context); this.assertToolObserver(channel, waiter.context); } catch (error) {
         channel.waiters.delete(waiter);
         if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
         waiter.reject(errorOf(error));
@@ -2678,7 +2768,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
+    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_observer_attach", "owner_observer_detach", "owner_task_input_boundary", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -2935,6 +3025,20 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!request.token) throw new Error("turn owner token is required");
       assertSurfaceNonce(request.surfaceNonce);
       return this.confirmSafeTurnSent(request.token, request.surfaceNonce);
+    }
+    if (request.method === "owner_task_input_boundary") {
+      if (!request.token) throw new Error("Task input boundary requires a physical capability");
+      return this.waitForTaskInputBoundary(request.token, socketSignal).then(open => ({ open }));
+    }
+    if (request.method === "owner_observer_detach") {
+      if (!request.token || !isTaskRevision(request.revision)) throw new Error("Observer detach requires its exact association");
+      this.detachToolObserver(request.token, request.revision!);
+      return { detached: true };
+    }
+    if (request.method === "owner_observer_attach") {
+      if (!request.token || !request.ownerContext) throw new Error("Observer association requires its current owner context");
+      this.attachToolObserver(request.token, request.ownerContext);
+      return { attached: true };
     }
     if (request.method === "owner_next") {
       if (!request.token) throw new Error("turn owner token is required");
@@ -3338,7 +3442,19 @@ export class TurnBroker implements TurnBrokerOwner {
         const invocation = channel.invocations.get(id);
         return invocation ? [{ ...invocation.request, operationId: invocation.operationId }] : [];
       });
-      recordRecoveryDelivery(channel.recovery, batch);
+      const pendingInput = Symbol("pending task input");
+      try {
+        recordRecoveryDelivery(channel.recovery, batch, () => {
+          this.assertTaskInputIntent(channel);
+          const task = channel.taskInput && recoveryStore(channel.recovery!).taskInputRecord(channel.taskInput.identity);
+          if (channel.taskUpdates && task?.messages.some(message => message.status === "accepted"
+            && !message.deliveryIds.some(id => task.deliveries.some(delivery => delivery.deliveryId === id
+              && !delivery.cancelled && delivery.intentGeneration === task.intentGeneration)))) throw pendingInput;
+        });
+      } catch (error) {
+        if (error === pendingInput) return [];
+        throw error;
+      }
     }
     const ids = channel.queuedCallIds.splice(0);
     for (const id of ids) {
@@ -3361,6 +3477,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private scheduleToolWaiters(channel: TurnChannel): void {
+    this.notifyTaskInputBoundary(channel);
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     if (channel.batchTimer) return;
     channel.batchTimer = setTimeout(() => {
@@ -3423,6 +3540,15 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private wakeToolWaiters(channel: TurnChannel): void {
+    if (channel.completionCommitted || channel.safe?.state === "completed") {
+      for (const waiter of channel.waiters) {
+        if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+        try { this.assertToolObserver(channel, waiter.context); waiter.resolve([]); }
+        catch (error) { waiter.reject(errorOf(error)); }
+      }
+      channel.waiters.clear();
+      return;
+    }
     this.invalidateToolWaiters(channel);
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     let batch: BrokerToolRequest[];
@@ -3437,6 +3563,7 @@ export class TurnBroker implements TurnBrokerOwner {
       channel.waiters.clear();
       return;
     }
+    if (!batch.length) return;
     this.logToolDelivery(channel, batch, "waiter");
     const waiters = [...channel.waiters];
     channel.waiters.clear();
@@ -3452,6 +3579,7 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   private rejectChannel(channel: TurnChannel, error: Error): void {
+    if (channel.taskInputBoundaryWaiters) this.resolveSafeWaiters(channel.taskInputBoundaryWaiters, false);
     this.rejectSafeWaiters(channel.nativeWaitingObservers, error);
     channel.nativeOperations.retire(error);
     if (channel.batchTimer) clearTimeout(channel.batchTimer);
@@ -3770,6 +3898,20 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
       throw new Error("DEV Zero Risk turn owner received an invalid Sent confirmation result");
     }
     return { confirmed: true, duplicate: response.duplicate };
+  }
+
+  async waitForTaskInputBoundary(token: string, signal?: AbortSignal): Promise<boolean> {
+    const result = await callTurnBroker<{ open: boolean }>(this.socketPath,
+      { method: "owner_task_input_boundary", token }, null, signal);
+    return result.open;
+  }
+
+  async detachToolObserver(token: string, generation: number): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_observer_detach", token, revision: generation });
+  }
+
+  async attachToolObserver(token: string, context: TaskUpdateOwnerContext): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_observer_attach", token, ownerContext: context });
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal, context?: TaskUpdateOwnerContext): Promise<BrokerToolRequest[]> {

@@ -333,13 +333,25 @@ test("primary browser bootstrap fails closed on navigation, renderer, and timeou
     const calls = [];
     stalled.isDestroyed = () => false;
     stalled.getURL = () => "about:blank";
+    stalled.isLoading = () => true;
+    stalled.isLoadingMainFrame = () => true;
     stalled.stop = () => calls.push("stop");
-    stalled.loadURL = () => new Promise(() => {});
+    stalled.loadURL = (url) => {
+      queueMicrotask(() => stalled.emit("did-start-navigation", {}, url, false, true));
+      return new Promise(() => {});
+    };
     await assert.rejects(
       loadCommittedBrowserSurface(stalled, IDLE_BROWSER_URL, 5),
-      /idle document did not commit within 5ms/,
+      error => {
+        assert.match(error.message, /idle document did not commit within 5ms/);
+        assert.deepEqual(error.bootstrap, { navigationStarted: true, documentCommitted: false,
+          domReady: false, loadFinished: false, loadStopped: false, loadResolved: false,
+          expectedDocument: false, loading: true, mainFrameLoading: true });
+        return true;
+      },
     );
     assert.deepEqual(calls, ["stop"]);
+    assert.equal(stalled.eventNames().length, 0);
   } finally {
     clearTimeout(keepTestAlive);
   }

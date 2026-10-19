@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, providerConfig } from "../src/config";
 import { resolveDevProfilePaths } from "../src/dev-chat/profile";
 import { prepareWorkingTreeBrowserHelper } from "../src/dev-chat/driver";
 import { startDevChatTransport } from "../src/dev-chat/transport";
@@ -16,6 +16,8 @@ import { chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptTurnSession }
 import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
+import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { taskInputQueue } from "../src/adapters/chatgpt-web/continuity-task-input-runtime";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { cancelLauncherManualTurn, endLauncherManualTurn, inspectLauncherContinuityConversation, markLauncherManualTurnStarted,
   readLauncherBrowserHostDescriptor, startLauncherManualTurn, waitForLauncherManualSent,
@@ -25,8 +27,13 @@ import { cancelLauncherManualTurn, endLauncherManualTurn, inspectLauncherContinu
 // 使用 DEV 当前的 Automatic 或 Zero Risk 模式，不更改交互模式。
 // 不保存原始请求、完整 prompt、能力 token、外部凭据或完整 rollout。
 // --check-only 不启动服务、客户端、浏览器或 tunnel，也不建立手工 turn。
+// --use-dev-inbox 只采用已验证 DEV 配置的实际收件目录；不初始化或重置该目录。
 const args = process.argv.slice(2);
 const option = (name: string) => args.find(value => value.startsWith(`${name}=`))?.slice(name.length + 1);
+assert.ok(args.every(value => !value.startsWith("--use-dev-inbox") || value === "--use-dev-inbox"),
+  "--use-dev-inbox 不接受目录或参数");
+assert.ok(args.filter(value => value === "--use-dev-inbox").length <= 1, "--use-dev-inbox 只能指定一次");
+const useDevInbox = args.includes("--use-dev-inbox");
 const paths = resolveDevProfilePaths();
 // 仅本探针进程选择 DEV 配置。HOME 和 CODEX_HOME 均不修改。
 process.env.CODEX_CHATGPT_WEB_HOME = paths.home;
@@ -60,11 +67,42 @@ if (manual && config.zeroRiskRequireSentConfirmation !== true) blockers.push("Ze
 if (!config.tunnel) blockers.push("DEV MCP tunnel 配置缺失");
 if (!["running", "present-permission-denied"].includes(launcherProcess)) blockers.push(`DEV Launcher 进程检查失败：${launcherProcess}`);
 if (!descriptor.features?.includes("session-continuity-v1")) blockers.push("DEV Launcher 未声明 session-continuity-v1 支持");
+function inspectDevInbox() {
+  const directory = providerConfig(config).chatgptWeb?.continuityStateDirectory;
+  assert.ok(directory, "DEV 配置缺少连续性收件目录");
+  assert.equal(realpathSync(directory), join(realpathSync(paths.home), "runtime", "session-continuity"),
+    "实际收件目录必须属于已验证 DEV profile，不能通过符号链接指向其它目录");
+  const store = new ContinuityRecoveryStore(directory);
+  // Keep maintenance disabled: this inspection cannot retire or reclaim existing tasks.
+  const before = store.withTaskInputTransaction(index => {
+    const tasks = Object.values(index);
+    const messages = tasks.flatMap(task => task.messages);
+    const pending = messages.filter(message => !["completed", "discarded"].includes(message.status));
+    const pages = store.pageRecords();
+    return { tasks: tasks.length, activeTasks: tasks.filter(task => task.state === "active").length,
+      messages: messages.length, pendingMessages: pending.length,
+      pendingBytes: pending.reduce((sum, message) => sum + message.bytes, 0), pageThreads: pages.length,
+      unfinishedWorks: pages.flatMap(page => Object.values(page.works))
+        .filter(work => !["completed", "stopped"].includes(work.state)).length,
+      ...store.capacityUsage() };
+  });
+  return { directory, before };
+}
+function assertDevInboxIdle(inbox: ReturnType<typeof inspectDevInbox>): void {
+  assert.equal(inbox.before.activeTasks, 0, "DEV 收件已有在途任务，不能运行共享收件验收");
+  assert.equal(inbox.before.unfinishedWorks, 0, "DEV 页面已有未完成工作，不能运行共享收件验收");
+}
+let devInbox: ReturnType<typeof inspectDevInbox> | undefined;
+if (useDevInbox) {
+  try { devInbox = inspectDevInbox(); assertDevInboxIdle(devInbox); }
+  catch (error) { blockers.push(`DEV 收件无法安全使用：${error instanceof Error ? error.message : String(error)}`); }
+}
 const preflight = { purpose: config.purpose, mode: config.mode, interaction: config.browserInteractionMode,
   connectorName: manual ? config.manualAppName : config.automaticAppName,
   sentConfirmationRequired: manual && config.zeroRiskRequireSentConfirmation, launcherProfile: descriptor.profile,
   launcherProcess, descriptorVersion: descriptor.version, tunnelConfigured: Boolean(config.tunnel),
   brokerSocketExists: existsSync(config.brokerSocketPath), surfaceCount: Object.keys(descriptor.surfaceTargets).length,
+  inboxStorage: useDevInbox ? "dev-profile" : "isolated-output", ...(devInbox ? { devInbox } : {}),
   readyToAttempt: blockers.length === 0, blockers,
   limitations: ["只读检查不验证 MCP tunnel 的实时连接；正式执行由 startDevChatTransport 检查", "socket 文件存在不等于 Broker 进程有效"] };
 console.log(JSON.stringify(preflight, null, 2));
@@ -77,7 +115,7 @@ const runId = `a1-${manual ? "zero-risk" : "automatic"}-${Date.now()}-${suffix}`
 const outputDir = resolve(option("--output") ?? join(".dev-workflows/continuity-append-handoff/tmp", runId));
 mkdirSync(outputDir, { recursive: true });
 const runtimeDir = join(outputDir, "runtime");
-const continuityDir = join(runtimeDir, "session-continuity");
+const continuityDir = devInbox?.directory ?? join(runtimeDir, "session-continuity");
 const clientRoot = realpathSync(mkdtempSync(join(tmpdir(), "cgw-append-live-")));
 const clientHome = join(clientRoot, "codex-home");
 const workspace = join(clientRoot, "workspace");
@@ -103,7 +141,9 @@ const report: Message = { schema: "codex-chatgpt-web/continuity-append-live-evid
       : "chatgpt-web/gpt-5.6-sol"),
     simulatedPage: false, simulatedTools: false, configFilesChanged: false,
     baselineHead: spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(),
-  }, preflight, events: [], requests: [], checks: {} };
+  }, preflight, inputRecovery: { inboxStorage: useDevInbox ? "dev-profile" : "isolated-output",
+    activityVerification: useDevInbox ? "pending" : "not-tested", preservedAfterProbe: false },
+  events: [], requests: [], checks: {} };
 const secrets = new Set<string>([config.controlToken, descriptor.control.token].filter(Boolean));
 function redact(value: string): string {
   for (const secret of secrets) value = value.replaceAll(secret, "[redacted]");
@@ -222,10 +262,15 @@ async function verifySurface(): Promise<void> {
 }
 
 try {
-  // 该探针采用独立 state 目录，需先完成真实 setup 的注册存储初始化。
-  // 不修改 DEV/生产存储，也不在请求失败时重置注册记录。
-  new ContinuityRegistrationStore(continuityDir).initialize();
-  record("isolated-continuity-storage-initialized");
+  if (useDevInbox) {
+    // Recheck immediately before execution. Never initialize, reset or clear shared DEV storage.
+    devInbox = inspectDevInbox();
+    assertDevInboxIdle(devInbox);
+    record("dev-inbox-selected", { before: devInbox.before, activityVerification: "pending" });
+  } else {
+    new ContinuityRegistrationStore(continuityDir).initialize();
+    record("isolated-continuity-storage-initialized");
+  }
   // 只修改内存中的探针 route；不修改 DEV 或生产配置文件。
   config.toolAuthorityMode = "delegated";
   transport = await startDevChatTransport(config, paths.home);
@@ -328,6 +373,11 @@ try {
           assert.equal(session.runtime.mode, "tools");
           assert.equal(Boolean(session.runtime.manualControl), manual);
           assert.ok(session.runtime.taskUpdates, "活动响应必须协商追加协议");
+          const queue = taskInputQueue(session);
+          assert.ok(queue, "真实 session 必须建立持久收件身份");
+          report.inputRecovery.identity = { ...queue.identity };
+          report.inputRecovery.identityFingerprint = sha256(JSON.stringify(queue.identity));
+          save();
         }
       };
       captureSession();
@@ -373,20 +423,30 @@ try {
   assert.equal(catalog.status, 0, "无法读取本机 Codex 模型目录");
   writeFileSync(join(clientRoot, "models.json"), JSON.stringify(augmentNativeModelCatalog(JSON.parse(catalog.stdout), config)));
   const model = report.provenance.model;
-  const localKey = randomUUID();
-  secrets.add(localKey);
+  // Use the supported native ChatGPT route so user-item provenance is present.
+  // All client provider/authentication requests remain on this loopback server;
+  // the real account is used only by the user's DEV Launcher browser.
+  const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const accountId = "00000000-0000-4000-8000-000000000001";
+  writeFileSync(join(clientHome, "auth.json"), JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null,
+    tokens: { id_token: `${b64({ alg: "none", typ: "JWT" })}.${b64({ email: "continuity-probe@example.invalid",
+      "https://api.openai.com/auth": { chatgpt_plan_type: "plus", chatgpt_user_id: "local-fixture", chatgpt_account_id: accountId } })}.c2ln`,
+      access_token: "local-fixture-not-a-credential", refresh_token: "local-fixture-no-refresh", account_id: accountId },
+    last_refresh: new Date().toISOString() }), { mode: 0o600 });
   writeFileSync(join(clientHome, "config.toml"), [
-    `model = ${JSON.stringify(model)}`, 'model_provider = "cgw_append_live"',
+    `model = ${JSON.stringify(model)}`, 'model_provider = "openai"',
     `model_catalog_json = ${JSON.stringify(join(clientRoot, "models.json"))}`,
+    `openai_base_url = "http://127.0.0.1:${server.port}/v1"`,
+    `chatgpt_base_url = "http://127.0.0.1:${server.port}/backend-api"`,
     'approval_policy = "never"', 'model_auto_compact_token_limit = 100000000',
-    '[model_providers.cgw_append_live]', 'name = "DEV continuity append live acceptance"',
-    `base_url = "http://127.0.0.1:${server.port}/v1"`, 'env_key = "CGW_APPEND_LIVE_KEY"',
-    'wire_api = "responses"', 'supports_websockets = false',
-    '[features]', 'multi_agent = false',
+    'check_for_update_on_startup = false', '[features]', 'multi_agent = false',
+    '[analytics]', 'enabled = false',
   ].join("\n"), { mode: 0o600 });
-  const childEnvironment: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: clientHome, CODEX_SQLITE_HOME: clientHome, CGW_APPEND_LIVE_KEY: localKey };
-  delete childEnvironment.OPENAI_API_KEY;
-  child = Bun.spawn([codex, "app-server"], { cwd: workspace, env: childEnvironment, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const loopbackProxy = `http://127.0.0.1:${server.port}`;
+  const childEnvironment: NodeJS.ProcessEnv = { PATH: process.env.PATH, TMPDIR: clientRoot, LANG: "en_US.UTF-8",
+    CODEX_HOME: clientHome, CODEX_SQLITE_HOME: clientHome,
+    HTTP_PROXY: loopbackProxy, HTTPS_PROXY: loopbackProxy, ALL_PROXY: loopbackProxy, NO_PROXY: "127.0.0.1,localhost,::1" };
+  child = Bun.spawn([codex, "app-server", "--strict-config"], { cwd: workspace, env: childEnvironment, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   const stderr = new Response(child.stderr).text();
   void child.exited.then(() => {
     if (report.status === "running") controller.abort(new Error("真实 app-server 提前退出"));
@@ -480,14 +540,28 @@ try {
   }
   assert.equal(nativeCommands.size, 1);
   assert.equal(nativeCompleted.size, 1);
-  const after = broker.taskUpdateState(capabilityToken);
-  assert.ok(after, "完成后仍需保留协议状态证据");
+  const brokerAfter = broker.taskUpdateState(capabilityToken);
+  const after = brokerAfter ?? firstSession.runtime.externalProgress.snapshot().taskUpdates;
+  assert.ok(after, "完成后必须有已捕获的协议状态证据");
   assert.equal(after.acceptedRevision, before.acceptedRevision + 1, "新增用户指令只接收一次");
   assert.equal(after.deliveredRevision, after.acceptedRevision, "追加必须经真实 MCP 控制通道交付");
   assert.equal(after.acknowledgedRevision, after.acceptedRevision, "真实模型必须确认追加");
   assert.equal(after.driverGeneration, before.driverGeneration + 1, "只建立一次新驱动");
   report.after = { acceptedRevision: after.acceptedRevision, deliveredRevision: after.deliveredRevision,
     acknowledgedRevision: after.acknowledgedRevision, driverGeneration: after.driverGeneration };
+  report.afterStateSource = brokerAfter ? "broker" : "physical-progress-snapshot";
+  const recovery = firstSession.runtime.continuityBinding!.recovery!;
+  const journal = new ContinuityRecoveryStore(continuityDir).get(recovery.thread)!.works[recovery.logicalWorkId]!.taskUpdateJournal;
+  assert.equal(journal?.acceptedRevision, after.acceptedRevision, "持久接收版本必须一致");
+  assert.equal(journal?.acknowledgedRevision, after.acknowledgedRevision, "持久 ACK 必须一致");
+  const queue = taskInputQueue(firstSession)!;
+  const inbox = queue.store.get(queue.identity)!;
+  assert.equal(inbox.receivedSequence, 1, "追加只收件一次");
+  assert.equal(inbox.messages.length, 1);
+  assert.equal(inbox.messages[0]!.status, "completed", "真实最终输出必须覆盖收件输入");
+  assert.equal(queue.store.readBody(queue.identity, inbox.messages[0]!.messageId), appendText);
+  report.inbox = { receivedSequence: inbox.receivedSequence, messages: inbox.messages.length,
+    status: inbox.messages[0]!.status, originalAvailable: true };
   const rollout: Message[] = readFileSync(started.thread.path, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
   const nativeItems = rollout.filter(entry => entry.type === "response_item").map(entry => entry.payload);
   const calls = nativeItems.filter(item => ["function_call", "custom_tool_call"].includes(item?.type));
@@ -550,6 +624,21 @@ try {
   if (cleanupErrors.length) report.cleanupError = cleanupErrors.join("；");
   server?.stop(true);
   await transport?.close();
+  if (useDevInbox && report.status === "passed" && firstSession) {
+    try {
+      const queue = taskInputQueue(firstSession)!;
+      const retained = queue.store.get(queue.identity);
+      assert.equal(retained?.messages.length, 1, "结束后必须保留本次已完成收件");
+      assert.equal(retained.messages[0]!.status, "completed");
+      assert.equal(queue.store.readBody(queue.identity, retained.messages[0]!.messageId), appendText);
+      report.inputRecovery.preservedAfterProbe = true;
+      report.inputRecovery.messageId = retained.messages[0]!.messageId;
+      report.inputRecovery.messageDigest = retained.messages[0]!.digest;
+    } catch (error) {
+      report.status = "failed"; process.exitCode = 1; cleanupFailure(error);
+    }
+  }
+  if (cleanupErrors.length) report.cleanupError = cleanupErrors.join("；");
   rmSync(clientRoot, { recursive: true, force: true });
   process.off("SIGINT", interrupt);
   process.off("SIGTERM", interrupt);

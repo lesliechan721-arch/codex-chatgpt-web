@@ -120,7 +120,7 @@ test("repair6: trusted Launcher start cancellation remains cancellation before p
   } finally { await f.client.close(); await server.stop(true); }
 });
 
-function recoveryFixture(directory: string) {
+function recoveryFixture(directory: string, pageReceiptId = "helper-page") {
   new ContinuityRegistrationStore(directory).initialize();
   const store = new ContinuityRecoveryStore(directory);
   const thread = "b".repeat(64), scope = "a".repeat(64), owner = continuityProcessInstance("f".repeat(64));
@@ -129,14 +129,14 @@ function recoveryFixture(directory: string) {
     instructionIdentity: "helper-instruction", workPayloadDigest: "d".repeat(64), snapshotDigest: "e".repeat(64),
     dispatchProtocolComplete: true, createPage: true });
   store.markAttempt(thread, { scope }, { logicalWorkId: "helper-work", attempt: 0, stage: "page-possible", launcherInstance: instance });
-  store.markAttempt(thread, { scope }, { logicalWorkId: "helper-work", attempt: 0, stage: "page-acquired", pageReceiptId: "helper-page" });
+  store.markAttempt(thread, { scope }, { logicalWorkId: "helper-work", attempt: 0, stage: "page-acquired", pageReceiptId });
   return { store, thread, scope, recovery: recoveryIdentity(store.get(thread)!, store.installationId()) };
 }
 
-function fencedHelperFixture(source: string, endpoint = "http://127.0.0.1:39002") {
+function fencedHelperFixture(source: string, endpoint = "http://127.0.0.1:39002", preparationTermination = false) {
   const root = mkdtempSync(join(tmpdir(), "codex-helper-fencing-")); roots.push(root);
   const directory = join(root, "continuity");
-  const durable = recoveryFixture(directory);
+  const durable = recoveryFixture(directory, preparationTermination ? "1".repeat(32) : undefined);
   const script = join(root, "helper.ts");
   writeFileSync(script, `
     import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
@@ -149,7 +149,8 @@ function fencedHelperFixture(source: string, endpoint = "http://127.0.0.1:39002"
     helper: { executable: process.execPath, script }, partition: "persist:codex-web-gpt-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "launcher_surface_id_0123456789AB",
     surfaceTargets: { launcher_surface_id_0123456789AB: "owned-helper-target" }, createdAt: new Date().toISOString(),
-    features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE],
+    features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE,
+      ...(preparationTermination ? ["preparation-termination-v1", "context-delivery-plan-v1"] : [])],
     launcherInstance: durable.recovery.launcherInstance,
   }), { mode: 0o600 });
   const client = new LauncherBrowserHelperClient({ appName: "Codex Native5", browserHost: "launcher",
@@ -164,6 +165,48 @@ function fencedHelperFixture(source: string, endpoint = "http://127.0.0.1:39002"
   };
   return { ...durable, directory, client, turn };
 }
+
+for (const failureStage of ["prepare", "plan-select"] as const) test(`a real helper ${failureStage} failure fences Send before aborted end and preserves its original error`, async () => {
+  let ended: Record<string, unknown> | undefined, fenceAtEnd = false;
+  let f: ReturnType<typeof fencedHelperFixture>;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as Record<string, any>;
+    if (body.phase === "start") return Response.json({ ok: true, executionProtocol: 1,
+      surfaceId: "launcher_surface_id_0123456789AB", reused: false, connectorBound: true,
+      continuity: { owner: body.continuity.owner, leaseId: "1".repeat(32), traceId: body.traceId, recovery: body.continuity.recovery } });
+    if (body.phase === "end") {
+      ended = body;
+      fenceAtEnd = Boolean(f.store.get(f.thread)!.works["helper-work"]!.attempts[0]!.preparationTermination);
+    }
+    return Response.json({ ok: true, executionProtocol: 1, recovery: body.recovery, cancelledByUser: false });
+  } });
+  f = fencedHelperFixture(`
+    ChatGptBrowserWorker.prototype.runBrowserTurn = async function(turn) {
+      await turn.prepare();
+      await turn.onSendActivated();
+      return "must never submit";
+    };
+  `, `http://127.0.0.1:${server.port}`, true);
+  f.turn.recoveryRequestId = "preparation-helper-request";
+  const original = new ChatGptWebAdapterError("Controlled local prompt preparation failure", {
+    code: "CONTEXT_SOURCE_UNAVAILABLE", status: 422, errorType: "invalid_request_error", retryable: false,
+  });
+  let activated = 0;
+  f.turn.prepare = failureStage === "prepare" ? async () => { throw original; }
+    : async () => ({ text: "Prepared but unselected", images: [], contextPlan: { planId: "helper_plan", contextId: "helper_context",
+      manifestDigest: "a".repeat(64), requiredAttachments: [] }, release() {} });
+  if (failureStage === "plan-select") f.turn.onContextPlanSelected = async () => { throw original; };
+  f.turn.onSendActivated = () => { activated++; };
+  try {
+    await expect(f.client.run(f.turn)).rejects.toBe(original);
+    expect(activated).toBe(0); expect(ended?.status).toBe("aborted"); expect(fenceAtEnd).toBe(true);
+    const attempt = f.store.get(f.thread)!.works["helper-work"]!.attempts[0]!;
+    expect(attempt.writerRetired).toBe(true);
+    expect(attempt.preparationTermination).toMatchObject({ status: "pending", traceId: f.turn.traceId,
+      requestId: f.turn.recoveryRequestId, recovery: f.recovery });
+    expect(() => f.store.withExecutionAuthority(f.recovery, () => "late ACK Send")).toThrow("obsolete");
+  } finally { await f.client.close(); await server.stop(true); }
+}, 15_000);
 
 test("a live old helper rejects a delayed Send acknowledgement and retains possibly-sent evidence", async () => {
   const fixture = fencedHelperFixture(`

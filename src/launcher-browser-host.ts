@@ -15,6 +15,7 @@ import { ChatGptWebAdapterError } from "./adapters/chatgpt-web/adapter-error";
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
 export const LAUNCHER_CONTEXT_DELIVERY_FEATURE = "context-delivery-plan-v1";
 export const CONTINUITY_EXECUTION_FENCING_FEATURE = "execution-generation-fencing-v1";
+export const CONTINUITY_PREPARATION_TERMINATION_FEATURE = "preparation-termination-v1";
 
 export interface LauncherKnownUnsentReceipt {
   schemaVersion: 1;
@@ -1165,6 +1166,29 @@ export async function markLauncherContinuitySendPossible(descriptorPath: string,
 /** Confirms logical isolation. Exact page cleanup proceeds independently; tools still need settlement. */
 export function retireLauncherContinuityWriter(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
   return launcherContinuityRequest(descriptorPath, "retire", recovery, undefined, recoveryStoreDirectory);
+}
+
+/** Repeating this exact operation recovers a lost termination reply without granting Send. */
+export async function terminateLauncherContinuityPreparation(descriptorPath: string, recovery: ContinuityRecoveryIdentity,
+  recoveryStoreDirectory: string, expected: { requestId: string; receiptId: string; traceId: string; helperPid: number; lease: ContinuityLease }): Promise<ContinuityLease> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  if (!descriptor.features?.includes(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) throw continuityError("continuity_configuration_conflict", "Update and restart Launcher to recover a local preparation failure.");
+  const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-terminate-preparation`, {
+    method: "POST", headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ recovery, recoveryStoreDirectory }), signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+  });
+  const body = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw continuityError(isContinuityControlCode(body.code) ? body.code : "continuity_unverified");
+  if (body.ok !== true || body.state !== "preparation-terminated" || !isContinuityRecoveryIdentity(body.recovery)
+    || !sameContinuityRecoveryIdentity(body.recovery, recovery) || body.requestId !== expected.requestId
+    || body.receiptId !== expected.receiptId || body.traceId !== expected.traceId || body.helperPid !== expected.helperPid
+    || !isContinuityLease(body.continuity) || body.continuity.owner !== expected.lease.owner
+    || body.continuity.leaseId !== expected.lease.leaseId || body.continuity.traceId !== expected.lease.traceId
+    || Boolean(body.continuity.recovery) !== Boolean(expected.lease.recovery)
+    || expected.lease.recovery && !sameContinuityRecoveryIdentity(body.continuity.recovery!, expected.lease.recovery)) {
+    throw continuityError("continuity_unverified", "Launcher did not confirm the exact preparation termination and lease.");
+  }
+  return body.continuity;
 }
 
 /** Reject known capacity exhaustion before consuming a new thread's creation registration. */

@@ -92,5 +92,10 @@ export function preflightContinuityInput(
       ...(retainedContinuity ? { retainedContinuity: true } : {}),
       ...(parts ? { experimentalMultipartParts: parts } : {}),
     } });
+  // Inline-only plans can return before navigation's capacity check. Retained
+  // page cost must still trigger the ordinary new-page fallback before Send.
+  if (planned.costs.requiredTotalTokens > planned.costs.contextWindowTokens) {
+    throw continuityError("continuity_input_limit");
+  }
   assertPreflightCapabilityBudget(planned.compiled, planned.projected, capabilities, placeholder);
 }

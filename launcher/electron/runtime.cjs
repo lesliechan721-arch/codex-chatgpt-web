@@ -71,12 +71,12 @@ function resolveToolAuthorityControl(
   };
 }
 
-function collect(stream, chunks, onLine, onError) {
+function collect(stream, chunks, onLine, onError, captureBytes = MAX_CAPTURE_BYTES) {
   let buffered = "";
   let bytes = 0;
   stream.on("data", (chunk) => {
     bytes += chunk.length;
-    if (bytes <= MAX_CAPTURE_BYTES) chunks.push(chunk);
+    if (bytes <= captureBytes) chunks.push(chunk);
     buffered += chunk.toString("utf8");
     for (;;) {
       const newline = buffered.indexOf("\n");
@@ -737,7 +737,7 @@ class RuntimeHost {
           if (options.onStdoutLine?.(line) !== true) {
             this.publishOperation?.({ name, status: "running", message: redactText(line) });
           }
-        }, recordPipeError("stdout"));
+        }, recordPipeError("stdout"), options.captureBytes);
         collect(child.stderr, stderr, (line) => {
           if (options.sensitiveOutput) return;
           this.logger.warn("runtime.stderr", { operation: name, line });
@@ -826,6 +826,15 @@ class RuntimeHost {
             stderr: Buffer.concat(stderr).toString("utf8"),
           });
         });
+        if (options.stdinText !== undefined) {
+          if (!options.controlStdin || typeof options.stdinText !== "string") {
+            terminateOwnedProcessTree(child);
+            reject(new Error("Invalid runtime control input"));
+            return;
+          }
+          child.stdin.on("error", recordPipeError("stdin"));
+          child.stdin.end(options.stdinText);
+        }
       });
       const acceptedExitCodes = options.acceptedExitCodes || [0];
       if (!acceptedExitCodes.includes(result.code)) {
@@ -861,6 +870,22 @@ class RuntimeHost {
         checks: [{ id: "runtime", status: "error", message: error instanceof Error ? error.message : String(error) }],
       };
     }
+  }
+
+  async taskInputAction(request) {
+    const result = await this.run("task-input", ["task-input", "--launcher-controlled",
+      ...(this.launcherProfile === "development" ? ["--dev-profile"] : [])], {
+      timeoutMs: 15_000,
+      sensitiveOutput: true,
+      controlStdin: true,
+      // The inbox snapshot can approach the existing 24 MiB durable metadata ceiling.
+      // This bounded capture does not change that storage budget.
+      captureBytes: 25 * 1024 * 1024,
+      stdinText: JSON.stringify(request),
+      env: this.launcherControlEnvironment(),
+      ...(this.launcherProfile === "development" ? { environment: this.devSetupEnvironment() } : {}),
+    });
+    return JSON.parse(result.stdout);
   }
 
   async verifyContextCapability() {

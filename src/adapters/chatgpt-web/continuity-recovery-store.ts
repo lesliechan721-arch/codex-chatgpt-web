@@ -9,8 +9,9 @@ import { continuityError } from "./continuity-errors";
 import { moveContinuityLockWithoutReplacement } from "./continuity-lock-windows";
 import { assertContextCoverageAdvance, validateContextCoverageJournal, validateContextCoverageReservations, type ContextCoverageJournalEntry, type ContextCoverageReservation } from "./context-coverage-journal";
 import { canonicalJson } from "./canonical-json";
+import { findTaskInput, TASK_INPUT_HISTORICAL_RETENTION_MS, taskInputReservedBytes, validateTaskInputIdentity, validateTaskInputIndex, type TaskInputIdentity, type TaskInputIndex, type TaskInputTaskRecord } from "./continuity-task-input-types";
 import { forgetRecoveryDurability, rememberRecoveryDurability, reuseRecoveryDurability } from "./recovery-durability";
-import { isContinuityRecoveryIdentity, type ContinuityRecoveryIdentity } from "./continuity-contract";
+import { isContinuityRecoveryIdentity, isContinuityLease, type ContinuityLease, type ContinuityRecoveryIdentity } from "./continuity-contract";
 
 export const MAX_CONTINUITY_RECOVERY_BYTES = 24 * 1024 * 1024;
 export const MAX_CONTINUITY_RECOVERY_ITEM_BYTES = 2 * 1024 * 1024;
@@ -37,6 +38,12 @@ export interface RecoveryAttemptRecord {
   launcherInstance?: ContinuityLauncherInstance;
   acquisitionEvidence?: { requestId: string; identityDigest: string; status: "possible" | "not-acquired"; receiptId?: string };
   sendEvidence?: { authorizationId: string; identityDigest: string; status: "possible" | "accepted" | "not-sent" };
+  preparationTermination?: RecoveryPreparationTermination;
+}
+/** A durable fence for one local preparation. It never settles a possible Send. */
+export interface RecoveryPreparationTermination {
+  requestId: string; traceId: string; helperPid: number; lease: ContinuityLease; recovery: ContinuityRecoveryIdentity;
+  receiptId: string; status: "pending" | "settled";
 }
 export interface RecoveryRetryBudget { attempts: number; startedAt: number; lastFailureAt?: number; deadlineAt?: number }
 /** The accepted boundary used to select the current instruction payload. No input positions or bodies. */
@@ -50,6 +57,11 @@ export interface RecoveryTaskUpdateJournal {
   updates: Array<{ revision: number; sourceMessageId: string; payloadDigest: string }>;
   deliveries: Array<{ deliveryId: string; fromRevision: number; throughRevision: number; attempt: number; epoch: number; ownerId: string; acknowledged: boolean }>;
 }
+/** Explicit user retry provenance. Old stopped work and delivery facts stay immutable. */
+export interface RecoveryTaskInputRetry {
+  taskId: string; intentGeneration: number; sourceLogicalWorkId?: string;
+  messageIds: string[]; messageDigests: string[];
+}
 export interface RecoveryWorkRecord {
   logicalWorkId: string; instructionIdentity: string; nativeTurnId?: string; workPayloadDigest: string;
   purpose: "ordinary" | "compaction"; state: WorkState; workLineageId: string; acceptedTaskRevision: number;
@@ -57,6 +69,7 @@ export interface RecoveryWorkRecord {
   terminalReceiptId?: string; terminalDigest?: string; stopReason?: "user-stop" | "mode-exit" | "page-close" | "native-interrupt";
   compactionTargetId?: string;
   taskUpdateJournal?: RecoveryTaskUpdateJournal;
+  taskInputRetry?: RecoveryTaskInputRetry;
   instructionPrevious?: RecoveryInstructionPrevious;
   allowRetainedSourceFallback?: boolean;
   activationState?: "shadow" | "active";
@@ -103,7 +116,7 @@ export interface RecoveryThreadRecord {
   contextCoverage?: ContextCoverageJournalEntry[];
   contextCoverageReservations?: ContextCoverageReservation[];
 }
-interface RecoveryDocument { version: 2 | 3 | 4; installation: string; threads: Record<string, RecoveryThreadRecord> }
+interface RecoveryDocument { version: 2 | 3 | 4; installation: string; threads: Record<string, RecoveryThreadRecord>; taskInputs?: TaskInputIndex }
 export interface RecoveryGuard { scope: string; expectedVersion?: number; expectedEpoch?: number; expectedOwner?: string }
 export interface RecoveryWriterReference { thread: string; logicalWorkId: string; attempt: number; ownerId?: string }
 export interface AdmitRecoveryWorkInput {
@@ -313,7 +326,7 @@ function durableWrite(path: string, encoded: string, afterAtomicReplace?: () => 
   }, Buffer.byteLength(encoded));
 }
 function validateAttempt(value: unknown): asserts value is RecoveryAttemptRecord {
-  exact(value, ["attempt", "epoch", "historyRevision", "snapshotVersion", "snapshotDigest", "stage", "dispatchProtocolComplete", "writerRetired"], ["pageReceiptId", "transactionId", "transactionVersion", "launcherInstance", "sendEvidence", "acquisitionEvidence"]);
+  exact(value, ["attempt", "epoch", "historyRevision", "snapshotVersion", "snapshotDigest", "stage", "dispatchProtocolComplete", "writerRetired"], ["pageReceiptId", "transactionId", "transactionVersion", "launcherInstance", "sendEvidence", "acquisitionEvidence", "preparationTermination"]);
   for (const key of ["attempt", "epoch", "historyRevision", "snapshotVersion"]) integer(value[key]); hash(value.snapshotDigest);
   oneOf(value.stage, ["prepared", "page-possible", "page-acquired", "send-possible", "accepted", "interrupted-settled", "completed", "stopped"]);
   boolean(value.dispatchProtocolComplete); boolean(value.writerRetired); optionalIdentity(value.pageReceiptId); optionalIdentity(value.transactionId);
@@ -329,6 +342,14 @@ function validateAttempt(value: unknown): asserts value is RecoveryAttemptRecord
     exact(value.sendEvidence, ["authorizationId", "identityDigest", "status"]);
     identity(value.sendEvidence.authorizationId); hash(value.sendEvidence.identityDigest);
     oneOf(value.sendEvidence.status, ["possible", "accepted", "not-sent"]);
+  }
+  if (value.preparationTermination !== undefined) {
+    const termination = value.preparationTermination;
+    exact(termination, ["requestId", "traceId", "helperPid", "lease", "recovery", "receiptId", "status"]);
+    for (const key of ["requestId", "traceId", "receiptId"]) identity(termination[key]);
+    integer(termination.helperPid); oneOf(termination.status, ["pending", "settled"]);
+    if (!isContinuityLease(termination.lease) || !isContinuityRecoveryIdentity(termination.recovery)) throw invalid("A preparation termination has invalid physical identity.");
+    if (termination.helperPid < 1 || !value.writerRetired || value.sendEvidence && value.sendEvidence.status !== "not-sent") throw invalid("A preparation termination cannot authorize or settle a possible Send.");
   }
 }
 function validateTarget(value: unknown, checkpoint = false): asserts value is RecoveryCompactionTarget {
@@ -371,11 +392,23 @@ function validateThread(value: unknown): asserts value is RecoveryThreadRecord {
   oneOf(value.state, ["creating", "running", "ready", "compacting", "unverified", "lost", "recovering", "stopped"]);
   for (const key of ["works", "lineages", "calls", "compactionTargets", "checkpoints"]) dictionary(value[key]);
   for (const [key, work] of Object.entries(value.works as Record<string, unknown>)) {
-    identity(key); exact(work, ["logicalWorkId", "instructionIdentity", "workPayloadDigest", "purpose", "state", "workLineageId", "acceptedTaskRevision", "attempts"], ["nativeTurnId", "predecessorLogicalWorkId", "retryBudget", "terminalReceiptId", "terminalDigest", "stopReason", "compactionTargetId", "instructionPrevious", "allowRetainedSourceFallback", "activationState", "taskUpdateJournal"]);
+    identity(key); exact(work, ["logicalWorkId", "instructionIdentity", "workPayloadDigest", "purpose", "state", "workLineageId", "acceptedTaskRevision", "attempts"], ["nativeTurnId", "predecessorLogicalWorkId", "retryBudget", "terminalReceiptId", "terminalDigest", "stopReason", "compactionTargetId", "instructionPrevious", "allowRetainedSourceFallback", "activationState", "taskUpdateJournal", "taskInputRetry"]);
     for (const field of ["logicalWorkId", "instructionIdentity", "workLineageId"]) identity(work[field]); hash(work.workPayloadDigest); integer(work.acceptedTaskRevision);
     if (key !== work.logicalWorkId) throw invalid("Continuity work index does not match.");
     for (const field of ["nativeTurnId", "predecessorLogicalWorkId", "terminalReceiptId", "compactionTargetId"]) optionalIdentity(work[field]); optionalHash(work.terminalDigest);
     oneOf(work.purpose, ["ordinary", "compaction"]); oneOf(work.state, ["prepared", "send-possible", "active", "completed", "stopped"]);
+    if (work.taskInputRetry !== undefined) {
+      const retry = work.taskInputRetry;
+      exact(retry, ["taskId", "intentGeneration", "messageIds", "messageDigests"], ["sourceLogicalWorkId"]);
+      identity(retry.taskId); integer(retry.intentGeneration); optionalIdentity(retry.sourceLogicalWorkId);
+      const source = (value.works as Record<string, RecoveryWorkRecord>)[String(retry.sourceLogicalWorkId)];
+      if (retry.sourceLogicalWorkId !== undefined && (!source || source.state !== "stopped" || source.nativeTurnId !== work.nativeTurnId)
+        || work.purpose !== "ordinary"
+        || Number(retry.intentGeneration) < 1 || !Array.isArray(retry.messageIds) || !retry.messageIds.length || retry.messageIds.length > 128
+        || new Set(retry.messageIds).size !== retry.messageIds.length || !Array.isArray(retry.messageDigests)
+        || retry.messageDigests.length !== retry.messageIds.length) throw invalid("Invalid explicit task input retry source.");
+      retry.messageIds.forEach(identity); retry.messageDigests.forEach(hash);
+    }
     if (work.taskUpdateJournal !== undefined) {
       const journal = work.taskUpdateJournal;
       exact(journal, ["streamId", "acceptedRevision", "acknowledgedRevision", "driverGeneration", "updates", "deliveries"]);
@@ -610,6 +643,7 @@ function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
       if (old[field] !== work[field]) throw unproven("The current accepted work payload or lineage conflicts with its durable identity.");
     }
     if (!sameInstructionSelection(old, work)) throw unproven("The accepted instruction source selection cannot be replaced.");
+    if (canonicalJson(old.taskInputRetry ?? null) !== canonicalJson(work.taskInputRetry ?? null)) throw unproven("Explicit user retry provenance cannot be changed.");
     if (old.retryBudget?.deadlineAt !== undefined && work.retryBudget && old.retryBudget.deadlineAt !== work.retryBudget.deadlineAt) throw unproven("The original compaction deadline cannot be changed.");
     if (old.activationState !== work.activationState) {
       if (old.activationState !== "shadow" || work.activationState !== "active") throw unproven("Compaction shadow activation cannot be reset or invented.");
@@ -627,6 +661,9 @@ function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
     if (work.attempts.length < old.attempts.length) throw unproven("Attempt evidence cannot be removed.");
     old.attempts.forEach((before, i) => {
       const after = work.attempts[i]!;
+      if (before.preparationTermination && (!after.preparationTermination
+        || canonicalJson({ ...after.preparationTermination, status: before.preparationTermination.status }) !== canonicalJson(before.preparationTermination)
+        || before.preparationTermination.status === "settled" && after.preparationTermination.status !== "settled")) throw unproven("A preparation termination cannot be removed or rebound.");
       if (!before.sendEvidence && after.sendEvidence && (before.writerRetired || terminal(old))) throw unproven("A retired attempt cannot invent a Send authorization.");
       if (before.sendEvidence && before.sendEvidence.status !== "not-sent"
         && (!after.sendEvidence || before.sendEvidence.authorizationId !== after.sendEvidence.authorizationId
@@ -703,6 +740,49 @@ export class ContinuityRecoveryStore {
     this.now = options.now ?? Date.now;
     this.limits = { totalBytes: MAX_CONTINUITY_RECOVERY_BYTES, itemBytes: MAX_CONTINUITY_RECOVERY_ITEM_BYTES,
       checkpoints: MAX_CONTINUITY_RECOVERY_CHECKPOINTS, tombstones: MAX_CONTINUITY_RECOVERY_TOMBSTONES, rounds: MAX_CONTINUITY_RECOVERY_ROUNDS, ...options.limits };
+  }
+  /** Inbox commits share the recovery lock and complete capacity budget.
+   * The synchronous callback must not acquire another recovery transaction.
+   * Each commit is durable; a later failure cannot undo a saved reservation.
+   */
+  withTaskInputTransaction<T>(operation: (index: TaskInputIndex, commit: () => void) => T, maintain = false): T {
+    return this.exclusive(() => {
+      const document = this.read();
+      this.confirmDocument(document);
+      document.taskInputs ??= {};
+      if (maintain) {
+        const sourceChanged = this.preserveTaskInputSources(document);
+        if (this.retireCompletedTaskInputs(document) || sourceChanged) this.write(document);
+      }
+      const result = operation(document.taskInputs, () => {
+        validateTaskInputIndex(document.taskInputs);
+        this.write(document);
+      });
+      if (result && typeof (result as { then?: unknown }).then === "function") throw invalid("Task input transactions must be synchronous.");
+      return result;
+    });
+  }
+  /** Read under an existing recovery lock, without opening a nested transaction. */
+  taskInputRecord(identity: TaskInputIdentity): TaskInputTaskRecord | undefined {
+    validateTaskInputIdentity(identity);
+    const document = this.read(); this.confirmDocument(document);
+    const task = findTaskInput(document.taskInputs, identity);
+    return task && structuredClone(task);
+  }
+  /** Call inside a shared-lock transaction at the actual execution side effect.
+   * This assertion does not acquire a lock or grant authority on its own.
+   */
+  assertTaskInputIntent(identity: TaskInputIdentity, intentGeneration: number): TaskInputTaskRecord {
+    validateTaskInputIdentity(identity); integer(intentGeneration);
+    const document = this.read(), task = findTaskInput(document.taskInputs, identity);
+    if (!task || task.state !== "active" || task.intentGeneration !== intentGeneration) throw continuityError("continuity_stopped", "The task input execution intent is no longer current.");
+    this.confirmDocument(document);
+    return structuredClone(task);
+  }
+  /** Complete shared charge: persisted metadata, retained bodies and all safety reserves. */
+  capacityUsage(): { usedBytes: number; limitBytes: number } {
+    const document = this.read();
+    return { usedBytes: this.checkCapacity(document), limitBytes: this.limits.totalBytes };
   }
   /** Controlled setup/upgrade only. v1 registrations are retained as legacy-unproven. */
   initialize(): void {
@@ -785,6 +865,8 @@ export class ContinuityRecoveryStore {
             || typeof process.getuid === "function" && stat.uid !== process.getuid()) throw error;
           readFileSync(file); // Do not turn denied access into an empty installation.
         }
+        // Accepted inbox identities are not disposable page evidence.
+        if (existsSync(join(this.directory, "task-input-payloads"))) throw error;
         // Without a readable journal no component can prove a current generation.
         // Revoke all old permits under both locks. No historical backup is retained.
         const { registry } = this.pageRegistrations({ version: 4, installation, threads: {} });
@@ -871,7 +953,10 @@ export class ContinuityRecoveryStore {
       if (current && (current.version !== expected.version || current.epoch !== expected.epoch || current.owner.id !== expected.owner.id
         || current.transaction?.transactionId !== expected.transaction?.transactionId
         || current.transaction?.version !== expected.transaction?.version)) return false;
-      if (current) { delete document.threads[thread]; this.write(document); }
+      if (current) {
+        this.preserveTaskInputSources(document);
+        delete document.threads[thread]; this.write(document);
+      }
       const { registry } = this.pageRegistrations(document);
       delete registry.entries[thread]; durableWrite(join(this.directory, "threads.json"), JSON.stringify(registry));
       return true;
@@ -1088,7 +1173,7 @@ export class ContinuityRecoveryStore {
           works: {}, lineages: {}, calls: {}, compactionTargets: {}, checkpoints: {} };
         document.threads[input.thread] = record;
       }
-      this.guard(record, { scope: input.scope }); this.admit(record, input);
+      this.guard(record, { scope: input.scope }); this.admit(record, input, undefined, document.taskInputs);
       const unchanged = document.version === 4 && previous && canonicalJson(record) === canonicalJson(previous);
       if (!unchanged) record.version++;
       validateThread(record); if (previous) transition(previous, record);
@@ -1097,6 +1182,44 @@ export class ContinuityRecoveryStore {
       } else {
         this.write(document);
       }
+      return structuredClone(record);
+    });
+  }
+  /** Admit one fresh generation only after an explicit inbox retry and current-source validation. */
+  reserveTaskInputRetry(input: AdmitRecoveryWorkInput, retry: RecoveryTaskInputRetry, expectedVersion?: number): RecoveryThreadRecord {
+    this.validateAdmission(input);
+    return this.exclusive(() => {
+      const document = this.read(); let record = document.threads[input.thread];
+      if (retry.taskId !== `task_${digest([input.thread, input.nativeTurnId])}`) throw unproven("The retry belongs to another native task.");
+      const task = findTaskInput(document.taskInputs, { thread: input.thread, scope: input.scope, taskId: retry.taskId });
+      const selected = task?.messages.filter(message => message.intentGeneration === retry.intentGeneration && message.retryOfIntentGeneration !== undefined);
+      if (!task || task.state !== "active" || task.intentGeneration !== retry.intentGeneration || !selected?.length
+        || canonicalJson(selected.map(message => message.messageId)) !== canonicalJson(retry.messageIds)
+        || canonicalJson(selected.map(message => message.digest)) !== canonicalJson(retry.messageDigests)) throw continuityError("continuity_stopped");
+      if (!record) {
+        if (retry.sourceLogicalWorkId !== undefined || expectedVersion !== undefined) throw unproven("The stopped retry source is no longer retained.");
+        if (Object.keys(document.threads).length >= MAX_THREADS) throw capacity("Continuity recovery capacity is 10,000 threads.");
+        record = { thread: input.thread, scope: input.scope, version: 0, epoch: input.initialEpoch ?? 0, historyRevision: 0,
+          owner: structuredClone(input.owner), state: "creating", legacyUnproven: false, works: {}, lineages: {}, calls: {}, compactionTargets: {}, checkpoints: {} };
+        document.threads[input.thread] = record;
+      }
+      const existing = record.works[input.logicalWorkId];
+      if (existing) {
+        if (record.owner.id !== input.owner.id || record.currentWorkId !== existing.logicalWorkId || canonicalJson(existing.taskInputRetry ?? null) !== canonicalJson(retry)
+          || existing.instructionIdentity !== input.instructionIdentity || existing.nativeTurnId !== input.nativeTurnId
+          || existing.workPayloadDigest !== input.workPayloadDigest || existing.state === "stopped") throw unproven("The retry intent already has another execution source.");
+        this.confirmDocument(document); return structuredClone(record);
+      }
+      this.guard(record, { scope: input.scope, expectedVersion });
+      const source = retry.sourceLogicalWorkId ? record.works[retry.sourceLogicalWorkId] : undefined;
+      if (retry.sourceLogicalWorkId !== undefined && (!source || record.currentWorkId !== source.logicalWorkId || source.state !== "stopped" || source.purpose !== "ordinary"
+        || source.nativeTurnId !== input.nativeTurnId) || retry.sourceLogicalWorkId === undefined && record.currentWorkId !== undefined
+        || selected.some(message => message.status !== "accepted" || message.payload !== "ready")) throw unproven("Explicit retry requires the stopped current native task or a fresh current source and ready selected input.");
+      if (source?.attempts.some(attempt => attempt.sendEvidence?.status === "possible")) throw continuityError("continuity_execution_unsettled", "The previous Send remains unverified; explicit retry cannot assume it was not sent.");
+      const previous = structuredClone(record);
+      this.admit(record, { ...input, createPage: true }, retry, document.taskInputs);
+      record.works[input.logicalWorkId]!.taskInputRetry = structuredClone(retry);
+      record.version++; validateThread(record); transition(previous, record); this.write(document);
       return structuredClone(record);
     });
   }
@@ -1231,9 +1354,10 @@ export class ContinuityRecoveryStore {
       if (record.currentWorkId && record.works[record.currentWorkId]!.workLineageId === work.workLineageId) record.state = "ready";
     });
   }
-  markAttempt(thread: string, guard: RecoveryGuard, input: { logicalWorkId: string; attempt: number; stage: RecoveryAttemptStage; pageReceiptId?: string; transactionVersion?: number; launcherInstance?: ContinuityLauncherInstance; sendAuthorizationId?: string; sendIdentity?: ContinuityRecoveryIdentity }): RecoveryThreadRecord {
+  markAttempt(thread: string, guard: RecoveryGuard, input: { logicalWorkId: string; attempt: number; stage: RecoveryAttemptStage; pageReceiptId?: string; transactionVersion?: number; launcherInstance?: ContinuityLauncherInstance; sendAuthorizationId?: string; sendIdentity?: ContinuityRecoveryIdentity; authorize?: () => void }): RecoveryThreadRecord {
     if (input.launcherInstance) validateLauncherInstance(input.launcherInstance);
     return this.transact(thread, guard, record => {
+      input.authorize?.();
       noPendingPreparation(record);
       const work = this.activeWork(record, input.logicalWorkId); const attempt = this.attempt(work, input.attempt);
       if (attempt.attempt !== work.attempts.length - 1 || attempt.epoch !== record.epoch || attempt.writerRetired) throw unproven("A late observer cannot authorize the current attempt.");
@@ -1337,8 +1461,11 @@ export class ContinuityRecoveryStore {
       snapshotDigest: attempt.snapshotDigest, ownerProcess: { pid: record.owner.pid, startIdentity: record.owner.startIdentity },
       ...(attempt.launcherInstance ? { launcherInstance: structuredClone(attempt.launcherInstance) } : {}) };
   }
-  retireAttempt(thread: string, guard: RecoveryGuard, logicalWorkId: string, number: number): RecoveryThreadRecord {
+  retireAttempt(thread: string, guard: RecoveryGuard, logicalWorkId: string, number: number, sourceTask?: TaskInputIdentity): RecoveryThreadRecord {
     return this.transact(thread, guard, record => {
+      if (sourceTask && (sourceTask.thread !== thread || this.taskInputRecord(sourceTask)?.retired)) {
+        throw continuityError("continuity_stopped", "The requesting task source has retired.");
+      }
       noPendingPreparation(record);
       const work = this.work(record, logicalWorkId); const attempt = this.attempt(work, number);
       if (["completed", "stopped", "interrupted-settled"].includes(attempt.stage)) return;
@@ -1424,6 +1551,86 @@ export class ContinuityRecoveryStore {
       this.failWork(this.activeWork(record, logicalWorkId));
     });
   }
+  /** Shares the actual Send lock. Once fenced, no delayed ACK can enqueue a Send. */
+  terminatePreparation(original: ContinuityRecoveryIdentity, input: {
+    requestId: string; traceId: string; helperPid: number; lease: ContinuityLease;
+  }): RecoveryPreparationTermination | undefined {
+    if (!isContinuityRecoveryIdentity(original) || !isContinuityLease(input.lease)) throw unproven("Invalid preparation identity.");
+    identity(input.requestId); identity(input.traceId); integer(input.helperPid);
+    return this.exclusive(() => {
+      const document = this.read(), record = document.threads[original.threadKey];
+      const work = record?.works[original.logicalWorkId], attempt = work?.attempts[original.attempt];
+      if (!record || record.legacyUnproven || record.pendingPreparation || document.installation !== original.installationId
+        || record.currentWorkId !== original.logicalWorkId || !work || terminal(work) || !attempt
+        || attempt !== work.attempts.at(-1) || record.epoch !== original.epoch
+        || canonicalJson(original) !== canonicalJson(this.sendIdentity(record, work, attempt))) return undefined;
+      const prior = attempt.preparationTermination;
+      if (prior) {
+        if (canonicalJson({ requestId: prior.requestId, traceId: prior.traceId, helperPid: prior.helperPid, lease: prior.lease }) !== canonicalJson(input)) throw unproven("The preparation termination belongs to another request.");
+        return structuredClone(prior);
+      }
+      if (attempt.writerRetired || !["prepared", "page-possible", "page-acquired"].includes(attempt.stage)
+        || attempt.sendEvidence && attempt.sendEvidence.status !== "not-sent"
+        || attempt.pageReceiptId && attempt.pageReceiptId !== input.lease.leaseId) return undefined;
+      const previous = structuredClone(record);
+      attempt.preparationTermination = { ...structuredClone(input), recovery: structuredClone(original), receiptId: randomBytes(16).toString("hex"), status: "pending" };
+      attempt.writerRetired = true;
+      this.syncTransaction(record, work, attempt);
+      record.version++; validateThread(record); transition(previous, record); this.write(document);
+      return structuredClone(attempt.preparationTermination);
+    });
+  }
+  /** Call only after Launcher confirms the exact fenced preparation and healthy lease. */
+  settlePreparationTermination(original: ContinuityRecoveryIdentity, receiptId: string): RecoveryThreadRecord | undefined {
+    identity(receiptId);
+    return this.exclusive(() => {
+      const document = this.read(), record = document.threads[original.threadKey];
+      const work = record?.works[original.logicalWorkId], attempt = work?.attempts[original.attempt];
+      const termination = attempt?.preparationTermination;
+      if (!record || record.legacyUnproven || record.pendingPreparation || record.currentWorkId !== original.logicalWorkId
+        || !work || terminal(work) || !attempt || attempt !== work.attempts.at(-1) || attempt.epoch !== record.epoch
+        || !termination || termination.receiptId !== receiptId || canonicalJson(termination.recovery) !== canonicalJson(original)
+        || canonicalJson(this.sendIdentity(record, work, attempt)) !== canonicalJson(original)) return undefined;
+      if (termination.status === "settled") return structuredClone(record);
+      const previous = structuredClone(record);
+      termination.status = "settled"; attempt.stage = "interrupted-settled";
+      this.failWork(work); this.syncTransaction(record, work, attempt); record.state = "ready";
+      record.contextCoverageReservations = record.contextCoverageReservations?.filter(value => value.logicalWorkId !== work.logicalWorkId || value.attempt !== attempt.attempt);
+      // The exact two-sided unsent receipt also releases the prompt's inbox prefix.
+      // Keep message IDs and S; an unknown Send must retain its original delivery.
+      const task = work.nativeTurnId && findTaskInput(document.taskInputs, { thread: record.thread, scope: record.scope,
+        taskId: `task_${digest([record.thread, work.nativeTurnId])}` });
+      if (task && task.state === "active" && !task.retired) {
+        let changed = false;
+        for (const delivery of task.deliveries) {
+          if (delivery.cancelled || delivery.mode !== "initial" || delivery.intentGeneration !== task.intentGeneration
+            || delivery.physicalResponseId !== termination.traceId || delivery.logicalWorkId !== work.logicalWorkId
+            || delivery.workLineageId !== work.workLineageId || delivery.acceptedTaskRevision !== work.acceptedTaskRevision
+            || delivery.driverGeneration !== 0 || delivery.historyRevision !== attempt.historyRevision
+            || delivery.deliveredMessageIds.length) continue;
+          delivery.cancelled = true; changed = true;
+        }
+        if (changed) task.version++;
+      }
+      record.version++; validateThread(record); transition(previous, record, { logicalWorkId: work.logicalWorkId, attempt: attempt.attempt }); this.write(document);
+      return structuredClone(record);
+    });
+  }
+  /** A retry gets a fresh writer and transaction while the same physical page is retained. */
+  retryTerminatedPreparation(thread: string, guard: RecoveryGuard, logicalWorkId: string, snapshotDigest: string): RecoveryThreadRecord {
+    hash(snapshotDigest);
+    return this.transact(thread, guard, record => {
+      noPendingPreparation(record);
+      const work = this.activeWork(record, logicalWorkId), before = work.attempts.at(-1)!;
+      if (record.currentWorkId !== logicalWorkId || record.state !== "ready" || before.preparationTermination?.status !== "settled"
+        || !before.writerRetired || before.stage !== "interrupted-settled") throw unproven("The preparation has no settled same-page retry.");
+      this.retry(work);
+      const next: RecoveryAttemptRecord = { attempt: work.attempts.length, epoch: record.epoch, historyRevision: record.historyRevision,
+        snapshotVersion: before.snapshotVersion + 1, snapshotDigest, stage: "prepared", dispatchProtocolComplete: true, writerRetired: false };
+      work.attempts.push(next); work.state = "prepared"; record.state = "running";
+      this.newTransaction(record, work, next, record.epoch);
+    });
+  }
   /** A helper error may fail or stop only the writer that produced it. Both effects share one lock and commit. */
   settleWriterFailure(reference: RecoveryWriterReference, stopReason?: NonNullable<RecoveryWorkRecord["stopReason"]>): RecoveryThreadRecord | undefined {
     hash(reference.thread); identity(reference.logicalWorkId); integer(reference.attempt); optionalHash(reference.ownerId);
@@ -1495,7 +1702,7 @@ export class ContinuityRecoveryStore {
       const checkpoint = record.checkpoints[commitId]; if (!checkpoint) throw unproven("The requested continuation commit is not retained.");
       if (checkpoint.continuation.nativeTurnId && checkpoint.continuation.nativeTurnId !== input.nativeTurnId) throw unproven("The continuation native turn does not match.");
       if (checkpoint.continuation.state === "consumed" && checkpoint.continuation.consumerLogicalWorkId !== input.logicalWorkId) throw unproven("A checkpoint continuation can have only one consumer.");
-      this.admit(record, { ...input, continuationCommitId: commitId });
+      this.admit(record, { ...input, continuationCommitId: commitId }, undefined, this.read().taskInputs);
       checkpoint.continuation = { ...checkpoint.continuation, state: "consumed", consumerLogicalWorkId: input.logicalWorkId };
     });
   }
@@ -1523,7 +1730,19 @@ export class ContinuityRecoveryStore {
     if (input.activate === false && (input.purpose !== "compaction" || input.createPage !== false || input.predecessorLogicalWorkId || input.continuationCommitId
       || !input.compactionTargetId || !input.dispatchProtocolComplete)) throw unproven("Shadow admission is restricted to a proved, tool-free compaction on the current source page.");
   }
-  private admit(record: RecoveryThreadRecord, input: AdmitRecoveryWorkInput): void {
+  private admit(record: RecoveryThreadRecord, input: AdmitRecoveryWorkInput, explicitRetry?: RecoveryTaskInputRetry, taskInputs?: TaskInputIndex): void {
+    const taskId = input.nativeTurnId && `task_${digest([input.thread, input.nativeTurnId])}`;
+    if (taskId && Object.values(taskInputs ?? {}).some(task => task.thread === input.thread && task.taskId === taskId
+      && ([input.scope, record.scope, record.canonicalScope].includes(task.scope)
+        || task.canonicalScope !== undefined && [input.scope, record.scope, record.canonicalScope].includes(task.canonicalScope)) && task.retired)) {
+      // A matching completed work may only be replayed. All new work identities are fenced,
+      // including cold admission after the page journal has been removed.
+      const replay = record.works[input.logicalWorkId];
+      if (!replay || replay.state !== "completed" || replay.nativeTurnId !== input.nativeTurnId
+        || replay.instructionIdentity !== input.instructionIdentity || replay.workPayloadDigest !== input.workPayloadDigest) {
+        throw continuityError("continuity_stopped", "This task source has retired. Start a new native turn for new work.");
+      }
+    }
     noPendingPreparation(record);
     if (record.legacyUnproven) throw unproven("The old v1 registration has no complete dispatch, submission or stop evidence.");
     const checkpoint = input.continuationCommitId ? record.checkpoints[input.continuationCommitId] : undefined;
@@ -1555,13 +1774,14 @@ export class ContinuityRecoveryStore {
     }
     const sameIdentity = Object.values(record.works).find(work => work.instructionIdentity === input.instructionIdentity && work.nativeTurnId === input.nativeTurnId
       && work.purpose === (input.purpose ?? "ordinary") && work.compactionTargetId === input.compactionTargetId);
-    if (sameIdentity && !checkpoint) throw unproven("An accepted instruction identity cannot obtain another logical work ID.");
+    if (sameIdentity && !checkpoint && !explicitRetry) throw unproven("An accepted instruction identity cannot obtain another logical work ID.");
     const head = record.currentWorkId ? record.works[record.currentWorkId] : undefined;
     const target = input.compactionTargetId ? record.compactionTargets[input.compactionTargetId] : undefined;
     const predecessor = input.predecessorLogicalWorkId ? this.activeWork(record, input.predecessorLogicalWorkId) : undefined;
     if (input.purpose === "compaction" && !target) throw unproven("Compaction admission requires a retained stable target.");
     if (input.activate === false && record.owner.id !== input.owner.id) throw unproven("A shadow control cannot change the current source owner.");
-    if (head && !terminal(head) && !predecessor && !target && !checkpoint) throw unproven("Another current logical work must settle before new admission.");
+    if (head && !terminal(head) && head.attempts.at(-1)?.preparationTermination?.status !== "settled"
+      && !predecessor && !target && !checkpoint) throw unproven("Another current logical work must settle before new admission.");
     if (predecessor && (head?.logicalWorkId !== predecessor.logicalWorkId || record.lineages[predecessor.workLineageId]?.headLogicalWorkId !== predecessor.logicalWorkId)) throw unproven("Append admission must name the actual accepted predecessor head.");
     if (input.createPage && head) {
       const retirementLineage = target?.workLineageId ?? checkpoint?.workLineageId ?? head.workLineageId;
@@ -1682,7 +1902,8 @@ export class ContinuityRecoveryStore {
       const marker = safeFile(this.marker, 1024); exact(marker, ["version", "installation"]); hash(marker.installation);
       let encoded = "";
       const document = safeFile(this.file, MAX_CONTINUITY_RECOVERY_BYTES, value => { encoded = value; });
-      exact(document, ["version", "installation", "threads"]); dictionary(document.threads);
+      exact(document, ["version", "installation", "threads"], ["taskInputs"]); dictionary(document.threads);
+      if (document.taskInputs !== undefined) validateTaskInputIndex(document.taskInputs);
       if (marker.version !== 2 || (document.version !== 2 && document.version !== 3 && document.version !== 4) || document.installation !== marker.installation || document.installation !== this.installation()
         || Object.keys(document.threads).length > MAX_THREADS) throw new Error("invalid installation");
       measureRuntimeOperation("recovery.validate", () => {
@@ -1698,7 +1919,7 @@ export class ContinuityRecoveryStore {
       throw invalid("Continuity recovery storage is missing, unreadable or invalid; it was not reset.");
     }
   }
-  private checkCapacity(document: RecoveryDocument): void {
+  private checkCapacity(document: RecoveryDocument): number {
     let reserve = 0; let checkpointCount = 0;
     for (const record of Object.values(document.threads)) {
       if (Object.keys(record.works).length > this.limits.tombstones) throw capacity("Continuity terminal identity capacity is 256 per thread, including reserved active identities.");
@@ -1730,7 +1951,9 @@ export class ContinuityRecoveryStore {
       }
     }
     if (checkpointCount > this.limits.checkpoints) throw capacity("Continuity checkpoint capacity is 256.");
-    if (size(document) + reserve > this.limits.totalBytes) throw capacity("Continuity recovery and checkpoint capacity is 24 MiB including terminal reservations.");
+    reserve += taskInputReservedBytes(document.taskInputs);
+    if (size(document) + reserve > this.limits.totalBytes) throw capacity("Continuity recovery, task inputs and checkpoints share 24 MiB including terminal reservations.");
+    return size(document) + reserve;
   }
   private confirmDocument(document: RecoveryDocument): void {
     // Unchanged transactions confirm the exact bytes read, including format whitespace.
@@ -1747,11 +1970,79 @@ export class ContinuityRecoveryStore {
       throw invalid("Continuity recovery commit durability remains unverified; no new side effect is permitted.");
     }
   }
+  /** Preserve only scope equivalence and final source facts proved before page deletion. */
+  private preserveTaskInputSources(document: RecoveryDocument): boolean {
+    let changed = false;
+    for (const task of Object.values(document.taskInputs ?? {})) {
+      const record = document.threads[task.thread];
+      if (!record || ![record.scope, record.canonicalScope].some(scope => scope !== undefined
+        && (scope === task.scope || scope === task.canonicalScope))) continue;
+      if (record.scope === task.scope && record.canonicalScope && record.canonicalScope !== task.scope) {
+        if (task.canonicalScope && task.canonicalScope !== record.canonicalScope) throw unproven("The task input scope alias conflicts with its saved authority.");
+        if (!task.canonicalScope) { task.canonicalScope = record.canonicalScope; task.version++; changed = true; }
+      }
+      if (task.retired) continue;
+      const sources = Object.values(record.works).filter(work => work.purpose === "ordinary" && work.nativeTurnId
+        && `task_${digest([task.thread, work.nativeTurnId])}` === task.taskId);
+      const settled = task.state === "completed" && task.messages.every(message => ["completed", "discarded"].includes(message.status))
+        && task.deliveries.every(delivery => delivery.cancelled || delivery.completedMessageIds.length === delivery.messageIds.length)
+        && sources.every(work => work.state === "completed" && work.attempts.every(attempt => attempt.writerRetired))
+        && !Object.values(record.calls).some(call => sources.some(work => work.workLineageId === call.workLineageId)
+          && ["queued", "delivery-possible"].includes(call.state));
+      if (sources.length && !!task.sourceSettled !== settled) {
+        if (settled) task.sourceSettled = true;
+        else { delete task.sourceSettled; delete task.retirementReadyAt; }
+        task.version++; changed = true;
+      }
+      // A missing journal never creates settlement proof. A later successful
+      // native turn makes this source historical; a failed preparation does not.
+      const head = record.currentWorkId ? record.works[record.currentWorkId] : undefined;
+      const sameTurn = head?.nativeTurnId && `task_${digest([task.thread, head.nativeTurnId])}` === task.taskId;
+      if (sameTurn && task.retirementReadyAt !== undefined) {
+        delete task.retirementReadyAt; task.version++; changed = true;
+      } else if (!sameTurn && head?.nativeTurnId && head.purpose === "ordinary" && head.state === "completed"
+        && task.sourceSettled && task.retirementReadyAt === undefined) {
+        task.retirementReadyAt = this.now() + TASK_INPUT_HISTORICAL_RETENTION_MS;
+        task.version++; changed = true;
+      }
+    }
+    return changed;
+  }
+  /** A successful later native turn and the historical replay window end detailed retention.
+   * Physical completion in the same native turn never closes its input source.
+   */
+  private retireCompletedTaskInputs(document: RecoveryDocument): boolean {
+    let changed = false;
+    for (const task of Object.values(document.taskInputs ?? {})) {
+      if (task.retired || !task.sourceSettled || task.retirementReadyAt === undefined || task.retirementReadyAt > this.now()
+        || !/^task_[a-f0-9]{64}$/.test(task.taskId) || task.state !== "completed" || task.messages.some(message => !["completed", "discarded"].includes(message.status))
+        || task.deliveries.some(delivery => !delivery.cancelled && delivery.completedMessageIds.length !== delivery.messageIds.length)) continue;
+      const record = document.threads[task.thread];
+      const current = record?.currentWorkId ? record.works[record.currentWorkId] : undefined;
+      if (!record || ![record.scope, record.canonicalScope].some(scope => scope !== undefined
+        && (scope === task.scope || scope === task.canonicalScope))
+        || !current?.nativeTurnId || current.purpose !== "ordinary"
+        || `task_${digest([task.thread, current.nativeTurnId])}` === task.taskId) continue;
+      const sources = Object.values(record.works).filter(work => work.purpose === "ordinary" && work.nativeTurnId
+        && `task_${digest([task.thread, work.nativeTurnId])}` === task.taskId);
+      // A fresh page can have removed the journal. The readiness proof was saved
+      // while the source work and its actual writer/call settlement were available.
+      if (sources.some(work => work.state !== "completed" || work.attempts.some(attempt => !attempt.writerRetired))
+        || Object.values(record.calls).some(call => sources.some(work => work.workLineageId === call.workLineageId)
+          && ["queued", "delivery-possible"].includes(call.state))) continue;
+      task.retired = { reason: "completed", sequence: task.receivedSequence, compacted: false };
+      delete task.waitReason; task.version++; changed = true;
+    }
+    return changed;
+  }
   private write(document: RecoveryDocument): void {
     // Even a failed write attempt must not leave a proof usable by another store instance.
     forgetRecoveryDurability(this.file);
     // Atomic format promotion preserves all facts and makes old v2 writers fail closed.
     document.version = 4;
+    this.preserveTaskInputSources(document);
+    this.retireCompletedTaskInputs(document);
+    validateTaskInputIndex(document.taskInputs ?? {});
     this.checkCapacity(document);
     let replaced = false;
     try {

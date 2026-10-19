@@ -7,6 +7,7 @@ function subscription(channel, listener) {
 }
 
 contextBridge.exposeInMainWorld("codexWebLauncher", {
+  taskInputs: (request) => ipcRenderer.invoke("launcher:task-input", request),
   apiAccessStatus: () => ipcRenderer.invoke("launcher:api-access-status"),
   apiAccessReveal: () => ipcRenderer.invoke("launcher:api-access-reveal"),
   apiAccessGenerate: () => ipcRenderer.invoke("launcher:api-access-generate"),

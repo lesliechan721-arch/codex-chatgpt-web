@@ -11,6 +11,8 @@ export const TASK_UPDATE_BATCH_LIMIT_BYTES = 32 * 1_024 * 1_024;
 export interface TaskUpdateOwnerContext {
   expectedDriverGeneration: number;
   taskRevision: number;
+  /** HTTP delivery association only. It never changes physical output authority. */
+  observerGeneration?: number;
   /** Final candidates retain the ACK head observed with their first text projection. */
   acknowledgedRevision?: number;
 }

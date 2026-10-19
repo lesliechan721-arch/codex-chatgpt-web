@@ -336,10 +336,22 @@ function loadCommittedBrowserSurface(
   }
   return new Promise((resolve, reject) => {
     let settled = false;
+    const bootstrap = { navigationStarted: false, documentCommitted: false, domReady: false,
+      loadFinished: false, loadStopped: false, loadResolved: false };
+    const onNavigationStarted = (_event, _url, _inPlace, mainFrame) => {
+      if (mainFrame) bootstrap.navigationStarted = true;
+    };
+    const onDocumentCommitted = () => { bootstrap.documentCommitted = true; };
+    const onDomReady = () => { bootstrap.domReady = true; };
+    const onLoadFinished = () => { bootstrap.loadFinished = true; onReady(); };
+    const onLoadStopped = () => { bootstrap.loadStopped = true; onReady(); };
     const cleanup = () => {
       clearTimeout(timeout);
-      contents.off("did-stop-loading", onReady);
-      contents.off("did-finish-load", onReady);
+      contents.off("did-start-navigation", onNavigationStarted);
+      contents.off("did-navigate", onDocumentCommitted);
+      contents.off("dom-ready", onDomReady);
+      contents.off("did-stop-loading", onLoadStopped);
+      contents.off("did-finish-load", onLoadFinished);
       contents.off("did-fail-load", onFailed);
       contents.off("render-process-gone", onRendererGone);
       contents.off("destroyed", onDestroyed);
@@ -369,17 +381,26 @@ function loadCommittedBrowserSurface(
     };
     const onDestroyed = () => finish(new Error("Browser closed during idle document bootstrap"));
     const timeout = setTimeout(() => {
-      finish(new Error(`Browser idle document did not commit within ${timeoutMs}ms`));
+      const error = new Error(`Browser idle document did not commit within ${timeoutMs}ms`);
+      // Keep preparation diagnostics independent of page contents, URLs and credentials.
+      error.bootstrap = { ...bootstrap,
+        expectedDocument: !contents.isDestroyed() && contents.getURL() === url,
+        loading: !contents.isDestroyed() && contents.isLoading?.(),
+        mainFrameLoading: !contents.isDestroyed() && contents.isLoadingMainFrame?.() };
+      finish(error);
       if (!contents.isDestroyed()) contents.stop();
     }, timeoutMs);
     timeout.unref?.();
-    contents.on("did-stop-loading", onReady);
-    contents.on("did-finish-load", onReady);
+    contents.on("did-start-navigation", onNavigationStarted);
+    contents.on("did-navigate", onDocumentCommitted);
+    contents.on("dom-ready", onDomReady);
+    contents.on("did-stop-loading", onLoadStopped);
+    contents.on("did-finish-load", onLoadFinished);
     contents.on("did-fail-load", onFailed);
     contents.on("render-process-gone", onRendererGone);
     contents.on("destroyed", onDestroyed);
     try {
-      Promise.resolve(contents.loadURL(url)).then(onReady, error => {
+      Promise.resolve(contents.loadURL(url)).then(() => { bootstrap.loadResolved = true; onReady(); }, error => {
         finish(error instanceof Error ? error : new Error(String(error)));
       });
     } catch (error) {
@@ -753,6 +774,7 @@ class BrowserHost {
         tabId: tab.id,
         traceId: tab.traceId,
         message,
+        ...(error?.bootstrap ? { bootstrap: error.bootstrap } : {}),
       });
       // Destroy the exact pending document too: abandoning its promise alone leaves renderer
       // work running and lets a late ownership mark race a future browser turn.
@@ -3083,6 +3105,22 @@ class BrowserHost {
       );
     }
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
+    if (!cancelledByUser && status !== "completed" && tab.continuityRecovery) {
+      let termination;
+      try { termination = require("./continuity-execution-authority.cjs").preparationTermination(this, tab.continuityRecovery); } catch {}
+      if (termination && termination.traceId === traceId && termination.helperPid === helperPid) {
+        const receipt = require("./continuity-recovery.cjs").terminateContinuityPreparation(this, tab.continuityRecovery);
+        return { cancelledByUser: false, preparationTermination: receipt };
+      }
+      if (require("./continuity-execution-authority.cjs").hasUnsettledSend(this, tab.continuityRecovery)
+        && tab.bootstrapReady === true && !tab.authenticationRequired && !tab.continuityInvalidated
+        && !tab.view.webContents.isDestroyed()) {
+        tab.status = "running"; tab.loading = false; tab.approvalPending = false;
+        tab.message = "Send status is unknown. Reconnect to verify this attempt before sending again.";
+        this.publishState?.(this.snapshot()); this.writeDescriptor();
+        return { cancelledByUser: false, sendState: "unknown" };
+      }
+    }
     if (tab.failedAt !== undefined) {
       if (status !== "failed") throw new Error(`Browser turn ${traceId} already failed`);
       return { cancelledByUser };
@@ -3698,7 +3736,7 @@ class BrowserHost {
     }
     const descriptor = {
       version: 3,
-      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE, CONTEXT_DELIVERY_FEATURE, EXECUTION_FENCING_FEATURE],
+      features: [CONTINUITY_FEATURE, RECOVERY_FEATURE, CONTEXT_DELIVERY_FEATURE, EXECUTION_FENCING_FEATURE, "preparation-termination-v1"],
       executionProtocol: EXECUTION_PROTOCOL,
       kind: "codex-web-gpt-launcher",
       profile: this.profile,

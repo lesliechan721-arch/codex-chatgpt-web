@@ -134,8 +134,9 @@ New compatible Full Native Automatic and started Zero Risk runtimes negotiate `t
 A new ordinary turn on a retained page negotiates the protocol with fresh tool authority and
 revision 0. Compaction does not negotiate it. All eligible routes use the same local work/source
 records for active text-only appends. The same trusted thread, turn, scope, owner and page lease,
-and a live tool boundary or update-confirmation window, must be identifiable. Initial Zero Risk
-requests awaiting Sent remain outside this active-append contract.
+must be identifiable. A live tool boundary is required for active model delivery, not for durable
+receipt. Initial Zero Risk inputs awaiting Sent can be saved; they do not modify a confirmed prompt
+snapshot or authorize automatic Send.
 
 Completed history may be trimmed or reserialized; edited old text is not sent back to a healthy
 page. Stable new user item IDs preserve order and prevent duplicate acceptance. Equal text under
@@ -168,9 +169,9 @@ No update is stored in the Native result cache or sent through the browser compo
 Apply delivered updates in order, then call `codex_task_update_ack` with the same capability,
 `delivery_id`, and `through_revision`. One immutable delivery is outstanding at a time; retries
 return it unchanged. A further append during the ACK gap stays queued and can be delivered in
-that ACK response. An active response without an available boundary rejects the append as not accepted and preserves
-the running work. ACK is confirmation, not Native
-execution or extra business progress.
+that ACK response. Without a boundary, accepted input stays in the durable queue until a controlled
+entry or the next ordinary browser response. ACK is confirmation, not Native execution or extra
+business progress.
 
 Every Native start on a negotiated capability declares a nonnegative safe integer `task_revision`,
 initially 0. That revision joins the bound start fingerprint and is removed from Native arguments.
@@ -182,9 +183,12 @@ calls keep their real results. Old queued calls are intercepted rather than exec
 
 All owner writes and waiter delivery capture `expectedDriverGeneration` and check it at the actual
 Broker mutation, including Remote IPC. Session generation checks also run after asynchronous
-owner calls. A superseded active observer ends with `incomplete(task_update_handoff)`; an already
-completed source round keeps its terminal journal. Late observer cancellation cannot revoke the
-new driver. Trusted user stop remains a separate physical cancellation operation.
+owner calls. Observer attachment has a separate protected association: changing the HTTP/tool
+delivery connection does not advance the driver generation or invalidate physical completion.
+Only the current association can claim new calls; an already dispatched call keeps its completion
+right. Normal waiting uses commentary/heartbeat, with no `incomplete(task_update_handoff)` terminal.
+An already completed source round keeps its terminal journal. Late observer cancellation cannot
+revoke the current physical owner. Trusted user stop remains a separate physical cancellation operation.
 
 The first nonempty final-answer delta locks its captured acknowledged version. Commentary and
 reasoning do not lock it. A strict buffered answer or worker-first completion may lock inside
@@ -192,8 +196,8 @@ the completion CAS before text is sent; sending then reuses that immutable recei
 are never upgraded to a later head. Automatic unacknowledged final output fails explicitly;
 Zero Risk completion requires the acknowledged revision after an update and can return the
 pending delivery on refusal. Its initial revision 0 remains the compatible default. After the
-lock, late ACKs cannot change the answer. Active appends are not accepted while that locked response is still running; wait for
-it to finish before sending a normal continuation. A response that did not negotiate the update
+lock, late ACKs cannot change the answer. New input is still saved, but belongs to a later ordinary
+response; it cannot change the locked output or be marked as covered by it. A response that did not negotiate the update
 protocol cannot be upgraded by an append. Compaction refuses unresolved updates or prepared
 transfers and requires the latest exact source. Compaction reuses locally accepted
 results, without requiring their old bodies again. Appends advance task revision and driver
@@ -216,6 +220,43 @@ round's recorded tool boundary; it inherits the buffered candidates' original ad
 An old result boundary cannot transfer ownership again. Rejecting a non-owning round can journal its own
 error, but cannot cancel or retire the owning execution. A newly committed task update may still
 bind its new revision/generation while strict text is buffered and no final-output lock exists.
+
+## Durable task input queue
+
+Supported continuity routes retain plain user messages under trusted task/thread/scope identities.
+Stable native message IDs and content digests provide idempotent receipt. A different ID with the
+same text is a second message; reusing an ID with changed text is a conflict. Complete text is stored
+in owner-only payload files, outside the recovery metadata journal. A receipt is successful only
+when that text and its identity are durable. Unknown commit outcomes require the same ID to be
+queried or retried; missing text blocks delivery and must be restored from the identical original.
+
+Receive sequence S is task-wide. Receipt alone changes neither model revision M, recovery work
+revision R, driver generation G, nor history revision H. An active finite prefix maps its exact S
+set to M+1 through M+k, advances G once, and admits one new recovery work revision. An ordinary
+next physical response starts M/G at zero and records its prefix as initial prompt input. Exact
+journal recovery keeps the journal's versions. ACK and completion cover exact message sets and
+physical/work bindings, including holes left by discarded messages.
+
+The queue checks existing Native admission, real-result return and ACK entries. One immutable
+unacknowledged delivery is allowed per capability. Already started tools retain their original
+IDs/results and are not redispatched. Unsent old decisions require a new model decision after the
+update. If no active entry is available, the current physical response settles and an authorized
+current observer can start the next ordinary response. Each physical assistant output remains a
+separate Responses item; JSON and SSE expose the same ordered content. Disconnect alone does
+not start new browser sends or business work. Zero Risk retains manual Send/Sent/attachment gates.
+
+Pending inputs are bounded by 128 messages and 1 MiB per task. Capability cumulative update limits
+still apply separately. Payload bytes, metadata and safe mutation reserves share the existing
+24 MiB recovery budget. Pending/stopped originals survive page cleanup and restart without a silent
+TTL. Activity provides view/copy, original-body repair, explicit stopped-input retry, discard before
+delivery permission, and cleanup. Input custody never grants tool or page ownership.
+Once a later native turn completes, a 30-minute historical Session replay window starts. After
+that window ends and all earlier work and exact input coverage have settled, maintenance releases the earlier inbox's
+bodies and detailed message/delivery references. A prepared or failed successor cannot start
+this retirement window.
+Explicit task deletion also commits a source fence before removing bodies. The compact fence
+continues to count toward the shared budget and prevents delayed old-source work from restarting;
+physical completion within the same native turn does not retire its inbox.
 
 ## Compaction, retirement, and completion
 
@@ -278,7 +319,7 @@ for cleanup before saving inherited candidates. If that storage exhausts the jou
 and capability revocation still occur; a rejected non-owning or older-generation round cannot
 gain cleanup authority from a capacity error.
 
-The implemented Broker protocol is 13. Native waiting and task update protocols are 1; the context
+The implemented Broker protocol is 14. Native waiting and task update protocols are 1; the context
 protocol is 2 and requires `context-text-read-v2` for successful text pages.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
