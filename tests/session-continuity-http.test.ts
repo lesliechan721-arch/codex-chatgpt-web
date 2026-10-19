@@ -271,7 +271,7 @@ for (const target of ["same-work", "new-work"] as const) for (const userClosed o
 }
 
 for (const manual of [false, true]) for (const stream of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} ${stream ? "streamed" : "JSON"} accepts Codex-roundtripped tool output without repeating work`, async () => {
-  const f = httpFixture(manual);
+  const f = httpFixture(manual, false, { mcpTransport: "in-process" });
   f.body.stream = stream;
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
@@ -567,7 +567,7 @@ test("HTTP next user turn accepts the bridge's complete commentary and final out
 });
 
 for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automatic"} replays an earlier accepted tool round after the canonical head advances`, async () => {
-  const f = httpFixture(manual);
+  const f = httpFixture(manual, false, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const initial = await (await f.send(f.body)).json() as { status: string; output: Array<Record<string, unknown>> };

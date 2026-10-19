@@ -1281,7 +1281,7 @@ describe("Automatic Adapter task updates", () => {
     const received = deferred<void>();
     const release = deferred<void>();
     const connections = new Set<Socket>();
-    const proxyPath = join(testRoot, "strict-admission-proxy.sock");
+    const proxyPath = process.platform === "win32" ? defaultBrokerEndpoint(join(testRoot, "strict-admission-proxy.sock")) : join(testRoot, "strict-admission-proxy.sock");
     const proxy = createServer(client => {
       connections.add(client);
       client.on("error", () => {});
@@ -1459,7 +1459,7 @@ test("Remote strict answer generated after real ACK succeeds while its owner sta
   const f = await fixture({ remote: true, structured: true });
   const release = deferred<void>();
   const ackSnapshotWaiting = deferred<void>();
-  const proxySocket = join(testRoot, "delayed-owner-observe.sock");
+  const proxySocket = process.platform === "win32" ? defaultBrokerEndpoint(join(testRoot, "delayed-owner-observe.sock")) : join(testRoot, "delayed-owner-observe.sock");
   const connections = new Set<Socket>();
   const proxy = createServer(client => {
     connections.add(client);

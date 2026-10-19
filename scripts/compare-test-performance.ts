@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from
 import { join, resolve, relative } from "node:path";
 import { performanceSource } from "./test-performance-source";
 import { validCounter } from "./test-performance-reports";
+import { repositoryTestFiles, targetTestFiles } from "./test-timing-history";
 
 const root = resolve(import.meta.dir, "..");
 export type Workers = 1 | 2;
@@ -85,7 +86,7 @@ export function readPerformanceSummary(output: string, workers: Workers, exitCod
   catch (error) { throw new InvalidSummary(path, null, [error instanceof Error ? error.message : String(error)]); }
   const reasons: string[] = [];
   if (!summary || typeof summary !== "object" || Array.isArray(summary)) throw new InvalidSummary(path, summary, ["invalid-summary"]);
-  if (summary.version !== 2 && summary.version !== 3) reasons.push("unsupported-summary-version");
+  if (![2, 3, 4].includes(summary.version)) reasons.push("unsupported-summary-version");
   if (summary.known !== true || summary.revision !== source.revision || summary.patchDigest !== source.patchDigest
     || summary.toolDigest !== source.toolDigest || summary.nodeVersion !== source.nodeVersion
     || JSON.stringify(summary.measurementFiles) !== JSON.stringify(source.measurementFiles)) reasons.push("different-or-unknown-source");
@@ -117,7 +118,20 @@ export function readPerformanceSummary(output: string, workers: Workers, exitCod
       try { schedulingInputs = commandScope(summary.command, workers, scope, run, true); }
       catch (error) { reasons.push(error instanceof Error ? error.message : String(error)); }
     }
-  } else if (summary.version === 3) {
+  } else if (summary.version === 3 || summary.version === 4) {
+    if (summary.version === 4) {
+      const timing = summary.fileTiming;
+      const cwd = scope.cwd ?? root;
+      const expected = targetTestFiles(cwd, scope.files, repositoryTestFiles(cwd));
+      const fullSuiteRequested = scope.files.length === 0 || scope.files.length === 1 && resolve(cwd, scope.files[0]!) === join(cwd, "tests");
+      const matches = (files: unknown) => Array.isArray(files) && files.length > 0
+        && files.every(file => typeof file === "string") && new Set(files).size === files.length
+        && JSON.stringify([...files].sort()) === JSON.stringify(expected);
+      if (timing?.version !== 2 || timing.complete !== true || !Array.isArray(timing.reasons) || timing.reasons.length !== 0
+        || timing.logsComplete !== true || timing.sourceStable !== true || timing.fullSuite !== fullSuiteRequested
+        || !matches(timing.targetFiles) || !matches(timing.executedFiles) || !matches(timing.measuredFiles)
+        || timing.reportedFiles !== expected.length) reasons.push("incomplete-file-measurements");
+    }
     if (summary.mode !== scope.mode || summary.isolation !== scope.isolation) reasons.push("different-measurement-mode-or-isolation");
     if (summary.testResult !== "success" || exitCode !== 0 || summary.counts?.fail !== 0) reasons.push("tests-did-not-succeed");
     if (summary.wallValid !== true || !Array.isArray(summary.wallInvalidReasons) || summary.wallInvalidReasons.length !== 0) reasons.push("invalid-wall-clock-status");
@@ -212,7 +226,7 @@ export async function compareTestPerformance(args: string[], options: { output?:
   if (!source.known || !after.known || source.revision !== after.revision || source.patchDigest !== after.patchDigest || source.toolDigest !== after.toolDigest) reasons.push("unknown-or-changed-source");
   if (runs.some(run => run.exitCode !== 0 || run.error !== null || run.wallMs === null)) reasons.push("failed-or-incomplete-samples");
   if (new Set(runs.map(run => JSON.stringify(run.counts))).size !== 1) reasons.push("different-test-coverage-counts");
-  if (new Set(runs.map(run => JSON.stringify(run.summaryVersion === 3 ? run.schedulingInputs?.map(input => input.digest) : run.schedulingInputs))).size !== 1) reasons.push("different-scheduling-inputs");
+  if (new Set(runs.map(run => JSON.stringify(run.summaryVersion !== null && run.summaryVersion >= 3 ? run.schedulingInputs?.map(input => input.digest) : run.schedulingInputs))).size !== 1) reasons.push("different-scheduling-inputs");
   const valid = reasons.length === 0;
   const groups = ([1, 2] as const).map(workers => {
     const group = runs.filter(run => run.workers === workers);

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { HistoryFetch } from "./test-timing-history-rest";
 
 export const HISTORY_MAX_BYTES = 1_048_576;
@@ -24,6 +24,12 @@ export type TimingHistory = {
 export type TimingScheduling = {
   source: "cold" | "restored"; reason: string; lookupMs: number; inputDigest: string | null;
   from: { kind: "local" | "artifact"; runId: string | null; artifactId: number | null; revision: string | null; workflow: string | null } | null;
+};
+export type HistoryPublication = {
+  status: "not-requested" | "ineligible" | "succeeded" | "failed";
+  stage: "eligibility" | "validation" | "local-history-write" | "artifact-staging" | null;
+  reasons: string[]; localPath: string | null; artifactPath: string | null;
+  remoteUpload: "not-observed";
 };
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -113,6 +119,25 @@ export function repositoryTestFiles(root: string): string[] {
   return files.sort();
 }
 
+/** Resolve positional Bun file/directory filters against this run's repository list. */
+export function targetTestFiles(root: string, requested: string[], repositoryFiles: string[]): string[] {
+  if (requested.length === 0) return [...repositoryFiles];
+  const selected = new Set<string>();
+  for (const request of requested) {
+    const path = relative(root, resolve(root, request)).replaceAll("\\", "/");
+    try {
+      const entry = statSync(resolve(root, request));
+      if (entry.isFile()) { selected.add(path); continue; }
+      if (entry.isDirectory()) {
+        for (const file of repositoryFiles) if (path === "" || file.startsWith(`${path}/`)) selected.add(file);
+        continue;
+      }
+    } catch { /* Bun also accepts filename substrings that are not filesystem paths. */ }
+    for (const file of repositoryFiles) if (file.includes(request.replaceAll("\\", "/"))) selected.add(file);
+  }
+  return [...selected].sort();
+}
+
 export async function prepareTimingHistory(options: {
   root: string; runDirectory: string; compatibility: TimingCompatibility; files: string[];
   env?: NodeJS.ProcessEnv; fetch?: HistoryFetch; budgetMs?: number;
@@ -160,47 +185,76 @@ export function finalizeFileTimings(options: {
 }) {
   const reasons: string[] = [];
   const stderr = options.stderr.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
-  const known = new Set(options.expectedFiles);
-  const executed = [...new Set(stderr.split("\n").filter(line => line.endsWith(":"))
-    .map(line => line.slice(0, -1).replace(/^::group::/, "").replaceAll("\\", "/").replace(/^\.\//, "")).filter(file => known.has(file)))].sort();
+  const targetFiles = [...options.expectedFiles].sort();
+  const headers = stderr.split("\n").filter(line => line.endsWith(":"))
+    .map(line => line.slice(0, -1).replace(/^::group::/, "").replaceAll("\\", "/").replace(/^\.\//, ""))
+    .filter(file => testName(file));
+  // The parallel reporter repeats this heading when output switches files.
+  const executed = [...new Set(headers)].sort();
   const fileCounts = [...stderr.matchAll(/(?:^|\n)Ran \d+ tests? across (\d+) files?\./g)];
   const reportedFiles = fileCounts.length ? Number(fileCounts.at(-1)![1]) : null;
-  if (options.exitCode !== 0 || options.signal !== null || options.spawnError !== null) reasons.push("test-execution-unsuccessful");
-  if (!options.fullSuiteRequested) reasons.push("partial-test-request");
   if (!options.logsComplete) reasons.push("incomplete-test-logs");
-  if (!options.sourceStable) reasons.push("unknown-or-changed-source");
-  if (executed.length === 0 || reportedFiles !== executed.length || !sameFiles(executed, options.expectedFiles)) reasons.push("incomplete-file-execution");
+  if (new Set(targetFiles).size !== targetFiles.length) reasons.push("duplicate-target-files");
+  if (executed.length === 0 || reportedFiles !== executed.length || !sameFiles(executed, targetFiles)) reasons.push("incomplete-file-execution");
+  const executionComplete = reasons.length === 0 && options.signal === null && options.spawnError === null;
   let timings: TimingData = { version: 1, files: {} };
+  let parsedTimings = false;
   try {
     const path = join(options.runDirectory, "file-timings.json");
     if (statSync(path).size > HISTORY_MAX_BYTES) fail("timings-too-large");
-    const data = JSON.parse(readFileSync(path, "utf8"));
+    const serialized = readFileSync(path, "utf8"), data = JSON.parse(serialized);
+    // JSON.parse discards repeated keys. Reject those and Windows path aliases
+    // before normalization can make two measurements appear to be one.
+    const keys = [...serialized.matchAll(/("(?:\\.|[^"\\])*")\s*:/g)].map(match => JSON.parse(match[1]!).replaceAll("\\", "/"));
+    if (new Set(keys).size !== keys.length) fail("duplicate-timing-entry");
     if (record(data) && record(data.files)) data.files = Object.fromEntries(Object.entries(data.files).map(([file, duration]) => [file.replaceAll("\\", "/"), duration]));
     const raw = parseTimingData(data);
+    parsedTimings = true;
     // Bun merges untouched historical entries into its output. Those are not measurements from this run.
     timings.files = Object.fromEntries(executed.filter(file => Object.hasOwn(raw.files, file)).map(file => [file, raw.files[file]!]));
     if (!sameFiles(Object.keys(timings.files), executed)) reasons.push("missing-file-measurements");
-    writeFileSync(path, JSON.stringify(timings, null, 2) + "\n");
   } catch { reasons.push("invalid-or-missing-file-timings"); }
-  let complete = reasons.length === 0;
-  let published = false;
-  if (complete) {
-    const history: TimingHistory = { version: 1, compatibility: options.compatibility, source: options.metadata,
-      execution: { complete: true, result: "success", fullSuite: true, files: executed }, timings };
-    try {
-      const serialized = JSON.stringify(history, null, 2) + "\n";
-      parseTimingHistory(serialized, options.compatibility);
-      writeFileSync(join(options.runDirectory, "history.json"), serialized);
-      if (options.artifactDirectory) {
+  // A failure to persist the sanitized output does not erase measurements that
+  // were already read and validated.
+  let outputWriteError: string | null = null;
+  try { if (parsedTimings) writeFileSync(join(options.runDirectory, "file-timings.json"), JSON.stringify(timings, null, 2) + "\n"); }
+  catch (error) { outputWriteError = error instanceof Error ? error.message : String(error); }
+  const complete = reasons.length === 0;
+  const fullSuite = options.fullSuiteRequested && executionComplete;
+  const publication: HistoryPublication = { status: "not-requested", stage: null, reasons: ["no-artifact-output-requested"],
+    localPath: null, artifactPath: null, remoteUpload: "not-observed" };
+  if (options.artifactDirectory) {
+    const ineligible: string[] = [];
+    if (!fullSuite) ineligible.push("not-full-suite");
+    if (!complete) ineligible.push("incomplete-file-measurements");
+    if (options.exitCode !== 0 || options.signal !== null || options.spawnError !== null) ineligible.push("test-execution-unsuccessful");
+    if (!options.sourceStable) ineligible.push("unknown-or-changed-source");
+    if (options.metadata.workflow !== null && !HISTORY_WORKFLOWS.some(workflow => workflow === options.metadata.workflow)) ineligible.push("untrusted-history-workflow");
+    if (ineligible.length) { publication.status = "ineligible"; publication.stage = "eligibility"; publication.reasons = ineligible; }
+    else {
+      const history: TimingHistory = { version: 1, compatibility: options.compatibility, source: options.metadata,
+        execution: { complete: true, result: "success", fullSuite: true, files: executed }, timings };
+      let stage: HistoryPublication["stage"] = "validation";
+      try {
+        const serialized = JSON.stringify(history, null, 2) + "\n";
+        parseTimingHistory(serialized, options.compatibility);
+        stage = "local-history-write";
+        writeFileSync(join(options.runDirectory, "history.json"), serialized);
+        publication.localPath = join(options.runDirectory, "history.json");
+        stage = "artifact-staging";
         mkdirSync(options.artifactDirectory, { recursive: true });
         const target = join(options.artifactDirectory, timingHistoryFilename(options.compatibility));
         const temporary = `${target}.${process.pid}.tmp`;
         writeFileSync(temporary, serialized);
         renameSync(temporary, target);
-        published = true;
+        publication.artifactPath = target;
+        publication.status = "succeeded"; publication.reasons = [];
+      } catch (error) {
+        publication.status = "failed"; publication.stage = stage;
+        publication.reasons = [error instanceof Error ? error.message : String(error)];
       }
-    } catch { reasons.push("history-publication-failed"); complete = false; }
+    }
   }
-  return { complete, fullSuite: options.fullSuiteRequested, measuredFiles: Object.keys(timings.files), executedFiles: executed,
-    reportedFiles, reasons, published };
+  return { fileTiming: { version: 2, complete, fullSuite, targetFiles, measuredFiles: Object.keys(timings.files), executedFiles: executed,
+    reportedFiles, reasons, logsComplete: options.logsComplete, sourceStable: options.sourceStable, outputWriteError }, historyPublication: publication };
 }

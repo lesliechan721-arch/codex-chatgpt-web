@@ -243,7 +243,7 @@ for (const workers of [1, 2]) test(`timing mode clears inherited collection and 
     expect(child.status).toBe(0);
     const run = join(reports, readdirSync(reports)[0]!);
     const summary = JSON.parse(readFileSync(join(run, "summary.json"), "utf8"));
-    expect(summary).toMatchObject({ version: 3, mode: "timing", isolation: "isolate", testResult: "success",
+    expect(summary).toMatchObject({ version: 4, mode: "timing", isolation: "isolate", testResult: "success",
       snapshots: 0, complete: false, collection: { status: "not-requested" }, counts: { pass: 1, skip: 0, fail: 0 } });
     expect(summary.command).not.toContain("--preload");
     expect(summary.segments.executionMs).toBe(summary.wallMs);
@@ -275,8 +275,8 @@ test("wrapper uses a fixed history snapshot as its second timings argument and p
     expect(summary.scheduling.inputDigest).toMatch(/^[a-f0-9]{64}$/);
     const index = summary.command.indexOf("--timings");
     expect(summary.command.slice(index, index + 5)).toEqual(["--timings", join(run, "file-timings.json"), "--timings", join(run, "history-input.json"), "--update-timings"]);
-    expect(summary.fileTiming).toMatchObject({ complete: false, fullSuite: false, published: false });
-    expect(summary.fileTiming.reasons).toContain("partial-test-request");
+    expect(summary.fileTiming).toMatchObject({ version: 2, complete: false, fullSuite: false });
+    expect(summary.historyPublication).toMatchObject({ status: "not-requested", remoteUpload: "not-observed" });
     expect(JSON.parse(readFileSync(join(run, "history-input.json"), "utf8"))).toEqual({ version: 1, files: { "tests/runtime-performance.test.ts": 42 } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -287,6 +287,43 @@ test("profile options reject ambiguous bail and mode values before starting test
   for (const arg of ["--bail", "--bail=0", "--bail=-1", "--bail=1.5", "--bail=01", "--bail=Infinity", "--bail=9007199254740992", "--mode=fast", "--isolation=unknown"]) {
     expect(() => profileOptions([arg])).toThrow();
   }
+});
+
+test("a name-filtered run can measure its target completely without claiming full-suite coverage", () => {
+  const output = mkdtempSync(join(tmpdir(), "cgw-profile-filtered-"));
+  try {
+    const child = spawnSync(process.execPath, [profiler, "--parallel=1", "--mode=timing",
+      "--test-name-pattern=runtime metrics await promises", "./tests/runtime-performance.test.ts"], {
+      encoding: "utf8", timeout: 15_000, env: { ...process.env, CGW_TEST_PROFILE_DIR: output },
+    });
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
+    const summary = JSON.parse(readFileSync(join(output, readdirSync(output)[0]!, "summary.json"), "utf8"));
+    expect(summary.fileTiming).toMatchObject({ version: 2, complete: true, fullSuite: false,
+      targetFiles: ["tests/runtime-performance.test.ts"], executedFiles: ["tests/runtime-performance.test.ts"],
+      measuredFiles: ["tests/runtime-performance.test.ts"], reasons: [] });
+    expect(summary.collection.status).toBe("not-requested");
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
+
+for (const exitCode of [0, 23]) test(`a failed summary write preserves the original test exit (${exitCode})`, () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-profile-summary-io-"));
+  try {
+    const fixture = join(root, "one.test.ts"), driver = join(root, "write-failure.ts");
+    writeFileSync(fixture, `import {test} from "bun:test"; test("original exit",()=>{ if (${exitCode}) process.exit(${exitCode}); });`);
+    writeFileSync(driver, `import * as fs from "node:fs"; import {spyOn} from "bun:test";
+      import {profileTests} from ${JSON.stringify(profiler)};
+      const original=fs.writeFileSync;
+      const spy=spyOn(fs,"writeFileSync").mockImplementation((...args)=>{
+        if(String(args[0]).endsWith("summary.json")) throw Error("summary destination failed");
+        return original(...args);
+      });
+      try { process.exitCode=await profileTests(["--parallel=1","--mode=timing",${JSON.stringify(fixture)}]); }
+      finally { spy.mockRestore(); }`);
+    const child = spawnSync(process.execPath, [driver], { encoding: "utf8", timeout: 15_000,
+      env: { ...process.env, CGW_TEST_PROFILE_DIR: join(root, "reports") } });
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(exitCode);
+    expect(child.stderr).toContain(`preserving test exit=${exitCode}: summary destination failed`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("post-exit log collection has a bounded deadline without changing the test result", async () => {

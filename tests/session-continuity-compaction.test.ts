@@ -271,7 +271,7 @@ test("a committed compaction is cleared with its page before a compact reconnect
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active compaction preserves delivered tool results and resumes with fresh authority on the same page`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const first = f.request();
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
@@ -312,7 +312,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active compaction rejects foreign execution records before checkpoint commit`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const first = f.request();
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
@@ -347,7 +347,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} compaction rejects source history superseded after preflight`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -526,7 +526,7 @@ test("completed delegated compaction retry rejects changed source content under 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} active delegated source content conflict preserves the accepted source owner`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -552,7 +552,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) for (const reclamation of ["retained", "capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation} committed compaction replay rejects changed accepted tool-result payload`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -630,7 +630,7 @@ test("completed local compaction retry rejects a changed control payload", async
 });
 
 for (const manual of [false, true]) for (const reclamation of ["retained", "capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation} cached compaction binds all source instructions after steering`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const prior = f.request("Earlier steering instruction.");
   await f.run(prior);
   const a = { type: "message", role: "user", id: "constraint-a", content: "Accepted constraint A.",
@@ -707,7 +707,7 @@ for (const manual of [false, true]) for (const reclamation of ["retained", "capa
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} concurrent compaction rejects changed results before initial acceptance`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -762,7 +762,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) for (const sameTurn of [false, true]) for (const retainPredecessor of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} moved checkpoint rejects ambiguous ${sameTurn ? "same-turn" : "ID-only"} history with predecessor ${retainPredecessor ? "before checkpoint" : "absent"}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const old = { type: "message", role: "user", id: "old-a", content: "Old instruction A.",
     ...(sameTurn ? { internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } } : {}) };
   const current = { type: "message", role: "user", id: "source-b", content: "Source instruction B.",
@@ -806,7 +806,7 @@ for (const manual of [false, true]) for (const sameTurn of [false, true]) for (c
 });
 
 for (const manual of [false, true]) test(`Round 7: accepted foreign-source tail cannot mask consumed current instruction ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const a = f.request("Consumed instruction A.", "turn-a");
   await f.run(a);
   f.controls.invokeSourceTools = true;
@@ -941,7 +941,7 @@ for (const manual of [false,true]) test(`Round 7: completed foreign tool search 
 });
 
 test("Round 7: verified Zero Risk compaction retry honors resolver-established source item aliases", async () => {
-  const f=fixture(true);
+  const f=fixture(true, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools=true;
   f.provider.chatgptWeb!.toolAuthorityMode="verified-environment";
   let restoredAliases=0;
@@ -1003,7 +1003,7 @@ for (const manual of [false, true]) test(`Round 7: queued active-source compacti
 });
 
 for (const manual of [false, true]) test(`Round 7: current native cross-task instruction resumes after checkpoint ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const first = f.request();
   await f.run(first);
@@ -1070,7 +1070,7 @@ for (const manual of [false, true]) test(`Round 7: conflicting queued compaction
 });
 
 for (const manual of [false, true]) test(`Round 7: approved discovery survives checkpoint and current registry removal ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.reviewWireName = "tool_search";
   const raw = structuredClone(f.request()._rawBody) as { input: unknown[]; tools: unknown[] };
@@ -1126,7 +1126,7 @@ for (const manual of [false, true]) test(`Round 7: approved discovery survives c
 });
 
 for (const manual of [false, true]) test(`Round 8: older accepted discovery cannot restore removed tools during compaction ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.repeatManualSourceTool = manual;
   f.controls.invokeSourceTools = true;
   f.controls.reviewWireName = "tool_search";
@@ -1200,7 +1200,7 @@ for (const manual of [false, true]) test(`Round 8: older accepted discovery cann
 for (const manual of [false, true]) for (const aliasedSource of (manual ? [false, true] : [false])) test(`Round 8: real verified source alias replays checkpoint continuation ${manual} original alias ${aliasedSource}`, async () => {
   const codexHome = mkdtempSync(join(tmpdir(), "cgw-cont-alias-home-"));
   cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
-  const f = fixture(manual, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410711" });
+  const f = fixture(manual, { mcpTransport: "in-process", codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410711" });
   const turnId = "019cbcc7-31b2-7028-a632-7f8118410712";
   mkdirSync(join(codexHome, "sessions", "2026", "09", "30"), { recursive: true });
   const rolloutPath = join(codexHome, "sessions", "2026", "09", "30", `rollout-2026-09-30T09-00-00-${f.threadId}.jsonl`);
@@ -1257,7 +1257,7 @@ for (const manual of [false, true]) for (const aliasedSource of (manual ? [false
 
 // Allow slower CI runners to complete all 600 sequential compaction requests.
 for (const manual of [false, true]) test(`Round 10: cached compact codecs do not retain rewritten historical source evidence ${manual}`, async () => {
-  const f = httpFixture(manual);
+  const f = httpFixture(manual, false, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = manual;
   f.controls.singleSourceTool = manual;
   const parent = { type: "agent_message", id: "parent-current", author: "/root", recipient: "/root/child",
@@ -1576,7 +1576,7 @@ for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, t
 }, 30000);
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const olderPrefix of [false, true]) test(`native AGENTS refresh reaches the healthy increment: manual=${manual} checkpoint=${checkpoint} older-prefix=${olderPrefix}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = checkpoint;
   f.controls.singleSourceTool = true;
   const first = f.request();

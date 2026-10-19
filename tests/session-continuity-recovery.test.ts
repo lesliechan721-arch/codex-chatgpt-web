@@ -265,7 +265,7 @@ for (const history of ["omitted", "edited"] as const) test(`page lifecycle regre
 });
 
 for (const manual of [false, true]) for (const pageState of ["healthy", "lost"] as const) test(`page lifecycle regression: ${manual ? "manual" : "automatic"} completed checkpoint consumer replays after later work with a ${pageState} page`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const first = f.request();
   const issued = await f.run(first);
@@ -1214,7 +1214,7 @@ test("unified recovery: non-externalized assistant text still fails before a rep
 }, 30_000);
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) test(`review repair1: persistent inspection failure isolates the old writer and admits one cold successor (${manual}, checkpoint=${checkpoint})`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.repeatManualSourceTool = manual && checkpoint;
   f.controls.singleSourceTool = !checkpoint;

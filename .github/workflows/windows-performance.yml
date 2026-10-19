@@ -14,12 +14,16 @@ on:
         options: ["continuity", "continuity-task", "continuity-adapter", "continuity-source", "cli", "all"]
         default: "continuity"
       condition:
-        description: "Run all contrasts or one bounded diagnostic condition"
+        description: "mode-pair: full/timing at default isolation, 2 workers; requires suite=all, cold, no filter"
         type: choice
-        options: ["all", "original-1", "original-2", "isolated-full-1", "isolated-full-2", "isolated-timing-1", "isolated-timing-2"]
+        options: ["all", "mode-pair", "original-1", "original-2", "isolated-full-1", "isolated-full-2", "isolated-timing-1", "isolated-timing-2"]
         default: "all"
       test_name_pattern:
         description: "Optional Bun test name regex; filtered runs cannot publish complete-suite history"
+        type: string
+        default: ""
+      skip_evidence:
+        description: "Optional mode-pair JSON: version 1, source identity and reviewed skip reasons"
         type: string
         default: ""
       history:
@@ -28,7 +32,7 @@ on:
         options: ["cold", "restore"]
         default: "cold"
       repetitions:
-        description: "Retain every result for each condition (10 for CLI or source regression)"
+        description: "Retain every attempt; mode-pair uses AB/BA/AB at 3 rounds (10 only for CLI/source)"
         type: choice
         options: ["1", "2", "3", "10"]
         default: "3"
@@ -63,7 +67,13 @@ jobs:
         shell: pwsh
         run: |
           $Runtime = if ($env:DIAGNOSTIC_RUNTIME -eq 'baseline') { $env:CODEX_CHATGPT_WEB_EMBEDDED_BUN } else { (Get-Command bun).Source }
-          & $Runtime run scripts/diagnose-test-performance.ts "--repetitions=$env:DIAGNOSTIC_REPETITIONS" "--suite=$env:DIAGNOSTIC_SUITE" "--condition=$env:DIAGNOSTIC_CONDITION" "--history=$env:DIAGNOSTIC_HISTORY" "--test-name-pattern=$env:DIAGNOSTIC_PATTERN"
+          $SkipEvidenceArguments = @()
+          if ($env:DIAGNOSTIC_CONDITION -eq 'mode-pair' -and -not [string]::IsNullOrEmpty($env:DIAGNOSTIC_SKIP_EVIDENCE)) {
+            $SkipEvidencePath = Join-Path $env:RUNNER_TEMP 'mode-pair-skip-evidence.json'
+            [System.IO.File]::WriteAllText($SkipEvidencePath, $env:DIAGNOSTIC_SKIP_EVIDENCE, [System.Text.UTF8Encoding]::new($false))
+            $SkipEvidenceArguments += "--skip-evidence=$SkipEvidencePath"
+          }
+          & $Runtime run scripts/diagnose-test-performance.ts "--repetitions=$env:DIAGNOSTIC_REPETITIONS" "--suite=$env:DIAGNOSTIC_SUITE" "--condition=$env:DIAGNOSTIC_CONDITION" "--history=$env:DIAGNOSTIC_HISTORY" "--test-name-pattern=$env:DIAGNOSTIC_PATTERN" @SkipEvidenceArguments
           exit $LASTEXITCODE
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
@@ -76,9 +86,17 @@ jobs:
           DIAGNOSTIC_CONDITION: ${{ inputs.condition }}
           DIAGNOSTIC_HISTORY: ${{ inputs.history }}
           DIAGNOSTIC_PATTERN: ${{ inputs.test_name_pattern }}
+          DIAGNOSTIC_SKIP_EVIDENCE: ${{ inputs.skip_evidence }}
       - name: Run Intel diagnostic conditions
         if: runner.os == 'macOS'
-        run: bun run scripts/diagnose-test-performance.ts "--repetitions=$DIAGNOSTIC_REPETITIONS" "--suite=$DIAGNOSTIC_SUITE" "--condition=$DIAGNOSTIC_CONDITION" "--history=$DIAGNOSTIC_HISTORY" "--test-name-pattern=$DIAGNOSTIC_PATTERN"
+        run: |
+          skip_evidence_arguments=()
+          if [[ "$DIAGNOSTIC_CONDITION" == 'mode-pair' && -n "$DIAGNOSTIC_SKIP_EVIDENCE" ]]; then
+            skip_evidence_path="$RUNNER_TEMP/mode-pair-skip-evidence.json"
+            printf '%s' "$DIAGNOSTIC_SKIP_EVIDENCE" > "$skip_evidence_path"
+            skip_evidence_arguments+=("--skip-evidence=$skip_evidence_path")
+          fi
+          bun run scripts/diagnose-test-performance.ts "--repetitions=$DIAGNOSTIC_REPETITIONS" "--suite=$DIAGNOSTIC_SUITE" "--condition=$DIAGNOSTIC_CONDITION" "--history=$DIAGNOSTIC_HISTORY" "--test-name-pattern=$DIAGNOSTIC_PATTERN" "${skip_evidence_arguments[@]}"
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
           CGW_TEST_RUNNER_CLASS: ${{ inputs.platform }}
@@ -89,6 +107,7 @@ jobs:
           DIAGNOSTIC_CONDITION: ${{ inputs.condition }}
           DIAGNOSTIC_HISTORY: ${{ inputs.history }}
           DIAGNOSTIC_PATTERN: ${{ inputs.test_name_pattern }}
+          DIAGNOSTIC_SKIP_EVIDENCE: ${{ inputs.skip_evidence }}
       - name: Upload complete platform file timings
         if: always()
         uses: actions/upload-artifact@v4

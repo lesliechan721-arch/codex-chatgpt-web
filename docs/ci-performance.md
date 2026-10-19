@@ -9,10 +9,18 @@ Launcher type checks and tests run first, so a Launcher failure does not wait fo
 server suite. Each verification command prints its elapsed time and exit code.
 `verify-summary.json` preserves stage results, failures and test-report locations. Actions
 also shows a verification summary. Missing report artifacts produce a warning.
+`bun run verify --test-mode=timing` selects timing collection for the server tests only.
+The default is `full`. Invalid mode values fail before verification starts.
 
 Continuity integration tests are split into adapter, HTTP, compaction, recovery and checkpoint
 files. Each file owns its fixture cleanup. Bun can distribute these files across workers;
 tests within each file remain serial, including the 600-request compaction stress cases.
+Selected manual protocol scenarios explicitly use an in-process MCP transport. Each
+fixture owns its client and server. Both transports use the same production tool registration,
+SDK validation and error mapping. These scenarios still use the real broker socket,
+registration/recovery files and helper HTTP. The default fixture uses CLI stdio.
+Process exit, cancellation, restart, ownership and persistence checks keep their real
+system boundaries. The paired MCP contracts also run through CLI stdio.
 
 CI uploads `test-performance-<OS>-workers-<N>`, and release builds upload
 `test-performance-release-<runner>`, even when tests fail. `CGW_TEST_PROFILE_DIR` selects the
@@ -123,6 +131,16 @@ exit. Strict v3 comparison rejects a missing or invalid completion record. Log d
 crash detection. The actual executable path/digest and whether it is the prepared embedded
 Bun are recorded. Preparing a Windows packaging runtime does not select it for tests.
 
+Version 4 also separates file measurement from history publication. `fileTiming.version=2`
+checks the target, executed and measured file sets. `complete` applies to the selected
+target; `fullSuite` separately identifies a complete, unfiltered suite. Test success,
+source stability and operation completeness remain separate fields. A history write failure
+does not erase valid file measurements. `historyPublication.status` is `not-requested`,
+`ineligible`, `succeeded` or `failed`; `stage` identifies the failed action. Success covers
+local history output and artifact staging. `remoteUpload=not-observed` never claims that
+Actions uploaded an artifact. Version 2/3 summaries keep their original file-timing meaning;
+a historical publication failure alone does not establish measurement completeness.
+
 Version 3 records the actual checkout SHA, dirty status and patch digest, measurement tool
 digest, Bun and installed Node versions, OS/architecture, runner image, command, timestamps
 and test counts. `workflowRevision` records `GITHUB_SHA` separately. The measurement patch
@@ -218,9 +236,28 @@ side must run at least one passing test and match its reviewed counts on every r
 failures and undeclared skip changes are rejected. Review this
 semantic mapping before use. That path runs the same external timer against both checkouts,
 uses three alternating pairs (AB, BA, AB), records tool-file differences, and permits changed
-pass counts only through the supplied mapping. It does not compare operation counts. Overlap
-between sample ranges produces `insufficient-evidence`; nonoverlap is engineering evidence,
-not a statistical significance claim. A local macOS result is not Windows acceptance.
+pass counts only through the supplied mapping. It does not compare operation counts. Each
+valid pair must have a shorter candidate time to report a repeatable benefit. Mixed directions
+produce `insufficient-evidence`. This is not a statistical significance claim. A local macOS
+result is not Windows acceptance.
+
+To compare the wrapper under a fixed collection and isolation condition, specify both:
+
+```sh
+bun run scripts/compare-test-versions.ts --baseline=/path/to/A --candidate=/path/to/B --wall-clock --mode=full --isolation=default --coverage-map=/path/map.json
+```
+
+The driver saves `measurement-tools.json`. Freeze these tools before fixture migration;
+reuse the manifest with `--measurement-manifest=/path/measurement-tools.json`. Both checkouts
+must contain the same collector, wrapper, driver and timer bytes. Changed fixture and
+business probe files need explicit `measurementChanges` entries with `file`, `reason` and
+mapped `scenarioIds`. Read the old and new assertions to check the mapping. JSON validation
+alone does not prove equivalent behavior. The external clock stops when the wrapper exits;
+parent log draining and report reads are separate. Omitting mode and isolation keeps the
+older direct Bun/isolate path and its own execution conditions.
+The wrapper map also declares `preparation` with `installation`, `warmup`, `cache` and
+`cleanup` policies. If tests skip, `expectedSkips.A` and `expectedSkips.B` must list each
+`test` (file and name) and reviewed `reason`. All attempts remain in the report.
 
 ## Collection and failure diagnosis
 
@@ -235,6 +272,33 @@ status is `not-requested`; absence of operation reports is expected. Full remain
 Release default. Local runs are cold unless `CGW_TEST_TIMING_HISTORY` names a validated history envelope.
 Release enables artifact restoration; manual diagnosis stays cold so its conditions use
 the same scheduling input.
+
+For a full/timing comparison under the daily CI isolation condition, use:
+
+```sh
+bun run scripts/diagnose-test-performance.ts --condition=mode-pair --suite=all --history=cold --repetitions=3
+```
+
+The diagnostic workflow exposes the same `mode-pair` condition. It runs only full/default/2
+and timing/default/2, in AB, BA, AB order. Each attempt gets a clean temporary directory.
+CLI/source diagnostics and history publication are disabled for this comparison. The
+report keeps every attempt, source/tool/runtime identities, commands, results, file scope,
+skip evidence and external wrapper times. Requested workers are separate from observed
+workers; timing does not add operation profiling to obtain worker evidence.
+
+At least three valid pairs and a shorter timing wrapper in every valid pair are required
+for a switch candidate. Failures, changed inputs, unknown skips or opposite results leave
+the conclusion as insufficient evidence. Bun logs name skipped tests but do not provide
+structured reasons; missing reason evidence remains unverified. A full operation report
+can be incomplete while its wall-clock sample is valid. Timing intentionally has no
+operation report. Neither result changes CI configuration automatically. Daily CI and
+Release stay full until platform-specific evidence supports an explicit CI change.
+Use `--skip-evidence=/path/reviewed-skips.json` to supply reviewed reasons. Its version 1
+document binds `source.revision`, `source.patchDigest` and `source.toolDigest`, and lists
+`entries` with `file`, `name` and `reason`. Store it outside tracked source or in an ignored
+directory. The driver records its SHA-256 and rejects changed, extra, duplicate or missing
+entries for candidate qualification. It still runs and retains all attempts when evidence
+is invalid. The workflow's optional `skip_evidence` JSON input supplies the same evidence.
 
 `--bail=N` accepts a positive integer and passes Bun's native option unchanged. It can
 stop dispatch after ordinary assertion failures; it is not a crash-only policy. Release
@@ -262,14 +326,16 @@ runner class, worker count, isolation, collection mode and timing format must ma
 identifies the runner class. `CGW_TEST_TIMING_ARTIFACT_DIR` selects the publication directory.
 Ordinary local tests do not make history requests.
 
-A full successful platform run creates `history.json` and can export a compatible history
-file. Its file gate checks actual file headers, Bun's final file count and fresh measured
+A full successful platform run can create `history.json` when publication is requested and
+the source is eligible. Its file gate checks actual file headers, Bun's final file count and fresh measured
 values against the repository's test set. Filtered, bailed, failed, interrupted or incomplete
 runs do not publish full-suite history. Old entries merged by Bun are removed from the current
 output. This gate does not depend on operation-report completeness or other matrix jobs.
 A diagnostic `all` run may publish complete results for its conditions; a CLI or continuity
 subset cannot become full-suite history. New tests still run without history and deleted
 files are ignored.
+Ordinary CI is not a trusted history publisher. Its complete file measurements remain
+usable, and its publication status is explicitly ineligible when an artifact output is requested.
 
 For a repeatable local input, point `CGW_TEST_TIMING_HISTORY` at a prior compatible
 `history.json`. The wrapper copies and validates it before the run. Reports record the input

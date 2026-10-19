@@ -1,11 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zipSync } from "fflate";
 import { HISTORY_MAX_AGE_MS, HISTORY_MAX_BYTES, finalizeFileTimings, parseTimingHistory, prepareTimingHistory,
-  repositoryTestFiles, timingCompatibility, timingHistoryFilename, type TimingHistory, type TimingMetadata } from "../scripts/test-timing-history";
+  repositoryTestFiles, targetTestFiles, timingCompatibility, timingHistoryFilename, type TimingHistory, type TimingMetadata } from "../scripts/test-timing-history";
 import { artifactTimingHistory, type HistoryFetch } from "../scripts/test-timing-history-rest";
 
 const compatibility = timingCompatibility({ workers: 2, mode: "timing", isolation: "isolate" }, { CGW_TEST_RUNNER_CLASS: "fixture" });
@@ -114,7 +115,8 @@ for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads th
     const result = finalizeFileTimings({ root, runDirectory, compatibility, metadata: source, expectedFiles: files,
       stderr: child.stderr, exitCode: child.status!, signal: child.signal, spawnError: null, fullSuiteRequested: true,
       logsComplete: true, sourceStable: true, artifactDirectory });
-    expect(result).toMatchObject({ complete: true, published: true, reportedFiles: 4, measuredFiles: files, executedFiles: files });
+    expect(result.fileTiming).toMatchObject({ version: 2, complete: true, fullSuite: true, targetFiles: files, reportedFiles: 4, measuredFiles: files, executedFiles: files });
+    expect(result.historyPublication).toMatchObject({ status: "succeeded", stage: null, remoteUpload: "not-observed" });
     input = join(runDirectory, "history.json");
     if (round === 2) {
       const order = readFileSync(orderLog, "utf8").trim().split("\n");
@@ -134,17 +136,56 @@ for (const prefix of ["", "::group::"]) test(`file headers normalize Windows pat
   const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source,
     expectedFiles: ["tests/slow.test.ts"], stderr: `\x1b[1m${prefix}.\\tests\\slow.test.ts:\x1b[0m\r\nRan 1 test across 1 file. [1ms]\r\n`,
     exitCode: 0, signal: null, spawnError: null, fullSuiteRequested: true, logsComplete: true, sourceStable: true });
-  expect(result).toMatchObject({ complete: true, executedFiles: ["tests/slow.test.ts"], measuredFiles: ["tests/slow.test.ts"] });
+  expect(result.fileTiming).toMatchObject({ complete: true, executedFiles: ["tests/slow.test.ts"], measuredFiles: ["tests/slow.test.ts"] });
   expect(JSON.parse(readFileSync(join(root, "file-timings.json"), "utf8"))).toEqual({ version: 1, files: { "tests/slow.test.ts": 800 } });
+}));
+
+for (const githubActions of [false, true]) test(`parallel output repeats file context headers without repeating execution (${githubActions ? "GitHub Actions" : "ordinary"})`, () => temporary(root => {
+  mkdirSync(join(root, "tests"));
+  const evaluationLog = join(root, "evaluations.log");
+  for (const name of ["first", "second"] as const) {
+    writeFileSync(join(root, `tests/${name}.test.ts`), `import {test} from "bun:test";
+      import {appendFileSync, existsSync, writeFileSync} from "node:fs";
+      import {join} from "node:path";
+      const root=${JSON.stringify(root)}, name=${JSON.stringify(name)};
+      appendFileSync(${JSON.stringify(evaluationLog)}, name+"\\n");
+      writeFileSync(join(root,name+"-ready"),"");
+      for(let round=0;round<3;round++) test(name+"-"+round,async()=>{
+        const prerequisite=name==="first" ? (round===0 ? "second-ready" : "second-"+(round-1)) : "first-"+round;
+        const deadline=Date.now()+5000;
+        while(!existsSync(join(root,prerequisite))) {
+          if(Date.now()>=deadline) throw Error("Parallel sibling did not reach "+prerequisite);
+          await Bun.sleep(2);
+        }
+        await Bun.sleep(10);
+        writeFileSync(join(root,name+"-"+round),"");
+      });`);
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
+  if (githubActions) env.GITHUB_ACTIONS = "true";
+  else delete env.GITHUB_ACTIONS;
+  const child = spawnSync(process.execPath, ["test", "--timings", join(root, "file-timings.json"), "--update-timings",
+    "--parallel=2", "--parallel-delay=0", "./tests"], { cwd: root, encoding: "utf8", timeout: 10_000, env });
+  expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
+  expect(readFileSync(evaluationLog, "utf8").trim().split("\n").sort()).toEqual(["first", "second"]);
+  const stderr = child.stderr.replaceAll("\\", "/").replace(/\x1b\[[0-9;]*m/g, "");
+  const files = ["tests/first.test.ts", "tests/second.test.ts"];
+  for (const file of files) expect(stderr.split("\n").filter(line => line === `${githubActions ? "::group::" : ""}${file}:`).length).toBeGreaterThan(1);
+  const result = finalizeFileTimings({ root, runDirectory: root,
+    compatibility: timingCompatibility({ workers: 2, mode: "timing", isolation: "default" }), metadata: source, expectedFiles: files,
+    stderr: child.stderr, exitCode: child.status!, signal: child.signal, spawnError: null,
+    fullSuiteRequested: true, logsComplete: true, sourceStable: true });
+  expect(result.fileTiming).toMatchObject({ complete: true, fullSuite: true, targetFiles: files,
+    executedFiles: files, measuredFiles: files, reportedFiles: 2, reasons: [] });
 }));
 
 test("partial execution removes merged historical values and never publishes a whole-suite history", () => temporary(root => {
   writeFileSync(join(root, "file-timings.json"), JSON.stringify(history().timings));
   const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source,
-    expectedFiles: history().execution.files, stderr: "\ntests/slow.test.ts:\n 1 pass\n 0 fail\nRan 1 test across 1 file. [1ms]\n",
+    expectedFiles: ["tests/slow.test.ts"], stderr: "\ntests/slow.test.ts:\n 1 pass\n 0 fail\nRan 1 test across 1 file. [1ms]\n",
     exitCode: 0, signal: null, spawnError: null, fullSuiteRequested: false, logsComplete: true, sourceStable: true, artifactDirectory: join(root, "artifacts") });
-  expect(result).toMatchObject({ complete: false, published: false, measuredFiles: ["tests/slow.test.ts"] });
-  expect(result.reasons).toContain("partial-test-request");
+  expect(result.fileTiming).toMatchObject({ complete: true, fullSuite: false, targetFiles: ["tests/slow.test.ts"], measuredFiles: ["tests/slow.test.ts"], reasons: [] });
+  expect(result.historyPublication).toMatchObject({ status: "ineligible", stage: "eligibility", reasons: ["not-full-suite"] });
   expect(JSON.parse(readFileSync(join(root, "file-timings.json"), "utf8"))).toEqual({ version: 1, files: { "tests/slow.test.ts": 800 } });
   expect(readdirSync(root)).toEqual(["file-timings.json"]);
 }));
@@ -157,7 +198,86 @@ for (const fault of ["exit", "logs", "source", "count", "missing-header", "missi
   const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source, expectedFiles: value.execution.files,
     stderr, exitCode: fault === "exit" ? 1 : 0, signal: null, spawnError: null, fullSuiteRequested: true,
     logsComplete: fault !== "logs", sourceStable: fault !== "source", artifactDirectory: join(root, "artifacts") });
-  expect(result.complete).toBe(false); expect(result.published).toBe(false);
+  expect(result.fileTiming.complete).toBe(fault === "exit" || fault === "source");
+  expect(result.historyPublication.status).toBe("ineligible");
+}));
+
+function measuredRun(root: string, changes: Partial<Parameters<typeof finalizeFileTimings>[0]> = {}) {
+  writeFileSync(join(root, "file-timings.json"), JSON.stringify({ version: 1, files: { "tests/slow.test.ts": 12 } }));
+  return finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source, expectedFiles: ["tests/slow.test.ts"],
+    stderr: "tests/slow.test.ts:\nRan 1 test across 1 file.\n", exitCode: 0, signal: null, spawnError: null,
+    fullSuiteRequested: true, logsComplete: true, sourceStable: true, ...changes });
+}
+
+test("ordinary CI keeps complete measurements without gaining trusted publication rights", () => temporary(root => {
+  const metadata = { ...source, workflow: ".github/workflows/ci.yml" };
+  const unrequested = measuredRun(root, { metadata });
+  expect(unrequested.fileTiming).toMatchObject({ complete: true, fullSuite: true, reasons: [] });
+  expect(unrequested.historyPublication).toMatchObject({ status: "not-requested", stage: null, remoteUpload: "not-observed" });
+  const requested = measuredRun(root, { metadata, artifactDirectory: join(root, "artifacts") });
+  expect(requested.fileTiming.complete).toBe(true);
+  expect(requested.historyPublication).toMatchObject({ status: "ineligible", stage: "eligibility", reasons: ["untrusted-history-workflow"] });
+  expect(readdirSync(root)).toEqual(["file-timings.json"]);
+  const untrusted = history(); untrusted.source.workflow = metadata.workflow;
+  expect(() => parseTimingHistory(JSON.stringify(untrusted), compatibility)).toThrow("invalid-history-source");
+}));
+
+for (const stage of ["validation", "local-history-write", "artifact-staging"] as const) {
+  test(`history ${stage} failure preserves complete measurements and identifies the failed action`, () => temporary(root => {
+    const artifactDirectory = join(root, "artifacts");
+    if (stage === "local-history-write") mkdirSync(join(root, "history.json"));
+    if (stage === "artifact-staging") writeFileSync(artifactDirectory, "blocked");
+    const result = measuredRun(root, { artifactDirectory, metadata: stage === "validation" ? { ...source, revision: null } : source });
+    expect(result.fileTiming).toMatchObject({ complete: true, reasons: [] });
+    expect(result.historyPublication).toMatchObject({ status: "failed", stage, remoteUpload: "not-observed", artifactPath: null });
+    expect(result.historyPublication.reasons.length).toBeGreaterThan(0);
+    expect(result.historyPublication.localPath === null).toBe(stage !== "artifact-staging");
+  }));
+}
+
+test("a sanitized timing-output write failure retains validated measurements and the original output", () => temporary(root => {
+  measuredRun(root);
+  const path = join(root, "file-timings.json"), original = readFileSync(path, "utf8"), write = fs.writeFileSync;
+  const spy = spyOn(fs, "writeFileSync").mockImplementation(((...args: Parameters<typeof fs.writeFileSync>) => {
+    if (args[0] === path) throw new Error("timing output unavailable");
+    return write(...args);
+  }) as typeof fs.writeFileSync);
+  try {
+    const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source, expectedFiles: ["tests/slow.test.ts"],
+      stderr: "tests/slow.test.ts:\nRan 1 test across 1 file.\n", exitCode: 23, signal: null, spawnError: null,
+      fullSuiteRequested: true, logsComplete: true, sourceStable: true });
+    expect(result.fileTiming).toMatchObject({ complete: true, reasons: [], outputWriteError: "timing output unavailable" });
+    expect(readFileSync(path, "utf8")).toBe(original);
+  } finally { spy.mockRestore(); }
+}));
+
+for (const defect of ["different-file", "duplicate-target", "invalid-duration", "duplicate-duration", "normalized-duplicate"] as const) {
+  test(`measurement integrity rejects ${defect} without trusting equal file counts`, () => temporary(root => {
+    const changes: Partial<Parameters<typeof finalizeFileTimings>[0]> = {};
+    if (defect === "different-file") changes.stderr = "tests/other.test.ts:\nRan 1 test across 1 file.\n";
+    if (defect === "duplicate-target") changes.expectedFiles = ["tests/slow.test.ts", "tests/slow.test.ts"];
+    measuredRun(root);
+    if (defect === "invalid-duration") writeFileSync(join(root, "file-timings.json"), '{"version":1,"files":{"tests/slow.test.ts":-1}}');
+    if (defect === "duplicate-duration") writeFileSync(join(root, "file-timings.json"), '{"version":1,"files":{"tests/slow.test.ts":1,"tests/slow.test.ts":2}}');
+    if (defect === "normalized-duplicate") writeFileSync(join(root, "file-timings.json"), JSON.stringify({ version: 1, files: { "tests/slow.test.ts": 1, "tests\\slow.test.ts": 2 } }));
+    const original = readFileSync(join(root, "file-timings.json"), "utf8");
+    const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source, expectedFiles: ["tests/slow.test.ts"],
+      stderr: "tests/slow.test.ts:\nRan 1 test across 1 file.\n", exitCode: 0, signal: null, spawnError: null,
+      fullSuiteRequested: true, logsComplete: true, sourceStable: true, ...changes });
+    expect(result.fileTiming.complete).toBe(false);
+    expect(result.fileTiming.reasons.length).toBeGreaterThan(0);
+    if (["invalid-duration", "duplicate-duration", "normalized-duplicate"].includes(defect)) expect(readFileSync(join(root, "file-timings.json"), "utf8")).toBe(original);
+  }));
+}
+
+test("positional file selection records the requested subset rather than the whole repository", () => temporary(root => {
+  mkdirSync(join(root, "tests/nested"), { recursive: true });
+  for (const file of ["tests/slow.test.ts", "tests/nested/fast.test.ts"]) writeFileSync(join(root, file), "");
+  const all = repositoryTestFiles(root);
+  expect(targetTestFiles(root, [], all)).toEqual(all);
+  expect(targetTestFiles(root, ["./tests"], all)).toEqual(all);
+  expect(targetTestFiles(root, ["./tests/nested"], all)).toEqual(["tests/nested/fast.test.ts"]);
+  expect(targetTestFiles(root, ["slow"], all)).toEqual(["tests/slow.test.ts"]);
 }));
 
 function githubMock(change?: { run?: (run: any) => void; artifact?: (artifact: any) => void; history?: (history: TimingHistory) => void; denied?: boolean }) {
