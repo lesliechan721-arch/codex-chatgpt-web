@@ -2831,6 +2831,34 @@ code {
 .plugin-name-setting code { overflow-wrap: anywhere; font-size: 12px; }
 .plugin-name-setting p { color: var(--color-text-secondary); font-size: 13px; margin: 0; }
 .activity-tasks { margin-bottom: 28px; }
+.task-inputs { margin: 0 0 32px; }
+.task-inputs-description, .task-inputs-usage { color: var(--color-text-secondary); font-size: 12px; line-height: 1.6; }
+.task-inputs-usage { font-variant-numeric: tabular-nums; }
+.task-inputs-error { color: var(--color-error, #c44742); font-size: 13px; }
+.task-inputs-task { border-bottom: 1px solid var(--color-border-light); }
+.task-inputs-task > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 16px 0; cursor: pointer; font-size: 13px; }
+.task-inputs-task > summary::before { content: "+"; width: 12px; color: var(--color-text-tertiary); }
+.task-inputs-task[open] > summary::before { content: "−"; }
+.task-inputs-task > summary span { min-width: 0; overflow-wrap: anywhere; color: var(--color-text-secondary); font-size: 12px; }
+.task-inputs-message { padding: 16px; border: 1px solid var(--color-border-light); border-radius: var(--radius-md); margin-bottom: 10px; }
+.task-inputs-message-heading { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; line-height: 1.6; }
+.task-inputs-message-heading span { color: var(--color-text-secondary); }
+.task-inputs-id { display: block; margin-top: 6px; overflow-wrap: anywhere; color: var(--color-text-tertiary); font-size: 11px; }
+.task-inputs-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.task-inputs button:not(.button-secondary) { padding: 7px 10px; min-height: 32px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-background-control); color: var(--color-text-primary); font: inherit; font-size: 12px; cursor: pointer; }
+.task-inputs button:hover:not(:disabled) { border-color: var(--color-border-heavy); }
+.task-inputs button:disabled { opacity: 0.5; cursor: default; }
+.task-inputs button:focus-visible, .task-inputs summary:focus-visible, .task-inputs textarea:focus-visible { outline: 2px solid var(--color-text-secondary); outline-offset: 3px; }
+.task-inputs-original { max-height: 300px; overflow: auto; margin: 14px 0 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 6px; background: var(--color-background-control); font: inherit; font-size: 12px; line-height: 1.6; user-select: text; }
+.task-inputs-repair { display: grid; gap: 8px; margin-top: 16px; }
+.task-inputs-repair label { font-size: 12px; }
+.task-inputs-repair textarea { width: 100%; min-height: 120px; resize: vertical; padding: 10px; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-text-primary); background: var(--color-background-control); font: inherit; font-size: 12px; }
+.task-inputs-repair p { margin: 0; font-size: 12px; line-height: 1.6; color: var(--color-text-secondary); }
+.task-inputs-repair button { justify-self: start; }
+.task-inputs-task-actions { margin-bottom: 16px; }
+.task-inputs-confirm { padding: 12px; margin-bottom: 16px; border: 1px solid var(--color-border-heavy); border-radius: 6px; }
+.task-inputs-confirm p { margin-top: 0; font-size: 12px; line-height: 1.6; }
+.task-inputs-confirm button + button { margin-left: 8px; }
 .activity-task {
   display: flex;
   align-items: center;

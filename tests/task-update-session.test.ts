@@ -832,3 +832,23 @@ test("a recovered session restores durable accepted revision and the next append
     expect(store.get(thread)!.works[workId]!.taskUpdateJournal!.acknowledgedRevision).toBe(0);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+
+test("observer detach cannot release its successor or change the captured output owner", () => {
+  const f = fixture();
+  const round = chatGptTurnRoundKey(f.parsed);
+  const candidate = { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 };
+  f.session.appendRoundBufferedTextCandidate(round, candidate);
+  f.session.retainTaskUpdateOutputRound(round, 0);
+  const first = f.session.attachToolObserver();
+  const second = f.session.attachToolObserver();
+  first.detach();
+  expect(f.session.isCurrentToolObserver(second.generation)).toBeTrue();
+  expect(() => f.session.assertToolObserver(first.generation)).toThrow();
+  expect(f.session.driverGeneration()).toBe(0);
+  expect(f.session.taskRevision()).toBe(0);
+  expect(f.session.ownsTaskUpdateOutputRound(round, 0)).toBeTrue();
+  expect(f.session.roundBufferedTextCandidates(round)).toEqual([candidate]);
+  second.detach();
+  expect(f.session.hasCurrentToolObserver()).toBeFalse();
+});

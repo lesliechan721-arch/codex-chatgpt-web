@@ -61,7 +61,8 @@ function resultStorage(session: ReturnType<Awaited<ReturnType<typeof fixture>>["
 }
 
 async function fixture(manual = false, protocol = true, search = false,
-  options: { root?: string; preserveRoot?: boolean; remote?: boolean;
+  options: { root?: string; preserveRoot?: boolean; remote?: boolean; fresh?: boolean;
+    manualPrepared?: (count: number) => void; manualSent?: (count: number) => Promise<void>;
     completionInspection?: { entered(): void; release: Promise<void> } } = {}) {
   // Keep Unix socket paths short; Windows uses its system temp directory and named pipes.
   const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-update-"));
@@ -129,6 +130,7 @@ async function fixture(manual = false, protocol = true, search = false,
   const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: {
     browserHost: "launcher", browserHostDescriptorPath: descriptorPath, continuityStateDirectory: statePath,
     browserInteractionMode: manual ? "manual" : "automatic", brokerSocketPath: socket,
+    experimentalFreshConversationPerTurn: options.fresh,
     localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: !manual, zeroRiskRequireSentConfirmation: true,
   } };
   const broker = TurnBroker.forSocket(socket);
@@ -203,16 +205,19 @@ async function fixture(manual = false, protocol = true, search = false,
       }, reject);
     });
   });
+  const manualPrompts: string[] = [];
   const manualControl: ChatGptZeroRiskManualControl = {
     async start(_path, activity) {
       submissions++;
       physicalKey = activity.conversationKey!;
       const continuity = { owner: activity.continuity!.owner, leaseId: "1".repeat(32), traceId: activity.traceId, recovery: activity.continuity!.recovery };
       acquire(physicalKey, continuity, "send-possible");
+      manualPrompts.push(activity.prompt);
+      options.manualPrepared?.(manualPrompts.length);
       token = JSON.parse(activity.prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id;
       return { continuity };
     },
-    async waitSent() { broker.startSafeTurn(token); sendActivations++; },
+    async waitSent() { await options.manualSent?.(manualPrompts.length); broker.startSafeTurn(token); sendActivations++; },
     waitTerminal: () => new Promise<never>(() => {}),
     async markStarted() { ready.resolve({ token }); },
     async end() { const page = pages.get(physicalKey); if (page) page.state = "ready"; },
@@ -271,7 +276,7 @@ async function fixture(manual = false, protocol = true, search = false,
     if (!options.preserveRoot) rmSync(root, { recursive: true, force: true });
   });
   return { initial, request, run, ready: ready.promise, start, wait, ack, finish, session, broker,
-    pages, provider, adapter, startTool, socket, root, statePath, browserRuns, coordination, waitSubmission,
+    pages, provider, adapter, startTool, socket, root, statePath, browserRuns, coordination, waitSubmission, manualPrompts,
     losePage: () => {
       const current = browserRuns.at(-1)!;
       pages.delete(current.key);
@@ -499,7 +504,11 @@ test("recovery E3: a failure before durable append preserves A and its outstandi
     await expect(f.run(f.request([output(call!.id), user("rejected-B", "Uncommitted update.")]))).rejects
       .toMatchObject({ code: "task_update_invalid" });
     expect(outcome).toMatchObject({ status: "not_committed" });
-    expect(f.record()).toEqual(before);
+    expect(f.record().currentWorkId).toBe(before.currentWorkId);
+    expect(f.record().calls[call!.id]).toMatchObject({ state: "settled", firstResultDigest: recoveryResultDigest(output(call!.id)) });
+    const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+    const queue = taskInputQueue(session)!;
+    expect(queue.store.get(queue.identity)?.messages[0]).toMatchObject({ messageId: "rejected-B", status: "accepted" });
     expect(session.driverGeneration()).toBe(0);
     expect(session.taskRevision()).toBe(0);
     expect(session.hasPendingTaskUpdate()).toBeFalse();
@@ -544,7 +553,7 @@ for (const blockReadback of [false, true]) test(`recovery E3: atomic B replaceme
     return get.call(this, thread);
   });
   const confirming = spyOn(ContinuityRecoveryStore.prototype, "confirmDurable").mockImplementation(function (this: ContinuityRecoveryStore, thread, guard) {
-    if (this.directory === f.statePath && blocked) throw continuityError("continuity_configuration_conflict", "Durability confirmation temporarily unavailable");
+    if (this.directory === f.statePath && replaced && blocked) throw continuityError("continuity_configuration_conflict", "Durability confirmation temporarily unavailable");
     return confirm.call(this, thread, guard);
   });
   const transfers: TaskUpdateTransfer[] = [];
@@ -640,6 +649,7 @@ for (const manual of [false, true]) test(`A1 continuity ${manual ? "Zero Risk" :
 
 test("A2-A4 continuity accepts trimmed history, first results, partial batches and a new transport request ID", async () => {
   const f = await fixture();
+  Object.assign(f.initial, f.request([output("accepted-history", "Accepted historical result."), user("initial-user", "Inspect the project.")]));
   const calls = await batch(f, 2);
   const accept = f.broker.acceptTaskUpdate.bind(f.broker);
   let lostReceipt = false;
@@ -648,13 +658,13 @@ test("A2-A4 continuity accepts trimmed history, first results, partial batches a
     if (!lostReceipt && result.status === "committed") { lostReceipt = true; throw new Error("Commit receipt lost"); }
     return result;
   };
-  const first = f.request([output(calls[0]!.id), user("append", "Keep the first result."), output("unknown", "ignored")]);
+  const first = f.request([output(calls[0]!.id), user("append", "Keep the first result."), output("accepted-history", "Accepted historical result.")]);
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: false });
   expect(f.session().outstanding()).toHaveLength(1);
   const reply = await f.wait(1);
   expect(reply.kind).toBe("result");
-  const retry = f.request([{ ...output(calls[0]!.id, "different retry body"), type: "custom_tool_call_output" },
-    output("history", "changed history"), user("append", "Keep the first result.")], "new-transport-request");
+  const retry = f.request([output(calls[0]!.id, "different retry body"),
+    output("accepted-history", "Accepted historical result."), user("append", "Keep the first result.")], "new-transport-request");
   await f.run(retry);
   expect(f.session().taskRevision()).toBe(1);
   expect(f.session().driverGeneration()).toBe(1);
@@ -705,9 +715,16 @@ test("continuity reclaims three 12 MiB results after delivery and does not resto
 test("continuity budgets undelivered first results atomically and releases capacity only on confirmed delivery", async () => {
   const f = await fixture();
   const calls = await batch(f, 3);
-  await f.run(f.request([user("append", "Receive results when available.")]));
-  const delivery = await f.wait(1);
+  const abort = new AbortController();
+  const queued = f.run(f.request([user("append", "Receive results when available.")]), [], abort.signal); void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  await f.start(4);
+  let delivery = await f.wait(1);
+  for (let i = 0; i < 100 && !delivery.taskUpdate; i++) { await Bun.sleep(2); delivery = await f.wait(1); }
   f.ack(delivery.taskUpdate!);
+  abort.abort(); await queued.catch(() => {});
   const session = f.session();
   const storage = resultStorage(session);
   const large = "x".repeat(12 * 1024 * 1024);
@@ -740,7 +757,7 @@ test("continuity budgets undelivered first results atomically and releases capac
   await expect(f.broker.completeTool(f.token(), calls[1]!.id, { content: [] }, context)).rejects.toThrow("Delivery interrupted");
   failedDelivery.mockRestore();
   expect((session.continuityReceivedToolResult(calls[1]!.id)?._meta as { raw: string }).raw.length).toBe(large.length);
-  await f.run(f.request([output(calls[0]!.id, "completed repeat"), output(calls[1]!.id, "changed retry")], "retry-second"));
+  await f.run(f.request([user("append", "Receive results when available."), output(calls[0]!.id, "completed repeat"), output(calls[1]!.id, "changed retry")], "retry-second"));
   const first = await f.wait(1);
   expect(first.kind === "result" && first.result.content).toEqual([{ type: "text", text: "first result" }]);
   expect(first.kind === "result" && (first.result._meta as { raw: string }).raw.length).toBe(large.length);
@@ -751,7 +768,7 @@ test("continuity budgets undelivered first results atomically and releases capac
   expect(storage.continuityReceivedResults.size).toBe(0);
   session.acceptContinuityToolResults(f.request([largeOutput(calls[2]!.id)]));
   expect(storage.taskUpdateStorageBytes()).toBeLessThanOrEqual(TASK_UPDATE_SESSION_JOURNAL_BYTES);
-  const running = f.run(f.request([output(calls[1]!.id, "changed retry"), output(calls[2]!.id, "changed retry")], "retry-rest"));
+  const running = f.run(f.request([user("append", "Receive results when available."), output(calls[1]!.id, "changed retry"), output(calls[2]!.id, "changed retry")], "retry-rest"));
   let final = await f.wait(3);
   while (final.kind !== "result") final = await f.wait(3);
   await f.finish(); await running;
@@ -807,7 +824,7 @@ test("A8 stale compaction preflight cannot stop a new appended driver", async ()
   expect(f.session().runtime.continuityBinding!.revision).toBe(0);
 });
 
-test("A7 continuity blocks completion before ACK and rejects a late append after output lock", async () => {
+test("A7 continuity blocks completion before ACK and retains a late append after output lock", async () => {
   const f = await fixture(true);
   const [call] = await batch(f);
   const disconnected = new AbortController();
@@ -820,29 +837,38 @@ test("A7 continuity blocks completion before ACK and rejects a late append after
   expect(f.broker.taskUpdateState(f.token())?.finalOutputRevision).toBeNull();
   f.ack(reply.taskUpdate!);
   f.broker.beginFinalOutput(f.token(), { expectedDriverGeneration: 1, taskRevision: 1, acknowledgedRevision: 1 });
-  await expect(f.run(f.request([user("too-late")]))).rejects.toMatchObject({ code: "task_update_final_output_started" });
+  const lateAbort = new AbortController();
+  const late = f.run(f.request([user("too-late")]), [], lateAbort.signal); void late.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && queue.store.get(queue.identity)?.messages.length !== 2; i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages.at(-1)?.messageId).toBe("too-late");
+  lateAbort.abort(); await late.catch(() => {});
   expect(f.session().taskRevision()).toBe(1);
   expect(f.session().isTaskUpdateCancelled()).toBeFalse();
   disconnected.abort(); await running.catch(() => {});
 });
 
-test("A3-A5 continuity accepts zero results and the next text-only append before ACK", async () => {
+test("A3-A5 continuity receives two text-only inputs before the real result boundary", async () => {
   const f = await fixture();
   const [call] = await batch(f);
-  await f.run(f.request([user("append-one", "First update.")]));
-  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 1, deliveredRevision: 0, acknowledgedRevision: 0 });
-  await f.run(f.request([user("append-two", "Second update.")]));
-  expect(f.session().taskRevision()).toBe(2);
-  expect(f.session().driverGeneration()).toBe(2);
-  expect(() => f.session().cancelDriver(0)).toThrow();
+  const first = f.run(f.request([user("append-one", "First update.")])); void first.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  const second = f.run(f.request([user("append-two", "Second update.")])); void second.catch(() => {});
+  for (let i = 0; i < 100 && queue.store.get(queue.identity)?.messages.length !== 2; i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages.map(message => message.receivedSequence)).toEqual([1, 2]);
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
   const running = f.run(f.request([user("append-two", "Second update."), output(call!.id)]));
   let reply = await f.wait(1);
   while (reply.kind !== "result") reply = await f.wait(1);
   expect(reply.taskUpdate?.updates.map(update => update.content)).toEqual(["First update.", "Second update."]);
   f.ack(reply.taskUpdate!);
   await f.finish(); await running;
-  expect(f.session().driverGeneration()).toBe(2);
+  expect(f.session().driverGeneration()).toBe(1);
   expect(f.submissions()).toBe(1);
+  for (const response of await Promise.all([first, second])) expect(response.some(event => event.type === "incomplete")).toBeFalse();
 });
 
 test("A6 continuity rejects a conflicting earlier new ID in a multiple-instruction append while permitting changed old history", async () => {
@@ -877,9 +903,12 @@ test("A6 continuity rejects a current result type and an accepted appended text 
   await expect(f.run(f.request([user("duplicate-new", "First text."), user("duplicate-new", "Changed text.")]))).rejects
     .toMatchObject({ code: "task_update_message_conflict" });
   expect(f.session().taskRevision()).toBe(0);
-  await f.run(f.request([user("append")]));
+  const abort = new AbortController();
+  const queued = f.run(f.request([user("append")]), [], abort.signal); void queued.catch(() => {});
+  await Bun.sleep(10);
   await expect(f.run(f.request([user("append", "conflicting text")]))).rejects.toMatchObject({ code: "task_update_message_conflict" });
-  expect(f.session().taskRevision()).toBe(1);
+  expect(f.session().taskRevision()).toBe(0);
+  abort.abort(); await queued.catch(() => {});
   expect(f.session().isTaskUpdateCancelled()).toBeFalse();
 });
 
@@ -910,8 +939,9 @@ for (const manual of [false, true]) for (const remote of [false, true]) test(`${
   cleanup.push(async () => { reserve.mockRestore(); accept.mockRestore(); });
   const second = f.request([user("second-append", "Second update.")], "second-append");
   const secondRunning = f.run(second);
-  expect((await firstRunning).at(-1)).toMatchObject({ type: "incomplete", reason: "task_update_handoff" });
-  const reply = await f.wait(1);
+  f.ack(firstReply.taskUpdate!);
+  let reply = await f.wait(1);
+  for (let i = 0; i < 100 && !reply.taskUpdate?.updates.some(update => update.sourceMessageId === "second-append"); i++) { await Bun.sleep(2); reply = await f.wait(1); }
   expect(receiptLost).toBeTrue();
   expect(reply.kind).toBe("result");
   expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["second-append"]);
@@ -920,6 +950,7 @@ for (const manual of [false, true]) for (const remote of [false, true]) test(`${
   f.ack(reply.taskUpdate!);
   await f.finish();
   expect((await secondRunning).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect((await firstRunning).some(event => event.type === "incomplete")).toBeFalse();
   expect((await f.run(f.request([user("second-append", "Second update.")], "second-append-retry"))).at(-1))
     .toMatchObject({ type: "done", endTurn: true });
   expect(f.session().taskRevision()).toBe(2);
@@ -1030,60 +1061,48 @@ for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} Zero Ri
   } finally { inspectionRelease.resolve(); }
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} rejects a completed tool boundary without binding an update ID and accepts the append at the next boundary`, async () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} queues at a consumed boundary and delivers before the next Native decision`, async () => {
   const f = await fixture(manual);
   const [firstCall] = await batch(f);
   const resultEvents: AdapterEvent[] = [];
   const resultRound = f.run(f.request([user("initial-user", "Inspect the project."), output(firstCall!.id)], "first-result"), resultEvents);
+  void resultRound.catch(() => {});
   let firstReply = await f.wait(1);
   while (firstReply.kind !== "result") firstReply = await f.wait(1);
   expect(f.session().outstanding()).toHaveLength(0);
-  const rejectedIds: string[] = [];
-  const originalReserve = f.broker.reserveTaskUpdate.bind(f.broker);
-  const reserve = spyOn(f.broker, "reserveTaskUpdate").mockImplementation((...args) => {
-    rejectedIds.push(args[1]);
-    return originalReserve(...args);
-  });
-  cleanup.push(async () => { reserve.mockRestore(); });
-  for (let retry = 0; retry < 2; retry++) {
-    const appended = f.request([user("append", "Also inspect tests.")], `append-${retry}`);
-    for (const message of appended.context.messages) message.timestamp += retry;
-    await expect(f.run(appended)).rejects.toMatchObject({ code: "task_update_no_boundary" });
-    expect(f.session().isActive()).toBeTrue();
-    expect(f.session().isTaskUpdateCancelled()).toBeFalse();
-    expect(f.session().hasPendingTaskUpdate()).toBeFalse();
-    expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
-  }
-  expect(rejectedIds).toHaveLength(2);
-  expect(new Set(rejectedIds).size).toBe(1);
-  expect(f.broker.taskUpdateTransferOutcome(f.token(), rejectedIds[0]!)).toMatchObject({ status: "unknown" });
-  expect(await f.start(2)).toMatchObject({ kind: "pending" });
-  await resultRound;
-  const nextCall = resultEvents.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
-  expect(nextCall).toBeDefined();
-  const running = f.run(f.request([user("append", "Also inspect tests."), output(nextCall!.id)], "append-next-boundary"));
-  let reply = await f.wait(2);
-  while (reply.kind !== "result") reply = await f.wait(2);
+  const events: AdapterEvent[] = [];
+  const appended = f.run(f.request([user("append", "Also inspect tests.")], "append"), events); void appended.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+  let reply = await f.start(2);
+  for (let i = 0; i < 100 && !reply.taskUpdate; i++) { await Bun.sleep(2); reply = await f.wait(2); }
   expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
+  expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
   f.ack(reply.taskUpdate!);
   await f.finish();
-  expect((await running).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect((await appended).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect((await resultRound).some(event => event.type === "incomplete")).toBeFalse();
   expect(f.submissions()).toBe(1);
 });
 
-test("A7-A9 continuity reports no boundary and old protocol without cancelling their physical response", async () => {
+test("A7-A9 continuity retains input with no boundary or old protocol without cancelling execution", async () => {
   for (const protocol of [true, false]) {
     const f = await fixture(false, protocol);
-    const disconnected = new AbortController();
-    const running = f.run(f.initial, [], disconnected.signal);
-    void running.catch(() => {});
+    const disconnected = new AbortController(), appendedAbort = new AbortController();
+    const running = f.run(f.initial, [], disconnected.signal); void running.catch(() => {});
     await f.ready;
-    await expect(f.run(f.request([user("append")]))).rejects.toMatchObject({ code: protocol ? "task_update_no_boundary" : "task_update_upgrade_required" });
+    const appended = f.run(f.request([user("append")]), [], appendedAbort.signal); void appended.catch(() => {});
+    const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+    const queue = taskInputQueue(f.session())!;
+    for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+    expect(queue.store.get(queue.identity)?.messages[0]?.status).toBe("accepted");
     expect(f.session().isActive()).toBeTrue();
     expect(f.session().isTaskUpdateCancelled()).toBeFalse();
     expect(f.submissions()).toBe(1);
-    disconnected.abort();
-    await running.catch(() => {});
+    disconnected.abort(); appendedAbort.abort();
+    await Promise.all([running.catch(() => {}), appended.catch(() => {})]);
     expect(f.session().isActive()).toBeTrue();
     const session = f.session();
     chatGptTurnSessions.cancelNativeTurn(session.nativeThreadId!, "turn", new DOMException("Explicit stop", "AbortError"));
@@ -1117,7 +1136,11 @@ for (const manual of [false, true]) test(`Review E1 ${manual ? "Zero Risk" : "Au
 test("Review E2 a stale compaction entering preflight after append cannot cancel the current driver", async () => {
   const f = await fixture();
   const [call] = await batch(f);
-  await f.run(f.request([user("append")]));
+  const abort = new AbortController();
+  const update = f.run(f.request([output(call!.id), user("append")]), [], abort.signal); void update.catch(() => {});
+  let reply = await f.wait(1);
+  while (reply.kind !== "result") reply = await f.wait(1);
+  f.ack(reply.taskUpdate!);
   const session = f.session();
   const binding = session.runtime.continuityBinding!;
   const lease = { ...binding.lease! };
@@ -1129,6 +1152,7 @@ test("Review E2 a stale compaction entering preflight after append cannot cancel
   expect(session.isTaskUpdateCancelled()).toBeFalse();
   expect(binding.state).toBe("running");
   expect(binding.lease).toEqual(lease);
+  abort.abort(); await update.catch(() => {});
 });
 
 test("Review E3 discovery delivered with append remains available with its first accepted definition", async () => {
@@ -1150,9 +1174,10 @@ test("Review E3 discovery delivered with append remains available with its first
   expect(await f.startTool(2, "discovered_tool", 1)).toMatchObject({ kind: "pending" });
   const returned = await running;
   expect(returned.some(event => event.type === "tool_call_start" && event.name === "discovered_tool")).toBeTrue();
-  const changed = f.request([{ ...searchResult, tools: [{ ...discovered, description: "Replacement must be ignored." }] },
-    { ...searchResult, call_id: "unknown", tools: [{ ...discovered, name: "injected_tool" }] }, user("append")]);
+  const changed = f.request([{ ...searchResult, tools: [{ ...discovered, description: "Replacement must be ignored." }] }, user("append")]);
   await f.run(changed);
+  const unknown = f.request([{ ...searchResult, call_id: "unknown", tools: [{ ...discovered, name: "injected_tool" }] }, user("append")]);
+  await expect(f.run(unknown)).rejects.toMatchObject({ code: "task_update_source_unproven" });
   expect(f.session().runtime.continuityBinding!.discoveredTools).toMatchObject([{ name: "discovered_tool", description: "First accepted definition." }]);
   expect(changed.context.tools?.some(tool => tool.name === "injected_tool")).toBeFalse();
 });
@@ -1166,14 +1191,20 @@ test("Review E4 a logical append succeeds at five physical sessions without allo
   }
   const first = sessions[0]!;
   const physical = first.session();
-  await first.run(first.request([user("append")]));
+  const abort = new AbortController();
+  const update = first.run(first.request([user("append")]), [], abort.signal); void update.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(physical)!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages).toHaveLength(1);
   expect(first.session()).toBe(physical);
-  expect(first.session().taskRevision()).toBe(1);
+  expect(first.session().taskRevision()).toBe(0);
   expect(first.submissions()).toBe(1);
   expect(chatGptTurnSessions.activeCount()).toBe(5);
   const sixth = await fixture();
   await expect(sixth.run(sixth.initial)).rejects.toMatchObject({ code: "continuity_resource_capacity" });
   expect(sixth.submissions()).toBe(0);
+  abort.abort(); await update.catch(() => {});
 });
 
 test("Review R0 ordinary revision zero keeps current payload and complete result batch checks before compaction", async () => {
@@ -1281,11 +1312,18 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
   }
   const appendInput = [...originalInput, ...(backendScenario === "checkpoint" ? [issuedCall(call.id, command)] : []),
     user("append", "Continue with the predecessor result.")];
-  await f.run(f.request(appendInput));
-  const delivery = await f.wait(1);
+  const appendAbort = new AbortController();
+  const appendRunning = f.run(f.request(appendInput), [], appendAbort.signal); void appendRunning.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  await f.start(2);
+  let delivery = await f.wait(1);
+  for (let i = 0; i < 100 && !delivery.taskUpdate; i++) { await Bun.sleep(2); delivery = await f.wait(1); }
   expect(delivery.kind).toBe("pending");
   expect(delivery.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["append"]);
   f.ack(delivery.taskUpdate!);
+  appendAbort.abort(); await appendRunning.catch(() => {});
   const appended = f.record();
   const headLogicalWorkId = appended.currentWorkId!;
   const head = appended.works[headLogicalWorkId]!;
@@ -1341,7 +1379,7 @@ if (backendScenario) test("recovery fixture: backend source chain", async () => 
       const compacting = f.run(compact);
       void compacting.catch(() => {});
       await requested.promise;
-      expect(await f.start(2, 1)).toMatchObject({ kind: "result", result: { isError: true } });
+      expect(await f.start(3, 1)).toMatchObject({ kind: "result", result: { isError: true } });
       expect(Object.keys(f.record().calls)).toEqual([call.id]);
       await f.finish();
       const events = await compacting;
@@ -1435,3 +1473,299 @@ for (const scenario of ["recover", "stop", "checkpoint", "publication-exit"] as 
   expect(e.dispatches).toBe(1); expect(e.sends + f.sends()).toBe(scenario === "checkpoint" ? 3 : 2);
   if (scenario === "recover") expect(readFileSync(join(f.root, "harmless-command-count"), "utf8")).toBe("x");
 }, 30_000);
+
+test("Q04 queued text without tools continues in a second physical response", async () => {
+  const f = await fixture();
+  const firstEvents: AdapterEvent[] = [], nextEvents: AdapterEvent[] = [];
+  const first = f.run(f.initial, firstEvents); void first.catch(() => {});
+  await f.ready;
+  const queued = f.run(f.request([user("queued-no-tools", "Also inspect the tests.")], "queued"), nextEvents);
+  void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages.map(message => message.messageId)).toEqual(["queued-no-tools"]);
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+  await f.finish();
+  await f.waitSubmission(2);
+  expect(f.sends()).toBe(2);
+  expect(f.browserRuns[1]!.prompt).toContain("Also inspect the tests.");
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0 });
+  await f.finish();
+  expect((await queued).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(nextEvents.some(event => event.type === "assistant_boundary")).toBeTrue();
+  expect(nextEvents.filter(event => event.type === "done" && event.endTurn)).toHaveLength(1);
+  expect(queue.store.get(queue.identity)?.messages[0]?.status).toBe("completed");
+  expect((await first).some(event => event.type === "incomplete")).toBeFalse();
+});
+
+test("Q01 queued activity keeps the issued call and delivers an ordered ACK batch", async () => {
+  const f = await fixture();
+  const [call] = await batch(f);
+  const events: AdapterEvent[] = [];
+  const response = f.run(f.request([output(call!.id, "real completed result"), user("first-queued", "First update."), user("second-queued", "Second update.")], "updates"), events);
+  void response.catch(() => {});
+  let reply = await f.wait(1);
+  for (let i = 0; i < 100 && (!reply.taskUpdate || reply.kind !== "result"); i++) { await Bun.sleep(2); reply = await f.wait(1); }
+  expect(reply.kind).toBe("result");
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["first-queued", "second-queued"]);
+  expect(reply.taskUpdate?.updates.map(update => update.revision)).toEqual([1, 2]);
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 2, driverGeneration: 1 });
+  f.ack(reply.taskUpdate!);
+  await f.finish();
+  expect((await response).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.sends()).toBe(1);
+  expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+});
+
+test("Q10 detached observers retain input without starting a follow-up Send", async () => {
+  const f = await fixture();
+  const firstAbort = new AbortController(), secondAbort = new AbortController();
+  const first = f.run(f.initial, [], firstAbort.signal); void first.catch(() => {});
+  await f.ready;
+  const appended = f.request([user("offline-input", "Keep this input for reconnect.")], "offline");
+  const second = f.run(appended, [], secondAbort.signal); void second.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  firstAbort.abort(); secondAbort.abort();
+  await Promise.allSettled([first, second]);
+  await f.finish(); await f.session().browserOutcome; await f.session().physicalSettlement;
+  await Bun.sleep(10);
+  expect(f.sends()).toBe(1);
+  expect(queue.store.get(queue.identity)?.messages[0]?.status).toBe("accepted");
+  expect(queue.store.readBody(queue.identity, "offline-input")).toBe("Keep this input for reconnect.");
+  const reconnected = f.run(f.request([user("offline-input", "Keep this input for reconnect.")], "reconnect"));
+  void reconnected.catch(() => {});
+  await f.waitSubmission(2); await f.finish();
+  expect((await reconnected).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(queue.store.get(queue.identity)?.receivedSequence).toBe(1);
+});
+
+test("Q05 input after final lock keeps the original output version and follows normally", async () => {
+  const f = await fixture();
+  const first = f.run(f.initial); void first.catch(() => {});
+  await f.ready;
+  const locked = f.broker.beginFinalOutput(f.token(), { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 });
+  const later = f.run(f.request([user("after-lock", "Follow-up after the final lock.")], "after-lock"));
+  void later.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 0, driverGeneration: 0, finalOutputRevision: 0 });
+  expect(f.broker.taskOutputReceipt(f.token())).toEqual(locked);
+  await f.finish(); await f.waitSubmission(2); await f.finish();
+  expect((await later).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  await first;
+  expect(f.sends()).toBe(2);
+});
+
+test("Q15 an old active protocol receives input for normal follow-up without upgrade", async () => {
+  const f = await fixture(false, false);
+  const first = f.run(f.initial); void first.catch(() => {});
+  await f.ready;
+  const later = f.run(f.request([user("legacy-queued", "Continue after this old response.")], "legacy-queued"));
+  void later.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.receivedSequence).toBe(1);
+  expect(f.session().taskUpdatesEnabled()).toBeFalse();
+  await f.finish(); await f.waitSubmission(2); await f.finish();
+  expect((await later).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  await first;
+  expect(f.sends()).toBe(2);
+});
+
+
+test("Q06 Zero Risk receives while awaiting Sent and keeps each prepared prompt frozen", async () => {
+  const prepared = [deferred<void>(), deferred<void>(), deferred<void>()];
+  const sent = [deferred<void>(), deferred<void>(), deferred<void>()];
+  const f = await fixture(true, true, false, { manualPrepared: count => prepared[count - 1]?.resolve(),
+    manualSent: count => sent[count - 1]!.promise });
+  const first = f.run(f.initial); void first.catch(() => {});
+  await prepared[0]!.promise;
+  const snapshot = f.manualPrompts[0];
+  const second = f.run(f.request([user("manual-second", "Second prepared task.")], "manual-second")); void second.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.waitReason).toBe("manual-send");
+  expect(f.sends()).toBe(0); expect(f.manualPrompts[0]).toBe(snapshot);
+  sent[0]!.resolve(); await f.ready; await f.finish(); await prepared[1]!.promise;
+  expect(f.sends()).toBe(1); expect(f.manualPrompts[1]).toContain("Second prepared task.");
+  const secondSnapshot = f.manualPrompts[1];
+  const third = f.run(f.request([user("manual-third", "Third prepared task.")], "manual-third")); void third.catch(() => {});
+  for (let i = 0; i < 100 && queue.store.get(queue.identity)?.messages.length !== 2; i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages.map(message => message.receivedSequence)).toEqual([1, 2]);
+  expect(f.manualPrompts[1]).toBe(secondSnapshot); expect(f.sends()).toBe(1);
+  sent[1]!.resolve();
+  for (let i = 0; i < 100 && f.sends() !== 2; i++) await Bun.sleep(2);
+  await f.finish(); await prepared[2]!.promise;
+  expect(f.sends()).toBe(2); expect(f.manualPrompts[2]).toContain("Third prepared task.");
+  sent[2]!.resolve();
+  for (let i = 0; i < 100 && f.sends() !== 3; i++) await Bun.sleep(2);
+  await f.finish();
+  expect((await third).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  await Promise.all([first, second]);
+  expect(queue.store.get(queue.identity)?.messages.map(message => message.status)).toEqual(["completed", "completed"]);
+});
+
+
+test("Q08 compaction freezes its source while queued input continues under the committed history", async () => {
+  const f = await fixture();
+  const [call] = await batch(f);
+  const current = [user("initial-user", "Inspect the project."), issuedCall(call!.id), output(call!.id), user("source-append", "Retain the original requirement.")];
+  const originalAbort = new AbortController();
+  const original = f.run(f.request(current, "source-result"), [], originalAbort.signal); void original.catch(() => {});
+  let returned = await f.wait(1); while (returned.kind !== "result") returned = await f.wait(1);
+  f.ack(returned.taskUpdate!);
+  originalAbort.abort(); await original.catch(() => {});
+  const requested = deferred<void>();
+  const requestCompaction = f.broker.requestCompaction.bind(f.broker);
+  const interception = spyOn(f.broker, "requestCompaction").mockImplementation((...args) => {
+    const result = requestCompaction(...args); requested.resolve(); return result;
+  });
+  cleanup.push(async () => interception.mockRestore());
+  const compact = f.request(current, "compact"); compact._compactionRequest = true;
+  const compacting = f.run(compact); void compacting.catch(() => {});
+  await Promise.race([requested.promise, compacting.then(() => { throw new Error("Compaction ended before interception"); })]);
+  const events: AdapterEvent[] = [];
+  const queued = f.run(f.request([user("during-compaction", "Apply this after the checkpoint.")], "during-compaction"), events); void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && queue.store.get(queue.identity)?.messages.length !== 2; i++) await Bun.sleep(2);
+  expect(queue.store.get(queue.identity)?.messages.at(-1)?.messageId).toBe("during-compaction");
+  expect(queue.store.get(queue.identity)?.waitReason).toBe("compaction");
+  expect(f.broker.taskUpdateState(f.token())).toMatchObject({ acceptedRevision: 1, driverGeneration: 1 });
+  expect(await f.start(2, 1)).toMatchObject({ kind: "result", result: { isError: true } });
+  await f.finish();
+  await compacting;
+  await Promise.race([f.waitSubmission(2), queued.then(() => { throw new Error(`Queued observer ended before continuation: ${JSON.stringify(events)}`); })]);
+  expect(f.browserRuns[1]!.prompt).toContain("Apply this after the checkpoint.");
+  expect(f.browserRuns[1]!.prompt).toContain("same retained conversation");
+  expect(f.session().runtime.continuityBinding?.revision).toBe(1);
+  const delivery = queue.store.get(queue.identity)?.deliveries.at(-1);
+  expect(delivery).toMatchObject({ mode: "initial", acceptedRevision: 0, driverGeneration: 0, historyRevision: 1 });
+  await f.finish();
+  expect((await queued).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  originalAbort.abort(); await original.catch(() => {});
+  expect(queue.store.get(queue.identity)?.messages.at(-1)?.status).toBe("completed");
+});
+
+test("Q09 page loss retains an undelivered input and binds it to the current recovery prompt", async () => {
+  const f = await fixture();
+  const first = f.run(f.initial); void first.catch(() => {});
+  await f.ready;
+  const saved = user("saved-before-loss", "Keep the queued requirement through page recovery.");
+  const queued = f.run(f.request([saved], "before-loss")); void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  f.losePage();
+  await Promise.allSettled([first, queued]);
+  expect(queue.store.get(queue.identity)?.messages[0]?.status).toBe("accepted");
+  const recovered = f.run(f.request([user("initial-user", "Inspect the project."), saved], "after-loss"));
+  void recovered.catch(() => {});
+  await Promise.race([f.waitSubmission(2), recovered.then(() => { throw new Error("Recovery ended before a new prompt"); })]);
+  expect(queue.store.get(queue.identity)?.deliveries).toHaveLength(1);
+  expect(queue.store.get(queue.identity)?.deliveries[0]).toMatchObject({ mode: "initial", messageIds: ["saved-before-loss"], acceptedRevision: 0, driverGeneration: 0 });
+  expect(f.browserRuns[1]!.prompt).toContain("Keep the queued requirement through page recovery.");
+  await f.finish();
+  expect((await recovered).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(queue.store.get(queue.identity)?.messages[0]?.status).toBe("completed");
+  expect(f.sends()).toBe(2);
+});
+
+test("Q15 old protocol rejects a mismatched tool result before receiving appended input", async () => {
+  const f = await fixture(false, false);
+  const [call] = await batch(f);
+  const malformed = f.request([user("initial-user", "Inspect the project."), issuedCall(call!.id),
+    { type: "tool_search_output", call_id: call!.id, status: "completed", tools: [] },
+    user("legacy-invalid-result", "Only save this with a valid result.")], "legacy-invalid-result");
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  await expect(f.run(malformed)).rejects.toMatchObject({ code: "task_update_result_type_invalid" });
+  expect(queue.store.get(queue.identity)).toBeUndefined();
+  expect(f.sends()).toBe(1);
+});
+
+for (const protocol of [false, true]) for (const activeCall of [false, true]) test(`review R1 unknown result is rejected before receipt: protocol=${protocol}, activeCall=${activeCall}`, async () => {
+  const f = await fixture(false, protocol);
+  const abort = new AbortController();
+  let initial: Promise<AdapterEvent[]> | undefined;
+  if (activeCall) await batch(f);
+  else { initial = f.run(f.initial, [], abort.signal); void initial.catch(() => {}); await f.ready; }
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  const before = f.record(), outstanding = f.session().outstanding();
+  const failed = f.run(f.request([output("never-issued", "Invented result."), user("unknown-result-input", "Apply this later.")]), [], abort.signal);
+  void failed.catch(() => {});
+  try {
+    await Promise.race([expect(failed).rejects.toMatchObject({ code: "task_update_source_unproven" }),
+      Bun.sleep(200).then(() => { throw new Error("Unknown result was not rejected at admission"); })]);
+    expect(queue.store.get(queue.identity)).toBeUndefined();
+    expect(f.record()).toEqual(before);
+    expect(f.session().outstanding()).toEqual(outstanding);
+    expect(f.sends()).toBe(1);
+  } finally { abort.abort(); await Promise.allSettled([failed, ...(initial ? [initial] : [])]); }
+});
+
+for (const fresh of [false, true]) test(`review R1 queued follow-up retains genuine final history only for a new page: fresh=${fresh}`, async () => {
+  const f = await fixture(false, true, false, { fresh });
+  const first = f.run(f.initial); void first.catch(() => {});
+  await f.ready;
+  const queued = f.run(f.request([user("follow-up-history", "Continue from the result just produced.")])); void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  await f.finish();
+  await f.waitSubmission(2);
+  const next = f.browserRuns[1]!;
+  expect(next.key === f.browserRuns[0]!.key).toBe(!fresh);
+  if (fresh) expect(next.prompt).toContain("Completed with the appended instruction.");
+  else expect(next.prompt).not.toContain("Completed with the appended instruction.");
+  await f.finish(); await queued; await first;
+  expect(queue.store.get(queue.identity)?.state).toBe("completed");
+  expect(f.sends()).toBe(2);
+});
+
+for (const fresh of [false, true]) test(`review R1 new-page continuation retains real tool context before final and queued input: fresh=${fresh}`, async () => {
+  const inspecting = deferred<void>(), inspected = deferred<void>();
+  const f = await fixture(false, true, false, { fresh,
+    ...(!fresh ? { completionInspection: { entered: () => inspecting.resolve(), release: inspected.promise } } : {}) });
+  const [call] = await batch(f);
+  const resultObserver = f.run(f.request([user("initial-user", "Inspect the project."),
+    issuedCall(call!.id), output(call!.id, "Verified repository state: clean.")]));
+  void resultObserver.catch(() => {});
+  let reply = await f.wait(1); while (reply.kind !== "result") reply = await f.wait(1);
+  f.broker.beginFinalOutput(f.token(), { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 });
+  const events: AdapterEvent[] = [];
+  const queued = f.run(f.request([user("follow-real-tool", "Continue using the verified state.")]), events);
+  void queued.catch(() => {});
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  for (let i = 0; i < 100 && !queue.store.get(queue.identity); i++) await Bun.sleep(2);
+  await f.finish();
+  if (!fresh) {
+    await inspecting.promise;
+    // Model a full retained page after its final. Full next-page history still fits.
+    f.session().runtime.continuityBinding!.retainedPageTokens = 10_000_000;
+    inspected.resolve();
+  }
+  await Promise.race([f.waitSubmission(2), queued.then(() => { throw new Error("Continuation ended before Send"); })]);
+  const next = f.browserRuns[1]!;
+  expect(next.key).not.toBe(f.browserRuns[0]!.key);
+  const resultAt = next.prompt.indexOf("Verified repository state: clean.");
+  const finalAt = next.prompt.indexOf("Completed with the appended instruction.");
+  const inputAt = next.prompt.indexOf("Continue using the verified state.");
+  expect(resultAt).toBeGreaterThan(-1);
+  expect(finalAt).toBeGreaterThan(resultAt);
+  expect(inputAt).toBeGreaterThan(finalAt);
+  expect(next.prompt.split("Completed with the appended instruction.")).toHaveLength(2);
+  expect(next.prompt).toContain(call!.id);
+  await f.finish(); await queued; await resultObserver;
+  expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+  expect(queue.store.get(queue.identity)?.state).toBe("completed");
+  expect(f.sends()).toBe(2);
+});

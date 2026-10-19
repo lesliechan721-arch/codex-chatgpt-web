@@ -282,24 +282,37 @@ Codex commentary.
 
 ### User updates during Native tool work
 
-A new compatible Full Native runtime negotiates `task-updates-v1`. A proven plain user suffix in
-the same native thread and turn can keep the existing physical ChatGPT response after the old
-local execution records identify its source and pending tools. Result batches may arrive partly;
-first-result and expected-type checks remain mandatory. Broker state separates accepted, delivered, and acknowledged revisions from driver
-generation and registry generation. A short owner transfer commits the registry, updates, new
-driver, and real result batch together; an unknown receipt recovers the same transfer.
+The continuity runtime separates durable receipt, model delivery and HTTP observation. Its task
+inbox binds a trusted native thread/turn and execution scope to stable native message IDs, exact
+text digests and receive sequence S. Original text lives in owner-only payload files. Metadata and
+body reservations use the recovery store's existing lock and 24 MiB global budget. Page deletion
+does not delete pending or stopped task inputs, and a saved inbox never grants execution rights.
+Detailed completed inbox records retire after a different native turn completes, the 30-minute
+historical Session replay window ends, and the older work, writers and delivery coverage settle.
+A failed successor preparation preserves the old head and does not start that window.
+A durable source fence precedes body
+deletion; maintenance finishes interrupted reclamation after restart. The small remaining fence
+uses the same budget and blocks delayed old-source admission after page-journal deletion.
 
-The Session registry stores one physical execution with bounded logical request routes. Exact
-reconnects replay only their own immutable journals. During the ACK gap, a further append can
-replace the active Responses observer; that observer ends with `task_update_handoff` while the
-physical response continues. Control arrives only in existing MCP replies or ACK replies.
-It adds no composer message, Native tool, or extra browser observation barrier. Versioned browser
-and helper candidates preserve their captured task head through completion and final text.
+Receipt can occur during preparation, thinking, tools, final output, compaction or manual waiting.
+It does not change M/R/G/H. A controlled Native/result/ACK entry can deliver an ordered finite
+prefix to a compatible `task-updates-v1` capability. That delivery advances M for its messages and
+G once, while recovery R advances per admitted work. Real tools retain their original completion
+rights. One immutable delivery is outstanding until its exact ACK. Without a boundary, accepted
+input waits for the next ordinary physical response, whose M/G start at zero. Final output and
+compaction sources remain frozen; later input cannot relabel an earlier answer or summary.
 
-Once final output locks, appends wait for normal continuation. Initial manual requests awaiting
-Sent and unproven or unsupported inputs retain their existing boundaries. Unresolved updates block compaction; accepted updates make the latest logical route
-the exact compaction source. See the [public protocol](native-tool-protocol.md#user-updates-during-tool-work)
-and [acceptance gate](release-validation.md#inflight-user-update-validation).
+Session keeps physical execution ownership separate from the current tool observer association.
+Changing that association does not change G or invalidate a final candidate/lock/CAS. Old observers
+cannot claim new calls or cancel successors. Normal waits emit nonterminal commentary/heartbeat;
+`incomplete(task_update_handoff)` is not used as a normal transition. Distinct physical responses
+produce distinct assistant items in JSON and SSE. No current observer means no automatic new Send
+or Native business admission. Zero Risk keeps its manual confirmation gates for every new prompt.
+
+The Launcher Activity panel reads saved originals through authenticated local control IPC. It
+shows storage use and supports copy, exact-body repair, explicit retry after stop, pre-delivery
+discard and original cleanup. See the [public protocol](native-tool-protocol.md#durable-task-input-queue)
+and [acceptance gate](release-validation.md#continuity-input-queue-validation).
 
 ### Unified task continuity
 

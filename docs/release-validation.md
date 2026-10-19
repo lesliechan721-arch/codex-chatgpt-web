@@ -368,6 +368,42 @@ The [DEV probe regression](../tests/native-tool-long-wait-probe.test.ts) and
 [waiting regressions](../tests/native-tool-long-wait.test.ts) remain available without retaining
 historical implementation/review rounds as public specifications.
 
+## Continuity input queue validation
+
+The input-queue contract applies to supported Full Native + Launcher Automatic and Zero Risk
+routes. Implementation and local contract tests do not establish authenticated platform success.
+Keep these evidence classes separate:
+
+| Gate | Required evidence |
+| --- | --- |
+| Preparation P01–P04 | Actual local preparation/Send race, same-lock termination receipt, healthy-page retry, unknown Send fence, stop/successor races, unchanged history/checkpoint, exact Send count, original error fields |
+| Queue Q01–Q17 | Thinking/no-tool receipt, ordered multi-message prefixes, ID/digest retry, real tool results exactly once, immutable ACK gap, final lock and compaction races, stop/discard intent fences, capacity and process-restart recovery |
+| C02 | Installed Codex 0.163.0 with deterministic loopback provider: nonterminal waits, steering timing, current association and same physical completion, multiple assistant items and one true logical terminal |
+| C01 | Real Codex input history plus product custody: refused/unknown receipt retains exact original and stable message ID; query/retry/repair recovers the same record; JSON/SSE ordered outputs agree |
+| C03 | Real Launcher/ChatGPT Automatic and Zero Risk: same-page local failure/retry, no-tool continuation, final-lock queue, manual Send/Sent/attachment snapshots, disconnect, stop and real tool effects |
+
+For every race, record trusted IDs, S/M/R/G/H, physical owner/capability, observer association,
+Send count, tool dispatch count and exact coverage. Do not infer completion from an empty queue
+or a successful Send. Missing originals must block delivery/copy and require an exact-body repair;
+capacity failure must leave the sender's original available. Inspect Activity occupancy and explicit
+cleanup after page loss and restart. Pending/stopped originals must not disappear on page cleanup.
+After a later native turn completes and the historical replay window ends, verify that only fully
+settled older inbox details are reclaimed. A prepared/failed successor must preserve the old head.
+Crash between source-fence commit, payload removal and final metadata compaction, then restart.
+The original source must remain unable to create new work, while pending/stopped originals remain
+readable. Include the remaining compact fences in the unchanged global budget.
+
+Local client checks can be reproduced with `bun run scripts/probe-continuity-input-queue.ts` and
+`bun test scripts/probe-continuity-input-adapter.test.ts`. Both use the installed Codex client and
+an isolated loopback upstream. The adapter probe additionally exercises real product request,
+queue and observation code against a deterministic page worker. They do not establish a C03 pass.
+
+Normal waiting must not emit `incomplete(task_update_handoff)`, a fake completion or an empty
+final answer. Codex 0.163.0 treats that incomplete reason as a failed turn; it is not a pause API.
+A pure observer handoff must keep G, the physical owner, final candidate, lock and completion CAS
+valid while preventing the old association from claiming new tools. Keep failed client evidence
+alongside successful cases. A deterministic page/helper fixture cannot substitute for C03.
+
 ## Inflight user update validation
 
 The [task update contract](native-tool-protocol.md#user-updates-during-tool-work) requires both
@@ -388,8 +424,8 @@ testing. Existing active tasks keep their original protocol; start a new compati
    result with the envelope's `native_result`; control must not alter it. Confirm old queued calls
    and new calls on an unacknowledged revision return an unexecuted terminal.
 5. Check that commentary remains process output and the first final-answer text closes the update
-   window. An active unified task append
-   is explicitly not accepted until the locked response ends. A late ACK cannot reopen it. Check
+   window. An input received after final output locks is durably queued for the next ordinary response;
+   it is not covered by the locked answer. A late ACK cannot reopen it. Check
    strict structured output, stable Automatic completion without ACK, and refused Zero Risk
    completion followed by a valid ACK and revision-bound complete answer.
 6. Check old-observer disconnect after a continuous append, explicit user stop, initial Zero Risk
@@ -404,8 +440,9 @@ must continue, the first result must remain unchanged, and each call must comple
 result type for a still-pending call must fail before accepting the append. After acknowledgement,
 compact the latest logical source without resending already accepted result bodies. Verify that
 only compaction advances history revision and that a stale preflight cannot retire a new driver.
-Without a boundary or negotiated protocol, record that the append was not accepted and that the
-original physical response survived. Keep real-client evidence separate from controlled fixtures.
+Without a boundary or negotiated active-update protocol, verify durable receipt and ordinary
+continuation after the original physical response settles. Do not silently upgrade the old
+capability or require the user to re-enter an already accepted input. Keep real-client evidence separate from controlled fixtures.
 
 The [continuity append probe](../scripts/probe-continuity-append-live.ts) runs a real local Codex
 app-server, the working-tree Adapter and helper, the isolated DEV Launcher, and one harmless

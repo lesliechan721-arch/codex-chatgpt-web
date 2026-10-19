@@ -120,7 +120,7 @@ function receipt(host, record, recovery = record?.identity) {
   const currentInstance = launcherInstance(host);
   if (!record) return missingReceipt(host, recovery);
   const tab = host.turnTabs.get(record.tabId);
-  const live = tab && sameRecovery(tab.continuityRecovery, record.identity)
+  const live = tab && ["ready", "running"].includes(tab.status) && sameRecovery(tab.continuityRecovery, record.identity)
     && !tab.continuityInvalidated && !tab.view.webContents.isDestroyed()
     && !require("./continuity-lease.cjs").continuityExpired(tab);
   const state = !live && ["prepared", "send-possible"].includes(record.state) ? "missing" : record.state;
@@ -347,6 +347,44 @@ function markContinuitySendPossible(host, recovery) {
   record.state = "send-possible";
   return { ...receipt(host, record), sendAuthorized };
 }
+/** Idempotent confirmation of a journal fence at the page owner. It cannot revoke a Send. */
+function terminateContinuityPreparation(host, recovery) {
+  const termination = require("./continuity-execution-authority.cjs").preparationTermination(host, recovery);
+  const { assertContinuityLease, continuityLease } = require("./continuity-lease.cjs");
+  const matches = [...host.turnTabs.values()].filter(tab => tab.continuityLeaseId === termination.lease.leaseId
+    && tab.continuityOwner === termination.lease.owner);
+  if (matches.length !== 1) throw failure("continuity_session_lost");
+  const tab = matches[0];
+  assertContinuityLease(tab, termination.lease);
+  if (tab.authenticationRequired || host.userCancelledTurnOwners?.has(termination.traceId)
+    || tab.failedAt !== undefined || tab.closing) throw failure("continuity_session_lost");
+  // A pre-publication manual failure still refers to the previous ready lease.
+  // An acquired helper preparation owns the current running trace and helper.
+  const acquired = sameRecovery(tab.continuityRecovery, recovery);
+  if (acquired && (tab.traceId !== termination.traceId || tab.helperPid !== termination.helperPid)) throw failure();
+  if (!acquired && tab.status !== "ready") throw failure("continuity_execution_unsettled");
+  let record = acquired ? exactRecord(host, recovery, true) : undefined;
+  if (!record && acquired) {
+    if (tables(host).has(threadKey(recovery)) || tables(host).size >= MAX_RECOVERY_THREADS) throw failure("continuity_unverified");
+    record = { identity: structuredClone(recovery), owner: tab.continuityOwner, traceId: tab.traceId,
+      helperPid: tab.helperPid, conversationKey: tab.conversationKey, mode: tab.interactionMode,
+      tabId: tab.id, state: "prepared", writerRetired: false,
+      result: { continuity: continuityLease(tab), ...(tab.surfaceId ? { surfaceId: tab.surfaceId } : {}) } };
+    tables(host).set(threadKey(recovery), record);
+  }
+  if (record && acquired) {
+    if (!["prepared", "completed"].includes(record.state) || record.preparationTerminated && record.preparationTerminated !== termination.receiptId) throw failure("continuity_execution_unsettled");
+    record.state = "completed";
+    record.preparationTerminated = termination.receiptId;
+  }
+  tab.status = "ready"; tab.approvalPending = false; tab.turnProgress = undefined;
+  tab.activity = undefined; tab.loading = false;
+  tab.message = "Preparation failed. The conversation is retained; correct the input and retry.";
+  if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling?.(true);
+  host.syncPowerSaveBlocker?.(); host.publishState?.(host.snapshot()); host.writeDescriptor?.();
+  return { recovery: structuredClone(recovery), requestId: termination.requestId, receiptId: termination.receiptId,
+    traceId: termination.traceId, helperPid: termination.helperPid, state: "preparation-terminated", continuity: continuityLease(tab) };
+}
 async function retireContinuityWriter(host, recovery) {
   let existing;
   try { existing = exactRecord(host, recovery, true); } catch { /* A successor owns the current table. */ }
@@ -445,4 +483,4 @@ module.exports = { RECOVERY_FEATURE, validRecovery, sameRecovery, validateRecove
   acquisitionCapacityFailure, noteAcquisitionEffect, acquisitionKnownUnsentReceipt,
   assertContinuityActivity, physicalTurnTabs, isSafelyReclaimableTurnTab,
   acquireContinuityTransaction, queryContinuityTransaction, updateContinuityPreparation,
-  markContinuitySendPossible, retireContinuityWriter, retryContinuityCleanup, completeContinuityTransaction, removedContinuityTab };
+  markContinuitySendPossible, terminateContinuityPreparation, retireContinuityWriter, retryContinuityCleanup, completeContinuityTransaction, removedContinuityTab };

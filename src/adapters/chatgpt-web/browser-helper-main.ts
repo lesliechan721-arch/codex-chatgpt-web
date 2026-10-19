@@ -793,4 +793,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", "preparation-termination-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });

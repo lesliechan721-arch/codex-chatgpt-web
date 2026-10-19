@@ -41,6 +41,7 @@ const { RuntimeHost } = require("./runtime.cjs");
 const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("./connector-identity.cjs");
 const { createApiAccessSettings, readPolicyFile } = require("./api-access-settings.cjs");
 const { registerApiAccessIpc } = require("./api-access-ipc.cjs");
+const { registerTaskInputIpc } = require("./task-input-ipc.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
@@ -757,6 +758,11 @@ function registerIpc({ logger, stateStore }) {
     beforeMutation: () => runtimeStartup,
   });
   app.once("will-quit", disposeApiAccessIpc);
+  const disposeTaskInputIpc = registerTaskInputIpc({
+    ipcMain, runtimeHost, clipboard, getWindow: () => mainWindow,
+    rendererNavigationAllowed, beforeAction: () => runtimeStartup,
+  });
+  app.once("will-quit", disposeTaskInputIpc);
   handle("launcher:limits", () => limitsController.snapshot());
   handle("launcher:limits-setup", async () => {
     if (runtimeHost.currentOperation()) throw new Error("Finish the current launcher operation before checking Limits.");

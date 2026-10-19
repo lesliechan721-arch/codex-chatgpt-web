@@ -2,11 +2,13 @@ import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-
 import { recoveryIdentity } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import * as recoveryRuntime from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
+import { ContinuityTaskInputStore } from "../src/adapters/chatgpt-web/continuity-task-input-store";
+import { taskUpdateDigest } from "../src/adapters/chatgpt-web/task-update-source";
 import { leaveContinuityMode, stopDurableContinuity } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
@@ -23,16 +25,19 @@ const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
 
-function repair6SourceHelper(f: ReturnType<typeof httpFixture>, boundary: "response" | "dom" | "unknown-send", fault: string): void {
+function repair6SourceHelper(f: ReturnType<typeof httpFixture>, boundary: "response" | "dom" | "unknown-send" | "unknown-send-healthy", fault: string): void {
   const script = join(f.root, "page-loss-helper.ts");
   writeFileSync(script, `
-    import { existsSync } from "node:fs";
+    import { existsSync, writeFileSync } from "node:fs";
     import { ChatGptBrowserWorker } from ${JSON.stringify(resolve("src/adapters/chatgpt-web/browser-worker.ts"))};
     import { callTurnBroker } from ${JSON.stringify(resolve("src/adapters/chatgpt-web/turn-broker.ts"))};
     ChatGptBrowserWorker.prototype.runBrowserTurn = async function(turn) {
       const compiled = await turn.prepare();
       await turn.onSendActivated();
-      if (${JSON.stringify(boundary)} === "unknown-send") {
+      if (${JSON.stringify(boundary)}.startsWith("unknown-send")) {
+        writeFileSync(${JSON.stringify(`${fault}.send-possible`)}, "ready");
+        while (!existsSync(${JSON.stringify(fault)})) await new Promise(resolve => setTimeout(resolve, 5));
+        if (${JSON.stringify(boundary)} === "unknown-send-healthy") throw new Error("fixture submission confirmation unavailable");
         this.activeComposer = async () => ({ locator: () => ({ locator: () => ({ waitFor: async () => {} }) }) });
         return this.sendAttachedPrompt({ isClosed: () => true }, {});
       }
@@ -128,17 +133,44 @@ for (const boundary of ["response", "dom"] as const) for (const userClosed of [f
   }, 30_000);
 }
 
-test("repair6: public helper page loss revokes unknown Send and accepts the current request", async () => {
+for (const closedBeforeHelperTerminal of [false, true]) test(`repair6: public helper page loss revokes unknown Send and accepts the current request (closed-before-terminal=${closedBeforeHelperTerminal})`, async () => {
   const f = httpFixture(), fault = join(f.root, "unknown-send-fault");
-  repair6SourceHelper(f, "unknown-send", fault);
-  const response = await f.send(f.body);
-  expect(response.status).toBe(200); expect((await response.json()).status).toBe("failed");
+  repair6SourceHelper(f, closedBeforeHelperTerminal ? "unknown-send" : "unknown-send-healthy", fault);
+  const pending = f.send(f.body); void pending.catch(() => {});
+  for (let i = 0; i < 1000 && !await Bun.file(`${fault}.send-possible`).exists(); i++) await Bun.sleep(10);
+  expect(await Bun.file(`${fault}.send-possible`).exists()).toBe(true);
   const store = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId);
+  const binding = continuityBindingsFor(f.statePath).observed(thread)!, lease = structuredClone(binding.lease!);
+  const source = chatGptTurnSessions.find(binding.executionKey!)!;
+  const original = store.get(thread)!;
+  expect(original.works[original.currentWorkId!]!.attempts[0]!.sendEvidence?.status).toBe("possible");
+  const closeOriginalPage = () => {
+    // Model the Launcher losing this exact physical page, without removing a successor.
+    const key = binding.conversation!.key;
+    expect(f.pages.get(key)?.continuity).toEqual(lease);
+    expect(source.traceId).toBe(lease.traceId);
+    expect(f.pages.delete(key)).toBe(true);
+  };
+  if (closedBeforeHelperTerminal) closeOriginalPage();
+  // The helper cannot observe its closed Page until the matching Launcher page is absent.
+  writeFileSync(fault, closedBeforeHelperTerminal ? "physical page absent" : "healthy page; submission unresolved");
+  const response = await pending;
+  expect(response.status).toBe(200); expect((await response.json()).status).toBe("failed");
+  await source.physicalSettlement;
   delete f.provider.chatgptWeb!.browserHelperScriptPath;
+  if (!closedBeforeHelperTerminal) {
+    expect(f.pages.get(binding.conversation!.key)?.continuity).toEqual(lease);
+    expect(store.get(thread)!.works[original.currentWorkId!]!.attempts[0]!.sendEvidence?.status).toBe("possible");
+    const unresolved = await f.send(f.body);
+    expect(unresolved.status).toBe(200); expect((await unresolved.json()).status).toBe("failed");
+    expect(f.controls.helperStarts).toBe(1); expect(f.submissions).toHaveLength(0);
+    closeOriginalPage();
+  }
   const recovered = await f.send(f.body);
   expect(recovered.status, await recovered.clone().text()).toBe(200); expect((await recovered.json()).status).toBe("completed");
+  expect(store.get(thread)!.epoch).not.toBe(original.epoch);
   expect(store.get(thread)!.works[store.get(thread)!.currentWorkId!]!.attempts).toHaveLength(1);
-  expect(f.controls.helperStarts).toBe(1); expect(f.submissions).toHaveLength(1);
+  expect(f.controls.helperStarts).toBe(1); expect(f.controls.helperEnds).toBe(1); expect(f.submissions).toHaveLength(1);
 }, 30_000);
 
 for (const target of ["same-work", "new-work"] as const) for (const userClosed of [false, true]) test(`repair6: late original helper failure cannot mutate a ${target} successor (user-close=${userClosed})`, async () => {
@@ -1348,6 +1380,70 @@ for (const history of ["completed", "unknown-tools", "unknown-send", "unknown-la
     expect(Object.keys(store.get(thread)!.works)).toHaveLength(1);
   });
 }
+
+for (const history of ["damaged", "missing"] as const) for (const retired of [false, true]) {
+  test(`page lifetime: HTTP ${history} recovery preserves the ${retired ? "retired" : "accepted"} inbox fence`, async () => {
+    const f = httpFixture();
+    await (await f.send(f.body)).text();
+    const recovery = new ContinuityRecoveryStore(f.statePath);
+    const thread = continuityDigest(f.threadId);
+    const identity = { thread, scope: recovery.get(thread)!.scope, taskId: `task_${taskUpdateDigest([thread, "turn-first"])}` };
+    const inbox = new ContinuityTaskInputStore(f.statePath);
+    inbox.receive(identity, [{ messageId: "saved-input", text: "Retain this accepted instruction." }]);
+    if (retired) inbox.deleteTask(identity);
+    const journal = join(f.statePath, "recovery.json"), original = readFileSync(journal);
+    const payloadDirectory = join(f.statePath, "task-input-payloads");
+    const payloads = readdirSync(payloadDirectory).map(file => ({ file, body: readFileSync(join(payloadDirectory, file)) }));
+    expect(payloads).toHaveLength(retired ? 0 : 1);
+    f.pages.clear();
+    if (history === "damaged") writeFileSync(journal, "{broken", { mode: 0o600 });
+    else rmSync(journal);
+    try {
+      const response = await f.send(f.body);
+      expect(response.status).toBe(409);
+      expect((await response.json()).error.code).toBe("continuity_configuration_conflict");
+      expect(f.submissions).toHaveLength(1);
+      expect(existsSync(payloadDirectory)).toBe(true);
+      expect(readdirSync(payloadDirectory)).toEqual(payloads.map(payload => payload.file));
+      for (const payload of payloads) expect(readFileSync(join(payloadDirectory, payload.file))).toEqual(payload.body);
+      if (history === "damaged") expect(readFileSync(journal, "utf8")).toBe("{broken");
+      else expect(existsSync(journal)).toBe(false);
+    } finally {
+      // Restore only the test fault so fixture disposal can inspect its records.
+      writeFileSync(journal, original, { mode: 0o600 });
+    }
+  });
+}
+
+test("page lifetime: retired HTTP source cannot inspect or retire its healthy successor", async () => {
+  const f = httpFixture();
+  await (await f.send(f.body)).text();
+  const recovery = new ContinuityRecoveryStore(f.statePath);
+  const thread = continuityDigest(f.threadId);
+  const identity = { thread, scope: recovery.get(thread)!.scope, taskId: `task_${taskUpdateDigest([thread, "turn-first"])}` };
+  const inbox = new ContinuityTaskInputStore(f.statePath);
+  inbox.receive(identity, [{ messageId: "old-input", text: "Retire this task source." }]);
+  inbox.deleteTask(identity);
+  const next = { ...(f.next(parseRequest(f.body))._rawBody as Record<string, unknown>), model: f.body.model, reasoning: f.body.reasoning };
+  const successorResponse = await f.send(next);
+  expect(successorResponse.status, await successorResponse.clone().text()).toBe(200);
+  expect((await successorResponse.json()).status).toBe("completed");
+  const successor = recovery.get(thread)!;
+  expect(successor.works[successor.currentWorkId!]!.nativeTurnId).toBe("turn-next");
+  const registrations = readFileSync(join(f.statePath, "threads.json"), "utf8");
+  const pages = [...f.pages.keys()];
+  f.controls.inspectFailures = 1;
+  try {
+    const response = await f.send(f.body);
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("continuity_stopped");
+    expect(f.controls.inspectFailures).toBe(1);
+    expect(recovery.get(thread)).toEqual(successor);
+    expect(readFileSync(join(f.statePath, "threads.json"), "utf8")).toBe(registrations);
+    expect([...f.pages.keys()]).toEqual(pages);
+    expect(f.submissions).toHaveLength(2);
+  } finally { f.controls.inspectFailures = 0; }
+});
 
 test("page lifetime: concurrent identical HTTP recovery sends once and live payload conflicts stay rejected", async () => {
   const f = httpFixture();

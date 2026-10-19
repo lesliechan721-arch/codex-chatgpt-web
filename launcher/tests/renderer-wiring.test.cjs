@@ -51,6 +51,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
       readPolicyFile: () => ({ policy: { mode: "openai" } }),
       createApiAccessSettings: () => ({ daemonEnvironment: () => ({}) }),
       registerApiAccessIpc: () => () => {}, rendererNavigationAllowed: () => true,
+      registerTaskInputIpc: () => () => {},
       app: { once() {} },
       runtimeHost: {
         currentOperation: () => null,

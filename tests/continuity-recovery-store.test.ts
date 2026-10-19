@@ -28,6 +28,51 @@ function input(logicalWorkId = "work-A", extra: Partial<AdmitRecoveryWorkInput> 
     workPayloadDigest: payload, snapshotDigest: snapshot, dispatchProtocolComplete: true, createPage: true, ...extra };
 }
 
+for (const sendFirst of [false, true]) test(`preparation termination and the real Send authorization are exclusive, send first=${sendFirst}`, () => {
+  const { path, store } = fixture();
+  store.admitWork(input());
+  const launcherInstance = { pid: owner.pid, startIdentity: owner.startIdentity, instanceId: "8".repeat(64) };
+  const acquired = store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "page-acquired", pageReceiptId: "7".repeat(32), launcherInstance });
+  const original = recoveryIdentity(acquired, store.installationId());
+  const local = { requestId: "local_preparation_0001", traceId: "preparation_trace_0001", helperPid: process.pid,
+    lease: { owner: owner.id, traceId: "preparation_trace_0001", leaseId: "7".repeat(32), recovery: original } };
+  if (sendFirst) store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "send-possible", sendIdentity: original });
+  const termination = store.terminatePreparation(original, local);
+  if (sendFirst) {
+    expect(termination).toBeUndefined();
+    expect(store.get(thread)!.works["work-A"]!.attempts[0]!.sendEvidence?.status).toBe("possible");
+    expect(store.withExecutionAuthority(original, () => "Send queued")).toBe("Send queued");
+    return;
+  }
+  expect(termination).toMatchObject({ ...local, recovery: original, status: "pending" });
+  expect(() => store.withExecutionAuthority(original, () => { throw new Error("must never enqueue"); })).toThrow("obsolete");
+  expect(() => store.markAttempt(thread, guard, { logicalWorkId: "work-A", attempt: 0, stage: "send-possible", sendIdentity: original })).toThrow();
+  const restarted = new ContinuityRecoveryStore(path);
+  expect(restarted.terminatePreparation(original, local)).toEqual(termination);
+  const settled = restarted.settlePreparationTermination(original, termination!.receiptId)!;
+  expect(settled.state).toBe("ready"); expect(settled.historyRevision).toBe(acquired.historyRevision);
+  expect(settled.checkpoints).toEqual(acquired.checkpoints);
+  const retried = restarted.retryTerminatedPreparation(thread, { scope, expectedVersion: settled.version }, "work-A", snapshot);
+  expect(retried.epoch).toBe(original.epoch);
+  expect(retried.works["work-A"]!.attempts).toHaveLength(2);
+  expect(retried.works["work-A"]!.attempts[0]!.writerRetired).toBe(true);
+  expect(retried.works["work-A"]!.attempts[1]!.writerRetired).toBe(false);
+  expect(restarted.settlePreparationTermination(original, termination!.receiptId)).toBeUndefined();
+});
+
+test("a stopped preparation cannot be settled back to ready or acquire a new writer", () => {
+  const { store } = fixture();
+  const admitted = store.admitWork(input());
+  const original = recoveryIdentity(admitted, store.installationId());
+  const termination = store.terminatePreparation(original, { requestId: "local_preparation_stop", traceId: "preparation_trace_stop", helperPid: process.pid,
+    lease: { owner: owner.id, traceId: "preparation_trace_stop", leaseId: "7".repeat(32) } })!;
+  store.stopWork(thread, guard, "work-A", "user-stop");
+  const stopped = store.get(thread)!;
+  expect(store.settlePreparationTermination(original, termination.receiptId)).toBeUndefined();
+  expect(store.get(thread)).toEqual(stopped);
+  expect(() => store.retryTerminatedPreparation(thread, guard, "work-A", snapshot)).toThrow();
+});
+
 for (const userClosed of [false, true]) test(`helper failure settlement excludes cross-process retirement until its one durable commit (user-close=${userClosed})`, () => {
   let inspectCommit = false, commits = 0;
   const { path, store } = fixture({ now: () => 10_000, beforeWrite: () => {

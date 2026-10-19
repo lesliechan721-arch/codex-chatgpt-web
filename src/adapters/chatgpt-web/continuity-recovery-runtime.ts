@@ -10,6 +10,7 @@ import type { BrokerToolRequest } from "./turn-broker";
 import { assertContextCoverageAdvance, validateContextCoverageMetadata, type ContextCoverageMetadata } from "./context-coverage-journal";
 import { CompactionSourceCoverage } from "./compaction-context";
 import type { ContextSnapshot } from "./context-snapshot";
+import type { TaskInputIdentity } from "./continuity-task-input-types";
 
 /** Passed only through authenticated local owner registration, never Native invocation input. */
 export interface RuntimeRecoveryReference {
@@ -81,7 +82,7 @@ export interface RuntimeRecoverySendReference {
   readonly authorizationId: string;
 }
 export function beginRecoverySend(ref: RuntimeRecoveryReference, original: ContinuityRecoveryIdentity,
-  authorizationId?: string): RuntimeRecoverySendReference {
+  authorizationId?: string, authorize?: () => void): RuntimeRecoverySendReference {
   const record = recoveryRecord(ref);
   if (ref.ownerId !== undefined && ref.ownerId !== record.owner.id) throw continuityError("continuity_source_unproven");
   if (original.threadKey !== ref.thread || original.logicalWorkId !== ref.logicalWorkId || original.attempt !== ref.attempt) {
@@ -90,7 +91,7 @@ export function beginRecoverySend(ref: RuntimeRecoveryReference, original: Conti
   const store = recoveryStore(ref);
   const next = store.markAttempt(ref.thread, { scope: record.scope, expectedVersion: record.version }, {
     logicalWorkId: ref.logicalWorkId, attempt: ref.attempt, stage: "send-possible",
-    transactionVersion: original.transactionVersion, sendIdentity: original, ...(authorizationId ? { sendAuthorizationId: authorizationId } : {}) });
+    transactionVersion: original.transactionVersion, sendIdentity: original, authorize, ...(authorizationId ? { sendAuthorizationId: authorizationId } : {}) });
   return Object.freeze({ directory: ref.directory, scope: record.scope, identity: Object.freeze(structuredClone(original)),
     authorizationId: next.works[ref.logicalWorkId]!.attempts[ref.attempt]!.sendEvidence!.authorizationId });
 }
@@ -279,7 +280,7 @@ export function bindRecoveryContextCoverage(ref: RuntimeRecoveryReference, cover
   coverage.bindPersistence(persist, initialMetadata);
 }
 /** Every Broker entry uses this one boundary before returning calls to an outer executor. */
-export function recordRecoveryDelivery(ref: RuntimeRecoveryReference, requests: Array<BrokerToolRequest & { operationId?: number }>): void {
+export function recordRecoveryDelivery(ref: RuntimeRecoveryReference, requests: Array<BrokerToolRequest & { operationId?: number }>, authorize?: () => void): void {
   // An observer may drain an empty queue after the accepted final retired its writer.
   // There is no dispatch authority or durable evidence to publish in that case.
   if (!requests.length) return;
@@ -288,6 +289,7 @@ export function recordRecoveryDelivery(ref: RuntimeRecoveryReference, requests: 
   // Publish identities and delivery-possible in one atomic write. An interrupted return is
   // deliberately unknown, never proof that the outer executor did not receive the call.
   store.transact(ref.thread, { scope: record.scope, expectedVersion: record.version }, draft => {
+    authorize?.();
     const work = draft.works[ref.logicalWorkId]!;
     const lineage = draft.lineages[work.workLineageId];
     if (!lineage) throw continuityError("continuity_context_missing");
@@ -467,6 +469,7 @@ export async function retireRecoveryWriter(
   bindings: import("./continuity-binding").ContinuityBindings,
   observed: RecoveryThreadRecord,
   descriptor: string,
+  sourceTask?: TaskInputIdentity,
 ): Promise<RecoveryThreadRecord> {
   const { chatGptTurnSessions } = await import("./turn-execution");
   const { continuityProcessInstanceStatus } = await import("./continuity-recovery-store");
@@ -487,8 +490,8 @@ export async function retireRecoveryWriter(
       || current.currentWorkId !== work!.logicalWorkId || current.epoch !== observed.epoch) {
       throw continuityError("continuity_source_unproven", "The retirement observation is stale; inspect the current writer again.");
     }
-    if (!attempt.writerRetired) bindings.recoveryStore.retireAttempt(current.thread,
-      { scope: current.scope, expectedVersion: current.version, expectedOwner: current.owner.id }, work!.logicalWorkId, attempt.attempt);
+    if (!attempt.writerRetired || sourceTask) bindings.recoveryStore.retireAttempt(current.thread,
+      { scope: current.scope, expectedVersion: current.version, expectedOwner: current.owner.id }, work!.logicalWorkId, attempt.attempt, sourceTask);
     if (source) {
       try { await source.runtime.retireCapability?.(); }
       catch { /* The durable fence already denies effects; late coverage cannot delay isolation. */ }
@@ -540,13 +543,14 @@ export interface RecoveryAppendAdmission {
   contextCoverage?: readonly Readonly<ContextCoverageMetadata>[];
 }
 /** Broker calls this after validation, immediately before publishing the new writer version. */
-export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: RecoveryAppendAdmission, updates?: readonly import("./task-update-protocol").UserUpdate[], driverGeneration?: number): void | { committed: boolean; confirm: () => void } {
+export function recordRecoveryAppend(ref: RuntimeRecoveryReference, input: RecoveryAppendAdmission, updates?: readonly import("./task-update-protocol").UserUpdate[], driverGeneration?: number, authorize?: () => void): void | { committed: boolean; confirm: () => void } {
   const record = assertRecoveryWriter(ref);
   const store = recoveryStore(ref);
   let candidate: RecoveryThreadRecord | undefined;
   let updated: RecoveryThreadRecord;
   let confirmation: { committed: boolean; confirm: () => void } | undefined;
   try { updated = store.transact(ref.thread, { scope: record.scope, expectedVersion: record.version }, draft => {
+    authorize?.();
     candidate = draft;
     if (input.contextCoverage) applyRecoveryContextCoverage(draft, ref, input.contextCoverage);
     const predecessor = draft.works[ref.logicalWorkId]!;

@@ -1,10 +1,10 @@
 import { isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
 import { chatGptCurrentInstructionRevision } from "./environment";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
-import { acquireContinuityStorageLock, continuityProcessInstance, continuityProcessInstanceStatus, type RecoveryThreadRecord, type RecoveryWorkRecord } from "./continuity-recovery-store";
+import { acquireContinuityStorageLock, continuityProcessInstance, continuityProcessInstanceStatus, type RecoveryThreadRecord, type RecoveryWorkRecord, type RecoveryTaskInputRetry } from "./continuity-recovery-store";
 import { recoveryContext, recoveryDigest, recoveryIdentity, retireRecoveryWriter, forgetRecoveryPage, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import type { ContinuityRecoveryIdentity } from "./continuity-contract";
 import { join, resolve } from "node:path";
@@ -14,6 +14,7 @@ import { expandUserPath } from "../../config";
 import {
   assertLauncherContinuityCapacity, assertLauncherContinuityFeature, inspectLauncherContinuityConversation,
   readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
+  terminateLauncherContinuityPreparation,
 } from "../../launcher-browser-host";
 import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -29,14 +30,15 @@ import {
 } from "./continuity-binding";
 import { isContinuityLease, sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityLease } from "./continuity-contract";
 import { continuityError } from "./continuity-errors";
-import { taskUpdateSourceError } from "./task-update-source";
+import { captureTaskUpdateSource, taskUpdateDigest, taskUpdateSourceError } from "./task-update-source";
+import { ContinuityTaskInputStore, type TaskInputIdentity } from "./continuity-task-input-store";
 import { continuityToolRegistry } from "./continuity-tools";
 import { isAcceptedCompactionContinuation } from "./compaction-continuation";
 import { existingStructuredCompactionRun, hasActiveStructuredCompactionRun, registerStructuredCompactionPage } from "./compaction-handoff";
 import { preflightContinuityInput } from "./continuity-input";
 import { chatGptConversationKey } from "./conversation-key";
 import {
-  chatGptCurrentInstructionIndex, chatGptInstructionContent, chatGptInstructionEnvelope,
+  chatGptCurrentInstructionIndex, chatGptInstructionContent, chatGptInstructionEnvelope, bindDurableQueuedInstructionInput, trustedChatGptTaskUpdateUserText,
   continuityCurrentEnvironmentInput, continuityCurrentInstructionInput, extractChatGptTurnIdentity, requestCarriedChatGptInstructionRevision,
   hasInitialChatGptTurnInstruction, hasNativeChatGptInstruction, continuityCheckpointSiblings, continuityCheckpointSiblingGroup, continuityCheckpointSiblingProof, bindContinuityCheckpointSourceIndex, CONTINUITY_CHECKPOINT_SIBLING_PROOF,
 } from "./environment";
@@ -69,6 +71,8 @@ export interface PreparedContinuityRequest {
   appendSource?: ChatGptTurnSession;
   recovery?: ContinuityRecoveryIdentity;
   recovered?: boolean;
+  /** Current-source proof for a user-created intent; initial prompt coverage only. */
+  taskInputRetry?: { identity: TaskInputIdentity; intentGeneration: number; messageIds: string[] };
   /** The exact accepted checkpoint selected for this recovery input. */
   recoveryCheckpointId?: string;
   releaseAdmission?: () => void;
@@ -178,6 +182,30 @@ function checkpointResumeInput(
     nativeTurnId: continuation?.instructionPrevious.nativeTurnId ?? checkpoint.sourceInstructionReplay?.nativeTurnId,
     checkpointDigest: proof.digest,
   };
+  // A queued same-turn instruction can arrive after the checkpoint source was
+  // frozen. Its durable ID/body prefix establishes the boundary independently
+  // of the removed source message; ordinary wire history cannot establish it.
+  const native = extractChatGptTurnIdentity(parsed);
+  const rawInput = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
+  if (!continuation && checkpoint.revision === binding.revision && proof.digest === continuityDigest(checkpoint.summary)
+    && parsed._continuityScope === binding.scope && parsed._continuityStateDirectory
+    && native.threadId && continuityDigest(native.threadId) === binding.thread && native.turnId
+    && proof.index === 0 && Array.isArray(rawInput) && rawInput.length > 1) {
+    const inbox = new ContinuityTaskInputStore(parsed._continuityStateDirectory);
+    const identity = { thread: binding.thread, scope: binding.scope, taskId: `task_${taskUpdateDigest([binding.thread, native.turnId])}` };
+    const task = inbox.get(identity);
+    const pending = task?.state === "active" ? task.messages.filter(message => message.status === "accepted"
+      && !message.deliveryIds.some(id => task.deliveries.some(delivery => delivery.deliveryId === id
+        && !delivery.cancelled && delivery.intentGeneration === task.intentGeneration))) : [];
+    const suffix = rawInput.slice(1);
+    if (suffix.length <= 16 && suffix.length <= pending.length && suffix.every((value, index) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const user = trustedChatGptTaskUpdateUserText(value as Record<string, unknown>, native.turnId!);
+      return user && user.sourceMessageId === pending[index]!.messageId
+        && taskUpdateDigest(user.content) === pending[index]!.digest
+        && inbox.readBody(identity, user.sourceMessageId) === user.content;
+    })) bindDurableQueuedInstructionInput(parsed, suffix.map((_, index) => index + 1));
+  }
   const suffix = continuation?.suffix ?? continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
   const hasNewInstruction = hasInitialChatGptTurnInstruction(parsed) && hasNativeChatGptInstruction(parsed, suffix);
   if (hasNewInstruction) chatGptTurnSessions.assertUnconsumedContinuityInstruction(binding, parsed);
@@ -292,13 +320,86 @@ function assertCheckpointSourceReplay(parsed: CodexParsedRequest, identity: Retu
   }
 }
 
-/** A stopped instruction is terminal even when a newer instruction owns the live binding. */
+function explicitTaskInputRetry(parsed: CodexParsedRequest, record?: RecoveryThreadRecord): RecoveryTaskInputRetry | undefined {
+  const native = extractChatGptTurnIdentity(parsed);
+  if (!native.threadId || !native.turnId || !parsed._continuityStateDirectory || !parsed._continuityScope || parsed._compactionRequest) return;
+  const identity = { thread: continuityDigest(native.threadId), scope: record?.scope ?? parsed._continuityScope,
+    taskId: `task_${taskUpdateDigest([continuityDigest(native.threadId), native.turnId])}` };
+  const task = new ContinuityTaskInputStore(parsed._continuityStateDirectory).get(identity);
+  if (!task) return;
+  if (task.retired) throw continuityError("continuity_stopped");
+  if (task.state === "stopped") throw continuityError("continuity_stopped");
+  const selected = task.messages.filter(message => message.intentGeneration === task.intentGeneration && message.retryOfIntentGeneration !== undefined);
+  if (!selected.length) return;
+  const proof = captureTaskUpdateSource(parsed, { capabilityIdentity: "explicit-task-input-retry" });
+  const carried = proof?.messages.filter(message => selected.some(saved => saved.messageId === message.sourceMessageId));
+  if (!proof || proof.conflictingMessageIds?.length || proof.currentMessageId !== selected.at(-1)!.messageId
+    || canonicalJson(carried?.map(message => [message.sourceMessageId, message.payloadDigest]))
+      !== canonicalJson(selected.map(message => [message.messageId, message.digest]))) throw continuityError("continuity_stopped",
+        "The explicit retry is waiting for the original client request with the complete selected input.");
+  if (!record) {
+    const historical = task.messages.filter(message => message.status !== "discarded");
+    const carriedHistory = proof.messages.filter(message => historical.some(saved => saved.messageId === message.sourceMessageId));
+    if (canonicalJson(carriedHistory.map(message => [message.sourceMessageId, message.payloadDigest]))
+      !== canonicalJson(historical.map(message => [message.messageId, message.digest]))) throw continuityError("continuity_source_unproven", "Cold retry requires the complete original native task input history.");
+    const calls = proof.input.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"
+      && ["function_call", "custom_tool_call", "tool_search_call"].includes(String((item as Record<string, unknown>).type))));
+    const results = proof.input.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"
+      && ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(String((item as Record<string, unknown>).type))));
+    if (calls.some(call => typeof call.call_id !== "string" || !results.some(result => result.call_id === call.call_id))) {
+      throw continuityError("continuity_execution_unsettled", "Cold retry requires actual results for every historical tool call; no old call will be dispatched again.");
+    }
+    return { taskId: identity.taskId, intentGeneration: task.intentGeneration,
+      messageIds: selected.map(message => message.messageId), messageDigests: selected.map(message => message.digest) };
+  }
+  const current = record.currentWorkId ? record.works[record.currentWorkId] : undefined;
+  const retry = current?.taskInputRetry;
+  const sourceLogicalWorkId = retry?.intentGeneration === task.intentGeneration && retry.taskId === identity.taskId
+    ? retry.sourceLogicalWorkId : current?.logicalWorkId;
+  if (!sourceLogicalWorkId && !retry) throw continuityError("continuity_source_unproven");
+  return { taskId: identity.taskId, intentGeneration: task.intentGeneration, sourceLogicalWorkId,
+    messageIds: selected.map(message => message.messageId), messageDigests: selected.map(message => message.digest) };
+}
+
+/** Reject a retired source before page inspection or retirement can affect its successor. */
+function taskInputRequestIdentity(parsed: CodexParsedRequest): TaskInputIdentity | undefined {
+  const native = extractChatGptTurnIdentity(parsed);
+  if (parsed._conversationPolicy !== "task" || !native.threadId || !native.turnId || !parsed._continuityScope) return;
+  const thread = continuityDigest(native.threadId), taskId = `task_${taskUpdateDigest([thread, native.turnId])}`;
+  return { thread, scope: parsed._continuityScope, taskId };
+}
+function assertTaskInputSourceNotRetired(parsed: CodexParsedRequest, directory: string): void {
+  const identity = taskInputRequestIdentity(parsed);
+  if (!identity) return;
+  const { thread, taskId } = identity;
+  const store = new ContinuityTaskInputStore(directory);
+  let task: ReturnType<ContinuityTaskInputStore["get"]>;
+  try {
+    task = store.get(identity);
+    if (!task) {
+      const record = continuityBindingsFor(directory).recoveryStore.get(thread);
+      if (record && (record.canonicalScope === parsed._continuityCanonicalScope || parsed._continuityLegacyScopes?.includes(record.scope))) {
+        task = store.get({ thread, scope: record.scope, taskId });
+      }
+    }
+  } catch (error) {
+    // A legacy page journal may be repaired below only if no inbox has ever
+    // reserved input. The payload directory survives body cleanup and deletion.
+    try { lstatSync(join(directory, "task-input-payloads")); }
+    catch (markerError) { if ((markerError as NodeJS.ErrnoException).code === "ENOENT") return; }
+    throw error;
+  }
+  if (task?.retired) throw continuityError("continuity_stopped", "This task source has retired. Start a new native turn for new work.");
+}
+
+/** A stopped instruction needs an exact user-created retry and fresh current-source admission. */
 export function assertContinuityStoppedReceipt(parsed: CodexParsedRequest): void {
   if (parsed._conversationPolicy !== "task" || parsed._compactionRequest
     || !parsed._continuityStateDirectory || !parsed._continuityScope) return;
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId || !identity.turnId) return;
   const record = continuityBindingsFor(parsed._continuityStateDirectory).recoveryStore.get(continuityDigest(identity.threadId));
+  if (explicitTaskInputRetry(parsed, record)) return;
   if (!record || record.legacyUnproven || !(record.scope === parsed._continuityScope
     || record.canonicalScope === parsed._continuityCanonicalScope
     || parsed._continuityLegacyScopes?.includes(record.scope))) return;
@@ -389,6 +490,8 @@ export async function prepareContinuityRequest(...args: Parameters<typeof prepar
       pageSelected();
     });
     try {
+      bindContinuityRequestScope(parsed, args[2]);
+      assertTaskInputSourceNotRetired(parsed, bindings.registrations.directory);
       await reconcilePageDirectory(bindings, resolve(expandUserPath(provider.chatgptWeb!.browserHostDescriptorPath!)),
         continuityDigest(native.threadId!), parsed);
       observedBeforePrepare = bindings.recoveryStore.get(continuityDigest(native.threadId!));
@@ -534,7 +637,13 @@ async function prepareFreshPage(parsed: CodexParsedRequest, namespace: string, c
   if (!parsed.context.messages.length) throw continuityError("continuity_context_missing", "The current request has no readable task context.");
   await compatible();
   bindRequestCheckpointInstruction(parsed);
-  const input = parsed;
+  const retry = explicitTaskInputRetry(parsed);
+  const input = retry ? structuredClone(parsed) : parsed;
+  if (retry) {
+    input.context.systemPrompt = [...input.context.systemPrompt ?? [],
+      `Explicit user retry: process only the retried user message IDs ${JSON.stringify(retry.messageIds)} using the current request's permissions. Historical tool calls and real returned results are context only. Do not replay old tool calls or assume a returned command session ID means that the command exited.`];
+    continuityRecoveredContextCandidate(parsed, input);
+  }
   preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
@@ -546,11 +655,15 @@ async function prepareFreshPage(parsed: CodexParsedRequest, namespace: string, c
   const thread = continuityDigest(identity.threadId!);
   const scope = parsed._continuityScope!;
   const payload = chatGptContinuityInstructionPayloadDigest(parsed);
-  const logicalWorkId = recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary", epoch]);
-  const record = bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
+  const logicalWorkId = retry ? recoveryDigest([scope, identity.turnId, "explicit-input-retry", retry.taskId, retry.intentGeneration])
+    : recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary", epoch]);
+  const admission = { thread, scope, owner: continuityProcessInstance(bindings.owner),
     logicalWorkId, instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId,
     workPayloadDigest: payload, snapshotDigest: recoveryDigest(input.context), createPage: true, dispatchProtocolComplete: true,
-    initialEpoch: epoch });
+    initialEpoch: epoch };
+  const record = retry ? bindings.recoveryStore.reserveTaskInputRetry(admission, retry) : bindings.recoveryStore.admitWork(admission);
+  parsed._continuityEpoch = input._continuityEpoch = record.epoch;
+  parsed._continuityPageGeneration = input._continuityPageGeneration = record.epoch;
   const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
   const binding = bindings.installRecovered(record, executionKey, continuityCheckpoint(parsed).digest, identity.turnId);
   binding.initialAcceptedInput = continuityAcceptedContextCandidate(parsed, input);
@@ -558,7 +671,9 @@ async function prepareFreshPage(parsed: CodexParsedRequest, namespace: string, c
   const conversationKey = chatGptConversationKey(parsed, namespace)!;
   binding.conversation = { key: conversationKey, descriptor };
   return { bindings, binding, descriptor, conversationKey, executionKey, nativeThreadId: identity.threadId!, revision: 0,
-    input, recovery: recoveryIdentity(record, bindings.recoveryStore.installationId()), recovered: true };
+    input, recovery: recoveryIdentity(record, bindings.recoveryStore.installationId()), recovered: true,
+    ...(retry ? { taskInputRetry: { identity: { thread, scope, taskId: retry.taskId },
+      intentGeneration: retry.intentGeneration, messageIds: retry.messageIds } } : {}) };
 }
 
 /** Resolves trusted history identity before trace/replay lookup or browser/clipboard mutation. */
@@ -599,6 +714,24 @@ async function prepareContinuityRequestUnlocked(
   }
   const scope = parsed._continuityScope!;
   let binding = bindings.lookup(thread, scope);
+  const pendingAttempt = durable?.currentWorkId ? durable.works[durable.currentWorkId]?.attempts.at(-1) : undefined;
+  const termination = pendingAttempt?.preparationTermination;
+  if (durable && termination && durable.owner.id === bindings.owner && durable.state !== "stopped"
+    && (termination.status === "pending" || binding?.state === "unverified" || binding?.state === "running")) {
+    try {
+      const lease = await terminateLauncherContinuityPreparation(descriptor, termination.recovery, bindings.registrations.directory, termination);
+      const settled = bindings.recoveryStore.settlePreparationTermination(termination.recovery, termination.receiptId);
+      if (!settled) throw continuityError("continuity_source_unproven");
+      if (binding?.executionKey) {
+        chatGptTurnSessions.restorePreparationConversationHead(binding.conversation!.key, binding.executionKey, binding.preparationSourceExecutionKey, binding);
+        bindings.preparationTerminated(binding, binding.executionKey, binding.preparationSourceExecutionKey, lease);
+      }
+      durable = settled;
+    } catch (error) {
+      if ((error as { code?: string }).code === "continuity_session_lost") throw error;
+      throw continuityError("continuity_unverified", "Preparation failed. Recovery is awaiting confirmation for the same attempt; no new Send is permitted.");
+    }
+  }
   if (binding?.initialAcceptedInput?._continuityRequestInstruction) bindRequestCheckpointInstruction(parsed);
   if (durable?.scope !== undefined && durable.scope !== scope) throw continuityError("continuity_configuration_conflict");
   if (durable?.legacyUnproven) throw continuityError("continuity_legacy_unproven");
@@ -613,6 +746,14 @@ async function prepareContinuityRequestUnlocked(
       throw continuityError("continuity_configuration_conflict", "Update and restart Launcher and its helper before starting this mode.");
     }
   };
+  if (!parsed._compactionRequest && durable) {
+    const retry = explicitTaskInputRetry(parsed, durable);
+    if (retry) {
+      const prepared = await prepareExplicitTaskInputRetry(parsed, namespace, capabilities, config.experimentalSkillAttachments,
+        bindings, durable, retry, descriptor, assertExecutionCompatible, abortSignal, config.experimentalBiggerContext);
+      if (prepared) return prepared;
+    }
+  }
   if (!pageAlive) {
     if (parsed._compactionRequest) {
       const { prepareFreshRecoveryCompaction } = await import("./continuity-recovery-compaction");
@@ -693,9 +834,10 @@ async function prepareContinuityRequestUnlocked(
   parsed._continuityEpoch = binding?.epoch ?? durable?.epoch ?? 0;
   const currentInstruction = !parsed._compactionRequest ? continuityInstructionIdentity(parsed) : undefined;
   const currentWork = currentInstruction && durable ? Object.values(durable.works).find(work => work.instructionIdentity === currentInstruction && work.nativeTurnId === identity.turnId && work.purpose === "ordinary") : undefined;
-  if (currentWork) parsed._continuityAttempt = currentWork.attempts.at(-1)!.attempt;
+  if (currentWork) parsed._continuityAttempt = currentWork.attempts.at(-1)!.attempt
+    + (currentWork.attempts.at(-1)!.preparationTermination?.status === "settled" ? 1 : 0);
   const localOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
-  const appendSource = !parsed._compactionRequest && binding?.lease && localOwner?.isActive()
+  const appendSource = !parsed._compactionRequest && localOwner?.isActive()
     && localOwner.nativeThreadId === identity.threadId && localOwner.nativeTurnId === identity.turnId
     && localOwner.runtime.continuityBinding === binding && !localOwner.supersededError
     ? localOwner : undefined;
@@ -859,10 +1001,9 @@ async function prepareContinuityRequestUnlocked(
   let coldPage = false;
   let pendingPageContext = false;
   if (!parsed._compactionRequest && !existing && appendSource) {
-    if (!appendSource.taskUpdatesEnabled()) {
-      throw taskUpdateSourceError("task_update_upgrade_required", "This append was not accepted because the active response did not negotiate task-updates-v1. Its current work continues.");
+    if (!appendSource.hasTaskInputSource()) {
+      throw taskUpdateSourceError("task_update_upgrade_required", "This runtime cannot prove durable input receipt for the active response.");
     }
-    if (binding!.state === "compacting") throw taskUpdateSourceError("task_update_compaction_pending", "This append was not accepted because context compaction owns the current source.");
   } else if (!parsed._compactionRequest && !existing) {
     // The first cold request already accepted these results as history. A retry
     // can arrive before its runtime exists, but cannot add or change results.
@@ -959,16 +1100,19 @@ async function prepareContinuityRequestUnlocked(
         || continuityDigest(binding.lease ?? null) !== continuityDigest(ordinarySourceObservation.lease ?? null)) {
         throw continuityError("continuity_source_unproven", "The cold-page source observation is stale; inspect the current writer again.");
       }
-      await retireRecoveryWriter(bindings, ordinarySourceObservation.record, descriptor);
+      await retireRecoveryWriter(bindings, ordinarySourceObservation.record, descriptor, taskInputRequestIdentity(parsed));
     }
     const logicalWorkId = recoveryDigest([scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary", parsed._continuityEpoch ?? 0]);
     if (instructionPrevious && !instructionPrevious.instructionIdentity) throw continuityError("continuity_source_unproven");
-    const record = bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
+    let record = bindings.recoveryStore.admitWork({ thread, scope, owner: continuityProcessInstance(bindings.owner),
       logicalWorkId, instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId,
       workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed, instructionPrevious, allowRetainedSourceInstructionPayload),
       instructionPrevious: instructionPrevious ? { ...instructionPrevious, instructionIdentity: instructionPrevious.instructionIdentity! } : undefined,
       allowRetainedSourceFallback: allowRetainedSourceInstructionPayload,
       snapshotDigest: recoveryDigest(input.context), createPage: !expected, dispatchProtocolComplete: true });
+    if (record.works[logicalWorkId]?.attempts.at(-1)?.preparationTermination?.status === "settled") {
+      record = bindings.recoveryStore.retryTerminatedPreparation(thread, { scope, expectedVersion: record.version }, logicalWorkId, recoveryDigest(input.context));
+    }
     if (coldPage) {
       parsed._continuityEpoch = record.epoch;
       parsed._continuityAttempt = record.works[logicalWorkId]!.attempts.at(-1)!.attempt;
@@ -1050,6 +1194,80 @@ export async function finishContinuityResponse(prepared: PreparedContinuityReque
 }
 
 /** Durable receipts win before any page inspection. Only the current request supplies context. */
+async function prepareExplicitTaskInputRetry(
+  parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities, attachments: boolean | undefined,
+  bindings: ContinuityBindings, observed: RecoveryThreadRecord, retry: RecoveryTaskInputRetry, descriptor: string,
+  compatible: () => Promise<void>, abortSignal?: AbortSignal, experimentalBiggerContext = false,
+): Promise<PreparedContinuityRequest> {
+  const native = extractChatGptTurnIdentity(parsed), store = bindings.recoveryStore;
+  const metadata = { identity: { thread: observed.thread, scope: observed.scope, taskId: retry.taskId },
+    intentGeneration: retry.intentGeneration, messageIds: [...retry.messageIds] };
+  const logicalWorkId = recoveryDigest([observed.scope, native.turnId, "explicit-input-retry", retry.taskId, retry.intentGeneration]);
+  const existing = observed.works[logicalWorkId];
+  if (existing) {
+    if (observed.currentWorkId !== logicalWorkId || existing.state === "stopped"
+      || canonicalJson(existing.taskInputRetry) !== canonicalJson(retry)) throw continuityError("continuity_stopped");
+    if (existing.workPayloadDigest !== chatGptContinuityInstructionPayloadDigest(parsed)) throw continuityError("continuity_source_unproven");
+    parsed._continuityAttempt = existing.attempts.at(-1)!.attempt;
+    parsed._continuityPageGeneration = existing.attempts[0]!.epoch;
+    parsed._continuityEpoch = existing.attempts.at(-1)!.epoch;
+    parsed._continuityHistoryRevision = existing.attempts.at(-1)!.historyRevision;
+    const binding = bindings.observed(observed.thread);
+    const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+    if (binding && binding.executionKey === executionKey && !["lost", "ended", "unverified"].includes(binding.state)
+      && observed.owner.id === bindings.owner) return { bindings, binding, descriptor,
+      conversationKey: binding.conversation!.key, executionKey, nativeThreadId: native.threadId!,
+      revision: observed.historyRevision, taskInputRetry: metadata };
+    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, attachments, bindings, observed,
+      descriptor, abortSignal, compatible, experimentalBiggerContext);
+    if (!recovered) throw continuityError("continuity_unverified");
+    return { ...recovered, taskInputRetry: metadata };
+  }
+  const source = retry.sourceLogicalWorkId ? observed.works[retry.sourceLogicalWorkId] : undefined;
+  if (!source || observed.currentWorkId !== source.logicalWorkId || source.state !== "stopped" || source.nativeTurnId !== native.turnId
+    || source.purpose !== "ordinary") throw continuityError("continuity_source_unproven");
+  if (source.attempts.some(attempt => attempt.sendEvidence?.status === "possible")) throw continuityError("continuity_execution_unsettled", "The previous Send remains unverified.");
+  // Reading the saved bodies verifies custody. Current trusted client bytes still
+  // supply the instruction and current permissions; inbox content grants neither.
+  const inbox = new ContinuityTaskInputStore(bindings.registrations.directory);
+  for (const [index, id] of retry.messageIds.entries()) {
+    if (taskUpdateDigest(inbox.readBody(metadata.identity, id)) !== retry.messageDigests[index]) throw continuityError("continuity_context_missing");
+  }
+  await compatible();
+  const input = recoveryContext(parsed, { directory: bindings.registrations.directory, thread: observed.thread,
+    logicalWorkId: source.logicalWorkId, attempt: source.attempts.at(-1)!.attempt });
+  continuityRecoveredContextCandidate(parsed, input);
+  assertRecoveredSource(parsed, input, store.get(observed.thread)!, source, source.attempts.at(-1)!.historyRevision);
+  preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
+  await assertLauncherContinuityCapacity(descriptor);
+  abortSignal?.throwIfAborted();
+  const current = store.get(observed.thread)!;
+  if (current.currentWorkId !== observed.currentWorkId || current.epoch !== observed.epoch || current.owner.id !== observed.owner.id) {
+    throw continuityError("continuity_unverified");
+  }
+  const retired = await retireRecoveryWriter(bindings, current, descriptor, taskInputRequestIdentity(parsed));
+  abortSignal?.throwIfAborted();
+  const payload = chatGptContinuityInstructionPayloadDigest(parsed);
+  const admitted = store.reserveTaskInputRetry({ thread: retired.thread, scope: retired.scope,
+    owner: continuityProcessInstance(bindings.owner), logicalWorkId, instructionIdentity: continuityInstructionIdentity(parsed),
+    nativeTurnId: native.turnId, workPayloadDigest: payload, snapshotDigest: recoveryDigest(input.context),
+    createPage: true, dispatchProtocolComplete: true }, retry, retired.version);
+  parsed._continuityAttempt = 0; parsed._continuityEpoch = admitted.epoch; parsed._continuityHistoryRevision = admitted.historyRevision;
+  parsed._continuityPageGeneration = input._continuityPageGeneration = admitted.epoch;
+  input._continuityAttempt = 0; input._continuityEpoch = admitted.epoch; input._continuityHistoryRevision = admitted.historyRevision;
+  const canonical = contextCandidateCanonicalSource(parsed, input)!;
+  canonical._continuityAttempt = 0; canonical._continuityEpoch = admitted.epoch; canonical._continuityHistoryRevision = admitted.historyRevision;
+  canonical._continuityPageGeneration = admitted.epoch;
+  const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
+  const binding = bindings.installRecovered(admitted, executionKey, continuityCheckpoint(parsed).digest, native.turnId);
+  binding.initialAcceptedInput = continuityAcceptedContextCandidate(parsed, input); binding.initialInstructionPayloadDigest = payload;
+  const conversationKey = chatGptConversationKey(parsed, namespace)!;
+  binding.conversation = { key: conversationKey, descriptor };
+  return { bindings, binding, descriptor, conversationKey, executionKey, nativeThreadId: native.threadId!,
+    revision: admitted.historyRevision, input, recovery: recoveryIdentity(admitted, store.installationId()), recovered: true,
+    taskInputRetry: metadata };
+}
+
 async function prepareDurableOrdinary(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
   attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
@@ -1060,7 +1278,9 @@ async function prepareDurableOrdinary(
   const liveBinding = bindings.observed(observed.thread);
   const instruction = continuityInstructionIdentity(parsed);
   const store = bindings.recoveryStore;
-  const logicalWorkId = recoveryDigest([observed.scope, identity.turnId, instruction, "ordinary", observed.epoch]);
+  const currentWork = observed.currentWorkId ? observed.works[observed.currentWorkId] : undefined;
+  const logicalWorkId = currentWork?.taskInputRetry && currentWork.instructionIdentity === instruction && currentWork.nativeTurnId === identity.turnId
+    ? currentWork.logicalWorkId : recoveryDigest([observed.scope, identity.turnId, instruction, "ordinary", observed.epoch]);
   let record = observed;
   let work = record.works[logicalWorkId];
   const binding = bindings.observed(record.thread);
@@ -1232,7 +1452,7 @@ async function prepareDurableOrdinary(
       sameAttempt = true;
     }
   }
-  if (!sameAttempt) record = await retireRecoveryWriter(bindings, record, descriptor);
+  if (!sameAttempt) record = await retireRecoveryWriter(bindings, record, descriptor, taskInputRequestIdentity(parsed));
   abortSignal?.throwIfAborted();
   if (work && !sameAttempt) {
     record = store.reserveRecovery(record.thread, { scope: record.scope, expectedVersion: record.version }, {
@@ -1430,7 +1650,7 @@ async function prepareDurableContinuation(
   preflightContinuityInput(input, capabilities, attachments, Boolean(expected), { experimentalBiggerContext });
   if (!expected) {
     await assertLauncherContinuityCapacity(descriptor);
-    record = await retireRecoveryWriter(bindings, record, descriptor);
+    record = await retireRecoveryWriter(bindings, record, descriptor, taskInputRequestIdentity(parsed));
   }
   abortSignal?.throwIfAborted();
   if (selection.action === "admit") {

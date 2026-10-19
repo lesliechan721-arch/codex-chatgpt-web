@@ -122,6 +122,16 @@ export function createSessionContinuityFixtures(testFilePath: string) {
           return Response.json({ ok: true, executionProtocol: 1, recovery: body.recovery, cancelledByUser: controls.helperUserClosed });
         }
         if (new URL(request.url).pathname.startsWith("/v1/turn/continuity-") && body.recovery) {
+          if (new URL(request.url).pathname === "/v1/turn/continuity-terminate-preparation") {
+            const record = new ContinuityRecoveryStore(statePath).get(body.recovery.threadKey);
+            const termination = record?.works[body.recovery.logicalWorkId]?.attempts[body.recovery.attempt]?.preparationTermination;
+            const page = termination && [...pages.values()].find(value => continuityDigest(value.continuity) === continuityDigest(termination.lease));
+            if (!termination || !page) return Response.json({ ok: false, code: "continuity_session_lost" }, { status: 409 });
+            if (controls.terminationConfirmFailures-- > 0) return Response.json({ ok: false, code: "continuity_unverified" }, { status: 503 });
+            page.state = "ready";
+            return Response.json({ ok: true, state: "preparation-terminated", recovery: body.recovery, requestId: termination.requestId,
+              receiptId: termination.receiptId, traceId: termination.traceId, helperPid: termination.helperPid, continuity: page.continuity });
+          }
           if (controls.actualRecovery) {
             try {
               launcherAuthority.bindExecutionAuthority(recoveryHost, body.recovery, body.recoveryStoreDirectory);
@@ -221,6 +231,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       preLeaseFailures: 0, unknownPreLeaseFailures: 0, failAfterSendOnce: false, failAfterToolsOnce: false, failAfterToolsKeepPage: false,
       acquisitionFailures: 0, actualRecovery: false, actualAcquisitions: 0,
       prepareBeforeFailures: 0, prepareAfterFailures: 0,
+      terminationConfirmFailures: 0,
       command: "fixture-command-not-executed-by-this-test",
       sourceArguments: undefined as Record<string, unknown> | undefined,
       queryPhase: "send-possible" as "send-possible" | "prepared" | "missing",

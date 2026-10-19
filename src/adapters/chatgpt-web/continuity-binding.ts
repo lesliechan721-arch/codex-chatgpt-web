@@ -177,6 +177,8 @@ export interface ContinuityBinding {
   executionKey?: string;
   /** Latest logical instruction; executionKey remains the physical response identity. */
   logicalExecutionKey?: string;
+  /** Last submitted history source while the next local preparation is pending. */
+  preparationSourceExecutionKey?: string;
   compactionKey?: string;
   compactionSourceState?: "ready" | "running";
   compactionEvidenceBytes?: number;
@@ -448,6 +450,7 @@ export class ContinuityBindings {
       throw continuityError("continuity_source_unproven", "Another response or compaction owns the page; finish or explicitly cancel that work first.");
     }
     binding.state = "running";
+    binding.preparationSourceExecutionKey = binding.executionKey;
     binding.executionKey = executionKey;
     binding.logicalExecutionKey = undefined;
     return { owner: this.owner, expected: { ...binding.lease } };
@@ -472,6 +475,19 @@ export class ContinuityBindings {
     if (binding.state === "compacting") binding.compactionSourceState = "ready";
     else binding.state = "ready";
     if (successfulWork) binding.lastUsedAt = this.now();
+    delete binding.preparationSourceExecutionKey;
+  }
+
+  /** Restore the last submitted source, without rolling back history or checkpoint consumption. */
+  preparationTerminated(binding: ContinuityBinding, executionKey: string, sourceExecutionKey: string | undefined, lease: ContinuityLease): void {
+    if (this.bindings.get(binding.thread) !== binding || binding.executionKey !== executionKey || !binding.recovery) throw continuityError("continuity_source_unproven");
+    const record = this.recoveryStore.get(binding.thread), ref = binding.recovery;
+    if (!record || record.owner.id !== this.owner || record.epoch !== binding.epoch || record.currentWorkId !== ref.logicalWorkId
+      || record.works[ref.logicalWorkId]?.attempts[ref.attempt]?.preparationTermination?.status !== "settled"
+      || record.state !== "ready") throw continuityError("continuity_source_unproven");
+    binding.lease = { ...lease }; binding.executionKey = sourceExecutionKey ?? binding.preparationSourceExecutionKey; binding.logicalExecutionKey = undefined;
+    delete binding.preparationSourceExecutionKey;
+    binding.state = "ready";
   }
 
   beginCompaction(binding: ContinuityBinding, key: string, sourceExecutionKey: string, sourceEvidenceBytes = 0): ContinuityClaim {

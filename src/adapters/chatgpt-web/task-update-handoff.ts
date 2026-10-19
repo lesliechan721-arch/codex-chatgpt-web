@@ -1,3 +1,5 @@
+import { receiveTaskInputs, taskInputQueue, synchronizeTaskInputDelivery } from "./continuity-task-input-runtime";
+import type { TaskInputDelivery } from "./continuity-task-input-types";
 import { recoveryDigest, recoveryResultDigest, acceptRecoveryResults } from "./continuity-recovery-runtime";
 import type { CodexParsedRequest, CodexToolResultMessage } from "../../types";
 import type { ChatGptTurnCapability } from "./environment";
@@ -10,6 +12,8 @@ import type { ChatGptExternalTurnProgress } from "./turn-progress";
 
 type EligibleProof = Extract<ChatGptTaskUpdateProof, { status: "eligible" }>;
 interface TransferAttempt {
+  request: CodexParsedRequest;
+  queueDelivery?: TaskInputDelivery;
   proof: EligibleProof; transfer: TaskUpdateTransfer; reserved: boolean; prepared: boolean;
   release: () => void; recordedResults?: boolean; preparationFailure?: { code: string };
 }
@@ -17,6 +21,10 @@ interface TransferAttempt {
 // The transfer lock excludes other local transfers, never the model or an observer's long wait.
 const transferTails = new WeakMap<ChatGptTurnSession, Promise<void>>();
 const attempts = new WeakMap<ChatGptTurnSession, TransferAttempt>();
+
+export function pendingTaskInputTransfer(session: ChatGptTurnSession): CodexParsedRequest | undefined {
+  return attempts.get(session)?.request;
+}
 
 function exclusive<T>(session: ChatGptTurnSession, action: () => Promise<T>): Promise<T> {
   const previous = transferTails.get(session) ?? Promise.resolve();
@@ -51,6 +59,8 @@ export async function tryTaskUpdateHandoff(options: {
   broker: TurnBrokerOwner;
   result: (message: CodexToolResultMessage, raw?: Record<string, unknown>) => BrokerToolResult;
   onProgress?: () => void;
+  /** Set only after the owner observes a real Native/return/ACK boundary. */
+  controlledBoundary?: boolean;
 }): Promise<ChatGptTurnSession | undefined> {
   const { parsed, broker } = options;
   if (parsed._compactionRequest) return undefined;
@@ -60,13 +70,22 @@ export async function tryTaskUpdateHandoff(options: {
   const foundSession = chatGptTurnSessions.findTaskUpdateOwner(identity.threadId, identity.turnId, options.ownerKey);
   if (!foundSession || foundSession.runtime.mode !== "tools") return undefined;
   const session: ChatGptTurnSession = foundSession;
+  return exclusive(session, async () => {
+    if (session.runtime.mode !== "tools") return undefined;
+    if (continuity && !options.controlledBoundary) {
+      receiveTaskInputs(session, parsed, options.execution);
+      if (!attempts.has(session)) {
+        session.acceptContinuityToolResults(parsed);
+        session.registerTaskInputObservation(parsed, options.execution);
+        chatGptTurnSessions.registerTaskUpdateRoute(options.executionKey, session);
+        return session;
+      }
+    }
+    const token = await session.runtime.token;
   if (!broker.taskUpdateState || !broker.reserveTaskUpdate || !broker.acceptTaskUpdate
     || !broker.taskUpdateTransferOutcome || !broker.rejectTaskUpdateReservation) {
     throw taskUpdateSourceError("task_update_upgrade_required", "The active task update owner protocol is unavailable.");
   }
-  return exclusive(session, async () => {
-    if (session.runtime.mode !== "tools") return undefined;
-    const token = await session.runtime.token;
     let attempt = attempts.get(session);
     if (attempt) {
       // No second transfer ID, even if a previous accept timed out before its receipt arrived.
@@ -90,7 +109,7 @@ export async function tryTaskUpdateHandoff(options: {
         return undefined;
       }
       if (state.finalOutputRevision !== null) {
-        if (continuity) throw taskUpdateSourceError("task_update_final_output_started", "This append was not accepted. Wait for the current answer to finish, then send it again.");
+        if (continuity) return session;
         return undefined;
       }
       const proof = session.proveTaskUpdate(parsed, options.execution);
@@ -101,6 +120,9 @@ export async function tryTaskUpdateHandoff(options: {
       const transferId = `update_${taskUpdateDigest({ namespace: options.namespace,
         physical: session.traceId, request: continuity ? proof.route.requestIdentity : proof.source.requestIdentity })}`;
       const contextCoverage = session.previewTaskUpdateContextCoverage(proof)?.metadata();
+      const receivedIds = new Set(proof.updates.map(update => update.sourceMessageId));
+      const workSource = continuity ? { ...parsed, _rawBody: { ...(parsed._rawBody as Record<string, unknown>),
+        input: proof.source.input.filter(value => value && typeof value === "object" && "id" in value && receivedIds.has(String(value.id))) } } : parsed;
       const payload = {
         transferId, expectedDriverGeneration: proof.expectedDriverGeneration,
         expectedRevision: proof.expectedRevision, environment: options.environment,
@@ -111,13 +133,13 @@ export async function tryTaskUpdateHandoff(options: {
         ...(continuity && session.runtime.continuityBinding?.recovery ? { recovery: {
           logicalWorkId: recoveryDigest([session.runtime.continuityBinding.scope, identity.turnId, continuityInstructionIdentity(parsed), "ordinary"]),
           instructionIdentity: continuityInstructionIdentity(parsed), nativeTurnId: identity.turnId!,
-          workPayloadDigest: chatGptContinuityInstructionPayloadDigest(parsed), snapshotDigest: recoveryDigest(parsed.context),
+          workPayloadDigest: session.taskInputWorkPayloadDigest(proof.updates.at(-1)!.sourceMessageId) ?? chatGptContinuityInstructionPayloadDigest(workSource), snapshotDigest: recoveryDigest(parsed.context),
           localSessionId: session.traceId ?? session.runtime.continuityBinding!.recovery!.logicalWorkId, localTaskRevision: proof.expectedRevision + proof.updates.length,
           results: proof.batch.rawResults.map(item => ({ callId: String(item.call_id), resultType: String(item.type), resultDigest: recoveryResultDigest(item) })),
           ...(contextCoverage ? { contextCoverage } : {}),
         } } : {}),
       };
-      attempt = { proof, transfer: { ...payload, payloadDigest: taskUpdateDigest(payload) }, reserved: false, prepared: false,
+      attempt = { request: parsed, proof, transfer: { ...payload, payloadDigest: taskUpdateDigest(payload) }, reserved: false, prepared: false,
         release: session.retainTaskUpdateTransaction() };
       attempts.set(session, attempt);
     }
@@ -142,11 +164,26 @@ export async function tryTaskUpdateHandoff(options: {
       }
       attempt.reserved = true;
     }
-    if (!attempt.prepared) {
+    if (!attempt.prepared || attempt.preparationFailure) {
       if (!attempt.preparationFailure) {
         try {
           session.prepareTaskUpdate(attempt.proof, attempt.transfer.transferId, attempt.transfer.payloadDigest);
           attempt.prepared = true;
+          const queue = continuity ? taskInputQueue(session) : undefined;
+          const ref = session.runtime.continuityBinding?.recovery;
+          if (queue && ref && attempt.transfer.recovery) {
+            const { recoveryRecord } = await import("./continuity-recovery-runtime");
+            const record = recoveryRecord(ref), work = record.works[ref.logicalWorkId]!;
+            attempt.queueDelivery = queue.store.reserveDelivery(queue.identity, {
+              deliveryId: attempt.transfer.transferId, mode: "active", physicalResponseId: session.traceId!,
+              capabilityId: taskUpdateDigest(token), workLineageId: work.workLineageId,
+              logicalWorkId: attempt.transfer.recovery.logicalWorkId,
+              acceptedRevision: attempt.proof.expectedRevision, acceptedTaskRevision: work.acceptedTaskRevision + 1,
+              driverGeneration: attempt.proof.expectedDriverGeneration + 1, historyRevision: record.historyRevision,
+              messageIds: attempt.proof.updates.map(update => update.sourceMessageId),
+            }, { authorize: queue.authorize });
+            if (!attempt.queueDelivery) throw taskUpdateSourceError("task_update_transfer_pending", "An earlier input delivery still requires confirmation.");
+          }
         } catch (error) {
           attempt.preparationFailure = { code: errorCode(error) ?? "task_update_preparation_rejected" };
         }
@@ -196,6 +233,7 @@ export async function tryTaskUpdateHandoff(options: {
         chatGptTurnSessions.registerTaskUpdateRoute(options.executionKey, session);
         if (session.runtime.mode === "tools") {
           mirrorLatestTaskUpdateState(session.runtime.externalProgress, outcome.state);
+          if (attempt!.queueDelivery) synchronizeTaskInputDelivery(session, attempt!.queueDelivery);
           if ((attempt!.proof.mode === "results" || attempt!.proof.mode === "continuity") && !attempt!.recordedResults) {
             for (const _message of attempt!.proof.batch.messages) session.runtime.externalProgress.recordToolResult();
             attempt!.recordedResults = true;
@@ -207,6 +245,9 @@ export async function tryTaskUpdateHandoff(options: {
         attempt!.release();
         return session;
       }
+      const queue = attempt!.queueDelivery && taskInputQueue(session);
+      if (queue && attempt!.queueDelivery) queue.store.cancelReservedDelivery(queue.identity,
+        attempt!.queueDelivery.deliveryId, attempt!.queueDelivery, { authorize: queue.authorize });
       const state = await broker.taskUpdateState!(token);
       if (attempt!.prepared) session.finishTaskUpdateTransfer(outcome, { state, ownerValid: state !== undefined,
         completed: state?.finalOutputRevision !== null && state?.finalOutputRevision !== undefined });

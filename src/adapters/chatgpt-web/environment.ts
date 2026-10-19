@@ -612,6 +612,16 @@ interface ContinuityInstructionSelection {
 
 // Request-local positions share identity and grouping decisions without copying source records.
 const continuityInstructionSelections = new WeakMap<CodexParsedRequest, ContinuityInstructionSelection>();
+const durableQueuedInstructionSelections = new WeakMap<CodexParsedRequest, { input: unknown[]; digest: string; scope?: string; indices: number[] }>();
+
+/** Only the current checkpoint's durable inbox proof may establish this boundary. */
+export function bindDurableQueuedInstructionInput(parsed: CodexParsedRequest, indices: number[]): void {
+  const input = record(parsed._rawBody)?.input;
+  if (!Array.isArray(input) || !indices.length || indices.some(index => !Number.isInteger(index) || index < 0 || index >= input.length)) {
+    throw continuityError("continuity_source_unproven");
+  }
+  durableQueuedInstructionSelections.set(parsed, { input, digest: canonicalJson(input), scope: parsed._continuityScope, indices: [...indices] });
+}
 
 function continuityInstructionSelection(parsed: CodexParsedRequest, input: unknown[]): ContinuityInstructionSelection | undefined {
   if (parsed._conversationPolicy !== "task") return undefined;
@@ -798,6 +808,10 @@ export function continuityCurrentInstructionInput(
     selection?.inputs.set(selectionKey, indices);
     return indices.map(clone);
   };
+  const queued = durableQueuedInstructionSelections.get(parsed);
+  if (queued && queued.input === input && queued.scope === parsed._continuityScope && queued.digest === canonicalJson(input)) {
+    return remember(queued.indices);
+  }
   const retainCurrentSource = includeRetainedSource && isRetainedCompactionSourceInstruction(parsed, input[index]);
   const identity = extractChatGptTurnIdentity(parsed);
   if (parsed._compactionRequest) {

@@ -111,6 +111,31 @@ store bounded source-coverage metadata, not raw text, images, or read credential
 is recorded, it contains references, ranges, sizes, routes, timing, and necessary identity summaries,
 not source bodies. See [context navigation](context-navigation.md) for the effective resource limits.
 
+### Durable input custody and preparation termination
+
+Task inbox originals are sensitive local data. Owner-only payload files hold exact user text;
+the metadata journal contains IDs, digests, sizes, ordering and delivery/coverage bindings rather
+than text, URLs or credentials. Bodies, metadata and mutation reservations share the existing
+24 MiB recovery budget. Each task is limited to 128 pending messages and 1 MiB. Capacity refusal
+must not evict an accepted original. Missing or unsafe payloads block delivery and copying; repair
+must supply the same ID and exact digest. Pending/stopped input has no silent expiry and survives
+page cleanup, but grants no tool, browser, owner or recovery execution permission.
+
+Launcher input controls require the trusted main renderer frame and live local Launcher token.
+Text crosses a bounded stdin pipe and a dedicated IPC path, not command arguments or general
+logs. Mutations recheck task version and intent under the durable lock. Stop/deletion fence older
+intents before subsequent dispatch. A user-selected retry creates a new linked intent rather than
+reviving an old automatic retry. An input with delivery permission cannot be withdrawn as unsent.
+Terminal reclamation and task deletion persist a source fence before deleting bodies. Detailed
+records can then be removed without allowing an old request to create new work after page cleanup.
+The compact fence remains charged to the shared budget; it has no unverified expiry or eviction.
+
+Preparation termination and actual Send permission use one durable lock and exact attempt/owner/
+epoch/page/lease identity. Neither an abort nor absence of a successful receipt proves unsent.
+A preparation termination receipt does not authorize a new Send or weaken page-loss recovery.
+Only the current owner can preserve the last committed source on a verified healthy page; late
+callbacks cannot restore a stopped attempt or overwrite a successor.
+
 ### Trusted user updates and owner writes
 
 `task-updates-v1` accepts only a proven ordered suffix of native plain user messages in the same
@@ -122,8 +147,10 @@ and do not change sandbox or approval authority.
 
 Only authenticated Broker owner IPC can reserve and accept the update transfer. Native starts
 declare their acknowledged task revision; generation-bound owner writes and waiter delivery
-reject stale or missing ownership at the mutation point. A new driver retains the same physical
-capability, while old Responses observers may only finish their own journal. Trusted user stop
+reject stale or missing ownership at the mutation point. An active update can replace the driver while retaining the same physical capability. Pure HTTP
+observer replacement uses a separate association and does not advance that driver. Old observers
+cannot claim new tools; already issued calls retain their original completion rights and final
+output keeps its captured version. Trusted user stop
 and launcher cancellation keep their physical revocation authority.
 
 An ACK authenticates through the original turn capability. Its delivery ID prevents unknown or
@@ -274,7 +301,8 @@ transmission and grants no new-generation writes.
 
 Page destruction removes that generation's registration, work/call, stop/completion, checkpoint,
 history/retry, binding, execution index, and task snapshots. Match the exact generation at cleanup,
-including late destruction events; cleanup is idempotent. Keep independently referenced in-flight
+including late destruction events; cleanup is idempotent. Independently owned pending/stopped
+task inbox originals remain outside that page cleanup and grant no execution rights. Keep independently referenced in-flight
 content only until its transmission ends. Do not retain replacement stop tombstones or history
 archives. The independent API cache and login/installation state are explicit exceptions.
 

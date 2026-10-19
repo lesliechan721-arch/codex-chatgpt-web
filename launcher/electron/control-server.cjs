@@ -2,9 +2,9 @@ const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
 const { releaseRetainedConversation } = require("./retained-turn-release.cjs");
 const { inspectContinuityConversation, validateContinuityClaim } = require("./continuity-lease.cjs");
-const { queryContinuityTransaction, updateContinuityPreparation, markContinuitySendPossible, retireContinuityWriter,
+const { queryContinuityTransaction, updateContinuityPreparation, markContinuitySendPossible, terminateContinuityPreparation, retireContinuityWriter,
   retryContinuityCleanup, assertContinuityActivity, acquisitionKnownUnsentReceipt } = require("./continuity-recovery.cjs");
-const { EXECUTION_PROTOCOL, bindExecutionAuthority } = require("./continuity-execution-authority.cjs");
+const { EXECUTION_PROTOCOL, bindExecutionAuthority, preparationTermination } = require("./continuity-execution-authority.cjs");
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MANUAL_START_BODY_BYTES = 3 * 1024 * 1024;
@@ -111,6 +111,7 @@ class BrowserControlServer {
       ["/v1/turn/continuity-query", "query"],
       ["/v1/turn/continuity-prepare", "prepare"],
       ["/v1/turn/continuity-send-possible", "send-possible"],
+      ["/v1/turn/continuity-terminate-preparation", "terminate-preparation"],
       ["/v1/turn/continuity-retire", "retire"],
       ["/v1/turn/continuity-cleanup", "cleanup"],
     ]).get(request.url);
@@ -161,6 +162,7 @@ class BrowserControlServer {
         const result = recoveryAction === "query" ? queryContinuityTransaction(host, body.recovery)
           : recoveryAction === "prepare" ? updateContinuityPreparation(host, body.expected, body.recovery)
           : recoveryAction === "send-possible" ? markContinuitySendPossible(host, body.recovery)
+          : recoveryAction === "terminate-preparation" ? terminateContinuityPreparation(host, body.recovery)
           : recoveryAction === "cleanup" ? await retryContinuityCleanup(host, body.recovery, body.cleanupRequestId)
           : await retireContinuityWriter(host, body.recovery);
         writeJson(response, 200, { ok: true, ...result });
@@ -231,7 +233,13 @@ class BrowserControlServer {
         throw new Error("continuity requires conversationKey");
       }
       if (!(request.url === "/v1/turn/start" || manualAction === "start")) {
-        assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+        let termination;
+        if ((request.url === "/v1/turn/end" || manualAction === "end") && body.recovery && body.status !== "completed") {
+          try { termination = preparationTermination(host, body.recovery); } catch {}
+        }
+        if (!termination || termination.traceId !== body.traceId || termination.helperPid !== body.helperPid) {
+          assertContinuityActivity(host, body.traceId, body.helperPid, body.recovery);
+        }
       }
       const recoveryAcknowledgement = body.recovery ? { recovery: body.recovery, executionProtocol: EXECUTION_PROTOCOL } : {};
       if (body.retain !== undefined && typeof body.retain !== "boolean") {

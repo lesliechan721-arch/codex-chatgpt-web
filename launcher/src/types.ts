@@ -1,6 +1,7 @@
 import languages from "../electron/languages.json";
 import type { ApiAccessApi, ApiAccessMode } from "./api-access-types";
 import type { LimitsSnapshot } from "./limits-types";
+import type { TaskInputsApi } from "./task-input-types";
 
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
@@ -166,7 +167,7 @@ export interface LauncherSnapshot {
   update: UpdateState;
 }
 
-export interface LauncherApi extends ApiAccessApi {
+export interface LauncherApi extends ApiAccessApi, TaskInputsApi {
   snapshot(): Promise<LauncherSnapshot>;
   getLimits(): Promise<LimitsSnapshot>;
   setupLimits(): Promise<LimitsSnapshot>;

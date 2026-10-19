@@ -129,6 +129,25 @@ function assertExecutionIsolation(host, recovery) {
     && current?.attempts.at(-1)?.writerRetired !== true) throw failure();
 }
 
+/** Read the durable fence, never infer an unsent turn from an aborted HTTP request. */
+function preparationTermination(host, recovery) {
+  const { record, work, attempt } = authority(host, recovery);
+  const termination = attempt.preparationTermination;
+  if (!termination || !require("./continuity-recovery.cjs").sameRecovery(termination.recovery, recovery)
+    || !attempt.writerRetired || attempt.sendEvidence && attempt.sendEvidence.status !== "not-sent"
+    || record.pendingPreparation || record.currentWorkId !== work.logicalWorkId || work.attempts.at(-1) !== attempt
+    || ["completed", "stopped"].includes(work.state) || record.state === "stopped" || record.epoch !== recovery.epoch
+    || record.owner?.pid !== recovery.ownerProcess.pid || record.owner?.startIdentity !== recovery.ownerProcess.startIdentity) throw failure();
+  return termination;
+}
+
+function hasUnsettledSend(host, recovery) {
+  try {
+    assertExecutionAuthority(host, recovery);
+    return authority(host, recovery).attempt.sendEvidence?.status === "possible";
+  } catch { return false; }
+}
+
 function hasIdleExecutionAuthority(host, recovery) {
   try {
     const { record, work } = authority(host, recovery);
@@ -141,4 +160,4 @@ function hasIdleExecutionAuthority(host, recovery) {
 }
 
 module.exports = { EXECUTION_FENCING_FEATURE, EXECUTION_PROTOCOL, bindExecutionAuthority,
-  assertExecutionAuthority, assertExecutionIsolation, hasIdleExecutionAuthority };
+  assertExecutionAuthority, assertExecutionIsolation, hasIdleExecutionAuthority, preparationTermination, hasUnsettledSend };

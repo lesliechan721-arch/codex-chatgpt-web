@@ -513,6 +513,13 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(f.registrations.get(continuityDigest(f.threadId))?.state).toBe("entered");
   expect(f.pages.size).toBe(0);
   expect(f.submissions).toHaveLength(0);
+  const store = new ContinuityRecoveryStore(f.statePath);
+  const pending = store.get(continuityDigest(f.threadId))!;
+  const attempt = pending.works[pending.currentWorkId!]!.attempts.at(-1)!;
+  expect(attempt).toMatchObject({ stage: "prepared", writerRetired: false,
+    acquisitionEvidence: { status: "not-acquired" } });
+  expect(attempt.sendEvidence?.status).toBe(manual ? "not-sent" : undefined);
+  expect(attempt.preparationTermination).toBeUndefined();
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.pages.size).toBe(1);
   expect(f.submissions).toHaveLength(1);
