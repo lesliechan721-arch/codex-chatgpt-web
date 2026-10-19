@@ -107,9 +107,10 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
    Tunnel，将 **身份验证** 设为 **无**，并将名称准确设置为 **Codex Native5**。
 5. 在 **Codex Native5** 的 **权限** 中选择 **允许所有操作**；**允许低风险操作** 会在命令和
    补丁到达本地运行时前将其拦截。外层 Codex harness 仍会执行沙箱和审批规则。
-6. 对所配置的身份运行 **验证运行时**。它检查已安装的 schema，然后要求普通凭据和独立压缩
-   凭据各完成 list、search、read，共六次成功的只读 MCP 返回。Zero Risk 保留手工选择插件、
-   发送和原有 Sent 策略。这证明所选配置可调用，不提供平台原始缓存 schema 的证明。
+6. 完成配置。**验证运行时**是可选的排查操作。运行该操作时，它检查已安装的 schema，并要求普通
+   凭据和独立压缩凭据各完成 list、search、read，共六次成功的只读 MCP 返回。Zero Risk 保留
+   手工选择插件、发送和原有 Sent 策略。结果只说明本次诊断，不保证后续调用成功。历史记录
+   缺失、失败或失配不会阻止任务、导航、压缩和恢复，也不会自动启动诊断。
 
 当前 MCP ABI 使用 **Codex Native5**（Automatic）、**Codex Zero Risk4**（Zero Risk）和
 **Codex Native5 DEV**（仓库开发）。保留 **Codex Native4**、**Codex Native4 DEV** 和

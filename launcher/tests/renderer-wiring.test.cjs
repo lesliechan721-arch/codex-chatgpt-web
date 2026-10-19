@@ -942,7 +942,7 @@ test("MCP verification proves runtime health before checking the connector", () 
   assert.match(appSource, /operation\?\.name === "mcp-verification"/);
 });
 
-test("MCP verification refuses retired identities before marking either mode complete", async () => {
+test("MCP diagnostics refuse retired identities and do not complete setup", async () => {
   const vm = require("node:vm");
   const identity = require("../electron/connector-identity.cjs");
   const start = electronMain.indexOf('  handle("launcher:mcp-verify"');
@@ -969,15 +969,15 @@ test("MCP verification refuses retired identities before marking either mode com
       vm.runInContext(electronMain.slice(start, end), context);
       const result = await handlers.get("launcher:mcp-verify")({ sender: { isFocused: () => false } });
       assert.equal(result.ok, !legacy);
-      assert.equal(state.mcpSetupComplete, !legacy);
+      assert.equal(state.mcpSetupComplete, false);
       assert.equal(browserChecks, !legacy && mode === "automatic" ? 1 : 0);
       assert.equal(capabilityChecks, legacy ? 0 : 1);
       if (legacy) {
         assert.match(result.checks.at(-1).message, /create that connector as a new ChatGPT plugin.*do not rename or refresh/);
         assert.equal(state.mcpSetupContract, undefined);
       } else {
-        assert.equal(state.mcpSetupContract, MCP_SETUP_CONTRACT);
-        assert.equal(state.mcpSetupConnectorName, name);
+        assert.equal(state.mcpSetupContract, undefined);
+        assert.equal(state.mcpSetupConnectorName, undefined);
         assert.equal(result.checks.at(-1).status, "ok");
         assert.match(result.checks.at(-1).message, /returned all six read-only context calls/);
       }
@@ -985,7 +985,7 @@ test("MCP verification refuses retired identities before marking either mode com
   }
 });
 
-test("MCP setup clears verification only after a successful runtime transaction", async () => {
+test("MCP setup resets completion only after a successful runtime transaction", async () => {
   const vm = require("node:vm");
   const start = electronMain.indexOf('  handle("launcher:setup-mcp"');
   const end = electronMain.indexOf('  handle("launcher:connector-name"', start);
@@ -1008,7 +1008,7 @@ test("MCP setup clears verification only after a successful runtime transaction"
     else await run();
     assert.equal(state.mcpSetupComplete, fails);
     assert.equal(state.mcpGuideStep, fails ? 0 : 2);
-    assert.equal(state.mcpSetupContract, "previous-ABI", "an unverified setup cannot write a current verification marker");
+    assert.equal(state.mcpSetupContract, "previous-ABI", "connecting the harness does not complete the final setup step");
   }
 });
 

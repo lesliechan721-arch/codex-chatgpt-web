@@ -9,16 +9,18 @@ import { assertContextCapabilityVerified, contextCapabilitySchemaDigest, invalid
   type ContextCapabilityReceipts } from "../src/adapters/chatgpt-web/context-capability-verification";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
+import { createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "../src/adapters/chatgpt-web/index";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { parseRequest } from "../src/responses/parser";
-import { CHATGPT_WEB_BACKEND_MODEL } from "../src/chatgpt-web-models";
+import { CHATGPT_WEB_BACKEND_MODEL, CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
-import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
+import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+
+import type { AdapterEvent } from "../src/types";
 
 const roots: string[] = [];
 afterEach(() => { chatGptTurnSessions.clear(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -356,7 +358,7 @@ describe("context capability evidence", () => {
     const f = fixture(); f.config.browserInteractionMode = "manual"; f.config.browserHost = "launcher";
     f.config.appName = f.config.manualAppName; f.config.browserHostDescriptorPath = join(f.home, "launcher.json");
     f.config.zeroRiskRequireSentConfirmation = requireSent;
-    f.config.manualTunnel = { ...f.config.tunnel!, profileName: "manual", alias: "manual" };
+    f.config.manualTunnel = { ...f.config.tunnel!, tunnelId: `tunnel_${"b".repeat(32)}`, profileName: "manual", alias: "manual" };
     const client = new Client({ name: "manual-verification-test", version: "1" });
     await client.connect(new StdioClientTransport({ command: process.execPath,
       args: [resolve("src/cli.ts"), "mcp", "--contract", "safe", "--broker-socket", f.config.brokerSocketPath], stderr: "pipe" }));
@@ -393,60 +395,141 @@ describe("context capability evidence", () => {
       expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true); expect(sentChecks).toBe(requireSent ? 1 : 0); expect(endStatus).toBe("completed");
     } finally { allowReads(); await userCalls?.catch(() => {}); await client.close(); }
   });
-  test("actual adapter factory blocks navigation publication without bound proof, accepts six-call evidence", async () => {
-    const f = fixture(); f.config.toolAuthorityMode = "delegated"; f.config.solAvailable = true;
-    const broker = TurnBroker.forSocket(f.config.brokerSocketPath); await broker.listen();
-    const client = new Client({ name: "factory-proof-test", version: "1" });
-    await client.connect(new StdioClientTransport({ command: process.execPath,
-      args: [resolve("src/cli.ts"), "mcp", "--contract", "native", "--broker-socket", f.config.brokerSocketPath], stderr: "pipe" }));
-    writeFileSync(join(f.home, "config.json"), JSON.stringify(f.config));
-    const provider = providerConfig(f.config); provider.chatgptWeb!.threadEnvironmentStatePath = join(f.home, "runtime", "thread-environments.json");
-    const worker = ChatGptBrowserWorker.forProvider(provider);
-    const taskUpdates = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(false);
-    const publish = spyOn(broker, "registerContextPlan"); let sends = 0;
-    const run = spyOn(worker, "run").mockImplementation(async turn => {
-      const compiled = await turn.prepare();
-      expect(compiled.contextPlan).toBeDefined();
-      await turn.onContextPlanSelected!(compiled.contextPlan!.planId); await turn.onSubmitted?.(); sends++;
-      turn.onTextDelta("Factory proof accepted"); return "Factory proof accepted";
-    });
-    let turnNumber = 0;
-    const request = () => parseRequest({ model: CHATGPT_WEB_BACKEND_MODEL, reasoning: { effort: "high" },
-      input: [{ type: "function_call", call_id: "old-call", name: "exec_command", arguments: '{"cmd":"old evidence"}' },
-        { type: "function_call_output", call_id: "old-call", output: "Recorded tool evidence.\n".repeat(4_000) },
-        { type: "message", id: `user-message-${turnNumber}`, role: "user", content: [{ type: "input_text", text: "Read the recorded evidence." }],
-          internal_chat_message_metadata_passthrough: { turn_id: `turn-${turnNumber + 1}` } }],
-      tools: [{ type: "function", name: "exec_command", description: "Execute", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }],
-      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: `${f.home}-${turnNumber}`, turn_id: `turn-${++turnNumber}` }) } });
-    const invoke = () => createChatGptWebAdapter(provider, { broker }).runTurn!(request(), { headers: new Headers() }, () => {});
-    try {
-      await expect(invoke()).rejects.toThrow("not verified"); expect(publish).not.toHaveBeenCalled(); expect(sends).toBe(0);
-      const evidence = await runContextCapabilityVerification(f.config, { home: f.home, broker, timeoutMs: 5_000, automaticRun: async turn => {
-        const prompt = await turn.prepare(); await turn.onSubmitted?.();
-        for (const line of prompt.text.split("\n").filter(line => line.startsWith("Call "))) {
-          const match = /^Call (codex_context_\w+) with (\{.*\})\.$/.exec(line)!;
-          expect((await client.callTool({ name: match[1]!, arguments: JSON.parse(match[2]!) })).isError).not.toBe(true);
-        }
-        return "Read-only verification completed";
-      } });
-      publish.mockClear();
-      for (const changed of [
-        { ...f.config, automaticAppName: "Codex Changed", appName: "Codex Changed" },
-        { ...f.config, automaticTunnel: { ...f.config.automaticTunnel!, tunnelId: `tunnel_${"b".repeat(32)}` }, tunnel: { ...f.config.tunnel!, tunnelId: `tunnel_${"b".repeat(32)}` } },
-        { ...f.config, browserInteractionMode: "manual", browserHost: "launcher", browserHostDescriptorPath: join(f.home, "launcher.json"),
-          appName: f.config.manualAppName, manualTunnel: { ...f.config.tunnel!, profileName: "manual" } },
-      ]) {
-        writeFileSync(join(f.home, "config.json"), JSON.stringify(changed));
-        await expect(invoke()).rejects.toThrow(); expect(publish).not.toHaveBeenCalled(); expect(sends).toBe(0);
-      }
+  for (const manual of [false, true]) for (const development of [false, true])
+    test(`actual ${manual ? "Zero Risk" : "Automatic"} ${development ? "DEV" : "production"} sends ignore historical diagnostic records`, async () => {
+      const f = fixture(); f.config.toolAuthorityMode = "delegated"; f.config.solAvailable = true;
+      f.config.browserInteractionMode = manual ? "manual" : "automatic";
+      f.config.browserHost = "launcher"; f.config.browserHostDescriptorPath = join(f.home, "launcher.json");
+      if (development) f.config.purpose = "dev-harness";
+      f.config.manualTunnel = { ...f.config.tunnel!, tunnelId: `tunnel_${"b".repeat(32)}`, profileName: "manual", alias: "manual" };
+      f.config.appName = manual ? f.config.manualAppName : f.config.automaticAppName;
+      const runtimeRoot = mkdtempSync(join(process.cwd(), ".context-runtime-")); roots.push(runtimeRoot);
+      const runtimeFile = join(runtimeRoot, "runtime-entry.ts");
+      const runtimeSource = `await import(${JSON.stringify(resolve("src/cli.ts"))});\n`;
+      writeFileSync(runtimeFile, runtimeSource); f.config.runtimeCommand = [process.execPath, runtimeFile];
       writeFileSync(join(f.home, "config.json"), JSON.stringify(f.config));
-      const evidencePath = getContextCapabilityEvidencePath(f.home); const originalEvidence = readFileSync(evidencePath, "utf8");
-      const staleSchema = JSON.parse(originalEvidence); staleSchema.modes.automatic.binding.schemaDigest = "f".repeat(64);
-      writeFileSync(evidencePath, JSON.stringify(staleSchema));
-      await expect(invoke()).rejects.toThrow("not verified"); expect(publish).not.toHaveBeenCalled(); expect(sends).toBe(0);
-      writeFileSync(evidencePath, originalEvidence);
-      expect(readProviderContextCapabilityEvidence(provider, evidence.binding.schemaDigest)).toBeDefined();
-      await invoke(); expect(publish).toHaveBeenCalledTimes(1); expect(sends).toBe(1);
-    } finally { run.mockRestore(); publish.mockRestore(); taskUpdates.mockRestore(); await client.close(); await broker.close(); }
-  }, 30_000);
+      const provider = providerConfig(f.config);
+      provider.chatgptWeb!.threadEnvironmentStatePath = development
+        ? join(f.home, "runtime", "dev-chat", "thread-environments.json") : join(f.home, "runtime", "thread-environments.json");
+      const broker = TurnBroker.forSocket(f.config.brokerSocketPath); await broker.listen();
+      const client = new Client({ name: "diagnostic-independent-factory-test", version: "1" });
+      await client.connect(new StdioClientTransport({ command: process.execPath,
+        args: [resolve("src/cli.ts"), "mcp", "--contract", manual ? "safe" : "native", "--broker-socket", f.config.brokerSocketPath], stderr: "pipe" }));
+      const schema = await installedContextCapabilitySchemaDigest(f.config);
+      const evidencePath = getContextCapabilityEvidencePath(f.home);
+      const worker = ChatGptBrowserWorker.forProvider(provider);
+      const taskUpdates = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(false);
+      const diagnostics = spyOn(broker, "armContextVerification");
+      const answer = "Recorded evidence is available.";
+      let sends = 0, expectedNavigation = false;
+      const plans: unknown[] = [];
+      const inspectPrompt = async (prompt: string) => {
+        sends++;
+        expect(prompt).not.toContain("Read-only capability verification");
+        const match = /<codex_context_navigation_json>\n([^\n]+)\n<\/codex_context_navigation_json>/.exec(prompt);
+        expect(Boolean(match)).toBe(expectedNavigation);
+        if (!match) { plans.push({ navigation: false }); return undefined; }
+        const entry = JSON.parse(match[1]!);
+        const listing = await client.callTool({ name: entry.first_call.name,
+          arguments: { ...entry.first_call.arguments, view: "entries", kind: "tool_result" } });
+        expect(listing.isError).not.toBe(true);
+        const target = (listing.structuredContent as any).entries.find((entry: any) => entry.call_id === "old-call");
+        expect(target).toBeDefined();
+        const { view, ...reference } = entry.first_call.arguments;
+        const result = await client.callTool({ name: "codex_context_read", arguments: { ...reference, read_ref: target.read_ref } });
+        expect(result.isError).not.toBe(true);
+        const read = parseContextTextReadResult(result);
+        expect(read.body).toContain("Recorded tool evidence.");
+        plans.push({ navigation: true, requiredImages: entry.required_images,
+          sourceBytes: read.metadata.utf8_bytes, delivery: target.delivery });
+        return entry;
+      };
+      const run = spyOn(worker, "run").mockImplementation(async turn => {
+        expect(manual).toBe(false);
+        const compiled = await turn.prepare();
+        try {
+          if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
+          await turn.onSubmitted?.(); await inspectPrompt(compiled.text);
+          turn.onTextDelta(answer); return answer;
+        } finally { await compiled.release(); }
+      });
+      let prompt = "", requestId: string | undefined;
+      const control: ChatGptZeroRiskManualControl = {
+        async start(_path, activity) { prompt = activity.prompt; return { selectedPlanId: activity.contextPlans?.full?.planId }; },
+        async waitSent() {
+          requestId = /request_id=([A-Za-z0-9_-]+)/.exec(prompt)?.[1]
+            ?? /"request_id":"([A-Za-z0-9_-]+)"/.exec(prompt)?.[1];
+          expect(requestId).toBeDefined();
+          expect((await client.callTool({ name: "codex_turn_start", arguments: { request_id: requestId } })).isError).not.toBe(true);
+        },
+        waitTerminal: () => new Promise<never>(() => {}),
+        async markStarted() {
+          const entry = await inspectPrompt(prompt);
+          if (entry) expect(entry.first_call.arguments.request_id).toBe(requestId);
+          expect((await client.callTool({ name: "codex_turn_complete", arguments: { request_id: requestId, final_answer: answer } })).isError).not.toBe(true);
+        },
+        async end() {}, async cancel() {},
+      };
+      let turnNumber = 0;
+      const request = (threadId: string, continuation: boolean) => {
+        const turnId = `turn-${++turnNumber}`;
+        return parseRequest({ model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : CHATGPT_WEB_BACKEND_MODEL,
+          reasoning: { effort: manual ? "low" : "high" },
+          input: [...(expectedNavigation ? [
+            { type: "function_call", call_id: "old-call", name: "exec_command", arguments: '{"cmd":"old evidence"}' },
+            { type: "function_call_output", call_id: "old-call", output: "Recorded tool evidence.\n".repeat(4_000) },
+          ] : []),
+          ...(continuation ? [{ type: "message", role: "assistant", content: [{ type: "output_text", text: answer }] }] : []),
+          { type: "message", id: `user-message-${turnNumber}`, role: "user", content: [{ type: "input_text", text: "Read the recorded evidence." }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId } }],
+          tools: [{ type: "function", name: "exec_command", description: "Execute", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }],
+          client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }) } });
+      };
+      const adapter = createChatGptWebAdapter(provider, { broker, zeroRiskManualControl: control });
+      try {
+        const variants = ["missing", "corrupt", "old-version", "schema", "mode", "plugin", "tunnel", "runtime-command", "runtime-replaced", "success"];
+        let baseline: unknown[] | undefined;
+        for (const variant of variants) {
+          writeFileSync(runtimeFile, runtimeSource);
+          const evidence = saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+          if (variant === "schema") evidence.binding.schemaDigest = "f".repeat(64);
+          if (variant === "mode") evidence.binding.mode = manual ? "automatic" : "manual";
+          if (variant === "plugin") evidence.binding.appName = "Codex Previous Plugin";
+          if (variant === "tunnel") evidence.binding.tunnelId = "previous-tunnel";
+          if (variant === "runtime-command") evidence.binding.runtimeCommand = ["previous-runtime"];
+          if (variant === "runtime-replaced") writeFileSync(runtimeFile, runtimeSource + "// compatible runtime upgrade\n");
+          if (variant === "missing") rmSync(evidencePath, { force: true });
+          else writeFileSync(evidencePath, variant === "corrupt" ? "{invalid" : JSON.stringify({
+            version: variant === "old-version" ? 1 : 2, modes: { [f.config.browserInteractionMode]: evidence } }));
+          expect(Boolean(readContextCapabilityEvidence(f.config, schema, f.home))).toBe(variant === "success");
+          const before = existsSync(evidencePath) ? readFileSync(evidencePath, "utf8") : undefined;
+          const firstPlan = plans.length, firstSend = sends;
+          for (const navigation of [false, true]) {
+            expectedNavigation = navigation;
+            const threadId = `${f.home}-${variant}-${navigation}`;
+            for (const continuation of [false, true]) {
+              const events: AdapterEvent[] = [];
+              await adapter.runTurn!(request(threadId, continuation), { headers: new Headers() }, event => events.push(event));
+              expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+              expect(events.filter(event => event.type === "error")).toEqual([]);
+            }
+          }
+          expect(sends - firstSend).toBe(4);
+          const actual = plans.slice(firstPlan);
+          if (baseline) expect(actual).toEqual(baseline); else baseline = actual;
+          expect(existsSync(evidencePath) ? readFileSync(evidencePath, "utf8") : undefined).toBe(before);
+        }
+        expect(diagnostics).not.toHaveBeenCalled();
+        expectedNavigation = true;
+        const beforeRejection = sends;
+        const registration = spyOn(broker, "registerContextPlan").mockImplementation(() => {
+          throw new Error("Current Broker context protocol is incompatible");
+        });
+        try {
+          await expect(adapter.runTurn!(request(`${f.home}-incompatible`, false), { headers: new Headers() }, () => {}))
+            .rejects.toThrow("Current Broker context protocol is incompatible");
+          expect(sends).toBe(beforeRejection);
+        } finally { registration.mockRestore(); }
+      } finally { run.mockRestore(); diagnostics.mockRestore(); taskUpdates.mockRestore(); await client.close(); await broker.close(); }
+    }, 30_000);
 });

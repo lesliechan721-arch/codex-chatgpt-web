@@ -619,6 +619,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     fromVersion: "1.1.1",
     toVersion: "1.1.3",
     connectorMigrated: false,
+    tunnelProfileMigrated: false,
     stdout: "",
   });
 });

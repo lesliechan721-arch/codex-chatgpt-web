@@ -144,7 +144,7 @@ export async function withContinuitySourceDiagnostics<T>(
     prepareSpy.mockImplementation(async (...args) => {
       const event = observe("compaction-prepare", () => {
         const event: Record<string, unknown> = { sequence: ++sequence, path: "compaction-prepare", entry: "durable",
-          state: durableState(args[6]), existingTarget: id(args[11]) };
+          state: durableState(args[6]), existingTarget: id(args[10]) };
         events.push(event);
         return event;
       });

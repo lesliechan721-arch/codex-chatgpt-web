@@ -160,12 +160,10 @@ export async function checkContinuityDev() {
         if (!Number.isInteger(status.protocolVersion) || status.protocolVersion < 13 || status.recoveryProtocol !== 2) report.blockers.push("Broker 缺少当前执行隔离协议");
       } else {
         const prepared = check.value as Awaited<ReturnType<typeof prepareContinuityDevProvider>>;
-        const evidence = prepared.evidence;
-        report.providerVerification = continuityDevProviderEvidence(prepared);
-        report.verification = { verified: true, verifiedAt: evidence.verifiedAt, schemaDigest: evidence.binding.schemaDigest,
-          contextProtocol: evidence.binding.contextProtocol, textReadFormat: evidence.binding.textReadFormat,
-          ordinary: { list: evidence.receipts.ordinary.list, search: evidence.receipts.ordinary.search, read: evidence.receipts.ordinary.read },
-          compaction: { list: evidence.receipts.compaction.list, search: evidence.receipts.compaction.search, read: evidence.receipts.compaction.read } };
+        const capability = prepared.capability;
+        report.providerCapability = continuityDevProviderEvidence(prepared);
+        report.contextCapability = { staticSchemaChecked: true, schemaDigest: capability.schemaDigest,
+          contextProtocol: capability.contextProtocol, textReadFormat: capability.textReadFormat };
       }
     }
     const tunnel = tunnelStatus(config);
@@ -412,7 +410,7 @@ export async function runContinuityLive(options: ContinuityLiveOptions, hooks?: 
       continuityStateDirectory: continuity, lunaCheckpointStatePath: join(runtime, "luna-checkpoints.json"),
       ...(helper ? { browserHelperScriptPath: helper } : {}),
     });
-    const provider = prepared.provider; report.providerVerification = continuityDevProviderEvidence(prepared); save();
+    const provider = prepared.provider; report.providerCapability = continuityDevProviderEvidence(prepared); save();
     transport = await startDevChatTransport(config, paths.runtimePath);
     const liveBroker = await callTurnBroker<Row>(config.brokerSocketPath, { method: "owner_status" });
     assert.ok(Number.isInteger(liveBroker.protocolVersion) && liveBroker.protocolVersion >= 13 && liveBroker.recoveryProtocol === 2, "真实准备 Broker 协议不兼容");

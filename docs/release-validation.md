@@ -74,8 +74,12 @@ verification. **Verify runtime** requires six real successful read-only context 
 against fixed small text, using ordinary and independent compaction credentials. Retain redacted
 evidence for each selected new plugin and both manual Sent policies. Missing calls, model-only
 success claims, failed transport sends, and profile/mode/plugin/tunnel/runtime/schema mismatches
-must refuse navigation publication and compaction admission. Evidence has no time-based expiry;
-binding changes invalidate it. A successful six-call check proves callability, not raw cloud schema,
+must fail the diagnosis rather than report success. Separately, prove that absent, damaged, old,
+and mismatched records do not block normal tasks, navigation, compaction, or recovery, alter plans,
+or trigger automatic diagnostic calls. Cover Automatic and Zero Risk, production and DEV, and
+setup completion without diagnosis. Current protocol, source, credential, delivery, and commit
+failures must still reject invalid execution even with successful historical evidence.
+Evidence has no time-based expiry; binding changes affect diagnostic applicability only. A successful six-call check proves callability, not raw cloud schema,
 image consumption, model understanding, or the remaining acceptance cases below.
 
 Complete acceptance and release validation are still pending. The initial live image checks,
@@ -157,7 +161,8 @@ Before treating the feature as release-ready, exercise both Automatic and Zero R
 The browser renderer and MCP text-read-v2 require separate evidence from the earlier context
 navigation observations above. Local round-trip, pagination, protocol, receipt, and control tests
 do not establish release readiness. Current connector names remain unchanged for this unreleased
-update; reconnect/refresh the same connector and obtain version-2 Verify runtime evidence.
+update; reconnect/refresh the same connector if needed. When validating the optional diagnosis,
+obtain version-2 Verify runtime evidence from all six real calls. Normal use does not require it.
 
 For Automatic and Zero Risk, record the actual runtime, model, effort, client path, source fixture,
 selected format, and observation limits:

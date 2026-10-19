@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultBrokerEndpoint, defaultConfig, getContextCapabilityEvidencePath, providerConfig } from "../src/config";
-import { contextCapabilityReceiptsComplete, installedContextCapabilitySchemaDigest,
+import { installedContextCapabilitySchemaDigest,
   readProviderContextCapabilityEvidence, saveContextCapabilityEvidence, type ContextCapabilityReceipts } from "../src/adapters/chatgpt-web/context-capability-verification";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
@@ -61,8 +61,8 @@ for (const mode of ["automatic", "manual"] as const) test(`final ${mode} DEV pro
   expect(prepared.provider.chatgptWeb!.continuityStateDirectory).toBe(f.state.continuityStateDirectory);
   expect(prepared.provider.chatgptWeb!.lunaCheckpointStatePath).toBe(f.state.lunaCheckpointStatePath);
   expect(prepared.provider.chatgptWeb!.browserHelperScriptPath).toBe(f.state.browserHelperScriptPath);
-  expect(contextCapabilityReceiptsComplete(prepared.evidence.receipts)).toBe(true);
-  expect(prepared.evidence.binding.mode).toBe(mode);
+  expect(prepared.capability.mode).toBe(mode);
+  expect(prepared.capability.schemaDigest).toBe(f.schema);
   const secondCase = continuityDevProvider(original, f.paths, { continuityStateDirectory: join(f.privateRoot, "other-case") });
   expect(secondCase.chatgptWeb!.continuityStateDirectory).not.toBe(prepared.provider.chatgptWeb!.continuityStateDirectory);
   expect(secondCase.chatgptWeb!.threadEnvironmentStatePath).toBe(prepared.provider.chatgptWeb!.threadEnvironmentStatePath);
@@ -70,6 +70,9 @@ for (const mode of ["automatic", "manual"] as const) test(`final ${mode} DEV pro
   expect(existsSync(f.state.lunaCheckpointStatePath)).toBe(false);
   const evidence = continuityDevProviderEvidence(prepared), json = JSON.stringify(evidence);
   expect(evidence.checkedBeforeTurnAdmission).toBe(true);
+  expect(evidence.staticSchemaChecked).toBe(true);
+  expect(evidence).not.toHaveProperty("verified");
+  expect(evidence).not.toHaveProperty("verifiedAt");
   expect(evidence.profile).toBe("development");
   for (const secret of [f.home, f.privateRoot, f.config.brokerSocketPath, f.config.tunnel!.tunnelId]) expect(json).not.toContain(secret);
 });
@@ -77,7 +80,7 @@ for (const mode of ["automatic", "manual"] as const) test(`final ${mode} DEV pro
 test("read-only preflight uses the installed DEV provider without creating a task journal", async () => {
   const f = await verifiedFixture(), before = readFileSync(getContextCapabilityEvidencePath(f.home));
   const prepared = await prepareContinuityDevProvider(providerConfig(f.config), f.paths);
-  expect(prepared.evidence).toEqual(f.proof);
+  expect(prepared.capability).toEqual(f.proof.binding);
   expect(prepared.provider.chatgptWeb!.continuityStateDirectory).toBe(join(f.paths.runtimePath, "session-continuity"));
   expect(existsSync(f.paths.runtimePath)).toBe(false);
   expect(before.equals(readFileSync(getContextCapabilityEvidencePath(f.home)))).toBe(true);
@@ -94,7 +97,7 @@ for (const mismatch of ["app", "mode", "socket", "local-tools"] as const) test(`
   expect(existsSync(f.state.continuityStateDirectory)).toBe(false);
 });
 
-for (const stale of ["missing", "schema", "tunnel", "text-receipt"] as const) test(`invalid installed ${stale} evidence rejects before the first activity`, async () => {
+for (const stale of ["missing", "schema", "tunnel", "text-receipt"] as const) test(`invalid installed ${stale} diagnostics do not block the first activity`, async () => {
   const f = await verifiedFixture(), firstActivity = mock(() => {});
   if (stale === "missing") rmSync(getContextCapabilityEvidencePath(f.home));
   if (stale === "schema") saveContextCapabilityEvidence(f.config, "0".repeat(64), receipts(), f.home);
@@ -104,8 +107,11 @@ for (const stale of ["missing", "schema", "tunnel", "text-receipt"] as const) te
     delete store.modes.automatic.receipts.compaction.text_read;
     writeFileSync(getContextCapabilityEvidencePath(f.home), JSON.stringify(store));
   }
-  await expect(prepareContinuityDevProvider(providerConfig(f.config), f.paths, f.state).then(firstActivity)).rejects.toThrow("six read-only MCP calls");
-  expect(firstActivity).not.toHaveBeenCalled();
+  const prepared = await prepareContinuityDevProvider(providerConfig(f.config), f.paths, f.state);
+  firstActivity();
+  expect(firstActivity).toHaveBeenCalledTimes(1);
+  expect(prepared.capability.profile).toBe("development");
+  expect(prepared.capability.schemaDigest).toBe(f.schema);
   expect(existsSync(f.state.continuityStateDirectory)).toBe(false);
 });
 

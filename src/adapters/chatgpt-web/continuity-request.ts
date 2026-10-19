@@ -383,7 +383,7 @@ export async function prepareContinuityRequest(...args: Parameters<typeof prepar
     }
     const bindings = continuityBindingsFor(resolve(expandUserPath(directory!)));
     let observedBeforePrepare: RecoveryThreadRecord | undefined;
-    const prepare = () => prepareContinuityRequestUnlocked(args[0], args[1], args[2], args[3], args[4], args[5], args[6], () => {
+    const prepare = () => prepareContinuityRequestUnlocked(args[0], args[1], args[2], args[3], args[4], args[5], () => {
       const binding = continuityBindingsFor(resolve(expandUserPath(directory!))).observed(continuityDigest(native.threadId!));
       if (binding?.lease) release?.();
       pageSelected();
@@ -569,7 +569,6 @@ async function prepareContinuityRequestUnlocked(
   capabilities: ChatGptWebCapabilities,
   worker: ChatGptBrowserWorker,
   abortSignal?: AbortSignal,
-  verifyContextCapability?: () => Promise<void>,
   livePageSelected?: () => void,
 ): Promise<PreparedContinuityRequest> {
   abortSignal?.throwIfAborted();
@@ -618,7 +617,7 @@ async function prepareContinuityRequestUnlocked(
     if (parsed._compactionRequest) {
       const { prepareFreshRecoveryCompaction } = await import("./continuity-recovery-compaction");
       return prepareFreshRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, descriptor,
-        abortSignal, assertExecutionCompatible, verifyContextCapability);
+        abortSignal, assertExecutionCompatible);
     }
     return prepareFreshPage(parsed, namespace, capabilities, bindings, descriptor, config.experimentalSkillAttachments,
       config.experimentalBiggerContext, assertExecutionCompatible, abortSignal);
@@ -637,7 +636,7 @@ async function prepareContinuityRequestUnlocked(
       identity: durable.transaction ? recoveryIdentity(durable, bindings.recoveryStore.installationId()) : undefined,
     } : undefined;
     const { prepareRecoveryCompaction, recoveryCompactionTarget } = await import("./continuity-recovery-compaction");
-    const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+    const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
     if (prepared) return prepared;
     const target = recoveryCompactionTarget(parsed);
     if (target?.source.allowRetainedSourceFallback && target.sourceRevision.instructionEnvelope?.role === "tool_result") {
@@ -668,7 +667,7 @@ async function prepareContinuityRequestUnlocked(
         && source?.acceptedTaskRevision === durable.works[durable.currentWorkId!]?.acceptedTaskRevision
         && source?.workPayloadDigest === durable.works[durable.currentWorkId!]?.workPayloadDigest) {
         const observed = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, current,
-          descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability, target.compactionTargetId);
+          descriptor, abortSignal, assertExecutionCompatible, target.compactionTargetId);
         if (observed) return observed;
       }
       throw continuityError("continuity_source_unproven");
@@ -677,7 +676,7 @@ async function prepareContinuityRequestUnlocked(
       if (!retained.identity || !retained.leaseRecovery
         || !sameContinuityRecoveryIdentity(retained.identity, retained.leaseRecovery)) throw continuityError("continuity_source_unproven");
       const recovered = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, current,
-        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+        descriptor, abortSignal, assertExecutionCompatible);
       if (recovered) return recovered;
       throw continuityError("continuity_session_lost");
     }

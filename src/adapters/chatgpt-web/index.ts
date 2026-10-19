@@ -12,7 +12,6 @@ import { ContextSend } from "./context-send";
 import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, contextCandidateMessageIndices, contextCandidateRawInputIndices } from "./context-candidate-mapping";
 import { createContextSnapshot, contextSnapshotPriorityImageLocators, type ContextSnapshot } from "./context-snapshot";
 import { prepareFreshCompactionSource, captureRetainedCompactionSource, type CompactionSourceCoverage } from "./compaction-context";
-import { assertProviderContextCapabilityVerified } from "./context-capability-verification";
 import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, scheduleChatGptWebHeartbeat, type ChatGptWebHeartbeatScheduler } from "./heartbeat";
 import { estimateTokens } from "../../lib/token-estimate";
 import {
@@ -472,8 +471,6 @@ export function createChatGptWebAdapter(
     broker?: TurnBrokerOwner;
     zeroRiskManualControl?: ChatGptZeroRiskManualControl;
     codexHome?: string;
-    /** Private host dependency; never populated from Responses input. */
-    verifyContextCapability?: () => Promise<void>;
     /** Internal timer dependency; never read from user input or provider configuration. */
     heartbeatScheduler?: ChatGptWebHeartbeatScheduler;
     /** Private acceptance dependency. Never read from user input or provider configuration. */
@@ -487,9 +484,6 @@ export function createChatGptWebAdapter(
     contextRendering: dependencies.contextPresentation?.contextRendering,
     contextRawTextPolicy: dependencies.contextPresentation?.contextRawTextPolicy,
   };
-  const verifyContextCapability = dependencies.verifyContextCapability ?? (async () => {
-    await assertProviderContextCapabilityVerified(provider);
-  });
   const preparedContinuity = new WeakMap<CodexParsedRequest, PreparedContinuityRequest>();
   const negotiatedTaskUpdates = new WeakSet<CodexParsedRequest>();
   const broker = dependencies.broker ?? TurnBroker.forSocket(brokerSocketPath(provider));
@@ -808,7 +802,7 @@ export function createChatGptWebAdapter(
     const contextSend = mode.localTools && !parsed._compactionRequest && !continuity?.finalReplaySource
       ? new ContextSend(contextCanonical,
         broker, turnCapabilities, traceId, previousCoverage,
-        initialTaskUpdateOwner, sourceSnapshot, verifyContextCapability) : undefined;
+        initialTaskUpdateOwner, sourceSnapshot) : undefined;
     if (contextSend && continuity?.binding.recovery) bindRecoveryContextCoverage(continuity.binding.recovery, contextSend.coverage);
     const finalizeContextSend = async (browser: Promise<string>): Promise<string> => {
       try { return await browser; }
@@ -1578,7 +1572,7 @@ export function createChatGptWebAdapter(
       await prepareTrustedEnvironment(parsed, incoming.abortSignal);
       if (parsed._conversationPolicy === "task") {
         chatGptTurnSessions.assertTaskAdoptionEvidence(parsed);
-        preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal, verifyContextCapability));
+        preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal));
       } else if (isChatGptWebZeroRiskBackendModel(parsed.modelId) === manualInteraction) {
         incoming.abortSignal?.throwIfAborted();
         await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, extractChatGptTurnIdentity(parsed).threadId);
@@ -1656,7 +1650,7 @@ export function createChatGptWebAdapter(
         }
         if (parsed._conversationPolicy === "task" && !preparedContinuity.has(parsed)) {
           chatGptTurnSessions.assertTaskAdoptionEvidence(parsed);
-          preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal, verifyContextCapability));
+          preparedContinuity.set(parsed, await prepareContinuityRequest(parsed, provider, executionNamespace, configuredCapabilities, worker, incoming.abortSignal));
         }
         if (parsed._conversationPolicy === "task" && environment) {
           environment = { ...environment, tools: parsed.context.tools ?? [] };
@@ -1683,7 +1677,7 @@ export function createChatGptWebAdapter(
           const shared = runContinuityCompaction(parsed, prepared, worker, broker, configuredCapabilities,
             executionNamespace, timeoutMs, incoming.onProgress, () => {
               emit({ type: "text_delta", text: "A new ChatGPT conversation was created with the current context.", phase: "commentary" });
-            }, verifyContextCapability, manualRequest ? options => {
+            }, manualRequest ? options => {
               options.signal.throwIfAborted();
               const runtime = startRuntime(parsed, environment, options.traceId, turnCapabilities, {
                 sourceSnapshot: options.sourceSnapshot, compactionDeadlineAt: options.deadlineAt,
@@ -1766,7 +1760,7 @@ export function createChatGptWebAdapter(
                     : {}),
                 },
                 async (operatorSignal, retainOwnershipUntil) => {
-                  await verifyContextCapability();
+                  operatorSignal.throwIfAborted();
                   const handoffTimeoutMs = Math.min(
                     timeoutMs ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
                     MAX_COMPACTION_HANDOFF_TIMEOUT_MS,

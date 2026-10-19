@@ -73,8 +73,11 @@ model claims. Its private scope rejects business execution and compaction submis
 verification retains the original user choice, Send, start, and Sent policy. The stored owner-only
 evidence contains no read credentials and is bound to profile/home, mode, exact plugin, tunnel,
 runtime command, and installed schema digest. Binding changes invalidate it; it has no time-based
-expiry. Navigation publication and new compaction admission require this evidence. It proves
-callability, not raw cloud schema contents or continued model reliability.
+expiry. The record is for diagnostic comparison only. Normal tasks, navigation, compaction,
+and recovery do not read it as permission or start diagnosis automatically. Current credentials,
+protocols, sources, budgets, and delivery and commit checks still apply. Setup completion depends
+on the required configuration steps, independent of diagnostic success or failure. A diagnosis
+proves callability at that time, not raw cloud schema contents or continued model reliability.
 
 ### Context source capabilities
 
@@ -249,7 +252,8 @@ and real results. Historical calls are context only; they cannot authorize redis
 model call needs current authority. Cold compaction can regenerate a summary from these sources,
 without claiming an exact replay of an old commit. Within a current page, one compaction
 transaction still commits once. Full/MCP navigation retains its independent read-only credential,
-actual source and delivery limits, and runtime verification. Ordinary assistant prose is not a
+actual source and delivery limits, and current protocol checks. Historical runtime diagnosis is
+optional and does not grant execution authority. Ordinary assistant prose is not a
 structured retained-path handoff. Zero Risk keeps manual Send, Sent, and attachment confirmation
 and its ended-response manual checkpoint boundary.
 

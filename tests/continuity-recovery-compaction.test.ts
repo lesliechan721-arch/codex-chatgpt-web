@@ -258,8 +258,8 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     return "Checkpoint submitted";
   });
   cleanup.push(async () => { run.mockRestore(); await broker.close(); await server.stop(true); rmSync(directory, { recursive: true, force: true }); });
-  const prepare = (parsed = request, verifyContextCapability?: () => Promise<void>) => prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings,
-    store.get(thread), descriptor, undefined, undefined, verifyContextCapability);
+  const prepare = (parsed = request, assertExecutionCompatible?: () => Promise<void>) => prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings,
+    store.get(thread), descriptor, undefined, assertExecutionCompatible);
   return { directory, state, bindings, binding, store, thread, threadId, scope, sourceWorkId, namespace, request, provider, worker, broker, starts,
     descriptor, launcherInstance,
     actualRetirement: () => { actualRetirement = true; },
@@ -306,11 +306,36 @@ async function interruptCompaction(f: ReturnType<typeof fixture>, turnId: string
     body: JSON.stringify({ threadId: f.threadId, turnId }) });
 }
 
-test("connector capability rejection precedes recovery writer transfer and source publication", async () => {
+test("current runtime protocol rejection precedes recovery writer transfer and source publication", async () => {
   const f = fixture();
   const before = f.store.get(f.thread)!;
-  const rejected = new Error("Connector navigation schema is not verified");
+  const rejected = new Error("Current helper protocol is incompatible");
   await expect(f.prepare(f.request, async () => { throw rejected; })).rejects.toBe(rejected);
+  const after = f.store.get(f.thread)!;
+  expect(after.epoch).toBe(before.epoch);
+  expect(after.currentWorkId).toBe(before.currentWorkId);
+  expect(after.works[f.sourceWorkId]!.attempts).toEqual(before.works[f.sourceWorkId]!.attempts);
+  expect(f.starts).toHaveLength(0);
+  expect(f.sends()).toBe(0);
+});
+
+for (const change of ["cancel", "source-stop"] as const) test(`current compatibility wait preserves ${change} before recovery writer transfer`, async () => {
+  const f = fixture();
+  const before = f.store.get(f.thread)!;
+  const controller = new AbortController();
+  let release!: () => void, entered!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const pending = prepareRecoveryCompaction(f.request, f.provider, f.namespace, capabilities, f.worker, f.bindings,
+    before, f.descriptor, controller.signal, async () => { entered(); await held; }).catch(error => error);
+  await started;
+  const cancellation = new Error("User cancelled while checking the current helper protocol");
+  if (change === "cancel") controller.abort(cancellation);
+  else f.store.stopWork(f.thread, { scope: f.scope }, f.sourceWorkId, "user-stop");
+  release();
+  const result = await pending;
+  if (change === "cancel") expect(result).toBe(cancellation);
+  else expect(result).toMatchObject({ code: "continuity_stopped" });
   const after = f.store.get(f.thread)!;
   expect(after.epoch).toBe(before.epoch);
   expect(after.currentWorkId).toBe(before.currentWorkId);
@@ -322,14 +347,13 @@ test("connector capability rejection precedes recovery writer transfer and sourc
 test("Automatic lost compaction creates one tool-free page, commits, and replays after page loss", async () => {
   const f = fixture();
   const prepared = (await f.prepare())!;
-  let recoveries = 0; let capabilityChecks = 0;
+  let recoveries = 0;
   const summary = await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace,
-    undefined, undefined, () => { recoveries++; }, async () => { capabilityChecks++; });
+    undefined, undefined, () => { recoveries++; });
   await assertContinuityCompactionResult(prepared);
   expect(f.starts).toHaveLength(1);
   expect(f.sends()).toBe(1);
   expect(recoveries).toBe(1);
-  expect(capabilityChecks).toBe(1);
   const record = f.store.get(f.thread)!;
   expect(record.epoch).toBe(1);
   expect(record.historyRevision).toBe(1);
@@ -343,7 +367,7 @@ test("Automatic lost compaction creates one tool-free page, commits, and replays
   (wrapped._rawBody as { stream?: boolean }).stream = true;
   const replay = (await f.prepare(wrapped))!;
   expect(await runContinuityCompaction(wrapped, replay, f.worker, f.broker, capabilities, f.namespace,
-    undefined, undefined, () => { recoveries++; }, async () => { throw new Error("Replay must not probe connector capability"); })).toBe(summary);
+    undefined, undefined, () => { recoveries++; })).toBe(summary);
   await assertContinuityCompactionResult(replay);
   expect(f.starts).toHaveLength(1);
   expect(recoveries).toBe(1);
@@ -528,10 +552,9 @@ test("a complete retained handoff commits once without creating a page or invent
   f.binding.acceptedHandoff = { key: "old-compaction", sourceRevision: 0, sourceExecutionKey: "source-execution",
     summary, bytes: Buffer.byteLength(summary), lease: { owner: f.bindings.owner, leaseId: "2".repeat(32),
       traceId: "old-handoff", recovery: originalIdentity } };
-  const noProbe = async () => { throw new Error("Accepted handoff must not probe connector capability"); };
-  const prepared = (await f.prepare(f.request, noProbe))!;
+  const prepared = (await f.prepare(f.request))!;
   expect(await runContinuityCompaction(f.request, prepared, f.worker, f.broker, capabilities, f.namespace,
-    undefined, undefined, undefined, noProbe)).toBe(summary);
+    undefined, undefined, undefined)).toBe(summary);
   expect(f.starts).toHaveLength(0);
   expect(f.store.get(f.thread)!.works[workId]!.attempts).toHaveLength(1);
   expect(prepared.binding.lease).toBeUndefined();
@@ -1233,7 +1256,7 @@ for (const history of ["omitted", "edited"] as const) test(`a closed checkpoint 
 test("repair12: existing-target observation cannot register a target or start a cold transaction", async () => {
   const f = fixture();
   const observe = (targetId: string) => prepareRecoveryCompaction(structuredClone(f.request), f.provider, f.namespace,
-    capabilities, f.worker, f.bindings, f.store.get(f.thread), f.descriptor, undefined, undefined, undefined, targetId);
+    capabilities, f.worker, f.bindings, f.store.get(f.thread), f.descriptor, undefined, undefined, targetId);
   const before = f.store.get(f.thread)!;
   expect(await observe("missing-target")).toBeUndefined();
   expect(f.store.get(f.thread)).toEqual(before);
@@ -1261,7 +1284,7 @@ for (const existingOnly of [false, true]) test(`repair12: captured compaction ob
     const observerRequest = structuredClone(f.request);
     const targetId = recoveryCompactionTarget(f.request)!.target.compactionTargetId;
     const observer = (await prepareRecoveryCompaction(observerRequest, f.provider, f.namespace, capabilities, f.worker,
-      f.bindings, f.store.get(f.thread), f.descriptor, undefined, undefined, undefined, existingOnly ? targetId : undefined))!;
+      f.bindings, f.store.get(f.thread), f.descriptor, undefined, undefined, existingOnly ? targetId : undefined))!;
     expect(observer).toBeDefined();
     release();
     const originalFailure = await original;

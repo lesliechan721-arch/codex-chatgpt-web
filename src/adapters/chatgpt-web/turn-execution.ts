@@ -6,7 +6,7 @@ import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
 import { createContextSnapshot } from "./context-snapshot";
 import type { BrokerToolRequest } from "./turn-broker";
-import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptBrowserErrorLog, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
   chatGptCurrentInstructionIndex,
   chatGptCurrentInstructionRevision,
@@ -868,14 +868,13 @@ export class ChatGptTurnSession {
       .then(outcome => {
       this.settledBrowserOutcome = outcome;
       if (runtime.continuityBinding) this.lastTouchedAt = runtime.continuityBinding.lastUsedAt;
-      const error = outcome.type === "error" && outcome.error instanceof ChatGptWebAdapterError
-        ? outcome.error : undefined;
-      console.info(`[chatgpt-web] browser_settled ${JSON.stringify({
+      const log = outcome.type === "error" ? console.warn : console.info;
+      log(`[chatgpt-web] browser_settled ${JSON.stringify({
         traceId: this.traceId,
         outcome: outcome.type,
         compaction: runtime.usageInput?._compactionRequest === true,
-        ...(!runtime.usageInput?._compactionRequest ? { submission: runtime.submission?.phase ?? "unknown" } : {}),
-        ...(error ? { code: error.code, retryable: error.retryable } : {}),
+        submission: runtime.submission?.phase ?? "unknown",
+        ...(outcome.type === "error" ? chatGptBrowserErrorLog(outcome.error) : {}),
       })}`);
       return outcome;
     });

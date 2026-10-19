@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { CodexProviderConfig } from "../src/types";
 import type { DevProfilePaths } from "../src/dev-chat/profile";
-import { assertProviderContextCapabilityVerified } from "../src/adapters/chatgpt-web/context-capability-verification";
+import { contextCapabilityBinding, installedContextCapabilitySchemaDigest } from "../src/adapters/chatgpt-web/context-capability-verification";
+import { loadConfigFromPath, providerConfig } from "../src/config";
 
 type DevRuntimePaths = Pick<DevProfilePaths, "home" | "runtimePath">;
 interface PrivateState {
@@ -27,18 +28,24 @@ export function continuityDevProvider(original: CodexProviderConfig, paths: DevR
 /** Call before transport/turn/page admission, then pass this exact provider to the adapter. */
 export async function prepareContinuityDevProvider(original: CodexProviderConfig, paths: DevRuntimePaths, state: PrivateState = {}) {
   const provider = continuityDevProvider(original, paths, state);
-  const evidence = await assertProviderContextCapabilityVerified(provider);
-  if (evidence.binding.profile !== "development") throw new Error("Continuity acceptance requires verified installed DEV capability");
-  return { provider, evidence };
+  const config = loadConfigFromPath(join(paths.home, "config.json"));
+  const current = providerConfig(config).chatgptWeb!, web = provider.chatgptWeb!;
+  if (config.purpose !== "dev-harness") throw new Error("Continuity acceptance requires the installed DEV profile");
+  if (config.mode !== "full" || web.localToolsEnabled !== true || web.appName !== current.appName
+    || (web.browserInteractionMode ?? "automatic") !== current.browserInteractionMode || web.brokerSocketPath !== current.brokerSocketPath) {
+    throw new Error("Continuity acceptance configuration does not match the active provider");
+  }
+  const schemaDigest = await installedContextCapabilitySchemaDigest(config);
+  return { provider, capability: contextCapabilityBinding(config, schemaDigest, paths.home) };
 }
 
 /** Whitelisted runtime identity evidence; never emit the provider or its complete binding. */
 export function continuityDevProviderEvidence(prepared: Awaited<ReturnType<typeof prepareContinuityDevProvider>>) {
-  const { provider, evidence } = prepared;
+  const { provider, capability } = prepared;
   const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-  return { verified: true, verifiedAt: evidence.verifiedAt, profile: evidence.binding.profile, mode: evidence.binding.mode,
-    schemaDigest: evidence.binding.schemaDigest, runtimeFingerprint: evidence.binding.runtimeFingerprint,
-    installedHomeDigest: digest(evidence.binding.home), statePathDigest: digest(provider.chatgptWeb!.threadEnvironmentStatePath!),
-    contextProtocol: evidence.binding.contextProtocol, textReadFormat: evidence.binding.textReadFormat,
+  return { configured: true, staticSchemaChecked: true, profile: capability.profile, mode: capability.mode,
+    schemaDigest: capability.schemaDigest, runtimeFingerprint: capability.runtimeFingerprint,
+    installedHomeDigest: digest(capability.home), statePathDigest: digest(provider.chatgptWeb!.threadEnvironmentStatePath!),
+    contextProtocol: capability.contextProtocol, textReadFormat: capability.textReadFormat,
     checkedBeforeTurnAdmission: true };
 }
