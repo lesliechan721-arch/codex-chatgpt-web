@@ -201,7 +201,9 @@ test("delayed physical absence is observed after one exact release without requi
   try {
     const targetsAbsent = f.source.targetsAbsent;
     f.source.targetsAbsent = async targets => { const absent = await targetsAbsent(targets, 100); return absent && f.counts.targets > 3; };
-    const result = await cleanupCompletedContinuityPage(f.source, limits);
+    // Real durable writes can exceed one second on Windows.
+    const result = await cleanupCompletedContinuityPage(f.source, { ...limits, deadlineMs: 5000 });
+    expect(result.error).toBeUndefined();
     expect(result.cleanupConfirmed).toBe(true); expect(f.counts.targets).toBeGreaterThan(3); expect(f.counts.release).toBe(1);
     expect(f.counts.query).toBe(1); expect(f.store.get(f.thread)).toBeUndefined();
   } finally { f.dispose(); }
