@@ -403,7 +403,8 @@ describe("context capability evidence", () => {
       if (development) f.config.purpose = "dev-harness";
       f.config.manualTunnel = { ...f.config.tunnel!, tunnelId: `tunnel_${"b".repeat(32)}`, profileName: "manual", alias: "manual" };
       f.config.appName = manual ? f.config.manualAppName : f.config.automaticAppName;
-      const runtimeRoot = mkdtempSync(join(process.cwd(), ".context-runtime-")); roots.push(runtimeRoot);
+      // Keep mutable fixtures outside Git so parallel source fingerprints stay stable.
+      const runtimeRoot = mkdtempSync(join(tmpdir(), "context-runtime-")); roots.push(runtimeRoot);
       const runtimeFile = join(runtimeRoot, "runtime-entry.ts");
       const runtimeSource = `await import(${JSON.stringify(resolve("src/cli.ts"))});\n`;
       writeFileSync(runtimeFile, runtimeSource); f.config.runtimeCommand = [process.execPath, runtimeFile];
