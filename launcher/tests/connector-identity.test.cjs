@@ -38,13 +38,23 @@ test("DEV setup gives the current production default its separate DEV identity",
   assert.equal(identity.connectorNameForDevSetup(identity.CURRENT_CONNECTOR_NAME), identity.DEV_CONNECTOR_NAME);
 });
 
-test("startup clears old ABI verification for defaults and custom names without changing config", () => {
-  for (const appName of ["Codex Native4", "Codex Native4 DEV", "Codex Zero Risk3", "Codex Work"]) {
+test("startup requires configuration migration for retired identities without changing config", () => {
+  for (const appName of ["Codex Native4", "Codex Native4 DEV", "Codex Zero Risk3"]) {
     const config = { mode: "full", appName };
     const state = { mcpSetupComplete: true, mcpGuideStep: 0 };
     assert.deepEqual(identity.connectorSetupStatePatch(config, state), { mcpSetupComplete: false, mcpGuideStep: 2 });
     assert.equal(config.appName, appName);
     assert.equal(state.mcpSetupComplete, true);
+  }
+});
+
+test("startup preserves completed configuration across setup-contract upgrades", () => {
+  for (const appName of [identity.CURRENT_CONNECTOR_NAME, identity.DEV_CONNECTOR_NAME, identity.CURRENT_MANUAL_CONNECTOR_NAME, "Codex Work"]) {
+    for (const mcpSetupContract of [undefined, "previous-ABI", identity.MCP_SETUP_CONTRACT]) {
+      const config = { mode: "full", appName };
+      const state = { mcpSetupComplete: true, mcpSetupContract, mcpGuideStep: 0 };
+      assert.deepEqual(identity.connectorSetupStatePatch(config, state), {});
+    }
   }
 });
 

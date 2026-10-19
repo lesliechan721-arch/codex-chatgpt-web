@@ -4,14 +4,13 @@ const DEV_LONG_WAIT_CONNECTOR_NAME = DEV_CONNECTOR_NAME;
 const CURRENT_MANUAL_CONNECTOR_NAME = "Codex Zero Risk4";
 const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native", "Codex Native2", "Codex Native2 DEV", "Codex Native3", "Codex Native3 DEV", "Codex Native4", "Codex Native4 DEV"]);
 const LEGACY_MANUAL_CONNECTOR_NAMES = Object.freeze(["Codex Zero Risk", "Codex Zero Risk2", "Codex Zero Risk3"]);
-// This versions the Launcher setup check, not proof of ChatGPT's cached remote schema.
+// Kept for setup-state compatibility. A version change does not invalidate saved configuration.
 const MCP_SETUP_CONTRACT = "context-navigation-v1";
 
 function connectorSetupStatePatch(config, state) {
   if (config?.mode !== "full") return { mcpSetupComplete: false, mcpGuideStep: 0 };
   if (isLegacyConnectorName(config.appName)
-    || state.mcpSetupContract !== MCP_SETUP_CONTRACT
-    || state.mcpSetupConnectorName !== config.appName) {
+    || (state.mcpSetupConnectorName !== undefined && state.mcpSetupConnectorName !== config.appName)) {
     return { mcpSetupComplete: false, mcpGuideStep: 2 };
   }
   return {};

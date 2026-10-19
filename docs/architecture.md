@@ -92,7 +92,8 @@ Existing Native operations, waiting, task revisions, and ACKs retain their contr
 change the part after `Codex ` for the selected mode. The retired `Codex Native`, `Codex Native2`,
 `Codex Native2 DEV`, `Codex Native3`, `Codex Native3 DEV`, `Codex Native4`, `Codex Native4 DEV`,
 `Codex Zero Risk`, `Codex Zero Risk2`, and `Codex Zero Risk3` are never selected or refreshed in
-place. Setup migrates known legacy local configuration transactionally and clears prior verification.
+place. Setup migrates known legacy local configuration transactionally and requires the necessary
+configuration steps for the selected identity.
 The user creates a new remote plugin. Exact browser selection never falls back to a retired
 identity. Production and DEV plugins can remain installed together. Future released public schema
 changes require another explicit connector identity. The current context-rendering/text-read-v2
@@ -105,18 +106,19 @@ are stored independently and must differ. Setup preserves custom nonlegacy names
 and mode changes. When upgrading from
 `Codex Native4`, `Codex Native4 DEV`, or `Codex Zero Risk3`, preserve the old remote connector and
 create the corresponding new connector; never rename or refresh an old identity.
-A name change uses the existing setup transaction, rejects active work, and clears MCP verification
-only after success. The user must create a new plugin with that exact name. Renaming a display
-label does not itself replace a remote connector's cached schema; retired connector identities cannot
+A name change uses the existing setup transaction, rejects active work, and requires completion of
+the changed configuration after success. The user must create a new plugin with that exact name.
+Renaming a display label does not itself replace a remote connector's cached schema; retired connector identities cannot
 be selected as new names and legacy connectors are still never reused. If a preserved custom name
 still caches a pre-navigation public contract, use the original new-name migration. For the
-unreleased text-v2 update, refresh/reconnect the same current connector and verify again. If that
+unreleased text-v2 update, refresh/reconnect the same current connector when needed. If that
 cannot establish v2 support, stop its use without selecting another or retired identity.
-An old setup-flow marker or saved-name mismatch clears local verification without changing the
-configured custom name. The marker records UI flow version only. Local health, installed
-`tools/list`, and browser connector selection cannot prove the remote cached schema. Verify runtime
-also registers a bounded private read-only pair over fixed small text, then requires six successful
-transport returns: list/search/read with ordinary and independent compaction credentials. Capability
+A saved-name mismatch can require completion of the changed configuration without changing the
+configured custom name. A compatible setup-marker upgrade alone does not reset valid configuration.
+The marker records configuration completion, independent of diagnosis. Local health, installed
+`tools/list`, and browser connector selection cannot prove the remote cached schema. Optional
+Verify runtime registers a bounded private read-only pair over fixed small text, then requires six
+successful transport returns: list/search/read with ordinary and independent compaction credentials. Capability
 evidence 2 additionally binds each read to the actual v2 result shape and supported-transport digest.
 The contract fingerprint includes tool descriptions, the text-read version, and any output schema.
 Old evidence is invalid. The pair
@@ -124,9 +126,13 @@ has no business or compaction-submission authority. Automatic uses real submissi
 manual uses the original user selection, Send, start, and Sent policy. The owner-only sidecar binds
 the result to profile/home, mode, exact plugin, tunnel, runtime command, and installed schema digest,
 with no time-based expiry. A retry clears that mode's old result; a binding change invalidates it.
-Context projection and new compaction admission check this result before publishing source access.
-It proves shape and callability, not model body use or the platform's raw cached schema. Separate real
-ordinary tasks and compaction transactions check body use through their existing answer/checkpoint
+Normal tasks, context projection, compaction, and recovery do not consume this record as permission.
+Missing, unreadable, failed, old, or mismatched records do not change plans or trigger automatic
+checks. Diagnosis does not clear configuration completion, and success does not bypass required
+configuration steps. Current protocol, credential, source, budget, delivery, and commit checks
+remain in place. The result proves shape and callability at that time, not model body use or the
+platform's raw cached schema. Separate real ordinary tasks and compaction transactions check body
+use through their existing answer/checkpoint
 exits; the private verifier still cannot complete a task. Image and model acceptance remain part
 of [release validation](release-validation.md#context-navigation-validation).
 

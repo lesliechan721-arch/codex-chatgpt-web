@@ -350,7 +350,7 @@ async function runResourceLive(options: RunOptions) {
     const prepared = await prepareContinuityDevProvider(providerConfig(config), paths, {
       continuityStateDirectory: continuity, lunaCheckpointStatePath: join(privateRuntime, "luna-checkpoints.json"), browserHelperScriptPath: helper,
     });
-    const provider = prepared.provider; report.providerVerification = continuityDevProviderEvidence(prepared); save();
+    const provider = prepared.provider; report.providerCapability = continuityDevProviderEvidence(prepared); save();
     transport = await startDevChatTransport(config, paths.runtimePath);
     const status = await callTurnBroker<Row>(config.brokerSocketPath, { method: "owner_status" });
     assert.ok(status.protocolVersion >= 13 && status.recoveryProtocol === 2, "真实 Broker 缺少 protocol13/recovery2");

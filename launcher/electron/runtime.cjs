@@ -1045,6 +1045,32 @@ class RuntimeHost {
     return requireCurrentRuntimeConnectorName(current.config?.appName);
   }
 
+  mcpSetupCompletionConnectorName(interactionMode) {
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured || current.owner !== "launcher" || current.mode !== "full"
+      || (current.config.browserInteractionMode ?? "automatic") !== interactionMode) {
+      throw new Error("Connect the local MCP harness for this mode before completing setup");
+    }
+    const connectorName = requireCurrentRuntimeConnectorName(current.config.appName);
+    if (!this.mcpCredentialsConfigured(interactionMode)) {
+      throw new Error("Save tunnel credentials for this mode before completing MCP setup");
+    }
+    const tunnel = current.config.tunnel;
+    if (!usableExecutable(tunnel?.binaryPath)
+      || !fs.statSync(tunnel.profileDir).isDirectory()
+      || !fs.statSync(tunnel.runtimeKeyFile).isFile()
+      || (process.platform !== "win32" && (fs.statSync(tunnel.runtimeKeyFile).mode & 0o077) !== 0)) {
+      throw new Error("The local MCP tunnel files are missing or have unsafe permissions; reconnect the harness");
+    }
+    const runtime = this.supervisor.readState();
+    if (runtime?.ownerPid !== process.pid || runtime.status !== "ready"
+      || !this.supervisor.tunnel
+      || (this.launcherProfile === "production" && !this.supervisor.daemon)) {
+      throw new Error("The local MCP runtime is not ready; reconnect the harness");
+    }
+    return connectorName;
+  }
+
   browserConnectorName() {
     const current = this.runtimeConfigSnapshot();
     if (this.launcherProfile === "development" && !current.config?.automaticAppName) {
@@ -1583,6 +1609,7 @@ class RuntimeHost {
       fromVersion: existing.config.releaseVersion,
       toVersion: currentVersion,
       connectorMigrated: connectorMigrationRequired,
+      tunnelProfileMigrated: tunnelProfileMigrationRequired,
       stdout: result.stdout,
     };
   }

@@ -1449,7 +1449,9 @@ function McpSurface({
   const [localBusy, setLocalBusy] = useState(false);
   const busy = localBusy || operation?.status === "running";
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
-  const verified = !configuringInactiveMode && snapshot.state.mcpSetupComplete === true;
+  const setupComplete = !configuringInactiveMode && snapshot.state.mcpSetupComplete === true;
+  const canComplete = !configuringInactiveMode && credentialsConfigured
+    && snapshot.state.coreSetupComplete === true && snapshot.state.mcpRuntimeInstalled === true;
   const manualInteraction = interactionMode === "manual";
   const steps = useMemo(() => [
     { title: copy.mcpStepOne, body: copy.mcpStepOneBody },
@@ -1519,6 +1521,19 @@ function McpSurface({
       setLocalBusy(false);
     }
   };
+  const complete = async () => {
+    if (busy || !canComplete) return;
+    setLocalBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.completeMcpSetup());
+      onDone();
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setLocalBusy(false);
+    }
+  };
 
   return (
     <ContentSurface
@@ -1535,13 +1550,13 @@ function McpSurface({
       <div className="wizard-stepper" aria-label={`${step + 1} / 3`}>
         {steps.map((item, index) => (
           <button
-            className={`${index === step ? "is-active" : ""}${index < step || (index === 2 && verified) ? " is-complete" : ""}`}
+            className={`${index === step ? "is-active" : ""}${index < step || (index === 2 && setupComplete) ? " is-complete" : ""}`}
             disabled={busy || index > step}
             key={item.title}
             onClick={() => void safeMove(index)}
             type="button"
           >
-            <span>{index < step || (index === 2 && verified) ? <Icon name="check" /> : index + 1}</span>
+            <span>{index < step || (index === 2 && setupComplete) ? <Icon name="check" /> : index + 1}</span>
             <em>{item.title}</em>
           </button>
         ))}
@@ -1676,7 +1691,18 @@ function McpSurface({
                     {copy.openConnectors}
                   </SecondaryButton>
                 </div>
-                {doctor ? <DoctorSummary copy={copy} language={language} report={doctor} /> : null}
+                <NoticeRow icon={setupComplete ? "check" : "setup"} tone={setupComplete ? "success" : "warning"}>
+                  <span>
+                    <strong>{setupComplete ? copy.mcpReady : copy.configureMcp}</strong>
+                    <small>{canComplete ? copy.mcpOptionalDiagnostic : copy.mcpSetupRequired}</small>
+                  </span>
+                </NoticeRow>
+                <div aria-live="polite">
+                  <p>{copy.latestMcpDiagnostic}</p>
+                  {doctor
+                    ? <DoctorSummary copy={copy} language={language} report={doctor} />
+                    : <p>{copy.mcpDiagnosticNotRun}</p>}
+                </div>
               </div>
             ) : null}
           </motion.section>
@@ -1705,20 +1731,18 @@ function McpSurface({
         ) : null}
         {step === 2 ? (
           <>
-            {verified ? (
-              <SecondaryButton disabled={busy} onClick={() => void verify()}>
-                {copy.verifyRuntime}
-              </SecondaryButton>
-            ) : null}
+            <SecondaryButton disabled={busy} onClick={() => void verify()}>
+              {copy.verifyRuntime}
+            </SecondaryButton>
             <PrimaryButton
-              disabled={busy}
-              onClick={() => void (verified ? onDone() : verify())}
+              disabled={busy || !canComplete}
+              onClick={() => void complete()}
             >
               {busy
                 ? operation?.name === "mcp-verification" && operation.status === "running"
                   ? localizeRuntimeMessage(copy, operation.message, undefined, language)
                   : copy.running
-                : verified ? copy.done : copy.verifyRuntime}
+                : setupComplete ? copy.done : copy.completeMcpSetup}
             </PrimaryButton>
           </>
         ) : null}

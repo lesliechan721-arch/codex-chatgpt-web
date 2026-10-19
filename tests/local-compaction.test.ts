@@ -58,9 +58,7 @@ test("Browser-only compaction prepares the complete input and completes without 
   });
   const events: AdapterEvent[] = [];
   try {
-    await createChatGptWebAdapter(provider, { verifyContextCapability: async () => {
-      throw new Error("Browser-only compaction must not require MCP capability verification");
-    } }).runTurn!(parseRequest(body), { headers: new Headers() }, event => events.push(event));
+    await createChatGptWebAdapter(provider).runTurn!(parseRequest(body), { headers: new Headers() }, event => events.push(event));
     expect(prepared).toBe(true);
     expect(events.filter(event => event.type === "error")).toEqual([]);
     expect(events).toContainEqual({ type: "text_delta", text: summary, phase: "final_answer" });

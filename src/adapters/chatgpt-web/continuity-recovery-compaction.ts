@@ -339,7 +339,7 @@ export function compileRecoveryCompactionInput(parsed: CodexParsedRequest, capab
 export async function prepareFreshRecoveryCompaction(parsed: CodexParsedRequest, provider: CodexProviderConfig,
   namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
   bindings: ContinuityBindings, descriptor: string, abortSignal?: AbortSignal,
-  assertExecutionCompatible?: () => Promise<void>, verifyContextCapability?: () => Promise<void>): Promise<PreparedContinuityRequest> {
+  assertExecutionCompatible?: () => Promise<void>): Promise<PreparedContinuityRequest> {
   await assertExecutionCompatible?.();
   abortSignal?.throwIfAborted();
   const source = extractChatGptCompactionSourceRevision(parsed);
@@ -357,7 +357,7 @@ export async function prepareFreshRecoveryCompaction(parsed: CodexParsedRequest,
   record = store.retireAttempt(record.thread, { scope: record.scope, expectedVersion: record.version }, logicalWorkId, 0);
   freshPageCompactions.add(parsed);
   const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, record,
-    descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+    descriptor, abortSignal, assertExecutionCompatible);
   if (!prepared) throw continuityError("continuity_context_missing", "The current request cannot form a readable compaction source.");
   return prepared;
 }
@@ -367,7 +367,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   namespace: string, capabilities: ChatGptWebCapabilities, worker: ChatGptBrowserWorker,
   bindings: ContinuityBindings, record: RecoveryThreadRecord | undefined, descriptor: string,
   abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
-  verifyContextCapability?: () => Promise<void>, existingTargetId?: string): Promise<PreparedContinuityRequest | undefined> {
+  existingTargetId?: string): Promise<PreparedContinuityRequest | undefined> {
   if (!parsed._compactionRequest) return undefined;
   if (!record) throw continuityError("continuity_source_unproven", "A standalone compaction cannot activate a continuity thread.");
   if (record.legacyUnproven) throw continuityError("continuity_legacy_unproven");
@@ -404,7 +404,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     const afterCompatibility = store.get(record.thread)!;
     if (afterCompatibility.version !== record.version) {
       return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
-        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+        descriptor, abortSignal, assertExecutionCompatible);
     }
     const siblings = continuityCheckpointSiblings(parsed, sourceSiblingPrevious(parsed, record, source));
     record = registerTarget(store, bindings.registrations.directory, record, {
@@ -529,7 +529,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     && afterCompatibility.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
   if (afterCompatibility.version !== record.version) {
     return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCompatibility,
-      descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
+      descriptor, abortSignal, assertExecutionCompatible);
   }
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId) && !endedManual && !freshPageCompactions.has(parsed)) throw continuityError("continuity_manual_handoff_required");
   const sourceAttempt = selection.source.attempts.at(-1);
@@ -589,15 +589,11 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     await assertCompactionReadable(sourceSnapshot!, compactionAvailableTokens(input, capabilities, 0)
       - estimateTokens(compiled.text));
   }
-  record = store.get(record.thread)!;
-  if (!acceptedHandoff) {
-    await verifyContextCapability?.();
-    abortSignal?.throwIfAborted();
-    const afterCapability = store.get(record.thread)!;
-    if (afterCapability.version !== record.version) {
-      return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterCapability,
-        descriptor, abortSignal, assertExecutionCompatible, verifyContextCapability);
-    }
+  abortSignal?.throwIfAborted();
+  const afterSourcePreparation = store.get(record.thread)!;
+  if (afterSourcePreparation.version !== record.version) {
+    return prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, afterSourcePreparation,
+      descriptor, abortSignal, assertExecutionCompatible);
   }
   // This coordinator verifies the target thread's retired authority, not merely a live PID.
   if (!freshPageCompactions.has(parsed) && observed?.lease) {
@@ -889,7 +885,7 @@ function checkAttempt(prepared: PreparedContinuityRequest, workId: string, attem
 export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared: PreparedContinuityRequest,
   worker: ChatGptBrowserWorker, owner: TurnBrokerOwner, capabilities: ChatGptWebCapabilities, namespace: string,
   configuredTimeout?: number, onProgress?: () => void, onRecovered?: () => void,
-  verifyContextCapability?: () => Promise<void>, startManual?: StartManualRecoveryCompaction): Promise<string> {
+  startManual?: StartManualRecoveryCompaction): Promise<string> {
   const plan = preparedPlans.get(prepared);
   if (!plan) throw continuityError("continuity_source_unproven");
   if (plan.mode === "observe") {
@@ -981,7 +977,6 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
       signal.throwIfAborted();
       if (store.get(oldRecord.thread)?.version !== oldRecord.version) throw continuityError("continuity_source_unproven");
       let compiled: CompiledChatGptWebPrompt | undefined;
-      await withCompactionAbort(Promise.resolve().then(() => verifyContextCapability?.()), signal);
       signal.throwIfAborted();
       const snapshotDigest = continuityDigest({ control: compactPrompt(parsed), sources: plan.sourceSnapshot!.targets.map(target => ({
         kind: target.kind, role: target.original_role, callId: target.call_id, digest: target.content_digest,

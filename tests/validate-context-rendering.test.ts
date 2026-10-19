@@ -48,9 +48,7 @@ async function sourceWiringHarness(run: (fixture: {
       extraHighAvailable: true, proAvailable: true, threadEnvironmentStatePath: join(f.root, "environments.json") } });
   let accepted: { parsed: CodexParsedRequest; provider: CodexProviderConfig } | undefined;
   const factory: NonNullable<Parameters<typeof compactRequest>[2]> = provider => {
-    const adapter = createChatGptWebAdapter(provider, { broker,
-      // This local fixture replaces cloud callability only; the source gate and ContextSend are production code.
-      verifyContextCapability: async () => {} });
+    const adapter = createChatGptWebAdapter(provider, { broker });
     const original = adapter.runTurn!;
     return { ...adapter, runTurn: (...parameters) => { accepted = { parsed: parameters[0], provider }; return original.apply(adapter, parameters); } };
   };

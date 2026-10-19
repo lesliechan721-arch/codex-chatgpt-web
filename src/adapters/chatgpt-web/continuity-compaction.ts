@@ -115,11 +115,10 @@ export function runContinuityCompaction(
   configuredTimeout?: number,
   onProgress?: () => void,
   onRecovered?: () => void,
-  verifyContextCapability?: () => Promise<void>,
   startManual?: StartManualRecoveryCompaction,
 ): Promise<string> {
   if (isRecoveryCompaction(prepared)) {
-    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered, verifyContextCapability, startManual);
+    return runRecoveryCompaction(parsed, prepared, worker, broker, capabilities, namespace, configuredTimeout, onProgress, onRecovered, startManual);
   }
   const { binding, bindings, executionKey } = prepared;
   const { owner, cached } = retainedCompactionAdmission(parsed, prepared, namespace);
@@ -191,9 +190,6 @@ export function runContinuityCompaction(
         source.assertContinuityCompactionResultBatch(parsed);
         const resultReplay = source.continuityToolResultReplayEvidence(parsed);
         source.assertContinuityGeneration(prepared.verifiedSourceGeneration);
-        if ((!manual || source.isActive()) && verifyContextCapability) {
-          await withCompactionAbort(verifyContextCapability(), signal);
-        }
         signal.throwIfAborted();
         await source.runtime.syncContextUsage?.();
         signal.throwIfAborted();

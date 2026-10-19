@@ -110,10 +110,11 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
    **Connect harness**.
 2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
    **Codex Native5**, with **Authentication: None** and **Allow all actions**.
-3. Run **Verify runtime** for the configured identity. It checks the installed schema, then requires
-   six successful read-only MCP returns: list, search, and read with ordinary and independent
-   compaction credentials. Zero Risk keeps manual plugin selection, Send, and its Sent policy.
-   This proves callability for the selected setup, not the platform's raw cached schema.
+3. Complete configuration. **Verify runtime** is optional for troubleshooting. When requested,
+   it checks the installed schema and requires six successful read-only MCP returns: list, search,
+   and read with ordinary and independent compaction credentials. Zero Risk keeps manual plugin
+   selection, Send, and its Sent policy. The result describes that check; it does not guarantee a
+   later call. Missing or failed historical results do not block tasks, navigation, or compaction.
 
 The current MCP ABI uses **Codex Native5** for Automatic, **Codex Zero Risk4** for Zero Risk, and
 **Codex Native5 DEV** for repository development. Preserve **Codex Native4**, **Codex Native4 DEV**,

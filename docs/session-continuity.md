@@ -47,7 +47,9 @@ required images, error allowance, and work/summary reserve. HTTP, parsing, sourc
 32 MiB snapshot storage, and durable-evidence limits remain separate. Navigation retains its
 96,000 estimated-token and 64 MiB wire cumulative limits. A small legal inline request remains valid.
 Navigation requires the configured Native5 / Native5 DEV / Zero Risk4 or supported custom connector
-and its real Verify runtime result; Full + Launcher alone does not establish navigation readiness.
+and its current protocol, credentials, readable sources, and delivery checks. Historical
+**Verify runtime** results do not control admission or recovery. Full + Launcher and a past
+successful diagnosis do not establish that the current operation can succeed.
 
 All three recovery entrances use this branch: unfinished ordinary work, checkpoint continuation,
 and uncommitted compaction after page loss. A new page can use the request's readable summary
@@ -217,9 +219,9 @@ legal sources. An independent `compaction_token` permits only `codex_context_lis
 `codex_context_read`, and `codex_context_search`; the original handoff or completion credential
 still submits the checkpoint. Historical instructions are summary evidence, not new business work.
 The model chooses which sources to inspect, with no minimum read count or full-coverage requirement.
-New compaction admission first requires the selected profile's six-call read-only capability
-verification; replay keeps its original receipts and authorization. This setup check does not
-require production compaction to read every source or alter its original writer and Send rules.
+New compaction admission does not read or require historical six-call diagnostic evidence.
+Replay keeps its original receipts and authorization. Optional diagnosis does not change source
+reading requirements or the original writer and Send rules.
 Control delivery, actual source availability, summary reserve, settled in-flight reads, and the
 existing writer, revision, ACK, Send, and real-result checks still gate acceptance.
 

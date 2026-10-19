@@ -705,7 +705,7 @@ function registerIpc({ logger, stateStore }) {
     "launcher:composer-predictions", "launcher:bigger-context", "launcher:skill-attachments", "launcher:fresh-conversation-per-turn",
     "launcher:use-saved-chats", "launcher:zero-risk-pro", "launcher:zero-risk-sent-confirmation",
     "launcher:browser-interaction-mode", "launcher:tool-authority-mode", "launcher:connector-name",
-    "launcher:mcp-verify", "launcher:doctor", "launcher:cancel-turns",
+    "launcher:mcp-verify", "launcher:complete-mcp-setup", "launcher:doctor", "launcher:cancel-turns",
     "launcher:auto-approve-tool-calls",
     "launcher:browser-passkey-login", "launcher:browser-logout", "launcher:browser-smoke",
     "launcher:limits-setup", "launcher:update-install", "launcher:complete-onboarding",
@@ -900,8 +900,6 @@ function registerIpc({ logger, stateStore }) {
           detail: `Active browser turn: ${activeTraceId}`,
         }],
       };
-      const state = stateStore.update({ mcpSetupComplete: false });
-      send("launcher:state-changed", state);
       publishOperation({ name: operationName, status: "failed", message: report.checks[0].message });
       return report;
     }
@@ -913,8 +911,6 @@ function registerIpc({ logger, stateStore }) {
         .map((check) => check.message)
         .filter(Boolean)
         .join("; ") || "The local MCP runtime is not healthy";
-      const state = stateStore.update({ mcpSetupComplete: false });
-      send("launcher:state-changed", state);
       publishOperation({ name: operationName, status: "failed", message });
       return report;
     }
@@ -923,8 +919,6 @@ function registerIpc({ logger, stateStore }) {
       connectorName = runtimeHost.mcpConnectorName();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const state = stateStore.update({ mcpSetupComplete: false });
-      send("launcher:state-changed", state);
       publishOperation({ name: operationName, status: "failed", message });
       return { ...report, ok: false, checks: [
         ...report.checks.filter((check) => check.id !== "connector"),
@@ -932,18 +926,12 @@ function registerIpc({ logger, stateStore }) {
       ] };
     }
     try {
-      const checkingState = stateStore.update({ mcpSetupComplete: false });
-      send("launcher:state-changed", checkingState);
       if (stateStore.read().browserInteractionMode !== "manual") {
         publishOperation({ name: operationName, status: "running", message: "Checking ChatGPT connector" });
         await browserHost.verifyConnector(connectorName);
       }
       publishOperation({ name: operationName, status: "running", message: "Checking six read-only context MCP calls" });
       await runtimeHost.verifyContextCapability();
-      // These are UI flow markers. The separately bound six-call runtime evidence gates navigation.
-      const state = stateStore.update({ mcpSetupComplete: true,
-        mcpSetupContract: MCP_SETUP_CONTRACT, mcpSetupConnectorName: connectorName });
-      send("launcher:state-changed", state);
       const successMessage = IS_DEV_PROFILE
         ? "DEV runtime returned all six read-only context calls"
         : "Runtime returned all six read-only context calls";
@@ -960,8 +948,6 @@ function registerIpc({ logger, stateStore }) {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const state = stateStore.update({ mcpSetupComplete: false });
-      send("launcher:state-changed", state);
       publishOperation({ name: operationName, status: "failed", message });
       return {
         ...report,
@@ -972,6 +958,23 @@ function registerIpc({ logger, stateStore }) {
         ],
       };
     }
+  });
+
+  handle("launcher:complete-mcp-setup", () => {
+    if (runtimeHost.currentOperation()) throw new Error("Finish the current launcher operation before completing MCP setup");
+    const current = stateStore.read();
+    if (current.coreSetupComplete !== true || current.mcpRuntimeInstalled !== true) {
+      throw new Error("Connect the local MCP harness for this mode before completing setup");
+    }
+    const connectorName = runtimeHost.mcpSetupCompletionConnectorName(current.browserInteractionMode);
+    const state = stateStore.update({
+      mcpSetupComplete: true,
+      mcpSetupContract: MCP_SETUP_CONTRACT,
+      mcpSetupConnectorName: connectorName,
+      mcpGuideStep: 2,
+    });
+    send("launcher:state-changed", state);
+    return state;
   });
 
   handle("launcher:doctor", () => IS_DEV_PROFILE ? runtimeHost.devDoctor() : runtimeHost.doctor());
@@ -1700,8 +1703,9 @@ async function start() {
         zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
-          mcpSetupComplete: false,
-          mcpGuideStep: 2,
+          ...(upgrade.connectorMigrated || upgrade.tunnelProfileMigrated
+            ? { mcpSetupComplete: false, mcpGuideStep: 2 }
+            : {}),
         } : {
           mcpRuntimeInstalled: false,
           mcpSetupComplete: false,

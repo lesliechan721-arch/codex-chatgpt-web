@@ -178,11 +178,11 @@ export function readContextCapabilityEvidence(config: AppConfig, schemaDigest: s
     || typeof evidence.verifiedAt !== "string" || !Number.isFinite(Date.parse(evidence.verifiedAt)) || canonical(evidence.binding) !== canonical(binding)) return undefined;
   return evidence;
 }
-/** Call before projecting context or admitting compaction. Ordinary inline sends do not depend on this gate. */
+/** Diagnostic comparison only. Normal execution does not require saved evidence. */
 export async function assertContextCapabilityVerified(config: AppConfig, options: { home?: string; schemaDigest?: string } = {}): Promise<ContextCapabilityEvidence> {
   const schemaDigest = options.schemaDigest ?? await installedContextCapabilitySchemaDigest(config);
   const evidence = readContextCapabilityEvidence(config, schemaDigest, options.home);
-  if (!evidence) throw new Error("Context navigation is not verified for this profile, mode, plugin and tunnel. Run Verify runtime and complete its six read-only MCP calls, including both context-text-read-v2 transport returns, before using projected context or compaction. Update or reconnect the existing Codex Native5, Codex Native5 DEV, Codex Zero Risk4, or custom non-retired connector when its cached contract is old, then verify again. If the client cannot update that contract, context navigation remains unavailable.");
+  if (!evidence) throw new Error("No matching successful runtime diagnostic exists for this profile, mode, plugin and tunnel. Run Verify runtime to collect six read-only MCP calls, including both context-text-read-v2 transport returns. Saved diagnostics do not control task execution.");
   return evidence;
 }
 
@@ -213,7 +213,7 @@ function providerRuntimeProfile(provider: CodexProviderConfig): { config: AppCon
   }
   return { config, home };
 }
-/** Synchronous read after schema validation. Missing or stale schema cache does not authorize use. */
+/** Diagnostic comparison after schema validation; a missing result does not restrict execution. */
 export function readProviderContextCapabilityEvidence(provider: CodexProviderConfig, schemaDigest?: string): ContextCapabilityEvidence | undefined {
   const { config, home } = providerRuntimeProfile(provider);
   const cached = schemaCache.get(schemaCacheKey(config));

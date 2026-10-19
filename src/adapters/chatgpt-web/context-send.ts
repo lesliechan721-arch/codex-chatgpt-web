@@ -27,7 +27,7 @@ export class ContextSend {
   constructor(private readonly canonical: CodexParsedRequest, private readonly broker: TurnBrokerOwner,
     private readonly capabilities: ChatGptWebCapabilities, private readonly pageGeneration: string,
     coverage?: CompactionSourceCoverage, private readonly ownerContext?: TaskUpdateOwnerContext,
-    sourceSnapshot?: ContextSnapshot, private readonly verifyNavigation?: () => Promise<void>) {
+    sourceSnapshot?: ContextSnapshot) {
     this.source = sourceSnapshot ?? createContextSnapshot(canonical, { imageStoragePolicy: "bounded" });
     this.coverage = coverage?.fork() ?? new CompactionSourceCoverage();
   }
@@ -38,8 +38,6 @@ export class ContextSend {
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
       turnToken: token, compileOptions: options, contextToolsAvailable: true, budget: { retainedTokens } });
     if (plan.registration) {
-      if (!this.verifyNavigation) throw new Error("Context navigation requires verified connector capability");
-      await this.verifyNavigation();
       if (!this.broker.registerContextPlan || !this.broker.selectContextPlan || !this.broker.markContextPlanSent
         || !this.broker.confirmContextAttachments || !this.broker.contextUsage) throw new Error("Update the Launcher and connector to use context navigation");
       // Remote owners validate the versioned contract before the prompt can leave this process.

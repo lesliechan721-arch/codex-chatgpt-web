@@ -4,6 +4,13 @@ export interface CodexErrorPayload {
   code: string | null;
 }
 
+function isOverloadMessage(text: string): boolean {
+  return text.includes("server_is_overloaded")
+    || text.includes("overloaded")
+    || text.includes("server is busy")
+    || text.includes("model is at capacity");
+}
+
 function isSubscriptionGateMessage(text: string): boolean {
   return (
     text.includes("requires a subscription") ||
@@ -144,12 +151,8 @@ export function classifyError(status: number, type: string, message: string): Co
   ) {
     return { message, type: "permission_error", code: "permission_denied" };
   }
-  if (
-    status === 503 ||
-    text.includes("overloaded") ||
-    text.includes("server is busy") ||
-    text.includes("temporarily unavailable")
-  ) {
+  // A local dependency can use 503 or be unavailable without the model being full.
+  if (isOverloadMessage(text)) {
     // Codex recognizes "server_is_overloaded" and applies retry-after backoff
     // (responses.rs is_server_overloaded_error); generic "upstream_server_error" is not recognized.
     return { message, type: "server_error", code: "server_is_overloaded" };
@@ -204,12 +207,7 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   // subscription/permission wording.
   if (isAuthenticationMessage(lower)) return 401;
   if (isSubscriptionGateMessage(lower) || isPermissionMessage(lower)) return 403;
-  if (
-    lower.includes("unavailable") ||
-    lower.includes("overloaded") ||
-    lower.includes("temporarily") ||
-    lower.includes("server is busy")
-  ) return 503;
+  if (isOverloadMessage(lower)) return 503;
   if (
     lower.includes("invalid") ||
     lower.includes("not found") ||

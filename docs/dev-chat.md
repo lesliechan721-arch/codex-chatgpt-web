@@ -18,7 +18,8 @@ usable.
   tunnel. Create `Codex Native5 DEV` as a new ChatGPT plugin; keep production `Codex Native5`
   separate. Preserve `Codex Native4 DEV` and earlier retired connectors unchanged. Never rename
   or refresh an old DEV connector. Setup preserves custom names that are not retired defaults;
-  a custom plugin with an old cached schema needs a newly named plugin. **Verify runtime** checks
+  a custom plugin with an old cached schema needs a newly named plugin. Complete the required
+  configuration steps. **Verify runtime** is optional for troubleshooting; when requested, it checks
   the installed schema and requires six successful read-only context returns over fixed small text,
   with ordinary and independent compaction credentials. Zero Risk keeps manual selection, Send,
   start, and its Sent policy. This proves callability, not raw cloud schema or image understanding.
@@ -28,14 +29,18 @@ matching DEV Launcher signed in and its isolated tunnel running. Production veri
 `codex-chatgpt-web verify-context` and never shares its result with DEV. The historical long-wait
 probe contract does not expose the three context tools and cannot pass this check. Use the normal
 DEV MCP contract and a newly created identity for context navigation; verification does not change
-the configuration, rename a plugin, or refresh its remote cache. Evidence is invalidated by bound
-profile/mode/plugin/tunnel/runtime/schema changes and has no time-based expiry.
+the configuration, rename a plugin, or refresh its remote cache. Bound
+profile/mode/plugin/tunnel/runtime/schema changes affect diagnostic comparison only; there is no
+time-based expiry. DEV tasks, navigation, compaction, and recovery do not require a saved result
+or run diagnostic calls automatically. Production follows the same rule with its own configuration
+and credentials. Failure or cancellation of diagnosis does not clear completed configuration.
 If an existing DEV profile retains the long-wait probe flag on `Codex Native5 DEV`, select a new
 custom identity through normal DEV setup, for example
 `bun run src/cli.ts dev setup --full --automatic-browser-interaction --connector-name-suffix "Native5 DEV Context"`.
-Create `Codex Native5 DEV Context` as a new ChatGPT plugin on the configured DEV tunnel, then run
-Verify runtime. This custom name selects the normal native contract; the old probe plugin remains
-unchanged. Omitting the probe flag alone does not clear a previously stored probe configuration.
+Create `Codex Native5 DEV Context` as a new ChatGPT plugin on the configured DEV tunnel.
+Run Verify runtime if a diagnostic check is useful. This custom name selects the normal native
+contract; the old probe plugin remains unchanged. Omitting the probe flag alone does not clear a
+previously stored probe configuration.
 
 Nothing is copied from the normal launcher. The DEV command fails closed if its own launcher,
 browser descriptor, credentials, or connector are not ready. It never falls back to the production

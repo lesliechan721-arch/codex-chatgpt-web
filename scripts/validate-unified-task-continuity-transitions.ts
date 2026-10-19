@@ -405,7 +405,7 @@ async function runZeroRiskBoundary(boundary: "active" | "ended", model: string, 
     const prepared = await prepareContinuityDevProvider(providerConfig(config), paths, {
       continuityStateDirectory: continuity, lunaCheckpointStatePath: join(runtime, "luna.json"),
     });
-    const provider = prepared.provider; report.providerVerification = continuityDevProviderEvidence(prepared); save();
+    const provider = prepared.provider; report.providerCapability = continuityDevProviderEvidence(prepared); save();
     transport = await startDevChatTransport(config, paths.runtimePath);
     const broker = await callTurnBroker<Row>(config.brokerSocketPath, { method: "owner_status" });
     assert.ok(broker.protocolVersion >= 13 && broker.recoveryProtocol === 2); new ContinuityRegistrationStore(continuity).initialize();

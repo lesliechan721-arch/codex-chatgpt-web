@@ -20,35 +20,46 @@ retired defaults remain retired. Production and DEV plugins can remain installed
 Setup preserves custom names that are not retired defaults. If a custom plugin caches the old
 pre-navigation schema, follow the original migration above. The still-unreleased context-rendering
 and text-read-v2 update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
-non-retired custom names. Refresh or reconnect that same connector and run **Verify runtime** again.
-If the client cannot update or consume v2, stop v2 use and report the missing capability; this
-update does not introduce another connector name. A local name change uses transactional setup and
-clears verification after success. An old setup marker or a mismatched saved identity also clears
-verification; it does not rename a remote plugin or change a custom name automatically.
+non-retired custom names. Refresh or reconnect that same connector if its current contract is
+incompatible. If the client cannot update or consume v2, stop v2 use and report the missing
+capability. This update does not introduce another connector name. A local name change uses
+transactional setup and requires the necessary configuration steps for that identity. It does not
+rename a remote plugin or change a custom name automatically.
 
-Verify the selected identity before a new Full task. The installed MCP tool list must include
-`codex_context_list`, `codex_context_read`, and `codex_context_search`, with exactly one ordinary
-mode credential or `compaction_token` in each input schema. Existing `operation_id`, `task_revision`,
-`codex_tool_wait`, and `codex_task_update_ack` contracts still apply. **Verify runtime** then uses a
-fixed small text source to require list, search, and read with each credential, for six successful
-supported-transport returns. Evidence version 2 also requires each text read's actual v2 result
-shape, matching metadata, body index, UTF-8 range, and result digest to match the successful return.
-Preparing a result, a stale Boolean receipt, or a written model claim is not evidence. The private verification scope
-cannot execute business tools, inventory, waits, completion, or compaction submission. Automatic
-opens reads after real prompt submission. Zero Risk keeps the user's plugin choice, manual Send,
-original start, and configured Sent policy. It never sends the manual prompt automatically.
+The selected connector must support `codex_context_list`, `codex_context_read`, and
+`codex_context_search`, with exactly one ordinary mode credential or `compaction_token` in each
+input schema. Existing `operation_id`, `task_revision`, `codex_tool_wait`, and
+`codex_task_update_ack` contracts still apply. Current Broker and Helper protocol, credential,
+source, budget, delivery, and commit checks remain at the execution boundary. An installed local
+schema does not prove the platform's remote cached schema or guarantee a later call.
 
-The owner-only result is bound to the runtime profile and home, interaction mode, exact plugin name,
+Complete setup after saving the required credentials and completing the connection and mode-specific
+runtime and directory steps. **Verify runtime** is optional and is also available for troubleshooting.
+A missing, failed, unreadable, old, or mismatched diagnostic record does not block normal tasks,
+navigation, compaction, or recovery, change their input plans, or start automatic test calls.
+A compatible upgrade or runtime-file change alone does not require setup or diagnosis again.
+Diagnostic failure, cancellation, timeout, or refusal during active work does not clear completed
+setup. A successful diagnosis does not replace the required configuration steps or current checks.
+
+When requested, **Verify runtime** checks the installed schema and uses a fixed small text source
+for list, search, and read with each credential: six successful supported-transport returns.
+Evidence version 2 requires both text reads' actual v2 shape, matching metadata, body index,
+UTF-8 range, and result digest. Preparing a result, a stale Boolean receipt, or a written model
+claim is not evidence. The private diagnostic scope cannot execute business tools, inventory,
+waits, completion, or compaction submission. Automatic opens reads after real prompt submission.
+Zero Risk keeps the user's plugin choice, manual Send, original start, and configured Sent policy.
+It never sends the manual prompt automatically. Failure and cancellation release only the
+resources owned by that diagnosis.
+
+The owner-only result is bound to runtime profile and home, interaction mode, exact plugin name,
 selected tunnel, runtime command, text-read format, and installed contract digest, including tool
-descriptions and any output schema. Old evidence is invalid. A binding change, missing result, or
-failed six-call retry requires verification again. There is no time-based validity period. The setup
-marker records UI flow only. Local health and `tools/list` alone cannot authorize navigation;
-ordinary unmodified inline input needs no navigation result. The gate runs before publishing a
-projected directory and before admitting compaction. These calls prove result shape and callability, not model
-use of the body or a raw copy
-of the platform's cached schema, image interpretation, or model stability. Retired identities are
-rejected without fallback. The CLI equivalent is `codex-chatgpt-web verify-context`; isolated DEV
-uses `codex-chatgpt-web verify-context --dev-profile`.
+descriptions and any output schema. A binding mismatch makes a result inapplicable for diagnostic
+comparison only. There is no time-based expiry. A diagnostic retry can clear that mode's old result;
+it does not clear another mode's result or affect business admission. These calls prove shape and
+callability at the time of the check, not model body use, raw cached schema, image interpretation,
+or continued model reliability. Retired identities remain rejected without fallback.
+The CLI equivalent is `codex-chatgpt-web verify-context`; isolated DEV uses
+`codex-chatgpt-web verify-context --dev-profile`.
 
 ## Sources and browser input
 

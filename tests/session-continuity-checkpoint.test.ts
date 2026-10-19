@@ -900,21 +900,20 @@ for (const boundary of ["unknown-send", "stopped", "changed-source", "missing-ve
   } else rmSync(configuration.getContextCapabilityEvidencePath(f.root));
   const before = store.get(thread)!;
   const response = await f.send(compactBody, true), body = await response.json();
-  if (boundary === "unknown-send" || boundary === "stopped") {
+  if (boundary === "unknown-send" || boundary === "stopped" || boundary === "missing-verification") {
     expect(response.status, JSON.stringify(body.error)).toBe(200);
     expect(body.output[0].type).toBe("message");
     expect(body.output.at(-1).content[0].text).toContain(SUMMARY_PREFIX);
     expect(body.output.at(-1).content[0].text).toContain("Completed response 2.");
     const after = store.get(thread)!;
-    expect(after.epoch).not.toBe(before.epoch);
-    expect(after.works[before.currentWorkId!]).toBeUndefined();
+    if (boundary !== "missing-verification") expect(after.epoch).not.toBe(before.epoch);
+    if (boundary !== "missing-verification") expect(after.works[before.currentWorkId!]).toBeUndefined();
     expect(after.calls).toEqual({});
     expect(Object.values(after.checkpoints)).toHaveLength(1);
     expect(f.submissions).toHaveLength(2);
   } else {
     expect(response.status).not.toBe(200);
-    expect(body.error.code).toBe(boundary === "changed-source" ? "continuity_source_unproven" : "upstream_server_error");
-    if (boundary === "missing-verification") expect(body.error.message).toContain("not verified");
+    expect(body.error.code).toBe("continuity_source_unproven");
     const after = store.get(thread)!;
     expect(after.epoch).toBe(before.epoch);
     expect(after.calls).toEqual(before.calls);

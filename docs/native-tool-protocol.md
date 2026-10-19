@@ -302,15 +302,19 @@ Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update
 context tools with their mutually exclusive credential schemas on the selected connector before
 using navigation or dispatching work. The private owner must advertise `contextProtocol: 2`.
 An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
-Verify runtime also requires six successful context transport returns over fixed small text, one
+Optional Verify runtime requires six successful context transport returns over fixed small text, one
 list/search/read sequence per ordinary and independent compaction credential. Evidence version 2
 also binds both reads to the actual result digest, two text blocks, matching metadata, body index 1,
 and UTF-8 page range. The body exists only in `content[1].text`; `content[0].text` and
 `structuredContent` carry metadata. Empty bodies still have a second block. The verification
 pair has no business or compaction-submission authority. A model's final reply cannot substitute
-for receipts. Bound owner-only evidence gates navigation publication and compaction admission;
-configuration/runtime/schema changes invalidate it, with no time-based expiry. Manual verification
-keeps the original start and Sent rules and never automates Send.
+for receipts. This optional diagnosis saves bound owner-only evidence for comparison; it does not
+gate normal tasks, navigation publication, compaction admission, or recovery. Missing, failed,
+unreadable, old, or mismatched records do not change execution plans or trigger test calls.
+Binding changes affect diagnostic applicability only, with no time-based expiry. Setup completion
+uses the required configuration steps rather than this result. Manual diagnosis keeps the original
+start and Sent rules and never automates Send. Current protocol, credential, source, delivery,
+and commit checks remain necessary even after a successful diagnosis.
 An incompatible connector or helper fails before execution; it must
 not silently fall back to the former timeout behavior. Production connector defaults are
 `Codex Native5` and `Codex Zero Risk4`; Automatic DEV uses `Codex Native5 DEV`. Old active runtimes
@@ -320,8 +324,9 @@ and cached-schema migration follow the [architecture](architecture.md), not an i
 an old production connector. Keep `Codex Native4`, `Codex Native4 DEV`, and `Codex Zero Risk3`
 unchanged and create the corresponding new plugin. Earlier retired defaults also remain unusable.
 For the still-unreleased context text v2 update, keep the current Native5 / Native5 DEV / Zero Risk4
-and non-retired custom names. Update or reconnect the same connector and verify again; stale
-evidence and old runtimes do not authorize v2. If the client cannot update or use the new shape,
+and non-retired custom names. Update or reconnect the same connector if its current contract is
+incompatible. A past diagnostic result cannot replace current v2 checks. If the client cannot
+update or use the new shape,
 stop v2 enablement. This exception does not restore any retired connector identity. The verification
 scope still forbids completion; body-use evidence comes from separate real tasks and compaction.
 
