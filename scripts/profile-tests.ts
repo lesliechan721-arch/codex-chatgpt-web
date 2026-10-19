@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } f
 import { join, resolve } from "node:path";
 import { collectPerformanceReports } from "./test-performance-reports";
 import { performanceSource } from "./test-performance-source";
-import { finalizeFileTimings, prepareTimingHistory, repositoryTestFiles, timingCompatibility, timingMetadata } from "./test-timing-history";
+import { finalizeFileTimings, prepareTimingHistory, repositoryTestFiles, targetTestFiles, timingCompatibility, timingMetadata } from "./test-timing-history";
 
 const root = resolve(import.meta.dir, "..");
 export function profileOptions(args: string[]) {
@@ -80,6 +80,7 @@ export async function profileTests(args: string[]): Promise<number> {
   const compatibility = timingCompatibility({ workers, mode, isolation });
   const metadata = timingMetadata(root, source.revision, source.patchDigest);
   const expectedFiles = repositoryTestFiles(root);
+  const targetFiles = targetTestFiles(root, files, expectedFiles);
   const history = run ? await prepareTimingHistory({ root, runDirectory: run, compatibility, files: expectedFiles })
     : { scheduling: { source: "cold" as const, reason: "report-directory-unavailable", lookupMs: 0, inputDigest: null, from: null } };
   const command = [process.execPath, "test", "--timeout", "30000",
@@ -148,7 +149,8 @@ export async function profileTests(args: string[]): Promise<number> {
     if (!run) throw new Error("Report directory unavailable");
     const after = performanceSource(root);
     const sourceStable = source.known && source.revision === after.revision && source.patchDigest === after.patchDigest && source.toolDigest === after.toolDigest;
-    const fileTiming = finalizeFileTimings({ root, runDirectory: run, compatibility, metadata, expectedFiles, stderr, exitCode, signal, spawnError,
+    const { fileTiming, historyPublication } = finalizeFileTimings({ root, runDirectory: run, compatibility, metadata,
+      expectedFiles: targetFiles, stderr, exitCode, signal, spawnError,
       fullSuiteRequested: filters.length === 0 && bail === undefined && (files.length === 0 || files.length === 1 && resolve(root, files[0]!) === join(root, "tests")),
       logsComplete: !diagnosticErrors.has("log-drain-timeout") && !diagnosticErrors.has("log-read-failed:stderr.log"), sourceStable,
       artifactDirectory: process.env.CGW_TEST_TIMING_ARTIFACT_DIR });
@@ -177,14 +179,14 @@ export async function profileTests(args: string[]): Promise<number> {
     // Bun counts worker exits as failures too; aggregate counts cannot establish the cause.
     const testResult = spawnError ? "spawn-failed" : signal ? "signal" : exitCode === 0 ? "success" : "nonzero-exit";
     const reportMs = elapsed(reportStart);
-    const summary = { version: 3, runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
+    const summary = { version: 4, runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
       nodeCompatibilityVersion: process.versions.node, runnerImage: process.env.ImageOS ?? null, runnerImageVersion: process.env.ImageVersion ?? null,
       ...source, workers, mode, isolation, bail: bail ?? null, command, cwd: root,
       executable: { path: process.execPath, sha256: executableDigest,
         embeddedBunSha256: digestFile(process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN),
         usesEmbeddedBun: process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN ? resolve(process.execPath) === resolve(process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN) : null },
       dependencyDigest: digestFile(join(root, "bun.lock")),
-      scheduling: history.scheduling, fileTiming,
+      scheduling: history.scheduling, fileTiming, historyPublication,
       startedAt, endedAt: new Date().toISOString(), rootPid, signal, spawnError, exitCode, testResult, wallMs,
       wallValid: wallInvalidReasons.length === 0, wallInvalidReasons,
       segments: { prepareMs, executionMs: wallMs, logDrainMs, reportMs, totalMs: elapsed(entry) },

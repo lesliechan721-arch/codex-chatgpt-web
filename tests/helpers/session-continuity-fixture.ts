@@ -2,8 +2,7 @@ import { ContinuityRecoveryStore, continuityProcessInstance } from "../../src/ad
 import { createRequire } from "node:module";
 import { expect, spyOn } from "bun:test";
 import { measureRuntimeOperation, measureRuntimeAsync, runtimePerformanceContext, withRuntimePerformanceContext } from "../../src/runtime-performance";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { createContinuityMcpClient, type ContinuityMcpTransport } from "./continuity-mcp-client";
 import { retainedFixtureCleanup } from "./retained-fixture-cleanup";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,11 +83,12 @@ export function createSessionContinuityFixtures(testFilePath: string) {
   }
 
   function fixture(...args: Parameters<typeof createFixture>) {
-    return withRuntimePerformanceContext({ ...runtimePerformanceContext(), fixtureMode: args[0] ? "manual" : "automatic" },
+    const mode = args[0] ? args[1]?.mcpTransport === "in-process" ? "manual-in-process" : "manual" : "automatic";
+    return withRuntimePerformanceContext({ ...runtimePerformanceContext(), fixtureMode: mode },
       () => measureRuntimeOperation("fixture.prepare", () => createFixture(...args)));
   }
 
-  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit" } = {}) {
+  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit"; mcpTransport?: ContinuityMcpTransport } = {}) {
     const profileContext = runtimePerformanceContext();
     const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
     const statePath = join(root, "continuity");
@@ -195,15 +195,15 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       },
     };
     const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
-    let modelMcp: Client | undefined;
+    let modelMcp: Awaited<ReturnType<typeof createContinuityMcpClient>> | undefined;
+    let modelMcpConnection: Promise<Awaited<ReturnType<typeof createContinuityMcpClient>>> | undefined;
     const manualMcp = async () => {
-      if (!modelMcp) {
-        modelMcp = new Client({ name: "continuity-manual-model-fixture", version: "1" });
-        await measureRuntimeAsync("fixture.mcp", () => modelMcp!.connect(new StdioClientTransport({ command: process.execPath,
-          args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", provider.chatgptWeb!.brokerSocketPath!],
-          cwd: process.cwd(), stderr: "pipe" })));
-      }
-      return modelMcp;
+      modelMcpConnection ??= measureRuntimeAsync("fixture.mcp", () => createContinuityMcpClient({
+        name: "continuity-manual-model-fixture", contract: "safe",
+        brokerSocketPath: provider.chatgptWeb!.brokerSocketPath!, transport: options.mcpTransport,
+      }));
+      modelMcp = await modelMcpConnection;
+      return modelMcp.client;
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
@@ -538,7 +538,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
     return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost, root, manualControl };
   }
 
-  function httpFixture(manual = false, taskUpdates = false, options: { root?: string; threadId?: string } = {}) {
+  function httpFixture(manual = false, taskUpdates = false, options: { root?: string; threadId?: string; mcpTransport?: ContinuityMcpTransport } = {}) {
     const f = fixture(manual, { ...options, taskUpdates });
     const config = {
       ...defaultConfig("full"), browserHost: "launcher" as const,

@@ -19,11 +19,20 @@ test("the public launcher command uses the Electron bootstrap", () => {
 });
 
 test("the full verification gate audits dependencies without advisory exclusions", () => {
-  const verify = fs.readFileSync(path.join(repositoryRoot, "scripts", "verify.ts"), "utf8");
   assert.equal(repositoryManifest.scripts.audit, "bun audit");
   assert.equal(manifest.scripts.audit, "bun audit");
   assert.equal(repositoryManifest.scripts["launcher:audit"], "bun run --cwd launcher audit");
-  assert.match(verify, /await run\(\["run", "launcher:audit"\]\);/);
+  const verification = spawnSync("bun", ["-e", `
+    import { verificationCommands } from "./scripts/verify.ts";
+    console.log(JSON.stringify(["full", "timing"].map(mode => verificationCommands(mode, "scratch"))));
+  `], { cwd: repositoryRoot, encoding: "utf8", timeout: 10_000 });
+  assert.equal(verification.status, 0, verification.error?.message || verification.stderr);
+  for (const commands of JSON.parse(verification.stdout)) {
+    assert.deepEqual(commands.filter(command => command[1] === "audit" || command[1] === "launcher:audit"),
+      [["run", "audit"], ["run", "launcher:audit"]]);
+    assert.ok(commands.findIndex(command => command[1] === "launcher:audit")
+      < commands.findIndex(command => command[1] === "test"));
+  }
 });
 
 test("launcher publishes native packages for all supported desktop operating systems", () => {

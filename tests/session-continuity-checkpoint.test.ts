@@ -95,7 +95,7 @@ for (const format of ["encrypted", "readable", "summary-only"] as const) test(`$
 });
 
 for (const manual of [false, true]) for (const reclamation of ["capacity", "ttl"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${reclamation}-reclaimed old ordinary replay stays bound to its stale repeated-summary revision`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const repeatedInstruction = "Repeat the same continuity instruction.";
   if (manual) {
     f.controls.invokeSourceTools = true;
@@ -208,7 +208,7 @@ test("a new instruction immediately after a checkpoint sends only its increment 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} repeated-summary checkpoint-only transition follows the second active source`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const compactActive = async (ordinary: CodexParsedRequest, turnId: string) => {
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(ordinary)}`)!;
@@ -248,7 +248,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} same-turn identical source text and summary select the explicitly retained source`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   const compactActive = async (ordinary: CodexParsedRequest) => {
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(ordinary)}`)!;
@@ -436,7 +436,7 @@ test("Automatic repeated-summary continuation replays the old result round for t
 });
 
 for (const manual of [false, true]) test(`Round 9: first checkpoint transition accepts structured source key order ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const original = { type: "message", role: "user", id: "source-instruction", content: [
@@ -467,8 +467,8 @@ for (const manual of [false, true]) test(`Round 9: first checkpoint transition a
   expect(f.submissions).toHaveLength(submissions + 1);
 });
 
-for (const manual of [false, true]) for (const parentFirst of [false, true]) for (const change of ["role", "content", "turn"] as const) test(`Round 9: first checkpoint transition rejects changed source ${change} ${manual} parent ${parentFirst}`, async () => {
-  const f = fixture(manual);
+for (const manual of [false, true]) for (const parentFirst of [false, true]) test(`Round 9: first checkpoint transition rejects changed source representations ${manual} parent ${parentFirst}`, async () => {
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const raw = structuredClone(f.request("Original source content.")._rawBody) as {
@@ -494,18 +494,20 @@ for (const manual of [false, true]) for (const parentFirst of [false, true]) for
   if (summary?.type !== "text_delta") throw new Error("Missing summary");
   f.controls.invokeSourceTools = false;
   const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
-  const changed = change === "role" ? parentFirst ? human : parent : change === "content"
-    ? { ...firstItem, content: "Changed source content." }
-    : { ...firstItem, internal_chat_message_metadata_passthrough: { turn_id: "changed-source-turn" } };
   const submissions = f.submissions.length;
-  await expect(f.run(parse([changed, marker]))).rejects.toMatchObject({ code: "continuity_source_unproven" });
-  expect(f.submissions).toHaveLength(submissions);
+  for (const change of ["role", "content", "turn"] as const) {
+    const changed = change === "role" ? parentFirst ? human : parent : change === "content"
+      ? { ...firstItem, content: "Changed source content." }
+      : { ...firstItem, internal_chat_message_metadata_passthrough: { turn_id: "changed-source-turn" } };
+    await expect(f.run(parse([changed, marker]))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(f.submissions).toHaveLength(submissions);
+  }
   expect((await f.run(parse([firstItem, marker]))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(submissions + 1);
 });
 
 for (const manual of [false, true]) for (const field of ["author", "recipient"] as const) test(`Round 9: first checkpoint transition rejects changed parent ${field} ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const raw = structuredClone(f.request("Parent source content.")._rawBody) as { client_metadata: Record<string, string> };
@@ -534,7 +536,7 @@ for (const manual of [false, true]) for (const field of ["author", "recipient"] 
 });
 
 for (const manual of [false, true]) for (const retainSource of [false, true]) test(`Round 9: checkpoint-only grouped instructions preserve source payload ${manual} retained ${retainSource}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const first = f.request("Original source work.");
@@ -571,7 +573,7 @@ for (const manual of [false, true]) for (const retainSource of [false, true]) te
 });
 
 for (const manual of [false, true]) test(`Round 9: committed compaction replay rejects malformed result groups across echoes ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const first = f.request();
@@ -597,7 +599,7 @@ for (const manual of [false, true]) test(`Round 9: committed compaction replay r
 });
 
 for (const manual of [false, true]) for (const retained of [false, true]) for (const idOnly of [false, true]) test(`Round 10: checkpoint-only continuation ignores completed prefix ${manual} retained ${retained} ID-only ${idOnly}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const oldUser = { type: "message", role: "user", content: "Completed historical request.",

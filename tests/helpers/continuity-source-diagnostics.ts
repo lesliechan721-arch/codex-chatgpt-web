@@ -4,7 +4,7 @@ import { join } from "node:path";
 import * as bindingModule from "../../src/adapters/chatgpt-web/continuity-binding";
 import * as continuationModule from "../../src/adapters/chatgpt-web/continuity-recovery-continuation";
 import * as compactionModule from "../../src/adapters/chatgpt-web/continuity-recovery-compaction";
-import * as environmentModule from "../../src/adapters/chatgpt-web/environment";
+import * as environmentModule from "../../src/adapters/chatgpt-web/environment-instruction";
 import type { RecoveryThreadRecord } from "../../src/adapters/chatgpt-web/continuity-recovery-store";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../../src/responses/compaction";
 import type { CodexParsedRequest } from "../../src/types";
@@ -50,7 +50,8 @@ function summaryDigests(parsed: CodexParsedRequest): Set<string> {
   return summaries;
 }
 
-function durableState(record: RecoveryThreadRecord | undefined) {
+function durableState(record: RecoveryThreadRecord | continuationModule.RecoveryContinuationRecord | undefined) {
+  if (record && !("owner" in record)) return null;
   return record ? {
     thread: id(record.thread), scope: id(record.scope), version: record.version, epoch: record.epoch, historyRevision: record.historyRevision,
     owner: id(record.owner.id), ownerPid: record.owner.pid, ownerStart: id(record.owner.startIdentity),
