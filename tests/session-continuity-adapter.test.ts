@@ -65,7 +65,7 @@ for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "
 });
 
 for (const manual of [false, true]) for (const replacement of ["empty", "removed"] as const) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} cached ordinary round applies ${replacement} tools before Native admission`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   f.controls.nativeSourceTools = true;
@@ -113,7 +113,7 @@ for (const manual of [false, true]) for (const replacement of ["empty", "removed
 });
 
 for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} rejected current payload leaves the active registry unchanged`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -180,7 +180,7 @@ for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk
 });
 
 for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk" : "Automatic"} old execution cannot replace the later owner's tools`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const first = f.request();
   const oldEvents = await f.run(first);
   f.controls.invokeSourceTools = true;
@@ -217,7 +217,7 @@ for (const manual of [false, true]) test(`registry replay: ${manual ? "Zero Risk
 });
 
 test("registry replay: a delayed old update cannot replace the new owner's discovery", async () => {
-  const f = fixture(true);
+  const f = fixture(true, { mcpTransport: "in-process" });
   f.controls.deferCompletion = true;
   const tools = [{ type: "tool_search", parameters: { type: "object" } }];
   const first = parseRequest({ ...f.request()._rawBody as object, tools });
@@ -746,7 +746,7 @@ for (const manual of [false, true]) for (const role of ["system", "developer"] a
 });
 
 for (const manual of [false, true]) for (const retainSource of [false, true]) for (const tagged of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} checkpoint-only keeps ${tagged ? "tagged" : "untagged"} trailing constraints with source ${retainSource ? "retained" : "recovered"}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = manual;
   const first = f.request();
@@ -1358,7 +1358,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} completed historical assistant changes replay the accepted result round`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -1383,7 +1383,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} accepted local tool result payload cannot be replaced by a retry`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();
@@ -1806,7 +1806,7 @@ for (const manual of [false, true]) for (const reclamation of ["retained", "capa
 });
 
 for (const manual of [false, true]) for (const reclamation of ["retained", "tombstone"] as const) test(`${manual ? "Zero Risk" : "Automatic"} checkpoint resume rejects a ${reclamation} consumed item-ID-only instruction`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const inputA = structuredClone((f.request("Instruction A.", "turn-a")._rawBody as { input: unknown[] }).input);
   delete (inputA[0] as { internal_chat_message_metadata_passthrough?: unknown }).internal_chat_message_metadata_passthrough;
   const a = f.request("", "turn-a", inputA);
@@ -1901,7 +1901,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} same native turn old instruction cannot revive after steering and checkpoint`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const a = f.request("Instruction A.", "turn-first");
   await f.run(a);
   if (manual) {
@@ -1939,7 +1939,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} checkpoint resume excludes old item-ID-only instructions and binds only new work`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   const old = { type: "message", role: "user", id: "historical-a", content: "Historical instruction A." };
   const current = { type: "message", role: "user", id: "current-b", content: "Source instruction B.",
     internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } };
@@ -2005,7 +2005,7 @@ for (const mutation of ["namespace", "identity", "foreign-turn", "payload", "cal
 });
 
 for (const manual of [false, true]) test(`Round 7: approved tool discovery remains usable on ordinary work ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   f.controls.reviewWireName = "tool_search";
@@ -2050,7 +2050,7 @@ for (const manual of [false, true]) test(`Round 7: approved tool discovery remai
 });
 
 for (const manual of [false, true]) test(`Round 8: historical result collision outside current native instruction ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const prior = { type: "function_call_output", call_id: "completed-historical-call", output: "Completed historical result." };
@@ -2076,7 +2076,7 @@ for (const manual of [false, true]) test(`Round 8: historical result collision o
 });
 
 for (const manual of [false, true]) for (const content of ["New task B.", "Source A."]) test(`Round 8: accepted same-turn source echo cannot mask new instruction ${manual} ${content}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request("Source A.", "turn-first");
@@ -2157,7 +2157,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
 });
 
 for (const manual of [false, true]) test(`Round 9: foreign call echoes cannot hide malformed current results ${manual}`, async () => {
-  const f = fixture(manual);
+  const f = fixture(manual, { mcpTransport: "in-process" });
   f.controls.invokeSourceTools = true;
   f.controls.singleSourceTool = true;
   const first = f.request();

@@ -6,6 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import * as z from "zod/v4";
 import { VERSION } from "../../version";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
@@ -104,7 +105,10 @@ function requestScopeSummary(extra: McpRequestExtra): string {
   });
 }
 
-export async function runChatGptMcpServer(options: { brokerSocketPath: string; contract?: ChatGptMcpContract }): Promise<void> {
+export function createChatGptMcpServer(options: { brokerSocketPath: string; contract?: ChatGptMcpContract }): {
+  connect(transport: Transport): Promise<void>;
+  close(): Promise<void>;
+} {
   const contract = options.contract ?? "native";
   const instructions = contract === "safe"
     ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete and the exact acknowledged task_revision from this request's task contract or the Broker ACK reply. " + NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS
@@ -380,5 +384,12 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string; c
     );
   }
 
-  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES, undefined, settleContextReturn, checkContextReturn, takeContextProtocolFailure));
+  return {
+    connect: transport => server.connect(observeMcpToolCalls(transport, BRIDGE_TOOL_NAMES, undefined, settleContextReturn, checkContextReturn, takeContextProtocolFailure)),
+    close: () => server.close(),
+  };
+}
+
+export async function runChatGptMcpServer(options: { brokerSocketPath: string; contract?: ChatGptMcpContract }): Promise<void> {
+  await createChatGptMcpServer(options).connect(new StdioServerTransport());
 }

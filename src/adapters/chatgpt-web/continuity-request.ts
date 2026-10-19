@@ -1,3 +1,4 @@
+import { recoveryContinuationPrimaryIndices } from "./continuity-source";
 import { isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
 import { chatGptCurrentInstructionRevision } from "./environment";
@@ -1293,21 +1294,8 @@ async function prepareDurableContinuation(
   if (source.nativeTurnId !== identity.turnId && hasNativeChatGptInstruction(parsed,
     continuityCurrentInstructionInput(parsed, { trustedLowerBound: proof.index }))) return undefined;
   const raw = (parsed._rawBody as { input: unknown[] }).input;
-  const primaryIndices = raw.flatMap((value, index) => {
-    const item = value as { id?: unknown; internal_chat_message_metadata_passthrough?: { turn_id?: unknown } } | undefined;
-    const matchesId = typeof item?.id === "string" && (parsed._chatGptMessageIdAliases?.[item.id] ?? item.id) === checkpoint.sourceIdentity;
-    const matchesTurn = !item?.id && checkpoint.sourceIdentity === `turn:${source.nativeTurnId}`
-      && item?.internal_chat_message_metadata_passthrough?.turn_id === source.nativeTurnId && hasNativeChatGptInstruction(parsed, [value]);
-    return matchesId || matchesTurn ? [index] : [];
-  });
+  const primaryIndices = recoveryContinuationPrimaryIndices(parsed, checkpoint, source);
   if (primaryIndices.length > 1) return undefined; // Existing source-echo/new-instruction routing owns this layout.
-  if (primaryIndices.length) {
-    const primary = requestCarriedChatGptInstructionRevision({ ...parsed,
-      _rawBody: { ...(parsed._rawBody as object), input: [raw[primaryIndices[0]!]] } }, source.nativeTurnId);
-    if (!primary || !checkpoint.representationDigests.includes(continuitySourceRepresentationDigest(parsed, primary))) {
-      throw continuityError("continuity_source_unproven", "The checkpoint primary conflicts with its accepted source.");
-    }
-  }
   const sourceIndex = primaryIndices[0] ?? chatGptCurrentInstructionIndex(parsed);
   for (const value of raw) {
     const sibling = continuityCheckpointSiblingProof(parsed, value);

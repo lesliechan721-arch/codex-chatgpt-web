@@ -1,15 +1,17 @@
 import { ContinuityRecoveryStore, continuityProcessInstance, type RecoveryThreadRecord, type RecoveryCheckpointRecord } from "./continuity-recovery-store";
 import { forgetRecoveryPage, recoveryIdentity, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { existsSync, watch, type FSWatcher } from "node:fs";
 import { forgetStructuredCompactionPage } from "./compaction-handoff";
 import { COMPACT_PROMPT, decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest, CodexTool } from "../../types";
-import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
 import { ContinuityRegistrationStore } from "./continuity-registration";
 import { CONTINUITY_IDLE_TTL_MS, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityLease, type ContinuityRecoveryIdentity } from "./continuity-contract";
-import { requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
+import type { ChatGptTurnIdentity } from "./environment";
+import { requestCarriedChatGptInstructionRevision, type ChatGptTurnUserRevision } from "./environment-instruction";
+import { continuityDigest, continuitySourceRepresentationDigest } from "./continuity-source";
+export { continuityDigest, continuitySourceRepresentationDigest } from "./continuity-source";
 import { chatGptTurnSessions, type ContinuitySourceInstructionReplayEvidence } from "./turn-execution";
 export { CONTINUITY_IDLE_TTL_MS, CONTINUITY_FEATURE } from "./continuity-contract";
 export type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
@@ -73,12 +75,6 @@ const checkpointSelections = new WeakMap<CodexParsedRequest, {
     checkpoint: WeakRef<ContinuityCheckpointCommit>;
   };
 }>();
-
-export function continuitySourceRepresentationDigest(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
-  return continuityDigest([source.turnId,
-    source.itemId ? parsed._chatGptMessageIdAliases?.[source.itemId] ?? source.itemId : null,
-    source.content, source.instructionEnvelope ?? { role: "user" }]);
-}
 
 /** Summary content filters committed relations; request-carried identity selects the source. */
 export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity): ContinuityCheckpointSelection | undefined {
@@ -235,10 +231,6 @@ export function retainContinuityOrdinaryReplayTombstone(
     ...(instructionIdentity ? { instructionIdentity } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
-}
-
-export function continuityDigest(value: unknown): string {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
 function inputMessageText(item: Record<string, unknown>): string {

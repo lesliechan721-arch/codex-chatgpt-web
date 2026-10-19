@@ -18,7 +18,7 @@ function save(output: string, report: unknown) {
   mkdirSync(run);
   writeFileSync(join(run, "summary.json"), JSON.stringify(report));
   const current = report as { version?: number; runId?: string; segments?: { reportMs: number; totalMs: number } };
-  if (current.version === 3 && current.segments) writeFileSync(join(run, "completion.json"), JSON.stringify({ version: 1,
+  if ((current.version === 3 || current.version === 4) && current.segments) writeFileSync(join(run, "completion.json"), JSON.stringify({ version: 1,
     runId: current.runId, segments: { ...current.segments, reportMs: current.segments.reportMs + 1, totalMs: current.segments.totalMs + 1 },
     endPoint: "after-summary-and-status-output", excludes: ["completion-write", "process-shutdown"] }));
 }
@@ -32,6 +32,39 @@ function fullSummary(workers: number, output: string, files: string[]) {
       "--timings", join(output, "workers-random", "file-timings.json"), "--update-timings", ...(workers === 2 ? ["--parallel=2"] : []),
       "--isolate", ...(files.length ? files : ["./tests"])] };
 }
+
+test("v4 readers keep publication independent while retaining strict operation and file gates", () => {
+  const output = mkdtempSync(join(tmpdir(), "cgw-summary-v4-"));
+  const files = ["./tests/runtime-performance.test.ts"], targetFiles = ["tests/runtime-performance.test.ts"];
+  try {
+    const report = { ...fullSummary(1, output, files), version: 4,
+      fileTiming: { version: 2, complete: true, fullSuite: false, targetFiles, executedFiles: targetFiles, measuredFiles: targetFiles,
+        reportedFiles: 1, reasons: [], logsComplete: true, sourceStable: true },
+      historyPublication: { status: "failed", stage: "artifact-staging", reasons: ["disk-full"], remoteUpload: "not-observed" } };
+    save(output, report);
+    const read = () => readPerformanceSummary(output, 1, 0, report, { mode: "full", isolation: "isolate", files });
+    expect(read().summary.historyPublication).toEqual(report.historyPublication);
+    report.fileTiming.measuredFiles = ["tests/test-performance.test.ts"];
+    writeFileSync(join(output, "workers-random", "summary.json"), JSON.stringify(report));
+    expect(read).toThrow("incomplete-file-measurements");
+    report.fileTiming.measuredFiles = targetFiles;
+    report.complete = false; report.collection.status = "incomplete";
+    report.incompleteReasons = ["missing-child-report:worker"];
+    writeFileSync(join(output, "workers-random", "summary.json"), JSON.stringify(report));
+    expect(read).toThrow("incomplete-operation-collection");
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
+
+test("legacy file timing failures retain their original meaning when read", () => {
+  const output = mkdtempSync(join(tmpdir(), "cgw-summary-legacy-timing-")), files = ["./tests/example.test.ts"];
+  try {
+    const report = { ...fullSummary(1, output, files), fileTiming: { complete: false, reasons: ["history-publication-failed"] } };
+    save(output, report);
+    const read = readPerformanceSummary(output, 1, 0, report, { mode: "full", isolation: "isolate", files });
+    expect(read.summary.version).toBe(3);
+    expect(read.summary.fileTiming).toEqual({ complete: false, reasons: ["history-publication-failed"] });
+  } finally { rmSync(output, { recursive: true, force: true }); }
+});
 
 for (const history of ["same", "different"] as const) {
   test(`worker comparison handles ${history} history in separate run snapshots`, async () => {

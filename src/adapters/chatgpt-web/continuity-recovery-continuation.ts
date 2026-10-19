@@ -1,10 +1,12 @@
-import { createHash } from "node:crypto";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexParsedRequest } from "../../types";
-import { canonicalJson } from "./canonical-json";
+import { continuityDigest as digest, continuitySourceRepresentationDigest } from "./continuity-source";
 import { continuityError } from "./continuity-errors";
-import { requestCarriedChatGptInstructionRevision } from "./environment";
+import { requestCarriedChatGptInstructionRevision } from "./environment-instruction";
 import type { RecoveryCheckpointRecord, RecoveryThreadRecord, RecoveryWorkRecord } from "./continuity-recovery-store";
+
+/** Only committed source relationships are read; no store capability is required. */
+export type RecoveryContinuationRecord = Readonly<Pick<RecoveryThreadRecord, "thread" | "scope" | "legacyUnproven" | "works" | "checkpoints" | "calls">>;
 
 export interface RecoveryContinuationSelection {
   checkpoint: RecoveryCheckpointRecord;
@@ -14,7 +16,6 @@ export interface RecoveryContinuationSelection {
   action: "admit" | "resume" | "replay" | "stopped";
   summaryIndex: number;
 }
-const digest = (value: unknown): string => createHash("sha256").update(canonicalJson(value)).digest("hex");
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
 
 function summary(item: Record<string, unknown>): string | undefined {
@@ -30,9 +31,14 @@ function summary(item: Record<string, unknown>): string | undefined {
 }
 
 /** Read-only recognition; only durable admission may consume a continuation or grant a writer. */
+export function selectRecoveryContinuation(parsed: CodexParsedRequest, record: RecoveryContinuationRecord,
+  identity: { threadId?: string; turnId?: string }): RecoveryContinuationSelection | undefined;
+// Retain the full-record call signature for existing typed consumers and diagnostics.
+export function selectRecoveryContinuation(parsed: CodexParsedRequest, record: RecoveryThreadRecord,
+  identity: { threadId?: string; turnId?: string }): RecoveryContinuationSelection | undefined;
 export function selectRecoveryContinuation(
   parsed: CodexParsedRequest,
-  record: RecoveryThreadRecord,
+  record: RecoveryContinuationRecord,
   identity: { threadId?: string; turnId?: string },
 ): RecoveryContinuationSelection | undefined {
   if (parsed._conversationPolicy !== "task") return undefined;
@@ -80,8 +86,7 @@ export function selectRecoveryContinuation(
   });
   const carried = requestCarriedChatGptInstructionRevision(parsed, identity.turnId);
   const carriedId = carried?.itemId ? parsed._chatGptMessageIdAliases?.[carried.itemId] ?? carried.itemId : undefined;
-  const representationDigest = carried ? digest([carried.turnId, carriedId ?? null,
-    carried.content, carried.instructionEnvelope ?? { role: "user" }]) : undefined;
+  const representationDigest = carried ? continuitySourceRepresentationDigest(parsed, carried) : undefined;
   if (carried) {
     const explicit = candidates.filter(({ checkpoint, source }) => (
       carriedId !== undefined && carriedId === checkpoint.sourceIdentity
