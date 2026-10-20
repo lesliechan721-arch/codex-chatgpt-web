@@ -92,7 +92,8 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
   const socket = defaultBrokerEndpoint(join(root, scope));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web", baseUrl: `manual://${scope}`,
-    chatgptWeb: {
+    // This simulated update model consumes the existing inline startup protocol.
+    chatgptWeb: { maxComposerCodePoints: 2_000_000,
       appName: ZERO_RISK_CHATGPT_CONNECTOR_NAME, browserInteractionMode: "manual", browserHost: "launcher",
       browserHostDescriptorPath: join(root, `${scope}-launcher.json`), brokerSocketPath: socket,
       localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: false,

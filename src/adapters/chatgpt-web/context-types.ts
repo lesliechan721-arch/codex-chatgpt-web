@@ -106,6 +106,7 @@ export interface ContextListArgs extends ContextFilter {
   context_id: string;
   view: "overview" | "entries";
   cursor?: string;
+  required_only?: boolean;
 }
 export interface ContextReadArgs { context_id: string; read_ref: string; cursor?: string }
 export interface ContextSearchArgs extends ContextFilter {
@@ -118,11 +119,35 @@ export interface ContextSearchArgs extends ContextFilter {
 /** Dynamic state is never mixed into stable entries/search pages. */
 export interface ContextLiveOverview {
   context_ready?: boolean;
+  text_ready?: boolean;
+  images_ready?: boolean;
+  required_texts?: number;
+  delivered_texts?: number;
+  required_text_bytes?: number;
+  delivered_text_bytes?: number;
+  next_required_read?: ContextRequiredRead | null;
   required_images?: number;
   delivered_images?: number;
   remaining_tokens?: number;
   remaining_wire_bytes?: number;
   stop_hint?: string;
+}
+
+export interface ContextRequiredRead {
+  tool: "codex_context_read";
+  arguments: ContextReadArgs;
+}
+export interface ContextBootstrapControl {
+  read_state?: "readable" | "waiting" | "retired" | "failed";
+  revision?: number;
+  acknowledged_revision?: number;
+  next_action?: string;
+}
+export interface ContextTextPageCost {
+  start: number;
+  end_exclusive: number;
+  tokens: number;
+  wire_bytes: number;
 }
 
 export interface ContextRemainingBudget {

@@ -12,6 +12,7 @@ import { resolve } from "node:path";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint, isLegacyChatGptConnectorIdentity, legacyChatGptConnectorMigrationMessage } from "../../config";
 import { ContextSend } from "./context-send";
+import { bindContextBootstrapRequestSource, inheritContextBootstrapRequestSource } from "./context-bootstrap-request";
 import { contextCandidateCanonicalSource, contextCandidateSourceProvenance, contextCandidateMessageIndices, contextCandidateRawInputIndices } from "./context-candidate-mapping";
 import { createContextSnapshot, contextSnapshotPriorityImageLocators, type ContextSnapshot } from "./context-snapshot";
 import { prepareFreshCompactionSource, captureRetainedCompactionSource, type CompactionSourceCoverage } from "./compaction-context";
@@ -510,7 +511,12 @@ export function createChatGptWebAdapter(
     solAvailable: provider.chatgptWeb?.solAvailable !== false,
     extraHighAvailable: provider.chatgptWeb?.extraHighAvailable === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
+    maxComposerCodePoints: provider.chatgptWeb?.maxComposerCodePoints ?? 8_000,
   };
+  if (!Number.isSafeInteger(configuredCapabilities.maxComposerCodePoints)
+    || configuredCapabilities.maxComposerCodePoints! < 1) {
+    throw new Error("ChatGPT maxComposerCodePoints must be a positive safe integer");
+  }
   const manualInteraction = provider.chatgptWeb?.browserInteractionMode === "manual";
   const zeroRiskRequireSentConfirmation = provider.chatgptWeb?.zeroRiskRequireSentConfirmation !== false;
   if (provider.chatgptWeb?.zeroRiskRequireSentConfirmation !== undefined
@@ -793,6 +799,7 @@ export function createChatGptWebAdapter(
     const previousSource = conversationKey ? chatGptTurnSessions.findConversationHead(conversationKey) : undefined;
     let previousCoverage = previousSource?.runtime.compactionSourceCoverage;
     const contextCanonical = contextCandidateCanonicalSource(checkpointInput.parsed, promptInput) ?? checkpointInput.parsed;
+    inheritContextBootstrapRequestSource(parsed, contextCanonical);
     const imagePriorities = (candidate: CodexParsedRequest) => contextSnapshotPriorityImageLocators(contextCanonical, {
       // Ordinary retained suffixes share the original message objects. Re-parsed
       // continuity candidates instead carry their producer-proven canonical map.
@@ -2231,6 +2238,7 @@ export function createChatGptWebAdapter(
         }
         const initialTaskSource = !existingTaskSession && !updatedTaskSession && taskExecution
           ? captureTaskUpdateSource(parsed, taskExecution) : undefined;
+        if (initialTaskSource) bindContextBootstrapRequestSource(parsed, initialTaskSource);
         if (initialTaskSource?.messages.length && broker.acceptTaskUpdate && broker.beginFinalOutput
           && broker.waitForTaskUpdateState && broker.revokeTrusted
           && (manualRequest || await worker.supportsTaskUpdates())) {

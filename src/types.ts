@@ -302,6 +302,8 @@ export interface CodexProviderConfig {
     browserInteractionMode?: "automatic" | "manual";
     /** Whether Zero Risk requires an explicit Launcher Sent confirmation before connector binding. */
     zeroRiskRequireSentConfirmation?: boolean;
+    /** Maximum Unicode code points in each ordinary Full/MCP composer message. */
+    maxComposerCodePoints?: number;
     /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */
     browserHost?: "managed-chrome" | "launcher";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */

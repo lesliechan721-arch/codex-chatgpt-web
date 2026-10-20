@@ -110,19 +110,24 @@ export class CompactionSourceCoverage {
       unavailable("The selected source plan has invalid coverage metadata.");
     }
     const all = versions(snapshot);
-    const externalizedVersions = plan.externalizedTargetIds.map(id => {
+    // Generated bootstrap records describe this delivery, rather than permanent
+    // task history. Later compaction reconstructs the real sources they carry.
+    const generated = (index: number): boolean => snapshot.targets[index]!.original_role === "context_record"
+      && snapshot.targets[index]!.source_kind === "summary"
+      && ["context_bootstrap_protocol", "context_bootstrap_payload"].includes(snapshot.targets[index]!.origin ?? "");
+    const externalizedVersions = plan.externalizedTargetIds.flatMap(id => {
       const index = snapshot.targets.findIndex(target => target.target_id === id);
       if (index < 0) unavailable("The source plan references an unknown source target.");
-      return all[index]!;
+      return generated(index) ? [] : [all[index]!];
     });
-    const routes = Object.entries(plan.deliveryByTarget ?? {}).map(([id, route]) => {
+    const routes = Object.entries(plan.deliveryByTarget ?? {}).flatMap(([id, route]) => {
       const index = snapshot.targets.findIndex(target => target.target_id === id);
       if (index < 0 || typeof route.delivery !== "string" || route.delivery.length > 80) unavailable("The selected source route is invalid.");
-      return { version: all[index]!, delivery: route.delivery,
-        ...(route.media_route ? { mediaRoute: route.media_route } : {}), required: route.required === true };
+      return generated(index) ? [] : [{ version: all[index]!, delivery: route.delivery,
+        ...(route.media_route ? { mediaRoute: route.media_route } : {}), required: route.required === true }];
     });
     const { externalizedTargetIds: _, deliveryByTarget: _routes, ...metadata } = plan;
-    const record = { ...metadata, versions: all, externalizedVersions, routes, delivered: false };
+    const record = { ...metadata, versions: all.filter((_, index) => !generated(index)), externalizedVersions, routes, delivered: false };
     const existing = this.records.find(r => r.planId === plan.planId);
     if (existing) {
       if (deterministicContextJson({ ...existing, delivered: false }) !== deterministicContextJson(record)) {

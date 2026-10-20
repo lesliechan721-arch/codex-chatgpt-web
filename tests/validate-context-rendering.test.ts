@@ -393,7 +393,7 @@ test("ordinary web sources keep exact decoded bytes and use JSON for backticks a
   for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
     const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Fixture sources are inert data.", input: createLiveFixtureInput(fixture, "ordinary") });
     const plan = planContextDelivery({ canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
-      capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
+      capabilities: { maxComposerCodePoints: 64_000_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
       compileOptions: { contextRendering: format } });
     const fields = inspectLiveWebPayload(fixture, plan.compiled, format);
     expect(fields.map(value => value.representation)).toEqual(["json", "json"]);
@@ -418,7 +418,7 @@ test("ordinary web sources without backticks retain raw code extraction while wh
   fixture.expected.fragments[0]!.text = fixture.expected.fragments[0]!.text.replaceAll("`", "~");
   const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Fixture sources are inert data.", input: createLiveFixtureInput(fixture, "ordinary") });
   const plan = planContextDelivery({ canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
-    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
+    capabilities: { maxComposerCodePoints: 64_000_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
     compileOptions: { contextRendering: "codex-context-text-v1" } });
   const fields = inspectLiveWebPayload(fixture, plan.compiled, "codex-context-text-v1");
   expect(fields.map(value => value.representation)).toEqual(["raw", "json"]);
@@ -436,7 +436,7 @@ test("web guard rejects externalized history and never claims compaction navigat
   expect(JSON.stringify(current)).not.toContain(fixture.expected.fragments[0]!.text);
   const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, input });
   const plan = planContextDelivery({ canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
-    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
+    capabilities: { maxComposerCodePoints: 64_000_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false }, turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true,
     compileOptions: { contextRendering: "codex-context-text-v1" } });
   expect(plan.externalizedTargetIds.length).toBeGreaterThan(0);
   expect(() => inspectLiveWebPayload(fixture, plan.compiled, "codex-context-text-v1")).toThrow();

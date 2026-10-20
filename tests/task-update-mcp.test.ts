@@ -142,11 +142,11 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} task-u
       for (const name of ["codex_exec", "codex_write_stdin", "codex_apply_patch", "codex_view_image", "codex_tool_inventory", "codex_tool_call"]) {
         const tool = listed.tools.find(candidate => candidate.name === name)!;
         expect(tool.inputSchema.properties!.task_revision).toMatchObject({ type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
-        expect(tool.description).toContain("every Native start");
-        expect(tool.description).toContain("this request's task contract or the Broker ACK reply");
+        expect(tool.description).toContain("New work needs a new operation_id");
+        expect(tool.description).toContain("acknowledged task_revision from task startup or Broker ACK");
         expect(tool.description).not.toContain("initially 0");
         expect(tool.inputSchema.properties!.task_revision).toMatchObject({
-          description: expect.stringContaining("this request's task contract or the Broker ACK reply"),
+          description: expect.stringContaining("the task entry or Broker ACK"),
         });
         expect(JSON.stringify(tool.inputSchema.properties!.task_revision)).not.toContain("initially 0");
       }
@@ -156,9 +156,9 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} task-u
       expect(ack.inputSchema.properties).not.toHaveProperty("operation_id");
       expect(ack.inputSchema.properties).not.toHaveProperty("content");
       expect(BRIDGE_TOOL_NAMES.has(ack.name)).toBe(true);
-      expect(f.client.getInstructions()).toContain("task-updates-v1");
-      expect(f.client.getInstructions()).toContain("read its task_revision as the initial acknowledged revision");
-      expect(f.client.getInstructions()).toContain("a recovered stream can start above 0");
+      expect(f.client.getInstructions()).toContain("context-bootstrap-v1");
+      expect(f.client.getInstructions()).toContain("required protocol contains execution, waiting, updates and completion rules");
+      expect(f.client.getInstructions()).toContain("Original inline tasks and compaction retain their own entry instructions");
       expect(f.client.getInstructions()).not.toContain("initially 0");
       expect(f.client.getInstructions()).not.toContain("initial acknowledged task revision is 0");
       const started = await f.client.callTool({ name: "codex_tool_inventory", arguments: { ...f.reference, operation_id: 8, task_revision: 3 } });

@@ -19,7 +19,9 @@ import { estimateWebContextFieldCost } from "../src/adapters/chatgpt-web/context
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
 import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 
-const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
+// These cases exercise the retained inline/on-demand contract. Bootstrap admission
+// and its independent default composer limit have dedicated tests.
+const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false, maxComposerCodePoints: 2_000_000 };
 const token = `turn_${"a".repeat(32)}`;
 const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4nGP4z8DwHwwZGP6DAQBJyAn3FGMynQAAAABJRU5ErkJggg==";
 /** Preserve a valid 2px raster and add an ancillary chunk with a valid CRC. */

@@ -1,8 +1,11 @@
 # Context navigation
 
-Full/MCP tasks can provide a source directory instead of repeating large tool-history fields in
-each browser input. Images use MCP first and use the existing attachment path only when necessary.
-This applies to Automatic and Zero Risk. Browser-only and API Key routes keep their existing paths.
+Full/MCP tasks can provide a source directory instead of repeating large source text in
+each browser input. Ordinary Automatic and Zero Risk tasks can use `context-bootstrap-v1`
+when the complete input exceeds the composer text budget. Images use MCP first and use the existing
+attachment path only when necessary.
+This applies to Automatic and Zero Risk. Browser-only and upstream API forwarding keep their
+existing paths. Local API Key authentication does not exclude a request that uses Web Full/MCP.
 The feature's complete release validation is still pending; the
 [validation record](release-validation.md#context-navigation-validation) defines the tested scope.
 
@@ -18,8 +21,8 @@ new plugin with the current name, the existing Tunnel URL, **Authentication: Non
 retired defaults remain retired. Production and DEV plugins can remain installed together.
 
 Setup preserves custom names that are not retired defaults. If a custom plugin caches the old
-pre-navigation schema, follow the original migration above. The still-unreleased context-rendering
-and text-read-v2 update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
+pre-navigation schema, follow the original migration above. The still-unreleased context-rendering,
+text-read-v2, and short-start update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
 non-retired custom names. Refresh or reconnect that same connector if its current contract is
 incompatible. If the client cannot update or consume v2, stop v2 use and report the missing
 capability. This update does not introduce another connector name. A local name change uses
@@ -70,11 +73,12 @@ only by a unique call ID. A recorded result is evidence that a result exists, no
 business success. Labels, snippets, digests, and references are not complete sources.
 
 The unified task mechanism selects a legal full or retained-suffix input first. Within that
-candidate, only eligible tool-history arguments and results can be replaced by references. A field
+candidate, the legacy navigation path replaces only eligible tool-history arguments and results
+with references. A field
 must offer at least 1 KiB of potential encoded-byte savings in its selected presentation. The planner
 then compares complete inline and externalized candidates in their best available presentation.
 Each candidate must fit the context window, browser message limits, and required navigation limits.
-When a valid inline candidate is available, externalization must reduce the total required token estimate, including protocol instructions,
+For legacy candidates within the composer text budget, when a valid inline candidate is available, externalization must reduce the total required token estimate, including protocol instructions,
 references, directory discovery, required media, and error reserves. If it has no benefit or cannot
 fit, the planner keeps that inline candidate. If inline cannot fit, a valid externalized candidate
 can be used. Required history navigation remains present in
@@ -121,6 +125,91 @@ Two- and six-part inputs partition complete records in one format. A raw field n
 Manifests and ACKs refer to the actual fixed payload bytes. The coverage journal records the selected
 `contextFormat` with the body digest and costs; older records without it mean `legacy-json`.
 
+## Short startup and required text
+
+The short-start plan captures the complete selected task and generated execution protocol as required
+sources. It preserves the selected value tree, source identity, roles, order, empty values, unknown
+structure, and known completeness. It does not infer authority from body markers such as
+`role:developer` or `AGENTS.md`. The guarantee starts after existing normalization, attachment
+projection, and retired-handle cleanup. It does not restore data that those steps already removed.
+
+Automatic starts with `codex_context_list` using `turn_token`, `context_id`, and `view: "overview"`
+after actual prompt submission. It does not call `codex_turn_start`. Zero Risk starts with
+`codex_turn_start` using `request_id`; the existing `started` and `duplicate` reply also contains
+`context_bootstrap`. A duplicate start keeps the same immutable manifest and current coverage.
+When configured Sent confirmation is pending, `read_state: "waiting"` identifies the original
+manual step. Waiting does not consume the read allowance and is not an instruction to poll reads.
+Manual Send, Sent policy, and image confirmation remain separate.
+
+The overview identifies `startup_protocol: "context-bootstrap-v1"`, `manifest_version: 1`,
+`context_id`, `plan_id`, `manifest_digest`, current revision and acknowledged revision, readiness
+and the next required read. `required_targets` contains a bounded first page and its continuation.
+Each target retains source location, role/origin/scope, UTF-8 size, digest, completeness, delivery
+route and read reference.
+`codex_context_list(view: "entries", required_only: true)` pages through required entries with the
+returned cursor. The default filter remains false. Each response, including its wrapper, fits the
+list limits of 20 targets, 12 KiB and 1,500 estimated tokens. Labels and previews are not body text.
+`next_required_read` first selects undelivered required MCP images, then the first missing text
+range in source order. Read arguments still need the current mode credential.
+
+A current user request that fits is retained exactly inline with its original identity. Otherwise,
+the whole accepted request or ordered message group becomes required text. It is never replaced
+by a summary, keyword-selected fragment, or truncated tail. Required rules and skill catalogs must
+be delivered before task work. Existing skill paths and relative-reference bases remain valid.
+
+`text_ready` requires successful supported-transport receipts matching pending v2 pages. Only their
+UTF-8 range union counts; every required source must cover `[0, utf8_bytes)`. Empty sources require
+an actual empty-body receipt. Duplicate or overlapping pages add only new coverage, but each return
+consumes budget. Failed, malformed, cross-source, expired, revoked or cross-scope receipts add no
+coverage. Preparing a reply, a search hit, a digest or a claim of reading does not count.
+`images_ready` stays independent; `context_ready` requires both. Text returns do not extend image
+deadlines. Readiness proves delivery to the supported transport, not model understanding.
+
+New business calls, business inventory and successful completion are checked atomically against
+readiness and existing authority, generation, revision, ACK, result and output fences. This includes
+Automatic direct answers and Zero Risk `codex_turn_complete`. Missing context returns
+`CONTEXT_NOT_READY` with bounded recovery details. A rejected operation ID retains its rejection;
+new work after recovery needs a new ID. Existing wait, replay, settlement, ACK, cancellation and
+other control paths retain their original permissions. They do not grant new business authority.
+ChatGPT-owned tools must also wait under the prompt rules; the connector cannot intercept them.
+
+The fixed short entry, including credentials and wrappers but excluding the inline request, is at
+most 3,000 Unicode code points. AppConfig accepts optional `maxComposerCodePoints`,
+`automaticMaxComposerCodePoints` and `zeroRiskMaxComposerCodePoints`. Values must be positive safe
+integers. The mode override takes priority over the common value, then the default of 8,000.
+The provider's `chatgptWeb` options receive only the effective valid `maxComposerCodePoints`.
+The complete final text is measured after rendering and escaping; UTF-16 length is recorded
+separately. The default is an engineering limit, not a measured platform attachment threshold.
+
+Plans reserve all required text pages, manifest discovery, startup and result wrappers, cursors,
+required images, corrective replies, retained context and working capacity. On-demand reads cannot
+spend the protected remaining required-source allowance. Repeats count again. A plan that exceeds
+the composer limit cannot win because it uses fewer tokens; a valid short plan can cost more total
+tokens. If no complete plan fits, preparation fails before Send with the limiting budget or missing
+capability. It does not summarize, truncate, switch model, attach text or automatically resend.
+Each actual composer message in existing multipart delivery also has this text limit.
+
+The short entry gives the first call, v2 body selection, trust boundary and pre-work gate. Detailed
+role, execution, wait, error, output and applicable update/image/attachment/continuity rules are in
+the required execution protocol. Server instructions and tool descriptions retain their own short
+parameter and recovery rules. Conditional rules use trusted plan state. Current errors select error
+recovery; historical error strings do not. Pending and lost receipts keep the original ID. Only an
+unexplained platform safety-check rejection permits at most three recovery attempts per affected
+step; uncertain writes must first be checked. Permission denials retain the original approval rules.
+Strict output values and the result/ACK/final-output order remain unchanged. Rich cards also need
+ordinary Markdown results that Codex can receive; their DOM markup is not final-answer content
+unless requested. Ordinary tasks recognize trusted compaction handoff, whose full control rules
+are supplied only on that path. Multipart stage/commit/ACK rules remain inline while stage sources
+are unavailable; they bind fixed bytes and do not execute task work before final commit. A resume
+entry states the remaining startup and ACK conditions rather than claiming the context is complete.
+
+Local checks require the current bootstrap and v2 contracts, not historical diagnostic success.
+They cannot prove adoption of the new schema in ChatGPT's remote cache. Refresh or reconnect the
+current compatible connector when needed. A known pre-send incompatibility allows only a complete
+legacy plan that fits every budget; post-send incompatibility stops the request without a new Send.
+The real editor, remote schema and model tail-page acceptance remain pending; see
+[short-start validation](release-validation.md#short-start-context-validation).
+
 ## Read-only tools
 
 All three tools require `context_id` and exactly one credential: Automatic uses `turn_token`,
@@ -143,8 +232,8 @@ Text reads report UTF-8 byte ranges `[start, end_exclusive)`. Successive pages r
 representation exactly and never split a character. Object and array inputs use a declared
 deterministic JSON representation; string and freeform inputs retain their characters. Source
 completeness remains `complete`, `truncated`, or `unknown` according to the supplied source evidence.
-A direct read does not require listing the full directory first. Ordinary text has no mandatory
-reading count or coverage threshold. Read an earlier result before deciding to repeat its operation.
+A direct read does not require listing the full directory first. Legacy and on-demand text have
+no mandatory reading count or coverage threshold. Short-start required text uses the gate above. Read an earlier result before deciding to repeat its operation.
 
 Successful text pages use `format: "context-text-read-v2"`. `structuredContent` contains metadata
 only; `content[0].text` is JSON for the same metadata; `content[1].text` is the one exact body.
@@ -179,7 +268,8 @@ Images from requirement sources in the selected input are required for that send
 tool-history images are normally on demand. Historical images excluded by a valid retained or
 continuity boundary do not become required merely because the directory still exposes them.
 
-`context_ready` requires delivery of every required image. MCP delivery uses the supported return
+`images_ready` requires delivery of every required image. Short startup also requires all required
+text before `context_ready` becomes true. MCP delivery uses the supported return
 receipt; Automatic attachments use upload evidence. In Zero Risk, the Launcher lists only the
 required fallback images. Attach all listed images to that ChatGPT turn and explicitly confirm the
 list. That confirmation records your statement (`user_attested`); the Launcher does not inspect
@@ -280,7 +370,7 @@ can be returned, the scope stops authorizing source queries. Further queries rec
 rejection. This does not close
 the shared MCP transport, ordinary business authority, or the original compaction submission path.
 Existing readiness and permanent-failure checks still apply; losing read permission cannot waive
-an undelivered required image or authorize a checkpoint after permanent source failure.
+undelivered required text or images, or authorize a checkpoint after permanent source failure.
 
 Required MCP images have a 120-second readiness deadline and a 45-second no-progress deadline,
 starting when the selected entry is delivered and the original start/Sent conditions allow reading.

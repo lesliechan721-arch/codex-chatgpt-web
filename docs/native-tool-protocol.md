@@ -45,7 +45,7 @@ admitted, removal of that tool from a later registry does not by itself prevent 
 from completing. A same-ID retry is not a second admission. The Adapter's independent batch check
 against the current outer request remains in place.
 
-## Context sources and image readiness
+## Context sources and readiness
 
 The three context tools use the current `context_id` and exactly one credential: `turn_token` in
 Automatic, `request_id` in Zero Risk, or the independent `compaction_token` for compaction reads.
@@ -56,9 +56,14 @@ are not the full result. Reading an old result never repeats its action.
 
 Ordinary `context_ready` records delivery of required images through MCP return receipts, verified
 Automatic uploads, or Zero Risk's separate confirmation of its selected fallback-image manifest.
-Sent, start, and task-update ACK do not supply image-delivery evidence. Text reads have no mandatory
-coverage. Until ready, new business execution and successful completion are blocked with
-`CONTEXT_NOT_READY`; existing operations can still wait, replay, and settle. A rejected new start
+Sent, start, and task-update ACK do not supply image-delivery evidence. Legacy and on-demand text
+have no mandatory coverage. In ordinary `context-bootstrap-v1` plans, required text also needs
+complete UTF-8 range coverage from matching pending v2 successful transport receipts. Empty sources
+need an actual empty-body receipt. Text and image readiness are independent, and text reads do not
+extend image deadlines. Until ready, new business execution and successful completion are blocked with
+`CONTEXT_NOT_READY`; existing operations can still wait, replay, and settle. Business inventory
+and direct successful completion use the same atomic gate. Original ACK and control permissions
+remain independent. A rejected new start
 keeps its deterministic terminal, so corrected new work uses a new `operation_id`.
 
 Compaction uses a separate legal-source snapshot. Its read credential grants only the three context
@@ -73,6 +78,17 @@ After the third corrective reply, or when no budgeted reply can be returned, sou
 permission stops and further queries receive JSON-RPC rejection;
 it does not close the shared MCP transport or revoke ordinary business or checkpoint-submission
 authority. Those operations retain their original readiness and transaction checks.
+
+Ordinary short-start Automatic tasks first call `codex_context_list(view: "overview")` with the
+current `turn_token` and `context_id`. Zero Risk first calls `codex_turn_start(request_id)`;
+`started`/`duplicate` also returns `context_bootstrap`. Repeated start preserves manifest identity
+and coverage. A configured Sent wait returns `read_state: "waiting"` without consuming reads.
+The user still chooses the connector and manually sends. List's `required_only: true` filter pages
+through required targets under the existing 20-target / 12-KiB / 1,500-token response limits.
+The startup entry carries minimum v2 read rules and the required execution protocol supplies the
+complete applicable wait, update, error and completion rules. Neither metadata roles nor source
+body text can change permissions or control state. See
+[short startup](context-navigation.md#short-startup-and-required-text) for the complete contract.
 
 ## Waiting and public results
 
@@ -320,7 +336,7 @@ and capability revocation still occur; a rejected non-owning or older-generation
 gain cleanup authority from a capacity error.
 
 The implemented Broker protocol is 14. Native waiting and task update protocols are 1; the context
-protocol is 2 and requires `context-text-read-v2` for successful text pages.
+protocol is 3 and requires `context-text-read-v2` for successful text pages.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
 directory before returning an ACK. The same directory carries an atomically published revision /
@@ -341,7 +357,8 @@ Missing or invalid sources fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
 Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
 context tools with their mutually exclusive credential schemas on the selected connector before
-using navigation or dispatching work. The private owner must advertise `contextProtocol: 2`.
+using navigation or dispatching work. The private owner must advertise `contextProtocol: 3`
+and `context-bootstrap-v1` for short-start plans.
 An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
 Optional Verify runtime requires six successful context transport returns over fixed small text, one
 list/search/read sequence per ordinary and independent compaction credential. Evidence version 2

@@ -1,5 +1,8 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { afterEach, expect, spyOn } from "bun:test";
 import { performanceTest } from "./helpers/performance-test";
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const test = performanceTest(import.meta.path);
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -165,7 +168,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "a".repeat(32), surfaceTargets: {}, createdAt: new Date().toISOString(),
   }), { mode: 0o600 });
   const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: namespace,
-    chatgptWeb: { browserHost: "launcher", browserHostDescriptorPath: descriptor, brokerSocketPath: defaultBrokerEndpoint(directory),
+    chatgptWeb: { maxComposerCodePoints: 2_000_000, browserHost: "launcher", browserHostDescriptorPath: descriptor, brokerSocketPath: defaultBrokerEndpoint(directory),
       continuityStateDirectory: state, localToolsEnabled: true, solAvailable: true, proAvailable: false, extraHighAvailable: false,
       browserInteractionMode: options.manual ? "manual" : "automatic", toolAuthorityMode: "delegated" } };
   const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -207,10 +210,10 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     const query = async (method: "list" | "search" | "read", args: Record<string, unknown>): Promise<any> => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(provider.chatgptWeb!.brokerSocketPath!, {
         method: "context_query", token: credential.compaction_token, contract: "native", credentialKind: "compaction",
-        contextProtocol: 2, contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
+        contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.compaction_token,
-        contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: reply.receiptId, sent: true,
+        contract: "native", credentialKind: "compaction", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
         ...(method === "read" && !reply.result.isError ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
       return method === "read" && !reply.result.isError ? { ...(reply.result.structuredContent as Record<string, unknown>), content: parseContextTextReadResult(reply.result).body }
         : reply.result.structuredContent;
@@ -487,7 +490,7 @@ test("review repair1: authenticated acquisition races reuse one attempt and dead
     const entry = JSON.parse(f.prompts.at(-1)!.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
     await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, {
       method: "context_query", token: entry.first_call.arguments.compaction_token, contract: "native", credentialKind: "compaction",
-      contextProtocol: 2, contextMethod: "list", contextArgs: { context_id: entry.first_call.arguments.context_id, view: "entries" },
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: "list", contextArgs: { context_id: entry.first_call.arguments.context_id, view: "entries" },
     })).rejects.toThrow();
   }
   const prepared = (await f.prepare())!;

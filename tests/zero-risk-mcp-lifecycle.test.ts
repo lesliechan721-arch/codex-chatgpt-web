@@ -397,8 +397,8 @@ describe("Zero Risk public MCP ABI", () => {
     const client = new Client({ name: "codex-safe-contract-test", version: "1.0.0" });
     try {
       await client.connect(transport);
-      expect(client.getInstructions()).toContain("begin with codex_turn_start using the request_id");
-      expect(client.getInstructions()).toContain("send the complete answer with codex_turn_complete");
+      expect(client.getInstructions()).toContain("Begin each pasted request with codex_turn_start(request_id)");
+      expect(client.getInstructions()).toContain("return the complete answer with codex_turn_complete");
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
@@ -416,7 +416,7 @@ describe("Zero Risk public MCP ABI", () => {
         "codex_write_stdin",
       ]);
       expect(listed.tools.find(tool => tool.name === "codex_turn_start")?.description)
-        .toContain("request_id included in the pasted Codex Web GPT request");
+        .toContain("Connect the pasted request_id");
       expect(listed.tools.find(tool => tool.name === "codex_tool_inventory")?.description)
         .toStartWith("List tools available to the connected Zero Risk request");
       const startSchema = listed.tools.find(tool => tool.name === "codex_turn_start")?.inputSchema;

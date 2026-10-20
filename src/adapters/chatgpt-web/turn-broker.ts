@@ -276,6 +276,7 @@ interface BrokerRequest {
     | "owner_revoke_trusted"
     | "task_update_ack";
   contextProtocol?: number;
+  contextBootstrapProtocol?: string;
   verificationRegistration?: Omit<ContextVerificationRegistration, "normal" | "compactionSnapshot"> & { normal: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire }; compactionSnapshot: ContextSnapshotWire };
   contextRegistration?: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
   compactionRegistration?: Omit<CompactionContextRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
@@ -562,6 +563,8 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
+  /** Current local/remote ABI support; saved diagnostic records are not consulted. */
+  contextBootstrapAvailable?(): boolean | Promise<boolean>;
   armContextVerification?(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): ContextVerificationHandle | Promise<ContextVerificationHandle>;
   markContextVerificationDelivered?(pairToken: string): void | Promise<void>;
   contextVerificationStatus?(pairToken: string): ContextVerificationStatus | undefined | Promise<ContextVerificationStatus | undefined>;
@@ -869,6 +872,8 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!Number.isSafeInteger(bytes) || bytes > 128 * 1024 * 1024) throw contextError("CONTEXT_BUDGET_EXCEEDED", "Active context storage is full");
   }
 
+  contextBootstrapAvailable(): boolean { return true; }
+
   registerContextPlan(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope) throw contextError("CONTEXT_INVALID", "The context plan is already selected");
@@ -1122,7 +1127,14 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!channel.contextScope || (!channel.safe && !channel.contextSent)) throw contextError("CONTEXT_NOT_READY", "Select and send the current context plan before reading");
       this.activateContextReads(channel); scope = channel.contextScope;
     } else throw contextError("CONTEXT_INVALID", "Invalid context credential");
-    return scope.prepare(request.contextMethod!, request.contextArgs);
+    if (scope.registration.startupProtocol && request.contextBootstrapProtocol !== scope.registration.startupProtocol) {
+      throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current connector to obtain context-bootstrap-v1 and context-text-read-v2; this sent request cannot change delivery plans");
+    }
+    const channel = request.credentialKind === "ordinary" ? this.channels.get(request.token) : undefined;
+    return scope.prepare(request.contextMethod!, request.contextArgs, channel?.taskUpdates ? {
+      revision: channel.taskUpdates.state.acceptedRevision,
+      acknowledged_revision: channel.taskUpdates.state.acknowledgedRevision,
+    } : undefined);
   }
 
   private finishContextReturn(request: BrokerRequest): void {
@@ -1922,7 +1934,7 @@ export class TurnBroker implements TurnBrokerOwner {
     return channel.compactionDeliveryCount;
   }
 
-  startSafeTurn(requestId: string): { started: true; duplicate: boolean } {
+  startSafeTurn(requestId: string): { started: true; duplicate: boolean; context_bootstrap?: Record<string, unknown> } {
     this.prune();
     const channel = this.channels.get(requestId);
     if (!channel) throw new Error("Zero Risk request_id is invalid, expired, or revoked");
@@ -1932,11 +1944,23 @@ export class TurnBroker implements TurnBrokerOwner {
     if (safe.state === "completed" || safe.state === "revoked") {
       throw new Error("Zero Risk turn is already terminal");
     }
-    if (safe.connectorStarted) return { started: true, duplicate: true };
-    safe.connectorStarted = true;
-    this.activateSafeTurn(channel, safe);
-    this.activateContextReads(channel);
-    return { started: true, duplicate: false };
+    const duplicate = safe.connectorStarted;
+    if (!duplicate) {
+      safe.connectorStarted = true;
+      this.activateSafeTurn(channel, safe);
+      this.activateContextReads(channel);
+    }
+    const scope = channel.contextScope;
+    if (!scope?.registration.startupProtocol) return { started: true, duplicate };
+    const bootstrap = scope.bootstrapManifest({
+      read_state: safe.state === "running" ? "readable" : "waiting",
+      revision: channel.taskUpdates?.state.acceptedRevision ?? 0,
+      acknowledged_revision: channel.taskUpdates?.state.acknowledgedRevision ?? 0,
+      ...(safe.state !== "running" ? { next_action: "Complete the original Launcher Sent confirmation. Then continue by repeating codex_turn_start with this request_id. Do not poll context reads while waiting." } : {}),
+    });
+    if (bootstrap.isError || !bootstrap.structuredContent || typeof bootstrap.structuredContent !== "object"
+      || Array.isArray(bootstrap.structuredContent)) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The startup manifest cannot fit its bounded return");
+    return { started: true, duplicate, context_bootstrap: bootstrap.structuredContent as Record<string, unknown> };
   }
 
   confirmSafeTurnSent(requestId: string, surfaceNonce: string): { confirmed: true; duplicate: boolean } {
@@ -2937,6 +2961,11 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "safe_start") {
       if (!request.token) throw new Error("Zero Risk request_id is required");
+      const scope = this.channels.get(request.token)?.contextScope;
+      if (scope?.registration.startupProtocol && (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION
+        || request.contextBootstrapProtocol !== scope.registration.startupProtocol)) {
+        throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current Zero Risk connector to obtain context-bootstrap-v1; the prepared request remains fixed");
+      }
       return this.startSafeTurn(request.token);
     }
     if (request.method === "safe_complete") {
@@ -2977,6 +3006,7 @@ export class TurnBroker implements TurnBrokerOwner {
         nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         taskUpdateProtocol: TASK_UPDATE_PROTOCOL_VERSION,
         contextProtocol: CONTEXT_PROTOCOL_VERSION,
+        contextBootstrapProtocol: "context-bootstrap-v1",
         acceptingExternalOwners: this.acceptingExternalOwners,
         owner: this.ownerId,
       };
@@ -3732,6 +3762,12 @@ export async function callTurnBroker<T>(
  */
 export class RemoteTurnBroker implements TurnBrokerOwner {
   constructor(readonly socketPath: string) {}
+
+  async contextBootstrapAvailable(): Promise<boolean> {
+    const status = await callTurnBroker<{ contextProtocol?: number; contextBootstrapProtocol?: string }>(
+      this.socketPath, { method: "owner_status" }, 5_000);
+    return status.contextProtocol === CONTEXT_PROTOCOL_VERSION && status.contextBootstrapProtocol === "context-bootstrap-v1";
+  }
 
   armContextVerification(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): Promise<ContextVerificationHandle> {
     return callTurnBroker(this.socketPath, { method: "owner_context_verification_arm", token, contextProtocol: CONTEXT_PROTOCOL_VERSION,

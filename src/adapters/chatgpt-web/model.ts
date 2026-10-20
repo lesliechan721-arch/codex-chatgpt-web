@@ -11,6 +11,8 @@ export interface ChatGptWebCapabilities {
   solAvailable: boolean;
   extraHighAvailable: boolean;
   proAvailable: boolean;
+  /** Independent ordinary Full/MCP composer budget; defaults to 8,000 code points. */
+  maxComposerCodePoints?: number;
 }
 
 export interface ChatGptWebModelMode {

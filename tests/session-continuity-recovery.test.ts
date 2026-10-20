@@ -1,3 +1,4 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessInstanceStatus } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { evictOptionalRecoveryResults, recordRecoveryAppend, recoveryDigest, recoveryIdentity, recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import * as recoveryRuntime from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
@@ -1166,13 +1167,13 @@ for (const checkpoint of [false, true]) test(`unified recovery: an oversized rea
     const credential = entry.first_call.arguments;
     const query = async (method: "search" | "read", args: Record<string, unknown>) => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
-        method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: 2,
+        method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
         contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       expect(reply.result.isError).not.toBe(true);
       const { contextTextReadReceipt } = await import("../src/adapters/chatgpt-web/context-text-result");
       await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.turn_token,
-        contract: "native", credentialKind: "ordinary", contextProtocol: 2, receiptId: reply.receiptId, sent: true,
+        contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
         ...(method === "read" ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
       return reply.result;
     };
@@ -1209,7 +1210,7 @@ test("unified recovery: non-externalized assistant text still fails before a rep
   f.controls.invokeSourceTools = false;
   const oversized = f.request("", "turn-first", [...input,
     { type: "message", role: "assistant", content: "Required assistant source text. ".repeat(60_000) }]);
-  await expect(f.run(oversized)).rejects.toMatchObject({ code: "continuity_input_limit" });
+  await expect(f.run(oversized)).rejects.toMatchObject({ code: "CONTEXT_BUDGET_EXCEEDED", retryable: false });
   expect(f.submissions).toHaveLength(1);
 }, 30_000);
 

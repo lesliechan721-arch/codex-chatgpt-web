@@ -82,8 +82,9 @@ Cold start includes all current effective system, developer, AGENTS, skill, dele
 instructions, request-carried summaries, history, real results, and required images. It is not an
 old resume suffix or just the last user message and a directory. The request need not become a new
 turn or prove equality with the closed page's history; it may contain rolled-back history.
-Only tool history and images eligible under the existing contract use the on-demand route.
-Other required text cannot be silently summarized, trimmed, or made optional reading.
+Eligible tool history remains on demand. Ordinary Full/MCP short-start plans can deliver other
+required text through `context-bootstrap-v1`; it must be fully delivered before business work or
+successful completion. Required text cannot be silently summarized, trimmed, or made optional.
 
 Complete sources need not fit as one browser prompt. The actual plan must fit its model and account
 window, composer/attachment limits, existing page cost, directory discovery, complete read replies,
@@ -120,6 +121,30 @@ multipart permission.
 Zero Risk still requires user sending, Sent confirmation, and required-attachment confirmation.
 An already-ended response uses the existing explicit manual checkpoint handoff; recovery never
 sends an automatic second prompt or treats navigation reads as Sent confirmation.
+
+## Short-start scope and updates
+
+A new physical ordinary send creates its own fixed source snapshot, plan and required-text coverage.
+A same-scope start/read retry retains those identities and its coverage. A new page, restart or
+cold recovery cannot reuse old receipts or a journal's read marker to satisfy new required text.
+It rebuilds current effective instructions and the complete request from authorized real sources.
+Late old-generation returns cannot change the new scope. Healthy retained pages keep their legal
+retained suffix; omitted history does not become required merely because it appears in a directory.
+Unknown Send retains the existing no-resend fence and lifecycle recovery branches.
+
+Active user updates retain exact ordered delivery and explicit ACK. They bypass the composer and
+keep their own capacity limits. An update revision does not mutate the initial snapshot or invalidate
+its still-authorized references. Reading initial sources does not ACK an update; ACK does not add
+initial coverage. New work and final output must satisfy both current revision checks and initial
+required-text readiness. Inputs during Zero Risk Send/Sent waiting do not rewrite the copied prompt
+or trigger automatic Send.
+
+Compaction sources remain optional summary evidence under their independent credential and
+submission protections. Compaction does not acquire an all-history coverage gate. A subsequent
+ordinary task delivers its current required instructions under its own new plan. Browser-only,
+upstream API forwarding, legacy inline delivery and existing multipart semantics retain their
+contracts; each actual composer message still obeys the effective code-point limit. See
+[short-start delivery and budgets](context-navigation.md#short-startup-and-required-text).
 
 ## Current work and committed relationships
 

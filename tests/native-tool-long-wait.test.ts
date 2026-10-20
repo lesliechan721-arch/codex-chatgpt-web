@@ -218,7 +218,8 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
         expect(rejectedControl.isError).toBe(true);
         expect(JSON.stringify(rejectedControl)).toContain("operation_id");
       }
-      expect(client.getInstructions()).toContain("before sending the original tool call");
+      expect(client.getInstructions()).toContain("context-bootstrap-v1");
+      expect(client.getInstructions()).toContain("required protocol contains execution, waiting, updates and completion rules");
       const missingCallId = await client.callTool({ name: "codex_tool_call", arguments: { ...reference, wire_name: "not-admitted", arguments: {} } });
       expect(missingCallId.isError).toBe(true);
       expect(JSON.stringify(missingCallId)).toContain("operation_id");

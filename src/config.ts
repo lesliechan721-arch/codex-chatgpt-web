@@ -149,6 +149,10 @@ export interface AppConfig {
   zeroRiskProEnabled: boolean;
   /** Require the user to confirm Sent in the Launcher before a Zero Risk connector can start. */
   zeroRiskRequireSentConfirmation: boolean;
+  /** Maximum Unicode code points in each ordinary Full/MCP composer message. */
+  maxComposerCodePoints?: number;
+  automaticMaxComposerCodePoints?: number;
+  zeroRiskMaxComposerCodePoints?: number;
   /** Optional adapter-silence budget for the Responses watchdog. */
   stallTimeoutSec?: number;
   autoApproveToolCalls: boolean;
@@ -627,6 +631,11 @@ function parseConfig(value: unknown, path: string): AppConfig {
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   const zeroRiskRequireSentConfirmation = parsed.zeroRiskRequireSentConfirmation !== false;
+  for (const key of ["maxComposerCodePoints", "automaticMaxComposerCodePoints", "zeroRiskMaxComposerCodePoints"] as const) {
+    if (parsed[key] !== undefined && (!Number.isSafeInteger(parsed[key]) || Number(parsed[key]) < 1)) {
+      throw new Error(`Invalid ${key} in ${path}: expected a positive safe integer`);
+    }
+  }
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
     throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
   }
@@ -701,6 +710,8 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       localToolsEnabled: config.mode === "full",
       toolAuthorityMode,
       zeroRiskRequireSentConfirmation: config.zeroRiskRequireSentConfirmation,
+      maxComposerCodePoints: (manual ? config.zeroRiskMaxComposerCodePoints : config.automaticMaxComposerCodePoints)
+        ?? config.maxComposerCodePoints ?? 8_000,
       solAvailable: manual ? false : config.solAvailable,
       extraHighAvailable: !manual && config.extraHighAvailable === true,
       proAvailable: manual ? false : config.proAvailable,

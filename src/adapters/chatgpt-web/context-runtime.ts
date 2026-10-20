@@ -2,12 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { ContextNavigator, ContextNavigationStoppedError, type ContextNavigationUsage } from "./context-navigator";
 import type { ContextSnapshot } from "./context-snapshot";
 import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides } from "./context-budget";
-import type { ContextDelivery, ContextListArgs, ContextReadArgs, ContextSearchArgs, ContextRemainingBudget } from "./context-types";
+import type { ContextDelivery, ContextListArgs, ContextReadArgs, ContextSearchArgs, ContextRemainingBudget, ContextBootstrapControl, ContextRequiredRead, ContextTextPageCost, ContextTarget } from "./context-types";
 import type { BrokerToolResult } from "./turn-broker";
 import { NativeOperationError } from "./native-tool-operations";
 import { contextTextReadReceipt, contextTextReadReceiptsEqual, parseContextTextReadResult, type ContextTextReadReceipt } from "./context-text-result";
+import { ContextTextCoverage } from "./context-text-coverage";
 
-export const CONTEXT_PROTOCOL_VERSION = 2;
+export const CONTEXT_PROTOCOL_VERSION = 3;
 export const CONTEXT_READY_TIMEOUT_MS = 120_000;
 export const CONTEXT_PROGRESS_TIMEOUT_MS = 45_000;
 export const CONTEXT_ATTACHMENT_TIMEOUT_MS = 300_000;
@@ -19,9 +20,12 @@ export interface ContextPlanRegistration {
   planId: string;
   manifestDigest: string;
   deliveryByTarget: Readonly<Record<string, ContextDelivery>>;
+  startupProtocol?: "context-bootstrap-v1";
   limits?: ContextLimitOverrides;
   requiredImageTokenReserves?: Readonly<Record<string, number>>;
   requiredImageWireReserves?: Readonly<Record<string, number>>;
+  requiredTextPageCosts?: Readonly<Record<string, readonly ContextTextPageCost[]>>;
+  requiredReturnRetryReserve?: { tokens: number; wire_bytes: number };
   remainingBudget?: ContextRemainingBudget;
 }
 export interface ContextAttachmentConfirmation { planId: string; manifestDigest: string }
@@ -29,6 +33,14 @@ export interface ContextStatus {
   context_id: string;
   plan_id: string;
   context_ready: boolean;
+  text_ready: boolean;
+  images_ready: boolean;
+  required_texts: number;
+  delivered_texts: number;
+  remaining_texts: number;
+  required_text_bytes: number;
+  delivered_text_bytes: number;
+  next_required_read: ContextRequiredRead | null;
   required_images: number;
   delivered_images: number;
   remaining_images: number;
@@ -97,8 +109,13 @@ export class ContextScope {
   readonly navigator: ContextNavigator;
   private readonly delivered = new Set<string>();
   private readonly generatedRequiredImages = new Set<string>();
+  private readonly generatedRequiredTextPages = new Set<ContextTextPageCost>();
+  private readonly coverage = new ContextTextCoverage();
+  private readonly textPageCosts: Readonly<Record<string, readonly ContextTextPageCost[]>>;
+  private readonly retryReserve: { tokens: number; wire_bytes: number };
+  private readonly failedRequiredCost = { tokens: 0, wire_bytes: 0 };
   private reservedTokensUsed = 0;
-  private readonly pending = new Map<string, { targetId?: string; method: ContextMethod; successful: boolean; textRead?: ContextTextReadReceipt; timer: ReturnType<typeof setTimeout> }>();
+  private readonly pending = new Map<string, { targetId?: string; method: ContextMethod; successful: boolean; textRead?: ContextTextReadReceipt; requiredCost?: { tokens: number; wire_bytes: number }; timer: ReturnType<typeof setTimeout> }>();
   private live = true;
   private deliveredEntry = false;
   private permanentFailure = false;
@@ -132,16 +149,68 @@ export class ContextScope {
     }
     for (const [id, delivery] of Object.entries(registration.deliveryByTarget)) {
       const target = registration.snapshot.getTarget(id);
-      if (!target || (target.kind !== "image" && delivery.required)) throw contextError("CONTEXT_INVALID", "Only source images can be required");
-      if (delivery.required && (!(["mcp", "attachment"].includes(delivery.media_route ?? "")) || (delivery.media_route === "mcp" && !target.read_ref))) {
+      if (!target || target.kind !== "image" && delivery.required && (registration.startupProtocol !== "context-bootstrap-v1"
+        || delivery.delivery !== "source_required" || !target.read_ref || target.source_completeness !== "complete")) throw contextError("CONTEXT_INVALID", "Invalid required context source");
+      if (target.kind === "image" && delivery.required && (!(["mcp", "attachment"].includes(delivery.media_route ?? "")) || (delivery.media_route === "mcp" && !target.read_ref))) {
         throw contextError("CONTEXT_IMAGE_UNAVAILABLE", "A required source image cannot be delivered");
       }
     }
-    const remainingBudget = (readingTarget?: import("./context-types").ContextTarget): ContextRemainingBudget => {
+    const pageCosts: Record<string, readonly ContextTextPageCost[]> = {};
+    const preflight = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose, limits: registration.limits,
+      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest } } : {}) });
+    for (const target of this.requiredTextTargets()) {
+      let pages = registration.requiredTextPageCosts?.[target.target_id];
+      if (!pages) {
+        const measured: ContextTextPageCost[] = [];
+        let cursor: string | undefined;
+        do {
+          const result = preflight.preflightRead({ context_id: registration.snapshot.context_id, read_ref: target.read_ref!, ...(cursor ? { cursor } : {}) });
+          if (result.isError) throw contextError("BUDGET_EXCEEDED", "A required text page cannot fit the context return limits");
+          const { metadata } = parseContextTextReadResult(result);
+          const cost = measureContextResponse(result, { ...limits, boundCursorTokens: true });
+          measured.push({ ...metadata.range, tokens: cost.total_tokens, wire_bytes: cost.wire_bytes });
+          cursor = metadata.next_cursor ?? undefined;
+        } while (cursor);
+        pages = measured;
+      }
+      let end = 0;
+      for (const page of pages) {
+        if ([page.start, page.end_exclusive, page.tokens, page.wire_bytes].some(n => !Number.isSafeInteger(n) || n < 0)
+          || page.start !== end || page.end_exclusive < page.start || page.end_exclusive === page.start && target.utf8_bytes !== 0
+          || page.tokens < limits.tokenReserve || page.wire_bytes < limits.wireReserveBytes) throw contextError("CONTEXT_INVALID", "Invalid required text page budget");
+        end = page.end_exclusive;
+      }
+      if (!pages.length || target.utf8_bytes === 0 && pages.length !== 1 || end !== target.utf8_bytes) throw contextError("CONTEXT_INVALID", "Required text page budgets do not cover the fixed source");
+      pageCosts[target.target_id] = pages.map(page => ({ ...page }));
+    }
+    this.textPageCosts = pageCosts;
+    const requiredMcpImages = this.requiredTargets().filter(t => registration.deliveryByTarget[t.target_id]?.media_route === "mcp");
+    const minimumRetry = {
+      tokens: Math.max(0, ...Object.values(pageCosts).flatMap(pages => pages.map(page => page.tokens)), ...requiredMcpImages.map(target =>
+        registration.requiredImageTokenReserves?.[target.target_id] ?? (target.visual_token_reserve ?? 0) + limits.imageMetadataTokens)),
+      wire_bytes: Math.max(0, ...Object.values(pageCosts).flatMap(pages => pages.map(page => page.wire_bytes)), ...requiredMcpImages.map(target =>
+        registration.requiredImageWireReserves?.[target.target_id] ?? Math.ceil((target.image_bytes ?? 0) / 3) * 4 + 2 * Buffer.byteLength(JSON.stringify(target)) + 1024 + limits.wireReserveBytes)) };
+    this.retryReserve = registration.startupProtocol ? registration.requiredReturnRetryReserve ?? minimumRetry : { tokens: 0, wire_bytes: 0 };
+    if (Object.entries(this.retryReserve).some(([key, n]) => !Number.isSafeInteger(n) || n < 0
+      || registration.startupProtocol && n < minimumRetry[key as keyof typeof minimumRetry])) throw contextError("CONTEXT_INVALID", "Invalid required return retry reserve");
+    const remainingBudget = (readingTarget?: ContextTarget, result?: BrokerToolResult): ContextRemainingBudget => {
       const used = this.navigator?.usage();
       const budget = this.effectiveBudget;
-      const pending = this.requiredTargets().filter(t => !this.delivered.has(t.target_id) && !this.hasPendingImage(t.target_id) && t.target_id !== readingTarget?.target_id
+      const pending = this.requiredTargets().filter(t => !this.delivered.has(t.target_id) && (registration.startupProtocol || !this.hasPendingImage(t.target_id)) && t.target_id !== readingTarget?.target_id
         && registration.deliveryByTarget[t.target_id]?.media_route === "mcp");
+      const readingRange = readingTarget && result && !result.isError && readingTarget.kind !== "image" ? parseContextTextReadResult(result).metadata.range : undefined;
+      let textTokens = 0, textWire = 0;
+      for (const [targetId, pages] of Object.entries(this.textPageCosts)) for (const page of pages) {
+        if (!this.coverage.contains(targetId, page.start, page.end_exclusive, targetId === readingTarget?.target_id ? readingRange : undefined)) {
+          textTokens += page.tokens; textWire += page.wire_bytes;
+        }
+      }
+      const inFlightCosts = [...this.pending.values()].reduce((sum, item) => ({ tokens: sum.tokens + (item.requiredCost?.tokens ?? 0),
+        wire_bytes: sum.wire_bytes + (item.requiredCost?.wire_bytes ?? 0) }), { tokens: 0, wire_bytes: 0 });
+      const unfinished = this.requiredTargets().some(target => !this.delivered.has(target.target_id))
+        || this.requiredTextTargets().some(target => !this.coverage.contains(target.target_id, 0, target.utf8_bytes!));
+      const retryTokens = unfinished ? Math.max(0, this.retryReserve.tokens - this.failedRequiredCost.tokens - inFlightCosts.tokens) : 0;
+      const retryWire = unfinished ? Math.max(0, this.retryReserve.wire_bytes - this.failedRequiredCost.wire_bytes - inFlightCosts.wire_bytes) : 0;
       // Planner supplies exact complete-response costs. Trusted callers which omit the
       // maps get conservative metadata allowances, never a zero-byte media reserve.
       const imageWireReserve = (target: import("./context-types").ContextTarget) => registration.requiredImageWireReserves?.[target.target_id]
@@ -152,11 +221,11 @@ export class ContextScope {
       // work reserve back to the local ceiling before subtracting it below.
       return { tokens: Math.max(0, Math.min(budget.tokens - spentTokens,
           limits.maxTotalTokens - spentTokens + (budget.reserved_tokens ?? 0))),
-        reserved_tokens: (budget.reserved_tokens ?? 0) + pending.reduce((sum, target) => sum +
+        reserved_tokens: (budget.reserved_tokens ?? 0) + textTokens + retryTokens + pending.reduce((sum, target) => sum +
           (registration.requiredImageTokenReserves?.[target.target_id] ?? (target.visual_token_reserve ?? 0) + limits.imageMetadataTokens), 0),
         wire_bytes: Math.max(0, Math.min(budget.wire_bytes - spentWire,
           limits.maxTotalWireBytes - spentWire + (budget.reserved_wire_bytes ?? 0))),
-        reserved_wire_bytes: (budget.reserved_wire_bytes ?? 0) + pending.reduce((sum, target) => sum + imageWireReserve(target), 0),
+        reserved_wire_bytes: (budget.reserved_wire_bytes ?? 0) + textWire + retryWire + pending.reduce((sum, target) => sum + imageWireReserve(target), 0),
         image_reads: Math.max(0, limits.maxImageReads - (used?.image_reads ?? 0)), reserved_image_reads: pending.length,
         image_bytes: Math.max(0, limits.maxTotalImageBytes - (used?.image_bytes ?? 0)),
         reserved_image_bytes: pending.reduce((sum, target) => sum + (target.image_bytes ?? 0), 0) };
@@ -172,7 +241,8 @@ export class ContextScope {
     }
     catch { throw contextError("BUDGET_EXCEEDED", "The context budget cannot protect required sources, completion and bounded corrective replies"); }
     this.navigator = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose,
-      deliveryByTarget: registration.deliveryByTarget, limits: registration.limits, remainingBudget });
+      deliveryByTarget: registration.deliveryByTarget, limits: registration.limits, remainingBudget,
+      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest } } : {}) });
   }
 
   assertPending(receiptId: string, textRead?: ContextTextReadReceipt): void {
@@ -191,6 +261,10 @@ export class ContextScope {
   private requiredTargets() {
     return this.purpose === "compaction" ? [] : this.registration.snapshot.targets.filter(t => t.kind === "image" && this.registration.deliveryByTarget[t.target_id]?.required === true);
   }
+  private requiredTextTargets() {
+    return this.purpose !== "normal" || !this.registration.startupProtocol ? [] : this.registration.snapshot.targets.filter(t => t.kind !== "image"
+      && this.registration.deliveryByTarget[t.target_id]?.required === true);
+  }
   status(): ContextStatus {
     const required = this.requiredTargets();
     const remaining = required.filter(t => !this.delivered.has(t.target_id));
@@ -199,9 +273,27 @@ export class ContextScope {
       if (this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp" && target.read_ref && next.length < 4) next.push({ read_ref: target.read_ref });
     }
     if (remaining.some(t => this.registration.deliveryByTarget[t.target_id]?.media_route === "attachment")) next.push({ action: "confirm_attachments", manifest_digest: this.registration.manifestDigest });
+    const texts = this.requiredTextTargets();
+    const missingTexts = texts.filter(t => !this.coverage.contains(t.target_id, 0, t.utf8_bytes!));
+    const image = remaining.find(t => this.registration.deliveryByTarget[t.target_id]?.media_route === "mcp" && t.read_ref);
+    const text = missingTexts[0];
+    const nextRequiredRead: ContextRequiredRead | null = image ? { tool: "codex_context_read", arguments: {
+      context_id: this.registration.snapshot.context_id, read_ref: image.read_ref! } } : text ? {
+      tool: "codex_context_read", arguments: this.navigator.readArgsAt(text.target_id, this.coverage.firstGap(text.target_id)) } : null;
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
-      context_ready: remaining.length === 0, required_images: required.length, delivered_images: required.length - remaining.length,
+      context_ready: remaining.length === 0 && missingTexts.length === 0, images_ready: remaining.length === 0, text_ready: missingTexts.length === 0,
+      required_texts: texts.length, delivered_texts: texts.length - missingTexts.length, remaining_texts: missingTexts.length,
+      required_text_bytes: texts.reduce((sum, target) => sum + target.utf8_bytes!, 0),
+      delivered_text_bytes: texts.reduce((sum, target) => sum + this.coverage.bytes(target.target_id), 0), next_required_read: nextRequiredRead,
+      required_images: required.length, delivered_images: required.length - remaining.length,
       remaining_images: remaining.length, next_actions: next };
+  }
+  bootstrapManifest(control: ContextBootstrapControl = {}): BrokerToolResult {
+    this.assertLive();
+    if (!this.registration.startupProtocol) throw contextError("CONTEXT_INVALID", "This plan has no bootstrap manifest");
+    const args = { context_id: this.registration.snapshot.context_id, view: "overview" as const };
+    return control.read_state && control.read_state !== "readable" ? this.navigator.preflightList(args, this.status(), control)
+      : this.navigator.list(args, this.status(), control);
   }
   markEntryDelivered(): void { this.assertLive(); this.deliveredEntry = true; }
   openReads(): void {
@@ -225,25 +317,30 @@ export class ContextScope {
   notReady(): BrokerToolResult | undefined {
     this.assertLive();
     const status = this.status();
-    return status.context_ready ? undefined : contextFailure("CONTEXT_NOT_READY", "Read the remaining images or confirm the selected attachment manifest. Use a new operation_id for new work after readiness.", { ...status });
+    return status.context_ready ? undefined : contextFailure("CONTEXT_NOT_READY", "Deliver the required context and confirm required attachments. Use a new operation_id for new work after readiness.", { ...status });
   }
   assertReady(): void {
     const failure = this.notReady();
     if (failure) throw contextError("CONTEXT_NOT_READY", (failure.content[0] as { text: string }).text);
   }
-  prepare(method: ContextMethod, args: ContextArgs): ContextPreparedReply {
+  prepare(method: ContextMethod, args: ContextArgs, overviewControl?: ContextBootstrapControl): ContextPreparedReply {
     this.openReads();
     if (this.navigator.usage().navigation_stopped) throw contextError("CONTEXT_NAVIGATION_STOPPED", "This scope's navigation capability is retired. Use its original completion path");
     if (this.pending.size >= 8) throw contextError("CONTEXT_BUSY", "Wait for the in-flight context returns");
     if (args.context_id !== this.registration.snapshot.context_id) throw contextError("CONTEXT_INVALID", "Context access is invalid or no longer active");
     const target = method === "read" ? this.registration.snapshot.targets.find(t => t.read_ref === (args as ContextReadArgs).read_ref) : undefined;
+    // One return buffer protects an undelivered required page if its transport fails.
+    // Parallel on-demand navigation still has to leave this buffer and all holes intact.
+    if (this.registration.startupProtocol && target && this.registration.deliveryByTarget[target.target_id]?.required
+      && [...this.pending.values()].some(pending => pending.requiredCost)) throw contextError("CONTEXT_BUSY", "Wait for the in-flight required context return");
     // The first return has already paid its budgets, but only its successful receipt
     // contributes coverage. A parallel duplicate must not spend its delivery reserve.
-    if (target?.kind === "image" && this.hasPendingImage(target.target_id)) throw contextError("CONTEXT_BUSY", "Wait for this image's in-flight return before reading it again");
+    if (target && (target.kind === "image" || this.registration.deliveryByTarget[target.target_id]?.required)
+      && this.hasPendingImage(target.target_id)) throw contextError("CONTEXT_BUSY", "Wait for this source's in-flight return before reading it again");
     const status = this.status();
     let result: BrokerToolResult;
     try {
-      result = method === "list" ? this.navigator.list(args as ContextListArgs, status)
+      result = method === "list" ? this.navigator.list(args as ContextListArgs, status, overviewControl)
         : method === "read" ? this.navigator.read(args as ContextReadArgs, status)
         : this.navigator.search(args as ContextSearchArgs);
     } catch (error) {
@@ -279,6 +376,18 @@ export class ContextScope {
         tokenReserve: limits.tokenReserve, wireReserveBytes: limits.wireReserveBytes });
       this.reservedTokensUsed += Math.min(reserved, cost.total_tokens);
     }
+    if (textRead && target) {
+      const page = this.textPageCosts[target.target_id]?.find(page => page.start === textRead.range.start
+        && page.end_exclusive === textRead.range.end_exclusive);
+      if (page && !this.generatedRequiredTextPages.has(page)) {
+        // Usage is charged when a return is generated, even if its transport fails.
+        // Credit each planned page once; retries and other ranges cost extra. Only
+        // the successful receipt below can advance delivery coverage.
+        this.generatedRequiredTextPages.add(page);
+        const cost = measureContextResponse(result, contextLimits(this.registration.limits));
+        this.reservedTokensUsed += Math.min(page.tokens, cost.total_tokens);
+      }
+    }
     if (result.isError) {
       const body = result.structuredContent as { code?: unknown; error?: { code?: unknown } } | undefined;
       const code = body?.error?.code ?? body?.code ?? (result.content[0] as { text?: unknown } | undefined)?.text;
@@ -289,7 +398,12 @@ export class ContextScope {
     }
     const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
     const timer = setTimeout(() => this.finish(receiptId, false), CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
-    this.pending.set(receiptId, { ...(validImage ? { targetId: target!.target_id } : {}), method, successful: !result.isError, textRead, timer });
+    const required = target && this.purpose === "normal" && this.registration.deliveryByTarget[target.target_id]?.required
+      && (target.kind === "image" ? !this.delivered.has(target.target_id) : !this.coverage.contains(target.target_id, 0, target.utf8_bytes!));
+    const cost = required && !result.isError ? measureContextResponse(result, { ...contextLimits(this.registration.limits),
+      visualTokens: target?.visual_token_reserve ?? 0 }) : undefined;
+    this.pending.set(receiptId, { ...(validImage || textRead ? { targetId: target!.target_id } : {}), method, successful: !result.isError, textRead,
+      ...(cost ? { requiredCost: { tokens: cost.total_tokens, wire_bytes: cost.wire_bytes } } : {}), timer });
     this.changed();
     return { result, receiptId };
   }
@@ -297,11 +411,16 @@ export class ContextScope {
     const pending = this.pending.get(receiptId);
     if (!pending) return;
     clearTimeout(pending.timer); this.pending.delete(receiptId);
-    if (sent && this.isLive && pending.targetId && !this.delivered.has(pending.targetId)) {
-      this.delivered.add(pending.targetId); this.lastProgress = Date.now();
+    const successful = sent && this.isLive && pending.successful && (!pending.textRead || contextTextReadReceiptsEqual(pending.textRead, textRead));
+    if (successful && pending.targetId) {
+      if (pending.textRead) this.coverage.add(pending.targetId, pending.textRead.range);
+      else if (!this.delivered.has(pending.targetId)) { this.delivered.add(pending.targetId); this.lastProgress = Date.now(); }
+    } else if (pending.requiredCost) {
+      this.failedRequiredCost.tokens += pending.requiredCost.tokens;
+      this.failedRequiredCost.wire_bytes += pending.requiredCost.wire_bytes;
     }
     this.changed(); this.scheduleReadiness();
-    return sent && this.isLive && pending.successful && (!pending.textRead || contextTextReadReceiptsEqual(pending.textRead, textRead))
+    return successful
       ? { method: pending.method, ...(pending.textRead ? { textRead: pending.textRead } : {}) } : undefined;
   }
   guardCommit(): void {

@@ -20,6 +20,8 @@ import { estimateTokens } from "../src/lib/token-estimate";
 import type { AdapterEvent, CodexProviderConfig } from "../src/types";
 import { CONTEXT_TEXT_READ_FORMAT, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
 const tailMarker = "unread-tail-evidence-七三九";
 const log = `${"recorded test line\n".repeat(3_000)}${tailMarker}\n`;
@@ -61,7 +63,7 @@ async function fixture(manual: boolean, sent: boolean) {
   const socket = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socket);
   await broker.listen();
-  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `context://${root}`, chatgptWeb: {
+  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `context://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
     browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
     browserInteractionMode: manual ? "manual" : "automatic",
     appName: manual ? ZERO_RISK_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME,
@@ -492,9 +494,11 @@ test("Zero Risk rejects an unavailable required image before exposing a manual p
     async markStarted() {}, async end() {}, async cancel() {},
   };
   const events: AdapterEvent[] = [];
-  await expect(createChatGptWebAdapter(f.provider, { broker: f.broker, zeroRiskManualControl: control }).runTurn!(
-    f.request("first-turn", history), { headers: new Headers() }, event => events.push(event)))
-    .rejects.toMatchObject({ code: "CONTEXT_IMAGE_UNAVAILABLE" });
+  await createChatGptWebAdapter(f.provider, { broker: f.broker, zeroRiskManualControl: control }).runTurn!(
+    f.request("first-turn", history), { headers: new Headers() }, event => events.push(event));
+  expect(events.filter(event => event.type === "error")).toEqual([expect.objectContaining({
+    code: "CONTEXT_IMAGE_UNAVAILABLE", status: 400, errorType: "invalid_request_error", retryable: false,
+  })]);
   expect(starts).toBe(0);
   expect(events.some(event => event.type === "done")).toBe(false);
 });

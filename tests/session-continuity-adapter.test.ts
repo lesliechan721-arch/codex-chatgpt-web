@@ -482,7 +482,7 @@ for (const biggerContext of [false, true]) test(`first input preflight rejects o
   const f = fixture();
   f.provider.chatgptWeb!.experimentalBiggerContext = biggerContext;
   await expect(f.run(f.request("oversized ".repeat(100_000)))).rejects.toMatchObject({
-    code: biggerContext ? "context_length_exceeded" : "continuity_input_limit", retryable: false,
+    code: biggerContext ? "context_length_exceeded" : "CONTEXT_BUDGET_EXCEEDED", retryable: false,
   });
   expect(f.registrations.get(continuityDigest(f.threadId))).toBeUndefined();
   expect(f.submissions).toHaveLength(0);

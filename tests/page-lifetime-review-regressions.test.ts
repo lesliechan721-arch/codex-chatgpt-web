@@ -46,6 +46,8 @@ import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../s
 import { actualCheckpoint, observeCheckpointResponse, checkpointContinuationBody, compactionBody, observeCompactionHandoff } from "../scripts/validate-unified-task-continuity-transitions";
 import { createLiveRequestBody } from "../scripts/validate-context-rendering";
 
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const test = performanceTest(import.meta.path);
 const cleanups: Array<() => Promise<void>> = [];
 const require = createRequire(import.meta.url);
@@ -174,7 +176,7 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
   writeFileSync(descriptorPath, JSON.stringify(descriptor), { mode: 0o600 });
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web", baseUrl: `fixture://${root}`,
-    chatgptWeb: {
+    chatgptWeb: { maxComposerCodePoints: 2_000_000,
       browserInteractionMode: manual ? "manual" : "automatic",
       browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
       ...(options.turnTimeoutMs !== undefined ? { turnTimeoutMs: options.turnTimeoutMs } : {}),

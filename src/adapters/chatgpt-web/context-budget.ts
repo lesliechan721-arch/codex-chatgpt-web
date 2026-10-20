@@ -97,13 +97,40 @@ export function measureContextResponse(result: BrokerToolResult, options: {
     return block;
   }) };
   const serializedText = JSON.stringify(textResult);
-  const cursor = options.boundCursorTokens ? (result.structuredContent as { next_cursor?: unknown } | undefined)?.next_cursor : undefined;
-  // A signed cursor is ASCII. At most one token per byte covers any future binding
-  // and signature of this length. Tokenize the other fragments separately so no
-  // cross-boundary merge is assumed. Both wire copies of the cursor are included.
-  const fragments = typeof cursor === "string" && cursor ? serializedText.split(cursor) : [serializedText];
-  const textTokens = fragments.reduce((sum, fragment) => sum + estimateTokens(fragment), 0)
-    + (fragments.length - 1) * (typeof cursor === "string" ? Buffer.byteLength(cursor) : 0)
+  const cursors = new Set<string>();
+  const collectCursors = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, entry] of Object.entries(value)) {
+      if (["cursor", "next_cursor", "read_cursor"].includes(key) && typeof entry === "string" && entry) cursors.add(entry);
+      else if (entry && typeof entry === "object") collectCursors(entry);
+    }
+  };
+  if (options.boundCursorTokens) collectCursors(result.structuredContent);
+  // Fixed cursor payloads retain their real token cost. Only the scope binding and
+  // HMAC vary in a future navigator. Bound their base64 characters by one token per
+  // byte, and tokenize adjacent fragments separately. Unknown cursor forms use the
+  // full ASCII bound. This also covers nested bootstrap and search cursors.
+  const boundCursorCost = (cursor: string): number => {
+    const parts = cursor.split(".");
+    if (parts.length !== 2 || !/^[A-Za-z0-9_-]{43}$/.test(parts[1]!)) return Buffer.byteLength(cursor);
+    try {
+      const raw = Buffer.from(parts[0]!, "base64url").toString("utf8");
+      const parsed = JSON.parse(raw);
+      const match = /"b":"[a-f0-9]{64}"/.exec(raw);
+      if (parsed.v !== 1 || !match || Object.keys(parsed).sort().join(",") !== "b,k,n,q,t,v") return Buffer.byteLength(cursor);
+      const begin = match.index + 5;
+      const first = Math.floor(begin / 3) * 4, last = Math.ceil((begin + 64) / 3) * 4;
+      return estimateTokens(parts[0]!.slice(0, first)) + last - first
+        + estimateTokens(parts[0]!.slice(last) + ".") + parts[1]!.length;
+    } catch { return Buffer.byteLength(cursor); }
+  };
+  let fragments = [serializedText], cursorTokens = 0;
+  for (const cursor of cursors) fragments = fragments.flatMap(fragment => {
+    const pieces = fragment.split(cursor);
+    cursorTokens += (pieces.length - 1) * boundCursorCost(cursor);
+    return pieces;
+  });
+  const textTokens = fragments.reduce((sum, fragment) => sum + estimateTokens(fragment), 0) + cursorTokens
     + (options.tokenReserve ?? CONTEXT_LIMITS.tokenReserve);
   const visual = options.visualTokens ?? 0;
   if (!Number.isSafeInteger(visual) || visual < 0) throw new Error("Invalid visual token reserve");

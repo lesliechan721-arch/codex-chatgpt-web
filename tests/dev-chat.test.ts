@@ -466,7 +466,8 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
   writeFileSync(codexConfig, "openai_base_url = \"http://127.0.0.1:17841/v1\"\n");
   const sentinel = readFileSync(codexConfig, "utf8");
   const occupied = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("live") });
-  const config = { ...defaultConfig("full"), port: occupied.port!, brokerSocketPath: defaultBrokerEndpoint(join(root, "broker")) };
+  // The simulated DEV model consumes the existing inline startup protocol.
+  const config = { ...defaultConfig("full"), maxComposerCodePoints: 2_000_000, port: occupied.port!, brokerSocketPath: defaultBrokerEndpoint(join(root, "broker")) };
   const localBroker = TurnBroker.forSocket(config.brokerSocketPath);
   await localBroker.listen();
   const remote = new RemoteTurnBroker(config.brokerSocketPath);

@@ -1,3 +1,4 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -159,7 +160,7 @@ test("durable fencing rejects old reads, ACK, final publication and compaction h
     broker.registerContextPlan(token, plan, ownerContext); broker.selectContextPlan(token, plan.planId, ownerContext);
     broker.markContextPlanSent(token, plan.planId, ownerContext);
     const query = { method: "context_query" as const, token, contract: "native" as const, credentialKind: "ordinary" as const,
-      contextProtocol: 2, contextMethod: "list" as const, contextArgs: { context_id: snapshot.context_id, view: "overview" as const } };
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: "list" as const, contextArgs: { context_id: snapshot.context_id, view: "overview" as const } };
     const pending = await callTurnBroker<{ receiptId: string }>(socket, query);
     const transaction = await broker.beginCompactionTransaction("fence-compaction");
     const compaction = broker.registerCompactionContext({ snapshot, recovery: f.ref, contract: "native",
@@ -173,7 +174,7 @@ test("durable fencing rejects old reads, ACK, final publication and compaction h
     await expect(callTurnBroker(socket, { method: "submit_compaction_handoff", token: transaction.token,
       handoffId: transaction.handoffId, summary: "late fabricated summary" })).rejects.toThrow("obsolete execution");
     // The old in-flight return may settle transport accounting, never renew read authority.
-    await callTurnBroker(socket, { method: "context_return", token, contract: "native", credentialKind: "ordinary", contextProtocol: 2,
+    await callTurnBroker(socket, { method: "context_return", token, contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
       receiptId: pending.receiptId, sent: true });
     await expect(callTurnBroker(socket, query)).rejects.toThrow("obsolete execution");
   } finally { await broker.close(); rmSync(f.directory, { recursive: true, force: true }); }

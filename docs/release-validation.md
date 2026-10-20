@@ -156,6 +156,54 @@ Before treating the feature as release-ready, exercise both Automatic and Zero R
    image check through the final new-ABI path; measure actual attachment limits and a higher count
    before making any capacity claim.
 
+## Short-start context validation
+
+`context-bootstrap-v1` implementation and local tests are separate from release acceptance.
+Real ChatGPT editor behavior, remote connector schema adoption and model use of required tail pages
+have not been accepted for this change. A15 remains pending. Earlier v2 text/image, continuity or
+Verify runtime evidence does not establish these passes. The default 8,000-code-point composer
+limit and 3,000-code-point fixed-entry limit are engineering limits, not measured attachment
+thresholds for every account or model.
+
+Validate ordinary Automatic and Zero Risk Full/MCP against the
+[short-start contract](context-navigation.md#short-startup-and-required-text). Keep Browser-only,
+upstream API forwarding, legacy inline, compaction and existing multipart regressions separate.
+
+| Gate | Required evidence |
+| --- | --- |
+| Exact planning | About 30,000 code points of injected rules, a short request, no history/images; both modes use a fixed entry at most 3,000 code points and final text within the effective limit. Test common and mode-specific configuration, invalid values, exact boundaries, emoji, escaping, whitespace and complete long ordered user requests. |
+| Source fidelity | Reconstruct the selected value tree, including source roles/order, skill paths, unknown structures, null, false and empty values. Preserve applicable instructions, delegation, summaries and assistant history. Body role/control imitations cannot change authority. |
+| Delivery | Missing/overlapping/repeated/out-of-order pages, empty sources, multibyte boundaries, malformed v2 metadata, failed transport, wrong digest/index/range, cross-source/scope, revocation and late receipts. Only valid range unions reach ready. |
+| Execution | Early business calls, inventory and no-tool direct success fail in both modes; existing wait/replay/ACK/control remains usable. Rejected IDs stay rejected; new decisions use new IDs. Verify atomic generation/revision checks and exact output-schema values. |
+| Independent controls | MCP and fallback images, configured Sent on/off, duplicate start, pending Sent without read spending, and image-first guidance. Text does not advance image progress or extend deadlines. Updates and ACK remain independent of initial coverage. |
+| Capacity | All manifest pages, startup/result wrappers, cursors, required pages/images, corrective replies, repeat reads and working reserves count. On-demand reads cannot exhaust protected required capacity. A shorter composer can cost more total tokens. Impossible complete plans fail before Send. |
+| Lifecycle | Same-scope retry, retained suffix, new-page/cold recovery, restart, unknown Send, active updates before/during/after reading, final lock, cancellation and compaction. Fresh scopes start with zero coverage; compaction keeps optional reads. |
+| Compatibility | Missing/old/failed diagnosis does not select a plan. Current missing capabilities and remote old schema fail explicitly; valid custom identities remain supported. Only a complete pre-send legacy plan within all limits can fall back. No post-send automatic reroute. |
+| Protocol migration | Account for P01–P13: role/trust, execution, wait, updates, navigation, v2 read, images, attachments/skills, real errors and safety recovery, retained/recovered context, output schema, final output and mode-specific completion. Verify all unique conditions and exceptions remain reachable. Server instructions/tool descriptions must not repeat full protocols. Current errors alone select recovery; the three-attempt rule applies only to unexplained platform safety-check rejection. |
+
+For real-platform A15 acceptance, compare old/new inputs on the same model, interaction mode and
+effort. Alternate order and run at least three pairs for each tested combination. Include harmless
+rules and request details found only on the last required page. Do not reveal those details in
+the entry, directory previews or expected answer. Record actual v2 bodies, read order, first business
+dispatch and final answer. Test the actual composer to confirm that text was not converted to an
+attachment, and retain remote-connector evidence separately from local schema checks. Zero Risk
+must retain manual connector choice, paste, Send, configured Sent and image confirmation.
+
+Record fixed-entry and inline-request code points, old/new final code points, UTF-16 length,
+UTF-8 and serialized bytes, required/on-demand source sizes, manifest and result-wrapper costs,
+unique/repeated delivered bytes, call counts, conservative total tokens, errors and elapsed time.
+Record old/new generated protocol characters separately for prompt, server instructions, tool
+metadata, first required protocol and triggered recovery. The fixed ordinary sample's first-use
+protocol total must decrease. Record which metadata actually reached the model; unknown model
+input tokens remain unknown. Keep logs to metrics and bounded identities without source bodies
+or credentials. A shorter pasted entry does not establish lower total cost.
+
+Any successful work before required delivery, byte corruption, expanded authority, duplicate
+business dispatch or cross-scope coverage blocks release. Until the real editor, connector and
+model-use evidence exists, do not claim that attachment conversion or missed required text is fixed.
+If 8,000 code points still converts to an attachment, reduce the configured limit and repeat the
+paired acceptance. Missing third-party sample bytes cannot be reported as a tested fixture.
+
 ## Context rendering validation
 
 The browser renderer and MCP text-read-v2 require separate evidence from the earlier context

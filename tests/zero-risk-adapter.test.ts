@@ -1,3 +1,4 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { afterAll, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -31,6 +32,8 @@ import { parseRequest } from "../src/responses/parser";
 import type { ProviderAdapter } from "../src/adapters/base";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const testTempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 const root = mkdtempSync(join(testTempRoot, "cgw-zero-risk-adapter-"));
 afterAll(() => {
@@ -81,7 +84,7 @@ function provider(name: string): CodexProviderConfig {
   return {
     adapter: "chatgpt-web",
     baseUrl: `manual://${name}-${Date.now()}`,
-    chatgptWeb: {
+    chatgptWeb: { maxComposerCodePoints: 2_000_000,
       appName: ZERO_RISK_CHATGPT_CONNECTOR_NAME,
       browserInteractionMode: "manual",
       browserHost: "launcher",
@@ -855,10 +858,10 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
       const query = async (method: ContextMethod, args: Record<string, unknown>) => {
         const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(config.chatgptWeb!.brokerSocketPath!, {
           method: "context_query", token: entry.first_call.arguments.request_id, contract: "safe", credentialKind: "ordinary",
-          contextProtocol: 2, contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as ContextArgs,
+          contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as ContextArgs,
         });
         await callTurnBroker(config.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: entry.first_call.arguments.request_id,
-          contract: "safe", credentialKind: "ordinary", contextProtocol: 2, receiptId: reply.receiptId, sent: true });
+          contract: "safe", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true });
         return reply.result;
       };
       const list = await query("list", { view: "entries", kind: "image" });

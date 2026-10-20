@@ -1,3 +1,4 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -241,15 +242,15 @@ for (const contract of ["native", "safe"] as const) test(`stdio ${contract} veri
       await f.client.callTool({ name: "codex_turn_start", arguments: f.reference });
     } else await owner.markContextVerificationDelivered(handle.pairToken);
     const cancelled = await callTurnBroker<ContextPreparedReply>(f.broker.socketPath, { method: "context_query", token: f.token, contract, credentialKind: "ordinary",
-      contextProtocol: 2, contextMethod: "list", contextArgs: { context_id: source.context_id, view: "overview" } });
-    await callTurnBroker(f.broker.socketPath, { method: "context_return", token: f.token, contract, credentialKind: "ordinary", contextProtocol: 2,
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: "list", contextArgs: { context_id: source.context_id, view: "overview" } });
+    await callTurnBroker(f.broker.socketPath, { method: "context_return", token: f.token, contract, credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
       receiptId: cancelled.receiptId, sent: false });
     expect((await owner.contextVerificationStatus(handle.pairToken))?.ordinary.list).toBe(false);
     expect((await invoke("codex_context_list", { view: "entries", cursor: "invalid" }, true)).isError).toBe(true);
     expect((await owner.contextVerificationStatus(handle.pairToken))?.compaction.list).toBe(false);
     for (const compaction of [false, true]) {
       const binding = { token: compaction ? handle.compactionToken : f.token, contract,
-        credentialKind: compaction ? "compaction" as const : "ordinary" as const, contextProtocol: 2 };
+        credentialKind: compaction ? "compaction" as const : "ordinary" as const, contextProtocol: CONTEXT_PROTOCOL_VERSION };
       const args = { context_id: source.context_id, read_ref: source.targets[0]!.read_ref! };
       await expect(callTurnBroker(f.broker.socketPath, { method: "context_query", ...binding, contextProtocol: 1,
         contextMethod: "read", contextArgs: args })).rejects.toMatchObject({ code: "CONTEXT_INVALID" });

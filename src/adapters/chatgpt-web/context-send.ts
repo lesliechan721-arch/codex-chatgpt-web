@@ -13,6 +13,7 @@ import type { ContextPlanDescriptor } from "./context-prompt";
 /** Owns only a new physical send. Replayed HTTP rounds never create this object. */
 export class ContextSend {
   private source?: ContextSnapshot;
+  private initialSource?: ContextSnapshot;
   private retired = false;
   get snapshot(): ContextSnapshot {
     if (this.retired || !this.source) throw new Error("The physical context send is retired");
@@ -29,14 +30,18 @@ export class ContextSend {
     coverage?: CompactionSourceCoverage, private readonly ownerContext?: TaskUpdateOwnerContext,
     sourceSnapshot?: ContextSnapshot) {
     this.source = sourceSnapshot ?? createContextSnapshot(canonical, { imageStoragePolicy: "bounded" });
+    this.initialSource = this.source;
     this.coverage = coverage?.fork() ?? new CompactionSourceCoverage();
   }
   async prepare(candidate: CodexParsedRequest, token: string, options: CompileChatGptWebPromptOptions,
     retainedTokens = 0): Promise<ContextDeliveryPlan> {
-    const plan = planContextDelivery({ canonical: this.canonical, snapshot: this.snapshot, candidate,
+    if (this.retired || !this.initialSource) throw new Error("The physical context send is retired");
+    const bootstrapAvailable = await this.broker.contextBootstrapAvailable?.() ?? false;
+    const plan = planContextDelivery({ canonical: this.canonical, snapshot: this.initialSource, candidate,
       messageIndices: contextCandidateMessageIndices(this.canonical, candidate), capabilities: this.capabilities,
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
-      turnToken: token, compileOptions: options, contextToolsAvailable: true, budget: { retainedTokens } });
+      turnToken: token, compileOptions: options, contextToolsAvailable: true,
+      contextBootstrapAvailable: bootstrapAvailable, budget: { retainedTokens } });
     if (plan.registration) {
       if (!this.broker.registerContextPlan || !this.broker.selectContextPlan || !this.broker.markContextPlanSent
         || !this.broker.confirmContextAttachments || !this.broker.contextUsage) throw new Error("Update the Launcher and connector to use context navigation");
@@ -63,19 +68,24 @@ export class ContextSend {
       if (!this.broker.discardUnselectedContextPlans) throw new Error("Update the Launcher to select this delivery plan");
       await this.broker.discardUnselectedContextPlans(token, this.ownerContext);
     }
-    this.coverage.prepare(this.snapshot, this.sourcePlan(id, plan));
+    this.coverage.prepare(plan.snapshot, this.sourcePlan(id, plan));
+    this.source = plan.snapshot;
     this.selected = { id, token, plan };
-    if (plan.registration) this.usageBinding = { id, token, contextId: this.snapshot.context_id };
+    if (plan.registration) this.usageBinding = { id, token, contextId: plan.snapshot.context_id };
   }
   private sourcePlan(id: string, plan: ContextDeliveryPlan): CompactionSourcePlan {
     const routes = plan.registration?.deliveryByTarget ?? {};
+    // Prepay required source returns, which runtime usage credits once each.
+    // Discovery, errors and retries enter this retained-page ledger through actual
+    // usage. Their full admission reserves remain in the planner and active scope.
+    const navigationReserve = plan.costs.requiredMcpTokens;
     return { historyRevision: this.canonical._continuityHistoryRevision ?? 0,
       pageGeneration: this.pageGeneration, planId: id, bodyDigest: plan.bodyDigest,
       contextFormat: plan.compiled.contextFormat ?? "legacy-json",
       manifestDigest: plan.manifestDigest ?? plan.bodyDigest,
-      pageTokens: plan.costs.retainedTokens + plan.costs.promptTokens + plan.costs.requiredMcpTokens
+      pageTokens: plan.costs.retainedTokens + plan.costs.promptTokens + navigationReserve
         + plan.costs.attachmentVisualTokens + plan.costs.workReserveTokens,
-      navigationReservedTokens: plan.costs.requiredMcpTokens,
+      navigationReservedTokens: navigationReserve,
       externalizedTargetIds: [...new Set([...plan.externalizedTargetIds,
         ...Object.entries(routes).filter(([, route]) => route.media_route === "mcp").map(([target]) => target)])],
       deliveryByTarget: routes };
@@ -85,7 +95,7 @@ export class ContextSend {
     const entry = [...this.plans].find(([, candidate]) => candidate === plan);
     if (!entry) throw new Error("Unknown candidate delivery plan");
     return plan.compiled.contextPlan ?? {
-      planId: entry[0], contextId: this.snapshot.context_id,
+      planId: entry[0], contextId: plan.snapshot.context_id,
       manifestDigest: plan.manifestDigest ?? plan.bodyDigest, requiredAttachments: [],
     };
   }
@@ -94,7 +104,7 @@ export class ContextSend {
     const entry = [...this.plans].find(([, candidate]) => candidate === plan);
     if (!entry) throw new Error("Unknown candidate source plan");
     const preview = this.coverage.fork();
-    preview.prepare(this.snapshot, this.sourcePlan(entry[0], plan));
+    preview.prepare(plan.snapshot, this.sourcePlan(entry[0], plan));
     return preview.metadata();
   }
   async sent(): Promise<void> {
@@ -139,5 +149,6 @@ export class ContextSend {
     this.plans.clear();
     this.selected = undefined;
     this.source = undefined;
+    this.initialSource = undefined;
   }
 }

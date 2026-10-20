@@ -1764,6 +1764,8 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
   process.env.CODEX_CHATGPT_WEB_HOME = root;
   const config = {
     ...defaultConfig("full"),
+    // The simulated replay model consumes the existing inline startup protocol.
+    maxComposerCodePoints: 2_000_000,
     port: 0,
     brokerSocketPath: defaultBrokerEndpoint(root),
   };

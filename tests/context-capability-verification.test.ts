@@ -397,7 +397,8 @@ describe("context capability evidence", () => {
   });
   for (const manual of [false, true]) for (const development of [false, true])
     test(`actual ${manual ? "Zero Risk" : "Automatic"} ${development ? "DEV" : "production"} sends ignore historical diagnostic records`, async () => {
-      const f = fixture(); f.config.toolAuthorityMode = "delegated"; f.config.solAvailable = true;
+      // Preserve the inline/on-demand candidate comparison used by this diagnostic test.
+      const f = fixture(); f.config.maxComposerCodePoints = 2_000_000; f.config.toolAuthorityMode = "delegated"; f.config.solAvailable = true;
       f.config.browserInteractionMode = manual ? "manual" : "automatic";
       f.config.browserHost = "launcher"; f.config.browserHostDescriptorPath = join(f.home, "launcher.json");
       if (development) f.config.purpose = "dev-harness";

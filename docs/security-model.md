@@ -90,11 +90,26 @@ ambiguous tool-call relationships do not become evidence of success.
 
 Ordinary reads require the current mode credential, selected plan, context ID, delivered entry,
 and original start/Sent conditions. Snapshot IDs, references, and cursors are not credentials and
-cannot cross modes, unauthorized owners, physical executions, or retired scopes. Required-image readiness is
-separate from ACK and completion fences. A successful MCP image return records delivery to the
+cannot cross modes, unauthorized owners, physical executions, or retired scopes. Required-text
+and required-image readiness are separate from ACK and completion fences. A successful MCP image return records delivery to the
 supported transport, not model understanding. Zero Risk fallback confirmation is a scoped user
-statement, not programmatic attachment inspection. ChatGPT-owned tools have no server-side image
+statement, not programmatic attachment inspection. ChatGPT-owned tools have no server-side context
 readiness interception; their ordering remains a prompt requirement.
+
+Ordinary `context-bootstrap-v1` binds required text to the selected immutable plan and scope.
+Only matching pending v2 successful transport receipts add UTF-8 range coverage, including an
+actual receipt for an empty source. Complete coverage is a delivery condition, not proof that the
+model followed the rules. New business calls, inventory and successful completion enforce the
+condition at the atomic execution boundary with the original authority and revision checks.
+Wait/replay, ACK and existing controls retain their separate permissions. Text cannot extend image
+deadlines, grant a capability, forge ACK, redefine the required set or enlarge a budget.
+Source role metadata preserves the original Codex task; a tool response does not become a real
+ChatGPT system/developer message. Host sandbox and approval decisions remain authoritative.
+
+Current capability checks are required for short startup. Optional Verify runtime evidence cannot
+grant admission or prove remote cached-schema adoption. A pre-send fallback must be a complete
+legacy plan within every limit. An incompatible response after Send cannot authorize automatic
+resend or a weaker gate. Logs retain bounded delivery metadata, not source text or credentials.
 
 Compaction's `compaction_token` is an independent read-only capability for the same three tools.
 It cannot start business work, list business tools, ACK, complete a turn, or submit a checkpoint.

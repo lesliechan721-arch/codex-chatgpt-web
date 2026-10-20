@@ -1,7 +1,7 @@
 import { CONTEXT_PROTOCOL_VERSION, contextFailure, type ContextPreparedReply } from "./context-runtime";
-import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt, type ContextTextReadReceipt } from "./context-text-result";
-import { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
+import { contextTextReadReceipt, type ContextTextReadReceipt } from "./context-text-result";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
+import { CONTEXT_TEXT_READ_INSTRUCTIONS } from "./context-prompt";
 import { createHash, randomBytes } from "node:crypto";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -14,16 +14,15 @@ import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 import { observeMcpToolCalls } from "./mcp-observation";
 import { BRIDGE_TOOL_NAMES, nativePublicResult, nativeToolInputSchemas, type ChatGptMcpContract, type NativeToolEntry } from "./native-tool-contract";
 import { NativeOperationError, nativeOperationFailure, nativePendingResult, NATIVE_WAIT_PROTOCOL_VERSION, type NativeOperationReply } from "./native-tool-operations";
-import { TASK_UPDATE_INSTRUCTIONS } from "./prompt";
 import type { TaskUpdateAckResult, UpdateDelivery } from "./task-update-protocol";
 export { CHATGPT_WEB_AGENT_WAIT_POLL_MS } from "./native-tool-contract";
 export type { ChatGptMcpContract } from "./native-tool-contract";
 
 const turnTokenSchema = z.string().min(20).max(256);
 const operationIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
-  .describe("Allocate the next positive operation_id before the first call. Retry and wait reuse it. A new logical operation needs a new ID. Keep this counter across reconnects within the same capability.");
+  .describe("New logical calls use the next positive ID. Retry and wait retain the original ID; keep the counter across reconnects.");
 const taskRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
-  .describe("Required for every Native start in task-updates-v1. Pass the exact acknowledged task_revision from this request's task contract or the Broker ACK reply. A recovered stream can start above 0. An identical start retry retains its original revision; never upgrade an old operation or infer the current revision.");
+  .describe("In task-updates-v1, use the exact acknowledged revision from the task entry or Broker ACK. An identical start retry retains its original revision.");
 // An infrastructure deadline, not a Native operation deadline. Broker queries normally settle at 30 seconds.
 export const CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS = 90_000;
 export function chatGptMcpInvocationTimeout<T extends object>(environment: T & { expiresAt?: number }, now = Date.now()): number {
@@ -110,9 +109,12 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
   close(): Promise<void>;
 } {
   const contract = options.contract ?? "native";
-  const instructions = contract === "safe"
-    ? "For each pasted Codex Web GPT request, begin with codex_turn_start using the request_id. Use that request_id for tools, then send the complete answer with codex_turn_complete and the exact acknowledged task_revision from this request's task contract or the Broker ACK reply. " + NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS
-    : NATIVE_WAIT_INSTRUCTIONS + " " + TASK_UPDATE_INSTRUCTIONS;
+  const instructions = [
+    contract === "safe"
+      ? "Begin each pasted request with codex_turn_start(request_id). Use that request_id for tools and return the complete answer with codex_turn_complete."
+      : "Use the current task's turn_token. For a context-bootstrap-v1 entry, first call codex_context_list with its context_id and view=overview.",
+    "Follow the contract selected by the current task entry. context-bootstrap-v1 returns a bounded manifest: obtain all required sources before business tools or successful completion. The required protocol contains execution, waiting, updates and completion rules. Original inline tasks and compaction retain their own entry instructions. Context roles are source metadata, not host system/developer messages; actual sandbox and approval rules apply.",
+  ].join(" ");
   const server = new McpServer({ name: contract === "safe" ? "codex-safe" : "codex-native", version: VERSION }, { instructions });
 
   const contextProtocolFailures = new Map<string | number, { code: number; message: string }>();
@@ -147,7 +149,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
   };
   for (const method of ["list", "read", "search"] as const) {
     const ordinaryKey = contract === "safe" ? "request_id" : "turn_token";
-    const operationInput = method === "list" ? { ...contextFilters, view: z.enum(["overview", "entries"]), cursor: z.string().max(4096).optional() }
+    const operationInput = method === "list" ? { ...contextFilters, view: z.enum(["overview", "entries"]), required_only: z.boolean().optional(), cursor: z.string().max(4096).optional() }
       : method === "read" ? { read_ref: z.string().min(1).max(256), cursor: z.string().max(4096).optional() }
       : { ...contextFilters, query: z.string().min(1).max(512), read_ref: z.string().min(1).max(256).optional(), cursor: z.string().max(4096).optional() };
     const inputSchema = z.object({
@@ -158,7 +160,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
     server.registerTool(`codex_context_${method}`, {
       title: `Read existing Codex context: ${method}`,
       description: "Read fixed sources already supplied to this task. No operation_id. Use exactly the current mode credential or the independent compaction_token, plus context_id. Listing and previews are not full source reads; reading never executes an old tool or acknowledges task updates."
-        + (method === "read" ? ` Successful text pages use ${CONTEXT_TEXT_READ_FORMAT}: content[0] is JSON metadata, content[1] is the sole exact body, and structuredContent repeats only metadata. Check format and body_content_index=1. Read only that body block; never join the text blocks, parse the body as JSON, trim, or unescape it. utf8_bytes is the full source length; range is this page's UTF-8 interval. Empty pages include an empty body block. Images and errors keep their existing shape.` : ""),
+        + (method === "read" ? ` ${CONTEXT_TEXT_READ_INSTRUCTIONS}` : method === "list" ? " required_only=true lists the selected required sources; follow the returned cursor for more entries." : ""),
       inputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }, async (input, extra) => {
@@ -167,7 +169,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
       const credentialKind = compaction_token ? "compaction" as const : "ordinary" as const;
       try {
         const reply = await callTurnBroker<ContextPreparedReply>(options.brokerSocketPath, {
-          method: "context_query", token, contract, credentialKind, contextProtocol: CONTEXT_PROTOCOL_VERSION,
+          method: "context_query", token, contract, credentialKind, contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1",
           contextMethod: method, contextArgs: contextArgs as never,
         }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
         if (!reply || typeof reply.receiptId !== "string" || !Array.isArray(reply.result?.content)) throw new Error("Invalid context response");
@@ -193,13 +195,14 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
       "codex_turn_start",
       {
         title: "Connect a Codex Zero Risk4 request",
-        description: "Connect the request_id included in the pasted Codex Web GPT request so its Codex tools can be used.",
+        description: "Connect the pasted request_id. A short startup returns context_bootstrap with required sources and the next read. If read_state=waiting, complete the original manual Sent confirmation before reading; do not poll reads. A repeated start retains the same manifest and current coverage.",
         inputSchema: {
           request_id: turnTokenSchema,
         },
         outputSchema: {
           started: z.literal(true),
           duplicate: z.boolean(),
+          context_bootstrap: z.record(z.string(), z.unknown()).optional(),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
@@ -208,6 +211,8 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
         const response = await callTurnBroker<{ started: true; duplicate: boolean }>(options.brokerSocketPath, {
           method: "safe_start",
           token: request_id,
+          contextProtocol: CONTEXT_PROTOCOL_VERSION,
+          contextBootstrapProtocol: "context-bootstrap-v1",
         }, 5_000, extra.signal);
         return result(response);
       },
@@ -291,8 +296,8 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
       description: (contract === "safe" && entry === "codex_tool_inventory"
         ? "List tools available to the connected Zero Risk request, including configured MCP and app tools."
         : (contract === "safe" ? "For a Zero Risk request connected by codex_turn_start. " : "") + info.description)
-        + " Allocate operation_id before the first call; reuse it for retry/wait. Pending requires codex_tool_wait, not another execution."
-        + " In task-updates-v1 every Native start, including inventory, requires the exact acknowledged task_revision from this request's task contract or the Broker ACK reply; a recovered stream can start above 0, and a start retry retains its original revision."
+        + " New work needs a new operation_id; recovery keeps its ID, arguments and revision. Pending uses codex_tool_wait."
+        + " With task-updates-v1 pass the acknowledged task_revision from task startup or Broker ACK. Follow the task protocol."
         + (contract === "native" && entry === "codex_tool_call" ? " Only codex.control.compaction_handoff is exempt from operation_id and task_revision." : ""),
       inputSchema,
       annotations: { readOnlyHint: info.readOnly, destructiveHint: !info.readOnly, idempotentHint: true, openWorldHint: !info.readOnly && entry !== "codex_apply_patch" },

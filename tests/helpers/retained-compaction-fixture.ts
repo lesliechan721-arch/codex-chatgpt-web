@@ -21,6 +21,8 @@ export function retainedTaskFixture(experimentalBiggerContext = false) {
     () => measureRuntimeOperation("fixture.prepare", () => createRetainedTaskFixture(experimentalBiggerContext)));
 }
 function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
+  // These fixtures exercise the existing inline/on-demand contract. Short startup
+  // and its default composer limit have separate production MCP integration tests.
   const profileContext = runtimePerformanceContext();
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-retained-task-"));
   const statePath = join(root, "continuity");
@@ -66,7 +68,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
     helper: { executable: process.execPath, script: import.meta.path }, partition: "persist:codex-web-gpt-dev-chatgpt",
     idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "a".repeat(32), surfaceTargets: {}, createdAt: new Date().toISOString(),
   }), { mode: 0o600 });
-  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: {
+  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
     browserHost: "launcher", browserHostDescriptorPath: descriptorPath, browserInteractionMode: "automatic",
     appName: CHATGPT_CONNECTOR_NAME, continuityStateDirectory: statePath, brokerSocketPath: defaultBrokerEndpoint(root),
     localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false,

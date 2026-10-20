@@ -24,6 +24,8 @@ import { compactRequest, responseRequest } from "../../src/server";
 import { parseRequest } from "../../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../../src/types";
 
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const require = createRequire(import.meta.url);
 
 export const launcherRecovery = require("../../launcher/electron/continuity-recovery.cjs");
@@ -194,7 +196,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
     writeFileSync(descriptorPath, JSON.stringify(descriptor), { mode: 0o600 });
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web", baseUrl: `fixture://${root}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 64_000_000,
         browserInteractionMode: manual ? "manual" : "automatic",
         browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
         ...(options.turnTimeoutMs !== undefined ? { turnTimeoutMs: options.turnTimeoutMs } : {}),

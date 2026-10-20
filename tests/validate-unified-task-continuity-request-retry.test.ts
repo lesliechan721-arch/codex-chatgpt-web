@@ -58,7 +58,9 @@ function publicLossFixture(successorFails = false) {
     features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
     control: { endpoint: `http://127.0.0.1:${server.port}`, token: "a".repeat(43) }, helper: { executable: process.execPath, script: import.meta.path },
     partition: "persist:codex-web-gpt-dev-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL, surfaceId: "a".repeat(32), surfaceTargets: {}, createdAt: new Date().toISOString() }), { mode: 0o600 });
-  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: {
+  // The controlled worker reads the existing inline protocol. Default short startup
+  // and required-text delivery have separate production MCP integration tests.
+  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
     browserHost: "launcher", browserInteractionMode: "automatic", browserHostDescriptorPath: descriptorPath, appName: CHATGPT_CONNECTOR_NAME,
     brokerSocketPath: defaultBrokerEndpoint(root), continuityStateDirectory: statePath, localToolsEnabled: true, solAvailable: true,
     toolAuthorityMode: "delegated", proAvailable: false, extraHighAvailable: false } };

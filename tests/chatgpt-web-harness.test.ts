@@ -34,6 +34,8 @@ import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool }
 // Each ordinary test call below is a new logical Native operation.
 let nextNativeOperationId = 0;
 
+// These fixtures exercise the existing inline/on-demand contract. Short startup
+// and its default composer limit have separate production MCP integration tests.
 const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date.now()}`);
 mkdirSync(tempRoot, { recursive: true });
 afterAll(() => rmSync(tempRoot, { recursive: true, force: true }));
@@ -361,7 +363,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-delegated-envless-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         toolAuthorityMode: "delegated",
@@ -417,7 +419,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-canonical-metadata-test",
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -457,7 +459,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-native-open-page-test",
-      chatgptWeb: { ...toolCapabilities, brokerSocketPath: socketPath, threadEnvironmentStatePath: join(tempRoot, "open-page-environment.json") },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, ...toolCapabilities, brokerSocketPath: socketPath, threadEnvironmentStatePath: join(tempRoot, "open-page-environment.json") },
     };
     const originalCodexHome = process.env.CODEX_HOME;
     process.env.CODEX_HOME = join(tempRoot, "isolated-launcher-codex");
@@ -526,7 +528,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-retained-messages-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         browserHost: "launcher",
         browserHostDescriptorPath: join(tempRoot, "retained-launcher.json"),
         experimentalFreshConversationPerTurn: freshConversation,
@@ -631,7 +633,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-close-trace-${Date.now()}`,
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1313,7 +1315,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-abort-retry-test",
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1372,7 +1374,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-batched-reconnect-${Date.now()}`,
-      chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1433,7 +1435,7 @@ describe("ChatGPT outer-native harness v4", () => {
     for (const failureAt of ["text", "heartbeat"]) {
       const provider: CodexProviderConfig = {
         adapter: "chatgpt-web", baseUrl: `browser://writer-disconnect-${failureAt}-${Date.now()}`,
-        chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+        chatgptWeb: { maxComposerCodePoints: 2_000_000, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
       };
       const worker = ChatGptBrowserWorker.forProvider(provider);
       const originalRun = worker.run.bind(worker);
@@ -1487,7 +1489,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-ambiguous-send-${Date.now()}`,
-      chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1522,7 +1524,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-error-retry-test",
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1565,7 +1567,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const socketPath = brokerTestEndpoint(`cgw-${code}-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web", baseUrl: `browser://${code}-${Date.now()}`,
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run;
@@ -1597,7 +1599,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-retry-budget-${Date.now()}`,
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1641,7 +1643,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://prepare-error-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         experimentalBiggerContext: true,
@@ -1683,7 +1685,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-nonretryable-test-${failure.code}`,
-      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -1721,7 +1723,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-luna-missing-checkpoint-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         localToolsEnabled: false,
         solAvailable: false,
         extraHighAvailable: false, proAvailable: false,
@@ -2678,7 +2680,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-usage-test",
-      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -2773,7 +2775,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const socketPath = brokerTestEndpoint(`cgw-compaction-cause-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web", baseUrl: `browser://compaction-cause-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         browserHost: "launcher", browserHostDescriptorPath: join(tempRoot, "compaction-cause-launcher.json"),
         brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true,
         extraHighAvailable: true, proAvailable: true, experimentalFreshConversationPerTurn: true,
@@ -2801,7 +2803,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://chatgpt-active-compact-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         browserHost: "launcher",
         browserHostDescriptorPath: join(tempRoot, "active-compact-launcher.json"),
         brokerSocketPath: socketPath,
@@ -3011,7 +3013,7 @@ describe("ChatGPT outer-native harness v4", () => {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-pro-test",
       contextWindow: 256_000,
-      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true,
         experimentalFreshConversationPerTurn: freshConversation },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -3202,12 +3204,12 @@ describe("ChatGPT outer-native harness v4", () => {
         outputSchema: tool.outputSchema ?? null,
         annotations: tool.annotations ?? null,
       }));
-      // This unreleased v2 upgrade keeps the approved connector identity. Its changed
+      // This v3 control upgrade keeps the approved connector identity and v2 body format. Its changed
       // tools/list contract, including recovered ACK revision guidance, requires same-name
       // refresh and new runtime capability evidence.
       expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("43a4005920b0b513d303d05606b55eecfcc1d80584928f0e50c669aaadcb5c30");
+        .toBe("663e67d8069c3ba81a9a83eaefb7c15fae91c74dbe9a0747608eff4a1c9a36d6");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {
@@ -4075,7 +4077,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://retired-tool-boundary-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         solAvailable: true,
@@ -4180,7 +4182,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://post-emission-retirement-${Date.now()}`,
-      chatgptWeb: {
+      chatgptWeb: { maxComposerCodePoints: 2_000_000,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         solAvailable: true,
@@ -4511,7 +4513,7 @@ describe("adapter liveness covers every path through a turn", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://liveness-${label}-${Date.now()}`,
-      chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
@@ -4606,7 +4608,7 @@ describe("adapter liveness covers every path through a turn", () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: `browser://abort-owner-${Date.now()}`,
-      chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { maxComposerCodePoints: 2_000_000, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);

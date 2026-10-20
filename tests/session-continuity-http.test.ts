@@ -1,3 +1,4 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { recoveryIdentity } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import * as recoveryRuntime from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
@@ -24,6 +25,26 @@ import { createSessionContinuityFixtures, launcherRecovery, reverseJsonObjectKey
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
+
+for (const manual of [false, true]) test(`short-start budget rejection is a non-retryable HTTP request error: manual=${manual}`, async () => {
+  const f = httpFixture(manual);
+  f.provider.chatgptWeb!.maxComposerCodePoints = 1;
+  const events: Array<{ type: string; retryable?: boolean; code?: string }> = [];
+  const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(f.body),
+  }), f.config, () => f.adapter(), { rememberState: false, onAdapterEvent: event => { events.push(event); } });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ error: {
+    type: "invalid_request_error", code: "CONTEXT_BUDGET_EXCEEDED",
+  } });
+  expect(events).toContainEqual(expect.objectContaining({ type: "error", code: "CONTEXT_BUDGET_EXCEEDED", retryable: false }));
+  expect(f.registrations.get(continuityDigest(f.threadId))).toBeUndefined();
+  expect(f.submissions).toHaveLength(0);
+  expect(f.pages.size).toBe(0);
+  // A rejected local plan leaves the original first-creation right available.
+  f.provider.chatgptWeb!.maxComposerCodePoints = 64_000_000;
+  expect((await (await f.send(f.body)).json()).status).toBe("completed");
+});
 
 function repair6SourceHelper(f: ReturnType<typeof httpFixture>, boundary: "response" | "dom" | "unknown-send" | "unknown-send-healthy", fault: string): void {
   const script = join(f.root, "page-loss-helper.ts");
@@ -1108,13 +1129,13 @@ for (const route of [
     const credential = entry.first_call.arguments;
     const query = async (method: "search" | "read", args: Record<string, unknown>) => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
-        method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: 2,
+        method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
         contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       expect(reply.result.isError).not.toBe(true);
       const { contextTextReadReceipt } = await import("../src/adapters/chatgpt-web/context-text-result");
       await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.turn_token,
-        contract: "native", credentialKind: "ordinary", contextProtocol: 2, receiptId: reply.receiptId, sent: true,
+        contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
         ...(method === "read" ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
       return reply.result;
     };
@@ -1229,13 +1250,13 @@ test("repair4: HTTP public uncommitted compaction retry starts a new generation 
     const credential = entry.first_call.arguments;
     const query = async (method: "search" | "read", args: Record<string, unknown>) => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
-        method: "context_query", token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: 2,
+        method: "context_query", token: credential.compaction_token, contract: "native", credentialKind: "compaction", contextProtocol: CONTEXT_PROTOCOL_VERSION,
         contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       expect(reply.result.isError).not.toBe(true);
       const { contextTextReadReceipt } = await import("../src/adapters/chatgpt-web/context-text-result");
       await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.compaction_token,
-        contract: "native", credentialKind: "compaction", contextProtocol: 2, receiptId: reply.receiptId, sent: true,
+        contract: "native", credentialKind: "compaction", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
         ...(method === "read" ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
       return reply.result;
     };

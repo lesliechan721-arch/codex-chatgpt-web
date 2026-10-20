@@ -83,7 +83,8 @@ test("three fixed PNGs contain distinct pixels and only metadata accompanies the
 test("DEV driver carries repeated image results through the real Responses adapter, broker and MCP server", async () => {
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-dev-image-probe-"));
   roots.push(root);
-  const config = { ...defaultConfig("full"), brokerSocketPath: defaultBrokerEndpoint(join(root, "broker")) };
+  // The simulated DEV model consumes the existing inline startup protocol.
+  const config = { ...defaultConfig("full"), maxComposerCodePoints: 2_000_000, brokerSocketPath: defaultBrokerEndpoint(join(root, "broker")) };
   const broker = TurnBroker.forSocket(config.brokerSocketPath);
   await broker.listen();
   const client = new Client({ name: "dev-image-probe-test", version: "1" });

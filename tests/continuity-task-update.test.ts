@@ -127,7 +127,8 @@ async function fixture(manual = false, protocol = true, search = false,
   const statePath = join(root, "state");
   new ContinuityRegistrationStore(statePath).initialize();
   const socket = defaultBrokerEndpoint(root);
-  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: {
+  // Keep the simulated update/ACK model on the existing inline startup contract.
+  const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `fixture://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
     browserHost: "launcher", browserHostDescriptorPath: descriptorPath, continuityStateDirectory: statePath,
     browserInteractionMode: manual ? "manual" : "automatic", brokerSocketPath: socket,
     experimentalFreshConversationPerTurn: options.fresh,

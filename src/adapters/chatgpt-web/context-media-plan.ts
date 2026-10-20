@@ -5,15 +5,18 @@ import { contextLimits, measureContextResponse, type ContextLimitOverrides, type
 import { ContextNavigator } from "./context-navigator";
 import { assertSupportedContextImage, type ContextSnapshot } from "./context-snapshot";
 import type { ContextDelivery, ContextTarget } from "./context-types";
+import { ChatGptWebAdapterError } from "./adapter-error";
 
 /** These are the existing browser-worker file checks, in a module with no browser side effects. */
 export const CONTEXT_ATTACHMENT_LIMITS = Object.freeze({ count: 10, imageBytes: 20_000_000, totalBytes: 50_000_000 });
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const REQUIRED_SOURCES = new Set(["system", "developer", "user", "skill", "delegation", "agent_message"]);
 
-export class ContextDeliveryPlanningError extends Error {
+export class ContextDeliveryPlanningError extends ChatGptWebAdapterError {
   constructor(readonly code: "CONTEXT_MAPPING_UNPROVEN" | "CONTEXT_IMAGE_UNAVAILABLE" | "CONTEXT_BUDGET_EXCEEDED",
-    message: string, readonly details: Record<string, unknown> = {}) { super(message); }
+    message: string, readonly details: Record<string, unknown> = {}) {
+    super(message, { status: 400, errorType: "invalid_request_error", code, retryable: false });
+  }
 }
 
 export function contextAttachmentImage(imageUrl: string): { mimeType: string; bytes: number } | undefined {
