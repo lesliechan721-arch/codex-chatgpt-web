@@ -31,8 +31,10 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.10-3` integrates upstream `6.1.10` with this fork's continuity, context, API access,
-provider, proxy, and remote-runtime contracts. The service, Launcher, installer, and download
+Version `6.1.12-1` integrates upstream `6.1.12` with this fork's continuity, durable input queue,
+short-start context, API access, provider, proxy, and remote-runtime contracts. New configurations
+and configurations without `useSavedChats` save chats by default; explicit choices are preserved.
+Connector verification uses the selected saved or temporary chat mode. The service, Launcher, installer, and download
 metadata use the same version. Next-message suggestions are available as an explicit opt-in;
 new installations and existing configurations without this setting leave them disabled.
 The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an

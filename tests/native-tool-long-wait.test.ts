@@ -206,13 +206,14 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
         expect((control!.required as string[] | undefined) ?? []).not.toContain("operation_id");
         expect(control).toMatchObject({ not: { anyOf: [{ required: ["operation_id"] }, { required: ["task_revision"] }] } });
 
+        const transaction = await f.broker.beginCompactionTransaction("native-wait-control-schema");
         const rejectedControl = await client.callTool({
           name: "codex_tool_call",
           arguments: {
-            ...reference,
+            turn_token: transaction.token,
             operation_id: 2,
             wire_name: "codex.control.compaction_handoff",
-            arguments: { handoff_id: "handoff-test", summary: "checkpoint" },
+            arguments: { handoff_id: transaction.handoffId, summary: "checkpoint" },
           },
         });
         expect(rejectedControl.isError).toBe(true);

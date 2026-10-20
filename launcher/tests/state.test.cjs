@@ -27,6 +27,19 @@ test("prediction setting defaults off for new, old, and invalid state and persis
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("saved chats default on for new or missing settings and preserve an explicit opt-out", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-saved-chat-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    assert.equal(createStateStore(file).read().useSavedChats, true);
+    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+    const store = createStateStore(file);
+    assert.equal(store.read().useSavedChats, true);
+    store.update({ useSavedChats: false });
+    assert.equal(createStateStore(file).read().useSavedChats, false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("launcher state persists onboarding, language, autostart, and network proxy atomically", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-launcher-state-"));
   const file = path.join(root, "state.json");
@@ -48,7 +61,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
-      useSavedChats: false,
+      useSavedChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,
@@ -84,7 +97,7 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
-      useSavedChats: false,
+      useSavedChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: "http://user:p%40ss@127.0.0.1:7890/",
@@ -171,7 +184,7 @@ test("persisted sidebar and proxy corruption are repaired without changing the r
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
-      useSavedChats: false,
+      useSavedChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,

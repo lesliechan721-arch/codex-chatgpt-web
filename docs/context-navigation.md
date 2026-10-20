@@ -23,8 +23,10 @@ retired defaults remain retired. Production and DEV plugins can remain installed
 Setup preserves custom names that are not retired defaults. If a custom plugin caches the old
 pre-navigation schema, follow the original migration above. The still-unreleased context-rendering,
 text-read-v2, and short-start update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
-non-retired custom names. Refresh or reconnect that same connector if its current contract is
-incompatible. If the client cannot update or consume v2, stop v2 use and report the missing
+non-retired custom names. Ordinary Native tool tokens use the exact `turn_` prefix and 32 case-sensitive
+characters. The independent `control_` token remains limited to compaction handoff submission;
+`compaction_token` remains limited to context reads. Refresh or reconnect that same connector to load the current token schema and copying
+instructions if its current contract is incompatible. If the client cannot update or consume v2, stop v2 use and report the missing
 capability. This update does not introduce another connector name. A local name change uses
 transactional setup and requires the necessary configuration steps for that identity. It does not
 rename a remote plugin or change a custom name automatically.

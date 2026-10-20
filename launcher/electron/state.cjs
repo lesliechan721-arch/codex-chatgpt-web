@@ -22,7 +22,7 @@ const DEFAULT_STATE = Object.freeze({
   composerPredictionsEnabled: false,
   experimentalSkillAttachments: false,
   experimentalFreshConversationPerTurn: false,
-  useSavedChats: false,
+  useSavedChats: true,
   zeroRiskProEnabled: false,
   zeroRiskRequireSentConfirmation: true,
   networkProxyUrl: null,

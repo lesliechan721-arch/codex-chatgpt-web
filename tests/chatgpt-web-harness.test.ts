@@ -3204,17 +3204,33 @@ describe("ChatGPT outer-native harness v4", () => {
         outputSchema: tool.outputSchema ?? null,
         annotations: tool.annotations ?? null,
       }));
-      // This v3 control upgrade keeps the approved connector identity and v2 body format. Its changed
-      // tools/list contract, including recovered ACK revision guidance, requires same-name
-      // refresh and new runtime capability evidence.
+      // ChatGPT caches the complete tools/list contract under the connector identity.
+      // The Native token schema and copying guidance require refreshing the current connector;
+      // context credentials retain their independent ordinary/compaction schema.
       expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("663e67d8069c3ba81a9a83eaefb7c15fae91c74dbe9a0747608eff4a1c9a36d6");
+        .toBe("32779b3d597ae4eecfdea757ac50474861adbdfa02354a8f77d2440c1dd5626a");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
-        expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
+        expect(properties.turn_token).toEqual(tool.name === "codex_tool_call"
+          ? { anyOf: [
+            { type: "string", pattern: "^turn_[A-Za-z0-9_-]{32}$", description: expect.stringContaining("Copy the complete turn_token") },
+            { type: "string", pattern: "^control_[a-f0-9]{32}$", description: expect.stringContaining("Independent one-shot submission token") },
+          ] }
+          : tool.name.startsWith("codex_context_")
+          ? { type: "string", minLength: 20, maxLength: 256 }
+          : {
+            type: "string", pattern: "^turn_[A-Za-z0-9_-]{32}$",
+            description: expect.stringContaining("Copy the complete turn_token from the current request unchanged"),
+          });
+        if (tool.name === "codex_tool_call") {
+          expect(tool.inputSchema.anyOf).toMatchObject([
+            { properties: { turn_token: { pattern: "^turn_[A-Za-z0-9_-]{32}$" } }, required: ["operation_id"] },
+            { properties: { wire_name: { const: "codex.control.compaction_handoff" }, turn_token: { pattern: "^control_[a-f0-9]{32}$" } } },
+          ]);
+        }
         expect(properties).not.toHaveProperty("binding_id");
         expect(tool.outputSchema).toBeUndefined();
         if (tool.name.startsWith("codex_context_")) {
@@ -3860,11 +3876,20 @@ describe("ChatGPT outer-native harness v4", () => {
     try {
       await client.connect(transport);
 
+      // The reported failures included a missing character and a different,
+      // correctly sized token. Neither may borrow the only registered turn.
+      const malformed = await call("codex_exec", { turn_token: token.slice(0, -1), cmd: "must not execute" });
+      expect(malformed.isError).toBe(true);
+      expect(JSON.stringify(malformed.content)).toContain("Copy turn_token exactly from the current request");
+      expect(JSON.stringify(malformed)).not.toContain(token);
+
       const invalid = await call("codex_tool_inventory", {
         turn_token: "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       });
       expect(invalid.isError).toBe(true);
       expect(invalid.structuredContent).toMatchObject({ code: "codex_tool_operation_retired" });
+      expect(JSON.stringify(invalid.content)).toContain("Copy turn_token exactly from the current request");
+      expect(JSON.stringify(invalid)).not.toContain(token);
 
       const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
       const [execRequest] = await Promise.race([

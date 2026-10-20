@@ -27,6 +27,11 @@ import type {
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
 
+export interface CodexRolloutEnvironment {
+  environment: ChatGptTurnEnvironment;
+  workspaceRootsDeclared: boolean;
+}
+
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
@@ -73,7 +78,7 @@ function canonicalRolloutName(name: string, threadId: string): boolean {
   ).test(name);
 }
 
-function configuredSqliteHome(codexHome: string, explicit?: string): string {
+function configuredSqliteHome(codexHome: string, explicit?: string, inheritEnvironment = true): string {
   if (explicit) return resolve(explicit);
 
   const configPath = join(codexHome, "config.toml");
@@ -89,7 +94,7 @@ function configuredSqliteHome(codexHome: string, explicit?: string): string {
     }
   }
 
-  const environmentValue = process.env.CODEX_SQLITE_HOME?.trim();
+  const environmentValue = inheritEnvironment ? process.env.CODEX_SQLITE_HOME?.trim() : undefined;
   return resolve(environmentValue ? expandUserPath(environmentValue) : codexHome);
 }
 
@@ -171,6 +176,26 @@ function scanCanonicalRollouts(codexHome: string, threadId: string): string[] {
   };
   visitLevel(sessionsRoot, 0);
   return matches;
+}
+
+function currentRolloutOwner(options: {
+  codexHome: string;
+  additionalCodexHomes?: readonly string[];
+  sqliteHome?: string;
+  lineage: RolloutIdentity;
+}): { home: string; indexed: IndexedRollout; candidates: string[] } | undefined {
+  // Select the owner before reading permissions, source proofs, or aliases. A stale
+  // copy in another registered home is still ambiguous ownership.
+  const owners = [options.codexHome, ...(options.additionalCodexHomes ?? [])].map((home, index) => {
+    const indexed = indexedRollout(configuredSqliteHome(
+      home, index === 0 ? options.sqliteHome : undefined, index === 0,
+    ), options.lineage);
+    const candidates = indexed.kind === "found"
+      ? [indexed.path] : scanCanonicalRollouts(home, options.lineage.threadId);
+    return { home, indexed, candidates };
+  }).filter(owner => owner.candidates.length > 0);
+  if (owners.length > 1) throw new Error("Codex thread exists in multiple trusted homes");
+  return owners[0];
 }
 
 function parseJsonLine(line: Buffer): Record<string, unknown> {
@@ -438,6 +463,7 @@ export interface ResolvedCodexRolloutMessageIdentity {
 
 export function resolveCurrentCodexRolloutMessageIdAliases(options: {
   codexHome: string;
+  additionalCodexHomes?: readonly string[];
   sqliteHome?: string;
   lineage: RolloutIdentity;
   turnId: string;
@@ -457,13 +483,11 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
     || ("parentThreadId" in options.lineage && !CODEX_ID.test(options.lineage.parentThreadId))) return undefined;
 
   try {
-    const indexed = indexedRollout(configuredSqliteHome(options.codexHome, options.sqliteHome), options.lineage);
-    const candidates = indexed.kind === "found"
-      ? [indexed.path]
-      : scanCanonicalRollouts(options.codexHome, options.lineage.threadId);
+    const owner = currentRolloutOwner(options);
+    if (!owner) return undefined;
     const recovered: ResolvedCodexRolloutMessageIdentity[] = [];
-    for (const candidate of candidates) {
-      const rolloutPath = validateRolloutPath(options.codexHome, candidate, options.lineage.threadId);
+    for (const candidate of owner.candidates) {
+      const rolloutPath = validateRolloutPath(owner.home, candidate, options.lineage.threadId);
       const fd = openSync(rolloutPath, "r");
       try {
         const size = fstatSync(fd).size;
@@ -539,6 +563,7 @@ function isNativeEnvironmentMessage(payload: Record<string, unknown>): boolean {
 /** A latest replacement overrides earlier records, including records with the same message id. */
 function nativeEnvironmentEvidence(
   fd: number, size: number, turnId: string, message: ChatGptUnattributedEnvironmentMessage,
+  publicationPendingIsTransient = false,
 ): NativeEnvironmentEvidence | undefined {
   let boundary: LocatedRolloutRecord | undefined;
   let checkpoint: LocatedRolloutRecord | undefined;
@@ -573,6 +598,11 @@ function nativeEnvironmentEvidence(
   // A removed checkpoint item cannot be revived by an earlier independent message. A newer
   // native message remains part of the active suffix, subject to the usual task boundary.
   const candidates = checkpoint ? responses.filter(entry => entry.order > checkpoint!.order) : responses;
+  // The current turn context can be flushed before its environment message. Only absence
+  // is transient; existing ambiguous or conflicting records must still fail validation.
+  if (candidates.length === 0 && publicationPendingIsTransient) {
+    throw new CodexRolloutPublicationPendingError("Codex rollout has not published the current environment message yet");
+  }
   if (candidates.length !== 1) return undefined;
   const location = candidates[0]!;
   const payload = record(location.item.payload);
@@ -582,8 +612,9 @@ function nativeEnvironmentEvidence(
 /** The wire omits ownership; only the exact native current message can supply that proof. */
 function verifyCurrentEnvironmentMessage(
   fd: number, size: number, turnId: string, message: ChatGptUnattributedEnvironmentMessage,
+  publicationPendingIsTransient: boolean,
 ): void {
-  const proof = nativeEnvironmentEvidence(fd, size, turnId, message);
+  const proof = nativeEnvironmentEvidence(fd, size, turnId, message, publicationPendingIsTransient);
   const owner = record(proof?.payload.internal_chat_message_metadata_passthrough)?.turn_id;
   if (!proof || proof.location.order <= proof.boundary.order || proof.location.activeTurn !== turnId
     || owner !== turnId || !isNativeEnvironmentMessage(proof.payload)) {
@@ -941,6 +972,7 @@ function environmentFromTurnContext(
 function validateMetadataConsistency(
   lineage: RolloutIdentity,
   environment: ChatGptTurnEnvironment,
+  workspaceRootsDeclared: boolean,
 ): void {
   // Request sandbox/workspace fields are diagnostic only. They narrow a rollout-derived authority
   // here and never create or expand it.
@@ -958,7 +990,8 @@ function validateMetadataConsistency(
       `ChatGPT Web ${owner} workspace metadata does not contain its Codex rollout cwd`,
     );
   }
-  if (lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
+  if ((workspaceRootsDeclared || environment.sandboxPolicy.type !== "dangerFullAccess")
+    && lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
     contains(rolloutRoot, root) || contains(root, rolloutRoot)
   )))) {
     throw new TrustedCodexEnvironmentValidationError(
@@ -969,6 +1002,7 @@ function validateMetadataConsistency(
 
 export function resolveCurrentCodexRolloutEnvironment(options: {
   codexHome: string;
+  additionalCodexHomes?: readonly string[];
   sqliteHome?: string;
   lineage: RolloutIdentity;
   turnId: string;
@@ -978,10 +1012,14 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
   currentEnvironmentMessage?: ChatGptUnattributedEnvironmentMessage;
   compactionPhase?: ChatGptNativeCompactionPhase;
-  validateCurrentEnvironmentMessage?: (message: ChatGptUnattributedEnvironmentMessage, environment: ChatGptTurnEnvironment) => void;
+  validateCurrentEnvironmentMessage?: (
+    message: ChatGptUnattributedEnvironmentMessage,
+    environment: ChatGptTurnEnvironment,
+    workspaceRootsDeclared: boolean,
+  ) => void;
   publicationPendingIsTransient?: boolean;
-}): ChatGptTurnEnvironment | undefined {
-  const { codexHome, lineage, turnId, tools, compactionSourceTurnId } = options;
+}): CodexRolloutEnvironment | undefined {
+  const { lineage, turnId, tools, compactionSourceTurnId } = options;
   const nativeThreadId = CODEX_ID.test(lineage.threadId);
   const nativeTurnId = CODEX_ID.test(turnId);
   if (!nativeThreadId && !nativeTurnId) return undefined;
@@ -992,11 +1030,8 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     );
   }
 
-  const indexed = indexedRollout(configuredSqliteHome(codexHome, options.sqliteHome), lineage);
-  const candidates = indexed.kind === "found"
-    ? [indexed.path]
-    : scanCanonicalRollouts(codexHome, lineage.threadId);
-  if (candidates.length === 0) {
+  const owner = currentRolloutOwner(options);
+  if (!owner) {
     if (!("parentThreadId" in lineage)) return undefined;
     if (options.publicationPendingIsTransient) {
       throw new CodexRolloutPublicationPendingError(
@@ -1006,16 +1041,16 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     throw new Error("Codex has no canonical rollout for the requested subagent thread");
   }
 
-  const matching: ChatGptTurnEnvironment[] = [];
+  const matching: CodexRolloutEnvironment[] = [];
   let sawAuthenticatedStaleTurn = false;
-  for (const candidate of candidates) {
+  for (const candidate of owner.candidates) {
     let rolloutPath: string;
     let fd: number;
     try {
-      rolloutPath = validateRolloutPath(codexHome, candidate, lineage.threadId);
+      rolloutPath = validateRolloutPath(owner.home, candidate, lineage.threadId);
       fd = openSync(rolloutPath, "r");
     } catch (error) {
-      if (options.publicationPendingIsTransient && indexed.kind === "found" && isEnoent(error)) {
+      if (options.publicationPendingIsTransient && owner.indexed.kind === "found" && isEnoent(error)) {
         throw new CodexRolloutPublicationPendingError("Codex indexed rollout is not published yet");
       }
       throw error;
@@ -1060,7 +1095,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
       // Borrowing another turn's permissions requires the exact native human source. A supplied
       // owner may constrain that proof, but matching the permission owner is never authority.
       if (latest.turn_id !== turnId && !sourceProof) {
-        if (indexed.kind === "found") {
+        if (owner.indexed.kind === "found") {
           if (options.publicationPendingIsTransient) {
             throw new CodexRolloutPublicationPendingError(
               "Codex indexed rollout has not published the requested turn context yet",
@@ -1072,9 +1107,11 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         continue;
       }
       const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
-      validateMetadataConsistency(lineage, environment);
+      const workspaceRootsDeclared = latest.workspace_roots !== undefined;
+      validateMetadataConsistency(lineage, environment, workspaceRootsDeclared);
       if (options.currentEnvironmentMessage) {
-        verifyCurrentEnvironmentMessage(fd, size, turnId, options.currentEnvironmentMessage);
+        verifyCurrentEnvironmentMessage(fd, size, turnId, options.currentEnvironmentMessage,
+          options.publicationPendingIsTransient === true);
       }
       if (options.historicalEnvironmentMessages) {
         if (new Set(options.historicalEnvironmentMessages.map(message => message.id)).size
@@ -1089,10 +1126,12 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         if (historical.length > 0) {
           const currentMessages = verifyHistoricalEnvironmentMessages(fd, size, turnId, historical,
             Boolean(options.compactionSource && options.compactionPhase));
-          for (const message of currentMessages) options.validateCurrentEnvironmentMessage?.(message, environment);
+          for (const message of currentMessages) {
+            options.validateCurrentEnvironmentMessage?.(message, environment, workspaceRootsDeclared);
+          }
         }
       }
-      matching.push(environment);
+      matching.push({ environment, workspaceRootsDeclared });
     } finally {
       closeSync(fd);
     }

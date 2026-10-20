@@ -47,9 +47,10 @@ function attemptClose(host, record) {
 }
 
 /** A webContents reference and its frozen creation identity are never replaced by a UI ordinal. */
-function cleanupTurnPage(host, tab, { executionIsolated = false, retryId } = {}) {
+function cleanupTurnPage(host, tab, { executionIsolated = false, retryId,
+  contents = tab.view?.webContents } = {}) {
+  if (!contents) throw require("./continuity-lease.cjs").continuityFailure("continuity_unverified");
   host.continuityPageCleanups ??= new Map();
-  const contents = tab.view.webContents;
   let record = host.continuityPageCleanups.get(contents);
   if (!record) {
     record = { cleanupId: randomBytes(16).toString("hex"), tabId: tab.id,

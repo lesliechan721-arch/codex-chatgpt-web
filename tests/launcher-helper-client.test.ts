@@ -320,9 +320,11 @@ test("a delayed connector approval cannot use withdrawn execution authority", as
     waitFor: async () => { fixture.store.retireAttempt(fixture.thread, { scope: fixture.scope }, "helper-work", 0); },
     click: async () => { approvals++; } };
   const deny = { filter() { return this; }, count: async () => 1, waitFor: async () => {} };
-  const dialog = { getByRole: (_role: string, options: { name: string | RegExp }) => options.name === "Deny" ? deny : allow };
+  const dialog = { isVisible: async () => true,
+    getByRole: (_role: string, options: { name: string | RegExp }) => options.name === "Deny" ? deny : allow };
   const dialogs = { filter() { return this; }, count: async () => 1, first: () => dialog };
-  const page = { locator: () => dialogs, getByText() {} } as any;
+  const stop = { filter() { return this; }, last() { return this; }, isVisible: async () => false };
+  const page = { locator: (selector: string) => selector.includes('role="dialog"') ? dialogs : stop, getByText() {} } as any;
   await expect(resolveChatGptToolConfirmation(page, "Codex Native5", true, undefined, undefined, undefined, undefined,
     dispatch => dispatchBrowserTurnWithExecutionAuthority(turn, dispatch))).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(approvals).toBe(0);
@@ -450,6 +452,27 @@ test("the real helper IPC preserves an exact authenticated automatic acquire uns
     const error = await fixture.client.run(fixture.turn).catch(error => error);
     expect(getLauncherKnownUnsentReceipt(error)).toMatchObject({ requestId, recovery: fixture.recovery, state: "known-unsent" });
   } finally { await fixture.client.close(); server.stop(true); }
+});
+
+test.each([false, true])("connector verification preserves chat mode through the real helper process (%s)", async useSavedChats => {
+  const root = mkdtempSync(join(tmpdir(), "codex-verification-chat-mode-"));
+  roots.push(root);
+  const helper = join(root, "helper.ts");
+  writeFileSync(helper, `
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    // Keep the launcher request, helper protocol and worker configuration real; replace browser IO.
+    ChatGptBrowserWorker.prototype.verifyConnector = async function() {
+      if (this.config.useSavedChats !== ${useSavedChats}) throw new Error("Verification chat mode lost in helper IPC");
+      return this.config.appName;
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
+  `, { mode: 0o700 });
+  const { verifyConnectorWithBrowserHelper } = require("../launcher/electron/browser-helper-verifier.cjs");
+  expect(await verifyConnectorWithBrowserHelper({
+    helper: { executable: process.execPath, script: helper },
+    descriptorPath: join(root, "launcher.json"),
+    appName: "Codex Native5", useSavedChats,
+  })).toEqual({ ok: true, appName: "Codex Native5" });
 });
 
 test("daemon streams browser lifecycle through the real helper process", async () => {

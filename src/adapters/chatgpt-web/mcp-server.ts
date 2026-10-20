@@ -19,6 +19,13 @@ export { CHATGPT_WEB_AGENT_WAIT_POLL_MS } from "./native-tool-contract";
 export type { ChatGptMcpContract } from "./native-tool-contract";
 
 const turnTokenSchema = z.string().min(20).max(256);
+const nativeTurnTokenPattern = /^turn_[A-Za-z0-9_-]{32}$/;
+const compactionControlTokenPattern = /^control_[a-f0-9]{32}$/;
+const nativeTurnTokenSchema = z.string().regex(nativeTurnTokenPattern,
+  "Copy turn_token exactly from the current request: turn_ followed by 32 case-sensitive characters. Do not guess or reuse an earlier token.")
+  .describe("Opaque capability for this request. Copy the complete turn_token from the current request unchanged, including case, hyphens and underscores. Never infer it from another turn or from an error.");
+const compactionControlTokenSchema = z.string().regex(compactionControlTokenPattern)
+  .describe("Independent one-shot submission token. Copy it exactly from the current compaction instruction; use it only for codex.control.compaction_handoff.");
 const operationIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
   .describe("New logical calls use the next positive ID. Retry and wait retain the original ID; keep the counter across reconnects.");
 const taskRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
@@ -61,7 +68,7 @@ export function encodeTaskUpdateMcpResult(value: BrokerToolResult, taskUpdate?: 
 function turnReferenceInput(contract: ChatGptMcpContract): Record<string, z.ZodString> {
   return contract === "safe"
     ? { request_id: turnTokenSchema }
-    : { turn_token: turnTokenSchema };
+    : { turn_token: nativeTurnTokenSchema };
 }
 
 function turnReference(contract: ChatGptMcpContract, input: object): string {
@@ -273,18 +280,26 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
     }).strict();
     const inputSchema = contract === "native" && entry === "codex_tool_call"
       ? z.object({
-        ...turnReferenceInput(contract),
+        turn_token: z.union([nativeTurnTokenSchema, compactionControlTokenSchema], {
+          error: "Copy turn_token exactly from the current request. For compaction handoff, copy its independent control_ token unchanged.",
+        }),
         operation_id: operationIdSchema.optional(),
         task_revision: taskRevisionSchema.optional(),
         ...nativeToolInputSchemas.codex_tool_call,
-      }).strict().meta({
+      }).strict().refine(input => (input.wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME
+        ? compactionControlTokenPattern : nativeTurnTokenPattern).test(input.turn_token), {
+        path: ["turn_token"],
+        message: "Copy turn_token exactly from the current request. Use the independent control_ token only for codex.control.compaction_handoff.",
+      }).meta({
         anyOf: [
           {
+            properties: { turn_token: { pattern: nativeTurnTokenPattern.source } },
             required: ["operation_id"],
             not: { properties: { wire_name: { const: CODEX_COMPACTION_CONTROL_WIRE_NAME } }, required: ["wire_name"] },
           },
           {
-            properties: { wire_name: { const: CODEX_COMPACTION_CONTROL_WIRE_NAME } },
+            properties: { wire_name: { const: CODEX_COMPACTION_CONTROL_WIRE_NAME },
+              turn_token: { pattern: compactionControlTokenPattern.source } },
             required: ["wire_name"],
             not: { anyOf: [{ required: ["operation_id"] }, { required: ["task_revision"] }] },
           },

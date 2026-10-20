@@ -349,6 +349,10 @@ background recovery. New work still uses current permission and approval checks.
 regressions from real Launcher, connector, and cross-process evidence; it is not proof those
 checks have passed.
 
+Task conversations are saved in ChatGPT history by default. **Save chats in ChatGPT** can be turned
+off to use Temporary Chat; an existing off setting is preserved when updating. Saved chats may use
+ChatGPT memory and custom instructions. Connector verification follows the same selected chat mode.
+
 ## Network exposure
 
 - Normal local installs bind Responses and health to `127.0.0.1`.

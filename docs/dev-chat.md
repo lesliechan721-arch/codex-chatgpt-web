@@ -103,12 +103,13 @@ not adoption of the new ABI or complete context-navigation acceptance. Current F
 delivery follows the [context navigation contract](context-navigation.md).
 
 Reusing the same name continues its canonical Responses history. Sequential native messages in the
-same compatible task lease one Temporary Chat. Every message receives a
+same compatible task lease one chat. Every message receives a
 new turn-bound MCP token, and all MCP tool rounds for that message remain inside the same ChatGPT
 response. On an exact native compaction request, the same Web agent submits the checkpoint through
 a one-shot MCP control call in that chat. Applicable Full Native + Launcher paths retain the
 healthy page across compaction; other paths keep their existing lifecycle. The complete named history remains owned by the existing prompt compiler. New
-chats use the cheapest account-supported browser mode:
+chats follow the configured **Save chats in ChatGPT** setting (on by default) and use the cheapest
+account-supported browser mode:
 Instant (`light`) when Sol is available, otherwise Luna. Override it with `--model` or `/model`.
 
 Interactive commands:
@@ -194,7 +195,7 @@ one-purpose response nor clicking close proves dispatched operations settled.
 
 Non-applicable paths keep their existing compaction lifecycle: the one-purpose response ends,
 physical Launcher settlement is awaited where required, and the old surface closes before a fresh
-Temporary Chat. This control-only completion does not depend on assistant prose or a Copy action.
+chat. This control-only completion does not depend on assistant prose or a Copy action.
 If an applicable task's retained chat was lost without user stop, its uncommitted compaction uses
 legal rebuilt sources and an actual read-only on-demand plan, with the same logical target,
 deadline and retry budget. An existing stop is never cleared. Non-applicable fallback paths retain
@@ -202,7 +203,7 @@ their original source and transport checks. Browser-only has no retained MCP bou
 the six-message compaction path with its complete expanded history.
 
 Any missing or malformed acknowledgement fails the whole transaction. No later part or final
-commit is sent, and a retry starts again from part one in a fresh Temporary Chat. The model context
+commit is sent, and a retry starts again from part one in a fresh chat. The model context
 and auto-compaction ceilings follow the model and account rules above. Every individual stage
 must still fit the selected ChatGPT mode's measured one-message boundary. Bigger Context uses only the existing supported model/account and staged-send paths. Unified
 task continuity does not exclude it by mode; Zero Risk retains its prohibition. The applicable

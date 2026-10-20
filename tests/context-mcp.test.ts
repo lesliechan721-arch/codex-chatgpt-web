@@ -103,6 +103,28 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
       expect(parseContextTextReadResult(textResult)).toMatchObject({ body: "独有片段 marker-zeta", metadata: { purpose: "compaction", format: "context-text-read-v2" } });
       expect((await f.client.callTool({ name: "codex_context_list", arguments: { ...readArgs, view: "overview", ...f.reference } })).isError).toBe(true);
       expect((await f.client.callTool({ name: "codex_tool_inventory", arguments: { compaction_token: handle.compactionToken, operation_id: 1 } })).isError).toBe(true);
+      if (transaction) {
+        const controlArgs = { wire_name: "codex.control.compaction_handoff",
+          arguments: { handoff_id: transaction.handoffId, summary: "must not submit" } };
+        for (const wrongToken of [f.token, handle.compactionToken, transaction.token.slice(0, -1),
+          transaction.token.replace("control_", "control_A")]) {
+          expect((await f.client.callTool({ name: "codex_tool_call", arguments: { ...controlArgs, turn_token: wrongToken } })).isError).toBe(true);
+        }
+        // A control credential must never reach the ordinary Native dispatcher.
+        for (const wrongToken of [transaction.token, f.token.slice(0, -1)]) {
+          const rejected = await f.client.callTool({ name: "codex_tool_call", arguments: {
+            turn_token: wrongToken, operation_id: 1, wire_name: "functions.exec_command", arguments: { cmd: "must not execute" },
+          } });
+          expect(rejected.isError).toBe(true);
+          expect(JSON.stringify(rejected.content)).toContain("Copy turn_token exactly from the current request");
+        }
+        for (const [name, args] of [
+          ["codex_tool_wait", { operation_id: 1 }],
+          ["codex_task_update_ack", { delivery_id: "unrelated-delivery", through_revision: 1 }],
+        ] as const) {
+          expect((await f.client.callTool({ name, arguments: { ...args, turn_token: transaction.token } })).isError).toBe(true);
+        }
+      }
       const submitted = contract === "native"
         ? await f.client.callTool({ name: "codex_tool_call", arguments: { turn_token: transaction!.token, wire_name: "codex.control.compaction_handoff", arguments: { handoff_id: transaction!.handoffId, summary: "Chosen partial evidence marker-zeta" } } })
         : await f.client.callTool({ name: "codex_turn_complete", arguments: { ...f.reference, final_answer: "Chosen partial evidence marker-zeta" } });

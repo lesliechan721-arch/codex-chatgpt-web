@@ -471,6 +471,7 @@ class BrowserControlServer {
       this.logger.warn("browser.control_rejected", { message });
       const cancelled = error?.code === "turn_cancelled";
       const retainedUnavailable = error?.code === "retained_conversation_unavailable";
+      const ownerLost = error?.code === "turn_owner_lost";
       const manualInspectionDisabled = error?.code === "manual_browser_inspection_disabled";
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
       const manualSentPolicyMismatch = error?.code === "manual_sent_policy_mismatch";
@@ -481,13 +482,14 @@ class BrowserControlServer {
         startFailureContext.recovery, startFailureContext.traceId, startFailureContext.helperPid, startFailureContext.requestId) : undefined;
       writeJson(
         response,
-        continuityCode === "continuity_unverified" ? 503 : cancelled || retainedUnavailable || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
+        continuityCode === "continuity_unverified" ? 503 : cancelled || retainedUnavailable || ownerLost || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
           ? 409
           : manualTimedOut ? 408 : 400,
         {
         error: message,
         ...(cancelled ? { code: "turn_cancelled" } : {}),
         ...(retainedUnavailable ? { code: "retained_conversation_unavailable" } : {}),
+        ...(ownerLost ? { code: "turn_owner_lost" } : {}),
         ...(manualInspectionDisabled ? { code: "manual_browser_inspection_disabled" } : {}),
         ...(manualOwnerLost ? { code: "manual_turn_owner_lost" } : {}),
         ...(manualSentPolicyMismatch ? { code: "manual_sent_policy_mismatch" } : {}),

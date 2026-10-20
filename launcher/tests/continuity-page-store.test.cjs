@@ -6,8 +6,9 @@ const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const { BrowserHost } = require("../electron/browser-host.cjs");
 const { bindContinuityTab } = require("../electron/continuity-lease.cjs");
-const { removedContinuityTab } = require("../electron/continuity-recovery.cjs");
+const { removedContinuityTab, physicalTurnTabs } = require("../electron/continuity-recovery.cjs");
 const { removeDestroyedPage } = require("../electron/continuity-page-store.cjs");
+const { cleanupTurnPage, cleanupReceipts } = require("../electron/continuity-page-cleanup.cjs");
 const { assertExecutionAuthority } = require("../electron/continuity-execution-authority.cjs");
 
 function fixture(t) {
@@ -62,11 +63,60 @@ test("destroyed callback clears page storage after WebContentsView loses its web
   assert.equal(f.host.continuityTransactionReceipts.size, 0);
 });
 
+for (const interactionMode of ["automatic", "manual"]) {
+  for (const status of ["running", "ready", "error"]) {
+    test(`external ${interactionMode} ${status} destruction clears the exact physical page and its durable receipts`, t => {
+      const f = fixture(t), key = `${f.creation.installationId}:${f.creation.threadKey}`;
+      const compact = { ...f.creation, transactionId: "compact-transaction", logicalWorkId: "compact" };
+      f.host.continuityTransactions.set(key, { identity: compact });
+      f.host.continuityTransactionReceipts.set(`${key}:compact`, { identity: compact });
+      let closes = 0, attached = true;
+      const contents = Object.assign(new EventEmitter(), f.tab.view.webContents, {
+        setWindowOpenHandler() {}, close() { closes++; },
+      });
+      Object.defineProperty(f.tab.view, "webContents", { get: () => attached ? contents : undefined });
+      Object.assign(f.tab, { interactionMode, status, traceId: "destroyed-trace", helperPid: process.pid });
+      const live = { id: "other-page", status: "running", view: { webContents: { isDestroyed: () => false } } };
+      const terminals = [];
+      Object.setPrototypeOf(f.host, BrowserHost.prototype);
+      Object.assign(f.host, {
+        turnTabs: new Map([[f.tab.id, f.tab], [live.id, live]]), closedTurnOwners: new Map(),
+        selectedTabId: f.tab.id, window: { contentView: { removeChildView() {} } },
+        logger: { info() {}, warn() {} }, syncViewVisibility() {}, writeDescriptor() {},
+        signalManualTerminal(_tab, state) { terminals.push(state); },
+      });
+      f.live();
+      if (interactionMode === "manual") f.host.bindManualTurnContents(f.tab);
+      else f.host.bindTurnContents(f.tab);
+      attached = false;
+      f.destroy();
+      assert.doesNotThrow(() => contents.emit("destroyed"));
+      assert.deepEqual(physicalTurnTabs(f.host), [live]);
+      const [receipt] = cleanupReceipts(f.host, f.creation);
+      assert.equal(receipt.state, "destroyed");
+      assert.equal(receipt.attempts, 0, "an observed destroyed page needs no close attempt");
+      assert.equal(receipt.physicalPageId, f.tab.physicalPageId);
+      assert.equal(f.host.continuityPageCleanups.get(contents).contents, contents);
+      assert.equal(closes, 0);
+      assert.deepEqual(JSON.parse(fs.readFileSync(f.journalFile)).threads, {});
+      assert.deepEqual(JSON.parse(fs.readFileSync(f.registryFile)).entries, {});
+      assert.equal(f.host.continuityTransactions.size, 0);
+      assert.equal(f.host.continuityTransactionReceipts.size, 0);
+      assert.deepEqual(terminals, interactionMode === "manual" ? ["failed"] : []);
+      contents.emit("destroyed");
+      assert.equal(f.host.turnTabs.get(live.id), live);
+      assert.equal(cleanupReceipts(f.host, f.creation)[0].cleanupId, receipt.cleanupId);
+    });
+  }
+}
+
 test("unavailable webContents without a captured destruction observation cannot clear page storage", t => {
   const f = fixture(t), key = `${f.creation.installationId}:${f.creation.threadKey}`;
   f.host.continuityTransactions.set(key, { identity: f.creation });
   Object.defineProperty(f.tab.view, "webContents", { get: () => undefined });
   assert.doesNotThrow(() => removedContinuityTab(f.host, f.tab));
+  assert.throws(() => cleanupTurnPage(f.host, f.tab), { code: "continuity_unverified" });
+  assert.equal(f.host.continuityPageCleanups, undefined, "missing contents cannot manufacture a destroyed receipt");
   assert.equal(removeDestroyedPage(f.host, f.creation, f.tab), false);
   assert.deepEqual(JSON.parse(fs.readFileSync(f.journalFile)), f.document);
   assert.deepEqual(JSON.parse(fs.readFileSync(f.registryFile)), f.registry);

@@ -1596,8 +1596,13 @@ describe("trusted Codex task environment continuity", () => {
     });
   }
 
-  test("local compaction re-id maps a retained instruction only to one exact native predecessor", () => {
+  for (const shared of [false, true]) test(`local compaction re-id maps a retained instruction only to one exact native predecessor (shared=${shared})`, () => {
     const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const bridgeHome = shared ? mkdtempSync(join(tmpdir(), "codex-shared-alias-")) : codexHome;
+    if (shared) temporaryRoots.push(bridgeHome);
+    const createStore = () => new ChatGptThreadEnvironmentStore(
+      undefined, Date.now, bridgeHome, undefined, shared ? [codexHome] : [],
+    );
     const body = request._rawBody as { input: Array<Record<string, unknown>> };
     const source = structuredClone(body.input[0]!);
     const retained = { ...source, id: "msg_retained_after_compaction" };
@@ -1606,7 +1611,7 @@ describe("trusted Codex task environment continuity", () => {
       JSON.stringify({ type: "compacted", payload: { replacement_history: [retained] } }),
     ].join("\n") + "\n");
     body.input[0] = retained;
-    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const store = createStore();
     expect(store.resolve(request).cwd).toBe(root);
     expect(request._chatGptMessageIdAliases).toEqual({
       msg_retained_after_compaction: "msg_child_prompt",
@@ -1624,7 +1629,7 @@ describe("trusted Codex task environment continuity", () => {
     });
     delete (compact._rawBody as { input: Array<Record<string, unknown>> }).input[0]!
       .internal_chat_message_metadata_passthrough;
-    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(compact).cwd).toBe(root);
+    expect(createStore().resolve(compact).cwd).toBe(root);
     expect(compact._chatGptMessageIdAliases).toEqual({
       msg_retained_after_compaction: "msg_child_prompt",
     });
@@ -1634,7 +1639,7 @@ describe("trusted Codex task environment continuity", () => {
       type: "response_item",
       payload: { ...source, id: "msg_same_instruction_again" },
     }) + "\n");
-    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request).cwd).toBe(root);
+    expect(createStore().resolve(request).cwd).toBe(root);
     expect(request._chatGptMessageIdAliases).toBeUndefined();
   });
 
@@ -2208,6 +2213,73 @@ describe("trusted Codex task environment continuity", () => {
     environmentPart.text = environmentXml;
     rmSync(rolloutPath);
     expect(() => store.resolve(request)).toThrow("missing cwd");
+  });
+
+  for (const shared of [false, true]) for (const format of ["v1", "v2"]) test(`${format} full-access compaction keeps current workspace context when a restart omits native roots (#847, shared=${shared})`, () => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const bridgeHome = shared ? mkdtempSync(join(tmpdir(), "codex-shared-compaction-")) : codexHome;
+    if (shared) temporaryRoots.push(bridgeHome);
+    const body = request._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    body.input[0]!.internal_chat_message_metadata_passthrough = { turn_id: oldTurnId };
+    const summary = `Full-access restart checkpoint ${format} shared=${shared}`;
+    rememberCompactionContinuation({ ...request, _compactionRequest: true }, extractChatGptTurnIdentity(request), [
+      { turnId: oldTurnId, content: body.input[0]!.content },
+    ], summary);
+    const auxiliary = join(codexHome, "second-workspace");
+    const currentEnvironment = environmentXml.replace(
+      "</workspace_roots>", `<root>${auxiliary}</root></workspace_roots>`,
+    );
+    const environmentPart = { type: "input_text", text: currentEnvironment };
+    body.input.unshift({
+      type: "message", role: "user", id: "msg_current_environment", content: [environmentPart],
+      internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
+    });
+    body.input.push(format === "v2"
+      ? { type: "compaction", encrypted_content: encodeCompactionSummary(summary) }
+      : { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] });
+    const native = childTurnContext(rolloutTurnId, { workspace_roots: [root, auxiliary] });
+    const payload = native.payload as Record<string, unknown>;
+    const writeContext = () => writeFileSync(rolloutPath, [
+      { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } }, native,
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    const resolveCurrent = () => new ChatGptThreadEnvironmentStore(
+      undefined, Date.now, bridgeHome, undefined, shared ? [codexHome] : [],
+    ).resolve(request);
+    writeContext();
+    const beforeRestart = resolveCurrent();
+    expect(beforeRestart.roots).toEqual([root, auxiliary]);
+    delete payload.workspace_roots;
+    writeContext();
+    expect(resolveCurrent()).toEqual(beforeRestart);
+
+    // Git metadata may also retain the second workspace. It is not a new grant.
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.workspaces = { [root]: {}, [auxiliary]: {} };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    expect(resolveCurrent()).toEqual(beforeRestart);
+    metadata.workspaces = { [root]: {} };
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+
+    for (const conflict of [
+      currentEnvironment.replaceAll(root, join(codexHome, "different-cwd")),
+      currentEnvironment.replace(dangerFullAccessProfileXml, readOnlyProfileXml),
+    ]) {
+      environmentPart.text = conflict;
+      expect(resolveCurrent).toThrow("environment conflicts");
+    }
+    environmentPart.text = currentEnvironment;
+    // An explicitly declared root set must still match, even with full access.
+    payload.workspace_roots = [root];
+    writeContext();
+    expect(resolveCurrent).toThrow("Compaction continuation environment conflicts");
+    payload.workspace_roots = null;
+    writeContext();
+    expect(resolveCurrent).toThrow();
+    delete payload.workspace_roots;
+    payload.turn_id = oldTurnId;
+    writeContext();
+    expect(resolveCurrent).toThrow("current turn");
   });
 
   test("compaction keeps current native output-directory grants omitted from workspace roots", () => {
@@ -2858,11 +2930,11 @@ describe("Codex 0.162.1 native compaction checkpoints", () => {
   const replacement = (fixture: NativeCompactionFixture) => fixture.rolloutRecords.findLast(item => item.type === "compacted")!.payload;
   const environmentItem = (items: Array<Record<string, unknown>>) => items.find(item => Array.isArray(item.content)
     && (item.content as Array<{ text?: string }>).some(part => part.text?.startsWith("<environment_context>")))!;
-  const resolveSourceIdentity = (parsed: CodexParsedRequest, codexHome: string) => {
+  const resolveSourceIdentity = (parsed: CodexParsedRequest, codexHome: string, additionalCodexHomes?: readonly string[]) => {
     const source = extractChatGptCompactionSourceRevision(parsed);
     const identity = extractChatGptTurnIdentity(parsed);
     return resolveCurrentCodexRolloutMessageIdAliases({
-      codexHome, lineage: extractChatGptRootThreadMetadata(parsed)!,
+      codexHome, additionalCodexHomes, lineage: extractChatGptRootThreadMetadata(parsed)!,
       turnId: source.turnId ?? identity.turnId!, revisions: [source], compactionSource: source,
       compactionTurnId: identity.turnId, compactionPhase: extractChatGptNativeCompactionPhase(parsed),
     });
@@ -2965,18 +3037,39 @@ describe("Codex 0.162.1 native compaction checkpoints", () => {
     }, SQLITE_TEST_TIMEOUT_MS);
   }
 
-  test("native compaction waits for complete source publication before attaching its owner", async () => {
+  for (const shared of [false, true]) test(`native compaction waits for complete source publication before attaching its owner (shared=${shared})`, async () => {
     const { fixture, codexHome, original, write } = currentCompactionFixture();
+    const bridgeHome = shared ? mkdtempSync(join(tmpdir(), "codex-shared-publication-")) : codexHome;
+    if (shared) temporaryRoots.push(bridgeHome);
     const published = [...fixture.rolloutRecords];
     fixture.rolloutRecords = fixture.rolloutRecords.filter(item => item.payload !== original);
     write();
     const timer = setTimeout(() => { fixture.rolloutRecords = published; write(); }, 15);
     try {
       const parsed = parseRequest(fixture.request);
-      expect((await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome)
+      expect((await new ChatGptThreadEnvironmentStore(undefined, Date.now, bridgeHome, undefined, shared ? [codexHome] : [])
         .resolveWithRolloutPublicationRetry(parsed)).cwd).toBe(fixtureRoot);
       expect(parsed._chatGptCompactionSourceTurnId).toBe(owner(original).turn_id);
     } finally { clearTimeout(timer); }
+  }, SQLITE_TEST_TIMEOUT_MS);
+
+  test("shared compaction rejects duplicate native owners before source proof or alias recovery", () => {
+    const { fixture, codexHome } = nativeCompactionFixture("manual-first-compaction");
+    const bridgeHome = mkdtempSync(join(tmpdir(), "codex-shared-source-owner-"));
+    temporaryRoots.push(bridgeHome);
+    const parsed = parseRequest(fixture.request);
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, bridgeHome, undefined, [codexHome]);
+    expect(resolveSourceIdentity(parsed, bridgeHome, [codexHome])?.turnId).toBeDefined();
+    expect(store.resolve(parsed).cwd).toBe(fixtureRoot);
+    const duplicatePath = join(bridgeHome, "sessions", "2026", "10", "12", fixture.rolloutFilename);
+    mkdirSync(dirname(duplicatePath), { recursive: true });
+    writeFileSync(duplicatePath, fixture.rolloutRecords.map(item => JSON.stringify(item)).join("\n") + "\n");
+    // Rechecking the same request must also discard an earlier resolved source owner.
+    const incoming = parsed;
+    expect(resolveSourceIdentity(incoming, bridgeHome, [codexHome])).toBeUndefined();
+    expect(() => store.resolve(incoming)).toThrow("multiple trusted homes");
+    expect(incoming._chatGptMessageIdAliases).toBeUndefined();
+    expect(incoming._chatGptCompactionSourceTurnId).toBeUndefined();
   }, SQLITE_TEST_TIMEOUT_MS);
 
   test("a native compact cannot repeat a proved current environment as older attributed history", () => {

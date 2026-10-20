@@ -3144,7 +3144,8 @@ export class TurnBroker implements TurnBrokerOwner {
         throw new NativeOperationError("codex_tool_operation_retired", retiredTurn !== undefined
           ? `${contract === "safe" ? "This request_id" : "This turn_token"} was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished.`
           + " This Codex Native action can no longer run."
-          : `${contract === "safe" ? "request id" : "turn token"} is invalid, expired, or revoked`);
+          : `${contract === "safe" ? "request id" : "turn token"} is invalid, expired, or revoked. `
+          + `Copy ${contract === "safe" ? "request_id" : "turn_token"} exactly from the current request; do not guess or reuse an earlier value.`);
       }
       if (activeChannel.recovery) assertRecoveryWriter(activeChannel.recovery);
       if (activeChannel.safe) {
@@ -3370,7 +3371,10 @@ export class TurnBroker implements TurnBrokerOwner {
     if (typeof token !== "string" || !token) throw new NativeOperationError("codex_tool_operation_unknown", "A Native capability reference is required");
     const channel = this.channels.get(token);
     if (!channel || channel.completionCommitted) {
-      throw new NativeOperationError("codex_tool_operation_retired", "The Native capability is invalid, expired, or has already finished");
+      const reference = request.contract === "safe" ? "request_id" : "turn_token";
+      throw new NativeOperationError("codex_tool_operation_retired",
+        "The Native capability is invalid, expired, or has already finished. "
+        + `Copy ${reference} exactly from the current request; do not guess or reuse an earlier value.`);
     }
     if (request.contract !== (channel.safe ? "safe" : "native")) {
       throw new NativeOperationError("codex_tool_operation_unknown", "The operation does not belong to this MCP contract");

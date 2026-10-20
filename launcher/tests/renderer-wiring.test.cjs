@@ -1311,7 +1311,7 @@ test("changing Bigger Context retires ordinary chats and preserves the continuit
   const vm = require("node:vm");
   const { continuityLease } = require("../electron/continuity-lease.cjs");
   const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
-    useSavedChats: false, autoApproveToolCalls: false, biggerContextAvailable: true };
+    useSavedChats: true, autoApproveToolCalls: false, biggerContextAvailable: true };
   const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
     traceId: "continuity-trace", continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32),
     continuityLastSuccessAt: Date.now(), view: { webContents: { isDestroyed: () => false } } };
