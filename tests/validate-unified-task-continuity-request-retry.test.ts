@@ -32,7 +32,9 @@ function publicLossFixture(successorFails = false) {
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-retry8-")), statePath = join(root, "continuity");
   new ContinuityRegistrationStore(statePath).initialize();
   const processInstance = continuityProcessInstance();
-  const launcherInstance = { pid: process.pid, startIdentity: processInstance.startIdentity, instanceId: "a".repeat(64) };
+  // The controlled Launcher uses a fixture identity when OS process probing is unavailable.
+  const launcherInstance = { pid: process.pid, startIdentity: processInstance.startIdentity === "unverified"
+    ? "darwin:Sat Oct 10 00:00:00 2026" : processInstance.startIdentity, instanceId: "a".repeat(64) };
   const pages = new Map<string, { continuity: ContinuityLease; state: "ready" | "running" }>();
   let sends = 0, dispatches = 0, browserRuns = 0;
   let successorRecord: RecoveryThreadRecord | undefined;
@@ -130,7 +132,7 @@ async function lostPublicContinuation(successorFails = false) {
   const f = publicLossFixture(successorFails), signal = new AbortController().signal;
   const headers = { "content-type": "application/json", "x-codex-turn-metadata": f.metadata };
   const first = await f.send({ body: JSON.stringify(f.body), headers, signal });
-  expect(first.envelope.error?.code).toBeUndefined();
+  expect(first.envelope.error?.code, JSON.stringify(first.envelope.error)).toBeUndefined();
   const call = first.envelope.output.find((item: Row) => item.type === "function_call"); expect(call).toBeDefined();
   const result = { type: "function_call_output", call_id: call.call_id, output: "original exact synthetic source result" };
   const body = JSON.stringify({ ...f.body, input: [...f.body.input, ...first.envelope.output, result] }); f.pages.clear();
