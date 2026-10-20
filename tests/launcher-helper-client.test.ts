@@ -1040,7 +1040,12 @@ test("a rejected old control frame waits for the real producer's first acknowled
 for (const rejectReceipt of [false, true]) test(`an observed original Send receipt may ${rejectReceipt ? "reject" : "settle"} after real helper failure without an old ACK or output`, async () => {
   const fixture = fencedHelperFixture(`
     const originalTimer = globalThis.setTimeout;
-    globalThis.setTimeout = (callback, delay, ...args) => originalTimer(callback, delay === 15000 ? 20 : delay, ...args);
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 15000) return originalTimer(callback, delay, ...args);
+      // Only accelerate the first submission receipt deadline.
+      globalThis.setTimeout = originalTimer;
+      return originalTimer(callback, 20, ...args);
+    };
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       await turn.onPreparedSelected(false);
       await turn.prepare();
@@ -1107,12 +1112,19 @@ test("a helper rejects its first claimed submitted fact after confirmed watchdog
     }
     const body = await request.json() as Record<string, unknown>;
     expect(body.phase).toBe("end");
+    // Releasing a turn can take longer than the accelerated watchdog interval.
+    await Bun.sleep(50);
     return Response.json({ ok: true, cancelledByUser: false, executionProtocol: 1, recovery: body.recovery });
   } });
   const endpoint = `http://127.0.0.1:${server.port}`;
   const fixture = fencedHelperFixture(`
     const originalTimer = globalThis.setTimeout;
-    globalThis.setTimeout = (callback, delay, ...args) => originalTimer(callback, delay === 15000 ? 20 : delay, ...args);
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 15000) return originalTimer(callback, delay, ...args);
+      // Only accelerate the abort watchdog; keep the release request's timeout.
+      globalThis.setTimeout = originalTimer;
+      return originalTimer(callback, 20, ...args);
+    };
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       await turn.onPreparedSelected(false);
       await turn.prepare();
