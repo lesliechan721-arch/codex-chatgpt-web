@@ -25,7 +25,7 @@ import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
 import type { CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -228,10 +228,10 @@ test("DOM observations retain only hashes and reject foreign run, trace, prompt 
 });
 
 test("private observer helper builds and loads the original helper entry without browser operations", async () => {
-  const root = resolve(import.meta.dir, "../.dev-workflows/model-context-rendering/tmp");
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  const output = mkdtempSync(join(root, "dom-observer-build-test-"));
+  const output = mkdtempSync(join(tmpdir(), "dom-observer-build-test-"));
   try {
+    // The generated helper needs project dependencies when it runs outside the repository.
+    symlinkSync(resolve(import.meta.dir, "../node_modules"), join(output, "node_modules"), process.platform === "win32" ? "junction" : "dir");
     const helper = await prepareObservedBrowserHelper(output, "fixture_run");
     expect(existsSync(helper.helper)).toBe(true);
     expect(readFileSync(join(output, "dom-observer-entry.ts"), "utf8")).toContain("browser-helper-main.ts");
