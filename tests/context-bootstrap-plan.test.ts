@@ -11,9 +11,10 @@ import { CONTEXT_PROTOCOL_VERSION, type ContextPreparedReply } from "../src/adap
 import { contextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
 import type { ContextReadArgs } from "../src/adapters/chatgpt-web/context-types";
 import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
-import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { defaultBrokerEndpoint } from "../src/config";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
@@ -128,10 +129,11 @@ test("fixed aggregate records preserve null, false, empty values and unknown str
 });
 
 test("ContextSend selects the candidate's actual snapshot and retains only real source history for compaction", async () => {
-  const canonical = fixture(), broker = TurnBroker.forSocket(join(tmpdir(), `bootstrap-${randomUUID().slice(0, 12)}.sock`));
-  const turnToken = await broker.register({ authorityMode: "delegated", threadId: "thread", turnId: "turn", tools: [] });
+  const canonical = fixture(), directory = mkdtempSync(join(tmpdir(), "ctx-plan-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   const send = new ContextSend(canonical, broker, capabilities, "bootstrap-page");
   try {
+    const turnToken = await broker.register({ authorityMode: "delegated", threadId: "thread", turnId: "turn", tools: [] });
     const first = await send.prepare(canonical, turnToken, {});
     const second = await send.prepare(canonical, turnToken, {});
     expect(first.snapshot.context_id).not.toBe(second.snapshot.context_id);
@@ -141,20 +143,21 @@ test("ContextSend selects the candidate's actual snapshot and retains only real 
     await send.sent();
     expect(() => send.coverage.prove(createContextSnapshot(canonical), { historyRevision: 0, pageGeneration: "bootstrap-page" })).not.toThrow();
     CompactionSourceCoverage.assertRecordedSource(createContextSnapshot(canonical), send.coverage.metadata(), 0);
-  } finally { send.retire(); await broker.close(); }
+  } finally { send.retire(); await broker.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 for (const manual of [false, true]) test(`bootstrap retained accounting credits first text pages and charges other returns once (${manual ? "manual" : "automatic"})`, async () => {
   const canonical = fixture();
   if (manual) canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
-  const broker = TurnBroker.forSocket(join(tmpdir(), `bootstrap-cost-${randomUUID().slice(0, 12)}.sock`));
+  const directory = mkdtempSync(join(tmpdir(), "ctx-cost-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   const environment = { authorityMode: "delegated" as const, threadId: "thread", turnId: "turn", tools: [] };
   const register = () => manual ? broker.registerSafe(environment, "bootstrap-cost-surface-123456", undefined, undefined,
     { requireSentConfirmation: false }) : broker.register(environment);
-  const token = await register(), contract = manual ? "safe" as const : "native" as const;
   const send = new ContextSend(canonical, broker, capabilities, "bootstrap-page");
   let next: ContextSend | undefined;
   try {
+    const token = await register(), contract = manual ? "safe" as const : "native" as const;
     const selected = await send.prepare(canonical, token, manual ? { manualControl: true } : {});
     await send.select(token, selected); await send.sent();
     const initialTokens = send.coverage.pageTokenReserve();
@@ -206,5 +209,5 @@ for (const manual of [false, true]) test(`bootstrap retained accounting credits 
     next = new ContextSend(canonical, broker, capabilities, "bootstrap-page", send.coverage);
     const nextPlan = await next.prepare(canonical, await register(), manual ? { manualControl: true } : {}, send.coverage.pageTokenReserve());
     expect(nextPlan.costs.retainedTokens).toBe(expectedTokens);
-  } finally { next?.retire(); send.retire(); await broker.close(); }
+  } finally { next?.retire(); send.retire(); await broker.close(); rmSync(directory, { recursive: true, force: true }); }
 });
