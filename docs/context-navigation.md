@@ -127,10 +127,64 @@ Two- and six-part inputs partition complete records in one format. A raw field n
 Manifests and ACKs refer to the actual fixed payload bytes. The coverage journal records the selected
 `contextFormat` with the body digest and costs; older records without it mean `legacy-json`.
 
+## Same-page rule reuse
+
+`context-reuse-v1` extends ordinary Full/MCP startup in Automatic and Zero Risk. A healthy
+ordinary continuation on the same physical page can reuse exact rule and protocol units from
+the preceding successfully completed task. Each new user event is delivered in full, including
+identical consecutive requests. Current environment, output schema and verbosity remain current
+task data. Reuse does not select a different history candidate or remove retained page cost.
+
+The new `context-bootstrap-payload-v2` explicitly identifies `full` or `incremental` delivery.
+Its structure and separate position table reconstruct the same selected candidate value tree.
+References contain unit identity, fingerprint, source role and scope, and a current source
+reference for exact rereading. A user value named like a reference is still user data. Reused
+bodies are absent from the required payload and startup metadata. The complete legal historical
+directory remains available on demand. A short complete increment is inline; a long increment
+uses required v2 text pages. An inline increment needs no artificial protocol or payload read.
+
+Source identity is checked against the real parsed request and its verified candidate mapping.
+The top-level Responses `instructions` field is a current rule field with replacement semantics.
+Uniquely identified system/developer sources and verified Native AGENTS sources can qualify as
+the same original source. Native content kinds alone do not establish identity across different
+message IDs. Unproven sources, plain text markers, unknown mixed records and user events cannot
+acquire reuse eligibility by their role, name, size or equal text. Source absence expresses a
+replacement only for a producer field with an explicit replacement contract; cache eviction
+does not revoke a rule.
+
+A baseline contains bounded identity and delivery metadata, not retained source bodies. It is
+committed only after the current required text and images, original completion checks, normal
+final response and physical termination all succeed. Page identity and the completed predecessor
+are checked again at commit. New scopes start with empty text coverage. `reuse_ready` checks
+the fixed baseline dependency separately from `text_ready` and `images_ready`, at preparation,
+Send admission, new business admission and successful completion. A baseline failure stops new
+work and success under that plan; it does not alter a sent plan or authorize another Send.
+
+New pages, cold recovery, restart and known compaction require full delivery and a new baseline.
+A proved unsent preparation failure can preserve the last healthy baseline. Late callbacks cannot
+commit to a successor. Baselines are limited to 128 units and 64 KiB of metadata per page; capacity
+loss causes complete redelivery. Exact rereads use current source data and credentials and count
+against navigation and retained-page costs. Neither a baseline nor a receipt proves model memory.
+The page budget uses the configured model and account limits. An enabled Bigger Context setting
+also applies when a short increment uses one message; the ordinary per-message limits remain
+unchanged. A small page window can still require a fresh page during a long sequence of turns.
+Content-free diagnostics record the lifecycle reason before dropping a baseline, the selected
+candidate, serialized prompt size and budget components. Transport observations separate the
+first startup manifest, later overview returns and directory pages. They count actual successful
+transport returns independently of unique text coverage; model input tokens remain unknown.
+
+Startup still uses `context-bootstrap-v1`; text reads still use `context-text-read-v2`.
+Reuse plans expose manifest version 2, the reuse capability, payload format and delivery mode.
+Known lack of reuse support can use the complete v1 short-start plan if supported and within all
+limits. Lack of reuse support does not imply lack of bootstrap support. A capability mismatch
+after Send stops that request and uses the existing connector repair path. Optional Verify runtime
+records do not enable reuse or control this decision. Zero Risk keeps manual Send, configured
+Sent confirmation and separate image confirmation, with no new reuse confirmation.
+
 ## Short startup and required text
 
-The short-start plan captures the complete selected task and generated execution protocol as required
-sources. It preserves the selected value tree, source identity, roles, order, empty values, unknown
+The complete v1 short-start plan captures the selected task and generated execution protocol as required
+sources. Reuse-enabled v2 plans apply the rules above. Both preserve the selected value tree, source identity, roles, order, empty values, unknown
 structure, and known completeness. It does not infer authority from body markers such as
 `role:developer` or `AGENTS.md`. The guarantee starts after existing normalization, attachment
 projection, and retired-handle cleanup. It does not restore data that those steps already removed.

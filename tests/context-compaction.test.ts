@@ -127,6 +127,7 @@ for (const bigger of [false, true]) test(`compaction protects platform capacity 
   const selectedCapabilities = { ...capabilities, experimentalBiggerContext: bigger };
   const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-platform-capacity-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
+  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const options = bigger ? { experimentalMultipartParts: 2 as const } : {};
   const token = "capacity-test-token";
   const first = new ContextSend(parsed, broker, capabilities, "capacity-page");
@@ -170,7 +171,7 @@ for (const bigger of [false, true]) test(`compaction protects platform capacity 
     expect(registration).not.toHaveBeenCalled();
     await first.retire(); await second.retire(); await boundary.retire();
   } finally {
-    registration.mockRestore(); await broker.abortCompactionTransaction(transaction.token);
+    registration.mockRestore(); reuseCapability.mockRestore(); await broker.abortCompactionTransaction(transaction.token);
     await broker.close(); rmSync(directory, { recursive: true, force: true });
   }
 });

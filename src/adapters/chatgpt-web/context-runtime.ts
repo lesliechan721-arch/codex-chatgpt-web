@@ -1,3 +1,4 @@
+import { ContextReuseDiagnostics } from "./context-reuse-diagnostics";
 import { createHash, randomBytes } from "node:crypto";
 import { ContextNavigator, ContextNavigationStoppedError, type ContextNavigationUsage } from "./context-navigator";
 import type { ContextSnapshot } from "./context-snapshot";
@@ -7,6 +8,9 @@ import type { BrokerToolResult } from "./turn-broker";
 import { NativeOperationError } from "./native-tool-operations";
 import { contextTextReadReceipt, contextTextReadReceiptsEqual, parseContextTextReadResult, type ContextTextReadReceipt } from "./context-text-result";
 import { ContextTextCoverage } from "./context-text-coverage";
+
+import { CONTEXT_REUSE_PROTOCOL, type ContextReusePlan, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
+import { boundedContextReuse } from "./context-reuse-lifecycle";
 
 export const CONTEXT_PROTOCOL_VERSION = 3;
 export const CONTEXT_READY_TIMEOUT_MS = 120_000;
@@ -21,6 +25,7 @@ export interface ContextPlanRegistration {
   manifestDigest: string;
   deliveryByTarget: Readonly<Record<string, ContextDelivery>>;
   startupProtocol?: "context-bootstrap-v1";
+  reuse?: ContextReusePlan;
   limits?: ContextLimitOverrides;
   requiredImageTokenReserves?: Readonly<Record<string, number>>;
   requiredImageWireReserves?: Readonly<Record<string, number>>;
@@ -34,6 +39,8 @@ export interface ContextStatus {
   plan_id: string;
   context_ready: boolean;
   text_ready: boolean;
+  reuse_ready?: boolean;
+  reuse_failure?: string;
   images_ready: boolean;
   required_texts: number;
   delivered_texts: number;
@@ -70,6 +77,8 @@ export interface ContextUsageEvidence {
   usage: ContextNavigationUsage;
   reserved_tokens_used: number;
   final: boolean;
+  reuse_delivery?: ContextReuseDeliveryEvidence;
+  reuse_diagnostics?: ReturnType<ContextReuseDiagnostics["snapshot"]>;
 }
 export interface ContextVerificationRegistration {
   normal: ContextPlanRegistration;
@@ -111,11 +120,14 @@ export class ContextScope {
   private readonly generatedRequiredImages = new Set<string>();
   private readonly generatedRequiredTextPages = new Set<ContextTextPageCost>();
   private readonly coverage = new ContextTextCoverage();
+  private readonly reuseDiagnostics = new ContextReuseDiagnostics();
+  private manifestSequence = 0;
+  private firstWorkReturns?: Set<string>;
   private readonly textPageCosts: Readonly<Record<string, readonly ContextTextPageCost[]>>;
   private readonly retryReserve: { tokens: number; wire_bytes: number };
   private readonly failedRequiredCost = { tokens: 0, wire_bytes: 0 };
   private reservedTokensUsed = 0;
-  private readonly pending = new Map<string, { targetId?: string; method: ContextMethod; successful: boolean; textRead?: ContextTextReadReceipt; requiredCost?: { tokens: number; wire_bytes: number }; timer: ReturnType<typeof setTimeout> }>();
+  private readonly pending = new Map<string, { targetId?: string; manifestOrder?: number; method: ContextMethod; successful: boolean; observedCost: { wire_bytes: number; total_tokens: number }; textRead?: ContextTextReadReceipt; requiredCost?: { tokens: number; wire_bytes: number }; timer: ReturnType<typeof setTimeout> }>();
   private live = true;
   private deliveredEntry = false;
   private permanentFailure = false;
@@ -131,8 +143,20 @@ export class ContextScope {
     private readonly changed: () => void,
     private readonly fail: (error: Error) => void,
     readonly expiresAt?: number,
+    private readonly reuseValid: () => boolean = () => !registration.reuse?.dependency,
   ) {
     identifier(registration.planId); identifier(registration.manifestDigest);
+    if (registration.reuse) {
+      const reuse = registration.reuse;
+      if (reuse.protocol !== CONTEXT_REUSE_PROTOCOL || reuse.payload_format !== "context-bootstrap-payload-v2"
+        || !boundedContextReuse(reuse) || new Set(reuse.units.map(unit => unit.unit_id)).size !== reuse.units.length
+        || reuse.units.some(unit => !registration.snapshot.getTarget(unit.target_id)
+          || !["inline", "required", "reuse"].includes(unit.delivery)
+          || unit.delivery === "required" && !registration.deliveryByTarget[unit.target_id]?.required
+          || unit.delivery === "reuse" && !reuse.dependency?.units.some(dependency => dependency.unit_id === unit.unit_id && dependency.fingerprint === unit.fingerprint))) {
+        throw contextError("CONTEXT_INVALID", "Invalid bounded reuse unit delivery plan");
+      }
+    }
     const limits = contextLimits(registration.limits);
     const supplied = registration.remainingBudget;
     this.effectiveBudget = { tokens: supplied?.tokens ?? limits.maxTotalTokens,
@@ -157,7 +181,7 @@ export class ContextScope {
     }
     const pageCosts: Record<string, readonly ContextTextPageCost[]> = {};
     const preflight = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose, limits: registration.limits,
-      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest } } : {}) });
+      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest, ...(registration.reuse ? { reuse: registration.reuse } : {}) } } : {}) });
     for (const target of this.requiredTextTargets()) {
       let pages = registration.requiredTextPageCosts?.[target.target_id];
       if (!pages) {
@@ -242,7 +266,7 @@ export class ContextScope {
     catch { throw contextError("BUDGET_EXCEEDED", "The context budget cannot protect required sources, completion and bounded corrective replies"); }
     this.navigator = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose,
       deliveryByTarget: registration.deliveryByTarget, limits: registration.limits, remainingBudget,
-      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest } } : {}) });
+      ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest, ...(registration.reuse ? { reuse: registration.reuse } : {}) } } : {}) });
   }
 
   assertPending(receiptId: string, textRead?: ContextTextReadReceipt): void {
@@ -254,8 +278,37 @@ export class ContextScope {
   get inFlight(): number { return this.pending.size; }
   get isLive(): boolean { return this.live && (this.expiresAt === undefined || Date.now() < this.expiresAt); }
   usageEvidence(final = false): ContextUsageEvidence {
+    const reuseDelivery = this.reuseDeliveryEvidence();
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
-      purpose: this.purpose, usage: this.navigator.usage(), reserved_tokens_used: this.reservedTokensUsed, final };
+      purpose: this.purpose, usage: this.navigator.usage(), reserved_tokens_used: this.reservedTokensUsed, final,
+      ...(this.registration.reuse ? { reuse_diagnostics: this.reuseDiagnostics.snapshot() } : {}),
+      ...(reuseDelivery ? { reuse_delivery: reuseDelivery } : {}) };
+  }
+  recordFirstWork(): void {
+    if (this.firstWorkReturns) return;
+    this.firstWorkReturns = new Set(this.pending.keys());
+    this.reuseDiagnostics.freeze();
+  }
+  /** Observe the actual start envelope without charging its already-generated manifest twice. */
+  prepareBootstrapReturn(response: Record<string, unknown>): string {
+    this.assertLive();
+    if (this.pending.size >= 8) throw contextError("CONTEXT_BUSY", "Wait for in-flight context returns");
+    const result = { content: [{ type: "text", text: JSON.stringify(response) }], structuredContent: response };
+    const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
+    const timer = setTimeout(() => this.finish(receiptId, false), CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
+    this.pending.set(receiptId, { manifestOrder: this.manifestSequence++, method: "list", successful: true,
+      observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), timer });
+    this.changed();
+    return receiptId;
+  }
+  private reuseDeliveryEvidence(): ContextReuseDeliveryEvidence | undefined {
+    const reuse = this.registration.reuse;
+    if (!reuse || !this.deliveredEntry || !this.live || this.permanentFailure || this.pending.size || !this.status().context_ready) return undefined;
+    if (reuse.units.some(unit => unit.delivery === "required" && !this.coverage.contains(unit.target_id, 0,
+      this.registration.snapshot.getTarget(unit.target_id)!.utf8_bytes!))) return undefined;
+    const evidence = { plan_id: this.registration.planId, context_id: this.registration.snapshot.context_id,
+      units: reuse.units.map(({ delivery, target_id, ...unit }) => unit), snapshots: reuse.snapshots };
+    return boundedContextReuse(evidence) ? evidence : undefined;
   }
   private hasPendingImage(targetId: string): boolean { return [...this.pending.values()].some(pending => pending.targetId === targetId); }
   private requiredTargets() {
@@ -280,8 +333,10 @@ export class ContextScope {
     const nextRequiredRead: ContextRequiredRead | null = image ? { tool: "codex_context_read", arguments: {
       context_id: this.registration.snapshot.context_id, read_ref: image.read_ref! } } : text ? {
       tool: "codex_context_read", arguments: this.navigator.readArgsAt(text.target_id, this.coverage.firstGap(text.target_id)) } : null;
+    const reuseReady = this.reuseValid();
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
-      context_ready: remaining.length === 0 && missingTexts.length === 0, images_ready: remaining.length === 0, text_ready: missingTexts.length === 0,
+      ...(this.registration.reuse ? { reuse_ready: reuseReady, ...(!reuseReady ? { reuse_failure: "baseline_invalid" } : {}) } : {}),
+      context_ready: remaining.length === 0 && missingTexts.length === 0 && reuseReady && (!this.registration.reuse || this.deliveredEntry), images_ready: remaining.length === 0, text_ready: missingTexts.length === 0 && (!this.registration.reuse || this.deliveredEntry),
       required_texts: texts.length, delivered_texts: texts.length - missingTexts.length, remaining_texts: missingTexts.length,
       required_text_bytes: texts.reduce((sum, target) => sum + target.utf8_bytes!, 0),
       delivered_text_bytes: texts.reduce((sum, target) => sum + this.coverage.bytes(target.target_id), 0), next_required_read: nextRequiredRead,
@@ -317,7 +372,9 @@ export class ContextScope {
   notReady(): BrokerToolResult | undefined {
     this.assertLive();
     const status = this.status();
-    return status.context_ready ? undefined : contextFailure("CONTEXT_NOT_READY", "Deliver the required context and confirm required attachments. Use a new operation_id for new work after readiness.", { ...status });
+    return status.context_ready ? undefined : status.reuse_ready === false
+      ? contextFailure("CONTEXT_NOT_READY", "The fixed reuse baseline is no longer valid. Stop new work and recover a new complete plan through the original lifecycle; do not resend this plan.", { ...status, recovery_action: "recover_full_plan" })
+      : contextFailure("CONTEXT_NOT_READY", "Deliver the required context and confirm required attachments. Use a new operation_id for new work after readiness.", { ...status });
   }
   assertReady(): void {
     const failure = this.notReady();
@@ -402,7 +459,9 @@ export class ContextScope {
       && (target.kind === "image" ? !this.delivered.has(target.target_id) : !this.coverage.contains(target.target_id, 0, target.utf8_bytes!));
     const cost = required && !result.isError ? measureContextResponse(result, { ...contextLimits(this.registration.limits),
       visualTokens: target?.visual_token_reserve ?? 0 }) : undefined;
-    this.pending.set(receiptId, { ...(validImage || textRead ? { targetId: target!.target_id } : {}), method, successful: !result.isError, textRead,
+    this.pending.set(receiptId, { ...(validImage || textRead ? { targetId: target!.target_id } : {}), method,
+      manifestOrder: !result.isError && method === "list" && (args as ContextListArgs).view === "overview" ? this.manifestSequence++ : undefined, successful: !result.isError,
+      observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), textRead,
       ...(cost ? { requiredCost: { tokens: cost.total_tokens, wire_bytes: cost.wire_bytes } } : {}), timer });
     this.changed();
     return { result, receiptId };
@@ -410,8 +469,10 @@ export class ContextScope {
   finish(receiptId: string, sent: boolean, textRead?: ContextTextReadReceipt): ContextSuccessfulReturn | undefined {
     const pending = this.pending.get(receiptId);
     if (!pending) return;
+    const beforeFirstWork = this.firstWorkReturns?.delete(receiptId) ?? false;
     clearTimeout(pending.timer); this.pending.delete(receiptId);
     const successful = sent && this.isLive && pending.successful && (!pending.textRead || contextTextReadReceiptsEqual(pending.textRead, textRead));
+    const beforeBytes = pending.targetId ? this.coverage.bytes(pending.targetId) : 0;
     if (successful && pending.targetId) {
       if (pending.textRead) this.coverage.add(pending.targetId, pending.textRead.range);
       else if (!this.delivered.has(pending.targetId)) { this.delivered.add(pending.targetId); this.lastProgress = Date.now(); }
@@ -419,6 +480,11 @@ export class ContextScope {
       this.failedRequiredCost.tokens += pending.requiredCost.tokens;
       this.failedRequiredCost.wire_bytes += pending.requiredCost.wire_bytes;
     }
+    if (sent && this.isLive) this.reuseDiagnostics.sent({ wireBytes: pending.observedCost.wire_bytes,
+      tokens: pending.observedCost.total_tokens, successful: pending.successful, method: pending.method, manifestOrder: pending.manifestOrder,
+      ...(successful && pending.textRead ? { textBytes: pending.textRead.range.end_exclusive - pending.textRead.range.start,
+        uniqueBytes: this.coverage.bytes(pending.targetId!) - beforeBytes,
+        reusedSource: this.registration.reuse?.units.some(unit => unit.delivery === "reuse" && unit.target_id === pending.targetId) } : {}) }, beforeFirstWork);
     this.changed(); this.scheduleReadiness();
     return successful
       ? { method: pending.method, ...(pending.textRead ? { textRead: pending.textRead } : {}) } : undefined;

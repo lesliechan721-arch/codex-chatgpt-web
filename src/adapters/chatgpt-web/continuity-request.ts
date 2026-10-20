@@ -1,3 +1,4 @@
+import { contextReusePageIdentity } from "./context-reuse-lifecycle";
 import { recoveryContinuationPrimaryIndices } from "./continuity-source";
 import { isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
@@ -1040,6 +1041,19 @@ async function prepareContinuityRequestUnlocked(
       input = continuityAcceptedContextCandidate(parsed, binding.initialAcceptedInput);
       pendingPageContext = true;
     } else input = parsed;
+    const contextReuseAvailable = !parsed._compactionRequest && (await bindings.broker?.contextReuseAvailable?.() ?? false);
+    const savedReuse = binding?.contextReuseBaseline;
+    const reuseRef = binding?.recovery;
+    const reuseRecord = savedReuse && reuseRef ? bindings.recoveryStore.get(thread) : undefined;
+    const reuseReason = parsed._compactionRequest || checkpointTransition ? "compaction"
+      : !savedReuse ? "no_baseline"
+      : !expected || !reuseRef || !reuseRecord || savedReuse.page_identity !== contextReusePageIdentity(reuseRef, reuseRecord) ? "page_changed"
+      : binding?.state !== "ready" ? "page_unsettled"
+      : savedReuse.predecessor !== reuseRef.logicalWorkId || reuseRecord.currentWorkId !== reuseRef.logicalWorkId
+        || reuseRecord.works[reuseRef.logicalWorkId]?.state !== "completed" ? "predecessor_changed" : "available";
+    const reuseBaseline = reuseReason === "available" ? savedReuse : undefined;
+    if (contextReuseAvailable || savedReuse) console.info(`[chatgpt-web] context_reuse_selection ${JSON.stringify({
+      stage: "preflight", candidate: expected ? "resume" : "full", reason: reuseReason })}`);
     if (!finalReplaySource && expected) {
       await toolSource?.runtime.syncContextUsage?.();
       const coverage = toolSource?.runtime.compactionSourceCoverage;
@@ -1050,9 +1064,11 @@ async function prepareContinuityRequestUnlocked(
       let retainedFailure = false;
       if (!config.experimentalFreshConversationPerTurn && retainedTokens !== undefined) {
         try { preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, true,
-          { retainedTokens, experimentalBiggerContext: config.experimentalBiggerContext }); }
+          { canonical: parsed, retainedTokens, experimentalBiggerContext: config.experimentalBiggerContext, contextReuseAvailable, reuseBaseline, ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) }); }
         catch (error) {
           if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
+          const costs = (error as { details?: { costs?: { retainedTokens?: number; requiredTotalTokens?: number; contextWindowTokens?: number; reuse?: unknown } } }).details?.costs;
+          console.info(`[chatgpt-web] context_preflight_limit ${JSON.stringify({ retained_tokens: retainedTokens, reuse_baseline: !!reuseBaseline, total_tokens: costs?.requiredTotalTokens, window_tokens: costs?.contextWindowTokens, reuse: costs?.reuse, code: (error as { code?: string }).code })}`);
           retainedFailure = true;
         }
       }
@@ -1060,10 +1076,11 @@ async function prepareContinuityRequestUnlocked(
         input = parsed;
         expected = undefined;
         coldPage = true;
+        console.info(`[chatgpt-web] context_candidate_fallback ${JSON.stringify({ selected: "full", reason: config.experimentalFreshConversationPerTurn ? "fresh_page" : retainedTokens === undefined ? "unproven_page_cost" : "retained_budget" })}`);
       }
     }
     if (!finalReplaySource) preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, Boolean(expected),
-      { experimentalBiggerContext: config.experimentalBiggerContext });
+      { canonical: parsed, experimentalBiggerContext: config.experimentalBiggerContext, contextReuseAvailable, ...(expected && reuseBaseline ? { reuseBaseline } : {}), ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) });
   } else if (binding?.state === "compacting" && !parsed._compactionRequest
     && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     throw continuityError("continuity_source_unproven");

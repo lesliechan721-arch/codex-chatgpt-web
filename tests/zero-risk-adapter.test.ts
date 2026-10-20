@@ -1,5 +1,5 @@
 import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -175,6 +175,7 @@ for (const scenario of [
   );
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const mcp = new Client({ name: "zero-risk-compaction-fixture", version: "1" });
   await mcp.connect(new StdioClientTransport({ command: process.execPath,
     args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", socket],
@@ -647,6 +648,7 @@ for (const scenario of [
   } finally {
     chatGptTurnSessions.clear();
     for (const tab of host.turnTabs.values()) clearTimeout(tab.manualDeadlineTimer);
+    reuseSupport.mockRestore();
     await broker.close();
     await mcp.close();
     await server.close();
@@ -656,6 +658,7 @@ for (const scenario of [
 test("Zero Risk adapter never starts the automatic browser worker and completes only through Zero Risk MCP", async () => {
   const config = provider("complete");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const worker = ChatGptBrowserWorker.forProvider(config);
   const originalRun = worker.run.bind(worker);
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
@@ -704,6 +707,7 @@ test("Zero Risk adapter never starts the automatic browser worker and completes 
   } finally {
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -712,6 +716,7 @@ test("Zero Risk can use connector binding instead of a second Launcher Sent conf
   const config = provider("connector-confirmation");
   config.chatgptWeb!.zeroRiskRequireSentConfirmation = false;
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   const calls: string[] = [];
   const control: ChatGptZeroRiskManualControl = {
@@ -751,6 +756,7 @@ test("Zero Risk can use connector binding instead of a second Launcher Sent conf
       .toBe("Connector-confirmed Zero Risk answer");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -759,6 +765,7 @@ test("delegated Zero Risk starts without filesystem environment authority", asyn
   const config = provider("delegated-envless");
   config.chatgptWeb!.toolAuthorityMode = "delegated";
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   const control: ChatGptZeroRiskManualControl = {
     async start(_path, activity) { exactBinding = binding(activity.prompt); },
@@ -785,6 +792,7 @@ test("delegated Zero Risk starts without filesystem environment authority", asyn
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -792,6 +800,7 @@ test("delegated Zero Risk starts without filesystem environment authority", asyn
 test("a lost launcher completion acknowledgement cannot replace an authoritative Zero Risk answer", async () => {
   const config = provider("completion-ack-lost");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   const endStatuses: string[] = [];
   const control: ChatGptZeroRiskManualControl = {
@@ -822,6 +831,7 @@ test("a lost launcher completion acknowledgement cannot replace an authoritative
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -829,6 +839,7 @@ test("a lost launcher completion acknowledgement cannot replace an authoritative
 test("Zero Risk delivers a supported image through MCP without a manual attachment", async () => {
   const config = provider("image-boundary");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const input = request("turn_safe_image_boundary");
   input.context.messages[1] = {
     role: "user",
@@ -892,6 +903,7 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
       .toBe("MCP image handoff completed");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -899,6 +911,7 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
 test("a stopped Responses observer revokes its Zero Risk binding and releases the manual turn", async () => {
   const config = provider("stopped-observer");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   let signalVisible!: () => void;
   const visible = new Promise<void>(resolve => { signalVisible = resolve; });
@@ -938,6 +951,7 @@ test("a stopped Responses observer revokes its Zero Risk binding and releases th
       .toThrow("invalid, expired, or revoked");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -945,6 +959,7 @@ test("a stopped Responses observer revokes its Zero Risk binding and releases th
 test("a Zero Risk launcher failure remains failed when its own capability cleanup retires the broker", async () => {
   const config = provider("failed-cleanup");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   const ended: string[] = [];
   const control: ChatGptZeroRiskManualControl = {
@@ -966,6 +981,7 @@ test("a Zero Risk launcher failure remains failed when its own capability cleanu
       .toThrow("invalid, expired, or revoked");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -973,6 +989,7 @@ test("a Zero Risk launcher failure remains failed when its own capability cleanu
 test("Zero Risk offers only the new Codex suffix when the launcher reuses its retained ChatGPT chat", async () => {
   const config = provider("incremental-resume");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const input = request("turn_safe_incremental");
   input.context.messages.push(
     { role: "assistant", content: [{ type: "text", text: "Earlier answer already visible in ChatGPT." }], timestamp: 3 },
@@ -1029,6 +1046,7 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
     expect(resumePrompt).toContain("Continue with only this new request.");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });
@@ -1048,6 +1066,7 @@ test("Zero Risk compaction uses a fresh manual checkpoint without leaking guide 
     surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
   }), { mode: 0o600 });
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   let manualCompaction: true | undefined;
   const control: ChatGptZeroRiskManualControl = {
@@ -1090,6 +1109,7 @@ test("Zero Risk compaction uses a fresh manual checkpoint without leaking guide 
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
     launcher.stop(true);
   }
@@ -1098,6 +1118,7 @@ test("Zero Risk compaction uses a fresh manual checkpoint without leaking guide 
 test("closing the Zero Risk Launcher tab revokes the bound turn instead of waiting forever", async () => {
   const config = provider("cancelled-tab");
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let exactBinding: ReturnType<typeof binding> | undefined;
   let releaseTerminal!: () => void;
   const terminal = new Promise<void>(resolve => { releaseTerminal = resolve; });
@@ -1130,6 +1151,7 @@ test("closing the Zero Risk Launcher tab revokes the bound turn instead of waiti
       .toThrow("invalid, expired, or revoked");
   } finally {
     chatGptTurnSessions.clear();
+    reuseSupport.mockRestore();
     await broker.close();
   }
 });

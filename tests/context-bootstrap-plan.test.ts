@@ -163,14 +163,14 @@ for (const manual of [false, true]) test(`bootstrap retained accounting credits 
     const initialTokens = send.coverage.pageTokenReserve();
     const binding = { token, contract, credentialKind: "ordinary" as const, contextProtocol: CONTEXT_PROTOCOL_VERSION };
     const query = (args: ContextReadArgs) => callTurnBroker<ContextPreparedReply>(broker.socketPath, {
-      ...binding, method: "context_query", contextBootstrapProtocol: "context-bootstrap-v1", contextMethod: "read", contextArgs: args });
+      ...binding, method: "context_query", contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1", contextMethod: "read", contextArgs: args });
     const finish = (reply: ContextPreparedReply, sent = true) => callTurnBroker(broker.socketPath, {
       ...binding, method: "context_return", receiptId: reply.receiptId, sent,
       ...(!reply.result.isError ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
-    if (manual) await callTurnBroker(broker.socketPath, { ...binding, method: "safe_start", contextBootstrapProtocol: "context-bootstrap-v1" });
+    if (manual) await callTurnBroker(broker.socketPath, { ...binding, method: "safe_start", contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" });
     else {
       const overview = await callTurnBroker<ContextPreparedReply>(broker.socketPath, { ...binding, method: "context_query",
-        contextBootstrapProtocol: "context-bootstrap-v1", contextMethod: "list", contextArgs: { context_id: selected.snapshot.context_id, view: "overview" } });
+        contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1", contextMethod: "list", contextArgs: { context_id: selected.snapshot.context_id, view: "overview" } });
       await callTurnBroker(broker.socketPath, { ...binding, method: "context_return", receiptId: overview.receiptId, sent: true });
     }
     // Discovery is charged when generated, rather than being prepaid and charged again.

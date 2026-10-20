@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   CodexAgentMessage,
   CodexAssistantMessage,
@@ -306,6 +307,81 @@ function findToolById(messages: CodexMessage[], callId: string): { name: string;
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
+export type ParsedRuleSourcePosition = { system_index: number } | { message_index: number };
+export interface ParsedRequestRuleSourceEvidence {
+  instructions: { present: boolean; value: unknown };
+  input: Array<{ rawIndex: number; role: "system" | "developer" | "user"; position?: ParsedRuleSourcePosition }>;
+}
+type RuleSourceProof = {
+  evidence: ParsedRequestRuleSourceEvidence;
+  rawBody: unknown;
+  rawDigest: string;
+  systemDigest: string;
+  messageDigests: Array<{ index: number; digest: string }>;
+};
+const ruleSourceProofs = new WeakMap<CodexParsedRequest, RuleSourceProof>();
+const proofValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) return ["array", value.map(proofValue)];
+  if (isObj(value)) return ["object", Object.keys(value).sort().map(key => [key, proofValue(value[key])])];
+  return [typeof value, value === undefined ? null : value];
+};
+const proofDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(proofValue(value))).digest("hex");
+const visibleRuleMessage = (message: CodexMessage | undefined): unknown => {
+  if (!message) return undefined;
+  const { timestamp: _timestamp, ...visible } = message;
+  return visible;
+};
+function ruleSourceRaw(request: CodexParsedRequest): unknown {
+  const body = isObj(request._rawBody) ? request._rawBody : {};
+  return { present: Object.hasOwn(body, "instructions"), instructions: body.instructions, input: body.input };
+}
+function rememberRuleSources(request: CodexParsedRequest, evidence: ParsedRequestRuleSourceEvidence): void {
+  ruleSourceProofs.set(request, { evidence, rawBody: request._rawBody, rawDigest: proofDigest(ruleSourceRaw(request)),
+    systemDigest: proofDigest(request.context.systemPrompt), messageDigests: evidence.input.flatMap(item =>
+      item.position && "message_index" in item.position
+        ? [{ index: item.position.message_index, digest: proofDigest(visibleRuleMessage(request.context.messages[item.position.message_index])) }]
+        : []) });
+}
+
+/** Only a real parse registers provenance. Request JSON cannot supply this proof. */
+export function parsedRequestRuleSourceEvidence(request: CodexParsedRequest): ParsedRequestRuleSourceEvidence | undefined {
+  const proof = ruleSourceProofs.get(request);
+  if (!proof || proof.rawBody !== request._rawBody || proof.rawDigest !== proofDigest(ruleSourceRaw(request))
+    || proof.systemDigest !== proofDigest(request.context.systemPrompt)
+    || proof.messageDigests.some(item => item.digest !== proofDigest(visibleRuleMessage(request.context.messages[item.index])))) return undefined;
+  return structuredClone(proof.evidence);
+}
+
+/** Trusted recovery may detach the parsed request. Appended system rules use the
+ * positions recorded by that construction, never positions inferred from text. */
+export function inheritParsedRequestRuleSourceEvidence(parsed: CodexParsedRequest, target: CodexParsedRequest,
+  restoredSystemPositions?: ReadonlyMap<number, number>): void {
+  const evidence = parsedRequestRuleSourceEvidence(parsed);
+  if (!evidence || proofDigest(ruleSourceRaw(parsed)) !== proofDigest(ruleSourceRaw(target))
+    || evidence.input.some(item => item.position && "message_index" in item.position
+      && proofDigest(visibleRuleMessage(parsed.context.messages[item.position.message_index]))
+        !== proofDigest(visibleRuleMessage(target.context.messages[item.position.message_index])))) return;
+  if (restoredSystemPositions) {
+    const parsedSystem = parsed.context.systemPrompt ?? [], targetSystem = target.context.systemPrompt ?? [];
+    const used = new Set<number>();
+    if (parsedSystem.length !== targetSystem.length) return;
+    if (typeof evidence.instructions.value === "string" && evidence.instructions.value.length > 0) {
+      if (parsedSystem[0] !== targetSystem[0]) return;
+      used.add(0);
+    }
+    for (const item of evidence.input) {
+      if (!item.position || !("system_index" in item.position)) continue;
+      const index = restoredSystemPositions.get(item.rawIndex);
+      if (index === undefined || !Number.isSafeInteger(index) || index < 0 || index >= targetSystem.length
+        || used.has(index) || parsedSystem[item.position.system_index] !== targetSystem[index]) return;
+      used.add(index);
+      item.position = { system_index: index };
+    }
+    if (used.size !== targetSystem.length) return;
+  } else if (proofDigest(parsed.context.systemPrompt) !== proofDigest(target.context.systemPrompt)) return;
+  rememberRuleSources(target, evidence);
+}
+
 export function parseRequest(body: unknown): CodexParsedRequest {
   const replayedInputPrefixLength = previousResponseReplayPrefixLength(body);
   const parsed = responsesRequestSchema.safeParse(body);
@@ -316,6 +392,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   const now = Date.now();
   const messages: CodexMessage[] = [];
   const systemPrompt: string[] = [];
+  const ruleSources: ParsedRequestRuleSourceEvidence = {
+    instructions: { present: isObj(body) && Object.hasOwn(body, "instructions"), value: isObj(body) ? body.instructions : undefined }, input: [],
+  };
   // Responses reasoning siblings belong to the following assistant, including across call items.
   // Keep them off the message list until that assistant arrives; turn boundaries clear the array.
   const pendingReasoning: Array<{ part: CodexThinkingContent; envelopeSigned: boolean }> = [];
@@ -344,7 +423,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   if (typeof data.input === "string") {
     messages.push({ role: "user", content: data.input, timestamp: now });
   } else if (data.input) {
-    for (const item of data.input) {
+    for (const [rawIndex, item] of data.input.entries()) {
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
 
       if (effectiveType === "compaction_trigger") {
@@ -424,6 +503,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
             pendingReasoning.length = 0;
             const text = inputContentParts(msg.content as unknown[] | string | undefined);
             const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
+            ruleSources.input.push({ rawIndex, role: "system", ...(flat.length > 0 ? { position: { system_index: systemPrompt.length } } : {}) });
             if (flat.length > 0) systemPrompt.push(flat);
             break;
           }
@@ -434,6 +514,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
             const kinds = msg.internal_chat_message_metadata_passthrough?.content_item_kinds;
             const selectedSkill = msg.role === "user" && kinds?.length === 1
               && kinds[0] === "skills.selected_skill_instructions";
+            ruleSources.input.push({ rawIndex, role: msg.role, position: { message_index: messages.length } });
             messages.push({ role: msg.role, content, timestamp: now, ...(selectedSkill ? { origin: "codex_skill" as const } : {}) });
             break;
           }
@@ -660,7 +741,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   if (data.prompt_cache_key !== undefined) options.promptCacheKey = data.prompt_cache_key;
 
   const textCompaction = !compactionRequest && isNativeTextCompaction(body);
-  return {
+  const request: CodexParsedRequest = {
     modelId: data.model,
     ...(data.previous_response_id ? { previousResponseId: data.previous_response_id } : {}),
     context,
@@ -673,4 +754,6 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     ...(textCompaction ? { _compactionResponseFormat: "message" as const } : {}),
     ...(opaqueMultiAgentV2Payload ? { _opaqueMultiAgentV2Payload: true } : {}),
   };
+  rememberRuleSources(request, ruleSources);
+  return request;
 }

@@ -1,3 +1,4 @@
+import type { ContextReuseBaseline } from "./context-reuse-types";
 import { randomBytes } from "node:crypto";
 import type { CodexParsedRequest } from "../../types";
 import { CompactionSourceCoverage, type CompactionSourcePlan } from "./compaction-context";
@@ -23,12 +24,14 @@ export class ContextSend {
   private readonly plans = new Map<string, ContextDeliveryPlan>();
   private readonly manualPlans = new WeakSet<ContextDeliveryPlan>();
   private selected?: { id: string; token: string; plan: ContextDeliveryPlan };
+  private reuseToken?: string;
   private usageBinding?: { id: string; token: string; contextId: string };
   private usageQueue: Promise<void> = Promise.resolve();
   constructor(private readonly canonical: CodexParsedRequest, private readonly broker: TurnBrokerOwner,
     private readonly capabilities: ChatGptWebCapabilities, private readonly pageGeneration: string,
     coverage?: CompactionSourceCoverage, private readonly ownerContext?: TaskUpdateOwnerContext,
-    sourceSnapshot?: ContextSnapshot) {
+    sourceSnapshot?: ContextSnapshot, private readonly reuseBaseline?: ContextReuseBaseline,
+    private readonly experimentalBiggerContext?: boolean) {
     this.source = sourceSnapshot ?? createContextSnapshot(canonical, { imageStoragePolicy: "bounded" });
     this.initialSource = this.source;
     this.coverage = coverage?.fork() ?? new CompactionSourceCoverage();
@@ -36,19 +39,45 @@ export class ContextSend {
   async prepare(candidate: CodexParsedRequest, token: string, options: CompileChatGptWebPromptOptions,
     retainedTokens = 0): Promise<ContextDeliveryPlan> {
     if (this.retired || !this.initialSource) throw new Error("The physical context send is retired");
+    const startedAt = performance.now();
     const bootstrapAvailable = await this.broker.contextBootstrapAvailable?.() ?? false;
-    const plan = planContextDelivery({ canonical: this.canonical, snapshot: this.initialSource, candidate,
+    const reuseAvailable = bootstrapAvailable && (await this.broker.contextReuseAvailable?.() ?? false);
+    const baseline = options.retainedContinuity ? this.reuseBaseline : undefined;
+    const planInput = { canonical: this.canonical, snapshot: this.initialSource, candidate,
       messageIndices: contextCandidateMessageIndices(this.canonical, candidate), capabilities: this.capabilities,
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
       turnToken: token, compileOptions: options, contextToolsAvailable: true,
-      contextBootstrapAvailable: bootstrapAvailable, budget: { retainedTokens } });
+      experimentalBiggerContext: this.experimentalBiggerContext,
+      contextBootstrapAvailable: bootstrapAvailable, contextReuseAvailable: reuseAvailable,
+      ...(baseline ? { reuseBaseline: baseline } : {}), budget: { retainedTokens } };
+    let plan = planContextDelivery(planInput);
+    console.info(`[chatgpt-web] context_reuse_plan ${JSON.stringify({ candidate: options.retainedContinuity ? "resume" : "full", mode: plan.registration?.reuse?.mode ?? "legacy", reason: !reuseAvailable ? "capability_missing" : !baseline ? "baseline_not_supplied" : plan.registration?.reuse?.mode === "incremental" ? "matched" : "content_or_scope_changed" })}`);
     if (plan.registration) {
       if (!this.broker.registerContextPlan || !this.broker.selectContextPlan || !this.broker.markContextPlanSent
         || !this.broker.confirmContextAttachments || !this.broker.contextUsage) throw new Error("Update the Launcher and connector to use context navigation");
       // Remote owners validate the versioned contract before the prompt can leave this process.
-      await this.broker.registerContextPlan(token, plan.registration, this.ownerContext);
+      try { await this.broker.registerContextPlan(token, plan.registration, this.ownerContext); }
+      catch (error) {
+        if (!plan.registration.reuse?.dependency || (error as { code?: string }).code !== "CONTEXT_NOT_READY") throw error;
+        // This preparation has not been selected or sent. An evicted or replaced
+        // baseline can safely fall back to a new, independently complete candidate.
+        plan = planContextDelivery({ ...planInput, reuseBaseline: undefined });
+        if (plan.registration) await this.broker.registerContextPlan(token, plan.registration, this.ownerContext);
+        console.info('[chatgpt-web] context_reuse_miss {"reason":"baseline_changed_or_evicted","action":"prepare_full"}');
+      }
     }
     if (this.retired) throw new Error("The physical context send was cancelled during preparation");
+    const costs = plan.costs;
+    console.info(`[chatgpt-web] context_prepared ${JSON.stringify({ prepare_ms: performance.now() - startedAt,
+      prompt_code_points: costs.promptCodePoints, retained_tokens: costs.retainedTokens, total_tokens: costs.requiredTotalTokens,
+      prompt_serialized_bytes: costs.promptJsonBytes, reuse: costs.reuse,
+      budget: { context_window_tokens: costs.contextWindowTokens, retained_tokens: costs.retainedTokens,
+        current_plan_tokens: costs.requiredTotalTokens - costs.retainedTokens - costs.platformReserveTokens,
+        prompt_tokens: costs.promptTokens, required_mcp_tokens: costs.requiredMcpTokens,
+        attachment_visual_tokens: costs.attachmentVisualTokens, work_reserve_tokens: costs.workReserveTokens,
+        platform_reserve_tokens: costs.platformReserveTokens, discovery_reserve_tokens: costs.discoveryReserveTokens,
+        error_reserve_tokens: costs.errorReserveTokens, total_tokens: costs.requiredTotalTokens,
+        required_navigation_wire_bytes: costs.requiredNavigationWireBytes }, actual_model_input_tokens: null })}`);
     const id = plan.planId ?? `body_${randomBytes(24).toString("base64url")}`;
     this.plans.set(id, plan);
     if (options.manualControl) this.manualPlans.add(plan);
@@ -71,6 +100,8 @@ export class ContextSend {
     this.coverage.prepare(plan.snapshot, this.sourcePlan(id, plan));
     this.source = plan.snapshot;
     this.selected = { id, token, plan };
+    if (plan.registration?.reuse) this.reuseToken = token;
+    console.info(`[chatgpt-web] context_plan_selected ${JSON.stringify({ mode: plan.registration?.reuse?.mode ?? "legacy", retained: plan.costs.retainedTokens > 0 })}`);
     if (plan.registration) this.usageBinding = { id, token, contextId: plan.snapshot.context_id };
   }
   private sourcePlan(id: string, plan: ContextDeliveryPlan): CompactionSourcePlan {
@@ -136,6 +167,7 @@ export class ContextSend {
         wireBytes: evidence.usage.wire_bytes, reservedTokensUsed: evidence.reserved_tokens_used,
       });
       if (evidence.final) {
+        if (evidence.reuse_diagnostics) console.info(`[chatgpt-web] context_delivery_observed ${JSON.stringify(evidence.reuse_diagnostics)}`);
         await this.broker.releaseContextUsage?.(binding.token);
         this.usageBinding = undefined;
       }
@@ -143,6 +175,12 @@ export class ContextSend {
     const result = this.usageQueue.then(update, update);
     this.usageQueue = result.catch(() => {});
     return result;
+  }
+  /** Called only after normal final and physical page settlement by the owning Session. */
+  async commitReuse(): Promise<ContextReuseBaseline | undefined> {
+    const token = this.reuseToken;
+    this.reuseToken = undefined;
+    return token ? this.broker.commitContextReuse?.(token) : undefined;
   }
   retire(): void {
     this.retired = true;

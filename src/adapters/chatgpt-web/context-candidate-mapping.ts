@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CodexMessage, CodexParsedRequest } from "../../types";
-import { parseRequest } from "../../responses/parser";
+import { inheritParsedRequestRuleSourceEvidence, parsedRequestRuleSourceEvidence, parseRequest } from "../../responses/parser";
 import { contextSourceParserModel } from "./context-source-parser";
 import { canonicalJson } from "./canonical-json";
 import { continuityError } from "./continuity-errors";
@@ -26,6 +26,7 @@ const candidateSources = new WeakMap<CodexParsedRequest, {
   canonicalDigests: string[];
   candidateDigests: string[];
   indices: CandidateMessageIndices;
+  systemIndices: CandidateMessageIndices;
   rawInputIndices: readonly number[];
   rawInput: unknown[];
   candidateRawInput: unknown[];
@@ -36,6 +37,8 @@ const candidateSources = new WeakMap<CodexParsedRequest, {
   rawDigests: string[];
   canonicalSystemDigest: string;
   candidateSystemDigest: string;
+  canonicalInstructionsDigest: string;
+  candidateInstructionsDigest: string;
 }>();
 
 function digest(value: unknown): string {
@@ -45,6 +48,11 @@ function digest(value: unknown): string {
 function visibleDigest(message: CodexMessage): string {
   const { timestamp: _timestamp, ...visible } = message;
   return digest(visible);
+}
+
+function instructionsDigest(request: CodexParsedRequest): string {
+  const body = request._rawBody as Record<string, unknown> | undefined;
+  return digest({ present: body ? Object.hasOwn(body, "instructions") : false, value: body?.instructions });
 }
 
 function unproven(): never {
@@ -69,7 +77,7 @@ export function bindContextEnvironmentInputSource(canonical: CodexParsedRequest,
 
 function rememberCandidate(canonical: CodexParsedRequest, candidate: CodexParsedRequest,
   indices: (number | null)[], rawInputIndices: number[],
-  candidateRawInputIndices: number[] = rawInputIndices): CodexParsedRequest {
+  candidateRawInputIndices: number[] = rawInputIndices, systemIndices?: (number | null)[]): CodexParsedRequest {
   const canonicalMessages = canonical.context.messages;
   const candidateMessages = candidate.context.messages;
   const rawInput = (canonical._rawBody as { input?: unknown[] } | undefined)?.input;
@@ -79,12 +87,15 @@ function rememberCandidate(canonical: CodexParsedRequest, candidate: CodexParsed
   candidateSources.set(candidate, { canonical, canonicalMessages, candidateMessages,
     canonicalReferences: canonicalMessages.slice(), candidateReferences: candidateMessages.slice(),
     canonicalDigests: canonicalMessages.map(visibleDigest), candidateDigests: candidateMessages.map(visibleDigest),
-    indices: Object.freeze(indices), rawInputIndices: Object.freeze(rawInputIndices), rawInput, candidateRawInput,
+    indices: Object.freeze(indices), systemIndices: Object.freeze(systemIndices ?? (candidate.context.systemPrompt ?? [])
+      .map((text, index) => canonical.context.systemPrompt?.[index] === text ? index : null)),
+    rawInputIndices: Object.freeze(rawInputIndices), rawInput, candidateRawInput,
     rawInputLength: rawInput.length, candidateRawInputLength: candidateRawInput.length,
     candidateRawInputIndices: Object.freeze(candidateRawInputIndices), rawReferences: rawInput.slice(),
     rawDigests: rawInput.map(digest),
     canonicalSystemDigest: digest(canonical.context.systemPrompt ?? null),
-    candidateSystemDigest: digest(candidate.context.systemPrompt ?? null) });
+    candidateSystemDigest: digest(candidate.context.systemPrompt ?? null),
+    canonicalInstructionsDigest: instructionsDigest(canonical), candidateInstructionsDigest: instructionsDigest(candidate) });
   return candidate;
 }
 
@@ -94,9 +105,11 @@ export function bindContextFullCandidate(canonical: CodexParsedRequest, candidat
   const candidateRawInput = (candidate._rawBody as { input?: unknown[] } | undefined)?.input;
   if (!Array.isArray(rawInput) || !Array.isArray(candidateRawInput)
     || digest(rawInput) !== digest(candidateRawInput)
+    || instructionsDigest(canonical) !== instructionsDigest(candidate)
     || digest(canonical.context.systemPrompt ?? null) !== digest(candidate.context.systemPrompt ?? null)
     || canonical.context.messages.length !== candidate.context.messages.length
     || candidate.context.messages.some((message, index) => visibleDigest(message) !== visibleDigest(canonical.context.messages[index]!))) unproven();
+  inheritParsedRequestRuleSourceEvidence(canonical, candidate);
   return rememberCandidate(canonical, candidate, candidate.context.messages.map((_, index) => index), rawInput.map((_, index) => index));
 }
 
@@ -108,7 +121,7 @@ export function continuityAcceptedContextCandidate(request: CodexParsedRequest,
   if (previous && !binding) unproven();
   const source = previous?.source ?? accepted;
   const candidate = binding
-    ? rememberCandidate(source, structuredClone(accepted), [...binding.indices], [...binding.rawInputIndices], [...binding.candidateRawInputIndices])
+    ? rememberCandidate(source, structuredClone(accepted), [...binding.indices], [...binding.rawInputIndices], [...binding.candidateRawInputIndices], [...binding.systemIndices])
     : bindContextFullCandidate(source, structuredClone(accepted));
   acceptedSources.set(candidate, { request, source });
   return candidate;
@@ -150,7 +163,9 @@ function sameRetainedItem(left: unknown, right: unknown): boolean {
  * remained active on the lost page must also return to the full recovery body. */
 function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsedRequest,
   indices: number[], rawMessageIndex: (index: number) => number | undefined, evidence: Map<number, ContextSourceEvidence>,
-  retained: readonly unknown[], objectCallIds: ReadonlySet<string>): { indices: number[]; evidence: Map<number, ContextSourceEvidence> } {
+  retained: readonly unknown[], objectCallIds: ReadonlySet<string>): {
+    indices: number[]; evidence: Map<number, ContextSourceEvidence>; systemPositions?: Map<number, number>;
+  } {
   const raw = (source._rawBody as { input: unknown[] }).input;
   const keyed = new Map<string, number[]>();
   raw.forEach((item, index) => { const key = retainedKey(item); if (key) keyed.set(key, [...keyed.get(key) ?? [], index]); });
@@ -177,6 +192,9 @@ function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsed
     bucket.unshift(item); added.set(next, bucket);
   }
   if (!added.size) return { indices, evidence };
+  const originalSystems = new Map(parsedRequestRuleSourceEvidence(parseRequest(source._rawBody))!.input.flatMap(item =>
+    item.position && "system_index" in item.position ? [[item.rawIndex, item.position.system_index] as const] : []));
+  const systemPositions = new Map<number, number>();
   const sourceBefore = new Map<number, Array<{ message: CodexMessage; include: boolean; evidence: ContextSourceEvidence }>>();
   const restoredSystem: string[] = [];
   const mergedRaw: unknown[] = [];
@@ -187,8 +205,10 @@ function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsed
       if (mapped !== undefined) { before = mapped; break; }
     }
     for (const item of added.get(rawIndex) ?? []) {
+      const mergedIndex = mergedRaw.length;
       mergedRaw.push(structuredClone(item));
       const parsed = parseRequest({ model: contextSourceParserModel(source), input: [item] }).context;
+      if (parsed.systemPrompt?.length) systemPositions.set(mergedIndex, (source.context.systemPrompt?.length ?? 0) + restoredSystem.length);
       restoredSystem.push(...parsed.systemPrompt ?? []);
       if (parsed.messages.length && rawIndex > 0) {
         for (let index = rawIndex - 1; index >= 0; index -= 1) {
@@ -211,7 +231,11 @@ function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsed
       }
       sourceBefore.set(before, bucket);
     }
-    if (rawIndex < raw.length) mergedRaw.push(raw[rawIndex]);
+    if (rawIndex < raw.length) {
+      const originalSystem = originalSystems.get(rawIndex);
+      if (originalSystem !== undefined) systemPositions.set(mergedRaw.length, originalSystem);
+      mergedRaw.push(raw[rawIndex]);
+    }
   }
   const candidateAtSource = new Map(indices.map((sourceIndex, candidateIndex) => [sourceIndex, candidate.context.messages[candidateIndex]!]));
   const messages: CodexMessage[] = [], candidateMessages: CodexMessage[] = [], mapped: number[] = [];
@@ -236,7 +260,7 @@ function restoreRetainedInput(source: CodexParsedRequest, candidate: CodexParsed
   // This detached candidate retains actual restored raw fields. The HTTP request
   // and its accepted current instruction identity remain unchanged.
   candidate._rawBody = { ...rawRecord(candidate._rawBody), input: structuredClone(mergedRaw) };
-  return { indices: mapped, evidence: restoredEvidence };
+  return { indices: mapped, evidence: restoredEvidence, systemPositions };
 }
 
 /** Register only after recoveryContext's original result and lineage checks pass.
@@ -316,6 +340,7 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
   source.context.messages = [];
   let indices: number[] = [];
   let restoredEvidence = new Map<number, ContextSourceEvidence>();
+  let restoredSystemPositions: Map<number, number> | undefined;
   const rawMessageIndices = new Map<number, number>();
   recovered.context.messages.forEach((message, index) => {
     for (const inserted of insertions.get(index) ?? []) {
@@ -343,11 +368,12 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
       rawMessageIndices.set(sourceIndex, indices[candidateIndex]!);
       return indices[candidateIndex];
     };
-    ({ indices, evidence: restoredEvidence } = restoreRetainedInput(source, recovered, indices, rawMessageIndex,
+    ({ indices, evidence: restoredEvidence, systemPositions: restoredSystemPositions } = restoreRetainedInput(source, recovered, indices, rawMessageIndex,
       restoredEvidence, retainedInput, objectCallIds));
   }
   restoredMessageSources.set(source, Object.freeze([...restoredEvidence.keys()]));
   restoredMessageEvidence.set(source, restoredEvidence);
+  inheritParsedRequestRuleSourceEvidence(parseRequest(source._rawBody), source, restoredSystemPositions);
   const currentRaw = (recovered._rawBody as { input: unknown[] }).input;
   rememberCandidate(source, recovered, indices,
     currentRaw === raw ? rawIndices : (source._rawBody as { input: unknown[] }).input.map((_, index) => index),
@@ -360,6 +386,10 @@ export function continuityRecoveredContextCandidate(request: CodexParsedRequest,
 export function continuityContextCandidate(canonical: CodexParsedRequest, input: unknown[]): CodexParsedRequest {
   const instructions = (canonical._rawBody as { instructions?: unknown } | undefined)?.instructions;
   const selectedContext = parseRequest({ model: contextSourceParserModel(canonical), instructions, input }).context;
+  const ruleSources = parsedRequestRuleSourceEvidence(canonical);
+  const sourceSystems = new Map(ruleSources?.input.flatMap(item => item.position && "system_index" in item.position
+    ? [[item.rawIndex, item.position.system_index] as const] : []) ?? []);
+  const systemIndices: (number | null)[] = typeof instructions === "string" && instructions.length > 0 ? [0] : [];
   const indices: (number | null)[] = [];
   const rawInputIndices: number[] = [];
   const used = new Set<number>();
@@ -375,6 +405,7 @@ export function continuityContextCandidate(canonical: CodexParsedRequest, input:
         || !record.content.every(part => part && typeof part === "object"
           && (part.type === "input_text" || part.type === "text") && typeof part.text === "string")) unproven();
       indices.push(...single.messages.map(() => null));
+      systemIndices.push(...(single.systemPrompt ?? []).map(() => null));
       continue;
     }
     const rawInput = (canonical._rawBody as { input?: unknown[] } | undefined)?.input;
@@ -384,6 +415,7 @@ export function continuityContextCandidate(canonical: CodexParsedRequest, input:
     // System items are selected by the existing contract but do not produce messages.
     if ((record.type === undefined || record.type === "message") && record.role === "system") {
       if (single.messages.length !== 0) unproven();
+      systemIndices.push(...(single.systemPrompt ?? []).map(() => sourceSystems.get(source.rawIndex) ?? null));
       continue;
     }
     if (single.messages.length !== 1 || (!["user", "developer", "agentMessage"].includes(single.messages[0]!.role)
@@ -400,7 +432,7 @@ export function continuityContextCandidate(canonical: CodexParsedRequest, input:
     indices.push(index);
   }
   return rememberCandidate(canonical, { ...canonical, context: { ...canonical.context,
-    systemPrompt: selectedContext.systemPrompt, messages: selectedContext.messages } }, indices, rawInputIndices);
+    systemPrompt: selectedContext.systemPrompt, messages: selectedContext.messages } }, indices, rawInputIndices, rawInputIndices, systemIndices);
 }
 
 /** A binding cannot be copied to another request or reused after its message lists change. */
@@ -416,6 +448,8 @@ function candidateSource(canonical: CodexParsedRequest, candidate: CodexParsedRe
       !== digest(source.candidateRawInput[source.candidateRawInputIndices[index]!]))
     || source.canonicalSystemDigest !== digest(canonical.context.systemPrompt ?? null)
     || source.candidateSystemDigest !== digest(candidate.context.systemPrompt ?? null)
+    || source.canonicalInstructionsDigest !== instructionsDigest(canonical)
+    || source.candidateInstructionsDigest !== instructionsDigest(candidate)
     || source.canonicalReferences.length !== canonical.context.messages.length
     || source.candidateReferences.length !== candidate.context.messages.length
     || source.canonicalReferences.some((message, index) => message !== canonical.context.messages[index]
@@ -428,6 +462,14 @@ function candidateSource(canonical: CodexParsedRequest, candidate: CodexParsedRe
 export function contextCandidateMessageIndices(canonical: CodexParsedRequest,
   candidate: CodexParsedRequest): CandidateMessageIndices | undefined {
   return candidateSource(canonical, candidate)?.indices;
+}
+
+/** Validate all selected positions together for the current synchronous operation.
+ * Null positions represent trusted synthetic status or environment text. */
+export function contextCandidateIndices(canonical: CodexParsedRequest, candidate: CodexParsedRequest) {
+  const source = candidateSource(canonical, candidate);
+  return source ? { messageIndices: source.indices, systemIndices: source.systemIndices,
+    rawInputIndices: source.rawInputIndices } : undefined;
 }
 
 /** Includes selected raw system items; synthetic environment text has no raw source. */

@@ -147,6 +147,7 @@ export function selectContinuityCheckpoint(parsed: CodexParsedRequest, identity:
 }
 
 export interface ContinuityBinding {
+  contextReuseBaseline?: import("./context-reuse-types").ContextReuseBaseline;
   readonly thread: string;
   readonly scope: string;
   readonly owner: string;
@@ -381,6 +382,8 @@ export class ContinuityBindings {
     for (const checkpoint of binding.checkpoints.values()) { this.checkpointCount--; this.checkpointBytes -= checkpoint.bytes; }
     binding.checkpoints.clear(); binding.revisions.clear(); binding.revisionDigests.clear(); binding.ordinaryReplayTombstones.clear();
     delete binding.initialAcceptedInput; delete binding.initialInstructionPayloadDigest; delete binding.discoveredTools;
+    if (binding.contextReuseBaseline) console.info('[chatgpt-web] context_reuse_selection {"stage":"forget","reason":"page_changed"}');
+    delete binding.contextReuseBaseline;
     binding.state = "lost";
     this.bindings.delete(binding.thread);
     if (this.bindings.size === 0) { this.watcher?.close(); this.watcher = undefined; }
@@ -498,6 +501,7 @@ export class ContinuityBindings {
     this.checkpointBytes += MAX_CHECKPOINT_BYTES;
     this.checkpointCount += 1;
     binding.compactionSourceState = binding.state === "running" ? "running" : "ready";
+    if (binding.contextReuseBaseline) console.info('[chatgpt-web] context_reuse_selection {"stage":"begin_compaction","reason":"compaction"}');
     binding.state = "compacting";
     binding.compactionKey = key;
     binding.compactionEvidenceBytes = sourceEvidenceBytes;
@@ -713,6 +717,7 @@ export class ContinuityBindings {
   }
 
   private retireCheckpointAuthority(binding: ContinuityBinding): void {
+    delete binding.contextReuseBaseline;
     delete binding.initialAcceptedInput;
     delete binding.initialInstructionPayloadDigest;
     delete binding.discoveredTools;

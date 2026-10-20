@@ -1,3 +1,5 @@
+import { contextCandidateCanonicalSource, contextCandidateMessageIndices, contextCandidateRawInputIndices } from "./context-candidate-mapping";
+import type { ContextReuseBaseline } from "./context-reuse-types";
 import {
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebContextLimits,
@@ -78,7 +80,7 @@ export function preflightContinuityInput(
   capabilities: ChatGptWebCapabilities,
   experimentalSkillAttachments = false,
   retainedContinuity = false,
-  options: { experimentalBiggerContext?: boolean; retainedTokens?: number } = {},
+  options: { canonical?: CodexParsedRequest; experimentalBiggerContext?: boolean; retainedTokens?: number; contextReuseAvailable?: boolean; taskUpdateProtocol?: 1; reuseBaseline?: ContextReuseBaseline } = {},
 ): void {
   const manual = isChatGptWebZeroRiskBackendModel(parsed.modelId);
   const placeholder = `${manual ? "request" : "turn"}_${"0".repeat(32)}`;
@@ -86,12 +88,18 @@ export function preflightContinuityInput(
     ? resolveBiggerContextMultipartParts(parsed, capabilities, experimentalSkillAttachments) : undefined;
   // This dry run proves capacity only. The real send still verifies the connector ABI,
   // binds the real credential and publishes its independently selected plan in the Adapter.
-  const planned = planContextDelivery({ canonical: parsed, snapshot: createContextSnapshot(parsed, { imageStoragePolicy: "bounded" }), candidate: parsed,
-    capabilities, turnToken: placeholder, contextToolsAvailable: true, budget: { retainedTokens: options.retainedTokens ?? 0 }, compileOptions: {
+  const canonical = contextCandidateCanonicalSource(options.canonical ?? parsed, parsed) ?? options.canonical ?? parsed;
+  const planned = planContextDelivery({ canonical, snapshot: createContextSnapshot(canonical, { imageStoragePolicy: "bounded" }), candidate: parsed,
+    messageIndices: contextCandidateMessageIndices(canonical, parsed), rawInputIndices: contextCandidateRawInputIndices(canonical, parsed),
+    capabilities, turnToken: placeholder, contextToolsAvailable: true, contextReuseAvailable: options.contextReuseAvailable,
+    experimentalBiggerContext: options.experimentalBiggerContext,
+    ...(retainedContinuity && options.reuseBaseline ? { reuseBaseline: options.reuseBaseline } : {}), budget: { retainedTokens: options.retainedTokens ?? 0 }, compileOptions: {
       ...(manual ? { manualControl: true } : { experimentalSkillAttachments }),
       ...(retainedContinuity ? { retainedContinuity: true } : {}),
+      ...(options.taskUpdateProtocol ? { taskUpdateProtocol: options.taskUpdateProtocol } : {}),
       ...(parts ? { experimentalMultipartParts: parts } : {}),
     } });
+  if (options.contextReuseAvailable) console.info(`[chatgpt-web] context_preflight ${JSON.stringify({ retained: retainedContinuity, retained_tokens: planned.costs.retainedTokens, total_tokens: planned.costs.requiredTotalTokens, window_tokens: planned.costs.contextWindowTokens, reuse: planned.costs.reuse })}`);
   // Inline-only plans can return before navigation's capacity check. Retained
   // page cost must still trigger the ordinary new-page fallback before Send.
   if (planned.costs.requiredTotalTokens > planned.costs.contextWindowTokens) {

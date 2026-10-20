@@ -1,3 +1,4 @@
+import { contextReusePageIdentity, contextReusePredecessor } from "./context-reuse-lifecycle";
 import { ContinuityTaskInputStore } from "./continuity-task-input-store";
 import { queuedTaskInputRequest, startTaskInputScheduler } from "./task-input-scheduler";
 import { completeTaskInputPhysicalResponse, taskInputQueue, pendingTaskInputs, synchronizeTaskInputDelivery, type RuntimeTaskInputQueue } from "./continuity-task-input-runtime";
@@ -824,10 +825,37 @@ export function createChatGptWebAdapter(
     const retainedTokens = Math.max(continuity?.binding.retainedPageTokens ?? 0,
       (previousCoverage?.latest()?.pageTokens ?? 0)
       + (previousOutcome?.type === "final" ? estimateTokens(previousOutcome.answer) : 0));
+    const reuseReference = continuity?.binding.recovery;
+    const savedReuse = continuity?.binding.contextReuseBaseline;
+    const reuseRecord = reuseReference && savedReuse ? recoveryStore(reuseReference).get(reuseReference.thread) : undefined;
+    const reuseReason = parsed._compactionRequest ? "compaction"
+      : !savedReuse ? "no_baseline"
+      : !continuityClaim?.expected || !reuseReference || !reuseRecord
+        || savedReuse.page_identity !== contextReusePageIdentity(reuseReference, reuseRecord) ? "page_changed"
+      : !previousSource?.isPhysicallySettled() || previousOutcome?.type !== "final" || previousSource.supersededError ? "predecessor_unsettled"
+      : !contextReusePredecessor(reuseRecord, reuseReference.logicalWorkId, savedReuse.predecessor) ? "predecessor_changed" : "available";
+    const reuseBaseline = reuseReason === "available" ? savedReuse : undefined;
+    if (mode.localTools) console.info(`[chatgpt-web] context_reuse_selection ${JSON.stringify({
+      stage: "prepare", candidate: continuityClaim?.expected ? "resume" : "full", reason: reuseReason })}`);
     const contextSend = mode.localTools && !parsed._compactionRequest && !continuity?.finalReplaySource
       ? new ContextSend(contextCanonical,
         broker, turnCapabilities, traceId, previousCoverage,
-        initialTaskUpdateOwner, sourceSnapshot) : undefined;
+        initialTaskUpdateOwner, sourceSnapshot, reuseBaseline, experimentalBiggerContext) : undefined;
+    const commitContextReuse = async (): Promise<void> => {
+      if (!contextSend || !continuity || !conversationKey || parsed._compactionRequest) return;
+      const binding = continuity.binding;
+      const head = chatGptTurnSessions.findConversationHead(conversationKey);
+      if (binding.executionKey !== continuity.executionKey || binding.state !== "ready" || !binding.lease
+        || head?.traceId !== traceId || head.supersededError || head.settledOutcome()?.type !== "final") return;
+      const leaseId = binding.lease.leaseId;
+      const pageEpoch = binding.epoch;
+      const baseline = await contextSend.commitReuse();
+      if (baseline && binding.executionKey === continuity.executionKey && binding.state === "ready"
+        && binding.lease?.leaseId === leaseId && binding.epoch === pageEpoch
+        && chatGptTurnSessions.findConversationHead(conversationKey) === head && !head.supersededError) {
+        binding.contextReuseBaseline = baseline;
+      }
+    };
     if (contextSend && continuity?.binding.recovery) bindRecoveryContextCoverage(continuity.binding.recovery, contextSend.coverage);
     const finalizeContextSend = async (browser: Promise<string>): Promise<string> => {
       let failed = false;
@@ -1443,7 +1471,7 @@ export function createChatGptWebAdapter(
         trace,
         text,
         usageInput: checkpointInput.parsed,
-        ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage() } : {}),
+        ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage(), commitContextReuse } : {}),
         manualControl: { surfaceNonce },
         ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
         ...(recoveryOrigin ? { recoveryOrigin } : {}),
@@ -1663,7 +1691,7 @@ export function createChatGptWebAdapter(
       trace,
       text,
       usageInput: checkpointInput.parsed,
-      ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage() } : {}),
+      ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: () => contextSend.syncUsage(), commitContextReuse } : {}),
       ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
       ...(recoveryOrigin ? { recoveryOrigin } : {}),
       get recoveryFinal() { return recoveryFinal; },

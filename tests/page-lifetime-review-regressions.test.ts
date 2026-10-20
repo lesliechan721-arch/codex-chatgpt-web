@@ -187,6 +187,7 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
     },
   };
   const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   let modelMcp: Client | undefined;
   const manualMcp = async () => {
     if (!modelMcp) {
@@ -466,7 +467,7 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
   cleanups.push(() => withRuntimePerformanceContext(profileContext, () => measureRuntimeAsync("fixture.cleanup", async () => {
     controls.releaseDeferredCompletion?.();
     controls.releaseAfterToolResults?.();
-    automatic.mockRestore(); compatible.mockRestore(); taskUpdatesSupport.mockRestore();
+    automatic.mockRestore(); compatible.mockRestore(); taskUpdatesSupport.mockRestore(); reuseSupport.mockRestore();
     broker.acceptTaskUpdate = originalAcceptTaskUpdate;
     await measureRuntimeAsync("cleanup.broker", () => broker.close());
     await controls.modelTask?.catch(() => {});

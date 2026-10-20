@@ -206,6 +206,37 @@ model-use evidence exists, do not claim that attachment conversion or missed req
 If 8,000 code points still converts to an attachment, reduce the configured limit and repeat the
 paired acceptance. Missing third-party sample bytes cannot be reported as a tested fixture.
 
+## Same-page reuse validation
+
+`context-reuse-v1` requires independent program-level and real-platform evidence. Earlier
+short-start, navigation and continuity results do not prove same-page reuse or model retention.
+The contract is in [Same-page rule reuse](context-navigation.md#same-page-rule-reuse).
+
+Program-level acceptance covers both modes for 20 healthy turns with at least 30,000 code points
+of real classified rules and growing canonical history. After a unit's first complete delivery,
+its mandatory repeated body must be zero bytes across prompt, protocol, payload, source map,
+manifest and actual required returns. Newly applicable protocol branches may be delivered once.
+Test exact reconstruction, independent identical user events, changed rules/roles/ordering,
+dynamic environment/schema, long-request missing pages, empty/multibyte/forged receipts,
+updates/ACK/output races, new page/restart/compaction, unknown Send, proved unsent preparation,
+late final, capacity eviction, current-scope rereads and old/new capability combinations.
+
+Real-platform acceptance is pending. For each of Automatic and Zero Risk, compare complete
+short-start and reuse plans with the same model and effort, alternate order, and record at least
+three paired sessions of at least ten turns each. Include stable rules, changed rules and a long
+request. Harmless early rule checks belong only in source bodies, not entry hints or expected
+answers. Record rule use before business work, tail-page use and any exact rereads. Zero Risk
+retains its original manual Send/Sent and image steps.
+
+Report selected full/resume candidates and bounded miss/fallback reasons; units hit/redelivered;
+reused original bytes and current required bytes; composer code points, UTF-16, UTF-8 and
+serialized bytes; mapping/reference/manifest/directory sizes; actual unique, duplicate and
+reread bytes; calls and time before first business work or successful completion; preparation
+time; retained, new and total token estimates. Model input tokens remain unknown when they
+cannot be observed. Reduced mandatory bytes do not establish a fixed speed or token benefit.
+Missing events, corrupt bytes, invalid-baseline admission, incomplete-context execution,
+expanded permissions or duplicate business dispatch block acceptance.
+
 ## Context rendering validation
 
 The browser renderer and MCP text-read-v2 require separate evidence from the earlier context

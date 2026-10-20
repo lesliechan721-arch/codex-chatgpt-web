@@ -75,6 +75,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
     toolAuthorityMode: "delegated", experimentalBiggerContext,
   } };
   const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
   const taskUpdates = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(false);
@@ -140,7 +141,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
       for (const [key, page] of pages) await measureRuntimeAsync("cleanup.release",
         () => releaseLauncherRetainedConversation(descriptorPath, key, undefined, page.continuity));
     } catch (error) { errors.push(error); }
-    automatic.mockRestore(); taskUpdates.mockRestore(); compatible.mockRestore();
+    automatic.mockRestore(); taskUpdates.mockRestore(); compatible.mockRestore(); reuseSupport.mockRestore();
     for (const result of await Promise.allSettled([measureRuntimeAsync("cleanup.broker", () => broker.close()), measureRuntimeAsync("cleanup.http", () => server.stop(true))])) {
       if (result.status === "rejected") errors.push(result.reason);
     }

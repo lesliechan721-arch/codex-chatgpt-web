@@ -205,6 +205,8 @@ interface ChatGptTurnRuntimeBase {
   compactionSourceCoverage?: import("./compaction-context").CompactionSourceCoverage;
   /** Synchronize actual cumulative navigation cost before page capacity or source capture. */
   syncContextUsage?: () => Promise<void>;
+  /** Commit reuse only after normal final and the physical owner has settled. */
+  commitContextReuse?: () => Promise<void>;
   browser: Promise<string>;
   /** Physical helper/Playwright settlement, including the launcher end/release acknowledgement. */
   physicalSettlement: Promise<void>;
@@ -871,7 +873,14 @@ export class ChatGptTurnSession {
       }
     });
     this.physicalSettlement = runtime.physicalSettlement.then(
-      () => { this.settledPhysical = true; },
+      async () => {
+        try {
+          if (runtime.commitContextReuse) {
+            const outcome = await this.browserOutcome;
+            if (outcome.type === "final" && !this.supersededError) await runtime.commitContextReuse();
+          }
+        } finally { this.settledPhysical = true; }
+      },
       error => {
         this.settledPhysical = true;
         throw error;

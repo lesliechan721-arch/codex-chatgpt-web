@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,6 +109,9 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
   };
   if (options.remote) await broker.listen();
   const owner = options.remote ? new RemoteTurnBroker(socket) : broker;
+  const reuseSupport = owner instanceof RemoteTurnBroker
+    ? spyOn(owner, "contextReuseAvailable").mockResolvedValue(false)
+    : spyOn(owner, "contextReuseAvailable").mockReturnValue(false);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run;
   let automaticStarts = 0;
@@ -173,6 +176,7 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
     session: () => chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(initial)}`)!,
     ready: running.promise, automaticStarts: () => automaticStarts,
     close: async () => {
+      reuseSupport.mockRestore();
       chatGptTurnSessions.clear();
       await Promise.allSettled([...activeRuns]);
       await Promise.allSettled(starts.map(start => broker.waitForRetirement(start.requestId, AbortSignal.timeout(1_000))));

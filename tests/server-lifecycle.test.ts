@@ -1772,7 +1772,9 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
   const provider = providerConfig(config);
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run.bind(worker);
-  await TurnBroker.forSocket(config.brokerSocketPath).listen();
+  const broker = TurnBroker.forSocket(config.brokerSocketPath);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
+  await broker.listen();
   const threadId = "thread_remote_replay_idle";
   const turnId = "turn_remote_replay_idle";
   const environment = [
@@ -1904,6 +1906,7 @@ test("remote real-adapter tool replay does not refresh the native turn idle leas
     expect(browserCancelled).toBeTrue();
   } finally {
     clock.mockRestore();
+    reuseSupport.mockRestore();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     chatGptTurnSessions.clear();
     await server.stop(true);

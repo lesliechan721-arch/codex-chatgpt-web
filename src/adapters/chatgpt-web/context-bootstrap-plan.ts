@@ -4,6 +4,7 @@ import { ContextNavigator } from "./context-navigator";
 import type { ContextSnapshot } from "./context-snapshot";
 import { parseContextTextReadResult } from "./context-text-result";
 import type { ContextDelivery } from "./context-types";
+import type { ContextReusePlan } from "./context-reuse-types";
 
 export interface RequiredTextPageCost { start: number; end_exclusive: number; tokens: number; wire_bytes: number }
 const empty = (): ContextResponseCost => ({ wire_bytes: 0, text_tokens: 0, visual_tokens: 0, total_tokens: 0 });
@@ -17,6 +18,7 @@ function add(total: ContextResponseCost, cost: ContextResponseCost): void {
 export function measureBootstrapRequiredCosts(input: {
   snapshot: ContextSnapshot; planId: string; manifestDigest: string; limits: ContextLimits;
   deliveryByTarget: Readonly<Record<string, ContextDelivery>>; manual: boolean; started: number;
+  reuse?: ContextReusePlan;
 }): { text: ContextResponseCost; discovery: ContextResponseCost;
   pageCosts: Record<string, RequiredTextPageCost[]>; retry: { tokens: number; wire_bytes: number } } {
   const { snapshot, limits, deliveryByTarget } = input;
@@ -25,7 +27,7 @@ export function measureBootstrapRequiredCosts(input: {
       "CONTEXT_BUDGET_EXCEEDED", "Required context preflight exceeded its bounded processing deadline");
   };
   const nav = new ContextNavigator({ scopeId: "context-bootstrap-preflight", snapshot, purpose: "normal", deliveryByTarget,
-    bootstrap: { planId: input.planId, manifestDigest: input.manifestDigest },
+    bootstrap: { planId: input.planId, manifestDigest: input.manifestDigest, ...(input.reuse ? { reuse: input.reuse } : {}) },
     limits: { ...limits, maxTotalTokens: Number.MAX_SAFE_INTEGER, maxTotalWireBytes: Number.MAX_SAFE_INTEGER } });
   const measure = (response: Parameters<typeof measureContextResponse>[0]): ContextResponseCost => {
     check();

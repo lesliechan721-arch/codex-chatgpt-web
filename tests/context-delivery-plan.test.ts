@@ -150,6 +150,7 @@ test("retained history keeps the inline candidate that fits the default window",
   expect(plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens } }).costs.requiredTotalTokens).toBe(90_000);
   expect(() => plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens + 1 } })).toThrow("exceed the context budget");
   const broker = TurnBroker.forSocket(join(tmpdir(), `context-cost-${randomUUID()}.sock`));
+  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const send = new ContextSend(canonical, broker, capabilities, "cost-boundary", undefined, undefined, snapshot);
   try {
     const prepared = await send.prepare(canonical, token, {}, retainedTokens);
@@ -158,7 +159,7 @@ test("retained history keeps the inline candidate that fits the default window",
     await send.select(token, prepared);
     await send.sent();
     expect(send.coverage.latest()?.delivered).toBe(true);
-  } finally { send.retire(); await broker.close(); }
+  } finally { send.retire(); reuseCapability.mockRestore(); await broker.close(); }
 });
 
 test("a complete externalized candidate can fit when the inline candidate exceeds capacity", () => {

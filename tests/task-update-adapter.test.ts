@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -97,8 +97,11 @@ async function fixture(options: { remote?: boolean; structured?: boolean } = {})
     chatgptWeb: { maxComposerCodePoints: 2_000_000, brokerSocketPath: socket, localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: true },
   };
   const broker = TurnBroker.forSocket(socket);
+  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   if (options.remote) await broker.listen();
   const owner = options.remote ? new RemoteTurnBroker(socket) : broker;
+  const remoteReuseCapability = owner instanceof RemoteTurnBroker
+    ? spyOn(owner, "contextReuseAvailable").mockResolvedValue(false) : undefined;
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run;
   const ready = deferred<{ token: string; turn: BrowserTurn }>();
@@ -183,6 +186,8 @@ async function fixture(options: { remote?: boolean; structured?: boolean } = {})
       runs.find(run => run.token === token)!.answer.resolve(value);
     },
     close: async () => {
+      reuseCapability.mockRestore();
+      remoteReuseCapability?.mockRestore();
       worker.run = originalRun;
       chatGptTurnSessions.clear();
       for (const run of runs) run.answer.resolve("");

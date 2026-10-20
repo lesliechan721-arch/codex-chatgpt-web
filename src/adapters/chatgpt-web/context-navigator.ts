@@ -3,6 +3,7 @@ import type { BrokerToolResult } from "./turn-broker";
 import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
 import { ContextSnapshot, deterministicContextJson } from "./context-snapshot";
 import { createContextTextReadResult } from "./context-text-result";
+import type { ContextReusePlan } from "./context-reuse-types";
 import type { ContextDelivery, ContextFilter, ContextListArgs, ContextLiveOverview, ContextPurpose, ContextReadArgs,
   ContextRemainingBudget, ContextSearchArgs, ContextTarget, ContextBootstrapControl } from "./context-types";
 
@@ -26,7 +27,7 @@ export interface ContextNavigatorOptions {
   purpose: ContextPurpose;
   deliveryByTarget?: Readonly<Record<string, ContextDelivery>>;
   limits?: ContextLimitOverrides;
-  bootstrap?: { planId: string; manifestDigest: string };
+  bootstrap?: { planId: string; manifestDigest: string; reuse?: ContextReusePlan };
   /** The runtime may credit only this target's still-undelivered reserve when reading it. */
   remainingBudget?: (target?: ContextTarget, result?: BrokerToolResult) => ContextRemainingBudget;
 }
@@ -69,7 +70,7 @@ export class ContextNavigator {
     }
     if (options.purpose === "compaction" && this.#snapshot.targets.some(t => !t.read_ref)) throw new Error("Compaction source is not fully readable");
     this.#remaining = options.remainingBudget;
-    this.#bootstrap = options.purpose === "normal" ? options.bootstrap : undefined;
+    this.#bootstrap = options.purpose === "normal" && options.bootstrap ? structuredClone(options.bootstrap) : undefined;
     // Never put the authorization scope itself inside a cursor.
     this.#binding = hash(deterministicContextJson([options.scopeId, this.#snapshot.context_id, options.purpose]));
   }
@@ -113,6 +114,11 @@ export class ContextNavigator {
           if (!["readable", "waiting", "retired", "failed"].includes(readState)) throw new NavigationError("INVALID_ARGUMENT");
           Object.assign(body, { startup_protocol: "context-bootstrap-v1", manifest_version: 1,
             plan_id: this.#bootstrap.planId, manifest_digest: this.#bootstrap.manifestDigest, read_state: readState });
+          if (this.#bootstrap.reuse) Object.assign(body, {
+            manifest_version: 2, protocol: this.#bootstrap.reuse.protocol,
+            payload_format: this.#bootstrap.reuse.payload_format, mode: this.#bootstrap.reuse.mode,
+            reuse_ready: liveOverview?.reuse_ready ?? !this.#bootstrap.reuse.dependency,
+          });
           for (const key of ["revision", "acknowledged_revision"] as const) if (control[key] !== undefined) {
             if (!Number.isSafeInteger(control[key]) || control[key]! < 0) throw new NavigationError("INVALID_ARGUMENT");
             body[key] = control[key];
@@ -513,7 +519,7 @@ export class ContextNavigator {
   }
   #live(value: ContextLiveOverview): ContextLiveOverview {
     const result: ContextLiveOverview = {};
-    for (const key of ["context_ready", "text_ready", "images_ready"] as const) if (value[key] !== undefined) {
+    for (const key of ["context_ready", "reuse_ready", "text_ready", "images_ready"] as const) if (value[key] !== undefined) {
       if (typeof value[key] !== "boolean") throw new NavigationError("INVALID_ARGUMENT"); result[key] = value[key];
     }
     for (const key of ["required_images", "delivered_images", "required_texts", "delivered_texts", "required_text_bytes", "delivered_text_bytes", "remaining_tokens", "remaining_wire_bytes"] as const) if (value[key] !== undefined) {

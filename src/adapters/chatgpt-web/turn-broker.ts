@@ -1,3 +1,5 @@
+import { CONTEXT_REUSE_PROTOCOL, type ContextReuseBaseline, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
+import { contextReusePageIdentity, contextReuseMatches, contextReuseBaseline, contextReusePredecessor } from "./context-reuse-lifecycle";
 import { recoveryStore } from "./continuity-recovery-runtime";
 import { taskUpdateDigest } from "./task-update-source";
 import type { TaskInputIdentity } from "./continuity-task-input-types";
@@ -228,6 +230,7 @@ interface BrokerRequest {
   id: string;
   method:
     | "context_query" | "context_return" | "context_return_check" | "context_control_return"
+    | "owner_context_reuse_commit"
     | "owner_context_register" | "owner_context_select" | "owner_context_discard_unselected" | "owner_context_sent" | "owner_context_attachments" | "owner_context_status" | "owner_context_usage" | "owner_context_usage_release"
     | "owner_context_verification_arm" | "owner_context_verification_delivered" | "owner_context_verification_status" | "owner_context_verification_revoke"
     | "owner_compaction_transaction_begin" | "owner_compaction_transaction_abort"
@@ -277,6 +280,7 @@ interface BrokerRequest {
     | "task_update_ack";
   contextProtocol?: number;
   contextBootstrapProtocol?: string;
+  contextReuseProtocol?: string;
   verificationRegistration?: Omit<ContextVerificationRegistration, "normal" | "compactionSnapshot"> & { normal: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire }; compactionSnapshot: ContextSnapshotWire };
   contextRegistration?: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
   compactionRegistration?: Omit<CompactionContextRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
@@ -565,6 +569,8 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 export interface TurnBrokerOwner {
   /** Current local/remote ABI support; saved diagnostic records are not consulted. */
   contextBootstrapAvailable?(): boolean | Promise<boolean>;
+  contextReuseAvailable?(): boolean | Promise<boolean>;
+  commitContextReuse?(token: string): ContextReuseBaseline | undefined | Promise<ContextReuseBaseline | undefined>;
   armContextVerification?(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): ContextVerificationHandle | Promise<ContextVerificationHandle>;
   markContextVerificationDelivered?(pairToken: string): void | Promise<void>;
   contextVerificationStatus?(pairToken: string): ContextVerificationStatus | undefined | Promise<ContextVerificationStatus | undefined>;
@@ -657,6 +663,8 @@ export class TurnBroker implements TurnBrokerOwner {
     contract: "native" | "safe"; ownerContext?: TaskUpdateOwnerContext; expiresAt: number; timer: ReturnType<typeof setTimeout>;
     ordinary: Set<ContextMethod>; compaction: Set<ContextMethod>; ordinaryTextRead?: ContextTextReadReceipt; compactionTextRead?: ContextTextReadReceipt }>();
   private readonly channels = new Map<string, TurnChannel>();
+  private readonly reuseBaselines = new Map<string, ContextReuseBaseline>();
+  private readonly completedReuse = new Map<string, { evidence: ContextReuseDeliveryEvidence; recovery: RuntimeRecoveryReference; expiresAt: number }>();
   private readonly retiredContextUsage = new Map<string, { evidence: ContextUsageEvidence; expiresAt: number }>();
   private readonly pending = new Map<string, TurnChannel>();
   private readonly compactionTransactions = new CompactionTransactionStore(token => {
@@ -873,10 +881,46 @@ export class TurnBroker implements TurnBrokerOwner {
   }
 
   contextBootstrapAvailable(): boolean { return true; }
+  contextReuseAvailable(): boolean { return true; }
+
+  private reuseDependencyValid(channel: TurnChannel, registration: ContextPlanRegistration): boolean {
+    const dependency = registration.reuse?.dependency;
+    if (!dependency) return true;
+    const ref = channel.recovery;
+    if (!ref) return false;
+    try {
+      const record = recoveryRecord(ref);
+      const work = record.works[ref.logicalWorkId]!;
+      return record.currentWorkId === ref.logicalWorkId && record.owner.id === ref.ownerId
+        && !["lost", "unverified", "recovering", "stopped", "compacting"].includes(record.state)
+        && work.purpose === "ordinary" && work.attempts.at(-1)?.attempt === ref.attempt
+        && work.attempts.at(-1)?.epoch === record.epoch
+        && contextReusePredecessor(record, ref.logicalWorkId, dependency.predecessor)
+        && record.works[dependency.predecessor]?.state === "completed"
+        && contextReusePageIdentity(ref, record) === dependency.page_identity
+        && contextReuseMatches(this.reuseBaselines.get(dependency.page_identity), dependency);
+    } catch { return false; }
+  }
+  commitContextReuse(token: string): ContextReuseBaseline | undefined {
+    const completed = this.completedReuse.get(token);
+    if (!completed) return undefined;
+    if (completed.expiresAt <= Date.now()) { this.completedReuse.delete(token); return undefined; }
+    const { recovery: ref, evidence } = completed;
+    return recoveryStore(ref).withCompletedPageAuthority(ref, record => {
+      const baseline = contextReuseBaseline(evidence, contextReusePageIdentity(ref, record), ref.logicalWorkId);
+      if (!baseline) return undefined;
+      this.completedReuse.delete(token);
+      this.reuseBaselines.delete(baseline.page_identity);
+      this.reuseBaselines.set(baseline.page_identity, baseline);
+      while (this.reuseBaselines.size > 128) this.reuseBaselines.delete(this.reuseBaselines.keys().next().value!);
+      return structuredClone(baseline);
+    });
+  }
 
   registerContextPlan(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope) throw contextError("CONTEXT_INVALID", "The context plan is already selected");
+    if (!this.reuseDependencyValid(channel, registration)) throw contextError("CONTEXT_NOT_READY", "The reuse baseline changed before preparation; recover a complete plan");
     const plans = channel.contextPlans ??= new Map();
     this.assertContextStorage(registration.snapshot.storage_bytes);
     if (plans.has(registration.planId)) throw contextError("CONTEXT_INVALID", "The context plan identity is already registered");
@@ -901,7 +945,8 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     const registration = channel.contextPlans?.get(planId);
     if (!registration) throw contextError("CONTEXT_INVALID", "Select a registered context plan");
-    channel.contextScope = new ContextScope(token, registration, "normal", () => { channel.activityRevision += 1; }, error => this.revokeTrusted(token, error));
+    if (!this.reuseDependencyValid(channel, registration)) throw contextError("CONTEXT_NOT_READY", "The reuse baseline changed before Send; recover a complete plan");
+    channel.contextScope = new ContextScope(token, registration, "normal", () => { channel.activityRevision += 1; }, error => this.revokeTrusted(token, error), undefined, () => this.reuseDependencyValid(channel, registration));
     channel.contextPlans!.clear();
     channel.contextScope.presentAttachments();
     this.activateContextReads(channel);
@@ -910,6 +955,7 @@ export class TurnBroker implements TurnBrokerOwner {
   markContextPlanSent(token: string, planId: string, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope?.registration.planId !== planId) throw contextError("CONTEXT_INVALID", "Send evidence must match the selected context plan");
+    if (!this.reuseDependencyValid(channel, channel.contextScope.registration)) throw contextError("CONTEXT_NOT_READY", "The fixed reuse baseline is no longer valid");
     channel.contextSent = true;
     this.activateContextReads(channel);
   }
@@ -1002,7 +1048,13 @@ export class TurnBroker implements TurnBrokerOwner {
     this.retiredContextUsage.set(token, { evidence: scope.usageEvidence(true), expiresAt: Date.now() + 300_000 });
     while (this.retiredContextUsage.size > MAX_RETIRED_TURN_HANDLES) this.retiredContextUsage.delete(this.retiredContextUsage.keys().next().value!);
   }
-  private retireTurnContext(token: string, channel: TurnChannel): void {
+  private retireTurnContext(token: string, channel: TurnChannel, successful = false): void {
+    const evidence = successful && !channel.compactionRequested ? channel.contextScope?.usageEvidence().reuse_delivery : undefined;
+    if (evidence && channel.recovery) {
+      this.completedReuse.set(token, { evidence: structuredClone(evidence), recovery: { ...channel.recovery }, expiresAt: Date.now() + 300_000 });
+      for (const [key, value] of this.completedReuse) if (value.expiresAt <= Date.now()) this.completedReuse.delete(key);
+      while (this.completedReuse.size > 128) this.completedReuse.delete(this.completedReuse.keys().next().value!);
+    }
     if (channel.contextScope) { this.retainContextUsage(token, channel.contextScope); channel.contextScope.retire(); }
     channel.contextScope = undefined; channel.contextPlans?.clear();
   }
@@ -1127,6 +1179,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!channel.contextScope || (!channel.safe && !channel.contextSent)) throw contextError("CONTEXT_NOT_READY", "Select and send the current context plan before reading");
       this.activateContextReads(channel); scope = channel.contextScope;
     } else throw contextError("CONTEXT_INVALID", "Invalid context credential");
+    if (scope.registration.reuse && request.contextReuseProtocol !== CONTEXT_REUSE_PROTOCOL) throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the connector for context-reuse-v1; the sent plan cannot change or resend");
     if (scope.registration.startupProtocol && request.contextBootstrapProtocol !== scope.registration.startupProtocol) {
       throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current connector to obtain context-bootstrap-v1 and context-text-read-v2; this sent request cannot change delivery plans");
     }
@@ -1835,7 +1888,9 @@ export class TurnBroker implements TurnBrokerOwner {
       || channel.nativeQueryCount > 0
       || channel.nativeOperations.hasOutstanding()
       || [...channel.devLongWaitProbeOperations.values()].some(operation => !operation.delivered)) return false;
-    this.retireTurnContext(token, channel);
+    if (!channel.compactionRequested) this.assertContextReady(channel);
+    channel.contextScope?.recordFirstWork();
+    this.retireTurnContext(token, channel, true);
     channel.completionCommitted = true;
     channel.completionRevision = revision;
     if (channel.taskUpdates) {
@@ -2034,7 +2089,8 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (updates && [...updates.transfers.values()].some(record => record.outcome.status === "unknown" || record.synchronize)) throw taskUpdateError("task_update_transfer_pending", "Resolve the task update transfer before completing the turn");
     if (compactionScope) { this.revokeCompactionContext(compactionScope[0]); this.compactionContextBindings.delete(requestId); }
-    this.retireTurnContext(requestId, channel);
+    channel.contextScope?.recordFirstWork();
+    this.retireTurnContext(requestId, channel, true);
     safe.state = "completed";
     if (updates) {
       updates.state.finalOutputRevision = taskRevision ?? 0;
@@ -2792,7 +2848,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_observer_attach", "owner_observer_detach", "owner_task_input_boundary", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
+    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_context_reuse_commit","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_observer_attach", "owner_observer_detach", "owner_task_input_boundary", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -2848,6 +2904,7 @@ export class TurnBroker implements TurnBrokerOwner {
         case "owner_context_attachments": this.confirmContextAttachments(request.token, { planId: request.planId!, manifestDigest: request.manifestDigest! }, request.ownerContext); break;
         case "owner_context_status": return { status: this.contextStatus(request.token) ?? null };
         case "owner_context_usage": return { usage: this.contextUsage(request.token) ?? null };
+        case "owner_context_reuse_commit": return { baseline: this.commitContextReuse(request.token) ?? null };
         case "owner_context_usage_release": this.releaseContextUsage(request.token); break;
         case "owner_compaction_context_delivered": this.markCompactionContextDelivered(request.token); break;
         case "owner_compaction_context_guard": this.guardCompactionContextCommit(request.token); break;
@@ -2966,7 +3023,9 @@ export class TurnBroker implements TurnBrokerOwner {
         || request.contextBootstrapProtocol !== scope.registration.startupProtocol)) {
         throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current Zero Risk connector to obtain context-bootstrap-v1; the prepared request remains fixed");
       }
-      return this.startSafeTurn(request.token);
+      if (scope?.registration.reuse && request.contextReuseProtocol !== CONTEXT_REUSE_PROTOCOL) throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the connector for context-reuse-v1; the prepared plan remains fixed");
+      const response = this.startSafeTurn(request.token);
+      return scope?.registration.reuse ? { ...response, contextBootstrapReceipt: scope.prepareBootstrapReturn(response) } : response;
     }
     if (request.method === "safe_complete") {
       if (!request.token) throw new Error("Zero Risk request_id is required");
@@ -3007,6 +3066,7 @@ export class TurnBroker implements TurnBrokerOwner {
         taskUpdateProtocol: TASK_UPDATE_PROTOCOL_VERSION,
         contextProtocol: CONTEXT_PROTOCOL_VERSION,
         contextBootstrapProtocol: "context-bootstrap-v1",
+        contextReuseProtocol: CONTEXT_REUSE_PROTOCOL,
         acceptingExternalOwners: this.acceptingExternalOwners,
         owner: this.ownerId,
       };
@@ -3402,7 +3462,7 @@ export class TurnBroker implements TurnBrokerOwner {
         if (channel.taskUpdates && (request.taskUpdateProtocol !== TASK_UPDATE_PROTOCOL_VERSION || !isTaskRevision(request.taskRevision))) {
           throw taskUpdateError("task_update_revision_required", "Declare the exact acknowledged task_revision from this request's task contract or Broker ACK reply on every Native start as a nonnegative safe integer");
         }
-        const started = channel.nativeOperations.start(operationId, request.entry, request.nativeInput, normalized => {
+        const startOperation = () => channel.nativeOperations.start(operationId, request.entry!, request.nativeInput!, normalized => {
           if (channel.compactionRequested) {
             if (!channel.compactionResult) throw new Error("Compaction control result is unavailable");
             return { result: structuredClone(channel.compactionResult), control: "compaction" };
@@ -3412,7 +3472,7 @@ export class TurnBroker implements TurnBrokerOwner {
           const notReady = channel.contextScope?.notReady();
           if (notReady) return { result: notReady };
           const plan = planNativeTool(request.entry!, normalized, turnSnapshot(channel), request.contract!);
-          if ("result" in plan) return plan;
+          if ("result" in plan) { if (!plan.result.isError) channel.contextScope?.recordFirstWork(); return plan; }
           const wireName = namespacedToolName(plan.tool.namespace, plan.tool.name);
           try {
             assertCurrentToolInvocation(plan.tool, { id: request.id, method: "invoke", freeform: plan.tool.freeform === true, ...plan.payload }, wireName);
@@ -3434,6 +3494,8 @@ export class TurnBroker implements TurnBrokerOwner {
             : state.acknowledgedRevision !== state.acceptedRevision ? "unacknowledged" : undefined;
           return reason ? { result: this.notExecutedResult(reason), control: "task-update" } : undefined;
         });
+        const started = channel.recovery ? withRecoveryWriter(channel.recovery, startOperation) : startOperation();
+        if (started.created && started.request) channel.contextScope?.recordFirstWork();
         if (started.created && started.control === "compaction") {
           channel.compactionDeliveryCount += 1;
           channel.onCompactionProgress?.();
@@ -3479,6 +3541,7 @@ export class TurnBroker implements TurnBrokerOwner {
       const pendingInput = Symbol("pending task input");
       try {
         recordRecoveryDelivery(channel.recovery, batch, () => {
+          this.assertContextReady(channel);
           this.assertTaskInputIntent(channel);
           const task = channel.taskInput && recoveryStore(channel.recovery!).taskInputRecord(channel.taskInput.identity);
           if (channel.taskUpdates && task?.messages.some(message => message.status === "accepted"
@@ -3494,6 +3557,7 @@ export class TurnBroker implements TurnBrokerOwner {
     for (const id of ids) {
       const invocation = channel.invocations.get(id);
       if (invocation) {
+        channel.contextScope?.recordFirstWork();
         invocation.deliveredAt ??= performance.now();
         channel.deliveredCallIds.add(id);
         if (invocation.operationId !== undefined) channel.nativeOperations.handoff(invocation.operationId);
@@ -3773,6 +3837,15 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return status.contextProtocol === CONTEXT_PROTOCOL_VERSION && status.contextBootstrapProtocol === "context-bootstrap-v1";
   }
 
+  async contextReuseAvailable(): Promise<boolean> {
+    const status = await callTurnBroker<{ contextProtocol?: number; contextReuseProtocol?: string }>(this.socketPath, { method: "owner_status" }, 5_000);
+    return status.contextProtocol === CONTEXT_PROTOCOL_VERSION && status.contextReuseProtocol === CONTEXT_REUSE_PROTOCOL;
+  }
+  async commitContextReuse(token: string): Promise<ContextReuseBaseline | undefined> {
+    const result = await callTurnBroker<{ baseline: ContextReuseBaseline | null }>(this.socketPath,
+      { method: "owner_context_reuse_commit", token, contextProtocol: CONTEXT_PROTOCOL_VERSION, contextReuseProtocol: CONTEXT_REUSE_PROTOCOL });
+    return result.baseline ?? undefined;
+  }
   armContextVerification(token: string, registration: ContextVerificationRegistration, context?: TaskUpdateOwnerContext): Promise<ContextVerificationHandle> {
     return callTurnBroker(this.socketPath, { method: "owner_context_verification_arm", token, contextProtocol: CONTEXT_PROTOCOL_VERSION,
       verificationRegistration: { ...registration, normal: { ...registration.normal, snapshot: serializeContextSnapshot(registration.normal.snapshot) },

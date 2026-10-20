@@ -112,7 +112,8 @@ export class CompactionSourceCoverage {
     const all = versions(snapshot);
     // Generated bootstrap records describe this delivery, rather than permanent
     // task history. Later compaction reconstructs the real sources they carry.
-    const generated = (index: number): boolean => snapshot.targets[index]!.original_role === "context_record"
+    const generated = (index: number): boolean => snapshot.targets[index]!.origin === "context_reuse_unit"
+      || snapshot.targets[index]!.original_role === "context_record"
       && snapshot.targets[index]!.source_kind === "summary"
       && ["context_bootstrap_protocol", "context_bootstrap_payload"].includes(snapshot.targets[index]!.origin ?? "");
     const externalizedVersions = plan.externalizedTargetIds.flatMap(id => {

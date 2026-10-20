@@ -135,6 +135,9 @@ async function fixture(manual = false, protocol = true, search = false,
     localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: !manual, zeroRiskRequireSentConfirmation: true,
   } };
   const broker = TurnBroker.forSocket(socket);
+  // The simulated update consumer uses the original inline/on-demand ABI.
+  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
+  faultRestorations.push(() => reuseCapability.mockRestore());
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
   const supported = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(protocol);
@@ -227,7 +230,12 @@ async function fixture(manual = false, protocol = true, search = false,
   const originalAccept = broker.acceptTaskUpdate;
   if (!protocol) broker.acceptTaskUpdate = undefined as never;
   if (options.remote) await broker.listen();
-  const adapter = createChatGptWebAdapter(provider, { broker: options.remote ? new RemoteTurnBroker(socket) : broker, zeroRiskManualControl: manualControl });
+  const owner = options.remote ? new RemoteTurnBroker(socket) : broker;
+  if (owner instanceof RemoteTurnBroker) {
+    const remoteReuseCapability = spyOn(owner, "contextReuseAvailable").mockResolvedValue(false);
+    faultRestorations.push(() => remoteReuseCapability.mockRestore());
+  }
+  const adapter = createChatGptWebAdapter(provider, { broker: owner, zeroRiskManualControl: manualControl });
   const request = (input: unknown[] = [user("initial-user", "Inspect the project.")], requestId = "request") => {
     const parsed = parseRequest({ model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : "gpt-5.6-sol",
       stream: false, input, tools: [{ type: "function", name: "exec_command", description: "Simulated tool",

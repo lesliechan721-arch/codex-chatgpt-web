@@ -414,6 +414,8 @@ describe("context capability evidence", () => {
       provider.chatgptWeb!.threadEnvironmentStatePath = development
         ? join(f.home, "runtime", "dev-chat", "thread-environments.json") : join(f.home, "runtime", "thread-environments.json");
       const broker = TurnBroker.forSocket(f.config.brokerSocketPath); await broker.listen();
+      // Compare the original inline/on-demand ABI across diagnostic histories.
+      const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
       const client = new Client({ name: "diagnostic-independent-factory-test", version: "1" });
       await client.connect(new StdioClientTransport({ command: process.execPath,
         args: [resolve("src/cli.ts"), "mcp", "--contract", manual ? "safe" : "native", "--broker-socket", f.config.brokerSocketPath], stderr: "pipe" }));
@@ -532,6 +534,6 @@ describe("context capability evidence", () => {
             .rejects.toThrow("Current Broker context protocol is incompatible");
           expect(sends).toBe(beforeRejection);
         } finally { registration.mockRestore(); }
-      } finally { run.mockRestore(); diagnostics.mockRestore(); taskUpdates.mockRestore(); await client.close(); await broker.close(); }
+      } finally { run.mockRestore(); diagnostics.mockRestore(); taskUpdates.mockRestore(); reuseCapability.mockRestore(); await client.close(); await broker.close(); }
     }, 30_000);
 });

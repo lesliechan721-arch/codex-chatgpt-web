@@ -1,3 +1,4 @@
+import { CONTEXT_REUSE_PROTOCOL } from "./context-reuse-types";
 import { CONTEXT_PROTOCOL_VERSION, contextFailure, type ContextPreparedReply } from "./context-runtime";
 import { contextTextReadReceipt, type ContextTextReadReceipt } from "./context-text-result";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
@@ -176,7 +177,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
       const credentialKind = compaction_token ? "compaction" as const : "ordinary" as const;
       try {
         const reply = await callTurnBroker<ContextPreparedReply>(options.brokerSocketPath, {
-          method: "context_query", token, contract, credentialKind, contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1",
+          method: "context_query", token, contract, credentialKind, contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: CONTEXT_REUSE_PROTOCOL,
           contextMethod: method, contextArgs: contextArgs as never,
         }, CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, extra.signal);
         if (!reply || typeof reply.receiptId !== "string" || !Array.isArray(reply.result?.content)) throw new Error("Invalid context response");
@@ -215,13 +216,15 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
       },
       async ({ request_id }, extra) => {
         console.error(`[chatgpt-web-mcp] codex_turn_start scope=${requestScopeSummary(extra)}`);
-        const response = await callTurnBroker<{ started: true; duplicate: boolean }>(options.brokerSocketPath, {
+        const response = await callTurnBroker<{ started: true; duplicate: boolean; contextBootstrapReceipt?: string }>(options.brokerSocketPath, {
           method: "safe_start",
           token: request_id,
           contextProtocol: CONTEXT_PROTOCOL_VERSION,
-          contextBootstrapProtocol: "context-bootstrap-v1",
+          contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: CONTEXT_REUSE_PROTOCOL,
         }, 5_000, extra.signal);
-        return result(response);
+        const { contextBootstrapReceipt, ...modelResponse } = response;
+        if (contextBootstrapReceipt) contextReturns.set(extra.requestId, { token: request_id, receiptId: contextBootstrapReceipt, credentialKind: "ordinary", signal: extra.signal });
+        return result(modelResponse);
       },
     );
   }

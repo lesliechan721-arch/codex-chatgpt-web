@@ -67,6 +67,7 @@ function publicLossFixture(successorFails = false) {
     brokerSocketPath: defaultBrokerEndpoint(root), continuityStateDirectory: statePath, localToolsEnabled: true, solAvailable: true,
     toolAuthorityMode: "delegated", proAvailable: false, extraHighAvailable: false } };
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!), worker = ChatGptBrowserWorker.forProvider(provider);
+  const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
   const updates = spyOn(worker, "supportsTaskUpdates").mockResolvedValue(true);
   const run = spyOn(worker, "run").mockImplementation(async (turn: BrowserTurn) => {
@@ -123,7 +124,7 @@ function publicLossFixture(successorFails = false) {
     const record = store.get(thread);
     return { record, logicalWorkId: record?.currentWorkId, sends, dispatches, expectedResults };
   };
-  cleanups.push(async () => { run.mockRestore(); compatible.mockRestore(); updates.mockRestore(); await http.stop(true); await broker.close(); await server.stop(true); rmSync(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { reuseSupport.mockRestore(); run.mockRestore(); compatible.mockRestore(); updates.mockRestore(); await http.stop(true); await broker.close(); await server.stop(true); rmSync(root, { recursive: true, force: true }); });
   return { body, pages, send, snapshot, received, store, thread, statePath, metadata, pageRecords, compiledTexts,
     get successorRecord() { return successorRecord; } };
 }

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -20,6 +20,8 @@ for (const contract of ["native", "safe"] as const) test(`short startup ${contra
   const root = mkdtempSync(join(tmpdir(), "ctx-boot-"));
   const socket = defaultBrokerEndpoint(root), broker = TurnBroker.forSocket(socket);
   const owner = new RemoteTurnBroker(socket);
+  // This suite preserves the complete v1 short-start contract; reuse has its own integration suite.
+  const reuseCapability = spyOn(owner, "contextReuseAvailable").mockResolvedValue(false);
   const client = new Client({ name: "bootstrap-integration", version: "1" });
   const transport = new StdioClientTransport({ command: process.execPath,
     args: ["src/cli.ts", "mcp", "--contract", contract, "--broker-socket", socket], cwd: process.cwd(), stderr: "pipe" });
@@ -93,7 +95,7 @@ for (const contract of ["native", "safe"] as const) test(`short startup ${contra
     }
   } finally {
     await client.close();
-    send?.retire();
+    reuseCapability.mockRestore(); send?.retire();
     await broker.close();
     rmSync(root, { recursive: true, force: true });
   }

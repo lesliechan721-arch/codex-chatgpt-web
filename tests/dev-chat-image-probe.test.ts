@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
@@ -166,6 +166,7 @@ test("DEV driver carries repeated image results through the real Responses adapt
     }
   };
   const remote = new RemoteTurnBroker(config.brokerSocketPath);
+  const reuseSupport = spyOn(remote, "contextReuseAvailable").mockResolvedValue(false);
   const store = new DevChatStore(join(root, "chats"));
   const driver = new DevChatDriver(config, store,
     provider => createChatGptWebAdapter(devProvider(provider), { broker: remote }), root);
@@ -202,6 +203,7 @@ test("DEV driver carries repeated image results through the real Responses adapt
     for (const answer of ["482731", "915406", "637258"]) expect(eventText).not.toContain(answer);
     expect(events.filter(event => event.type === "tool_result")).toHaveLength(5);
   } finally {
+    reuseSupport.mockRestore();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await client.close();
     await driver.close();

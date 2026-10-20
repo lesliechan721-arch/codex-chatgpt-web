@@ -126,6 +126,16 @@ store bounded source-coverage metadata, not raw text, images, or read credential
 is recorded, it contains references, ranges, sizes, routes, timing, and necessary identity summaries,
 not source bodies. See [context navigation](context-navigation.md) for the effective resource limits.
 
+`context-reuse-v1` authorizes reuse only through a committed same-page baseline and verified
+current source units. Exact content, source identity, role, structure and applicability are part
+of the unit fingerprint. Text that claims to be stable, read or privileged is not evidence.
+References cannot inherit credentials, operation IDs, ACKs, permissions or text coverage.
+The Broker checks the baseline separately from this scope's delivery at business and success
+boundaries. A sent plan is immutable after baseline invalidation. Baseline commit requires
+normal completion, physical termination and a fresh page/head check; delayed old execution
+cannot write a successor's baseline. Baselines contain bounded metadata and are not restored
+as reuse authority after restart.
+
 ### Durable input custody and preparation termination
 
 Task inbox originals are sensitive local data. Owner-only payload files hold exact user text;

@@ -62,6 +62,8 @@ async function fixture(manual: boolean, sent: boolean) {
   const root = mkdtempSync(join(tmpdir(), "context-adapter-"));
   const socket = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socket);
+  // This fixture represents a connector with the original inline/on-demand ABI.
+  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   await broker.listen();
   const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `context://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
     browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
@@ -98,7 +100,7 @@ async function fixture(manual: boolean, sent: boolean) {
       type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }],
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: root, turn_id: turnId }) },
   });
-  cleanups.push(async () => { await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { reuseCapability.mockRestore(); await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
   return { broker, provider, client, call, credential, input, request };
 }
 

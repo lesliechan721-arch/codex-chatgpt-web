@@ -124,6 +124,20 @@ sends an automatic second prompt or treats navigation reads as Sent confirmation
 
 ## Short-start scope and updates
 
+With `context-reuse-v1`, a healthy ordinary continuation can reuse exact stable units delivered
+on the same page. The baseline belongs to the live page and its completed predecessor, not the
+per-turn trace, context ID or read reference. The existing ordinary-resume checks still select
+the candidate; reuse does not require equality of all canonical history. Changed completed
+assistant text and foreign history retain their existing continuation behavior.
+
+Only normal final output plus confirmed physical termination can commit a new baseline. The
+commit rechecks page ownership, generation and current head. Required text needs complete v2
+transport evidence; Sent and compaction source coverage alone are insufficient. New work and
+success validate the fixed dependency again. Failed, cancelled, superseded or unsettled work
+cannot advance it. A proved unsent preparation failure retains the previous healthy predecessor.
+Cold recovery, new pages, restart and compaction cannot inherit reuse eligibility. The baseline
+stores bounded metadata only and does not restore missing source text.
+
 A new physical ordinary send creates its own fixed source snapshot, plan and required-text coverage.
 A same-scope start/read retry retains those identities and its coverage. A new page, restart or
 cold recovery cannot reuse old receipts or a journal's read marker to satisfy new required text.

@@ -17,7 +17,7 @@ import type { NativeOperationReply } from "../../src/adapters/chatgpt-web/native
 import type { UserUpdate } from "../../src/adapters/chatgpt-web/task-update-protocol";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult, type BrokerToolRequest } from "../../src/adapters/chatgpt-web/turn-broker";
-import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../../src/chatgpt-web-models";
+import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL } from "../../src/chatgpt-web-models";
 import { CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, defaultConfig } from "../../src/config";
 import { CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL, LauncherKnownUnsentReceiptError } from "../../src/launcher-browser-host";
 import { compactRequest, responseRequest } from "../../src/server";
@@ -33,6 +33,14 @@ export const launcherRecovery = require("../../launcher/electron/continuity-reco
 export const launcherLease = require("../../launcher/electron/continuity-lease.cjs");
 
 export const launcherAuthority = require("../../launcher/electron/continuity-execution-authority.cjs");
+
+export interface ContinuityContextModelInput {
+  prompt: string;
+  token: string;
+  manual: boolean;
+  client: Awaited<ReturnType<typeof createContinuityMcpClient>>["client"];
+  broker: TurnBroker;
+}
 
 export function recordedCall(call: BrokerToolRequest): Record<string, unknown> {
   return call.freeform
@@ -90,7 +98,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       () => measureRuntimeOperation("fixture.prepare", () => createFixture(...args)));
   }
 
-  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit"; mcpTransport?: ContinuityMcpTransport } = {}) {
+  function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit"; mcpTransport?: ContinuityMcpTransport;
+    zeroRiskPro?: boolean; contextModel?: (input: ContinuityContextModelInput) => Promise<void> } = {}) {
     const profileContext = runtimePerformanceContext();
     const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
     const statePath = join(root, "continuity");
@@ -207,11 +216,14 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       },
     };
     const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
+    // Existing cases exercise the compatible inline path. Reuse cases opt into
+    // a model that consumes the real versioned startup and text receipts.
+    const reuseSupport = options.contextModel ? undefined : spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
     let modelMcp: Awaited<ReturnType<typeof createContinuityMcpClient>> | undefined;
     let modelMcpConnection: Promise<Awaited<ReturnType<typeof createContinuityMcpClient>>> | undefined;
     const manualMcp = async () => {
       modelMcpConnection ??= measureRuntimeAsync("fixture.mcp", () => createContinuityMcpClient({
-        name: "continuity-manual-model-fixture", contract: "safe",
+        name: "continuity-model-fixture", contract: manual ? "safe" : "native",
         brokerSocketPath: provider.chatgptWeb!.brokerSocketPath!, transport: options.mcpTransport,
       }));
       modelMcp = await modelMcpConnection;
@@ -389,6 +401,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         await new Promise<void>(resolve => { controls.releaseDeferredCompletion = resolve; controls.onStarted?.(); });
         controls.releaseDeferredCompletion = undefined;
       }
+      if (options.contextModel) await options.contextModel({ prompt: compiled.text, token: compiled.turnToken!,
+        manual, client: await manualMcp(), broker });
       if (controls.invokeSourceTools) {
         const token = compiled.turnToken;
         expect(token).toBeDefined();
@@ -454,7 +468,9 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         const prompt = activity.requireRetainedConversation ? activity.resumePrompt! : activity.prompt;
         if (activity.continuity!.expected || !hadPage) {
           submissions.push({ prompt, claim: activity.continuity!, key: activity.conversationKey!, reused: Boolean(activity.requireRetainedConversation) });
-          controls.safeToken = JSON.parse(prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id;
+          const bootstrap = prompt.match(/<codex_bootstrap_json>\n([^\n]+)\n/);
+          controls.safeToken = bootstrap ? JSON.parse(bootstrap[1]!).first_call.arguments.request_id
+            : JSON.parse(prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id;
         }
         if (controls.loseStartAcknowledgementOnce && !hadPage && !activity.continuity!.expected) {
           controls.loseStartAcknowledgementOnce = false;
@@ -469,6 +485,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       async markStarted() {
         controls.started = true;
         controls.onStarted?.();
+        if (options.contextModel) await options.contextModel({ prompt: submissions.at(-1)!.prompt,
+          token: controls.safeToken, manual, client: await manualMcp(), broker });
         if (controls.invokeSourceTools) {
           const token = controls.safeToken;
           controls.modelTask = sourceTools(token).then(async () => {
@@ -489,6 +507,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       controls.releaseDeferredCompletion?.();
       controls.releaseAfterToolResults?.();
       automatic.mockRestore(); compatible.mockRestore(); taskUpdatesSupport.mockRestore();
+      reuseSupport?.mockRestore();
       broker.acceptTaskUpdate = originalAcceptTaskUpdate;
       await measureRuntimeAsync("cleanup.broker", () => broker.close());
       await controls.modelTask?.catch(() => {});
@@ -517,7 +536,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
     });
     const request = (text = "First continuity instruction.", turnId = "turn-first", input?: unknown[]): CodexParsedRequest => {
       const parsed = parseRequest({
-        model: manual ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL : "gpt-5.6-sol", stream: false,
+        model: manual ? (options.zeroRiskPro ? CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL : CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL) : "gpt-5.6-sol", stream: false,
         reasoning: { effort: "low" }, tools: [{
           type: "function", name: "exec_command", description: "Fixture command; Native execution is simulated by the test.",
           parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
@@ -12,7 +12,7 @@ import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import type { ContinuityBinding } from "../src/adapters/chatgpt-web/continuity-binding";
 import { CHATGPT_TURN_REVISION_CONFLICT_MESSAGE, extractChatGptDelegatedTurnCapability, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, priorChatGptAbortedTurnIds } from "../src/adapters/chatgpt-web/environment";
-import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
+import { CHATGPT_WEB_ADAPTER_HEARTBEAT_MS, chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter as createProductionChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
 import { scheduleChatGptWebHeartbeat, type ChatGptWebHeartbeatScheduler } from "../src/adapters/chatgpt-web/heartbeat";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -25,7 +25,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessi
 import { callTurnBroker, TurnBroker, RemoteTurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
-import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, resolveBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
@@ -39,6 +39,24 @@ let nextNativeOperationId = 0;
 const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date.now()}`);
 mkdirSync(tempRoot, { recursive: true });
 afterAll(() => rmSync(tempRoot, { recursive: true, force: true }));
+const legacyBrokers = new Set<object>();
+const restoreLegacyCapabilities: Array<() => void> = [];
+afterEach(() => {
+  for (const restore of restoreLegacyCapabilities.splice(0).reverse()) restore();
+  legacyBrokers.clear();
+});
+function createChatGptWebAdapter(...[provider, dependencies = {}]: Parameters<typeof createProductionChatGptWebAdapter>) {
+  const broker = dependencies.broker ?? TurnBroker.forSocket(resolveBrokerEndpoint(
+    provider.chatgptWeb?.brokerSocketPath?.trim() || defaultBrokerEndpoint()));
+  if (!legacyBrokers.has(broker) && (broker instanceof TurnBroker || broker instanceof RemoteTurnBroker)) {
+    const capability = broker instanceof RemoteTurnBroker
+      ? spyOn(broker, "contextReuseAvailable").mockResolvedValue(false)
+      : spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
+    legacyBrokers.add(broker);
+    restoreLegacyCapabilities.push(() => capability.mockRestore());
+  }
+  return createProductionChatGptWebAdapter(provider, { ...dependencies, broker });
+}
 
 test("current-turn MCP progress tracks active calls without claiming completion", async () => {
   const progress = new ChatGptExternalTurnProgress();

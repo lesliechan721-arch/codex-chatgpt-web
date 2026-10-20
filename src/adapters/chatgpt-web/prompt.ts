@@ -1,6 +1,7 @@
 import {
   NATIVE_EXECUTION_INSTRUCTIONS, SKILL_ATTACHMENT_INSTRUCTIONS, TASK_OUTPUT_INSTRUCTIONS,
-  TASK_ROLE_INSTRUCTIONS, TASK_UPDATE_INSTRUCTIONS, bootstrapExecutionProtocol, taskContinuityInstructions,
+  TASK_ROLE_INSTRUCTIONS, TASK_UPDATE_INSTRUCTIONS, bootstrapExecutionProtocol, bootstrapExecutionProtocolUnits, taskContinuityInstructions,
+  type BootstrapProtocolUnit,
 } from "./execution-protocol";
 import { normalContextPrompt, type ContextPlanDescriptor, type ContextPromptNavigation } from "./context-prompt";
 import { createHash } from "node:crypto";
@@ -47,6 +48,8 @@ export interface CompiledChatGptWebPrompt {
   /** Internal exact candidate for a short-start plan; never pasted with its full inline duplicate. */
   bootstrapContent?: {
     protocol: string;
+    protocolUnits: BootstrapProtocolUnit[];
+    outputControl: readonly string[];
     payload: { version: 3; system: unknown[]; messages: Record<string, unknown>[] };
     /** Each prepared message's index in the supplied candidate, after superseded-contract removal. */
     messageSourceIndices: number[];
@@ -729,16 +732,19 @@ function compileChatGptWebPromptCandidate(
       ...prepared.system.map((content, system_index) => ({ kind: "system" as const, system_index, content })),
       ...prepared.messages.map((message, message_index) => ({ kind: "message" as const, message_index, message })),
     ];
-    const bootstrapContent = options?.bootstrapPreparation ? {
+    const bootstrapInput = options?.bootstrapPreparation ? {
+      manualControl: options.manualControl, taskUpdateProtocol: options.taskUpdateProtocol,
+      retainedContinuity: options.retainedContinuity, recoveredContinuity: options.recoveredContinuity,
+      requiredMcpImages: options.contextNavigation?.requiredMcpImages ?? options.contextNavigation?.requiredImages ?? 0,
+      imageAttachments: images.length > 0, skillAttachments: skillFiles.length > 0,
+      outputControlInstructions: outputControlContract,
+    } : undefined;
+    const bootstrapContent = bootstrapInput ? {
       payload: prepared,
       messageSourceIndices: [...sourceMessageIndices],
-      protocol: bootstrapExecutionProtocol({
-        manualControl: options.manualControl, taskUpdateProtocol: options.taskUpdateProtocol,
-        retainedContinuity: options.retainedContinuity, recoveredContinuity: options.recoveredContinuity,
-        requiredMcpImages: options.contextNavigation?.requiredMcpImages ?? options.contextNavigation?.requiredImages ?? 0,
-        imageAttachments: images.length > 0, skillAttachments: skillFiles.length > 0,
-        outputControlInstructions: outputControlContract,
-      }),
+      outputControl: outputControlContract,
+      protocolUnits: bootstrapExecutionProtocolUnits(bootstrapInput),
+      protocol: bootstrapExecutionProtocol(bootstrapInput),
     } : undefined;
     if (multipartEnabled) {
       const emptyPart = (index: number): string => encodeWebContextPayload([], contextFormat, {

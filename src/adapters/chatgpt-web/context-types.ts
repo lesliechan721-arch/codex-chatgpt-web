@@ -119,6 +119,7 @@ export interface ContextSearchArgs extends ContextFilter {
 /** Dynamic state is never mixed into stable entries/search pages. */
 export interface ContextLiveOverview {
   context_ready?: boolean;
+  reuse_ready?: boolean;
   text_ready?: boolean;
   images_ready?: boolean;
   required_texts?: number;

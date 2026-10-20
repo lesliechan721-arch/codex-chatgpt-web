@@ -416,7 +416,8 @@ export function restoreContextSnapshot(wire: unknown, options: { maxStorageBytes
 export interface FixedContextRecord {
   text: string;
   encoding: "utf-8" | "deterministic-json";
-  origin: "context_bootstrap_protocol" | "context_bootstrap_payload";
+  origin: "context_bootstrap_protocol" | "context_bootstrap_payload" | "context_reuse_unit";
+  originalRole?: string;
 }
 export function appendFixedContextRecords(snapshot: ContextSnapshot, records: readonly FixedContextRecord[],
   options: { contextId?: string; maxStorageBytes?: number } = {}): ContextSnapshot {
@@ -425,13 +426,14 @@ export function appendFixedContextRecords(snapshot: ContextSnapshot, records: re
   for (const record of records) {
     const index = sources.length + 1;
     const source: ContextSource = { source_id: `s_${index}`, source_index: index, source_kind: "summary",
-      original_role: "context_record", origin: record.origin, provenance: "parsed", source_completeness: "complete",
+      original_role: record.originalRole ?? "context_record", origin: record.origin, provenance: "parsed", source_completeness: "complete",
       locator: { system_index: index - 1, field: "systemPrompt" } };
     const target: ContextTarget = { ...source, target_id: `t_${targets.length + 1}`, target_index: 1,
       kind: "message_text", tool_name: null, namespace: null, call_id: null, read_ref: opaque("read"),
       encoding: record.encoding, utf8_bytes: Buffer.byteLength(record.text), content_digest: digest(record.text),
       mime_type: null, image_bytes: null, visual_token_reserve: null,
-      label: record.origin === "context_bootstrap_protocol" ? "Required execution protocol" : "Required exact task context value tree",
+      label: record.origin === "context_bootstrap_protocol" ? "Required execution protocol"
+        : record.origin === "context_reuse_unit" ? "Exact current context unit" : "Required exact task context value tree",
       label_source: "excerpt", unavailable_reason: null, error_status: "not_error",
       relation: { state: "not_applicable", call_count: 0, result_count: 0, related_target_ids: [] } };
     sources.push(source); targets.push(target); payloads.push({ target_id: target.target_id, type: "text", text: record.text });

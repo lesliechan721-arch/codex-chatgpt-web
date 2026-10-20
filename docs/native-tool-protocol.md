@@ -90,6 +90,15 @@ complete applicable wait, update, error and completion rules. Neither metadata r
 body text can change permissions or control state. See
 [short startup](context-navigation.md#short-startup-and-required-text) for the complete contract.
 
+Ordinary `context-reuse-v1` plans add `reuse_ready` to the context gate. A v2 full plan has no
+reuse dependency; an incremental plan must retain its server-validated page baseline. Required
+text coverage is still local to this scope. Inline data needs real prompt submission, and external
+text still needs complete v2 receipts. Reused units are optional exact rereads with current
+references; reading them again consumes budget. Startup remains overview in Automatic and
+`codex_turn_start` in Zero Risk. An invalid baseline blocks new business calls, inventory and
+successful completion with bounded recovery information. Existing operation settlement,
+wait/replay, ACK, cancellation and error termination retain their own rules.
+
 ## Waiting and public results
 
 The first call and each `codex_tool_wait` have a 30,000 ms semantic waiting window. A still-running

@@ -1001,6 +1001,18 @@ export class ContinuityRecoveryStore {
       return commit();
     });
   }
+  /** A completed physical owner may publish bounded metadata only while its page is still the head. */
+  withCompletedPageAuthority<T>(reference: RecoveryWriterReference, commit: (record: RecoveryThreadRecord) => T): T | undefined {
+    return this.exclusive(() => {
+      const record = this.get(reference.thread);
+      const work = record?.works[reference.logicalWorkId], attempt = work?.attempts[reference.attempt];
+      if (!record || record.legacyUnproven || record.pendingPreparation || record.state !== "ready"
+        || record.currentWorkId !== reference.logicalWorkId || reference.ownerId !== record.owner.id
+        || work?.state !== "completed" || work.purpose !== "ordinary" || !work.terminalReceiptId
+        || !attempt || attempt !== work.attempts.at(-1) || attempt.epoch !== record.epoch) return undefined;
+      return commit(record);
+    });
+  }
   /** Order the actual command enqueue against revocation, without awaiting page transport. */
   withExecutionAuthority<T>(identity: ContinuityRecoveryIdentity, dispatch: () => T): T {
     return this.exclusive(() => { this.assertExecutionAuthority(identity); return dispatch(); });

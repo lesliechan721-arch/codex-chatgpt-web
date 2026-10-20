@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -471,6 +471,7 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
   const localBroker = TurnBroker.forSocket(config.brokerSocketPath);
   await localBroker.listen();
   const remote = new RemoteTurnBroker(config.brokerSocketPath);
+  const reuseSupport = spyOn(remote, "contextReuseAvailable").mockResolvedValue(false);
   const stateRoot = join(root, "state");
   const devProvider = (provider: CodexProviderConfig): CodexProviderConfig => ({
     ...provider,
@@ -530,6 +531,7 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("live");
     expect(readFileSync(codexConfig, "utf8")).toBe(sentinel);
   } finally {
+    reuseSupport.mockRestore();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await driver.close();
     chatGptTurnSessions.clear();
