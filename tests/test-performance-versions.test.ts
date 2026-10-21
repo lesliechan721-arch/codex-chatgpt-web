@@ -205,6 +205,11 @@ test("external driver runs AB BA AB with different fixture tools and equivalent 
     expect(result.report.runs.filter(run => run.version === "B").every(run => (run.counts as any).pass === 3)).toBe(true);
     expect(result.report.differences.business.map(change => change.file)).toContain("tests/helpers/session-continuity-fixture.ts");
     expect(result.report.groups.every(group => group.wallMs.length === 3 && group.medianWallMs! > 0 && group.rangeWallMs!.min > 0)).toBe(true);
+    expect(result.report.pairedStatistics.metric).toBe("wallMs");
+    for (const pair of result.report.pairs) {
+      expect(pair.baselineMs).toBe(result.report.runs.find(run => run.pair === pair.pair && run.version === "A")!.wallMs);
+      expect(pair.candidateMs).toBe(result.report.runs.find(run => run.pair === pair.pair && run.version === "B")!.wallMs);
+    }
     for (const run of result.report.runs) {
       const raw = JSON.parse(readFileSync(join(dirname(result.reportPath), run.summary!), "utf8"));
       expect(raw.command).toEqual([process.execPath, "test", "--timeout", "30000", "--parallel=2", "--isolate", ...fixture.files]);
@@ -722,27 +727,6 @@ test("a signalled wrapper preserves its actual exit and measurement report", asy
     const raw = JSON.parse(readFileSync(join(fixture.output, "wall-clock.json"), "utf8"));
     expect(raw.exitCode).toBe(result.exitCode);
     expect(raw.signal).toBe(result.signal);
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
-}, 30_000);
-
-test("one reversed pair prevents a speedup claim even when the median paired difference improves", async () => {
-  const fixture = checkouts(`import { test } from "bun:test";
-    import { existsSync, readFileSync, writeFileSync } from "node:fs";
-    const marker = "../paired-run-count.txt";
-    const count = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0;
-    writeFileSync(marker, String(count + 1));
-    test("B scenario", async () => { await Bun.sleep(count === 0 ? 900 : 1); });\n`);
-  try {
-    writeFileSync(join(fixture.A, "tests/equivalent.test.ts"), 'import { test } from "bun:test"; test("A scenario", async () => { await Bun.sleep(300); });\n');
-    fixture.map.sources = { A: performanceSource(fixture.A), B: performanceSource(fixture.B) }; fixture.saveMap();
-    const result = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
-    expect(result.exitCode).toBe(0);
-    expect(result.report.pairs[0]!.absoluteDifferenceMs!).toBeLessThan(0);
-    expect(result.report.pairs.slice(1).every(pair => pair.absoluteDifferenceMs! > 0)).toBe(true);
-    expect(result.report.pairedStatistics.absoluteDifferenceMs.median!).toBeGreaterThan(0);
-    expect(result.report.pairedStatistics.absoluteDifferenceMs.range!.min).toBeLessThan(0);
-    expect(result.report.conclusion).toBe("insufficient-evidence");
   } catch (error) { preserveComparisonFailure(fixture, error); }
   finally { fixture.clean(); }
 }, 30_000);

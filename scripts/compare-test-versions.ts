@@ -191,7 +191,7 @@ async function observeCommand(cwd: string, output: string, command: string[], wr
   const temporaryDirectory = wrapper ? mkdtempSync(join(tmpdir(), "cgw-versions-")) : null;
   if (temporaryDirectory) Object.assign(env, { TMPDIR: temporaryDirectory, TMP: temporaryDirectory, TEMP: temporaryDirectory });
   const invalidReasons: string[] = [];
-  let exitCode: number | null = null, signal: string | null = null, wallMs: number | null = null, logDrainMs = 0;
+  let exitCode: number | null = null, signal: string | number | null = null, wallMs: number | null = null, logDrainMs = 0;
   const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
   const copy = async (stream: ReadableStream<Uint8Array>, name: string) => {
     const reader = stream.getReader(); readers.push(reader);
@@ -361,7 +361,7 @@ export function prepareVersionComparison(args: string[], outputOverride?: string
 }
 
 export function versionSampleResult(slot: { pair: number; version: Version }) {
-  return { pair: slot.pair, version: slot.version, exitCode: null as number | null, signal: null as string | null, wallMs: null as number | null,
+  return { pair: slot.pair, version: slot.version, exitCode: null as number | null, signal: null as string | number | null, wallMs: null as number | null,
     wrapperExitMs: null as number | null, completionPath: null as string | null, completion: null as unknown,
     summaryVersion: null as number | null, schedulingInputs: null as { path: string; digest: string }[] | null,
     summary: null as string | null, counts: null as unknown, invalidReasons: [] as string[], error: null as string | null,

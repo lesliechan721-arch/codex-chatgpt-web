@@ -346,7 +346,7 @@ when assessing net scheduling benefit. A restored history is not proof of a perf
 
 `verify (windows-latest)` runs complete verify, including installer syntax validation.
 `Windows package and smoke` independently installs both frozen lockfiles, prepares the
-same Bun 1.4.2 baseline runtime, packages the installer and runs its existing artifact
+same Bun 1.4.3 baseline runtime, packages the installer and runs its existing artifact
 smoke. Neither Windows chain waits for the other. Linux/macOS keep their packaging and
 smoke coverage. Both Windows statuses must succeed before Windows acceptance; failure,
 cancellation or a skipped chain does not satisfy it. Configure both names as required

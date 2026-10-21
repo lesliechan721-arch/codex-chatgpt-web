@@ -180,7 +180,7 @@ export async function prepareTimingHistory(options: {
 /** The file gate is independent of operation reports and their completeness. */
 export function finalizeFileTimings(options: {
   root: string; runDirectory: string; compatibility: TimingCompatibility; metadata: TimingMetadata; expectedFiles: string[];
-  stderr: string; exitCode: number; signal: string | null; spawnError: string | null; fullSuiteRequested: boolean;
+  stderr: string; exitCode: number; signal: string | number | null; spawnError: string | null; fullSuiteRequested: boolean;
   logsComplete: boolean; sourceStable: boolean; artifactDirectory?: string;
 }) {
   const reasons: string[] = [];

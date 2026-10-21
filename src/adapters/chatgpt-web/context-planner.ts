@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, resolveChatGptWebMessageTokenBudget, resolveChatGptWebTransportLimits } from "../../chatgpt-web-models";
-import { estimateTokens } from "../../lib/token-estimate";
+import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import type { CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
 import { contextErrorReserve, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
 import { ContextDeliveryPlanningError, planContextMedia, type ContextMediaPlan } from "./context-media-plan";
@@ -329,6 +329,10 @@ function projection(input: ContextDeliveryPlanInput, messages: ReadonlyMap<numbe
 
 /** Optimizes only the already selected send candidate. It never changes source or send policy. */
 export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
+  return withTokenEstimateCache(() => planDelivery(input));
+}
+
+function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
   const started = performance.now();
   const limits = contextLimits(input.limits);
   // Multipart keeps its existing staged value-tree and acknowledgement contract.

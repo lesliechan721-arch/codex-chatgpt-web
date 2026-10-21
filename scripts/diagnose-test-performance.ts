@@ -96,7 +96,7 @@ function diagnosticInputs() {
 type Inputs = ReturnType<typeof diagnosticInputs>;
 export type ModePairSample = {
   round: number; condition: { name: string; workers: number; mode: string; isolation: string }; command: string[];
-  exitCode: number | null; signal: string | null; error: string | null; wrapperWallMs: number | null;
+  exitCode: number | null; signal: string | number | null; error: string | null; wrapperWallMs: number | null;
   parentLogDrainMs: number; logIssues: string[]; summary: Record<string, any> | null; completion: Record<string, any> | null;
   before: Inputs; after: Inputs; environmentDigest: string;
   runner: { instance: string; category: string; image: string | null; imageVersion: string | null; platform: string; arch: string };
@@ -213,7 +213,7 @@ export async function observeDiagnosticWrapper(command: string[], output: string
     } catch { logIssues.push(`log-read-failed:${name}`); }
     finally { reader.releaseLock(); }
   };
-  let exitCode: number | null = null, signal: string | null = null, error: string | null = null, wrapperWallMs: number | null = null, parentLogDrainMs = 0, exitedAt: string | null = null;
+  let exitCode: number | null = null, signal: string | number | null = null, error: string | null = null, wrapperWallMs: number | null = null, parentLogDrainMs = 0, exitedAt: string | null = null;
   const startedAt = new Date().toISOString(), start = process.hrtime.bigint();
   try {
     const child = Bun.spawn(command, { cwd: root, stdin: "inherit", stdout: "pipe", stderr: "pipe", env });

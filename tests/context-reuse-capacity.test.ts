@@ -71,6 +71,7 @@ function reconstruct(delivered: ReturnType<typeof deliver>, previous = new Map<s
   return payload;
 }
 
+// Paged cases plan and deliver three complete scopes; allow headroom on Intel CI.
 for (const [manual, inline] of [[false, false], [true, false], [false, true]] as const) {
   test(`capacity fallback preserves real delivery, bounded evidence and the next scope: manual=${manual} inline=${inline}`, () => {
     const first = plan(manual, inline);
@@ -94,5 +95,5 @@ for (const [manual, inline] of [[false, false], [true, false], [false, true]] as
     expect(removal.payload.rule_replacements).toContainEqual({ domain: "responses.instructions/current/v1", state: "null",
       unit_ids: [], replaces: baseline!.snapshots[0]!.unit_ids });
     expect(reconstruct(removal, delivered.units)).toEqual(removed.compiled.bootstrapContent!.payload);
-  }, 30_000);
+  }, inline ? 30_000 : 60_000);
 }

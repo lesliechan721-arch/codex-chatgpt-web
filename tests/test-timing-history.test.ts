@@ -79,7 +79,7 @@ test("repository file discovery follows Bun test/spec suffixes and excludes perf
   expect(repositoryTestFiles(root)).toEqual(included.map(file => `tests/${file}`).sort());
 }));
 
-for (const githubActions of [false, true]) test(`Bun 1.4.2 second round reads the measured first round and starts slow files before fast files (${githubActions ? "GitHub Actions" : "ordinary"} output)`, () => temporary(async root => {
+for (const githubActions of [false, true]) test(`Bun second round reads the measured first round and starts slow files before fast files (${githubActions ? "GitHub Actions" : "ordinary"} output)`, () => temporary(async root => {
   mkdirSync(join(root, "tests"));
   for (const [name, delay] of [["a-fast", 5], ["b-medium", 80], ["c-medium", 100], ["z-slow", 250]] as const) {
     writeFileSync(join(root, `tests/${name}.test.ts`), `import {test} from "bun:test"; import {appendFileSync, readFileSync} from "node:fs";
@@ -190,15 +190,15 @@ test("partial execution removes merged historical values and never publishes a w
   expect(readdirSync(root)).toEqual(["file-timings.json"]);
 }));
 
-for (const fault of ["exit", "logs", "source", "count", "missing-header", "missing-timing"]) test(`whole-suite file publication rejects ${fault}`, () => temporary(root => {
+for (const fault of ["exit", "numeric-signal", "logs", "source", "count", "missing-header", "missing-timing"]) test(`whole-suite file publication rejects ${fault}`, () => temporary(root => {
   const value = history();
   if (fault === "missing-timing") delete value.timings.files["tests/slow.test.ts"];
   writeFileSync(join(root, "file-timings.json"), JSON.stringify(value.timings));
   const stderr = `\ntests/slow.test.ts:\n${fault === "missing-header" ? "" : "tests/deleted.test.ts:\n"} 2 pass\n 0 fail\nRan 2 tests across ${fault === "count" ? 1 : 2} files. [1ms]\n`;
   const result = finalizeFileTimings({ root, runDirectory: root, compatibility, metadata: source, expectedFiles: value.execution.files,
-    stderr, exitCode: fault === "exit" ? 1 : 0, signal: null, spawnError: null, fullSuiteRequested: true,
+    stderr, exitCode: fault === "exit" ? 1 : 0, signal: fault === "numeric-signal" ? 35 : null, spawnError: null, fullSuiteRequested: true,
     logsComplete: fault !== "logs", sourceStable: fault !== "source", artifactDirectory: join(root, "artifacts") });
-  expect(result.fileTiming.complete).toBe(fault === "exit" || fault === "source");
+  expect(result.fileTiming.complete).toBe(fault === "exit" || fault === "source" || fault === "numeric-signal");
   expect(result.historyPublication.status).toBe("ineligible");
 }));
 

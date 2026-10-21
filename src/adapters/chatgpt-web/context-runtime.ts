@@ -1,5 +1,6 @@
 import { ContextReuseDiagnostics } from "./context-reuse-diagnostics";
 import { createHash, randomBytes } from "node:crypto";
+import { withTokenEstimateCache } from "../../lib/token-estimate";
 import { ContextNavigator, ContextNavigationStoppedError, type ContextNavigationUsage } from "./context-navigator";
 import type { ContextSnapshot } from "./context-snapshot";
 import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides } from "./context-budget";
@@ -381,6 +382,9 @@ export class ContextScope {
     if (failure) throw contextError("CONTEXT_NOT_READY", (failure.content[0] as { text: string }).text);
   }
   prepare(method: ContextMethod, args: ContextArgs, overviewControl?: ContextBootstrapControl): ContextPreparedReply {
+    return withTokenEstimateCache(() => this.prepareReply(method, args, overviewControl));
+  }
+  private prepareReply(method: ContextMethod, args: ContextArgs, overviewControl?: ContextBootstrapControl): ContextPreparedReply {
     this.openReads();
     if (this.navigator.usage().navigation_stopped) throw contextError("CONTEXT_NAVIGATION_STOPPED", "This scope's navigation capability is retired. Use its original completion path");
     if (this.pending.size >= 8) throw contextError("CONTEXT_BUSY", "Wait for the in-flight context returns");

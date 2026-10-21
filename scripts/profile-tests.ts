@@ -90,7 +90,7 @@ export async function profileTests(args: string[]): Promise<number> {
     ...(isolation === "isolate" ? ["--isolate"] : isolation === "shared" ? ["--no-isolate"] : []),
     ...(bail !== undefined ? [`--bail=${bail}`] : []), ...filters, ...(files.length ? files : ["./tests"])];
   const startedAt = new Date().toISOString();
-  let exitCode = 1, rootPid: number | null = null, signal: string | null = null;
+  let exitCode = 1, rootPid: number | null = null, signal: string | number | null = null;
   let spawnError: string | null = null;
   let wallMs = 0, logDrainMs = 0;
   console.info(`[test-performance] workers=${workers}; mode=${mode}; isolation=${isolation}; reports=${run ?? "unavailable"}`);
