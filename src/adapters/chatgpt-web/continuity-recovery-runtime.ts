@@ -471,7 +471,7 @@ export async function retireRecoveryWriter(
   observed: RecoveryThreadRecord,
   descriptor: string,
   sourceTask?: TaskInputIdentity,
-  compactionReplaySource?: { executionKey: string; historyRevision: number },
+  compaction?: { executionKey: string; replaySource?: { executionKey: string; historyRevision: number } },
 ): Promise<RecoveryThreadRecord> {
   const { chatGptTurnSessions } = await import("./turn-execution");
   const { continuityProcessInstanceStatus } = await import("./continuity-recovery-store");
@@ -479,6 +479,7 @@ export async function retireRecoveryWriter(
   const binding = bindings.observed(observed.thread);
   const source = binding ? (binding.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined)
     ?? chatGptTurnSessions.findFailedContinuityCreation(binding) : undefined;
+  const compactionReplaySource = compaction?.replaySource;
   if (compactionReplaySource && (!binding || !source || binding.executionKey !== compactionReplaySource.executionKey
     || source.runtime.continuityBinding !== binding
     || source.runtime.usageInput?._continuityHistoryRevision !== compactionReplaySource.historyRevision)) {
@@ -500,6 +501,11 @@ export async function retireRecoveryWriter(
     }
     if (!attempt.writerRetired || sourceTask) bindings.recoveryStore.retireAttempt(current.thread,
       { scope: current.scope, expectedVersion: current.version, expectedOwner: current.owner.id }, work!.logicalWorkId, attempt.attempt, sourceTask);
+    if (compaction && binding && bindings.observed(current.thread) === binding && binding.epoch === current.epoch) {
+      // Retirement can schedule the source's release callback before a successor
+      // attempt exists. Keep the journal through that callback and capacity waits.
+      binding.recoveryCleanupExecutionKey = compaction.executionKey;
+    }
     if (preserveSourceReplay) retainContinuityOrdinaryReplayTombstone(binding!, compactionReplaySource!.executionKey,
       compactionReplaySource!.historyRevision, source!.acceptedContinuityInstructionIdentity(), source!.nativeTurnId);
     if (source) {

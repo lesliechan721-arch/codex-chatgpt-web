@@ -614,7 +614,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     throw continuityError("continuity_source_unproven", "The known unacquired retry no longer matches its original reservation.");
   }
   if (!waitingAcquisition && !freshPageCompactions.has(parsed)) record = await retireRecoveryWriter(bindings, record, descriptor,
-    undefined, compactionReplaySource);
+    undefined, { executionKey, replaySource: compactionReplaySource });
   const shadow = record.works[`compaction:${selection.target.compactionTargetId}`];
   if (shadow?.activationState === "shadow") {
     const attempt = shadow.attempts.at(-1)!;

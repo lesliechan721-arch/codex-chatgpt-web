@@ -32,6 +32,23 @@ const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
 
+async function compactAfterRetiredSourceCleanup(f: ReturnType<typeof fixture>,
+  source: NonNullable<ReturnType<typeof chatGptTurnSessions.find>>, compact: CodexParsedRequest) {
+  f.controls.onCapacityQuery = async () => {
+    const store = continuityBindingsFor(f.statePath).recoveryStore;
+    const thread = continuityDigest(f.threadId);
+    const before = store.get(thread);
+    // Force the old page's real release callback to finish before cold admission.
+    // Healthy same-page compaction does not query capacity or enter this barrier.
+    await source.physicalSettlement;
+    await source.runtime.releaseRetainedConversation!();
+    expect(before).toBeDefined();
+    expect(store.get(thread)).toEqual(before);
+  };
+  try { return await f.run(compact); }
+  finally { f.controls.onCapacityQuery = undefined; }
+}
+
 for (const format of ["encrypted", "readable", "summary-only"] as const) test(`${format} checkpoint replays a completed ordinary answer without resubmission and then resumes new work`, async () => {
   const f = fixture();
   const first = f.request();
@@ -259,7 +276,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       { type: "function_call_output", call_id: call.callId, output: "Accepted exact source result." },
     ]);
     compact._compactionRequest = true;
-    const events = await f.run(compact);
+    const events = await compactAfterRetiredSourceCleanup(f, source, compact);
     const summary = events.find(event => event.type === "text_delta" && event.phase === "final_answer");
     if (summary?.type !== "text_delta") throw new Error("Missing committed checkpoint");
     return { compact, summary: summary.text };
@@ -402,7 +419,7 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
       { type: "function_call_output", call_id: call.callId, output },
     ]);
     compact._compactionRequest = true;
-    const events = await f.run(compact);
+    const events = await compactAfterRetiredSourceCleanup(f, source, compact);
     const summary = events.find(event => event.type === "text_delta" && event.phase === "final_answer");
     if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
     return summary.text;

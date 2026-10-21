@@ -1409,16 +1409,20 @@ describe("trusted Codex task environment continuity", () => {
     return child;
   }
 
-  function createRolloutState(databasePath: string, rolloutPath: string): void {
-    mkdirSync(dirname(databasePath), { recursive: true });
-    const database = new Database(databasePath, { create: true });
-    database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_path TEXT)");
-    database.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)");
-    database.query("INSERT INTO threads (id, rollout_path, agent_path) VALUES (?, ?, ?)")
-      .run(rolloutThreadId, rolloutPath, rolloutAgent);
-    database.query("INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)")
-      .run(rolloutParentId, rolloutThreadId, "open");
-    database.close();
+  type MeasureRolloutStep = <T>(stage: string, action: () => T) => T;
+
+  function createRolloutState(databasePath: string, rolloutPath: string,
+    measure: MeasureRolloutStep = (_stage, action) => action()): void {
+    measure("state.mkdir", () => mkdirSync(dirname(databasePath), { recursive: true }));
+    const database = measure("state.open", () => new Database(databasePath, { create: true }));
+    try {
+      measure("state.create-threads", () => database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_path TEXT)"));
+      measure("state.create-edges", () => database.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL)"));
+      measure("state.insert-thread", () => database.query("INSERT INTO threads (id, rollout_path, agent_path) VALUES (?, ?, ?)")
+        .run(rolloutThreadId, rolloutPath, rolloutAgent));
+      measure("state.insert-edge", () => database.query("INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)")
+        .run(rolloutParentId, rolloutThreadId, "open"));
+    } finally { measure("state.close", () => database.close()); }
   }
 
   function resumedRootFixture(): { codexHome: string; request: CodexParsedRequest; rolloutPath: string } {
@@ -2113,20 +2117,31 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(request)).toThrow();
   });
 
-  test.skipIf(process.platform !== "win32")("resumed Windows tasks accept the same indexed rollout with either path namespace", () => {
-    for (const namespaceHome of [false, true]) for (const namespaceRollout of [false, true]) {
-      const { codexHome, request, rolloutPath } = resumedRootFixture();
+  for (const namespaceHome of [false, true]) for (const namespaceRollout of [false, true]) {
+    test.skipIf(process.platform !== "win32")(`resumed Windows tasks accept the same indexed rollout (namespaceHome=${namespaceHome}, namespaceRollout=${namespaceRollout})`, () => {
+      const measure: MeasureRolloutStep = (stage, action) => {
+        const started = performance.now();
+        const context = { namespaceHome, namespaceRollout, stage };
+        // Emit before synchronous calls too, so a blocked call has a visible boundary.
+        console.info(`[windows-rollout] ${JSON.stringify({ ...context, event: "start" })}`);
+        try { return action(); }
+        finally {
+          console.info(`[windows-rollout] ${JSON.stringify({ ...context, event: "end", elapsedMs: performance.now() - started })}`);
+        }
+      };
+      const { codexHome, request, rolloutPath } = measure("fixture", resumedRootFixture);
       const databasePath = join(codexHome, "state_5.sqlite");
-      createRolloutState(databasePath, namespaceRollout ? toNamespacedPath(rolloutPath) : rolloutPath);
-      const database = new Database(databasePath);
-      database.exec("DELETE FROM thread_spawn_edges; UPDATE threads SET agent_path = NULL");
-      database.close();
-      const store = new ChatGptThreadEnvironmentStore(
-        undefined, Date.now, namespaceHome ? toNamespacedPath(codexHome) : codexHome,
-      );
-      expect(store.resolve(request).cwd).toBe(root);
-    }
-  });
+      const indexedPath = measure("rollout-path", () => namespaceRollout ? toNamespacedPath(rolloutPath) : rolloutPath);
+      createRolloutState(databasePath, indexedPath, measure);
+      const database = measure("update.open", () => new Database(databasePath));
+      try {
+        measure("update.exec", () => database.exec("DELETE FROM thread_spawn_edges; UPDATE threads SET agent_path = NULL"));
+      } finally { measure("update.close", () => database.close()); }
+      const home = measure("home-path", () => namespaceHome ? toNamespacedPath(codexHome) : codexHome);
+      const store = measure("store", () => new ChatGptThreadEnvironmentStore(undefined, Date.now, home));
+      expect(measure("resolve", () => store.resolve(request)).cwd).toBe(root);
+    }, 30_000);
+  }
 
   for (const format of ["v1", "v2"]) for (const groupedPreamble of [false, true]) for (const newInstruction of [false, true]) test(`${format} ${groupedPreamble ? "grouped preamble" : "context-only"} continuation ${newInstruction ? "with a new instruction" : "of the previous instruction"} requires a matching current rollout, not just a checkpoint`, () => {
     const { codexHome, request, rolloutPath } = resumedRootFixture();

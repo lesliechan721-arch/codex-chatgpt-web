@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { ContinuityBindings } from "../src/adapters/chatgpt-web/continuity-binding";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 import * as storeModule from "../src/adapters/chatgpt-web/continuity-recovery-store";
-import { retireRecoveryWriter } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
+import { recoveryIdentity, retireRecoveryWriter } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import type { TurnBrokerOwner } from "../src/adapters/chatgpt-web/turn-broker";
 import * as launcher from "../src/launcher-browser-host";
 
@@ -14,7 +14,7 @@ function fixture() {
   const registrations = new ContinuityRegistrationStore(directory); registrations.initialize();
   const bindings = new ContinuityBindings(registrations);
   const observed = bindings.recoveryStore.admitWork({ thread: "1".repeat(64), scope: "2".repeat(64),
-    owner: storeModule.continuityProcessInstance(), logicalWorkId: "work", instructionIdentity: "instruction",
+    owner: storeModule.continuityProcessInstance(bindings.owner), logicalWorkId: "work", instructionIdentity: "instruction",
     workPayloadDigest: "3".repeat(64), snapshotDigest: "4".repeat(64), dispatchProtocolComplete: true });
   return { directory, bindings, observed };
 }
@@ -53,6 +53,32 @@ test("a failed fencing assertion cannot fall back to an exited process", async (
     expect(status).not.toHaveBeenCalled();
     expect(f.bindings.recoveryStore.get(f.observed.thread)).toEqual(f.observed);
   } finally { status.mockRestore(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+for (const cleanup of ["compaction", "explicit-exit"] as const) test(`cold retirement protects the journal until ${cleanup} cleanup`, async () => {
+  const f = fixture();
+  const binding = f.bindings.installRecovered(f.observed, "source", "5".repeat(64));
+  const expected = { ownerId: f.observed.owner.id, identity: recoveryIdentity(f.observed, f.bindings.recoveryStore.installationId()) };
+  const page = spyOn(launcher, "retireLauncherContinuityWriter").mockImplementation(async (_descriptor, recovery) => {
+    // Page retirement can trigger cleanup before the compaction reserves an attempt.
+    expect(() => f.bindings.forgetPage(binding, "source", expected)).toThrow();
+    expect(f.bindings.recoveryStore.get(f.observed.thread)).toBeDefined();
+    return { recovery, state: "retired", writerRetired: true, toolsSettled: false, physicalCleanup: "destroyed" };
+  });
+  f.bindings.broker = { assertRecoveryFencing: async () => {} } as unknown as TurnBrokerOwner;
+  try {
+    const retired = await retireRecoveryWriter(f.bindings, f.observed, "unused-launcher-descriptor", undefined,
+      { executionKey: "compaction" });
+    expect(retired.works.work!.attempts).toHaveLength(1);
+    expect(retired.works.work!.retryBudget).toEqual(f.observed.works.work!.retryBudget);
+    expect(() => f.bindings.forgetPage(binding, "source", expected)).toThrow();
+    expect(f.bindings.recoveryStore.get(f.observed.thread)).toEqual(retired);
+    expect(f.bindings.observed(f.observed.thread)).toBe(binding);
+    f.bindings.forgetPage(binding, cleanup === "compaction" ? "compaction" : undefined, expected);
+    expect(f.bindings.recoveryStore.get(f.observed.thread)).toBeUndefined();
+    expect(f.bindings.registrations.get(f.observed.thread)).toBeUndefined();
+    expect(f.bindings.observed(f.observed.thread)).toBeUndefined();
+  } finally { page.mockRestore(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 
 for (const identity of ["live", "unverified", "exited"] as const) test(`without Broker fencing retirement still checks the original process (${identity})`, async () => {
