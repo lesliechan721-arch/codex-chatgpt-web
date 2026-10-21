@@ -3223,11 +3223,20 @@ describe("ChatGPT outer-native harness v4", () => {
         annotations: tool.annotations ?? null,
       }));
       // ChatGPT caches the complete tools/list contract under the connector identity.
-      // The Native token schema and copying guidance require refreshing the current connector;
-      // context credentials retain their independent ordinary/compaction schema.
+      // Refresh the current connector for reads-array and context-text-batch-v1.
+      // Context credentials retain their independent ordinary/compaction schema.
       expect(CHATGPT_CONNECTOR_NAME).toBe("Codex Native5");
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("32779b3d597ae4eecfdea757ac50474861adbdfa02354a8f77d2440c1dd5626a");
+        .toBe("226323bb8f8d08c7f72da38fd284d05cba91043007ac0f1b5226b405a2c9e32c");
+      const contextRead = listed.tools.find(tool => tool.name === "codex_context_read")!;
+      expect(contextRead.description).toContain("context-text-batch-v1");
+      expect(contextRead.inputSchema).toMatchObject({ additionalProperties: false, required: ["context_id", "reads"],
+        properties: { reads: { type: "array", minItems: 1, maxItems: 8,
+          items: { additionalProperties: false, required: ["read_ref"], properties: {
+            read_ref: { type: "string", minLength: 1, maxLength: 256 }, cursor: { type: "string", minLength: 1, maxLength: 2048 },
+          } } } } });
+      expect(contextRead.inputSchema.properties).not.toHaveProperty("read_ref");
+      expect(contextRead.inputSchema.properties).not.toHaveProperty("cursor");
       expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
         .toContain("Only codex.control.compaction_handoff is exempt from operation_id");
       for (const tool of listed.tools) {

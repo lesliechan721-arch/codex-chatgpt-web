@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { canonicalJson } from "./canonical-json";
 import {
   closeSync,
   existsSync,
@@ -23,6 +25,7 @@ import type {
   ChatGptTurnUserRevision,
   ChatGptUnattributedEnvironmentMessage,
   ChatGptNativeCompactionPhase,
+  ChatGptNativeInstructionOwnership,
 } from "./environment";
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
@@ -30,6 +33,7 @@ type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
 export interface CodexRolloutEnvironment {
   environment: ChatGptTurnEnvironment;
   workspaceRootsDeclared: boolean;
+  currentInstructionOwnership?: ChatGptNativeInstructionOwnership;
 }
 
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -303,6 +307,33 @@ function visitRolloutRecords(fd: number, size: number, visit: (entry: LocatedRol
     if (carry.length > MAX_ROLLOUT_JSON_LINE_BYTES) throw new Error("Codex rollout JSONL record exceeds the bounded record size");
   }
   // Partial records are never provenance evidence.
+}
+
+/** A current human after the latest checkpoint must have its own exact native record. */
+function currentInstructionOwnership(fd: number, size: number, turnId: string,
+  instruction: ChatGptTurnUserRevision): ChatGptNativeInstructionOwnership | undefined {
+  if (!instruction.itemId || (instruction.turnId !== undefined && instruction.turnId !== turnId)) return undefined;
+  let checkpoint: LocatedRolloutRecord | undefined, context: LocatedRolloutRecord | undefined;
+  const boundaries: LocatedRolloutRecord[] = [], matches: LocatedRolloutRecord[] = [];
+  visitRolloutRecords(fd, size, entry => {
+    const payload = record(entry.item.payload);
+    if (entry.item.type === "compacted") checkpoint = entry;
+    if (entry.item.type === "turn_context") context = entry;
+    if (entry.item.type === "event_msg" && payload?.type === "task_started" && payload.turn_id === turnId) boundaries.push(entry);
+    if (entry.item.type === "response_item" && payload?.id === instruction.itemId) matches.push(entry);
+  });
+  if (!checkpoint || !context || boundaries.length !== 1 || matches.length !== 1) return undefined;
+  const boundary = boundaries[0]!, original = matches[0]!, payload = record(original.item.payload)!;
+  const provenance = record(payload.internal_chat_message_metadata_passthrough);
+  const kinds = provenance?.content_item_kinds;
+  if (!(checkpoint.order < boundary.order && boundary.order < context.order && context.order < original.order)
+    || record(context.item.payload)?.turn_id !== turnId || context.activeTurn !== turnId
+    || original.activeTurn !== turnId || payload.type !== "message" || payload.role !== "user"
+    || provenance?.turn_id !== turnId || !Array.isArray(payload.content) || !Array.isArray(kinds)
+    || kinds.length === 0 || kinds.length !== payload.content.length || !kinds.every(kind => kind === "user.text")
+    || !isDeepStrictEqual(payload.content, instruction.content)) return undefined;
+  return { itemId: instruction.itemId, turnId,
+    contentDigest: createHash("sha256").update(canonicalJson(payload.content)).digest("hex") };
 }
 
 interface NativeCompactionSourceProof {
@@ -1011,6 +1042,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
   currentEnvironmentMessage?: ChatGptUnattributedEnvironmentMessage;
+  currentInstruction?: ChatGptTurnUserRevision;
   compactionPhase?: ChatGptNativeCompactionPhase;
   validateCurrentEnvironmentMessage?: (
     message: ChatGptUnattributedEnvironmentMessage,
@@ -1131,7 +1163,9 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
           }
         }
       }
-      matching.push({ environment, workspaceRootsDeclared });
+      const ownership = options.currentInstruction && latest.turn_id === turnId
+        ? currentInstructionOwnership(fd, size, turnId, options.currentInstruction) : undefined;
+      matching.push({ environment, workspaceRootsDeclared, ...(ownership ? { currentInstructionOwnership: ownership } : {}) });
     } finally {
       closeSync(fd);
     }

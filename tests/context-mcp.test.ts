@@ -56,6 +56,11 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
         expect(tool.inputSchema.properties).not.toHaveProperty(contract === "safe" ? "turn_token" : "request_id");
         expect(tool.inputSchema).toHaveProperty("oneOf");
       }
+      expect(contexts.find(tool => tool.name === "codex_context_read")!.inputSchema).toMatchObject({
+        additionalProperties: false, required: ["context_id", "reads"],
+        properties: { reads: { type: "array", minItems: 1, maxItems: 8,
+          items: { additionalProperties: false, required: ["read_ref"] } } },
+      });
       expect((await f.call("codex_context_list", { view: "overview" })).isError).toBe(true);
       if (contract === "safe") await f.client.callTool({ name: "codex_turn_start", arguments: f.reference }); else f.broker.markContextPlanSent(f.token, "selected");
       expect((await f.call("codex_context_list", { view: "overview", operation_id: 1 })).isError).toBe(true);
@@ -63,7 +68,7 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
       const list = await f.call("codex_context_list", { view: "entries" }); expect(list.isError).not.toBe(true);
       const listed = (list.structuredContent as { entries: Array<{ kind: string; read_ref: string }> }).entries;
       const imageRef = listed.find(t => t.kind === "image")!.read_ref;
-      const read = await f.call("codex_context_read", { read_ref: imageRef });
+      const read = await f.call("codex_context_read", { reads: [{ read_ref: imageRef }] });
       expect(read.isError).not.toBe(true);
       const blocks = read.content as Array<{ type: string; data?: string; text?: string; mimeType?: string }>;
       expect(blocks.filter(t => t.type === "image")).toEqual([expect.objectContaining({ type: "image", data: png, mimeType: "image/png" })]);
@@ -73,10 +78,10 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
       const overview = await f.call("codex_context_list", { view: "overview" }); expect(overview.isError).not.toBe(true);
       expect(f.broker.contextStatus(f.token)?.context_ready).toBe(true);
       const search = await f.call("codex_context_search", { query: "marker-zeta" }); expect(search.isError).not.toBe(true); expect(JSON.stringify(search)).toContain("marker-zeta");
-      const repeat = await f.call("codex_context_read", { read_ref: imageRef }); expect(repeat.content).toEqual(read.content);
+      const repeat = await f.call("codex_context_read", { reads: [{ read_ref: imageRef }] }); expect(repeat.content).toEqual(read.content);
       const textRef = listed.find(t => t.kind !== "image")!.read_ref;
-      const textResult = await f.call("codex_context_read", { read_ref: textRef });
-      expect(parseContextTextReadResult(textResult).body).toBe("独有片段 marker-zeta");
+      const textResult = await f.call("codex_context_read", { reads: [{ read_ref: textRef }] });
+      expect(parseContextTextReadResult(textResult).bodies[0]).toBe("独有片段 marker-zeta");
       expect(textResult.structuredContent).not.toHaveProperty("content");
       expect((await f.call("codex_context_search", { query: "" })).isError).toBe(true);
       const oversized = await f.call("codex_context_list", { view: "entries", ["unknown".repeat(2000)]: true });
@@ -99,8 +104,8 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
       const readArgs = { compaction_token: handle.compactionToken, context_id: handle.contextId };
       const result = await f.client.callTool({ name: "codex_context_search", arguments: { ...readArgs, query: "marker-zeta" } });
       expect(result.isError).not.toBe(true); expect(JSON.stringify(result)).toContain("marker-zeta");
-      const textResult = await f.client.callTool({ name: "codex_context_read", arguments: { ...readArgs, read_ref: f.snapshot.targets.find(t => t.kind !== "image")!.read_ref! } });
-      expect(parseContextTextReadResult(textResult)).toMatchObject({ body: "独有片段 marker-zeta", metadata: { purpose: "compaction", format: "context-text-read-v2" } });
+      const textResult = await f.client.callTool({ name: "codex_context_read", arguments: { ...readArgs, reads: [{ read_ref: f.snapshot.targets.find(t => t.kind !== "image")!.read_ref! }] } });
+      expect(parseContextTextReadResult(textResult)).toMatchObject({ bodies: ["独有片段 marker-zeta"], metadata: { purpose: "compaction", format: "context-text-batch-v1" } });
       expect((await f.client.callTool({ name: "codex_context_list", arguments: { ...readArgs, view: "overview", ...f.reference } })).isError).toBe(true);
       expect((await f.client.callTool({ name: "codex_tool_inventory", arguments: { compaction_token: handle.compactionToken, operation_id: 1 } })).isError).toBe(true);
       if (transaction) {
@@ -143,22 +148,66 @@ test("transport send failure records no delivery and bridge navigation cannot en
   for (const name of ["codex_context_list", "tools__codex_context_read", "apps__codex_context_search"]) expect(() => planNativeTool("codex_tool_call", { wire_name: name, arguments: {} }, { tools: [], registryGeneration: 1 }, "native")).toThrow();
 });
 
-test("transport observers bind the actual outgoing v2 result; malformed, cancelled and failed sends form no receipt", async () => {
-  const source = createContextSnapshot(parseRequest({ model: "gpt-6", input: "transport-only secret marker" }));
+for (const contract of ["native", "safe"] as const)
+test(`batch read validates the full array and credential envelope (${contract})`, async () => {
+  const f = await fixture(contract, false);
+  const source = createContextSnapshot(parseRequest({ model: "gpt-6", input: Array.from({ length: 9 }, (_, index) =>
+    ({ role: "user", content: `independent source ${index}: 中文😀 final-${index}` })) }));
+  try {
+    f.broker.registerContextPlan(f.token, { snapshot: source, planId: "batch-input", manifestDigest: "batch-input", deliveryByTarget: {} });
+    f.broker.selectContextPlan(f.token, "batch-input");
+    if (contract === "safe") await f.client.callTool({ name: "codex_turn_start", arguments: f.reference });
+    else f.broker.markContextPlanSent(f.token, "batch-input");
+    const reads = source.targets.map(target => ({ read_ref: target.read_ref! }));
+    const read = (args: Record<string, unknown>) => f.call("codex_context_read", { context_id: source.context_id, ...args });
+    for (const args of [
+      { reads: [] }, { reads }, { read_ref: reads[0]!.read_ref }, { reads: reads.slice(0, 1), cursor: "old-top-level" },
+      { reads: [{ ...reads[0], unknown: true }] }, { reads: "invalid" },
+      { reads: reads.slice(0, 1), compaction_token: "compaction_mixed_12345678901234567890" },
+      { reads: reads.slice(0, 5).map(item => ({ ...item, cursor: "x".repeat(1900) })) },
+    ]) expect((await read(args)).isError).toBe(true);
+    const single = parseContextTextReadResult(await read({ reads: reads.slice(0, 1) }));
+    expect(single.bodies).toEqual(["independent source 0: 中文😀 final-0"]);
+    const batch = parseContextTextReadResult(await read({ reads: reads.slice(0, 8) }));
+    expect(batch.bodies).toEqual(Array.from({ length: 8 }, (_, index) => `independent source ${index}: 中文😀 final-${index}`));
+    expect(batch.metadata.items.map(item => item.request_index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    // Broker independently checks the complete MCP envelope before looking up an invalid cursor.
+    const binding = { token: f.token, contract, credentialKind: "ordinary" as const, contextProtocol: CONTEXT_PROTOCOL_VERSION };
+    await expect(callTurnBroker(f.broker.socketPath, { method: "context_query", ...binding, contextMethod: "read",
+      contextArgs: { context_id: source.context_id, reads: reads.slice(0, 5).map(item => ({ ...item, cursor: "x".repeat(1900) })) } }))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    for (const invalid of [
+      [reads[0]!, { read_ref: "invalid-final-reference" }],
+      [reads[0]!, reads[0]!],
+      [reads[0]!, { ...reads[1]!, cursor: "invalid-final-cursor" }],
+    ]) {
+      const usage = f.broker.contextUsage(f.token)!.usage;
+      const rejected = await read({ reads: invalid });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.content).toHaveLength(1);
+      expect(JSON.stringify(rejected)).not.toContain("independent source 0");
+      expect(f.broker.contextUsage(f.token)!.usage.text_tokens).toBeGreaterThan(usage.text_tokens);
+    }
+  } finally { await f.close(); }
+});
+
+test("transport observers bind every outgoing body; a lost or changed final body, cancellation and failed sends form no receipt", async () => {
+  const source = createContextSnapshot(parseRequest({ model: "gpt-6", input: [{ role: "user", content: "transport-only secret marker" }, { role: "user", content: "second transport body tail" }] }));
   const scope = new ContextScope("transport-result", { snapshot: source, planId: "transport", manifestDigest: "transport", deliveryByTarget: {} },
     "normal", () => {}, () => {});
   scope.markEntryDelivered();
   try {
-    for (const mode of ["valid", "malformed", "changed_after_check", "cancelled", "failed"] as const) {
-      const reply = scope.prepare("read", { context_id: source.context_id, read_ref: source.targets[0]!.read_ref! });
+    for (const mode of ["valid", "malformed", "missing_last", "changed_after_check", "cancelled", "failed"] as const) {
+      const reply = scope.prepare("read", { context_id: source.context_id, reads: source.targets.map(target => ({ read_ref: target.read_ref! })) });
       const wire = structuredClone(reply.result);
-      if (mode === "malformed") (wire.content[1] as { text: string }).text = "wrong body";
+      if (mode === "malformed") (wire.content[2] as { text: string }).text = "wrong final body";
+      if (mode === "missing_last") wire.content.pop();
       const sentMessages: unknown[] = [], credits: unknown[] = [];
       const transport = { start: async () => {}, close: async () => {}, send: async (message: unknown) => {
         if (mode === "failed") throw new Error("broken pipe");
         sentMessages.push(message);
         // Same byte length and valid metadata: only binding the actual body catches this.
-        if (mode === "changed_after_check") (wire.content[1] as { text: string }).text = "transport-only forged marker";
+        if (mode === "changed_after_check") (wire.content[2] as { text: string }).text = "second transport body fake";
       } } as Transport;
       const observed = observeMcpToolCalls(transport, BRIDGE_TOOL_NAMES, () => {}, (_id, sent, actual) => {
         let proof;
@@ -169,13 +218,13 @@ test("transport observers bind the actual outgoing v2 result; malformed, cancell
         scope.assertPending(reply.receiptId, contextTextReadReceipt(actual));
       });
       const send = observed.send({ jsonrpc: "2.0", id: 1, result: wire as never });
-      if (mode === "malformed" || mode === "cancelled" || mode === "failed") await expect(send).rejects.toThrow();
+      if (mode === "malformed" || mode === "missing_last" || mode === "cancelled" || mode === "failed") await expect(send).rejects.toThrow();
       else await send;
       if (mode === "valid") {
         expect(credits).toEqual([{ method: "read", textRead: contextTextReadReceipt(reply.result) }]);
         expect(sentMessages).toHaveLength(1);
       } else expect(credits).toEqual([undefined]);
-      if (mode === "malformed" || mode === "cancelled") expect(sentMessages).toHaveLength(0);
+      if (mode === "malformed" || mode === "missing_last" || mode === "cancelled") expect(sentMessages).toHaveLength(0);
       expect(scope.inFlight).toBe(0);
     }
   } finally { scope.retire(); }
@@ -248,7 +297,7 @@ test("navigation denial exhaustion returns protocol errors and preserves the sha
 for (const contract of ["native", "safe"] as const) test(`stdio ${contract} verification records only six successful receipts and never grants business or submission rights`, async () => {
   const f = await fixture(contract, false, contract === "safe");
   const owner = new RemoteTurnBroker(f.broker.socketPath);
-  const source = createContextSnapshot(parseRequest({ model: "gpt-5", input: "fixed connector marker-lambda" }));
+  const source = createContextSnapshot(parseRequest({ model: "gpt-5", input: [{ role: "user", content: "fixed connector marker-lambda" }, { role: "user", content: "second fixed connector marker-tail" }] }));
   const normal = { snapshot: source, planId: "connector-verification", manifestDigest: "connector-verification",
     deliveryByTarget: Object.fromEntries(source.targets.map(target => [target.target_id, { delivery: "on_demand", required: false }])) };
   try {
@@ -273,7 +322,7 @@ for (const contract of ["native", "safe"] as const) test(`stdio ${contract} veri
     for (const compaction of [false, true]) {
       const binding = { token: compaction ? handle.compactionToken : f.token, contract,
         credentialKind: compaction ? "compaction" as const : "ordinary" as const, contextProtocol: CONTEXT_PROTOCOL_VERSION };
-      const args = { context_id: source.context_id, read_ref: source.targets[0]!.read_ref! };
+      const args = { context_id: source.context_id, reads: source.targets.map(target => ({ read_ref: target.read_ref! })) };
       await expect(callTurnBroker(f.broker.socketPath, { method: "context_query", ...binding, contextProtocol: 1,
         contextMethod: "read", contextArgs: args })).rejects.toMatchObject({ code: "CONTEXT_INVALID" });
       const read = () => callTurnBroker<ContextPreparedReply>(f.broker.socketPath, { method: "context_query", ...binding,
@@ -286,13 +335,17 @@ for (const contract of ["native", "safe"] as const) test(`stdio ${contract} veri
       const cancelledRead = await read();
       await callTurnBroker(f.broker.socketPath, { method: "context_return", ...binding, receiptId: cancelledRead.receiptId, sent: false,
         textReadReceipt: contextTextReadReceipt(cancelledRead.result) });
+      const singleRead = await callTurnBroker<ContextPreparedReply>(f.broker.socketPath, { method: "context_query", ...binding,
+        contextMethod: "read", contextArgs: { context_id: source.context_id, reads: [{ read_ref: source.targets[0]!.read_ref! }] } });
+      await callTurnBroker(f.broker.socketPath, { method: "context_return", ...binding, receiptId: singleRead.receiptId, sent: true,
+        textReadReceipt: contextTextReadReceipt(singleRead.result) });
       const status = await owner.contextVerificationStatus(handle.pairToken);
       expect(status?.[compaction ? "compaction" : "ordinary"].read).toBe(false);
       expect(status?.[compaction ? "compaction" : "ordinary"].text_read).toBeUndefined();
     }
     for (const compaction of [false, true]) {
       expect((await invoke("codex_context_list", { view: "entries" }, compaction)).isError).not.toBe(true);
-      expect((await invoke("codex_context_read", { read_ref: source.targets[0]!.read_ref }, compaction)).isError).not.toBe(true);
+      expect((await invoke("codex_context_read", { reads: source.targets.map(target => ({ read_ref: target.read_ref! })) }, compaction)).isError).not.toBe(true);
       expect((await invoke("codex_context_search", { query: "marker-lambda" }, compaction)).isError).not.toBe(true);
     }
     // A subsequent private round trip sees the preceding transport receipt.

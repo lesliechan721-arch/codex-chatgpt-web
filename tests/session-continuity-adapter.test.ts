@@ -10,8 +10,7 @@ import { type ContinuityLease } from "../src/adapters/chatgpt-web/continuity-con
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { cancelAbandonedContinuityCreation, leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
-import { chatGptCurrentInstructionRevision } from "../src/adapters/chatgpt-web/environment";
-import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
+import { chatGptCurrentInstructionRevision, continuityCurrentInstructionInput } from "../src/adapters/chatgpt-web/environment";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
@@ -325,7 +324,7 @@ for (const [kind, layout] of [
   expect(f.submissions).toHaveLength(2);
 });
 
-test("verified pure environment: a derived no-AGENTS checkpoint continuation stays on the same page", async () => {
+for (const layout of ["rebuilt environment", "native retained preamble"] as const) test(`verified pure environment: ${layout} checkpoint continuation stays on the same page`, async () => {
   const codexHome = mkdtempSync(join(tmpdir(), "cgw-cont-pure-env-home-"));
   cleanups.push(async () => { rmSync(codexHome, { recursive: true, force: true }); });
   const f = fixture(false, { codexHome, threadId: "019cbcc7-31b2-7028-a632-7f8118410741" });
@@ -358,7 +357,7 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
     workspace_roots: ["/tmp/cgw-protocol-fixture/workspace"], approval_policy: "never", sandbox_policy: { type: "read-only" },
     permission_profile: { type: "managed", network: "restricted", file_system: { type: "restricted",
       entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] } } } });
-  const nativeRecords: unknown[] = [
+  const nativeRecords: Array<{ type: string; payload: Record<string, any> }> = [
     { type: "session_meta", payload: { id: f.threadId, source: "vscode" } },
     { type: "event_msg", payload: { type: "task_started", turn_id: sourceTurn } },
     nativeEnvironment(sourceBody.input.find(item => item.id === "item_4")!, sourceTurn),
@@ -370,7 +369,9 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   const writeNativeRecords = () => writeFileSync(rolloutPath, nativeRecords.map(item => JSON.stringify(item)).join("\n") + "\n");
   writeNativeRecords();
   const metadata = JSON.parse(sourceBody.client_metadata["x-codex-turn-metadata"]!);
-  const options = { model: "gpt-5.6-sol", reasoning: { effort: "low" }, stream: false };
+  const options = { model: "gpt-5.6-sol", reasoning: { effort: "low" }, stream: false,
+    ...(layout === "native retained preamble" ? { tools: (f.request()._rawBody as { tools: unknown[] }).tools } : {}),
+  };
   const first = parseRequest({ ...sourceBody, ...options, client_metadata: { "x-codex-turn-metadata": JSON.stringify({
     ...metadata, thread_id: f.threadId, turn_id: sourceTurn, request_kind: "turn",
   }) } });
@@ -393,7 +394,35 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   // alone is not historical provenance; native Codex writes the task_started boundary too.
   nativeRecords.push({ type: "event_msg", payload: { type: "task_started", turn_id: compactTurn } });
   writeNativeRecords();
-  await new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolveWithRolloutPublicationRetry(compact);
+  expect(sourceItem.internal_chat_message_metadata_passthrough?.turn_id).toBeUndefined();
+  expect(compact._chatGptCompactionSourceTurnId).toBeUndefined();
+  for (const unavailable of ["missing", "conflicting-source"] as const) {
+    try {
+      if (unavailable === "missing") rmSync(rolloutPath);
+      else {
+        const conflicting = structuredClone(nativeRecords) as Array<{ type: string; payload: Record<string, any> }>;
+        conflicting.find(item => item.type === "response_item" && item.payload.id === sourceItem.id)!.payload.content = [
+          { type: "input_text", text: "A different source body absent from this request." },
+        ];
+        writeFileSync(rolloutPath, conflicting.map(item => JSON.stringify(item)).join("\n") + "\n");
+      }
+      await expect(f.adapter().preflight!(structuredClone(compact), { headers: new Headers() }))
+        .rejects.toMatchObject({ code: "invalid_trusted_codex_environment" });
+      expect(f.submissions).toHaveLength(1);
+      expect(binding.state).toBe("ready");
+      expect(binding.revision).toBe(0);
+      expect(binding.checkpoints.size).toBe(0);
+      expect(binding.lease!.leaseId).toBe(leaseId);
+    } finally { writeNativeRecords(); }
+  }
+  const automatic = f.automatic.getMockImplementation()!;
+  f.automatic.mockImplementation(turn => {
+    if (turn.compaction) {
+      expect(turn.capabilities.localToolsEnabled).toBe(false);
+      expect(turn.nativeConnector).toBe(true);
+    }
+    return automatic(turn);
+  });
   const summary = (await f.run(compact)).find(event => event.type === "text_delta");
   if (summary?.type !== "text_delta") throw new Error("Missing verified compaction summary");
   expect(compact._chatGptCompactionSourceTurnId).toBe(sourceTurn);
@@ -401,18 +430,113 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   expect(binding.revision).toBe(1);
   expect(f.submissions).toHaveLength(2);
   continuedBody.input.find(item => item.id === "item_18")!.content = [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary.text}` }];
+  if (layout === "native retained preamble") {
+    const environment = sourceBody.input.find(item => item.id === "item_4")!;
+    const checkpoint = continuedBody.input.find(item => item.id === "item_18")!;
+    const instruction = continuedBody.input.find(item => item.id === "item_21")!;
+    // Installed Native emits this seven-item wire shape after local compaction. Its new
+    // instruction has an ID but no owner; only the original rollout can establish that owner.
+    continuedBody.input = [...sourceBody.input, checkpoint, instruction];
+    expect(continuedBody.input).toHaveLength(7);
+    nativeRecords.push({ type: "compacted", payload: { message: "", replacement_history: [
+      ...sourceBody.input.map(item => ({ ...item, internal_chat_message_metadata_passthrough: {
+        turn_id: item === environment ? compactTurn : sourceTurn,
+        content_item_kinds: item === environment ? ["environments.environment_context"] : ["user.text"],
+      } })), checkpoint,
+    ], resume_metadata: { last_started_turn_id: compactTurn } } }, nativeContext(compactTurn));
+  }
   const continued = parseRequest({ ...continuedBody, ...options, client_metadata: { "x-codex-turn-metadata": JSON.stringify({
     ...JSON.parse(continuedBody.client_metadata["x-codex-turn-metadata"]!), thread_id: f.threadId, turn_id: continuedTurn, request_kind: "turn",
   }) } });
   continued._conversationPolicy = "task";
-  nativeRecords.push(
-    { type: "event_msg", payload: { type: "task_started", turn_id: continuedTurn } },
-    nativeEnvironment(continuedBody.input.find(item => item.id === "item_20")!, continuedTurn),
-    nativeContext(continuedTurn),
-  );
+  nativeRecords.push({ type: "event_msg", payload: { type: "task_started", turn_id: continuedTurn } });
+  if (layout === "rebuilt environment") {
+    nativeRecords.push(nativeEnvironment(continuedBody.input.find(item => item.id === "item_20")!, continuedTurn));
+  }
+  nativeRecords.push(nativeContext(continuedTurn));
+  if (layout === "native retained preamble") {
+    const instruction = continuedBody.input.find(item => item.id === "item_21")!;
+    // An older human event may repeat the same text. Its different ID must stay distinct.
+    nativeRecords.splice(nativeRecords.findIndex(item => item.type === "event_msg" && item.payload.turn_id === compactTurn), 0, { type: "response_item", payload: {
+      ...instruction, id: "earlier-same-body-different-event",
+      internal_chat_message_metadata_passthrough: { turn_id: sourceTurn, content_item_kinds: ["user.text"] },
+    } });
+    nativeRecords.push({ type: "response_item", payload: { ...instruction,
+      internal_chat_message_metadata_passthrough: { turn_id: continuedTurn, content_item_kinds: ["user.text"] },
+    } });
+  }
   writeNativeRecords();
+  if (layout === "native retained preamble") {
+    const faults = ["missing rollout", "wrong thread", "missing current user", "changed native id", "changed native body",
+      "duplicate native id", "foreign native owner", "wrong native kind", "old native user", "missing current boundary",
+      "stale current context", "changed wire id", "changed wire body", "foreign wire owner", "extra unowned history",
+      "unsigned result", "trailing unsigned result", "execution history", "changed checkpoint"] as const;
+    for (const fault of faults) {
+      const records = structuredClone(nativeRecords) as Array<{ type: string; payload: Record<string, any> }>;
+      const raw = structuredClone(continued._rawBody) as typeof continuedBody;
+      const native = records.findLast(item => item.type === "response_item" && item.payload.id === "item_21")!;
+      const wire = raw.input.find(item => item.id === "item_21")!;
+      if (fault === "wrong thread") records[0]!.payload.id = sourceTurn;
+      if (fault === "missing current user") records.splice(records.indexOf(native), 1);
+      if (fault === "changed native id") native.payload.id = "different-native-user";
+      if (fault === "changed native body") native.payload.content[0].text += " changed";
+      if (fault === "duplicate native id") records.push(structuredClone(native));
+      if (fault === "foreign native owner") native.payload.internal_chat_message_metadata_passthrough.turn_id = sourceTurn;
+      if (fault === "wrong native kind") native.payload.internal_chat_message_metadata_passthrough.content_item_kinds = ["agents_md.instructions"];
+      if (fault === "old native user") {
+        records.splice(records.indexOf(native), 1); records.splice(1, 0, native);
+      }
+      if (fault === "missing current boundary") records.splice(records.findLastIndex(item => item.type === "event_msg"
+        && item.payload.type === "task_started" && item.payload.turn_id === continuedTurn), 1);
+      if (fault === "stale current context") records.findLast(item => item.type === "turn_context")!.payload.turn_id = sourceTurn;
+      if (fault === "changed wire id") wire.id = "different-wire-user";
+      if (fault === "changed wire body") wire.content[0].text += " changed";
+      if (fault === "foreign wire owner") wire.internal_chat_message_metadata_passthrough = { turn_id: sourceTurn };
+      if (fault === "extra unowned history") raw.input.splice(-1, 0,
+        { type: "message", role: "user", id: "unproven-extra-user", content: "Unproven completed history." });
+      if (fault === "unsigned result") raw.input.splice(-1, 0,
+        { type: "function_call_output", call_id: "never-issued-call", output: "Unaccepted result." });
+      if (fault === "trailing unsigned result") raw.input.push(
+        { type: "function_call_output", call_id: "never-issued-trailing-call", output: "Unaccepted trailing result." });
+      if (fault === "execution history") raw.input.splice(-1, 0,
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Unproven execution history." }] });
+      if (fault === "changed checkpoint") raw.input.find(item => item.id === "item_18")!.content[0].text += " changed";
+      const candidate = parseRequest(raw); candidate._conversationPolicy = "task";
+      const update = spyOn(f.broker, "updateEnvironment");
+      try {
+        if (fault === "missing rollout") rmSync(rolloutPath);
+        else writeFileSync(rolloutPath, records.map(item => JSON.stringify(item)).join("\n") + "\n");
+        await expect(f.run(candidate), fault).rejects.toThrow();
+        expect(update, fault).not.toHaveBeenCalled();
+        expect(f.submissions, fault).toHaveLength(2);
+        expect(f.controls.toolResults, fault).toHaveLength(0);
+        expect(binding.revision, fault).toBe(1);
+        expect(binding.checkpoints.size, fault).toBe(1);
+      } finally { update.mockRestore(); writeNativeRecords(); }
+    }
+  }
+  if (layout === "native retained preamble") { f.controls.invokeSourceTools = true; f.controls.singleSourceTool = true; }
   const accepted = await f.run(continued);
-  expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  if (layout === "native retained preamble") {
+    expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: false });
+    const current = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(continued)}`)!;
+    const call = current.outstanding()[0]!;
+    const result = parseRequest({ ...continued._rawBody as object, input: [...continuedBody.input, recordedCall(call),
+      { type: "function_call_output", call_id: call.callId, output: "Accepted current-turn result." }] });
+    result._conversationPolicy = "task";
+    const completed = await f.run(result);
+    expect(completed.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(await f.run(structuredClone(result))).toEqual(completed);
+    expect(f.controls.toolResults).toHaveLength(1);
+    expect(f.controls.toolResults[0]!.content).toEqual([{ type: "text", text: "Accepted current-turn result." }]);
+    const previous = { instructionIdentity: sourceItem.id, nativeTurnId: sourceTurn, trustedLowerBound: 5 };
+    // A replay selection cached on this exact parsed object cannot authorize checkpoint
+    // entry. The stricter new-task check runs before any cached return.
+    const selected = continuityCurrentInstructionInput(result, previous);
+    expect(() => continuityCurrentInstructionInput(result, { ...previous, rejectExecutionOutput: true }))
+      .toThrow(expect.objectContaining({ code: "continuity_source_unproven" }));
+    expect(continuityCurrentInstructionInput(result, previous)).toEqual(selected);
+  } else expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.pages.size).toBe(1);
   expect(f.submissions).toHaveLength(3);
   expect(f.submissions[2]).toMatchObject({ key: physicalKey, reused: true });
@@ -435,6 +559,38 @@ test("verified pure environment: a derived no-AGENTS checkpoint continuation sta
   expect(f.pages.size).toBe(1);
   expect(binding.revision).toBe(1);
   expect(binding.checkpoints.size).toBe(1);
+  if (layout === "native retained preamble") {
+    const previous = { instructionIdentity: sourceItem.id, nativeTurnId: sourceTurn, trustedLowerBound: 5 };
+    const originalBody = continued._rawBody, originalScope = continued._continuityScope;
+    const raw = originalBody as typeof continuedBody, input = raw.input, current = input[6]!;
+    const text = current.content[0].text, id = current.id, metadata = raw.client_metadata["x-codex-turn-metadata"]!;
+    const selected = continuityCurrentInstructionInput(continued, previous);
+    for (const mutation of ["body reference", "input reference", "item reference", "body", "id", "history", "scope", "thread", "turn"] as const) {
+      try {
+        if (mutation === "body reference") continued._rawBody = { ...raw };
+        if (mutation === "input reference") raw.input = [...input];
+        if (mutation === "item reference") input[6] = structuredClone(current);
+        if (mutation === "body") current.content[0].text += " mutated after verification";
+        if (mutation === "id") current.id = "changed-after-verification";
+        if (mutation === "history") input.push({ type: "message", role: "user", id: "unbound-history", content: "Extra history." });
+        if (mutation === "scope") continued._continuityScope = "foreign-scope";
+        if (mutation === "thread" || mutation === "turn") raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+          ...JSON.parse(metadata), [mutation === "thread" ? "thread_id" : "turn_id"]: sourceTurn,
+        });
+        expect(() => continuityCurrentInstructionInput(continued, previous), mutation)
+          .toThrow(expect.objectContaining({ code: "continuity_source_unproven" }));
+      } finally {
+        continued._rawBody = originalBody; continued._continuityScope = originalScope;
+        raw.input = input; input.length = 7; input[6] = current; current.id = id; current.content[0].text = text;
+        raw.client_metadata["x-codex-turn-metadata"] = metadata;
+      }
+    }
+    // Copying parsed cannot copy trusted ownership or resurrect a cached selection.
+    expect(() => continuityCurrentInstructionInput(structuredClone(continued), previous))
+      .toThrow(expect.objectContaining({ code: "continuity_source_unproven" }));
+    expect(continuityCurrentInstructionInput(continued, previous)).toEqual(selected);
+    expect(f.submissions).toHaveLength(3);
+  }
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} strictly resumes one leased page and exact reconnect does not submit again`, async () => {

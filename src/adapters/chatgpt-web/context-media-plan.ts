@@ -89,7 +89,7 @@ export function planContextMedia(input: ContextMediaPlanInput): ContextMediaPlan
       && requiredCost + fixed.visual_token_reserve <= input.availableTokens) {
       const navigator = new ContextNavigator({ scopeId: "context-media-preflight", snapshot: input.snapshot, purpose: "normal", limits,
         deliveryByTarget: { [target.target_id]: { delivery: "source_on_demand", media_route: "mcp", required: isRequired } } });
-      const response = navigator.read({ context_id: input.snapshot.context_id, read_ref: target.read_ref! });
+      const response = navigator.read({ context_id: input.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
       if (!response.isError) mcpCost = measureContextResponse(response, { visualTokens: fixed.visual_token_reserve,
         wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve });
     }

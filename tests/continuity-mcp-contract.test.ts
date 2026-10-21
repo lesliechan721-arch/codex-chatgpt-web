@@ -112,12 +112,12 @@ for (const contract of ["native", "safe"] as const) {
         const args = { ...f.reference, context_id: snapshot.context_id };
         const list = await f.client.callTool({ name: "codex_context_list", arguments: { ...args, view: "entries" } });
         expect(list.isError).not.toBe(true);
-        const read = await f.client.callTool({ name: "codex_context_read", arguments: { ...args, read_ref: snapshot.targets[0]!.read_ref! } });
-        expect(parseContextTextReadResult(read).body).toBe("Fixed source marker.\n保留原文。");
+        const read = await f.client.callTool({ name: "codex_context_read", arguments: { ...args, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] } });
+        expect(parseContextTextReadResult(read).bodies).toEqual(["Fixed source marker.\n保留原文。"]);
         const overview = await f.client.callTool({ name: "codex_context_list", arguments: { ...args, view: "overview" } });
         expect(overview.isError).not.toBe(true);
         expect(f.broker.contextStatus(f.token)?.context_ready).toBe(true);
-        const wrongSource = await f.client.callTool({ name: "codex_context_read", arguments: { ...args, read_ref: "unavailable-source" } });
+        const wrongSource = await f.client.callTool({ name: "codex_context_read", arguments: { ...args, reads: [{ read_ref: "unavailable-source" }] } });
         expect(wrongSource.isError).toBe(true);
         const wrongScope = await f.client.callTool({ name: "codex_context_list", arguments: { ...args, context_id: "another-context", view: "overview" } });
         expect(wrongScope.isError).toBe(true);

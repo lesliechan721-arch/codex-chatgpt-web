@@ -11,6 +11,7 @@ import { assertContextCoverageAdvance, validateContextCoverageMetadata, type Con
 import { CompactionSourceCoverage } from "./compaction-context";
 import type { ContextSnapshot } from "./context-snapshot";
 import type { TaskInputIdentity } from "./continuity-task-input-types";
+import { retainContinuityOrdinaryReplayTombstone } from "./continuity-binding";
 
 /** Passed only through authenticated local owner registration, never Native invocation input. */
 export interface RuntimeRecoveryReference {
@@ -470,6 +471,7 @@ export async function retireRecoveryWriter(
   observed: RecoveryThreadRecord,
   descriptor: string,
   sourceTask?: TaskInputIdentity,
+  compaction?: { executionKey: string; replaySource?: { executionKey: string; historyRevision: number } },
 ): Promise<RecoveryThreadRecord> {
   const { chatGptTurnSessions } = await import("./turn-execution");
   const { continuityProcessInstanceStatus } = await import("./continuity-recovery-store");
@@ -477,6 +479,13 @@ export async function retireRecoveryWriter(
   const binding = bindings.observed(observed.thread);
   const source = binding ? (binding.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined)
     ?? chatGptTurnSessions.findFailedContinuityCreation(binding) : undefined;
+  const compactionReplaySource = compaction?.replaySource;
+  if (compactionReplaySource && (!binding || !source || binding.executionKey !== compactionReplaySource.executionKey
+    || source.runtime.continuityBinding !== binding
+    || source.runtime.usageInput?._continuityHistoryRevision !== compactionReplaySource.historyRevision)) {
+    throw continuityError("continuity_source_unproven");
+  }
+  const preserveSourceReplay = Boolean(compactionReplaySource && source?.hasCompletedContinuityReplay());
   const work = observed.currentWorkId ? observed.works[observed.currentWorkId] : undefined;
   const attempt = work?.attempts.at(-1);
   if (attempt) {
@@ -492,6 +501,13 @@ export async function retireRecoveryWriter(
     }
     if (!attempt.writerRetired || sourceTask) bindings.recoveryStore.retireAttempt(current.thread,
       { scope: current.scope, expectedVersion: current.version, expectedOwner: current.owner.id }, work!.logicalWorkId, attempt.attempt, sourceTask);
+    if (compaction && binding && bindings.observed(current.thread) === binding && binding.epoch === current.epoch) {
+      // Retirement can schedule the source's release callback before a successor
+      // attempt exists. Keep the journal through that callback and capacity waits.
+      binding.recoveryCleanupExecutionKey = compaction.executionKey;
+    }
+    if (preserveSourceReplay) retainContinuityOrdinaryReplayTombstone(binding!, compactionReplaySource!.executionKey,
+      compactionReplaySource!.historyRevision, source!.acceptedContinuityInstructionIdentity(), source!.nativeTurnId);
     if (source) {
       try { await source.runtime.retireCapability?.(); }
       catch { /* The durable fence already denies effects; late coverage cannot delay isolation. */ }
@@ -529,8 +545,9 @@ export async function retireRecoveryWriter(
     // Physical settlement is independent. Live or failed-to-close pages retain their slot.
   }
   if (source?.settledOutcome()?.type === "error" && binding?.executionKey) {
-    chatGptTurnSessions.retire(binding.executionKey, source,
-      Object.assign(new Error("The continuity writer was retired for recovery."), { code: "continuity_recovery_retired" }));
+    const reason = Object.assign(new Error("The continuity writer was retired for recovery."), { code: "continuity_recovery_retired" });
+    if (preserveSourceReplay) chatGptTurnSessions.retirePreservingContinuityReplay(binding.executionKey, source, reason);
+    else chatGptTurnSessions.retire(binding.executionKey, source, reason);
   }
   return bindings.recoveryStore.get(observed.thread)!;
 }

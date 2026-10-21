@@ -215,15 +215,17 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
       await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: credential.compaction_token,
         contract: "native", credentialKind: "compaction", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
         ...(method === "read" && !reply.result.isError ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
-      return method === "read" && !reply.result.isError ? { ...(reply.result.structuredContent as Record<string, unknown>), content: parseContextTextReadResult(reply.result).body }
-        : reply.result.structuredContent;
+      if (method !== "read" || reply.result.isError) return reply.result.structuredContent;
+      const page = parseContextTextReadResult(reply.result);
+      expect(page.metadata.items).toHaveLength(1);
+      return { ...page.metadata.items[0], content: page.bodies[0] };
     };
     let source = "", cursor: string | undefined;
     if (options.sourceTail) {
       expect(compiled.text).not.toContain(options.sourceTail);
       const found = await query("search", { query: options.sourceTail });
       expect(found.hits).toHaveLength(1);
-      const read = await query("read", { read_ref: found.hits[0].read_ref, cursor: found.hits[0].read_cursor });
+      const read = await query("read", { reads: [{ read_ref: found.hits[0].read_ref, cursor: found.hits[0].read_cursor }] });
       source += read.content;
       expect(read.content).toContain(options.sourceTail);
     }
@@ -233,7 +235,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
         if (options.sourceTail && target.kind === "tool_result") continue;
         let readCursor: string | undefined;
         do {
-          const read = await query("read", { read_ref: target.read_ref, ...(readCursor ? { cursor: readCursor } : {}) });
+          const read = await query("read", { reads: [{ read_ref: target.read_ref, ...(readCursor ? { cursor: readCursor } : {}) }] });
           if (read.error) {
             // This fixture only needs the source prefix for its fixed summary.
             // A long source can exhaust navigation while preserving the summary reserve.

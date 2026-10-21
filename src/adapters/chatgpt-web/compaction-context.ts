@@ -4,7 +4,7 @@ import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, ty
 import type { CodexParsedRequest } from "../../types";
 import { parseRequest } from "../../responses/parser";
 import type { ChatGptTurnSession } from "./turn-execution";
-import { contextLimits, assertContextNavigationBudget, contextErrorReserve, measureContextResponse, type ContextLimitOverrides } from "./context-budget";
+import { configuredContextBudgetProfile, contextBudgetProfileLimits, contextLimits, assertContextNavigationBudget, contextErrorReserve, measureContextResponse, type ContextLimitOverrides } from "./context-budget";
 import { ContextNavigator } from "./context-navigator";
 import { compactionContextPrompt } from "./context-prompt";
 import { createContextSnapshot, deterministicContextJson, type ContextSnapshot } from "./context-snapshot";
@@ -398,16 +398,22 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
     withTokenEstimateCache(() => {
       const entry = navigator.preflightListEntry(index);
       const entryCost = measureContextResponse(entry, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
-      if (entry.isError || entryCost.total_tokens + directory.text_tokens + errors.tokens > budget.tokens - COMPACTION_SUMMARY_RESERVE
-        || entryCost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+      if (entry.isError) {
         unavailable("A compaction source cannot be discovered within a bounded directory page.");
       }
-      const result = navigator.preflightRead({ context_id: snapshot.context_id, read_ref: target.read_ref ?? "" });
+      if (entryCost.total_tokens + directory.text_tokens + errors.tokens > budget.tokens - COMPACTION_SUMMARY_RESERVE
+        || entryCost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+        throw continuityError("continuity_input_limit", "The retained page cannot fit source discovery and the summary reserve.");
+      }
+      const result = navigator.preflightRead({ context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref ?? "" }] });
       const cost = measureContextResponse(result, { wireReserveBytes: limits.wireReserveBytes,
         tokenReserve: limits.tokenReserve, visualTokens: target.kind === "image" ? target.visual_token_reserve ?? 0 : 0 });
-      if (result.isError || cost.total_tokens + directory.text_tokens + directory.visual_token_reserve + errors.tokens
-        > budget.tokens - COMPACTION_SUMMARY_RESERVE || cost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+      if (result.isError) {
         unavailable("A compaction source cannot be returned within a bounded read.");
+      }
+      if (cost.total_tokens + directory.text_tokens + directory.visual_token_reserve + errors.tokens
+        > budget.tokens - COMPACTION_SUMMARY_RESERVE || cost.wire_bytes + directory.wire_bytes + errors.wire_bytes > budget.wire_bytes) {
+        throw continuityError("continuity_input_limit", "The retained page cannot fit a source return and the summary reserve.");
       }
     });
     if (performance.now() - yieldedAt >= 8) {
@@ -425,15 +431,16 @@ export async function registerCompactionSource(broker: TurnBrokerOwner, input: O
     || !broker.guardCompactionContextCommit) unavailable("The connector has no compaction source capability.");
   // Charge a fixed entry reserve before creating credentials; charge the exact control below.
   const { availableTokens, ...registration } = input;
-  const remaining = Math.min(contextLimits(input.limits).maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
-  await assertCompactionReadable(input.snapshot, remaining, input.limits);
-  const handle = await broker.registerCompactionContext({ ...registration,
-    remainingBudget: { tokens: remaining, wire_bytes: contextLimits(input.limits).maxTotalWireBytes,
+  const limits = contextLimits({ ...contextBudgetProfileLimits(configuredContextBudgetProfile()), ...input.limits });
+  const remaining = Math.min(limits.maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
+  await assertCompactionReadable(input.snapshot, remaining, limits);
+  const handle = await broker.registerCompactionContext({ ...registration, limits,
+    remainingBudget: { tokens: remaining, wire_bytes: limits.maxTotalWireBytes,
       reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 } }, ownerContext);
   try {
     if (handle.contextId !== input.snapshot.context_id) unavailable("The compaction source registration changed its fixed context identity.");
     const selectedInstruction = compactionSourceInstruction(input.snapshot, instruction, availableTokens,
-      handle.compactionToken, input.limits);
+      handle.compactionToken, limits);
     compactionPageEntries.set(input.snapshot, { token: handle.compactionToken, instructionTokens: estimateTokens(selectedInstruction) });
     return { instruction: selectedInstruction, token: handle.compactionToken };
   } catch (error) { await broker.revokeCompactionContext(handle.compactionToken); throw error; }

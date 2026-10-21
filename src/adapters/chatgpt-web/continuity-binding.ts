@@ -172,6 +172,8 @@ export interface ContinuityBinding {
   /** Trusted local ownership metadata only; never persisted or supplied by request JSON. */
   conversation?: { key: string; descriptor: string };
   executionKey?: string;
+  /** Cold compaction owns journal cleanup while its retired source page closes. */
+  recoveryCleanupExecutionKey?: string;
   /** Latest logical instruction; executionKey remains the physical response identity. */
   logicalExecutionKey?: string;
   /** Last submitted history source while the next local preparation is pending. */
@@ -672,6 +674,8 @@ export class ContinuityBindings {
     ownerId: string; identity: ContinuityRecoveryIdentity;
   }): void {
     if (this.bindings.get(binding.thread) !== binding
+      || executionKey !== undefined && binding.recoveryCleanupExecutionKey !== undefined
+        && binding.recoveryCleanupExecutionKey !== executionKey
       || !expectedRecovery && executionKey !== undefined && binding.executionKey !== executionKey) {
       if (expectedRecovery) throw continuityError("continuity_source_unproven");
       return;

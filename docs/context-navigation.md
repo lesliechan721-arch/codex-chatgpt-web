@@ -22,11 +22,11 @@ retired defaults remain retired. Production and DEV plugins can remain installed
 
 Setup preserves custom names that are not retired defaults. If a custom plugin caches the old
 pre-navigation schema, follow the original migration above. The still-unreleased context-rendering,
-text-read-v2, and short-start update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
+text-batch-v1, and short-start update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
 non-retired custom names. Ordinary Native tool tokens use the exact `turn_` prefix and 32 case-sensitive
 characters. The independent `control_` token remains limited to compaction handoff submission;
 `compaction_token` remains limited to context reads. Refresh or reconnect that same connector to load the current token schema and copying
-instructions if its current contract is incompatible. If the client cannot update or consume v2, stop v2 use and report the missing
+instructions if its current contract is incompatible. If the client cannot update or consume batch-v1, stop context reads and report the missing
 capability. This update does not introduce another connector name. A local name change uses
 transactional setup and requires the necessary configuration steps for that identity. It does not
 rename a remote plugin or change a custom name automatically.
@@ -46,10 +46,11 @@ A compatible upgrade or runtime-file change alone does not require setup or diag
 Diagnostic failure, cancellation, timeout, or refusal during active work does not clear completed
 setup. A successful diagnosis does not replace the required configuration steps or current checks.
 
-When requested, **Verify runtime** checks the installed schema and uses a fixed small text source
+When requested, **Verify runtime** checks the installed schema and uses fixed text sources
 for list, search, and read with each credential: six successful supported-transport returns.
-Evidence version 2 requires both text reads' actual v2 shape, matching metadata, body index,
-UTF-8 range, and result digest. Preparing a result, a stale Boolean receipt, or a written model
+Each read requests at least two sources and verifies every batch-v1 metadata item, body block,
+UTF-8 range and actual successful transport batch receipt. Old single-read evidence is inapplicable.
+Preparing a result, a stale Boolean receipt, or a written model
 claim is not evidence. The private diagnostic scope cannot execute business tools, inventory,
 waits, completion, or compaction submission. Automatic opens reads after real prompt submission.
 Zero Risk keeps the user's plugin choice, manual Send, original start, and configured Sent policy.
@@ -141,7 +142,7 @@ References contain unit identity, fingerprint, source role and scope, and a curr
 reference for exact rereading. A user value named like a reference is still user data. Reused
 bodies are absent from the required payload and startup metadata. The complete legal historical
 directory remains available on demand. A short complete increment is inline; a long increment
-uses required v2 text pages. An inline increment needs no artificial protocol or payload read.
+uses required batch-v1 text responses. An inline increment needs no artificial protocol or payload read.
 
 Source identity is checked against the real parsed request and its verified candidate mapping.
 The top-level Responses `instructions` field is a current rule field with replacement semantics.
@@ -173,9 +174,11 @@ candidate, serialized prompt size and budget components. Transport observations 
 first startup manifest, later overview returns and directory pages. They count actual successful
 transport returns independently of unique text coverage; model input tokens remain unknown.
 
-Startup still uses `context-bootstrap-v1`; text reads still use `context-text-read-v2`.
-Reuse plans expose manifest version 2, the reuse capability, payload format and delivery mode.
-Known lack of reuse support can use the complete v1 short-start plan if supported and within all
+Startup uses `context-bootstrap-v1`; all text reads use `context-text-batch-v1`.
+All new startup plans expose manifest version 3, including reuse capability, payload format and
+delivery mode when applicable. `context-reuse-v1` and its payload value tree keep their own versions.
+Known lack of reuse support can use a complete non-reuse short-start plan with this read contract
+if supported and within all
 limits. Lack of reuse support does not imply lack of bootstrap support. A capability mismatch
 after Send stops that request and uses the existing connector repair path. Optional Verify runtime
 records do not enable reuse or control this decision. Zero Risk keeps manual Send, configured
@@ -183,8 +186,8 @@ Sent confirmation and separate image confirmation, with no new reuse confirmatio
 
 ## Short startup and required text
 
-The complete v1 short-start plan captures the selected task and generated execution protocol as required
-sources. Reuse-enabled v2 plans apply the rules above. Both preserve the selected value tree, source identity, roles, order, empty values, unknown
+The complete short-start plan captures the selected task and generated execution protocol as required
+sources. Reuse-enabled plans apply the rules above. Both preserve the selected value tree, source identity, roles, order, empty values, unknown
 structure, and known completeness. It does not infer authority from body markers such as
 `role:developer` or `AGENTS.md`. The guarantee starts after existing normalization, attachment
 projection, and retired-handle cleanup. It does not restore data that those steps already removed.
@@ -197,23 +200,33 @@ When configured Sent confirmation is pending, `read_state: "waiting"` identifies
 manual step. Waiting does not consume the read allowance and is not an instruction to poll reads.
 Manual Send, Sent policy, and image confirmation remain separate.
 
-The overview identifies `startup_protocol: "context-bootstrap-v1"`, `manifest_version: 1`,
-`context_id`, `plan_id`, `manifest_digest`, current revision and acknowledged revision, readiness
-and the next required read. `required_targets` contains a bounded first page and its continuation.
-Each target retains source location, role/origin/scope, UTF-8 size, digest, completeness, delivery
-route and read reference.
-`codex_context_list(view: "entries", required_only: true)` pages through required entries with the
-returned cursor. The default filter remains false. Each response, including its wrapper, fits the
-list limits of 20 targets, 12 KiB and 1,500 estimated tokens. Labels and previews are not body text.
-`next_required_read` first selects undelivered required MCP images, then the first missing text
-range in source order. Read arguments still need the current mode credential.
+The overview identifies `startup_protocol: "context-bootstrap-v1"`, `manifest_version: 3`,
+`text_read_format: "context-text-batch-v1"`, `required_discovery: "batch-metadata"`, plan identity,
+digests, counts, current revision/ACK, readiness and `next_required_read`. It does not embed a
+required-directory page or require traversing its cursors. Batch item metadata supplies source
+identity, order, location, role/origin/scope, completeness, UTF-8 size and digest.
+
+Follow `next_required_read` with the current mode credential. Images come first, in single-item
+`reads` arrays with no cursor and their original result/confirmation flow. After each image,
+read overview to recover the next step. For required text, follow only
+`required_step.next_required_read`, whose arguments are fixed by the plan. Do not also execute
+`remaining_reads`. An empty next step means the fixed chain ended; it does not establish successful
+delivery. Read overview once at the end to obtain settled `context_ready`, then follow any explicit
+missing-image or recovery step without polling. Automatic normally uses two overview calls;
+Zero Risk uses its start reply and one final overview. Pure-text startup requires zero `entries` calls.
+
+`codex_context_list(view: "entries", required_only: true)` remains available on demand; the default
+filter is false. It is not required discovery for manifest 3. Older manifests do not acquire this
+exemption. Recovery overview chooses the first incompletely covered canonical batch and may repeat
+already delivered ranges within it. Replaying that batch's original arguments returns the same
+bodies and fixed successor, even after coverage changes.
 
 A current user request that fits is retained exactly inline with its original identity. Otherwise,
 the whole accepted request or ordered message group becomes required text. It is never replaced
 by a summary, keyword-selected fragment, or truncated tail. Required rules and skill catalogs must
 be delivered before task work. Existing skill paths and relative-reference bases remain valid.
 
-`text_ready` requires successful supported-transport receipts matching pending v2 pages. Only their
+`text_ready` requires successful supported-transport receipts matching pending batch-v1 results. Only their
 UTF-8 range union counts; every required source must cover `[0, utf8_bytes)`. Empty sources require
 an actual empty-body receipt. Duplicate or overlapping pages add only new coverage, but each return
 consumes budget. Failed, malformed, cross-source, expired, revoked or cross-scope receipts add no
@@ -237,15 +250,17 @@ The provider's `chatgptWeb` options receive only the effective valid `maxCompose
 The complete final text is measured after rendering and escaping; UTF-16 length is recorded
 separately. The default is an engineering limit, not a measured platform attachment threshold.
 
-Plans reserve all required text pages, manifest discovery, startup and result wrappers, cursors,
-required images, corrective replies, retained context and working capacity. On-demand reads cannot
+Plans reserve complete canonical text batches, initial startup and final overview, image recovery
+controls, wrappers, cursors, required images, corrective replies, retained context and working
+capacity, plus one maximum required-return retry allowance. They do not reserve a mandatory
+required-directory traversal. On-demand reads cannot
 spend the protected remaining required-source allowance. Repeats count again. A plan that exceeds
 the composer limit cannot win because it uses fewer tokens; a valid short plan can cost more total
 tokens. If no complete plan fits, preparation fails before Send with the limiting budget or missing
 capability. It does not summarize, truncate, switch model, attach text or automatically resend.
 Each actual composer message in existing multipart delivery also has this text limit.
 
-The short entry gives the first call, v2 body selection, trust boundary and pre-work gate. Detailed
+The short entry gives the first call, batch body selection, trust boundary and pre-work gate. Detailed
 role, execution, wait, error, output and applicable update/image/attachment/continuity rules are in
 the required execution protocol. Server instructions and tool descriptions retain their own short
 parameter and recovery rules. Conditional rules use trusted plan state. Current errors select error
@@ -259,10 +274,11 @@ are supplied only on that path. Multipart stage/commit/ACK rules remain inline w
 are unavailable; they bind fixed bytes and do not execute task work before final commit. A resume
 entry states the remaining startup and ACK conditions rather than claiming the context is complete.
 
-Local checks require the current bootstrap and v2 contracts, not historical diagnostic success.
+Local checks require the current bootstrap and batch-v1 contracts, not historical diagnostic success.
 They cannot prove adoption of the new schema in ChatGPT's remote cache. Refresh or reconnect the
-current compatible connector when needed. A known pre-send incompatibility allows only a complete
-legacy plan that fits every budget; post-send incompatibility stops the request without a new Send.
+current compatible connector when needed. A known pre-send incompatibility allows only an
+existing complete candidate that fits every budget and does not depend on the incompatible
+context interface; post-send incompatibility stops the request without a new Send.
 The real editor, remote schema and model tail-page acceptance remain pending; see
 [short-start validation](release-validation.md#short-start-context-validation).
 
@@ -276,7 +292,7 @@ These tools allocate no `operation_id`, execute no historical action, and acknow
 | Tool | Input and result |
 | --- | --- |
 | `codex_context_list` | `view: "overview"` returns bounded source counts and current readiness. `view: "entries"` returns a page of source targets; use its cursor for the next page. |
-| `codex_context_read` | `read_ref` returns one exact text page or one complete image. Text pages can use a cursor. |
+| `codex_context_read` | `reads: [{read_ref, cursor?}]` requests 1–8 distinct text targets under one shared response budget, or one complete image without a cursor. |
 | `codex_context_search` | A nonempty `query` returns bounded literal matches and snippets. A match's `read_cursor` opens the corresponding text; the search pagination cursor cannot be used for read. |
 
 List and search accept `kind`, exact base `tool_name`, `namespace`, `call_id`, and a one-based
@@ -291,19 +307,39 @@ completeness remains `complete`, `truncated`, or `unknown` according to the supp
 A direct read does not require listing the full directory first. Legacy and on-demand text have
 no mandatory reading count or coverage threshold. Short-start required text uses the gate above. Read an earlier result before deciding to repeat its operation.
 
-Successful text pages use `format: "context-text-read-v2"`. `structuredContent` contains metadata
-only; `content[0].text` is JSON for the same metadata; `content[1].text` is the one exact body.
-Metadata includes `body_content_index: 1`. Consumers select that block using the version and index,
-not by concatenating text blocks. The body is never moved to `_meta` or copied into metadata.
-An empty source still returns the second text block with an empty string. The body byte length is
-`range.end_exclusive - range.start`; `utf8_bytes` remains the complete source length. Unknown
-versions, missing blocks, wrong indices, inconsistent metadata, and wrong lengths are errors.
+All successful text reads, including one-item arrays, use `format: "context-text-batch-v1"`.
+`content[0].text` is JSON metadata; `structuredContent` repeats that same metadata without bodies.
+`items` describes a nonempty prefix of the request in order. Each item selects its independent
+exact body with a unique, continuous `body_content_index` in `content[1..K]`; the total block count
+is exactly `items.length + 1`. Every item retains source identity, full `utf8_bytes`, digest,
+completeness, UTF-8 range, `has_more` and `next_cursor`. An empty source has an actual empty body
+block. Validate every block, metadata representation, request index, identity, range and length.
+Never join different sources or metadata, trim, normalize, unescape or JSON-parse a body.
 
-Page sizing accounts for the complete v2 response. The core body, range, and next cursor remain
-stable for the same source/scope retry; compaction's remaining-budget hints can change. Strings
-are not trimmed, reparsed, normalized, or unescaped. Images, list, search, and errors retain their
-existing result forms. New scopes require v2 and do not silently accept an older text result.
+For on-demand reads, continue `remaining_reads`: the partial final item gets its next cursor;
+unstarted suffix items keep their original arguments. A batch stops after a partial source instead
+of skipping ahead. Startup uses only `required_step.next_required_read` as described above.
+Requests validate the whole array before returning any body, including budget-deferred suffix
+items. Duplicate targets, unknown fields, old top-level `read_ref`/`cursor`, mixed scope, mixed
+images/text, multiple images and image cursors are rejected as a whole. A search hit opens with
+`reads: [{read_ref: hit.read_ref, cursor: hit.read_cursor}]`.
 
+Complete-result sizing includes every body, both metadata copies, remaining reads, cursors and
+fixed successor. The same snapshot, scope, budget, ordered arguments and cursors produce the same
+bodies/ranges and successor. Dynamic compaction budget hints cannot change them. Insufficient
+cumulative balance produces an error instead of silently shrinking the page. Images, list, search
+and errors keep their original forms. New scopes reject `context-text-read-v2`; no old-schema adapter
+or dual text-output selection is provided.
+
+Each batch has one pending transaction and one receipt. Any missing/corrupt item, mismatched
+metadata or invalid receipt prevents coverage for the entire batch. Only successful full transport
+and matching fixed source bytes atomically commit all returned ranges. Unreturned suffix items do
+not count. Generation costs are charged once for the complete response and remain charged after
+failure, cancellation or replay. A canonical unit releases its full reservation only when every
+planned range is covered; partial or overlapping coverage releases no proportional credit.
+One finite maximum-return recovery allowance protects failed delivery and identical canonical
+replay through the first business/success admission, including after final overview. It is not an
+unlimited retry guarantee; exhausted recovery does not waive coverage or spend workspace reserves.
 ## Images and confirmation
 
 Each image target uses fixed PNG, JPEG, GIF, or WebP bytes from the request or an existing authorized
@@ -342,7 +378,7 @@ and task-update ACKs retain their permissions. A deterministically rejected busi
 its rejection; use a new `operation_id` after correcting readiness. ChatGPT-owned web or research
 tools have no equivalent server interception point. The prompt requires image delivery before
 using them, but this is not a programmatic block or proof that the model understood an image.
-With no required images, the plan is ready from the start and has no image-readiness timer.
+With no required images, image readiness has no timer; short-start text and reuse gates still apply.
 
 ## Compaction sources
 
@@ -376,14 +412,19 @@ Neither source failure nor missing evidence permits rerunning business tools to 
 
 ## Effective local budgets
 
-These are runtime ceilings, not measured ChatGPT limits or a promise of more image capacity.
+The trusted `expanded` profile is the default planning candidate. The `conservative` profile uses
+24 KiB / 2,500 tokens per text batch and 20 targets / 12 KiB / 1,500 tokens per list response.
+Set `CODEX_CONTEXT_BUDGET_PROFILE=expanded` or `conservative` in the runtime environment before
+preparing a new plan. The selected profile and effective limits are frozen in that plan and scope.
+Both use arrays and batch-v1; neither can change a published plan. These are runtime ceilings,
+not measured ChatGPT limits or a promise of more image capacity.
 The selected model's existing context and composer budgets can impose smaller effective allowances.
 
 | Return | Maximum items | Complete response bytes | Estimated text tokens |
 | --- | --- | --- | --- |
-| List | 20 targets | 12 KiB | 1,500 |
+| List (`expanded`) | 50 targets | 48 KiB | 6,000 |
 | Search | 10 hits | 12 KiB | 1,500 |
-| Text read | One target page | 24 KiB | 2,500 |
+| Text read (`expanded`) | Up to 8 distinct targets | 64 KiB | 8,000 |
 | Image read | One complete image | 4 MiB raw; 6 MiB wire | 1,500 metadata tokens, plus visual reserve |
 
 | Shared limit | Effective value |
@@ -391,7 +432,7 @@ The selected model's existing context and composer budgets can impose smaller ef
 | Snapshot source storage | 32 MiB |
 | Cumulative navigation wire / estimated tokens | 64 MiB / 96,000 tokens, including the corrective-reply reserve |
 | Image returns / cumulative raw image bytes | 64 / 32 MiB |
-| Query / context arguments after credential removal | 512 UTF-8 bytes / 8 KiB |
+| Search query / complete serialized MCP arguments including credential | 512 UTF-8 bytes / 8 KiB |
 | Navigation entry JSON / label / search snippet | 8 KiB / 120 characters / 160 characters |
 | Response framing / token reserve | 128 bytes / 32 tokens per return |
 | Corrective replies | 3 at up to 512 wire bytes and 128 tokens each; protected reserve of 1,536 bytes / 384 tokens |
@@ -402,17 +443,20 @@ and 50,000,000 bytes total, including reserved skill attachments. These are loca
 measurement of the account's current composer allowance. Only actual attachments consume slots.
 
 Ordinary planning includes the selected prompt, retained-page estimate, required images, return
-wrappers, an 8,192-token platform reserve, and a 4,096-token work reserve. Navigation also reserves
-the measured directory overview and useful entries pages, plus the protected error reserve.
-Discovery includes all pages needed to find required image references and the largest useful
-single-target page, with bounded cursor costs. Each image uses a conservative visual reserve of 4,096 tokens,
+wrappers, an 8,192-token platform reserve, and a 4,096-token work reserve. Navigation reserves the
+fixed required batch chain, initial startup, image-progress recovery,
+final overview, the protected error reserve and one maximum required-return retry. Optional
+list/search/read cannot spend remaining required or workspace reserves. Each image uses a conservative
+visual reserve of 4,096 tokens,
 or 8,192 for original detail. These reserves are estimates, not observed vision usage or billing.
 Compaction deducts its instruction and a 4,096-token entry reserve from available page capacity,
 caps the shared allowance at 96,000 tokens, and reserves 8,192 of that allowance for summary and
 submission. Unread sources need not all fit within the remaining reading allowance.
 
 Wire measurement includes the complete result's content, structured content, JSON escaping,
-cursors, base64, and framing reserve. Text-token estimation excludes image base64 and counts visual
+cursors, base64, and framing reserve. Text batches are charged once, not once per item. The
+two-second processing limit applies to the entire batch. Text-token estimation excludes image
+base64 and counts visual
 reserves separately. Repeated reads and retries count again. A shorter prompt alone does not prove
 lower total delivery cost; directory, search, read, retry, and image costs must also be measured.
 The hard text budget still serializes the complete result without image base64 and adds the existing

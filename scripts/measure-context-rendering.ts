@@ -68,9 +68,9 @@ export function measureContextRendering() {
   }
   return { kind: "offline-context-rendering-replay", generated_at: new Date().toISOString(),
     runtime: `bun ${Bun.version}`, source_sha256: sourceHash.digest("hex"),
-    model: CHATGPT_WEB_MODEL_ID, effort: "high", mcp_format: "context-text-read-v2",
+    model: CHATGPT_WEB_MODEL_ID, effort: "high", mcp_format: "context-text-batch-v1",
     limits: ["No browser, model, network or semantic-quality measurement.",
-      "Forced legacy/new candidates and automatic selection all use the current v2 MCP navigator; this is not a v1 client experiment.",
+      "Forced legacy/new candidates and automatic selection all use the current batch-v1 MCP navigator; this does not compare old and new MCP contracts.",
       "Source bytes are identical between variants. Runtime identifiers are sampled by the real planner.",
       "Complete-reading rows include one intentional repeated first page. Hard token estimates include reserves.",
       "Diagnostic visible-field tokens do not replace hard budgets. Actual model input counts are unknown."], rows };
@@ -101,17 +101,19 @@ function replayReads(plan: ContextDeliveryPlan, source: string, reading: "partia
     assert.ok(readRef, "Recorded source must be discoverable");
     let cursor: string | undefined, restored = "", firstBody = "";
     do {
-      const result = account(navigator.read({ context_id: snapshot.context_id, read_ref: readRef, ...(cursor ? { cursor } : {}) }));
-      const { metadata, body } = parseContextTextReadResult(result);
-      assert.equal(metadata.range.start, uniqueBytes);
+      const result = account(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: readRef, ...(cursor ? { cursor } : {}) }] }));
+      const { metadata, bodies } = parseContextTextReadResult(result);
+      assert.equal(metadata.items.length, 1);
+      const item = metadata.items[0]!, body = bodies[0]!;
+      assert.equal(item.range.start, uniqueBytes);
       if (readCalls === 0) firstBody = body;
       readCalls++; restored += body; uniqueBytes += Buffer.byteLength(body);
-      cursor = metadata.next_cursor ?? undefined;
+      cursor = metadata.remaining_reads[0]?.cursor;
     } while (reading === "complete" && cursor);
     assert.equal(restored, Buffer.from(source).subarray(0, uniqueBytes).toString("utf8"));
     if (reading === "complete") assert.equal(restored, source);
-    const repeated = account(navigator.read({ context_id: snapshot.context_id, read_ref: readRef })); readCalls++;
-    const repeatBody = parseContextTextReadResult(repeated).body;
+    const repeated = account(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: readRef }] })); readCalls++;
+    const repeatBody = parseContextTextReadResult(repeated).bodies[0]!;
     assert.equal(repeatBody, firstBody); repeatedBytes = Buffer.byteLength(repeatBody);
     assert.equal(navigator.usage().wire_bytes, wire);
   }

@@ -14,6 +14,7 @@ import { leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-life
 import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
 import { chatGptCurrentInstructionIndex, chatGptCurrentInstructionRevision, extractChatGptTurnIdentity, extractChatGptTurnUserRevision, extractChatGptCompactV1SourceRevision, extractChatGptCompactionSourceRevision } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
+import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
 import { chatGptContinuityInstructionPayloadDigest, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { buildCompactV1Output, COMPACT_PROMPT, encodeCompactionSummary, extractCompactUserMessages, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -144,6 +145,74 @@ test("Automatic completed compaction retains the exact page and concurrent retri
   expect((await f.run(structuredClone(compact))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.pages.size).toBe(1);
   expect(f.submissions).toHaveLength(3);
+});
+
+for (const withTools of [false, true]) test(`durable retained compaction forwards its authenticated directory through the original Helper guard (tool results=${withTools})`, async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = withTools;
+  f.controls.parallelSourceTools = withTools;
+  const first = f.request();
+  await f.run(first);
+  let completed = first;
+  if (withTools) {
+    const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+    const calls = source.outstanding();
+    expect(calls).toHaveLength(2);
+    completed = f.request("", "turn-first", [...(first._rawBody as { input: unknown[] }).input,
+      ...calls.flatMap((call, index) => [recordedCall(call), {
+        type: "function_call_output", call_id: call.callId, output: `Accepted source result ${index}.`,
+      }])]);
+    expect((await f.run(completed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  }
+  const helper = new LauncherBrowserHelperClient({} as never);
+  const internal = helper as unknown as {
+    ensureChild(): Promise<void>;
+    send(message: { type: string; turn?: { recoveryStoreDirectory?: string } }): Promise<void>;
+  };
+  // The external child boundary is controlled; the original run() directory guard is intact.
+  internal.ensureChild = async () => {};
+  helper.assertContinuityCompatible = async () => {};
+  const atHelperPipe = new Error("Controlled external Helper pipe boundary");
+  const frames: Array<{ type: string; turn?: { recoveryStoreDirectory?: string } }> = [];
+  internal.send = async frame => { frames.push(frame); throw atHelperPipe; };
+  const ordinary = f.automatic.getMockImplementation()!;
+  f.automatic.mockImplementation(async turn => {
+    if (!turn.compaction) return ordinary(turn);
+    expect(turn.continuity?.recovery).toBeDefined();
+    expect(turn.onSendActivated).toBeFunction();
+    expect(turn.nativeConnector).toBe(true);
+    expect(turn.capabilities.localToolsEnabled).toBe(false);
+    const submissions = f.submissions.length;
+    await expect(helper.run({ ...turn, recoveryStoreDirectory: undefined })).rejects.toMatchObject({
+      code: "continuity_configuration_conflict",
+      message: expect.stringContaining("Recovery requires the authenticated durable state directory in the browser helper."),
+    });
+    expect(frames).toHaveLength(0);
+    expect(f.submissions).toHaveLength(submissions);
+    try { await helper.run(turn); throw new Error("The controlled Helper pipe did not run"); }
+    catch (error) { if (error !== atHelperPipe) throw error; }
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({ type: "run", turn: { recoveryStoreDirectory: f.registrations.directory } });
+    expect(turn.recoveryStoreDirectory).toBe(f.registrations.directory);
+    // Continue through the fixture's original durable lease, Send receipt and handoff.
+    return ordinary(turn);
+  });
+  try {
+    const compact = structuredClone(completed); compact._compactionRequest = true;
+    const events = await f.run(compact);
+    expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(events.find(event => event.type === "text_delta" && event.phase === "final_answer"))
+      .toMatchObject({ text: expect.stringContaining(f.controls.handoffSummary) });
+    const journal = new ContinuityRecoveryStore(f.registrations.directory).get(continuityDigest(f.threadId))!;
+    expect(journal.historyRevision).toBe(1);
+    expect(Object.values(journal.checkpoints)).toHaveLength(1);
+    expect(Object.values(journal.checkpoints)[0]!.coveredCallIds).toHaveLength(withTools ? 2 : 0);
+    expect(f.submissions).toHaveLength(2);
+    expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
+    expect((await f.run(structuredClone(compact))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(frames).toHaveLength(1);
+    expect(f.submissions).toHaveLength(2);
+  } finally { await helper.close(); }
 });
 
 test("Automatic shared compaction is cancelled by a later request's native turn identity", async () => {
@@ -901,8 +970,9 @@ test("Round 7: verified compaction retry honors established source item aliases"
     const retry=structuredClone(compact);
     (retry._rawBody as {input:Array<Record<string,unknown>>}).input[0]!.id="msg-turn-first";
     const before=f.submissions.length;
+    const restoredBeforeRetry=restoredAliases;
     const result=await f.run(retry).then(events=>({accepted:true,events}),error=>({accepted:false,code:error.code,message:error.message}));
-    expect(restoredAliases).toBe(1);
+    expect(restoredAliases).toBe(restoredBeforeRetry);
     expect(result).toMatchObject({accepted:true});
     expect(f.submissions).toHaveLength(before);
   } finally {resolver.mockRestore();}

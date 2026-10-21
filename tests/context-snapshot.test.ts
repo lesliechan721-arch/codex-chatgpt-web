@@ -83,7 +83,7 @@ function expectPreservedImage(bytes: Buffer, mime: string): void {
   for (const source of [snapshot, fixed, restoreContextSnapshot(serializeContextSnapshot(snapshot))]) {
     const target = source.targets[0]!; expect(target.read_ref).toBeString(); expect(target.image_bytes).toBe(bytes.length);
     expect(Buffer.from(source.getImage(target.read_ref!)!.bytes)).toEqual(Buffer.from(bytes));
-    const result = new ContextNavigator({ scopeId: "valid-format", snapshot: source, purpose: "normal" }).read({ context_id: source.context_id, read_ref: target.read_ref! });
+    const result = new ContextNavigator({ scopeId: "valid-format", snapshot: source, purpose: "normal" }).read({ context_id: source.context_id, reads: [{ read_ref: target.read_ref! }] });
     expect(result.isError).not.toBe(true);
     expect(result.content.find((block: any) => block.type === "image")).toEqual({ type: "image", mimeType: mime, data: bytes.toString("base64") });
   }
@@ -92,7 +92,7 @@ function expectRejectedImage(bytes: Buffer, mime: string, valid: Buffer): void {
   expect(() => assertSupportedContextImage(bytes, mime)).toThrow();
   const parsed = imageRequest(bytes, mime), snapshot = createContextSnapshot(parsed);
   expect(snapshot.targets[0]!.read_ref).toBeNull();
-  expect(new ContextNavigator({ scopeId: "invalid-format", snapshot, purpose: "normal" }).read({ context_id: snapshot.context_id, read_ref: "unavailable" }).isError).toBe(true);
+  expect(new ContextNavigator({ scopeId: "invalid-format", snapshot, purpose: "normal" }).read({ context_id: snapshot.context_id, reads: [{ read_ref: "unavailable" }] }).isError).toBe(true);
   expect(() => createContextSnapshot(parsed, { fixedImages: [{ locator: { message_index: 0, content_index: 0 }, bytes, mime_type: mime }] })).toThrow();
   const wire = serializeContextSnapshot(createContextSnapshot(imageRequest(valid, mime))) as any;
   wire.payloads[0].data = bytes.toString("base64"); wire.targets[0].image_bytes = bytes.length;

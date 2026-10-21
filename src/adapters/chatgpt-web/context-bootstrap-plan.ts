@@ -2,90 +2,89 @@ import { measureContextResponse, type ContextLimits, type ContextResponseCost } 
 import { ContextDeliveryPlanningError } from "./context-media-plan";
 import { ContextNavigator } from "./context-navigator";
 import type { ContextSnapshot } from "./context-snapshot";
-import { parseContextTextReadResult } from "./context-text-result";
-import type { ContextDelivery } from "./context-types";
+import type { ContextDelivery, ContextRequiredTextBatch } from "./context-types";
 import type { ContextReusePlan } from "./context-reuse-types";
 
-export interface RequiredTextPageCost { start: number; end_exclusive: number; tokens: number; wire_bytes: number }
 const empty = (): ContextResponseCost => ({ wire_bytes: 0, text_tokens: 0, visual_tokens: 0, total_tokens: 0 });
 function add(total: ContextResponseCost, cost: ContextResponseCost): void {
   total.wire_bytes += cost.wire_bytes; total.text_tokens += cost.text_tokens;
   total.visual_tokens += cost.visual_tokens; total.total_tokens += cost.total_tokens;
 }
-
-/** Measure complete v2 pages and every required directory page. The same navigator
- * packs both preflight and runtime pages, including signed-cursor token bounds. */
+export interface ContextBootstrapControlCosts {
+  overview: { tokens: number; wire_bytes: number };
+  start: { tokens: number; wire_bytes: number };
+  /** Initial control, each MCP image recovery, and final readiness. */
+  count: number;
+}
+/** Plan one finite chain with the runtime packer, then validate every materialized
+ * step. Future scope bindings/signatures use bounded cursor token accounting. */
 export function measureBootstrapRequiredCosts(input: {
   snapshot: ContextSnapshot; planId: string; manifestDigest: string; limits: ContextLimits;
-  deliveryByTarget: Readonly<Record<string, ContextDelivery>>; manual: boolean; started: number;
+  deliveryByTarget: Readonly<Record<string, ContextDelivery>>; started: number;
   reuse?: ContextReusePlan;
-}): { text: ContextResponseCost; discovery: ContextResponseCost;
-  pageCosts: Record<string, RequiredTextPageCost[]>; retry: { tokens: number; wire_bytes: number } } {
+}): { text: ContextResponseCost; discovery: ContextResponseCost; batches: ContextRequiredTextBatch[];
+  retry: { tokens: number; wire_bytes: number }; control: ContextBootstrapControlCosts } {
   const { snapshot, limits, deliveryByTarget } = input;
   const check = (): void => {
     if (performance.now() - input.started > limits.totalProcessingMs) throw new ContextDeliveryPlanningError(
       "CONTEXT_BUDGET_EXCEEDED", "Required context preflight exceeded its bounded processing deadline");
   };
-  const nav = new ContextNavigator({ scopeId: "context-bootstrap-preflight", snapshot, purpose: "normal", deliveryByTarget,
-    bootstrap: { planId: input.planId, manifestDigest: input.manifestDigest, ...(input.reuse ? { reuse: input.reuse } : {}) },
-    limits: { ...limits, maxTotalTokens: Number.MAX_SAFE_INTEGER, maxTotalWireBytes: Number.MAX_SAFE_INTEGER } });
+  for (const target of snapshot.targets) if (target.kind !== "image" && deliveryByTarget[target.target_id]?.required
+    && (!target.read_ref || target.source_completeness !== "complete")) throw new ContextDeliveryPlanningError(
+    "CONTEXT_MAPPING_UNPROVEN", "A required text source is not complete and readable", { target_id: target.target_id });
+  const options = { scopeId: "context-bootstrap-preflight", snapshot, purpose: "normal" as const, deliveryByTarget,
+    limits: { ...limits, maxTotalTokens: Number.MAX_SAFE_INTEGER, maxTotalWireBytes: Number.MAX_SAFE_INTEGER } };
+  const bootstrap = { planId: input.planId, manifestDigest: input.manifestDigest, ...(input.reuse ? { reuse: input.reuse } : {}) };
+  let batches: ContextRequiredTextBatch[];
+  try { batches = new ContextNavigator({ ...options, bootstrap }).preflightRequiredTextBatches(); }
+  catch { throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A required context batch cannot fit its complete response budget"); }
+  const nav = new ContextNavigator({ ...options, bootstrap: { ...bootstrap, requiredTextBatches: batches } });
   const measure = (response: Parameters<typeof measureContextResponse>[0]): ContextResponseCost => {
     check();
     if (response.isError) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A required context page cannot fit its complete response budget");
     return measureContextResponse(response, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
   };
-  const text = empty(), discovery = empty(), pageCosts: Record<string, RequiredTextPageCost[]> = {};
-  const retry = { tokens: 0, wire_bytes: 0 };
-  for (const target of snapshot.targets) {
-    if (target.kind === "image" || !deliveryByTarget[target.target_id]?.required) continue;
-    if (!target.read_ref || target.source_completeness !== "complete") throw new ContextDeliveryPlanningError(
-      "CONTEXT_MAPPING_UNPROVEN", "A required text source is not complete and readable", { target_id: target.target_id });
-    const pages: RequiredTextPageCost[] = [];
-    let cursor: string | undefined;
-    do {
-      check();
-      const result = nav.preflightRead({ context_id: snapshot.context_id, read_ref: target.read_ref, ...(cursor ? { cursor } : {}) });
-      const cost = measure(result), { metadata } = parseContextTextReadResult(result);
-      add(text, cost);
-      pages.push({ ...metadata.range, tokens: cost.total_tokens, wire_bytes: cost.wire_bytes });
-      retry.tokens = Math.max(retry.tokens, cost.total_tokens); retry.wire_bytes = Math.max(retry.wire_bytes, cost.wire_bytes);
-      if (metadata.next_cursor === cursor) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "Required context pagination did not advance");
-      cursor = metadata.next_cursor ?? undefined;
-    } while (cursor);
-    pageCosts[target.target_id] = pages;
+  const text = empty(), discovery = empty(), retry = { tokens: 0, wire_bytes: 0 };
+  for (let index = 0; index < batches.length; index++) {
+    const batch = batches[index]!, cost = measure(nav.preflightRead(nav.requiredReadArgs(index)));
+    if (cost.total_tokens > batch.tokens || cost.wire_bytes > batch.wire_bytes
+      || cost.total_tokens > limits.readTokens || cost.wire_bytes > limits.readBytes) throw new ContextDeliveryPlanningError(
+      "CONTEXT_BUDGET_EXCEEDED", "A materialized required batch exceeded its fixed upper bound");
+    batch.tokens = cost.total_tokens; batch.wire_bytes = cost.wire_bytes;
+    add(text, cost);
+    retry.tokens = Math.max(retry.tokens, cost.total_tokens); retry.wire_bytes = Math.max(retry.wire_bytes, cost.wire_bytes);
   }
-  // The start return and the overview return have different outer envelopes.
-  // Reserve the larger complete result, including initial revision/control data.
-  const overview = nav.preflightList({ context_id: snapshot.context_id, view: "overview" }, {
-    context_ready: false, required_images: snapshot.targets.filter(t => t.kind === "image" && deliveryByTarget[t.target_id]?.required).length,
-    delivered_images: 0, remaining_tokens: Number.MAX_SAFE_INTEGER, remaining_wire_bytes: Number.MAX_SAFE_INTEGER,
-    text_ready: false, images_ready: false, required_texts: Object.keys(pageCosts).length, delivered_texts: Object.keys(pageCosts).length,
-    required_text_bytes: snapshot.targets.filter(t => pageCosts[t.target_id]).reduce((sum, target) => sum + target.utf8_bytes!, 0),
-    delivered_text_bytes: snapshot.targets.filter(t => pageCosts[t.target_id]).reduce((sum, target) => sum + target.utf8_bytes!, 0),
-  }, { read_state: "readable", revision: Number.MAX_SAFE_INTEGER, acknowledged_revision: Number.MAX_SAFE_INTEGER });
-  let overviewCost = measure(overview);
-  // Runtime meters the complete start envelope as an upper bound in both modes.
-  for (const duplicate of [false, true]) {
-    const body = { started: true, duplicate, context_bootstrap: overview.structuredContent };
-    const cost = measure({ content: [{ type: "text", text: JSON.stringify(body) }], structuredContent: body });
-    overviewCost = { wire_bytes: Math.max(overviewCost.wire_bytes, cost.wire_bytes), text_tokens: Math.max(overviewCost.text_tokens, cost.text_tokens),
-      visual_tokens: 0, total_tokens: Math.max(overviewCost.total_tokens, cost.total_tokens) };
+  const images = snapshot.targets.filter(target => target.kind === "image" && deliveryByTarget[target.target_id]?.required
+    && deliveryByTarget[target.target_id]?.media_route === "mcp");
+  const requiredTexts = snapshot.targets.filter(target => target.kind !== "image" && deliveryByTarget[target.target_id]?.required).length;
+  const controlReads = [null, ...batches.map((_, index) => ({ tool: "codex_context_read" as const, arguments: nav.requiredReadArgs(index) })),
+    ...images.map(target => ({ tool: "codex_context_read" as const, arguments: { context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] } }))];
+  let overviewTokens = 0, overviewBytes = 0;
+  for (const next of controlReads) {
+    const overview = nav.preflightList({ context_id: snapshot.context_id, view: "overview" }, {
+      context_ready: false, reuse_ready: false, text_ready: false, images_ready: false,
+      required_images: images.length, delivered_images: images.length, required_texts: requiredTexts, delivered_texts: requiredTexts,
+    }, { read_state: "readable", revision: Number.MAX_SAFE_INTEGER, acknowledged_revision: Number.MAX_SAFE_INTEGER,
+      next_action: "Complete the original Launcher Sent confirmation. Then continue by repeating codex_turn_start with this request_id. Do not poll context reads while waiting." }, next);
+    measure(overview);
+    // Navigator meters this complete envelope for both list and start returns.
+    for (const duplicate of [false, true]) {
+      const body = { started: true, duplicate, context_bootstrap: overview.structuredContent };
+      const cost = measure({ content: [{ type: "text", text: JSON.stringify(body) }], structuredContent: body });
+      overviewTokens = Math.max(overviewTokens, cost.total_tokens); overviewBytes = Math.max(overviewBytes, cost.wire_bytes);
+    }
   }
-  overviewCost.wire_bytes = Math.max(overviewCost.wire_bytes, limits.listBytes);
-  overviewCost.text_tokens = Math.max(overviewCost.text_tokens, limits.listTokens);
-  overviewCost.total_tokens = Math.max(overviewCost.total_tokens, limits.listTokens);
-  add(discovery, overviewCost);
-  const manifest = overview.structuredContent as { required_targets: { has_more: boolean; next_cursor?: string | null } };
-  let cursor = manifest.required_targets.next_cursor ?? undefined;
-  let more = manifest.required_targets.has_more;
-  while (more) {
-    const result = nav.preflightList({ context_id: snapshot.context_id, view: "entries", required_only: true, ...(cursor ? { cursor } : {}) });
-    add(discovery, measure(result));
-    const page = result.structuredContent as { next_cursor: string | null };
-    if (page.next_cursor === cursor) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "Required directory pagination did not advance");
-    cursor = page.next_cursor ?? undefined;
-    more = cursor !== undefined;
+  const control: ContextBootstrapControlCosts = { overview: { tokens: overviewTokens, wire_bytes: overviewBytes },
+    start: { tokens: overviewTokens, wire_bytes: overviewBytes }, count: images.length + 2 };
+  for (let index = 0; index < control.count; index++) add(discovery, { wire_bytes: overviewBytes, text_tokens: overviewTokens,
+    total_tokens: overviewTokens, visual_tokens: 0 });
+  for (const target of images) {
+    const result = nav.preflightRead({ context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
+    const cost = measureContextResponse(result, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve,
+      visualTokens: target.visual_token_reserve ?? 0, boundCursorTokens: true });
+    if (result.isError) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A required image cannot fit its response budget");
+    retry.tokens = Math.max(retry.tokens, cost.total_tokens); retry.wire_bytes = Math.max(retry.wire_bytes, cost.wire_bytes);
   }
   check();
-  return { text, discovery, pageCosts, retry };
+  return { text, discovery, batches, retry, control };
 }

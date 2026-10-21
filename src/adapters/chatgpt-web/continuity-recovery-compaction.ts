@@ -483,6 +483,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   }
   const healthy = observed && ["running", "ready", "compacting"].includes(observed.state)
     && ["running", "ready", "compacting"].includes(record.state) && observed.lease && record.owner.id === bindings.owner;
+  let compactionReplaySource: { executionKey: string; historyRevision: number } | undefined;
   const endedManual = isChatGptWebZeroRiskBackendModel(parsed.modelId) && selection.source.state === "completed";
   // Public compact is the explicit manual request. An ended source needs a new
   // control-only owner; an active source keeps its original handoff boundary.
@@ -519,6 +520,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
         if ((error as { code?: string }).code !== "continuity_input_limit") throw error;
         // An otherwise healthy page may fit ordinary work but lack the independent
         // checkpoint reading and summary allowance. Admit the actual cold plan below.
+        compactionReplaySource = { executionKey: observed.executionKey!, historyRevision: selection.target.sourceHistoryRevision };
       }
     }
   }
@@ -611,7 +613,8 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     !== recoveryDigest(canonicalJson(recoveryIdentity(record, store.installationId())))) {
     throw continuityError("continuity_source_unproven", "The known unacquired retry no longer matches its original reservation.");
   }
-  if (!waitingAcquisition && !freshPageCompactions.has(parsed)) record = await retireRecoveryWriter(bindings, record, descriptor);
+  if (!waitingAcquisition && !freshPageCompactions.has(parsed)) record = await retireRecoveryWriter(bindings, record, descriptor,
+    undefined, { executionKey, replaySource: compactionReplaySource });
   const shadow = record.works[`compaction:${selection.target.compactionTargetId}`];
   if (shadow?.activationState === "shadow") {
     const attempt = shadow.attempts.at(-1)!;

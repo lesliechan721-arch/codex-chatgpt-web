@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { shortContextBootstrapPrompt } from "../src/adapters/chatgpt-web/context-prompt";
+import { compactionContextPrompt, shortContextBootstrapPrompt, shortContextReuseBootstrapPrompt } from "../src/adapters/chatgpt-web/context-prompt";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -53,8 +53,11 @@ test.each(["automatic", "zero-risk"] as const)("%s short entry has a usable firs
   expect(entry.text.split(mode === "automatic" ? token : requestId)).toHaveLength(2);
   expect(entry.fixedCodePoints).toBe(points(entry.text));
   expect(entry.fixedCodePoints).toBeLessThanOrEqual(3_000);
-  expect(entry.text).toContain("context-text-read-v2");
-  expect(entry.text).toContain("body_content_index=1");
+  expect(entry.text).toContain("context-text-batch-v1");
+  expect(entry.text).toContain("reads:[{read_ref,cursor?}]");
+  expect(entry.text).toContain("required_step.next_required_read");
+  expect(entry.text).toContain("read overview once for context_ready");
+  expect(entry.text).not.toContain("context-text-read-v2");
   expect(entry.text).toContain("ChatGPT-native");
   expect(entry.text).toContain("sandbox and approval");
   expect(entry.text).toContain("metadata");
@@ -158,4 +161,35 @@ test("prepared source positions follow superseded-contract removal and do not in
   const short = shortContextBootstrapPrompt({ plan, credential: { turn_token: token } });
   expect(short.text).not.toContain("codex_inline_request_json");
   expect(short.text).not.toContain("User request:");
+});
+
+// Both startup variants must fit with every conditional control branch enabled.
+test.each(["automatic", "zero-risk"] as const)("%s fixed startup and reuse entries fit with images and updates", mode => {
+  const credential = mode === "automatic" ? { turn_token: token } : { request_id: requestId };
+  const input = { plan: { ...plan, planId: `plan_${"d".repeat(32)}`, contextId: `context_${"e".repeat(32)}` },
+    credential, requiredMcpImages: 1, taskUpdateInitialState: {
+      acceptedRevision: Number.MAX_SAFE_INTEGER, acknowledgedRevision: Number.MAX_SAFE_INTEGER } };
+  for (const entry of [shortContextBootstrapPrompt(input), shortContextReuseBootstrapPrompt({ ...input,
+    reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v2", mode: "incremental" } }),
+    shortContextReuseBootstrapPrompt({ ...input, inlinePayload: {},
+      reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v2", mode: "full" } })]) {
+    expect(entry.fixedCodePoints).toBeLessThanOrEqual(3_000);
+    expect(entry.text).toContain("required_step.next_required_read");
+    expect(entry.text).toContain("overview once");
+    expect(entry.text).toContain("image");
+    expect(entry.text).toContain("ACK");
+    expect(entry.text).toContain("context-text-batch-v1");
+    if (mode === "zero-risk") expect(entry.text).toContain("Sent");
+  }
+});
+
+test("compaction uses batch bodies while keeping optional reads and submission protection", () => {
+  const text = compactionContextPrompt({ contextId: plan.contextId, compactionToken: "compaction-fixture", overview: {} }).join("\n");
+  expect(text).toContain("reads:[{read_ref,cursor?}]");
+  expect(text).toContain("context-text-batch-v1");
+  expect(text).toContain("remaining_reads");
+  expect(text).toContain("may submit without reading");
+  expect(text).toContain("full-coverage gate do not apply to compaction");
+  expect(text).toContain("Let in-flight reads finish before submitting");
+  expect(text).toContain("neither credential grants business-tool permission");
 });

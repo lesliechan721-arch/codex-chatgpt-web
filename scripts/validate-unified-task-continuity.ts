@@ -70,7 +70,7 @@ export function createContinuityFixture(entropy = randomBytes(24).toString("hex"
     "Before the gate result exists, use the actual context navigation entry to list the source and read exactly one opening page at offset zero. Do not search or read the tail yet.",
     `After that opening read has returned, invoke ${GATE_TOOL} exactly once with {}. Wait for its real outer result. Do not complete before that result.`,
     `When the gate result is in the history, use the current page's context navigation entry, search for ${TAIL_LABEL}, and read the source body with the search hit's read_cursor. The tail value is beyond the search snippet.`,
-    "Read the exact body block from context-text-read-v2. Do not derive the tail value from a label, digest, summary or previous answer.",
+    "Use reads:[{read_ref,cursor?}] and select each exact context-text-batch-v1 body through metadata.items[].body_content_index; continue remaining_reads on demand. Do not derive the tail value from a label, digest, summary or previous answer.",
     'Complete with JSON only: {"tailValue":"the exact value from the source body"}. If navigation or the source is unavailable, report the actual failure.',
   ].join("\n");
   return { text, tailValue, tailStart, tailEnd: tailStart + Buffer.byteLength(tailValue), task };
@@ -264,7 +264,7 @@ export async function runContinuityLive(options: ContinuityLiveOptions, hooks?: 
   let readListener: ((row: ReadEvidence) => void) | undefined;
   let actualWorkerPage: { lease: ContinuityLease; conversation: string; settlement: Promise<void> } | undefined;
   const physicalTargets = new Set<string>();
-  const readReceipts = new Map<string, ReadEvidence>();
+  const readReceipts = new Map<string, ReadEvidence[]>();
   const navigationReceipts = new Map<string, Row>();
   const controller = new AbortController();
   const interrupt = () => controller.abort(new Error("验收用户停止"));
@@ -355,20 +355,28 @@ export async function runContinuityLive(options: ContinuityLiveOptions, hooks?: 
     report.navigationCosts.push(navigationRow); navigationReceipts.set(reply.receiptId, navigationRow);
     if (args[0] !== "read") assert.ok(!JSON.stringify(reply.result).includes(fixture.tailValue), "目录或 search 泄漏了尾部答案");
     else if (!reply.result.isError) {
-      const { metadata, body } = parseContextTextReadResult(reply.result);
-      const exact = Buffer.from(fixture.text).subarray(metadata.range.start, metadata.range.end_exclusive).equals(Buffer.from(body));
-      const row: ReadEvidence = { phase, contextDigest: hash(metadata.context_id), start: metadata.range.start, end: metadata.range.end_exclusive,
-        bytes: Buffer.byteLength(body), exact, confirmed: false, tail: body.includes(fixture.tailValue) };
-      report.reads.push(row); readReceipts.set(reply.receiptId, row);
-      if (phase === "opening" && exact) assert.ok(metadata.range.start === 0 && metadata.range.end_exclusive < fixture.tailStart, "首轮提前读取尾部");
+      const { metadata, bodies } = parseContextTextReadResult(reply.result);
+      const rows = metadata.items.map((item, index) => {
+        const body = bodies[index]!;
+        const exact = Buffer.from(fixture.text).subarray(item.range.start, item.range.end_exclusive).equals(Buffer.from(body));
+        const row: ReadEvidence = { phase, contextDigest: hash(metadata.context_id), start: item.range.start, end: item.range.end_exclusive,
+          bytes: Buffer.byteLength(body), exact, confirmed: false, tail: body.includes(fixture.tailValue) };
+        if (phase === "opening" && exact) assert.ok(item.range.start === 0 && item.range.end_exclusive < fixture.tailStart, "首轮提前读取尾部");
+        return row;
+      });
+      report.reads.push(...rows); readReceipts.set(reply.receiptId, rows);
     }
     save(); return reply;
   };
   ContextScope.prototype.finish = function (...args) {
-    const result = originalFinish.apply(this, args), row = readReceipts.get(args[0]);
+    const result = originalFinish.apply(this, args), rows = readReceipts.get(args[0]);
     const navigation = navigationReceipts.get(args[0]);
     if (navigation && result) navigation.transportConfirmed = true;
-    if (row && !row.confirmed && result?.method === "read" && result.textRead) { row.confirmed = true; save(); readListener?.(row); }
+    if (rows && result?.method === "read" && result.textRead) {
+      for (const row of rows) {
+        if (!row.confirmed) { row.confirmed = true; save(); readListener?.(row); }
+      }
+    }
     return result;
   };
   ChatGptBrowserWorker.prototype.run = function (turn: BrowserTurn) {

@@ -1,11 +1,11 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { BrokerToolResult } from "./turn-broker";
-import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
+import { assertContextNavigationBudget, CONTEXT_CREDENTIAL_ARGUMENT_BYTES, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
 import { ContextSnapshot, deterministicContextJson } from "./context-snapshot";
-import { createContextTextReadResult } from "./context-text-result";
+import { createContextTextReadResult, parseContextTextReadResult, type ContextTextReadItem, type ContextTextReadMetadata } from "./context-text-result";
 import type { ContextReusePlan } from "./context-reuse-types";
 import type { ContextDelivery, ContextFilter, ContextListArgs, ContextLiveOverview, ContextPurpose, ContextReadArgs,
-  ContextRemainingBudget, ContextSearchArgs, ContextTarget, ContextBootstrapControl } from "./context-types";
+  ContextRemainingBudget, ContextSearchArgs, ContextTarget, ContextBootstrapControl, ContextRequiredTextBatch, ContextReadItem, ContextRequiredRead } from "./context-types";
 
 export type ContextErrorCode = "CONTEXT_EXPIRED" | "INVALID_ARGUMENT" | "INVALID_REFERENCE" | "INVALID_CURSOR"
   | "IMAGE_UNAVAILABLE" | "UNSUPPORTED_TYPE" | "BUDGET_EXCEEDED" | "PROCESSING_BUDGET_EXCEEDED";
@@ -16,10 +16,12 @@ export class ContextNavigationStoppedError extends Error {
   readonly code = "CONTEXT_NAVIGATION_STOPPED";
   constructor() { super("Context navigation has stopped"); this.name = "ContextNavigationStoppedError"; }
 }
+interface ValidatedRead { target: ContextTarget; input: ContextReadItem; bytes: Buffer; start: number }
 interface Cursor { v: 1; b: string; k: "entries" | "search" | "read"; q: string; t: string | null; n: number }
 export interface ContextNavigationUsage {
   wire_bytes: number; text_tokens: number; visual_token_reserve: number; image_reads: number; image_bytes: number; processing_ms: number;
   error_responses: number; navigation_stopped: boolean;
+  read_calls: number; read_requested_items: number; read_returned_items: number; budget_hits: Record<string, number>;
 }
 export interface ContextNavigatorOptions {
   scopeId: string;
@@ -27,9 +29,9 @@ export interface ContextNavigatorOptions {
   purpose: ContextPurpose;
   deliveryByTarget?: Readonly<Record<string, ContextDelivery>>;
   limits?: ContextLimitOverrides;
-  bootstrap?: { planId: string; manifestDigest: string; reuse?: ContextReusePlan };
-  /** The runtime may credit only this target's still-undelivered reserve when reading it. */
-  remainingBudget?: (target?: ContextTarget, result?: BrokerToolResult) => ContextRemainingBudget;
+  bootstrap?: { planId: string; manifestDigest: string; reuse?: ContextReusePlan; requiredTextBatches?: readonly ContextRequiredTextBatch[] };
+  /** Runtime credits only complete fixed units covered by this result. */
+  remainingBudget?: (targets?: readonly ContextTarget[], result?: BrokerToolResult) => ContextRemainingBudget;
 }
 
 const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -53,7 +55,8 @@ export class ContextNavigator {
   readonly #bootstrap?: ContextNavigatorOptions["bootstrap"];
   readonly #secret = randomBytes(32);
   readonly #binding: string;
-  readonly #usage: ContextNavigationUsage = { wire_bytes: 0, text_tokens: 0, visual_token_reserve: 0, image_reads: 0, image_bytes: 0, processing_ms: 0, error_responses: 0, navigation_stopped: false };
+  readonly #usage: ContextNavigationUsage = { wire_bytes: 0, text_tokens: 0, visual_token_reserve: 0, image_reads: 0, image_bytes: 0, processing_ms: 0, error_responses: 0, navigation_stopped: false, read_calls: 0, read_requested_items: 0, read_returned_items: 0, budget_hits: {} };
+  #activeBudgetHits?: Set<string>;
   #admissionChecked = false;
   #retired = false;
 
@@ -76,15 +79,15 @@ export class ContextNavigator {
   }
 
   retire(): void { this.#retired = true; }
-  usage(): Readonly<ContextNavigationUsage> { return Object.freeze({ ...this.#usage }); }
+  usage(): Readonly<ContextNavigationUsage> { return Object.freeze({ ...this.#usage, budget_hits: Object.freeze({ ...this.#usage.budget_hits }) }); }
 
   list(args: ContextListArgs | unknown, liveOverview?: ContextLiveOverview, control?: ContextBootstrapControl): BrokerToolResult {
     return this.#list(args, liveOverview, false, control);
   }
   /** Trusted directory measurement: pack pages using future cursor token bounds. */
-  preflightList(args: ContextListArgs, liveOverview?: ContextLiveOverview, control?: ContextBootstrapControl): BrokerToolResult { return this.#list(args, liveOverview, true, control); }
+  preflightList(args: ContextListArgs, liveOverview?: ContextLiveOverview, control?: ContextBootstrapControl, nextRequiredRead?: ContextRequiredRead | null): BrokerToolResult { return this.#list(args, liveOverview, true, control, nextRequiredRead); }
 
-  #list(args: ContextListArgs | unknown, liveOverview?: ContextLiveOverview, preflight = false, control: ContextBootstrapControl = {}): BrokerToolResult {
+  #list(args: ContextListArgs | unknown, liveOverview?: ContextLiveOverview, preflight = false, control: ContextBootstrapControl = {}, nextRequiredRead?: ContextRequiredRead | null): BrokerToolResult {
     return this.#run("list", () => {
       const input = this.#validate(args, ["context_id", "view", "cursor", "required_only", ...filterKeys]);
       if (input.view !== "overview" && input.view !== "entries") throw new NavigationError("INVALID_ARGUMENT");
@@ -112,10 +115,10 @@ export class ContextNavigator {
           }
           const readState = control.read_state ?? "readable";
           if (!["readable", "waiting", "retired", "failed"].includes(readState)) throw new NavigationError("INVALID_ARGUMENT");
-          Object.assign(body, { startup_protocol: "context-bootstrap-v1", manifest_version: 1,
+          Object.assign(body, { startup_protocol: "context-bootstrap-v1", manifest_version: 3, text_read_format: "context-text-batch-v1", required_discovery: "batch-metadata",
             plan_id: this.#bootstrap.planId, manifest_digest: this.#bootstrap.manifestDigest, read_state: readState });
           if (this.#bootstrap.reuse) Object.assign(body, {
-            manifest_version: 2, protocol: this.#bootstrap.reuse.protocol,
+            protocol: this.#bootstrap.reuse.protocol,
             payload_format: this.#bootstrap.reuse.payload_format, mode: this.#bootstrap.reuse.mode,
             reuse_ready: liveOverview?.reuse_ready ?? !this.#bootstrap.reuse.dependency,
           });
@@ -129,33 +132,21 @@ export class ContextNavigator {
           if (preflight && readState === "readable") {
             const texts = required.filter(target => target.kind !== "image");
             const images = required.length - texts.length;
-            body.live = { context_ready: false, text_ready: false, images_ready: false,
+            body.live = { context_ready: false, reuse_ready: false, text_ready: false, images_ready: false,
               required_texts: texts.length, delivered_texts: texts.length, required_images: images, delivered_images: images };
-            const reads = required.filter(target => target.read_ref && target.kind !== "image").map(target => ({
-              tool: "codex_context_read", arguments: this.readArgsAt(target.target_id, target.utf8_bytes!) }));
-            reads.sort((a, b) => JSON.stringify(b).length - JSON.stringify(a).length);
-            if (reads.length) body.next_required_read = reads[0];
+            if (nextRequiredRead !== undefined) {
+              body.next_required_read = nextRequiredRead;
+            } else {
+              const reads = (this.#bootstrap.requiredTextBatches ?? []).map((_, index) => ({
+                tool: "codex_context_read", arguments: this.requiredReadArgs(index) }));
+              for (const target of required.filter(target => target.kind === "image" && this.#route(target) === "mcp")) {
+                reads.push({ tool: "codex_context_read", arguments: { context_id: this.#snapshot.context_id, reads: [{ read_ref: target.read_ref! }] } });
+              }
+              reads.sort((a, b) => JSON.stringify(b).length - JSON.stringify(a).length);
+              if (reads.length) body.next_required_read = reads[0];
+            }
           }
-          const query = hash(deterministicContextJson({ required_only: true }));
-          const selected: Record<string, unknown>[] = [];
-          const make = (end: number) => {
-            const cursor = end < required.length ? this.#encode("entries", query, null, end) : null;
-            // A header plus two signed cursors can exceed the list ceiling. When
-            // no entry fits, start the regular required-only directory directly.
-            // Its first page needs no cursor and always makes ordinary progress.
-            return end === 0 && cursor ? response({ ...body, required_targets: { entries: [], has_more: true },
-              next_required_list: { tool: "codex_context_list", arguments: { context_id: this.#snapshot.context_id,
-                view: "entries", required_only: true } } })
-              : response({ ...body, required_targets: { entries: [...selected], has_more: cursor !== null, next_cursor: cursor } });
-          };
-          let result = make(0);
-          for (let index = 0; index < required.length && selected.length < this.#limits.listEntries; index++) {
-            const entry = this.#bootstrapEntry(required[index]!);
-            selected.push(entry);
-            const candidate = make(index + 1);
-            if (!this.#fits(this.#bootstrapEnvelope(candidate), "list", false, preflight)) { selected.pop(); result = make(index); break; }
-            result = candidate;
-          }
+          const result = response(body);
           return { result, meteredResult: this.#bootstrapEnvelope(result) };
         }
         if (this.#purpose === "compaction") body.remaining_budget = this.#budgetHint();
@@ -178,18 +169,19 @@ export class ContextNavigator {
         if (!this.#fits(candidate, "list", false, preflight)) break;
         selected.push(entry); result = candidate;
       }
+      if (start + selected.length < matches.length && selected.length === this.#limits.listEntries) this.#hit("list_entries");
       if (start < matches.length && selected.length === 0) throw new NavigationError("BUDGET_EXCEEDED");
       return { result };
     }, preflight);
   }
 
-  read(args: ContextReadArgs | unknown, liveOverview?: ContextLiveOverview): BrokerToolResult {
-    return this.#read(args, liveOverview);
+  read(args: ContextReadArgs | unknown): BrokerToolResult {
+    return this.#read(args);
   }
   /** Trusted preparation only: validates one real page using the same rendering and
    * per-response limits, without charging the cumulative cost of reading every source.
    * The caller owns the bounded total preparation deadline and event-loop yielding. */
-  preflightRead(args: ContextReadArgs): BrokerToolResult { return this.#read(args, undefined, true); }
+  preflightRead(args: ContextReadArgs): BrokerToolResult { return this.#read(args, true); }
 
   /** Trusted coverage navigation. This does not read or mark a byte delivered. */
   readArgsAt(targetId: string, start: number): ContextReadArgs {
@@ -197,8 +189,8 @@ export class ContextNavigator {
     const text = target?.read_ref ? this.#snapshot.getText(target.read_ref) : undefined;
     if (!target?.read_ref || target.kind === "image" || text === undefined || !Number.isSafeInteger(start)
       || start < 0 || start > Buffer.byteLength(text) || !boundary(Buffer.from(text), start)) throw new Error("Invalid fixed text offset");
-    return { context_id: this.#snapshot.context_id, read_ref: target.read_ref,
-      ...(start ? { cursor: this.#encode("read", this.#readQuery(target.read_ref), target.target_id, start) } : {}) };
+    return { context_id: this.#snapshot.context_id, reads: [{ read_ref: target.read_ref,
+      ...(start ? { cursor: this.#encode("read", this.#readQuery(target.read_ref), target.target_id, start) } : {}) }] };
   }
 
   /** Trusted preparation only: test the smallest unfiltered directory page for one
@@ -212,68 +204,163 @@ export class ContextNavigator {
     }, true);
   }
 
-  #read(args: ContextReadArgs | unknown, liveOverview?: ContextLiveOverview, preflight = false): BrokerToolResult {
-    return this.#run("read", () => {
-      const input = this.#validate(args, ["context_id", "read_ref", "cursor"]);
-      if (typeof input.read_ref !== "string" || !input.read_ref) throw new NavigationError("INVALID_ARGUMENT");
-      const target = this.#snapshot.getTargetByReadRef(input.read_ref);
+  /** Materialize a fixed request in this scope; persisted plans contain offsets only. */
+  requiredReadArgs(index: number): ContextReadArgs {
+    const batch = this.#bootstrap?.requiredTextBatches?.[index];
+    if (!Number.isSafeInteger(index) || index < 0 || !batch) throw new Error("Invalid required batch index");
+    return { context_id: this.#snapshot.context_id, reads: batch.reads.map(read => this.readArgsAt(read.target_id, read.start).reads[0]!) };
+  }
+
+  /** Complete finite planning uses the runtime packer and a bounded next-request allowance. */
+  preflightRequiredTextBatches(): ContextRequiredTextBatch[] {
+    const required = this.#snapshot.targets.filter(target => target.kind !== "image" && this.#required(target));
+    if (!required.length) return [];
+    for (let width = Math.min(8, required.length); width > 0; width--) {
+      try {
+        const batches: ContextRequiredTextBatch[] = [];
+        let position = 0, start = 0;
+        // Bound each possible successor item independently. Extra wrapper copies make
+        // this additive bound safe for any subset, order, offset, or scope signature.
+        let itemTokens = 0, itemBytes = 0;
+        for (const target of required) {
+          const read = { read_ref: target.read_ref!, cursor: this.#encode("read", this.#readQuery(target.read_ref!), target.target_id, Number.MAX_SAFE_INTEGER) };
+          const cost = this.#costBound(response({ read }));
+          itemTokens = Math.max(itemTokens, cost.total_tokens); itemBytes = Math.max(itemBytes, cost.wire_bytes);
+        }
+        const wrapper = this.#costBound(response({ tool: "codex_context_read", arguments: { context_id: this.#snapshot.context_id, reads: [] } }));
+        const allowance = { wire_bytes: width * itemBytes + wrapper.wire_bytes, tokens: width * itemTokens + wrapper.total_tokens };
+        while (position < required.length) {
+          const reads = required.slice(position, position + width).map((target, index) => ({ target_id: target.target_id, start: index === 0 ? start : 0 }));
+          const args = { context_id: this.#snapshot.context_id, reads: reads.map(read => this.readArgsAt(read.target_id, read.start).reads[0]!) };
+          const validated = this.#validateReads(args);
+          const step = { plan_id: this.#bootstrap?.planId ?? "context-preflight", index: Number.MAX_SAFE_INTEGER, next_required_read: null };
+          const result = this.#packText(validated, step, allowance);
+          const { metadata } = parseContextTextReadResult(result);
+          const cost = this.#costBound(result);
+          batches.push({ reads, ranges: metadata.items.map(item => ({ target_id: item.source.target_id, ...item.range })),
+            tokens: cost.total_tokens + allowance.tokens, wire_bytes: cost.wire_bytes + allowance.wire_bytes });
+          for (const item of metadata.items) {
+            if (item.has_more) { start = item.range.end_exclusive; break; }
+            position++; start = 0;
+          }
+          if (performance.now() - this.#planningStarted > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
+        }
+        return batches;
+      } catch (error) {
+        if (!(error instanceof NavigationError) || error.code !== "BUDGET_EXCEEDED" || width === 1) throw error;
+      }
+    }
+    throw new NavigationError("BUDGET_EXCEEDED");
+  }
+  readonly #planningStarted = performance.now();
+
+  #validateReads(args: unknown): ValidatedRead[] {
+    const input = this.#validate(args, ["context_id", "reads"]);
+    if (!Array.isArray(input.reads) || input.reads.length < 1 || input.reads.length > 8) throw new NavigationError("INVALID_ARGUMENT");
+    if (Buffer.byteLength(JSON.stringify(input)) + CONTEXT_CREDENTIAL_ARGUMENT_BYTES > this.#limits.maxArgumentBytes) { this.#hit("argument_bytes"); throw new NavigationError("INVALID_ARGUMENT"); }
+    const seen = new Set<string>();
+    const validated = input.reads.map(read => {
+      if (!obj(read) || Object.keys(read).some(key => !["read_ref", "cursor"].includes(key))
+        || typeof read.read_ref !== "string" || !read.read_ref || read.read_ref.length > 256) throw new NavigationError("INVALID_ARGUMENT");
+      if (read.cursor !== undefined && (typeof read.cursor !== "string" || !read.cursor || read.cursor.length > 2048)) throw new NavigationError("INVALID_CURSOR");
+      const target = this.#snapshot.getTargetByReadRef(read.read_ref);
       if (!target) throw new NavigationError("INVALID_REFERENCE");
+      if (seen.has(target.target_id)) throw new NavigationError("INVALID_ARGUMENT");
+      seen.add(target.target_id);
       if (target.kind === "image") {
-        if (input.cursor !== undefined) throw new NavigationError("INVALID_CURSOR");
-        const route = this.#route(target);
-        if (route !== "mcp") throw new NavigationError("IMAGE_UNAVAILABLE");
+        if (read.cursor !== undefined) throw new NavigationError("INVALID_CURSOR");
+        return { target, input: read as unknown as ContextReadItem, bytes: Buffer.alloc(0), start: 0 };
+      }
+      const text = this.#snapshot.getText(target.read_ref!);
+      if (text === undefined) throw new NavigationError("INVALID_REFERENCE");
+      const bytes = Buffer.from(text, "utf8");
+      const start = read.cursor === undefined ? 0 : this.#decode(read.cursor, "read", this.#readQuery(target.read_ref!), target.target_id).n;
+      if (start > bytes.length || !boundary(bytes, start)) throw new NavigationError("INVALID_CURSOR");
+      return { target, input: read as unknown as ContextReadItem, bytes, start };
+    });
+    if (validated.length > 1 && validated.some(item => item.target.kind === "image")) throw new NavigationError("UNSUPPORTED_TYPE");
+    return validated;
+  }
+
+  #packText(reads: ValidatedRead[], step?: ContextTextReadMetadata["required_step"],
+    allowance = { tokens: 0, wire_bytes: 0 }, fixedRanges?: ContextRequiredTextBatch["ranges"]): BrokerToolResult {
+    const items: ContextTextReadItem[] = [], bodies: string[] = [];
+    const hint = this.#purpose === "compaction" ? this.#budgetHint() : undefined;
+    const make = (candidateItems: ContextTextReadItem[], candidateBodies: string[], conservative: boolean): BrokerToolResult => {
+      const last = candidateItems[candidateItems.length - 1]!;
+      const remaining = [ ...(last.has_more ? [{ read_ref: last.read_ref, cursor: last.next_cursor! }] : []),
+        ...reads.slice(candidateItems.length).map(read => ({ ...read.input })) ];
+      return createContextTextReadResult({ context_id: this.#snapshot.context_id, purpose: this.#purpose, items: candidateItems,
+        remaining_reads: remaining, ...(step ? { required_step: step } : {}), ...(hint ? { remaining_budget: conservative
+          ? { tokens: Number.MAX_SAFE_INTEGER, wire_bytes: Number.MAX_SAFE_INTEGER, reserved_tokens: Number.MAX_SAFE_INTEGER,
+            reserved_wire_bytes: Number.MAX_SAFE_INTEGER, stop_hint: "Stop reading before consuming the summary and submission reserve" } : hint } : {}) }, candidateBodies);
+    };
+    const fits = (result: BrokerToolResult): boolean => {
+      const cost = this.#costBound(result);
+      if (cost.wire_bytes + allowance.wire_bytes > this.#limits.readBytes) this.#hit("read_bytes");
+      if (cost.text_tokens + allowance.tokens > this.#limits.readTokens) this.#hit("read_tokens");
+      return cost.wire_bytes + allowance.wire_bytes <= this.#limits.readBytes && cost.text_tokens + allowance.tokens <= this.#limits.readTokens;
+    };
+    for (let index = 0; index < reads.length; index++) {
+      const { target, bytes, start } = reads[index]!;
+      const item = (end: number): ContextTextReadItem => ({ request_index: index, read_ref: target.read_ref!, source: this.#source(target),
+        kind: target.kind as ContextTextReadItem["kind"], locator: target.locator, content_digest: target.content_digest!, required: this.#required(target),
+        encoding: target.encoding!, source_completeness: target.source_completeness, utf8_bytes: bytes.length, range: { start, end_exclusive: end },
+        body_content_index: index + 1, has_more: end < bytes.length,
+        next_cursor: end < bytes.length ? this.#encode("read", this.#readQuery(target.read_ref!), target.target_id, end) : null });
+      const candidate = (end: number) => make([...items, item(end)], [...bodies, bytes.subarray(start, end).toString("utf8")], true);
+      if (fixedRanges) {
+        const range = fixedRanges[index];
+        if (!range) break;
+        if (range.target_id !== target.target_id || range.start !== start || range.end_exclusive > bytes.length
+          || range.end_exclusive < start || !boundary(bytes, range.end_exclusive) || range.end_exclusive === start && start !== bytes.length) throw new NavigationError("INVALID_ARGUMENT");
+        items.push(item(range.end_exclusive)); bodies.push(bytes.subarray(start, range.end_exclusive).toString("utf8"));
+        if (range.end_exclusive < bytes.length) break;
+        continue;
+      }
+      // EOF/empty terminal wrappers have no cursor and must be tried first.
+      if (bytes.length - start <= this.#limits.readBytes && fits(candidate(bytes.length))) { items.push(item(bytes.length)); bodies.push(bytes.subarray(start).toString("utf8")); continue; }
+      let low = start, high = Math.min(bytes.length - 1, start + this.#limits.readBytes);
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2), end = floorBoundary(bytes, middle);
+        if (end <= low) { high = middle - 1; continue; }
+        if (fits(candidate(end))) low = end; else high = middle - 1;
+      }
+      let end = floorBoundary(bytes, low), next = end + 1;
+      while (next < bytes.length && !boundary(bytes, next)) next++;
+      if (next < bytes.length && fits(candidate(next))) end = next;
+      if (end > start) { items.push(item(end)); bodies.push(bytes.subarray(start, end).toString("utf8")); }
+      break;
+    }
+    if (!items.length) throw new NavigationError("BUDGET_EXCEEDED");
+    const conservative = make(items, bodies, true);
+    if (!fits(conservative)) throw new NavigationError("BUDGET_EXCEEDED");
+    return make(items, bodies, false);
+  }
+
+  #read(args: ContextReadArgs | unknown, preflight = false): BrokerToolResult {
+    return this.#run("read", () => {
+      const reads = this.#validateReads(args);
+      const target = reads[0]!.target;
+      if (target.kind === "image") {
+        if (this.#route(target) !== "mcp") throw new NavigationError("IMAGE_UNAVAILABLE");
         const image = this.#snapshot.getImage(target.read_ref!);
         if (!image) throw new NavigationError("IMAGE_UNAVAILABLE");
         if (image.bytes.length > this.#limits.maxImageBytes) throw new NavigationError("BUDGET_EXCEEDED");
         const body = { context_id: this.#snapshot.context_id, purpose: this.#purpose, read_ref: target.read_ref,
           source: this.#source(target), mime_type: image.mime_type, image_bytes: image.bytes.length, content_digest: target.content_digest,
           visual_token_reserve: image.visual_token_reserve,
-          ...(this.#purpose === "compaction" ? { remaining_budget: this.#budgetHint(target) } : {}) };
+          ...(this.#purpose === "compaction" ? { remaining_budget: this.#budgetHint([target]) } : {}) };
         return { result: response(body, { type: "image", mimeType: image.mime_type, data: Buffer.from(image.bytes).toString("base64") }),
-          target, visual: image.visual_token_reserve, imageBytes: image.bytes.length };
+          targets: [target], requestedItems: reads.length, returnedItems: 1, visual: image.visual_token_reserve, imageBytes: image.bytes.length };
       }
-      const text = this.#snapshot.getText(target.read_ref!);
-      if (text === undefined) throw new NavigationError("INVALID_REFERENCE");
-      const bytes = Buffer.from(text, "utf8");
-      const q = this.#readQuery(target.read_ref!);
-      const start = input.cursor === undefined ? 0 : this.#decode(input.cursor, "read", q, target.target_id).n;
-      if (start > bytes.length || !boundary(bytes, start)) throw new NavigationError("INVALID_CURSOR");
-      // Keep the core page fixed when remaining budgets change. This allowance is measured
-      // with maximal safe integers, covering the optional bounded compaction hint as well.
-      const hint = this.#purpose === "compaction" ? this.#budgetHint() : undefined;
-      const make = (end: number, conservative = false): BrokerToolResult => createContextTextReadResult({
-        context_id: this.#snapshot.context_id, purpose: this.#purpose, read_ref: target.read_ref!, source: this.#source(target),
-        encoding: target.encoding!, source_completeness: target.source_completeness, utf8_bytes: bytes.length,
-        range: { start, end_exclusive: end },
-        has_more: end < bytes.length, next_cursor: end < bytes.length ? this.#encode("read", q, target.target_id, end) : null,
-        ...(hint ? { remaining_budget: conservative ? { tokens: Number.MAX_SAFE_INTEGER, wire_bytes: Number.MAX_SAFE_INTEGER, reserved_tokens: Number.MAX_SAFE_INTEGER, reserved_wire_bytes: Number.MAX_SAFE_INTEGER, stop_hint: "Stop reading before consuming the summary and submission reserve" } : hint } : {}),
-      }, bytes.subarray(start, end).toString("utf8"));
-      void liveOverview; // Live image readiness belongs only to overview/runtime gate errors.
-      if (start === bytes.length) {
-        // EOF still returns a metadata block and an empty body block. Check that
-        // complete v2 result against the same page limits as non-empty pages.
-        if (!this.#fits(make(start, true), "read", false, !!this.#bootstrap)) throw new NavigationError("BUDGET_EXCEEDED");
-        return { result: make(start), target };
-      }
-      // A terminal page has no cursor and can fit even when every nonterminal page
-      // exceeds the metadata ceiling. Test it before the monotone partial-page search.
-      if (bytes.length - start <= this.#limits.readBytes && this.#fits(make(bytes.length, true), "read", false, !!this.#bootstrap)) return { result: make(bytes.length), target };
-      let low = start, high = Math.min(bytes.length, start + this.#limits.readBytes);
-      while (low < high) {
-        const middle = Math.ceil((low + high) / 2);
-        const end = floorBoundary(bytes, middle);
-        if (end <= low) { high = middle - 1; continue; }
-        if (this.#fits(make(end, true), "read", false, !!this.#bootstrap)) low = end;
-        else high = middle - 1;
-      }
-      let end = floorBoundary(bytes, low);
-      // Binary search can land in a continuation byte. Probe the next whole scalar, so a
-      // four-byte character can always advance when the smallest valid page fits.
-      let next = end + 1; while (next < bytes.length && !boundary(bytes, next)) next++;
-      if (next <= bytes.length && this.#fits(make(next, true), "read", false, !!this.#bootstrap)) end = next;
-      if (end <= start) throw new NavigationError("BUDGET_EXCEEDED");
-      return { result: make(end), target };
-    }, preflight);
+      const batches = this.#bootstrap?.requiredTextBatches;
+      const index = batches?.findIndex(batch => batch.reads.length === reads.length && batch.reads.every((read, i) => read.target_id === reads[i]!.target.target_id && read.start === reads[i]!.start)) ?? -1;
+      const step = index < 0 ? undefined : { plan_id: this.#bootstrap!.planId, index,
+        next_required_read: index + 1 < batches!.length ? { tool: "codex_context_read" as const, arguments: this.requiredReadArgs(index + 1) } : null };
+      const result = this.#packText(reads, step, undefined, index < 0 ? undefined : batches![index]!.ranges);
+      return { result, targets: reads.map(read => read.target), requestedItems: reads.length, returnedItems: (result.structuredContent as unknown as ContextTextReadMetadata).items.length };
+    }, preflight, obj(args) && Array.isArray(args.reads) ? args.reads.length : 0);
   }
 
   search(args: ContextSearchArgs | unknown): BrokerToolResult {
@@ -344,8 +431,9 @@ export class ContextNavigator {
     });
   }
 
-  #run(tool: "list" | "read" | "search", action: () => { result: BrokerToolResult; meteredResult?: BrokerToolResult; target?: ContextTarget; visual?: number; imageBytes?: number }, preflight = false): BrokerToolResult {
+  #run(tool: "list" | "read" | "search", action: () => { result: BrokerToolResult; meteredResult?: BrokerToolResult; targets?: readonly ContextTarget[]; requestedItems?: number; returnedItems?: number; visual?: number; imageBytes?: number }, preflight = false, requestedReadItems = 0): BrokerToolResult {
     const started = performance.now();
+    this.#activeBudgetHits = preflight ? undefined : new Set();
     if (this.#usage.navigation_stopped) throw new ContextNavigationStoppedError();
     // A standalone caller receives the same fail-closed admission as the Broker.
     // Construction itself never invokes a callback which may refer to this instance.
@@ -356,11 +444,11 @@ export class ContextNavigator {
     }
     let result: BrokerToolResult;
     let meteredResult: BrokerToolResult | undefined;
-    let visual = 0, imageBytes = 0;
+    let visual = 0, imageBytes = 0, requestedItems = requestedReadItems, returnedItems = 0;
     try {
       if (this.#retired) throw new NavigationError("CONTEXT_EXPIRED");
       if (this.#usage.processing_ms >= this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
-      const value = action(); result = value.result; meteredResult = value.meteredResult; visual = value.visual ?? 0; imageBytes = value.imageBytes ?? 0;
+      const value = action(); result = value.result; meteredResult = value.meteredResult; visual = value.visual ?? 0; imageBytes = value.imageBytes ?? 0; requestedItems = value.requestedItems ?? requestedReadItems; returnedItems = value.returnedItems ?? 0;
       const image = imageBytes > 0;
       if (!this.#fits(meteredResult ?? result, tool, image, preflight && tool === "list")) throw new NavigationError("BUDGET_EXCEEDED");
       if (preflight) {
@@ -368,21 +456,26 @@ export class ContextNavigator {
         return result;
       }
       const cost = this.#cost(meteredResult ?? result, visual);
-      const remaining = this.#remaining?.(value.target, result);
+      const remaining = this.#remaining?.(value.targets, result);
       if (remaining) this.#validateRemaining(remaining);
       const errors = this.#errorReserve();
-      if (this.#usage.wire_bytes + cost.wire_bytes + errors.wire_bytes > this.#limits.maxTotalWireBytes
-        || this.#usage.text_tokens + this.#usage.visual_token_reserve + cost.total_tokens + errors.tokens > this.#limits.maxTotalTokens
+      const exceedsWireBudget = this.#usage.wire_bytes + cost.wire_bytes + errors.wire_bytes > this.#limits.maxTotalWireBytes
+        || remaining && cost.wire_bytes + errors.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0);
+      const exceedsTokenBudget = this.#usage.text_tokens + this.#usage.visual_token_reserve + cost.total_tokens + errors.tokens > this.#limits.maxTotalTokens
+        || remaining && cost.total_tokens + errors.tokens > remaining.tokens - (remaining.reserved_tokens ?? 0);
+      if (exceedsWireBudget) this.#hit("total_wire");
+      if (exceedsTokenBudget) this.#hit("total_tokens");
+      if (exceedsWireBudget || exceedsTokenBudget
         || image && (this.#usage.image_reads >= this.#limits.maxImageReads || this.#usage.image_bytes + imageBytes > this.#limits.maxTotalImageBytes)
         || image && remaining && (remaining.image_reads !== undefined && remaining.image_reads - (remaining.reserved_image_reads ?? 0) < 1
-          || remaining.image_bytes !== undefined && imageBytes > remaining.image_bytes - (remaining.reserved_image_bytes ?? 0))
-        || remaining && (cost.total_tokens + errors.tokens > remaining.tokens - (remaining.reserved_tokens ?? 0)
-          || cost.wire_bytes + errors.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0))) throw new NavigationError("BUDGET_EXCEEDED");
+          || remaining.image_bytes !== undefined && imageBytes > remaining.image_bytes - (remaining.reserved_image_bytes ?? 0))) throw new NavigationError("BUDGET_EXCEEDED");
       if (this.#retired) throw new NavigationError("CONTEXT_EXPIRED");
       if (performance.now() - started > this.#limits.callProcessingMs || this.#usage.processing_ms + performance.now() - started > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
     } catch (error) {
       if (error instanceof ContextNavigationStoppedError) throw error;
       const code = error instanceof NavigationError ? error.code : "INVALID_ARGUMENT";
+      if (code === "PROCESSING_BUDGET_EXCEEDED") this.#hit("processing");
+      returnedItems = 0;
       const last = !preflight && this.#usage.error_responses + 1 >= this.#limits.maxErrorResponses;
       result = response({ error: { code, ...(last ? { navigation_stopped: true, stop_hint: "Stop context navigation" } : {}) } }); result.isError = true; visual = 0; imageBytes = 0;
       meteredResult = undefined;
@@ -405,8 +498,12 @@ export class ContextNavigator {
     this.#usage.visual_token_reserve += visual; this.#usage.image_bytes += imageBytes;
     if (imageBytes > 0) this.#usage.image_reads++;
     this.#usage.processing_ms += performance.now() - started;
+    if (tool === "read") { this.#usage.read_calls++; this.#usage.read_requested_items += requestedItems; this.#usage.read_returned_items += returnedItems; }
+    for (const name of this.#activeBudgetHits ?? []) this.#usage.budget_hits[name] = (this.#usage.budget_hits[name] ?? 0) + 1;
+    this.#activeBudgetHits = undefined;
     return result;
   }
+  #costBound(result: BrokerToolResult) { return measureContextResponse(result, { wireReserveBytes: this.#limits.wireReserveBytes, tokenReserve: this.#limits.tokenReserve, boundCursorTokens: !!this.#bootstrap }); }
   #cost(result: BrokerToolResult, visualTokens = 0) { return measureContextResponse(result, {
     wireReserveBytes: this.#limits.wireReserveBytes, tokenReserve: this.#limits.tokenReserve, visualTokens }); }
   #fits(result: BrokerToolResult, tool: "list" | "read" | "search", image = false, boundCursorTokens = false): boolean {
@@ -414,10 +511,14 @@ export class ContextNavigator {
       tokenReserve: this.#limits.tokenReserve, boundCursorTokens });
     const bytes = image ? this.#limits.imageWireBytes : tool === "list" ? this.#limits.listBytes : tool === "search" ? this.#limits.searchBytes : this.#limits.readBytes;
     const tokens = image ? this.#limits.imageMetadataTokens : tool === "list" ? this.#limits.listTokens : tool === "search" ? this.#limits.searchTokens : this.#limits.readTokens;
+    if (cost.wire_bytes > bytes) this.#hit(`${tool}_bytes`);
+    if (cost.text_tokens > tokens) this.#hit(`${tool}_tokens`);
     return cost.wire_bytes <= bytes && cost.text_tokens <= tokens;
   }
+  #hit(name: string): void { this.#activeBudgetHits?.add(name); }
   #validate(value: unknown, allowed: string[]): Record<string, unknown> {
-    if (!obj(value) || Object.keys(value).some(k => !allowed.includes(k)) || Buffer.byteLength(JSON.stringify(value)) > this.#limits.maxArgumentBytes) throw new NavigationError("INVALID_ARGUMENT");
+    if (!obj(value) || Object.keys(value).some(k => !allowed.includes(k))) throw new NavigationError("INVALID_ARGUMENT");
+    if (Buffer.byteLength(JSON.stringify(value)) > this.#limits.maxArgumentBytes) { this.#hit("argument_bytes"); throw new NavigationError("INVALID_ARGUMENT"); }
     if (typeof value.context_id !== "string" || !value.context_id || value.context_id.length > 1024) throw new NavigationError("INVALID_ARGUMENT");
     if (value.context_id !== this.#snapshot.context_id) throw new NavigationError("CONTEXT_EXPIRED");
     if (value.cursor !== undefined && (typeof value.cursor !== "string" || !value.cursor || value.cursor.length > 2048)) throw new NavigationError("INVALID_CURSOR");
@@ -463,14 +564,6 @@ export class ContextNavigator {
   #bootstrapEnvelope(result: BrokerToolResult): BrokerToolResult {
     return response({ started: true, duplicate: false, context_bootstrap: result.structuredContent });
   }
-  #bootstrapEntry(target: ContextTarget): Record<string, unknown> {
-    const delivery = this.#delivery[target.target_id]!;
-    return { ...this.#source(target), kind: target.kind, source_completeness: target.source_completeness,
-      read_ref: target.kind === "image" && this.#route(target) !== "mcp" ? null : target.read_ref,
-      utf8_bytes: target.utf8_bytes, content_digest: target.content_digest, delivery: delivery.delivery,
-      ...(target.kind === "image" ? { media_route: this.#route(target), mime_type: target.mime_type, image_bytes: target.image_bytes }
-        : { encoding: target.encoding }) };
-  }
   #entry(target: ContextTarget): Record<string, unknown> {
     const delivery = this.#delivery[target.target_id];
     const route = target.kind === "image" ? this.#route(target) : null;
@@ -512,8 +605,8 @@ export class ContextNavigator {
   #errorReserve() { const count = this.#limits.maxErrorResponses - this.#usage.error_responses;
     return { tokens: count * this.#limits.errorResponseTokens, wire_bytes: count * this.#limits.errorResponseBytes }; }
   #localRemaining(): ContextRemainingBudget { return { tokens: Math.max(0, this.#limits.maxTotalTokens - this.#usage.text_tokens - this.#usage.visual_token_reserve), wire_bytes: Math.max(0, this.#limits.maxTotalWireBytes - this.#usage.wire_bytes) }; }
-  #budgetHint(target?: ContextTarget) {
-    const budget = this.#remaining?.(target) ?? this.#localRemaining();
+  #budgetHint(targets?: readonly ContextTarget[]) {
+    const budget = this.#remaining?.(targets) ?? this.#localRemaining();
     this.#validateRemaining(budget);
     return { tokens: budget.tokens, wire_bytes: budget.wire_bytes, reserved_tokens: budget.reserved_tokens ?? 0, reserved_wire_bytes: budget.reserved_wire_bytes ?? 0, stop_hint: "Stop reading before consuming the summary and submission reserve" };
   }

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { parseRequest } from "../src/responses/parser";
 import { appendFixedContextRecords, createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
-import { ContextScope, type ContextPlanRegistration } from "../src/adapters/chatgpt-web/context-runtime";
+import { CONTEXT_PROTOCOL_VERSION, ContextScope, type ContextPlanRegistration } from "../src/adapters/chatgpt-web/context-runtime";
 import { contextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
 import { measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 import { boundedContextReuse, contextReuseBaseline, contextReuseMatches } from "../src/adapters/chatgpt-web/context-reuse-lifecycle";
@@ -81,7 +81,7 @@ test("fixed reuse dependencies are checked again after reads and before successf
     expect(scope.status()).toMatchObject({ context_ready: true, reuse_ready: true, required_texts: 0 });
     expect(scope.usageEvidence().reuse_delivery?.units).toHaveLength(1);
     const target = scope.registration.snapshot.targets.at(-1)!;
-    const reread = scope.prepare("read", { context_id: scope.registration.snapshot.context_id, read_ref: target.read_ref! });
+    const reread = scope.prepare("read", { context_id: scope.registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
     valid = false;
     scope.finish(reread.receiptId, true, contextTextReadReceipt(reread.result));
     expect(scope.status()).toMatchObject({ context_ready: false, text_ready: true, reuse_ready: false });
@@ -125,7 +125,7 @@ test(`late startup receipts retain startup identity and the original business bo
   const token = manual ? await owner.registerSafe(environment, "surface-diagnostic-123456789", undefined, "diagnostic-test", { requireSentConfirmation: false })
     : await owner.register(environment, undefined, "diagnostic-test");
   const request = { token, contract: manual ? "safe" as const : "native" as const, credentialKind: "ordinary" as const,
-    contextProtocol: 3, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
+    contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
   try {
     const plan = registration("inline", "Exact inline rule.");
     await owner.registerContextPlan(token, plan); await owner.selectContextPlan(token, plan.planId);
@@ -200,7 +200,7 @@ test("transported navigation errors retain their cost without becoming manifest 
   const owner = new RemoteTurnBroker(broker.socketPath);
   const token = await owner.register({ authorityMode: "delegated", threadId: "error-thread", turnId: "error-turn", tools: [] }, undefined, "error-test");
   const request = { token, contract: "native" as const, credentialKind: "ordinary" as const,
-    contextProtocol: 3, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
+    contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
   try {
     const plan = registration("inline", "Exact inline rule.");
     await owner.registerContextPlan(token, plan); await owner.selectContextPlan(token, plan.planId);
@@ -254,7 +254,7 @@ test(`Broker reuse commit requires its own delivery, normal completion and curre
   const token = manual ? await owner.registerSafe(environment, "surface-reuse-1234567890123456", undefined, "reuse-test", { recovery, requireSentConfirmation: false })
     : await owner.register(environment, undefined, "reuse-test", { recovery });
   const request = { token, contract: manual ? "safe" as const : "native" as const, credentialKind: "ordinary" as const,
-    contextProtocol: 3, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
+    contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
   try {
     expect(await owner.contextReuseAvailable()).toBe(true);
     const plan = registration("required", "exact stable rule🙂");

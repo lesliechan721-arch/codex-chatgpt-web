@@ -6,6 +6,8 @@ import { assertLauncherContextDeliveryFeature, CONTINUITY_EXECUTION_FENCING_FEAT
   LauncherKnownUnsentReceiptError, type LauncherKnownUnsentReceipt,
   LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
+import { CONTEXT_PROTOCOL_VERSION } from "./context-runtime";
+import { hasContextBootstrapCapabilities } from "./context-protocol";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
@@ -49,7 +51,7 @@ const ABORT_RETIREMENT_TIMEOUT_MS = 15_000;
 const MAX_UNFINISHED_ABORTS = 5;
 
 type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
-  | { type: "ready"; features?: string[] }
+  | { type: "ready"; features?: string[]; contextCompatible: boolean }
   | { type: "event"; id: string; event: "heartbeat" | "generation_progress" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
@@ -91,7 +93,7 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
       && (!Array.isArray(features) || features.some(feature => typeof feature !== "string"))) {
       throw new Error("Launcher browser helper advertised invalid features");
     }
-    return { type: "ready", ...(features ? { features: features as string[] } : {}) };
+    return { type: "ready", contextCompatible: hasContextBootstrapCapabilities(message, CONTEXT_PROTOCOL_VERSION), ...(features ? { features: features as string[] } : {}) };
   }
   if (typeof message.id !== "string" || !message.id) {
     throw new Error("Launcher browser helper message has no turn identity");
@@ -246,6 +248,7 @@ export class LauncherBrowserHelperClient {
   private readyReject?: (error: Error) => void;
   private readonly pending = new Map<string, PendingTurn>();
   private helperFeatures = new Set<string>();
+  private helperContextCompatible = false;
   // A timed-out legacy worker may still emit frames. Do not reuse its trace until its
   // terminal frame or process exit proves that the old producer has stopped.
   private readonly unfinishedAborts = new Map<string, { child: ChildProcessWithoutNullStreams; recovery?: ContinuityRecoveryIdentity }>();
@@ -436,8 +439,8 @@ export class LauncherBrowserHelperClient {
   async assertContextDeliveryCompatible(): Promise<void> {
     await this.ensureChild();
     assertLauncherContextDeliveryFeature(readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!));
-    if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE)) {
-      throw new ChatGptWebAdapterError("Launcher browser helper does not support context delivery plans; update the runtime and helper before using context navigation", {
+    if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE) || !this.helperContextCompatible) {
+      throw new ChatGptWebAdapterError("Launcher browser helper does not support context delivery plans with the current reads-array, context-text-batch-v1 and manifest 3 contract; update the runtime and helper before using context navigation", {
         status: 503, errorType: "server_error", code: "codex_context_upgrade_required", retryable: false,
       });
     }
@@ -542,6 +545,7 @@ export class LauncherBrowserHelperClient {
     if (message.type === "ready") {
       // Optional frames are sent only when the helper advertises support for them.
       this.helperFeatures = new Set(message.features ?? []);
+      this.helperContextCompatible = message.contextCompatible;
       this.readyResolve?.();
       this.readyResolve = undefined;
       this.readyReject = undefined;
@@ -770,7 +774,7 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "context_plan_selected") {
-        if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE)
+        if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE) || !this.helperContextCompatible
           || !pending.prepared?.contextPlan || message.planId !== pending.prepared.contextPlan.planId
           || pending.selectedContextPlanId !== undefined) {
           this.abortWithLocalFailure(message.id, new Error("Launcher browser helper selected an unknown or mismatched context plan"), pending);

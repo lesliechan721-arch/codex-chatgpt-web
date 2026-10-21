@@ -768,6 +768,7 @@ export interface ChatGptTaskUpdateRestoreAuthority {
 
 export class ChatGptTurnSession {
   supersededError?: Error;
+  private continuityReplayOnly = false;
   private cancelledWith?: Error;
   readonly createdAt = Date.now();
   private lastTouchedAt = this.createdAt;
@@ -2053,7 +2054,7 @@ export class ChatGptTurnSession {
   private notifyTaskUpdateLifecycle(): void { for (const observer of [...this.lifecycleObservers]) observer(); }
 
   touch(): void {
-    if (!this.runtime.continuityBinding) this.lastTouchedAt = Date.now();
+    if (!this.runtime.continuityBinding || this.continuityReplayOnly) this.lastTouchedAt = Date.now();
   }
 
   lastUsedAt(): number {
@@ -2073,6 +2074,7 @@ export class ChatGptTurnSession {
     previous?: ChatGptContinuityInstructionPrevious,
     allowRetainedSourceFallback = false,
   ): void {
+    if (this.continuityReplayOnly) { this.assertCanonicalReplayInput(parsed); return; }
     if (this.taskUpdateSource?.continuity || this.isQueuedTaskInputRequest(parsed)) { this.assertCanonicalReplayInput(parsed); return; }
     const input = (parsed._rawBody as { input?: unknown[] } | undefined)?.input;
     if (!Array.isArray(input)) throw continuityError("continuity_source_unproven");
@@ -2116,6 +2118,9 @@ export class ChatGptTurnSession {
   }
 
   assertCanonicalReplayInput(parsed: CodexParsedRequest): void {
+    if (this.continuityReplayOnly && !this.roundCompleted(this.continuityRoundKey(parsed))) {
+      throw continuityError("continuity_source_unproven", "The retired source retains only its completed response rounds.");
+    }
     if (this.isQueuedTaskInputRequest(parsed)) {
       const source = chatGptCurrentInstructionRevision(parsed);
       if (!source || this.receivedTaskInputDigests.get(continuityInstructionIdentity(parsed)) !== taskUpdateDigest(
@@ -2299,6 +2304,7 @@ export class ChatGptTurnSession {
   }
 
   acceptContinuityToolResults(parsed: CodexParsedRequest): CodexToolResultMessage[] {
+    if (this.continuityReplayOnly) throw continuityError("continuity_source_unproven", "A retired source cannot accept new tool results.");
     if (this.taskUpdateSource?.continuity) {
       const messages = this.acceptLightContinuityToolResults(parsed);
       this.prepareCompactionToolResults(parsed, messages.map(message => message.toolCallId));
@@ -2434,6 +2440,7 @@ export class ChatGptTurnSession {
   }
 
   setOutstanding(requests: BrokerToolRequest[], reasoning: string[] = [], prelude: AdapterEvent[] = []): void {
+    if (this.continuityReplayOnly) throw continuityError("continuity_source_unproven", "A retired source cannot issue new tool calls.");
     if (this.outstandingById.size > 0) throw new Error("cannot emit a new ChatGPT tool batch while the previous batch is unresolved");
     if (new Set(requests.map(request => request.callId)).size !== requests.length
       || requests.some(request => this.toolBatchByCallId.has(request.callId) || this.outstandingById.has(request.callId))) {
@@ -2490,6 +2497,31 @@ export class ChatGptTurnSession {
 
   hasContinuityToolCall(callId: string): boolean {
     return this.toolBatchByCallId.has(callId);
+  }
+
+  hasCompletedContinuityReplay(): boolean {
+    return [...this.rounds.values()].some(round => round.completed && !round.failure);
+  }
+
+  isContinuityReplayOnly(): boolean { return this.continuityReplayOnly; }
+
+  /** A fenced cold-compaction source keeps responses, never pending work or delivery authority. */
+  retainCompletedContinuityReplay(): void {
+    if (!this.runtime.continuityBinding || this.isActive() || !this.hasCompletedContinuityReplay()) {
+      throw continuityError("continuity_source_unproven");
+    }
+    this.continuityReplayOnly = true;
+    this.lastTouchedAt = Date.now();
+    for (const [key, round] of this.rounds) if (!round.completed || round.failure) this.rounds.delete(key);
+    for (const [id, batch] of this.toolBatches) {
+      if (batch.acceptedResultDigests && this.roundCompleted(batch.resultRoundKey)) continue;
+      this.toolBatches.delete(id);
+      for (const request of batch.requests) this.toolBatchByCallId.delete(request.callId);
+    }
+    // Cancellation discards unresolved work. It must not record a delivered result or coverage.
+    this.outstandingById.clear();
+    this.outstandingReasoning = [];
+    this.outstandingPrelude = [];
   }
 
   markResultDelivered(callId: string): void {
@@ -2735,6 +2767,7 @@ export class ChatGptTurnSession {
   private round(key: string) {
     let round = this.rounds.get(key);
     if (round) return round;
+    if (this.continuityReplayOnly) throw continuityError("continuity_source_unproven", "The retired response round was not retained.");
     this.reserveTaskUpdateRoundError(key);
     round = { events: [], reasoning: [], completed: false };
     this.rounds.set(key, round);
@@ -2952,8 +2985,15 @@ export class ChatGptTurnSessions {
   }
 
   continuityToolCallRevision(binding: ContinuityBinding, callId: string): number | undefined {
-    const sources = [...this.entries.values()].filter(session => session.runtime.continuityBinding === binding
-      && session.hasContinuityToolCall(callId));
+    const sources = [...this.entries].filter(([key, session]) => {
+      if (!session.hasContinuityToolCall(callId)) return false;
+      const original = session.runtime.continuityBinding;
+      if (original === binding) return true;
+      return session.isContinuityReplayOnly() && original?.scope === binding.scope
+        && original.thread === binding.thread && original.owner === binding.owner
+        && [...binding.checkpoints.values()].some(checkpoint => checkpoint.sourceExecutionKey === key
+          && checkpoint.sourceRevision === session.runtime.usageInput?._continuityHistoryRevision);
+    }).map(([, session]) => session);
     if (sources.length > 1) throw continuityError("continuity_source_unproven");
     return sources[0]?.runtime.usageInput?._continuityHistoryRevision;
   }
@@ -3260,6 +3300,17 @@ export class ChatGptTurnSessions {
     this.removePhysicalSession(session);
     this.forgetConversationHead(session);
     this.beginRetirement(key, session, reason);
+    return true;
+  }
+
+  /** Called only after a cold compaction has fenced and cancelled this exact source writer. */
+  retirePreservingContinuityReplay(key: string, session: ChatGptTurnSession, reason: Error): boolean {
+    if (this.entries.get(key) !== session) return false;
+    session.retainCompletedContinuityReplay();
+    this.forgetConversationHead(session);
+    this.beginRetirement(key, session, reason);
+    const conversationKey = session.conversationKey();
+    if (conversationKey) session.detachConversation(conversationKey);
     return true;
   }
 

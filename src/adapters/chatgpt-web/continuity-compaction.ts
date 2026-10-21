@@ -279,6 +279,7 @@ export function runContinuityCompaction(
           capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
             claim, sourceSnapshot,
             ...(durableCompactionWorkId ? {
+              recoveryStoreDirectory: bindings.registrations.directory,
               onPrepared: (instruction: string) => prepareHealthyRecoveryCompactionControl(prepared, instruction),
               onSendActivated: () => markHealthyRecoveryCompactionSend(prepared),
               onSubmitted: () => markHealthyRecoveryCompactionAccepted(prepared),

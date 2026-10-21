@@ -40,8 +40,9 @@ function navigation(prompt: string): Entry {
 }
 function data(result: any): any {
   if (result.structuredContent?.format !== CONTEXT_TEXT_READ_FORMAT) return result.structuredContent;
-  const { metadata, body } = parseContextTextReadResult(result);
-  return { ...metadata, content: body };
+  const { metadata, bodies } = parseContextTextReadResult(result);
+  expect(metadata.items).toHaveLength(1);
+  return { ...metadata.items[0], content: bodies[0] };
 }
 
 function paddedPng(size: number): string {
@@ -123,8 +124,8 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
           expect(entry.context_id).not.toBe(oldEntry.context_id);
           expect(entry.first_call.arguments).not.toEqual(oldEntry.first_call.arguments);
           expect((await f.call(oldEntry)).isError).toBe(true);
-          expect((await f.call(entry, "codex_context_read", { context_id: oldEntry.context_id, read_ref: oldReadRef })).isError).toBe(true);
-          expect((await f.call(entry, "codex_context_read", { read_ref: oldReadRef })).isError).toBe(true);
+          expect((await f.call(entry, "codex_context_read", { context_id: oldEntry.context_id, reads: [{ read_ref: oldReadRef }] })).isError).toBe(true);
+          expect((await f.call(entry, "codex_context_read", { reads: [{ read_ref: oldReadRef }] })).isError).toBe(true);
         }
         const listing = await f.call(entry, "codex_context_list", { view: "entries", kind: "tool_result", tool_name: "exec_command" });
         expect(listing.isError).not.toBe(true);
@@ -133,7 +134,7 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
         if (round === 1) {
           expect(prompt).not.toContain(tailMarker);
           expect(result.delivery).toBe("source_on_demand");
-          const first = await f.call(entry, "codex_context_read", { read_ref: result.read_ref });
+          const first = await f.call(entry, "codex_context_read", { reads: [{ read_ref: result.read_ref }] });
           expect(first.isError).not.toBe(true);
           expect(data(first).content).toBe(log.slice(0, data(first).range.end_exclusive));
           expect(data(first).has_more).toBe(true);
@@ -147,7 +148,7 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
           const search = await f.call(entry, "codex_context_search", { query: tailMarker, kind: "tool_result" });
           expect(search.isError).not.toBe(true);
           const hit = data(search).hits[0];
-          const tail = await f.call(entry, "codex_context_read", { read_ref: hit.read_ref, cursor: hit.read_cursor });
+          const tail = await f.call(entry, "codex_context_read", { reads: [{ read_ref: hit.read_ref, cursor: hit.read_cursor }] });
           expect(tail.isError).not.toBe(true);
           expect(data(tail).content).toContain(tailMarker);
         }
@@ -164,7 +165,7 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
           if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
             ...f.credential(entry), task_revision: 0, final_answer: "premature success" } })).isError).toBe(true);
         }
-        const image = await f.call(entry, "codex_context_read", { read_ref: picture.read_ref });
+        const image = await f.call(entry, "codex_context_read", { reads: [{ read_ref: picture.read_ref }] });
         expect(image.isError).not.toBe(true);
         expect(image.content).toContainEqual(expect.objectContaining({ type: "image", data: png, mimeType: "image/png" }));
         expect(JSON.stringify(image.structuredContent)).not.toContain(png);
@@ -289,7 +290,7 @@ for (const sent of [true, false]) test(`Zero Risk mixed image routes, Sent=${sen
         expect(plan.requiredAttachments.map(value => value.id)).toEqual([attachment.target_id]);
         expect(attachment.read_ref).toBeNull();
         expect(plan.requiredAttachments.map(value => value.id)).not.toContain(mcp.target_id);
-        const image = await f.call(entry, "codex_context_read", { read_ref: mcp.read_ref });
+        const image = await f.call(entry, "codex_context_read", { reads: [{ read_ref: mcp.read_ref }] });
         expect(image.content).toContainEqual(expect.objectContaining({ type: "image", data: png }));
         const overview = await f.call(entry);
         expect(data(overview).live).toMatchObject({ context_ready: false, required_images: 2, delivered_images: 1 });
@@ -376,7 +377,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       expect(images.isError).not.toBe(true);
       const picture = data(images).entries[0];
       expect(picture).toMatchObject({ required: true, media_route: "mcp" });
-      const firstImage = await paid("codex_context_read", { read_ref: picture.read_ref });
+      const firstImage = await paid("codex_context_read", { reads: [{ read_ref: picture.read_ref }] });
       expect(firstImage.isError).not.toBe(true);
       expect(firstImage.content).toContainEqual(expect.objectContaining({ type: "image", data: png }));
       const imageReserveUsed = usage.reserved_tokens_used;
@@ -385,7 +386,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       const results = await paid("codex_context_list", { view: "entries", kind: "tool_result" });
       expect(results.isError).not.toBe(true);
       const resultRef = data(results).entries.find((value: any) => value.call_id === "recorded-call").read_ref;
-      const firstPage = await paid("codex_context_read", { read_ref: resultRef });
+      const firstPage = await paid("codex_context_read", { reads: [{ read_ref: resultRef }] });
       expect(firstPage.isError).not.toBe(true);
       expect(data(firstPage).has_more).toBe(true);
       expect(data(firstPage).content).not.toContain(tailMarker);
@@ -393,21 +394,20 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       expect(search.isError).not.toBe(true);
       expect(data(search).hits).toHaveLength(1);
       const hit = data(search).hits[0];
-      const tail = await paid("codex_context_read", { read_ref: hit.read_ref, cursor: hit.read_cursor });
+      const tail = await paid("codex_context_read", { reads: [{ read_ref: hit.read_ref, cursor: hit.read_cursor }] });
       expect(tail.isError).not.toBe(true);
       expect(data(tail).content).toContain(tailMarker);
-      const repeatPage = await paid("codex_context_read", { read_ref: resultRef });
+      const repeatPage = await paid("codex_context_read", { reads: [{ read_ref: resultRef }] });
       expect(repeatPage.isError).not.toBe(true);
       expect(data(repeatPage).content).toBe(data(firstPage).content);
-      const repeatImage = await paid("codex_context_read", { read_ref: picture.read_ref });
+      const repeatImage = await paid("codex_context_read", { reads: [{ read_ref: picture.read_ref }] });
       expect(repeatImage.isError).not.toBe(true);
       expect(usage.usage.image_reads).toBe(2);
       expect(usage.reserved_tokens_used).toBe(imageReserveUsed);
       // Corrupt a public cursor. No private reference or capability is supplied to the model.
       const publicCursor: string = data(firstPage).next_cursor;
       const errors = usage.usage.error_responses;
-      const invalidCursor = await paid("codex_context_read", { read_ref: resultRef,
-        cursor: `${publicCursor.slice(0, -4)}AAAA` });
+      const invalidCursor = await paid("codex_context_read", { reads: [{ read_ref: resultRef, cursor: `${publicCursor.slice(0, -4)}AAAA` }] });
       expect(invalidCursor.isError).toBe(true);
       expect(JSON.stringify(invalidCursor.structuredContent)).toContain("INVALID_CURSOR");
       expect(usage.usage.error_responses).toBe(errors + 1);
@@ -526,7 +526,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     const search = await f.call(entry, "codex_context_search", { kind: "tool_result", query: tailMarker });
     expect(search.isError).not.toBe(true);
     const hit = data(search).hits[0];
-    const source = await f.call(entry, "codex_context_read", { read_ref: hit.read_ref, cursor: hit.read_cursor });
+    const source = await f.call(entry, "codex_context_read", { reads: [{ read_ref: hit.read_ref, cursor: hit.read_cursor }] });
     expect(source.isError).not.toBe(true);
     expect(data(source).content).toContain(tailMarker);
     if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
@@ -623,7 +623,7 @@ for (const branch of ["full", "resume"] as const) test(`Zero Risk selects ${bran
           expect(listing.isError).not.toBe(true);
           const recorded = data(listing).entries.find((entry: any) => entry.call_id === "short-recorded-call");
           expect(recorded.delivery).toBe("source_on_demand");
-          const result = await f.call(resumeEntry, "codex_context_read", { read_ref: recorded.read_ref });
+          const result = await f.call(resumeEntry, "codex_context_read", { reads: [{ read_ref: recorded.read_ref }] });
           expect(result.isError).not.toBe(true);
           expect(data(result).content).toBe(shortResult);
         }
@@ -705,7 +705,7 @@ for (const manual of [false, true]) for (const source of ["system", "delegation"
       expect(typeof required[0].read_ref).toBe("string");
       expect(pictures.filter(picture => picture.source_kind === "user")).toHaveLength(9);
       expect(pictures.some(picture => !picture.required && picture.media_route === "unavailable")).toBe(true);
-      const returned = await f.call(resumeEntry, "codex_context_read", { read_ref: required[0].read_ref });
+      const returned = await f.call(resumeEntry, "codex_context_read", { reads: [{ read_ref: required[0].read_ref }] });
       expect(returned.isError).not.toBe(true);
       const blocks = returned.content as Array<{ type: string; mimeType?: string; data?: string }>;
       const image = blocks.find(block => block.type === "image")!;

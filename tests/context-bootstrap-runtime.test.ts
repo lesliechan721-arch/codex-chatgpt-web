@@ -14,7 +14,7 @@ function registration(texts: string[], withImage = false): ContextPlanRegistrati
   ] : "optional history" }] }));
   const snapshot = appendFixedContextRecords(base, texts.map(text => ({ text, encoding: "utf-8", origin: "context_bootstrap_payload" })));
   return { snapshot, planId: "bootstrap-plan", manifestDigest: "bootstrap-manifest", startupProtocol: "context-bootstrap-v1",
-    limits: { readBytes: 2800, readTokens: 1000 }, deliveryByTarget: Object.fromEntries(snapshot.targets.map(target => [target.target_id,
+    limits: { readBytes: 12 * 1024, readTokens: 4_000 }, deliveryByTarget: Object.fromEntries(snapshot.targets.map(target => [target.target_id,
       target.origin === "context_bootstrap_payload" ? { delivery: "source_required", required: true }
         : target.kind === "image" ? { delivery: "on_demand", required: true, media_route: "mcp" } : { delivery: "source_on_demand" }])) };
 }
@@ -23,7 +23,7 @@ function scopeOf(plan: ContextPlanRegistration, purpose: "normal" | "compaction"
   scope.markEntryDelivered(); return scope;
 }
 function finish(scope: ContextScope, reply: ContextPreparedReply, sent = true) {
-  const receipt = !reply.result.isError && reply.result.content.length === 2 && (reply.result.content[1] as { type?: string }).type === "text"
+  const receipt = !reply.result.isError && reply.result.content.length >= 2 && (reply.result.content[1] as { type?: string }).type === "text"
     ? contextTextReadReceipt(reply.result) : undefined;
   return scope.finish(reply.receiptId, sent, receipt);
 }
@@ -33,23 +33,23 @@ function read(scope: ContextScope, args?: ContextReadArgs) {
 }
 
 test("required UTF-8 coverage uses successful interval unions, including out-of-order, repeated, overlapping and empty pages", () => {
-  const original = Array.from({ length: 700 }, (_, index) => `item${index.toString().padStart(4, "0")} 中文😀\\\n`).join("");
+  const original = Array.from({ length: 2300 }, (_, index) => `item${index.toString().padStart(4, "0")} 中文😀\\\n`).join("");
   const plan = registration([original, ""]), scope = scopeOf(plan), target = requiredText(plan);
   try {
-    const args = { context_id: plan.snapshot.context_id, read_ref: target.read_ref! };
+    const args = { context_id: plan.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] };
     const pages: ContextReadArgs[] = [];
     let current: ContextReadArgs = args;
     for (;;) {
       pages.push(current);
-      const page = parseContextTextReadResult(scope.navigator.preflightRead(current)).metadata;
+      const page = parseContextTextReadResult(scope.navigator.preflightRead(current)).metadata.items[0]!;
       if (!page.next_cursor) break;
-      current = { ...args, cursor: page.next_cursor };
+      current = { ...args, reads: [{ ...args.reads[0]!, cursor: page.next_cursor }] };
     }
     expect(pages.length).toBeGreaterThan(3);
     // Merely preparing or discovering all pages does not deliver them.
     expect(scope.status().delivered_text_bytes).toBe(0);
     finish(scope, scope.prepare("list", { context_id: plan.snapshot.context_id, view: "entries", required_only: true }));
-    const search = scope.prepare("search", { ...args, query: "item0010" }); finish(scope, search);
+    const search = scope.prepare("search", { context_id: args.context_id, read_ref: args.reads[0]!.read_ref, query: "item0010" }); finish(scope, search);
     expect(scope.status().text_ready).toBe(false);
     const last = read(scope, pages.at(-1)); finish(scope, last);
     const first = read(scope, pages[0]); finish(scope, first);
@@ -58,13 +58,13 @@ test("required UTF-8 coverage uses successful interval unions, including out-of-
     expect(scope.status().delivered_text_bytes).toBe(beforeRepeat);
     expect(scope.navigator.usage().wire_bytes).toBeGreaterThan(beforeWire);
     const hit = (search.result.structuredContent as any).hits[0];
-    const overlap = read(scope, { ...args, cursor: hit.read_cursor });
-    const overlapRange = parseContextTextReadResult(overlap.result).metadata.range;
+    const overlap = read(scope, { ...args, reads: [{ ...args.reads[0]!, cursor: hit.read_cursor }] });
+    const overlapRange = parseContextTextReadResult(overlap.result).metadata.items[0]!.range;
     expect(overlapRange.start).toBeGreaterThan(0);
-    expect(overlapRange.start).toBeLessThan(parseContextTextReadResult(first.result).metadata.range.end_exclusive);
+    expect(overlapRange.start).toBeLessThan(parseContextTextReadResult(first.result).metadata.items[0]!.range.end_exclusive);
     finish(scope, overlap);
     expect(scope.status().text_ready).toBe(false);
-    // The next action always returns the first actual hole, independent of read order.
+    // Recovery selects the first incomplete fixed batch, independent of read order.
     for (let count = 0; !scope.status().text_ready && count < 100; count++) {
       const next = read(scope); expect(next.result.isError).not.toBe(true); finish(scope, next);
     }
@@ -76,11 +76,11 @@ test("required UTF-8 coverage uses successful interval unions, including out-of-
 
 test("failed, altered, cross-source, cross-scope and retired returns never deliver required text", () => {
   const plan = registration(["first source", "other source"]), scope = scopeOf(plan), other = scopeOf(plan);
-  const args = { context_id: plan.snapshot.context_id, read_ref: requiredText(plan).read_ref! };
+  const args = { context_id: plan.snapshot.context_id, reads: [{ read_ref: requiredText(plan).read_ref! }] };
   try {
     const failed = read(scope, args); finish(scope, failed, false);
     expect(scope.status().delivered_text_bytes).toBe(0);
-    const second = read(scope, { ...args, read_ref: requiredText(plan, 1).read_ref! });
+    const second = read(scope, { ...args, reads: [{ read_ref: requiredText(plan, 1).read_ref! }] });
     const otherReceipt = contextTextReadReceipt(second.result); finish(scope, second, false);
     const attempts = [otherReceipt,
       { ...contextTextReadReceipt(failed.result), result_digest: "0".repeat(64) },
@@ -114,7 +114,7 @@ test("bootstrap manifests remain bounded, waiting is free, revision is independe
       const reply = scope.prepare("list", { context_id: plan.snapshot.context_id, view: "entries", required_only: true, ...(cursor ? { cursor } : {}) });
       expect(reply.result.isError).not.toBe(true);
       const page = reply.result.structuredContent as any;
-      expect(page.entries.length).toBeGreaterThan(0); expect(page.entries.length).toBeLessThanOrEqual(20);
+      expect(page.entries.length).toBeGreaterThan(0); expect(page.entries.length).toBeLessThanOrEqual(50);
       seen.push(...page.entries.map((entry: any) => entry.target_id)); finish(scope, reply);
       cursor = page.next_cursor ?? undefined;
       if (cursor && seen.length < 5) {
@@ -130,11 +130,13 @@ test("bootstrap manifests remain bounded, waiting is free, revision is independe
       manifest_digest: plan.manifestDigest, revision: 7, acknowledged_revision: 6, live: { text_ready: false, images_ready: true } });
     const envelope = { started: true, duplicate: false, context_bootstrap: body };
     const cost = measureContextResponse({ content: [{ type: "text", text: JSON.stringify(envelope) }], structuredContent: envelope });
-    expect(cost.text_tokens).toBeLessThanOrEqual(1500); expect(cost.wire_bytes).toBeLessThanOrEqual(12 * 1024);
+    expect(cost.text_tokens).toBeLessThanOrEqual(6000); expect(cost.wire_bytes).toBeLessThanOrEqual(48 * 1024);
     finish(scope, read(scope));
     const next = scope.bootstrapManifest({ revision: 7, acknowledged_revision: 6 }).structuredContent as any;
     expect(next).toMatchObject({ manifest_digest: plan.manifestDigest, revision: 7, acknowledged_revision: 6 });
-    expect(next.live.delivered_texts).toBe(1);
+    expect(next.live.delivered_texts).toBeGreaterThan(0);
+    expect(next).toMatchObject({ manifest_version: 3, required_discovery: "batch-metadata" });
+    expect(next.required_targets).toBeUndefined();
   } finally { scope.retire(); }
 });
 
@@ -150,51 +152,178 @@ test("required text cannot change control state and has no full-read compaction 
       manifest_digest: plan.manifestDigest, revision: 2, acknowledged_revision: 1 });
     expect(() => compaction.guardCommit()).not.toThrow();
     expect(compaction.status()).toMatchObject({ text_ready: true, required_texts: 0 });
-    const pending = compaction.prepare("read", { context_id: plan.snapshot.context_id, read_ref: requiredText(plan).read_ref! });
+    const pending = compaction.prepare("read", { context_id: plan.snapshot.context_id, reads: [{ read_ref: requiredText(plan).read_ref! }] });
     expect(() => compaction.guardCommit()).toThrow(); finish(compaction, pending);
     expect(() => compaction.guardCommit()).not.toThrow();
   } finally { ordinary.retire(); compaction.retire(); }
 });
 
-test("on-demand navigation cannot spend the required delivery and retry reserve", () => {
-  const plan = registration(["required bytes"]), measured = scopeOf(plan);
-  const page = measured.navigator.preflightRead({ context_id: plan.snapshot.context_id, read_ref: requiredText(plan).read_ref! });
-  const cost = measureContextResponse(page, { boundCursorTokens: true }), errors = contextErrorReserve();
-  measured.retire();
-  plan.requiredTextPageCosts = { [requiredText(plan).target_id]: [{ start: 0, end_exclusive: Buffer.byteLength("required bytes"), tokens: cost.total_tokens, wire_bytes: cost.wire_bytes }] };
-  plan.requiredReturnRetryReserve = { tokens: cost.total_tokens, wire_bytes: cost.wire_bytes };
-  plan.remainingBudget = { tokens: 2 * cost.total_tokens + errors.tokens, wire_bytes: 2 * cost.wire_bytes + errors.wire_bytes };
-  const scope = scopeOf(plan);
+function tightPlan(): ContextPlanRegistration {
+  const plan = registration(["Alpha value ".repeat(1500), "Bravo data ".repeat(1500)]);
+  plan.limits = {};
+  const costs = measureBootstrapRequiredCosts({ snapshot: plan.snapshot, planId: plan.planId, manifestDigest: plan.manifestDigest,
+    limits: contextLimits(plan.limits), deliveryByTarget: plan.deliveryByTarget, started: performance.now() });
+  expect(costs.batches.length).toBe(2);
+  plan.requiredTextBatches = costs.batches; plan.requiredControlReserve = costs.control; plan.requiredReturnRetryReserve = costs.retry;
+  const errors = contextErrorReserve();
+  plan.remainingBudget = { tokens: costs.text.total_tokens + costs.discovery.total_tokens + costs.retry.tokens + errors.tokens,
+    wire_bytes: costs.text.wire_bytes + costs.discovery.wire_bytes + costs.retry.wire_bytes + errors.wire_bytes };
+  return plan;
+}
+function overview(scope: ContextScope) {
+  const reply = scope.prepare("list", { context_id: scope.registration.snapshot.context_id, view: "overview" });
+  expect(reply.result.isError).not.toBe(true); finish(scope, reply); return reply;
+}
+
+test("tight budgets reserve all remaining units and final control while a completed batch replays", () => {
+  const plan = tightPlan(), scope = scopeOf(plan);
   try {
-    const optional = scope.prepare("read", { context_id: plan.snapshot.context_id, read_ref: plan.snapshot.targets[0]!.read_ref! });
-    expect(optional.result.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } }); finish(scope, optional);
-    const first = read(scope); expect(first.result.isError).not.toBe(true); finish(scope, first, false);
-    expect(scope.status().text_ready).toBe(false);
-    const retry = read(scope); expect(retry.result.isError).not.toBe(true); finish(scope, retry);
-    expect(scope.status().context_ready).toBe(true);
-    expect(scope.navigator.usage().wire_bytes).toBeGreaterThan(2 * cost.wire_bytes);
+    overview(scope);
+    const firstArgs = scope.status().next_required_read!.arguments;
+    const first = read(scope, firstArgs); expect(first.result.isError).not.toBe(true); finish(scope, first);
+    const before = scope.status().delivered_text_bytes;
+    const afterFirst = scope.navigator.usage();
+    const replay = read(scope, firstArgs);
+    expect(replay.result).toEqual(first.result);
+    const replayCost = measureContextResponse(replay.result);
+    expect(scope.navigator.usage().wire_bytes - afterFirst.wire_bytes).toBe(replayCost.wire_bytes);
+    expect(scope.navigator.usage().text_tokens - afterFirst.text_tokens).toBe(replayCost.text_tokens);
+    finish(scope, replay, false);
+    expect(scope.status().delivered_text_bytes).toBe(before);
+    expect(scope.navigator.usage().wire_bytes).toBeGreaterThan(afterFirst.wire_bytes);
+    const second = read(scope); expect(second.result.isError).not.toBe(true); finish(scope, second);
+    const final = overview(scope);
+    expect(final.result.structuredContent).toMatchObject({ live: { context_ready: true } });
+    expect(scope.usageEvidence().reuse_diagnostics).toMatchObject({ directory_calls: 0, text_read_calls: 2 });
   } finally { scope.retire(); }
-  expect(() => scopeOf({ ...plan, remainingBudget: { tokens: 2 * cost.total_tokens + errors.tokens - 1,
-    wire_bytes: 2 * cost.wire_bytes + errors.wire_bytes } })).toThrow();
+});
+
+test("a failure after recovery exhaustion stops reads and keeps business admission closed", () => {
+  const scope = scopeOf(tightPlan());
+  try {
+    overview(scope);
+    const firstArgs = scope.status().next_required_read!.arguments;
+    finish(scope, read(scope, firstArgs));
+    finish(scope, read(scope, firstArgs));
+    const last = read(scope); expect(last.result.isError).not.toBe(true);
+    const charged = scope.navigator.usage();
+    finish(scope, last, false);
+    expect(scope.navigator.usage()).toEqual(charged);
+    expect(scope.status().context_ready).toBe(false);
+    expect(() => scope.assertReady()).toThrow();
+    expect(() => read(scope)).toThrow("navigation capability is retired");
+  } finally { scope.retire(); }
+});
+
+test("pending required delivery after recovery exhaustion defers optional navigation without retiring the scope", () => {
+  const plan = tightPlan(), scope = scopeOf(plan);
+  try {
+    overview(scope);
+    const firstArgs = scope.status().next_required_read!.arguments;
+    finish(scope, read(scope, firstArgs));
+    finish(scope, read(scope, firstArgs));
+    const last = read(scope);
+    expect(last.result.isError).not.toBe(true);
+    const charged = scope.navigator.usage();
+    expect(() => scope.prepare("read", { context_id: plan.snapshot.context_id,
+      reads: [{ read_ref: plan.snapshot.targets[0]!.read_ref! }] })).toThrow("in-flight required");
+    expect(() => overview(scope)).toThrow("in-flight required");
+    expect(scope.navigator.usage()).toEqual(charged);
+    expect(scope.navigator.usage().navigation_stopped).toBe(false);
+    expect(scope.status().context_ready).toBe(false);
+    finish(scope, last);
+    expect(overview(scope).result.structuredContent).toMatchObject({ live: { context_ready: true } });
+    expect(() => scope.assertReady()).not.toThrow();
+  } finally { scope.retire(); }
+});
+
+test("a pending batch protects its second target and all items settle together", () => {
+  const plan = registration(["first", "second", ""]), scope = scopeOf(plan);
+  try {
+    const args = { context_id: plan.snapshot.context_id,
+      reads: [0, 1, 2].map(index => ({ read_ref: requiredText(plan, index).read_ref! })) };
+    const first = read(scope, args), parsed = parseContextTextReadResult(first.result);
+    expect(parsed.metadata.items).toHaveLength(3);
+    expect(scope.status().delivered_texts).toBe(0);
+    expect(() => read(scope, { ...args, reads: [args.reads[1]!] })).toThrow("in-flight required");
+    const damaged = structuredClone(first.result);
+    (damaged.content[2] as { text: string }).text = "Second";
+    const receipt = contextTextReadReceipt(damaged);
+    expect(() => scope.assertPending(first.receiptId, receipt)).toThrow();
+    scope.finish(first.receiptId, true, receipt);
+    expect(scope.status().delivered_texts).toBe(0);
+    const retry = read(scope, args); finish(scope, retry);
+    expect(scope.status()).toMatchObject({ context_ready: true, delivered_texts: 3, delivered_text_bytes: 11 });
+  } finally { scope.retire(); }
+});
+
+test("effective scope limits and fixed batch boundaries survive caller configuration changes", () => {
+  const plan = registration(["Exact UTF-8 中文😀\n".repeat(900)]), scope = scopeOf(plan);
+  try {
+    const args = scope.status().next_required_read!.arguments;
+    const first = read(scope, args); finish(scope, first);
+    plan.limits!.readBytes = 65_536; plan.limits!.readTokens = 8_000;
+    const replay = read(scope, args); expect(replay.result).toEqual(first.result); finish(scope, replay);
+    expect(scope.registration.limits!.readBytes).toBe(12 * 1024);
+  } finally { scope.retire(); }
+});
+
+test("the last delivered batch retains replay space through final overview until first work", () => {
+  const scope = scopeOf(tightPlan());
+  try {
+    overview(scope);
+    finish(scope, read(scope));
+    const lastArgs = scope.status().next_required_read!.arguments;
+    const last = read(scope, lastArgs); finish(scope, last);
+    overview(scope);
+    const replay = read(scope, lastArgs); expect(replay.result).toEqual(last.result); finish(scope, replay);
+    expect(scope.status().context_ready).toBe(true);
+    // Finite recovery is not replenished by repeated settlement or by overview.
+    finish(scope, replay);
+    let refused = false;
+    for (let index = 0; index < 8; index++) {
+      const again = read(scope, lastArgs);
+      if (again.result.isError) { refused = true; finish(scope, again); break; }
+      finish(scope, again);
+    }
+    expect(refused).toBe(true);
+    scope.recordFirstWork();
+    expect(scope.usageEvidence().reuse_diagnostics?.before_first_work).not.toBeNull();
+  } finally { scope.retire(); }
+});
+
+test("on-demand reads cannot borrow protected recovery and failed delivery keeps the full unit reserved", () => {
+  const plan = tightPlan(), scope = scopeOf(plan);
+  try {
+    overview(scope);
+    const optional = scope.prepare("read", { context_id: plan.snapshot.context_id, reads: [{ read_ref: plan.snapshot.targets[0]!.read_ref! }] });
+    expect(optional.result.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } }); finish(scope, optional);
+    const args = scope.status().next_required_read!.arguments;
+    const first = read(scope, args); expect(first.result.isError).not.toBe(true); finish(scope, first, false);
+    expect(scope.status().delivered_text_bytes).toBe(0);
+    const retry = read(scope, args); expect(retry.result).toEqual(first.result); finish(scope, retry);
+    const next = read(scope); expect(next.result.isError).not.toBe(true); finish(scope, next);
+    overview(scope); expect(scope.status().context_ready).toBe(true);
+  } finally { scope.retire(); }
 });
 
 test("planner page intervals and complete-response reserves survive new scope cursor bindings", () => {
-  const original = "Exact 中文😀 page with trailing whitespace. \r\n".repeat(90);
+  const original = "Exact 中文😀 page with trailing whitespace. \r\n".repeat(400);
   const plan = registration([original]), target = requiredText(plan);
   const costs = measureBootstrapRequiredCosts({ snapshot: plan.snapshot, planId: plan.planId, manifestDigest: plan.manifestDigest,
-    limits: contextLimits(plan.limits), deliveryByTarget: plan.deliveryByTarget, manual: true, started: performance.now() });
-  plan.requiredTextPageCosts = costs.pageCosts; plan.requiredReturnRetryReserve = costs.retry;
+    limits: contextLimits(plan.limits), deliveryByTarget: plan.deliveryByTarget, started: performance.now() });
+  plan.requiredTextBatches = costs.batches; plan.requiredControlReserve = costs.control; plan.requiredReturnRetryReserve = costs.retry;
   const scope = new ContextScope("another-physical-scope", plan, "normal", () => {}, () => {});
   scope.markEntryDelivered();
   try {
     let restored = "", count = 0;
-    for (const expected of costs.pageCosts[target.target_id]!) {
+    for (const expected of costs.batches) {
       const reply = read(scope), page = parseContextTextReadResult(reply.result);
-      expect(page.metadata.range).toEqual({ start: expected.start, end_exclusive: expected.end_exclusive });
+      expect(page.metadata.items.map(item => ({ target_id: item.source.target_id, ...item.range }))).toEqual(expected.ranges);
       const actual = measureContextResponse(reply.result);
       expect(actual.total_tokens).toBeLessThanOrEqual(expected.tokens);
       expect(actual.wire_bytes).toBeLessThanOrEqual(expected.wire_bytes);
-      restored += page.body; finish(scope, reply); count++;
+      restored += page.bodies.join(""); finish(scope, reply); count++;
     }
     expect(count).toBeGreaterThan(1); expect(restored).toBe(original);
     expect(scope.status().text_ready).toBe(true);
@@ -211,9 +340,9 @@ test("text returns do not extend image deadlines, and delivered images have no t
   const scope = scopeOf(plan);
   try {
     scope.openReads(); expect([...timers.values()].at(-1)?.delay).toBe(45_000);
-    expect(scope.status().next_required_read?.arguments.read_ref).toBe(plan.snapshot.targets.find(t => t.kind === "image")!.read_ref!);
+    expect(scope.status().next_required_read?.arguments.reads[0]!.read_ref).toBe(plan.snapshot.targets.find(t => t.kind === "image")!.read_ref!);
     time += 20_000;
-    finish(scope, read(scope, { context_id: plan.snapshot.context_id, read_ref: requiredText(plan).read_ref! }));
+    finish(scope, read(scope, { context_id: plan.snapshot.context_id, reads: [{ read_ref: requiredText(plan).read_ref! }] }));
     expect([...timers.values()].at(-1)?.delay).toBe(25_000);
     finish(scope, read(scope));
     expect(scope.status()).toMatchObject({ images_ready: true, text_ready: false, context_ready: false });

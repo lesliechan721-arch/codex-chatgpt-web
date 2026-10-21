@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, resolveChatGptWebMessageTokenBudget, resolveChatGptWebTransportLimits } from "../../chatgpt-web-models";
 import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import type { CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
-import { contextErrorReserve, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
+import { contextErrorReserve, contextLimits, contextBudgetProfileLimits, measureContextResponse, type ContextBudgetProfile, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
 import { ContextDeliveryPlanningError, planContextMedia, type ContextMediaPlan } from "./context-media-plan";
 import { CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage,
@@ -49,6 +49,7 @@ export interface ContextDeliveryPlanInput {
   /** Supplied only by the healthy retained-page lifecycle gate. */
   reuseBaseline?: ContextReuseBaseline;
   limits?: ContextLimitOverrides;
+  budgetProfile?: ContextBudgetProfile;
   budget?: { contextWindowTokens?: number; retainedTokens?: number; workReserveTokens?: number };
 }
 
@@ -334,7 +335,8 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
 
 function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
   const started = performance.now();
-  const limits = contextLimits(input.limits);
+  const budgetProfile = input.budgetProfile ?? "expanded";
+  const limits = contextLimits({ ...contextBudgetProfileLimits(budgetProfile), ...input.limits });
   // Multipart keeps its existing staged value-tree and acknowledgement contract.
   const reuseAvailable = input.contextReuseAvailable === true && !input.compileOptions?.experimentalMultipartParts;
   const compile = (parsed: CodexParsedRequest, options = input.compileOptions) => compileChatGptWebPrompt(parsed, input.capabilities, input.turnToken, options);
@@ -428,8 +430,7 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
     return { snapshot: input.snapshot, compiled: original, projected: input.candidate, navigationEnabled: false, externalizedTargetIds: [],
       bodyDigest: hash(transportTexts(original).join("\n")), costs, limits };
   };
-  if (!input.contextToolsAvailable || !input.capabilities.localToolsEnabled || !mode.localTools || input.candidate._compactionRequest) return fast();
-  if (!input.turnToken) throw new Error("Context navigation requires the current credential");
+  if (!input.capabilities.localToolsEnabled || !mode.localTools || input.candidate._compactionRequest) return fast();
   const messages = mapping(input);
   if (input.rawInputIndices && (new Set(input.rawInputIndices).size !== input.rawInputIndices.length
     || input.rawInputIndices.some(index => !Number.isSafeInteger(index) || index < 0
@@ -459,6 +460,14 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       throw new ContextDeliveryPlanningError("CONTEXT_MAPPING_UNPROVEN", "Candidate image is absent from the canonical snapshot", { candidate_index: index, content_index: partIndex });
     }
   }
+  const omittedHistory = input.snapshot.targets.some(t => !selected.has(t.target_id) && t.read_ref
+    && (t.kind === "tool_arguments" || t.kind === "tool_result" || t.kind === "image"));
+  if (!input.contextToolsAvailable) {
+    if (omittedHistory) throw new ContextDeliveryPlanningError("CONTEXT_MAPPING_UNPROVEN",
+      "The candidate requires omitted history that the current connector cannot expose. Refresh its context tool schema or prepare a complete candidate before Send");
+    return fast();
+  }
+  if (!input.turnToken) throw new Error("Context navigation requires the current credential");
   const bootstrapCandidate = (): ContextDeliveryPlan => {
     // Each trial gets its own source identity before any reference is rendered.
     let source: ContextSnapshot;
@@ -580,8 +589,18 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
         const aggregate = snapshot.targets.at(-1)!;
         deliveryByTarget[aggregate.target_id] = { delivery: inlineReusePayload ? "inline" : "source_required", required: !inlineReusePayload };
       }
-      const manifestDigest = hash(deterministicContextJson({ context_id: snapshot.context_id, plan_id: planId,
-        targets: snapshot.targets.map(target => ({ ...target, ...deliveryByTarget[target.target_id] })) }));
+      const manifestBasis = { context_id: snapshot.context_id, plan_id: planId, budget_profile: budgetProfile, limits,
+        context_protocol: 4, manifest_version: 3, read_arguments: "reads-array", text_read_format: "context-text-batch-v1",
+        targets: snapshot.targets.map(target => ({ ...target, ...deliveryByTarget[target.target_id] })) };
+      let manifestDigest = hash(deterministicContextJson(manifestBasis));
+      let required = measureBootstrapRequiredCosts({ snapshot, planId, manifestDigest, limits, deliveryByTarget,
+        started, ...(reuse ? { reuse } : {}) });
+      manifestDigest = hash(deterministicContextJson({ ...manifestBasis,
+        batches: required.batches.map(({ reads, ranges }) => ({ reads, ranges })) }));
+      // Final control wrappers include the manifest digest. Measure that exact
+      // version before the candidate can be selected or sent.
+      required = measureBootstrapRequiredCosts({ snapshot, planId, manifestDigest, limits, deliveryByTarget,
+        started, ...(reuse ? { reuse } : {}) });
       const descriptor = { planId, contextId: snapshot.context_id, manifestDigest, requiredAttachments: media.requiredAttachments };
       const entry = reuse ? shortContextReuseBootstrapPrompt({ ...entryInput, plan: descriptor, reuse,
         ...(inlineReusePayload ? { inlinePayload: inlineReusePayload } : {}) })
@@ -590,8 +609,6 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
         "CONTEXT_BUDGET_EXCEEDED", "The fixed bootstrap exceeds its 3000 Unicode code point engineering limit",
         { limit: "fixed_bootstrap", fixed_code_points: entry.fixedCodePoints });
       const compiled: CompiledChatGptWebPrompt = { ...prepared, text: entry.text, contextPlan: descriptor };
-      const required = measureBootstrapRequiredCosts({ snapshot, planId, manifestDigest, limits, deliveryByTarget,
-        manual: input.compileOptions?.manualControl === true, started, ...(reuse ? { reuse } : {}) });
       for (const [id, cost] of Object.entries(media.imageResponseCosts)) if (deliveryByTarget[id]?.required) {
         required.retry.tokens = Math.max(required.retry.tokens, cost.total_tokens);
         required.retry.wire_bytes = Math.max(required.retry.wire_bytes, cost.wire_bytes);
@@ -625,16 +642,16 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       assertCandidateCapacity(compiled, costs);
       if (costs.requiredNavigationWireBytes > limits.maxTotalWireBytes
         || costs.requiredMcpTokens + costs.discoveryReserveTokens + costs.errorReserveTokens + required.retry.tokens > limits.maxTotalTokens) {
-        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The complete required reads, directory, retry and corrective replies exceed the navigation budget", { limit: "required_reads", costs });
+        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The complete required batches, controls, recovery and corrective replies exceed the navigation budget", { limit: "required_reads", costs });
       }
       if (compiled.images.length !== media.attachmentCount || compiled.images.length + (compiled.skillFiles?.length ?? 0) > 10) {
         throw new ContextDeliveryPlanningError("CONTEXT_IMAGE_UNAVAILABLE", "The short bootstrap does not preserve its selected image attachment routes");
       }
-      const registration: ContextPlanRegistration = { snapshot, planId, manifestDigest, startupProtocol: "context-bootstrap-v1", deliveryByTarget, limits,
+      const registration: ContextPlanRegistration = { snapshot, planId, manifestDigest, startupProtocol: "context-bootstrap-v1", deliveryByTarget, limits, budgetProfile,
         ...(reuse ? { reuse } : {}),
         remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: limits.maxTotalWireBytes, reserved_wire_bytes: 0 },
         requiredImageTokenReserves: media.requiredImageTokenReserves, requiredImageWireReserves: media.requiredImageWireReserves,
-        requiredTextPageCosts: required.pageCosts, requiredReturnRetryReserve: required.retry };
+        requiredTextBatches: required.batches, requiredControlReserve: required.control, requiredReturnRetryReserve: required.retry };
       return { snapshot, compiled, projected, navigationEnabled: true, externalizedTargetIds: [...externalized, ...added],
         registration, planId, manifestDigest, bodyDigest: hash(compiled.text), costs, limits };
     }
@@ -642,8 +659,6 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
   };
   if (reuseAvailable && input.contextBootstrapAvailable !== false && !input.compileOptions?.captureLunaCheckpoint) return bootstrapCandidate();
   if (!fitsComposer(original) && input.contextBootstrapAvailable !== false && !input.compileOptions?.captureLunaCheckpoint) return bootstrapCandidate();
-  const omittedHistory = input.snapshot.targets.some(t => !selected.has(t.target_id) && t.read_ref
-    && (t.kind === "tool_arguments" || t.kind === "tool_result" || t.kind === "image"));
   const currentImages = imageParts.size > 0;
   const eligible = input.snapshot.targets.filter(t => selected.has(t.target_id) && t.read_ref
     && (t.kind === "tool_arguments" && t.source_kind === "assistant" || t.kind === "tool_result" && t.source_kind === "tool"))

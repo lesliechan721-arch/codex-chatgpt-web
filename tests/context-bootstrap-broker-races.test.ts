@@ -68,10 +68,10 @@ function plan(withImages: boolean): ContextPlanRegistration {
     { type: "input_image", image_url: `data:image/png;base64,${image}` },
     { type: "input_image", image_url: `data:image/png;base64,${image}` },
   ] }] : [] }));
-  const snapshot = appendFixedContextRecords(base, [{ text: "Required original instruction 中文😀. ".repeat(180) + "LAST_REQUIRED_RULE",
+  const snapshot = appendFixedContextRecords(base, [{ text: "Required original instruction 中文😀. ".repeat(1800) + "LAST_REQUIRED_RULE",
     encoding: "utf-8", origin: "context_bootstrap_payload" }]);
   return { snapshot, planId: "races-plan", manifestDigest: "races-manifest", startupProtocol: "context-bootstrap-v1",
-    limits: { readBytes: 4000, readTokens: 1500 }, deliveryByTarget: Object.fromEntries(snapshot.targets.map(target => [target.target_id,
+    deliveryByTarget: Object.fromEntries(snapshot.targets.map(target => [target.target_id,
       target.kind === "image" ? { delivery: target.target_id === "t_1" ? "on_demand" : "attachment", required: true,
         media_route: target.target_id === "t_1" ? "mcp" : "attachment" } : { delivery: "source_required", required: true }])) };
 }
@@ -112,11 +112,11 @@ test(`bootstrap mixed text/MCP/attachments remain independent (${mode.contract},
       }
     }
     const text = value.snapshot.targets.find(t => t.kind !== "image")!;
-    const page = await f.query(value, { context_id: value.snapshot.context_id, read_ref: text.read_ref! });
-    expect(parseContextTextReadResult(page.result).metadata.has_more).toBe(true); await f.finish(page);
+    const page = await f.query(value, { context_id: value.snapshot.context_id, reads: [{ read_ref: text.read_ref! }] });
+    expect(parseContextTextReadResult(page.result).metadata.items[0]!.has_more).toBe(true); await f.finish(page);
     expect(await f.owner.contextStatus(f.token)).toMatchObject({ text_ready: false, images_ready: false, delivered_images: 0 });
     const before = (await f.owner.contextStatus(f.token))!;
-    expect(before.next_required_read!.arguments.read_ref).toBe(value.snapshot.targets[0]!.read_ref!);
+    expect(before.next_required_read!.arguments.reads[0]!.read_ref).toBe(value.snapshot.targets[0]!.read_ref!);
     await f.finish(await f.query(value, before.next_required_read!.arguments));
     expect(await f.owner.contextStatus(f.token)).toMatchObject({ delivered_images: 1, images_ready: false, text_ready: false });
     await expect(f.owner.confirmContextAttachments(f.token, { planId: value.planId, manifestDigest: "wrong" }, context(0)))
@@ -148,13 +148,13 @@ test(`bootstrap keeps fixed source receipts separate from real update/ACK/final 
     const delivery1 = (await f.wait(1)).taskUpdate!;
     expect(delivery1).toMatchObject({ throughRevision: 1, updates: [{ content: first.updates[0]!.content }] });
     const text = value.snapshot.targets[0]!;
-    const inFlight = await f.query(value, { context_id: value.snapshot.context_id, read_ref: text.read_ref! });
+    const inFlight = await f.query(value, { context_id: value.snapshot.context_id, reads: [{ read_ref: text.read_ref! }] });
     const fixedPage = parseContextTextReadResult(inFlight.result);
     const during = f.transfer("during-read", 1, [], "continuity");
     expect(await f.accept(during)).toMatchObject({ status: "committed", state: { acceptedRevision: 2, acknowledgedRevision: 0 } });
     await f.finish(inFlight);
     expect(await f.owner.taskUpdateState(f.token)).toMatchObject({ acceptedRevision: 2, acknowledgedRevision: 0 });
-    expect(await f.owner.contextStatus(f.token)).toMatchObject({ text_ready: false, delivered_text_bytes: fixedPage.metadata.range.end_exclusive });
+    expect(await f.owner.contextStatus(f.token)).toMatchObject({ text_ready: false, delivered_text_bytes: fixedPage.metadata.items[0]!.range.end_exclusive });
     const manifest = await f.query(value); await f.finish(manifest);
     expect(manifest.result.structuredContent).toMatchObject({ context_id: value.snapshot.context_id, plan_id: value.planId,
       manifest_digest: value.manifestDigest, revision: 2, acknowledged_revision: 0 });

@@ -35,9 +35,12 @@ function fixture(mode: "automatic" | "manual" = "automatic") {
 // Isolated local receipt fixtures use the production text transport and receipt validator.
 // They are not copied to DEV and are not evidence of remote/cloud verification.
 function receipts(): ContextCapabilityReceipts {
-  const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: "Inert fixture receipt source." }));
+  const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: [
+    { role: "user", content: "First inert fixture receipt source." },
+    { role: "user", content: "Second inert fixture receipt source." },
+  ] }));
   const read = (purpose: "normal" | "compaction") => contextTextReadReceipt(new ContextNavigator({ scopeId: "profile-receipt-fixture", snapshot, purpose })
-    .read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }));
+    .read({ context_id: snapshot.context_id, reads: snapshot.targets.map(target => ({ read_ref: target.read_ref! })) }));
   return { ordinary: { list: true, search: true, read: true, text_read: read("normal") },
     compaction: { list: true, search: true, read: true, text_read: read("compaction") } };
 }
