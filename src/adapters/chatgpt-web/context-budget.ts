@@ -7,8 +7,8 @@ import type { ContextRemainingBudget } from "./context-types";
  * Image limits allow the measured small PNGs; larger client limits are unproven.
  * Time is active processing time only, never time between authorized calls. */
 export const CONTEXT_LIMITS = Object.freeze({
-  listEntries: 20, searchHits: 10, listBytes: 12 * 1024, searchBytes: 12 * 1024,
-  readBytes: 24 * 1024, listTokens: 1_500, searchTokens: 1_500, readTokens: 2_500,
+  listEntries: 50, searchHits: 10, listBytes: 48 * 1024, searchBytes: 12 * 1024,
+  readBytes: 64 * 1024, listTokens: 6_000, searchTokens: 1_500, readTokens: 8_000,
   wireReserveBytes: 128, tokenReserve: 32, labelChars: 120, snippetChars: 160,
   maxImageBytes: 4 * 1024 * 1024, imageWireBytes: 6 * 1024 * 1024,
   imageMetadataTokens: 1_500, maxImageReads: 64, maxTotalImageBytes: 32 * 1024 * 1024,
@@ -19,8 +19,28 @@ export const CONTEXT_LIMITS = Object.freeze({
   // consume unused reply slots; errors never borrow required-media or summary reserves.
   maxErrorResponses: 3, errorResponseTokens: 128, errorResponseBytes: 512,
 });
-export type ContextLimits = typeof CONTEXT_LIMITS;
-export type ContextLimitOverrides = { [K in keyof ContextLimits]?: number };
+export type ContextLimits = { readonly [K in keyof typeof CONTEXT_LIMITS]: number };
+export type ContextLimitOverrides = { -readonly [K in keyof ContextLimits]?: number };
+
+export const CONTEXT_BUDGET_PROFILES = Object.freeze({
+  expanded: Object.freeze({ readBytes: 64 * 1024, readTokens: 8_000, listBytes: 48 * 1024, listTokens: 6_000, listEntries: 50 }),
+  conservative: Object.freeze({ readBytes: 24 * 1024, readTokens: 2_500, listBytes: 12 * 1024, listTokens: 1_500, listEntries: 20 }),
+});
+export type ContextBudgetProfile = keyof typeof CONTEXT_BUDGET_PROFILES;
+/** Read once at new-plan admission, never from an active navigator. */
+export function configuredContextBudgetProfile(): ContextBudgetProfile {
+  const value = process.env.CODEX_CONTEXT_BUDGET_PROFILE ?? "expanded";
+  if (value !== "expanded" && value !== "conservative") throw new Error("Invalid CODEX_CONTEXT_BUDGET_PROFILE");
+  return value;
+}
+/** Trusted preparation configuration. Existing scopes never read mutable configuration. */
+export function contextBudgetProfileLimits(profile: ContextBudgetProfile = "expanded"): ContextLimitOverrides {
+  const limits = CONTEXT_BUDGET_PROFILES[profile];
+  if (!limits) throw new Error("Invalid context budget profile");
+  return { ...limits };
+}
+/** Broker-issued ASCII credentials and their one property fit within this allowance. */
+export const CONTEXT_CREDENTIAL_ARGUMENT_BYTES = 1024;
 
 export function contextLimits(overrides: ContextLimitOverrides = {}): ContextLimits {
   const result = { ...CONTEXT_LIMITS, ...overrides };
@@ -119,9 +139,16 @@ export function measureContextResponse(result: BrokerToolResult, options: {
       const match = /"b":"[a-f0-9]{64}"/.exec(raw);
       if (parsed.v !== 1 || !match || Object.keys(parsed).sort().join(",") !== "b,k,n,q,t,v") return Buffer.byteLength(cursor);
       const begin = match.index + 5;
-      const first = Math.floor(begin / 3) * 4, last = Math.ceil((begin + 64) / 3) * 4;
-      return estimateTokens(parts[0]!.slice(0, first)) + last - first
-        + estimateTokens(parts[0]!.slice(last) + ".") + parts[1]!.length;
+      const number = /"n":([0-9]+)/.exec(raw);
+      if (!number) return Buffer.byteLength(cursor);
+      const intervals = [[Math.floor(begin / 3) * 4, Math.ceil((begin + 64) / 3) * 4],
+        [Math.floor((number.index + 4) / 3) * 4, Math.ceil((number.index + 4 + number[1]!.length) / 3) * 4]];
+      let position = 0, cost = 0;
+      for (const [first, last] of intervals) {
+        cost += estimateTokens(parts[0]!.slice(position, first)) + last! - first!;
+        position = last!;
+      }
+      return cost + estimateTokens(parts[0]!.slice(position) + ".") + parts[1]!.length;
     } catch { return Buffer.byteLength(cursor); }
   };
   let fragments = [serializedText], cursorTokens = 0;

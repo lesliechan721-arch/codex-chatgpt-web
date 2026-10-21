@@ -633,7 +633,15 @@ export function createChatGptWebAdapter(
     // Preserve runTurn's deterministic validation order before accepting trusted authority.
     if (!parsed._compactionRequest) createChatGptStructuredOutputValidator(parsed.options.outputFormat);
     const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
-    if ((parsed._conversationPolicy !== "task" && chatGptWebTurnRetryPolicy.exhaustedError(retryKey)) || !mode.localTools) return;
+    if (parsed._conversationPolicy !== "task" && chatGptWebTurnRetryPolicy.exhaustedError(retryKey)) return;
+    if (!mode.localTools) {
+      if (parsed._compactionRequest && parsed._conversationPolicy === "task" && toolAuthorityMode === "verified-environment") {
+        // Standalone compaction owns a new control turn. Only the actual rollout can
+        // bind its retained source turn, even while business tools remain closed.
+        await resolveTrustedEnvironment(parsed, abortSignal);
+      }
+      return;
+    }
     preparedEnvironment = { parsed, environment: await resolveToolAuthority(parsed, abortSignal) };
   };
 
@@ -1028,6 +1036,12 @@ export function createChatGptWebAdapter(
           try { const page = await inspectLauncherContinuityConversation(continuity.descriptor, conversationKey!, (continuityLease ?? continuity.expected)!);
             alive = page.state === "ready" || page.state === "running"; } catch {}
           if (!alive) {
+            // A retired writer can finish while cold compaction is preparing. Check
+            // ownership after the awaited inspection, before deleting its source ledger.
+            if (continuity.binding.recovery) {
+              try { assertRecoveryWriter(ref ?? continuity.binding.recovery); }
+              catch { throw error; }
+            }
             diagnose("closed-or-unknown", "unconfirmed", "page-recovery");
             forgetContinuityPage();
             throw error;

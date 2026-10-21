@@ -175,18 +175,18 @@ upstream API forwarding, legacy inline, compaction and existing multipart regres
 | --- | --- |
 | Exact planning | About 30,000 code points of injected rules, a short request, no history/images; both modes use a fixed entry at most 3,000 code points and final text within the effective limit. Test common and mode-specific configuration, invalid values, exact boundaries, emoji, escaping, whitespace and complete long ordered user requests. |
 | Source fidelity | Reconstruct the selected value tree, including source roles/order, skill paths, unknown structures, null, false and empty values. Preserve applicable instructions, delegation, summaries and assistant history. Body role/control imitations cannot change authority. |
-| Delivery | Missing/overlapping/repeated/out-of-order pages, empty sources, multibyte boundaries, malformed v2 metadata, failed transport, wrong digest/index/range, cross-source/scope, revocation and late receipts. Only valid range unions reach ready. |
+| Delivery | Missing/overlapping/repeated/out-of-order pages, empty sources, multibyte boundaries, malformed batch-v1 metadata, failed transport, wrong digest/index/range, cross-source/scope, revocation and late receipts. Only valid range unions reach ready. |
 | Execution | Early business calls, inventory and no-tool direct success fail in both modes; existing wait/replay/ACK/control remains usable. Rejected IDs stay rejected; new decisions use new IDs. Verify atomic generation/revision checks and exact output-schema values. |
 | Independent controls | MCP and fallback images, configured Sent on/off, duplicate start, pending Sent without read spending, and image-first guidance. Text does not advance image progress or extend deadlines. Updates and ACK remain independent of initial coverage. |
-| Capacity | All manifest pages, startup/result wrappers, cursors, required pages/images, corrective replies, repeat reads and working reserves count. On-demand reads cannot exhaust protected required capacity. A shorter composer can cost more total tokens. Impossible complete plans fail before Send. |
+| Capacity | All fixed required batches, initial/final overview, image recovery controls, startup/result wrappers, cursors, required images, corrective replies, one maximum-return recovery allowance and working reserves count. No mandatory entries traversal is reserved. On-demand reads cannot exhaust protected required capacity. A shorter composer can cost more total tokens. Impossible complete plans fail before Send. |
 | Lifecycle | Same-scope retry, retained suffix, new-page/cold recovery, restart, unknown Send, active updates before/during/after reading, final lock, cancellation and compaction. Fresh scopes start with zero coverage; compaction keeps optional reads. |
-| Compatibility | Missing/old/failed diagnosis does not select a plan. Current missing capabilities and remote old schema fail explicitly; valid custom identities remain supported. Only a complete pre-send legacy plan within all limits can fall back. No post-send automatic reroute. |
-| Protocol migration | Account for P01–P13: role/trust, execution, wait, updates, navigation, v2 read, images, attachments/skills, real errors and safety recovery, retained/recovered context, output schema, final output and mode-specific completion. Verify all unique conditions and exceptions remain reachable. Server instructions/tool descriptions must not repeat full protocols. Current errors alone select recovery; the three-attempt rule applies only to unexplained platform safety-check rejection. |
+| Compatibility | Missing/old/failed diagnosis does not select a plan. Current missing capabilities and remote old schema fail explicitly; valid custom identities remain supported. Only a complete pre-send candidate independent of the incompatible context interface can fall back; old read parameters cannot. No post-send automatic reroute. |
+| Protocol migration | Account for P01–P13: role/trust, execution, wait, updates, navigation, batch-v1 read, images, attachments/skills, real errors and safety recovery, retained/recovered context, output schema, final output and mode-specific completion. Verify all unique conditions and exceptions remain reachable. Server instructions/tool descriptions must not repeat full protocols. Current errors alone select recovery; the three-attempt rule applies only to unexplained platform safety-check rejection. |
 
 For real-platform A15 acceptance, compare old/new inputs on the same model, interaction mode and
 effort. Alternate order and run at least three pairs for each tested combination. Include harmless
 rules and request details found only on the last required page. Do not reveal those details in
-the entry, directory previews or expected answer. Record actual v2 bodies, read order, first business
+the entry, directory previews or expected answer. Record actual batch-v1 bodies, read order, first business
 dispatch and final answer. Test the actual composer to confirm that text was not converted to an
 attachment, and retain remote-connector evidence separately from local schema checks. Zero Risk
 must retain manual connector choice, paste, Send, configured Sent and image confirmation.
@@ -239,11 +239,12 @@ expanded permissions or duplicate business dispatch block acceptance.
 
 ## Context rendering validation
 
-The browser renderer and MCP text-read-v2 require separate evidence from the earlier context
+The browser renderer and MCP text-batch-v1 require separate evidence from the earlier context
 navigation observations above. Local round-trip, pagination, protocol, receipt, and control tests
 do not establish release readiness. Current connector names remain unchanged for this unreleased
 update; reconnect/refresh the same connector if needed. When validating the optional diagnosis,
-obtain version-2 Verify runtime evidence from all six real calls. Normal use does not require it.
+obtain current batch-v1 Verify runtime evidence from all six real calls, with at least two
+independent text bodies in each ordinary/compaction read. Normal use does not require it.
 
 For Automatic and Zero Risk, record the actual runtime, model, effort, client path, source fixture,
 selected format, and observation limits:
@@ -252,8 +253,9 @@ selected format, and observation limits:
    extraction. Cover long code, links, nested/long fences, LF, tabs, and trailing whitespace. Zero
    Risk keeps manual paste/Send/Sent. Only actual evidence for a path can enable its whitespace
    allowances; default production policy retains these fields in JSON.
-2. Confirm two text blocks reach the real MCP client: matching metadata in the first block and
-   structured content, and the unique exact body in the second. Cover empty and paginated sources.
+2. Confirm matching metadata in the first text block and structured content, and every independent
+   body selected by `items[].body_content_index`. Request at least two fixed sources in each read;
+   validate all blocks and the actual successful transport batch receipt. Cover empty and paginated sources.
    The new verifier's ordinary and compaction shape/transport receipts must pass; they do not prove
    the model used the body.
 3. In separate real ordinary tasks and compaction transactions, extract a unique body-only fragment
@@ -273,14 +275,50 @@ selected format, and observation limits:
 
 Missing editor evidence blocks that browser allowance. Missing any required real ordinary or
 compaction body-use evidence blocks stage-two release. A client that cannot update under the
-current identity stops v2 enablement; it does not authorize a new connector name or weaker budget.
+current identity stops batch-v1 use; it does not authorize a new connector name or weaker budget.
 
 `bun run scripts/measure-context-rendering.ts` produces the offline cost replay with forced legacy,
-forced new, and automatic candidates; all use MCP v2. `bun run scripts/validate-context-rendering.ts
+forced new, and automatic candidates; all use MCP batch-v1. `bun run scripts/validate-context-rendering.ts
 check` checks the default DEV setup, and `plan` prints the fixed live matrix without sending a task.
 Its explicit `run` action creates a real model task and records observed evidence. Use the project
 development Launcher so its supervised MCP process loads the checkout; a source path in a copied
 configuration does not prove that an installed Launcher uses that runtime.
+
+## Context batch and short-start validation
+
+Protocol 4, manifest 3 and `context-text-batch-v1` require fresh acceptance. Historical single-read,
+image and renderer results above do not prove this contract or its larger response limits.
+Real Automatic, Zero Risk and applicable installed Codex validation is pending. Local parser,
+DEV simulation and offline replay do not establish remote schema adoption or model body use.
+
+Use saved fixed sources: one about 65 KiB; 24 short sources totaling about 9 KiB; dense multibyte
+text; empty text; and necessary details only in the last page or last returned item. Compare the
+historical baseline, conservative batch-v1 and expanded batch-v1 separately. Isolate larger-page
+benefit from source grouping. Observe multiple actual bodies in a response and fewer read calls
+than per-source reading where grouping fits; do not assume 24 sources always take three calls.
+Check zero required `entries` calls in normal pure-text startup, the fixed successor chain and
+final settled overview. Test single text, single image, mixed-image plans and failure recovery;
+images retain their separate receipt/confirmation and Send/Sent/ACK remain independent.
+
+Local acceptance must cover strict 0/1/8/9 arrays, duplicate targets, invalid suffixes, old schemas,
+complete UTF-8 reconstruction, all-block validation, packaging/argument limits, deterministic
+partial pages, whole-batch receipts, cancellation, late scope callbacks and canonical replay.
+Prove that partial coverage does not release proportional reservation credit, generated response
+costs remain charged after failed transport, one finite maximum-return allowance serves both retry and replay, and the
+final overview retains it until first business/success admission. Impossible complete plans fail
+before Send; running out of recovery cannot waive coverage or consume protected workspace funds.
+Compaction may still read partially or not at all and waits for in-flight reads before submission.
+
+Real validation must record remote acceptance of the array schema, intact maximum candidate
+responses, use of last-page/item details, readiness before work and elapsed time. Record requested
+and returned items per batch, body read calls, overview and entries calls separately, complete
+response bytes, estimated tokens, unique/repeated body bytes and the actual limiting budget.
+Separate generation costs from successful transport metrics. `before_first_work.elapsed_ms`
+starts at scope diagnostics, not browser Send. Separately record actual Send or confirmed manual
+Send to first business admission; identify waiting for Sent/image confirmation. Keep actual model
+input tokens unknown unless observed. No fixed speedup or platform-capacity claim is accepted
+before these measurements. If expanded fails, choose conservative only for a new plan; never
+switch a sent plan to old arguments/format or automatically Send again.
 
 ## Session continuity validation
 

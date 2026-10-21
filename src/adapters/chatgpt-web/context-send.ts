@@ -1,3 +1,4 @@
+import { configuredContextBudgetProfile } from "./context-budget";
 import type { ContextReuseBaseline } from "./context-reuse-types";
 import { randomBytes } from "node:crypto";
 import type { CodexParsedRequest } from "../../types";
@@ -40,13 +41,15 @@ export class ContextSend {
     retainedTokens = 0): Promise<ContextDeliveryPlan> {
     if (this.retired || !this.initialSource) throw new Error("The physical context send is retired");
     const startedAt = performance.now();
-    const bootstrapAvailable = await this.broker.contextBootstrapAvailable?.() ?? false;
+    const contextToolsAvailable = await this.broker.contextToolsAvailable?.() ?? false;
+    const bootstrapAvailable = contextToolsAvailable && (await this.broker.contextBootstrapAvailable?.() ?? false);
+    const budgetProfile = configuredContextBudgetProfile();
     const reuseAvailable = bootstrapAvailable && (await this.broker.contextReuseAvailable?.() ?? false);
     const baseline = options.retainedContinuity ? this.reuseBaseline : undefined;
     const planInput = { canonical: this.canonical, snapshot: this.initialSource, candidate,
       messageIndices: contextCandidateMessageIndices(this.canonical, candidate), capabilities: this.capabilities,
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
-      turnToken: token, compileOptions: options, contextToolsAvailable: true,
+      turnToken: token, compileOptions: options, contextToolsAvailable, budgetProfile,
       experimentalBiggerContext: this.experimentalBiggerContext,
       contextBootstrapAvailable: bootstrapAvailable, contextReuseAvailable: reuseAvailable,
       ...(baseline ? { reuseBaseline: baseline } : {}), budget: { retainedTokens } };
@@ -71,6 +74,7 @@ export class ContextSend {
     console.info(`[chatgpt-web] context_prepared ${JSON.stringify({ prepare_ms: performance.now() - startedAt,
       prompt_code_points: costs.promptCodePoints, retained_tokens: costs.retainedTokens, total_tokens: costs.requiredTotalTokens,
       prompt_serialized_bytes: costs.promptJsonBytes, reuse: costs.reuse,
+      context_budget_profile: budgetProfile, context_limits: plan.limits,
       budget: { context_window_tokens: costs.contextWindowTokens, retained_tokens: costs.retainedTokens,
         current_plan_tokens: costs.requiredTotalTokens - costs.retainedTokens - costs.platformReserveTokens,
         prompt_tokens: costs.promptTokens, required_mcp_tokens: costs.requiredMcpTokens,

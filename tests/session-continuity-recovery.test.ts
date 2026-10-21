@@ -1179,9 +1179,11 @@ for (const checkpoint of [false, true]) test(`unified recovery: an oversized rea
     };
     const found = (await query("search", { query: tail })).structuredContent as { hits: Array<{ read_ref: string; read_cursor: string }> };
     expect(found.hits).toHaveLength(1);
-    const read = await query("read", { read_ref: found.hits[0]!.read_ref, cursor: found.hits[0]!.read_cursor });
+    const read = await query("read", { reads: [{ read_ref: found.hits[0]!.read_ref, cursor: found.hits[0]!.read_cursor }] });
     const { parseContextTextReadResult } = await import("../src/adapters/chatgpt-web/context-text-result");
-    readBody = parseContextTextReadResult(read).body;
+    const page = parseContextTextReadResult(read);
+    expect(page.bodies).toHaveLength(1);
+    readBody = page.bodies[0]!;
     expect(readBody).toContain(tail);
     f.pages.get(turn.conversationKey!)!.state = "ready";
     turn.onTextDelta("Continued from the real stored tail.");

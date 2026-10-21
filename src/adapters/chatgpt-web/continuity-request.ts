@@ -208,7 +208,7 @@ function checkpointResumeInput(
         && inbox.readBody(identity, user.sourceMessageId) === user.content;
     })) bindDurableQueuedInstructionInput(parsed, suffix.map((_, index) => index + 1));
   }
-  const suffix = continuation?.suffix ?? continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
+  const suffix = continuation?.suffix ?? continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index, rejectExecutionOutput: true });
   const hasNewInstruction = hasInitialChatGptTurnInstruction(parsed) && hasNativeChatGptInstruction(parsed, suffix);
   if (hasNewInstruction) chatGptTurnSessions.assertUnconsumedContinuityInstruction(binding, parsed);
   else if (continuityInstructionIdentity(parsed) !== instructionPrevious.instructionIdentity) {
@@ -291,7 +291,7 @@ function recoveredCheckpointNewInstruction(
   }
   const instructionPrevious = { instructionIdentity: source.instructionIdentity, nativeTurnId: source.nativeTurnId,
     checkpointDigest: proof.digest };
-  const suffix = continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index });
+  const suffix = continuityCurrentInstructionInput(parsed, { ...instructionPrevious, trustedLowerBound: proof.index, rejectExecutionOutput: true });
   if (!hasNativeChatGptInstruction(parsed, suffix)) throw continuityError("continuity_source_unproven");
   return { suffix, instructionPrevious };
 }

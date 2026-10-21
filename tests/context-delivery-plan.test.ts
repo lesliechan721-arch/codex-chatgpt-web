@@ -92,11 +92,13 @@ test("large history fields use the real compiler and exact pagination without ch
   const nav = navigator(result), contextId = entry(result).context_id;
   let read = "", cursor: string | undefined, end = 0;
   do {
-    const response = nav.read({ context_id: contextId, read_ref: field.read_ref, ...(cursor ? { cursor } : {}) });
+    const response = nav.read({ context_id: contextId, reads: [{ read_ref: field.read_ref, ...(cursor ? { cursor } : {}) }] });
     expect(response.isError).not.toBe(true);
-    const body = response.structuredContent as Record<string, any>;
+    const page = parseContextTextReadResult(response);
+    expect(page.metadata.items).toHaveLength(1);
+    const body = page.metadata.items[0]!;
     expect(body.range.start).toBe(end);
-    const textPage = parseContextTextReadResult(response).body;
+    const textPage = page.bodies[0]!;
     expect(textPage).not.toContain("�");
     expect(body.range.end_exclusive).toBeGreaterThan(end);
     read += textPage; end = body.range.end_exclusive; cursor = body.next_cursor ?? undefined;
@@ -197,6 +199,16 @@ test("mandatory history navigation keeps low-token selected logs inline and stil
   expect(() => plan(canonical, { snapshot, candidate, budget: { retainedTokens } })).toThrow("exceed the context budget");
 });
 
+test("an incompatible current context contract cannot silently drop omitted history", () => {
+  const canonical = logRequest("historical evidence must remain available");
+  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
+  expect(plan(canonical, { candidate }).navigationEnabled).toBe(true);
+  expect(() => plan(canonical, { candidate, contextToolsAvailable: false })).toThrow("Refresh its context tool schema");
+  const complete = plan(canonical, { contextToolsAvailable: false });
+  expect(complete.navigationEnabled).toBe(false);
+  expect(complete.compiled.text).toContain("historical evidence must remain available");
+});
+
 test("plan costs and body identity use the chosen presentation of the same selected input", () => {
   const canonical = request([{ role: "user", content: JSON.stringify(Array.from({ length: 400 }, (_, i) => ({
     id: i, value: '"quoted"', path: `C:\\source\\${i}.ts`,
@@ -230,7 +242,7 @@ test("externalization threshold uses mixed field cost instead of escaped JSON sa
 
 test("multiple medium fields can jointly repay the complete entry cost", () => {
   const canonical = request(Array.from({ length: 6 }, (_, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
-    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(200)}`, isError: false, timestamp: index })));
+    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(300)}`, isError: false, timestamp: index })));
   const result = plan(canonical);
   expect(result.navigationEnabled).toBe(true);
   expect(result.externalizedTargetIds).toHaveLength(6);
@@ -251,8 +263,9 @@ test("resume and short second-round inputs publish a new visible entry for omitt
   expect(entry(resume).first_call.arguments.turn_token).toBe(token);
   const field = entries(resume).find(value => value.kind === "tool_result")!;
   expect(field.delivery).toBe("source_on_demand");
-  const read = navigator(resume).read({ context_id: entry(resume).context_id, read_ref: field.read_ref });
-  expect(parseContextTextReadResult(read).body).toContain("unique unread suffix");
+  const read = navigator(resume).read({ context_id: entry(resume).context_id, reads: [{ read_ref: field.read_ref }] });
+  expect(parseContextTextReadResult(read).bodies).toHaveLength(1);
+  expect(parseContextTextReadResult(read).bodies[0]).toContain("unique unread suffix");
 });
 
 test("re-parsed candidates require an explicit map and do not infer repeated call identities", () => {
@@ -332,15 +345,17 @@ test("partial and full log replays count complete MCP response overhead and repe
   wire += measureContextResponse(search).wire_bytes;
   let cursor: string | undefined, calls = 0, partial = 0;
   do {
-    const response = nav.read({ context_id: contextId, read_ref: field!.read_ref, ...(cursor ? { cursor } : {}) });
+    const response = nav.read({ context_id: contextId, reads: [{ read_ref: field!.read_ref, ...(cursor ? { cursor } : {}) }] });
     expect(response.isError).not.toBe(true);
     wire += measureContextResponse(response).wire_bytes; calls++;
     if (calls === 1) partial = wire;
-    cursor = (response.structuredContent as any).next_cursor ?? undefined;
+    const parsed = parseContextTextReadResult(response);
+    expect(parsed.metadata.items).toHaveLength(1);
+    cursor = parsed.metadata.items[0]!.next_cursor ?? undefined;
   } while (cursor);
   expect(result.costs.promptBytes + partial).toBeLessThan(result.costs.originalPromptBytes);
   expect(result.costs.promptBytes + wire).toBeGreaterThan(result.costs.originalPromptBytes);
-  const repeated = nav.read({ context_id: contextId, read_ref: field!.read_ref });
+  const repeated = nav.read({ context_id: contextId, reads: [{ read_ref: field!.read_ref }] });
   expect(nav.usage().wire_bytes).toBe(wire + measureContextResponse(repeated).wire_bytes);
   expect(calls).toBeGreaterThan(1);
 });
@@ -354,7 +369,7 @@ test("short inputs with more than ten required MCP images do not enter composer 
   expect(entries(result).filter(value => value.kind === "image").every(value => value.media_route === "mcp" && value.required && value.read_ref)).toBe(true);
   expect(result.costs.requiredMcpTokens).toBeGreaterThan(12 * 4096);
   const first = result.registration!.snapshot.targets.find(value => value.kind === "image")!;
-  const read = navigator(result).read({ context_id: entry(result).context_id, read_ref: first.read_ref! });
+  const read = navigator(result).read({ context_id: entry(result).context_id, reads: [{ read_ref: first.read_ref! }] });
   expect(read.content.filter((value: any) => value.type === "image")).toHaveLength(1);
   expect(JSON.stringify(read.structuredContent)).not.toContain("iVBOR");
 });
@@ -411,7 +426,7 @@ test("bounded optional image history preserves the current required image in pla
   const result = plan(canonical, { snapshot, candidate });
   expect(result.registration!.deliveryByTarget[current.target_id]).toMatchObject({ required: true, media_route: "mcp" });
   expect(result.compiled.images).toHaveLength(0);
-  const returned = navigator(result).read({ context_id: snapshot.context_id, read_ref: current.read_ref! });
+  const returned = navigator(result).read({ context_id: snapshot.context_id, reads: [{ read_ref: current.read_ref! }] });
   expect(returned.isError).not.toBe(true);
   expect(returned.content.some((block: any) => block.type === "image")).toBe(true);
   expect(() => preflightContinuityInput(canonical, capabilities)).not.toThrow();
@@ -620,7 +635,7 @@ test("required-media reserve includes the exact complete MCP response and retain
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: png }], timestamp: 1 }]);
   const result = plan(canonical, { budget: { retainedTokens: 12_000, workReserveTokens: 5000 } });
   const target = result.registration!.snapshot.targets.find(value => value.kind === "image")!;
-  const actual = navigator(result).read({ context_id: entry(result).context_id, read_ref: target.read_ref! });
+  const actual = navigator(result).read({ context_id: entry(result).context_id, reads: [{ read_ref: target.read_ref! }] });
   const measured = measureContextResponse(actual, { visualTokens: target.visual_token_reserve! });
   expect(result.registration!.requiredImageTokenReserves![target.target_id]).toBe(measured.total_tokens);
   expect(result.costs.requiredMcpWireBytes).toBe(measured.wire_bytes);
@@ -668,14 +683,14 @@ test("exact directory and required-image reserves survive a corrective reply and
   const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const corrective = scope.prepare("read", { context_id: snapshot.context_id, read_ref: "unknown" });
+    const corrective = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref: "unknown" }] });
     expect(corrective.result.isError).toBe(true);
     scope.finish(corrective.receiptId, true);
     const directory = scope.prepare("list", { context_id: snapshot.context_id, view: "overview" });
     expect(directory.result.isError).not.toBe(true);
     scope.finish(directory.receiptId, true);
     const image = snapshot.targets.find(value => value.kind === "image")!;
-    const returned = scope.prepare("read", { context_id: snapshot.context_id, read_ref: image.read_ref! });
+    const returned = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref: image.read_ref! }] });
     expect(returned.result.isError).not.toBe(true);
     scope.finish(returned.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
@@ -711,7 +726,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     expect(pages).toBe(6); expect(new Set(refs).size).toBe(6);
     expect(scope.navigator.usage().wire_bytes).toBeLessThanOrEqual(result.costs.discoveryReserveWireBytes);
     for (const read_ref of refs) {
-      const returned = scope.prepare("read", { context_id: snapshot.context_id, read_ref });
+      const returned = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref }] });
       expect(returned.result.isError).not.toBe(true); scope.finish(returned.receiptId, true);
     }
     expect(scope.status().context_ready).toBe(true);
@@ -738,13 +753,14 @@ for (const manual of [false, true]) for (const terminal of [false, true]) {
       ...(terminal ? [] : [{ role: "user", content: "Continue" }]),
     ] });
     const snapshot = createContextSnapshot(canonical);
-    const nav = new ContextNavigator({ scopeId: "normal-directory-regression", snapshot, purpose: "normal" });
+    const limits = { listBytes: 12_288, listTokens: 1_500, listEntries: 20 };
+    const nav = new ContextNavigator({ scopeId: "normal-directory-regression", snapshot, purpose: "normal", limits });
     const first = nav.list({ context_id: snapshot.context_id, view: "entries" });
     expect(first.isError).not.toBe(true);
     expect((first.structuredContent as any).has_more).toBe(true);
     expect(nav.preflightListEntry(8).structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
     const candidate = { ...canonical, context: { ...canonical.context, messages: terminal ? [] : canonical.context.messages.slice(-1) } };
-    expect(() => plan(canonical, { snapshot, candidate, compileOptions: manual ? { manualControl: true } : {} }))
+    expect(() => plan(canonical, { snapshot, candidate, limits, compileOptions: manual ? { manualControl: true } : {} }))
       .toThrow("bounded directory page");
   });
 }

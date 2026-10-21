@@ -33,18 +33,18 @@ test("real navigation search finds a signed read cursor without revealing the an
   const target = snapshot.targets.find(target => target.kind === "tool_result")!;
   expect(target.utf8_bytes).toBe(FIXTURE_BYTES);
   const navigator = new ContextNavigator({ scopeId: "isolated-test", snapshot, purpose: "normal" });
-  const opening = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, read_ref: target.read_ref! }));
-  expect(opening.metadata.range.start).toBe(0);
-  expect(opening.body).toStartWith("CONTINUITY_HEAD");
-  expect(opening.body).not.toContain(fixture.tailValue);
+  const opening = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] }));
+  expect(opening.metadata.items[0]!.range.start).toBe(0);
+  expect(opening.bodies[0]!).toStartWith("CONTINUITY_HEAD");
+  expect(opening.bodies[0]!).not.toContain(fixture.tailValue);
   const search = navigator.search({ context_id: snapshot.context_id, read_ref: target.read_ref!, query: "CONTINUITY_TAIL_TARGET" });
   expect(search.isError).not.toBe(true);
   expect(JSON.stringify(search)).not.toContain(fixture.tailValue);
   const hits = (search.structuredContent as { hits: Array<{ read_cursor: string; read_ref: string }> }).hits;
   expect(hits).toHaveLength(1);
-  const tail = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, read_ref: hits[0]!.read_ref, cursor: hits[0]!.read_cursor }));
-  expect(tail.body).toContain(fixture.tailValue);
-  expect(Buffer.from(tail.body).equals(Buffer.from(fixture.text).subarray(tail.metadata.range.start, tail.metadata.range.end_exclusive))).toBe(true);
+  const tail = parseContextTextReadResult(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: hits[0]!.read_ref, cursor: hits[0]!.read_cursor }] }));
+  expect(tail.bodies[0]!).toContain(fixture.tailValue);
+  expect(Buffer.from(tail.bodies[0]!).equals(Buffer.from(fixture.text).subarray(tail.metadata.items[0]!.range.start, tail.metadata.items[0]!.range.end_exclusive))).toBe(true);
 });
 
 test("only explicit run accepts a sending action; invalid, duplicate and removed mode parameters fail before any runtime action", () => {

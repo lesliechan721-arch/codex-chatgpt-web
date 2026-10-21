@@ -32,7 +32,7 @@ async function fixture(remote: boolean, safe = false, sent = false) {
   const contract = safe ? "safe" as const : "native" as const;
   const query = (registration: ContextPlanRegistration, read = true, options: Record<string, unknown> = {}) => callTurnBroker<ContextPreparedReply>(socket, {
     method: "context_query", token, contract, credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
-    contextMethod: read ? "read" : "list", contextArgs: read ? { context_id: registration.snapshot.context_id, read_ref: registration.snapshot.targets.find(t => t.kind === "image")!.read_ref! } : { context_id: registration.snapshot.context_id, view: "entries" }, ...options,
+    contextMethod: read ? "read" : "list", contextArgs: read ? { context_id: registration.snapshot.context_id, reads: [{ read_ref: registration.snapshot.targets.find(t => t.kind === "image")!.read_ref! }] } : { context_id: registration.snapshot.context_id, view: "entries" }, ...options,
   });
   const finish = (reply: ContextPreparedReply, sent = true) => callTurnBroker(socket, { method: "context_return", token, contract, credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent });
   const start = (id: number, cmd = "echo test") => callTurnBroker<NativeOperationReply>(socket, { method: "native_operation_start", token, contract, nativeWaitProtocol: 1, taskUpdateProtocol: 1, operationId: id, taskRevision: 0, entry: "codex_exec", nativeInput: { cmd }, waitMs: 1 });
@@ -142,7 +142,7 @@ test("ready contexts have no idle or business deadline", () => {
   const scope = new ContextScope("scope", a, "normal", () => {}, error => { failed = error; });
   try {
     scope.markEntryDelivered(); scope.openReads();
-    const reply = scope.prepare("read", { context_id: a.snapshot.context_id, read_ref: a.snapshot.targets.find(t => t.kind === "image")!.read_ref! });
+    const reply = scope.prepare("read", { context_id: a.snapshot.context_id, reads: [{ read_ref: a.snapshot.targets.find(t => t.kind === "image")!.read_ref! }] });
     scope.finish(reply.receiptId, true); time += 24 * 60 * 60 * 1000;
     expect(scope.status().context_ready).toBe(true); expect(scope.isLive).toBe(true); expect(failed).toBeUndefined();
     const listing = scope.prepare("list", { context_id: a.snapshot.context_id, view: "overview" }); expect(listing.result.isError).not.toBe(true);
@@ -173,12 +173,12 @@ test("compaction budget rejection allows stopping, while permanent source failur
   try {
     scope.markEntryDelivered();
     const imageRef = a.snapshot.targets.find(t => t.kind === "image")!.read_ref!;
-    const refused = scope.prepare("read", { context_id: a.snapshot.context_id, read_ref: imageRef });
+    const refused = scope.prepare("read", { context_id: a.snapshot.context_id, reads: [{ read_ref: imageRef }] });
     expect(refused.result.isError).toBe(true); expect(refused.result.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
     scope.finish(refused.receiptId, true); expect(() => scope.guardCommit()).not.toThrow();
     const originalRead = scope.navigator.read.bind(scope.navigator);
     scope.navigator.read = () => ({ isError: true, content: [{ type: "text", text: "Source unavailable" }], structuredContent: { error: { code: "IMAGE_UNAVAILABLE" } } });
-    const failed = scope.prepare("read", { context_id: a.snapshot.context_id, read_ref: imageRef }); scope.finish(failed.receiptId, true);
+    const failed = scope.prepare("read", { context_id: a.snapshot.context_id, reads: [{ read_ref: imageRef }] }); scope.finish(failed.receiptId, true);
     scope.navigator.read = originalRead;
     expect(() => scope.guardCommit()).toThrow("permanent read failure");
   } finally { scope.retire(); }
@@ -204,7 +204,7 @@ test("overview refusals preserve complete required-image token and wire reserves
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("image-cost-probe", registration, "normal", () => {}, () => {});
   probe.markEntryDelivered();
-  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, read_ref: target.read_ref! });
+  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
   const cost = measureContextResponse(sampled.result, { visualTokens: target.visual_token_reserve! });
   probe.finish(sampled.receiptId, true); probe.retire();
   const errors = contextErrorReserve();
@@ -217,7 +217,7 @@ test("overview refusals preserve complete required-image token and wire reserves
     const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
     expect(rejected.result.isError).toBe(true); scope.finish(rejected.receiptId, true);
     const errorCost = scope.navigator.usage(); expect(errorCost.wire_bytes).toBeGreaterThan(0); expect(errorCost.text_tokens).toBeGreaterThan(0);
-    const read = scope.prepare("read", { context_id: registration.snapshot.context_id, read_ref: target.read_ref! });
+    const read = scope.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
     expect(read.result.isError).not.toBe(true); scope.finish(read.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
     const usage = scope.navigator.usage();
@@ -232,7 +232,7 @@ test("local navigation caps protect required images without charging shared work
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("local-cost-probe", registration, "normal", () => {}, () => {});
   probe.markEntryDelivered();
-  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, read_ref: target.read_ref! });
+  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
   const cost = measureContextResponse(sampled.result, { visualTokens: target.visual_token_reserve! });
   probe.finish(sampled.receiptId, true); probe.retire();
   const errors = contextErrorReserve();
@@ -244,7 +244,7 @@ test("local navigation caps protect required images without charging shared work
     scope.markEntryDelivered();
     const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
     expect(rejected.result.isError).toBe(true); scope.finish(rejected.receiptId, true);
-    const image = scope.prepare("read", { context_id: registration.snapshot.context_id, read_ref: target.read_ref! });
+    const image = scope.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
     expect(image.result.isError).not.toBe(true); scope.finish(image.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
   } finally { scope.retire(); }
@@ -286,7 +286,7 @@ for (const dimension of ["count", "bytes"] as const) for (const firstRequired of
     }, "normal", () => {}, error => { failed = error; });
     try {
       scope.markEntryDelivered();
-      const read = (read_ref: string) => scope.prepare("read", { context_id: source.context_id, read_ref });
+      const read = (read_ref: string) => scope.prepare("read", { context_id: source.context_id, reads: [{ read_ref }] });
       const firstReturn = read(first!.read_ref!); expect(firstReturn.result.isError).not.toBe(true);
       scope.finish(firstReturn.receiptId, true);
       const duplicate = read(first!.read_ref!); expect(duplicate.result.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
@@ -314,7 +314,7 @@ test("in-flight required images spend their reserve once and gain coverage only 
   const scope = new ContextScope("in-flight-images", registration, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const read = (index: number) => scope.prepare("read", { context_id: source.context_id, read_ref: targets[index]!.read_ref! });
+    const read = (index: number) => scope.prepare("read", { context_id: source.context_id, reads: [{ read_ref: targets[index]!.read_ref! }] });
     const first = read(0); expect(first.result.isError).not.toBe(true);
     const usage = scope.navigator.usage();
     expect(() => read(0)).toThrow("in-flight return"); expect(scope.navigator.usage()).toEqual(usage);
@@ -331,7 +331,7 @@ for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} owner u
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("usage-cost", registration, "normal", () => {}, () => {});
   probe.markEntryDelivered();
-  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, read_ref: target.read_ref! });
+  const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
   const cost = measureContextResponse(sampled.result, { visualTokens: target.visual_token_reserve! });
   probe.finish(sampled.receiptId, true); probe.retire();
   registration.requiredImageTokenReserves = { [target.target_id]: cost.total_tokens };
@@ -353,7 +353,10 @@ for (const remote of [false, true]) test(`${remote ? "Remote" : "Local"} owner u
     expect(current.usage.text_tokens).toBeGreaterThan(repeated.usage.text_tokens); expect(current.usage.error_responses).toBe(1);
     await f.owner.revoke(f.token, new Error("usage settlement test"), ownerContext);
     const final = await f.owner.contextUsage(f.token);
-    expect(final).toEqual({ ...current, final: true }); expect(await f.owner.contextStatus(f.token)).toBeUndefined();
+    expect(final!.reuse_diagnostics!.elapsed_ms).toBeGreaterThanOrEqual(current.reuse_diagnostics!.elapsed_ms);
+    expect(final).toEqual({ ...current, final: true,
+      reuse_diagnostics: { ...current.reuse_diagnostics!, elapsed_ms: final!.reuse_diagnostics!.elapsed_ms } });
+    expect(await f.owner.contextStatus(f.token)).toBeUndefined();
     await expect(callTurnBroker(f.socket, { method: "owner_context_usage", token: f.token, contextProtocol: 999 })).rejects.toMatchObject({ code: "CONTEXT_INVALID" });
     await f.owner.releaseContextUsage(f.token); expect(await f.owner.contextUsage(f.token)).toBeUndefined();
   } finally { await f.close(); }

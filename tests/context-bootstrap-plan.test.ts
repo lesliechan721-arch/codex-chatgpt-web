@@ -19,8 +19,8 @@ import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
 const credential = `turn_${"a".repeat(32)}`;
-function fixture(texts = ["请检查结尾规则。🙂  \n"], trusted = true) {
-  const parsed = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Use task rule.\n".repeat(2000),
+function fixture(texts = ["请检查结尾规则。🙂  \n"], trusted = true, ruleRepeats = 2000) {
+  const parsed = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "Use task rule.\n".repeat(ruleRepeats),
     input: texts.map((text, index) => ({ type: "message", id: `message-${index}`, role: "user",
       content: [{ type: "input_text", text }],
       internal_chat_message_metadata_passthrough: { turn_id: "turn", content_item_kinds: ["user.text"] } })),
@@ -60,12 +60,12 @@ for (const manual of [false, true]) test(`long rules and no history or images se
   expect(source.payload).toEqual(result.compiled.bootstrapContent!.payload);
   expect(result.costs.requiredTextTokens).toBeGreaterThan(0);
   expect(result.costs.requiredRetryTokens).toBeGreaterThan(0);
-  expect(result.registration!.requiredTextPageCosts && Object.values(result.registration!.requiredTextPageCosts!).some(pages => pages.length > 1)).toBeTrue();
+  expect(result.registration!.requiredTextBatches!.length > 1).toBeTrue();
   expect(restoreContextSnapshot(serializeContextSnapshot(result.snapshot)).toWire()).toEqual(result.snapshot.toWire());
   if (process.env.CONTEXT_BOOTSTRAP_METRICS === "1") console.info(JSON.stringify({ mode: manual ? "Zero Risk" : "Automatic",
     sample: "Use task rule.\\n repeated 2000 times", sourceCodePoints: 30_000,
     utf16: result.compiled.text.length, utf8: Buffer.byteLength(result.compiled.text), snapshotBytes: result.snapshot.storage_bytes,
-    ...result.costs, requiredPages: Object.values(result.registration!.requiredTextPageCosts!).reduce((sum, pages) => sum + pages.length, 0),
+    ...result.costs, requiredBatches: result.registration!.requiredTextBatches!.length,
     requiredSources: result.snapshot.targets.filter(target => result.registration!.deliveryByTarget[target.target_id]?.required)
       .map(target => ({ origin: target.origin, bytes: target.utf8_bytes })) }));
 });
@@ -147,7 +147,8 @@ test("ContextSend selects the candidate's actual snapshot and retains only real 
 });
 
 for (const manual of [false, true]) test(`bootstrap retained accounting credits first text pages and charges other returns once (${manual ? "manual" : "automatic"})`, async () => {
-  const canonical = fixture();
+  // Keep two physical sends within their context window with the larger batch envelope.
+  const canonical = fixture(undefined, true, 1500);
   if (manual) canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
   const directory = mkdtempSync(join(tmpdir(), "ctx-cost-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
@@ -198,7 +199,7 @@ for (const manual of [false, true]) test(`bootstrap retained accounting credits 
     }
     expect(pages).toBeGreaterThan(2); expect(broker.contextStatus(token)!.context_ready).toBe(true);
     const optional = selected.snapshot.targets.find(target => target.read_ref && !selected.registration!.deliveryByTarget[target.target_id]?.required)!;
-    for (const args of [firstArgs, { context_id: selected.snapshot.context_id, read_ref: optional.read_ref! }, { ...firstArgs, cursor: "invalid" }]) {
+    for (const args of [firstArgs, { context_id: selected.snapshot.context_id, reads: [{ read_ref: optional.read_ref! }] }, { ...firstArgs, reads: [{ ...firstArgs.reads[0]!, cursor: "invalid" }, ...firstArgs.reads.slice(1)] }]) {
       const before = usageTokens(), reply = await query(args);
       expectedTokens += usageTokens() - before;
       await finish(reply); await send.syncUsage();

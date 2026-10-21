@@ -3,8 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultBrokerEndpoint, defaultConfig, getContextCapabilityEvidencePath, providerConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
-import { assertContextCapabilityVerified, contextCapabilitySchemaDigest, invalidateContextCapabilityEvidence,
-  contextCapabilityReceiptsComplete,
+import { CONTEXT_CAPABILITY_VERIFICATION_VERSION, assertContextCapabilityVerified, contextCapabilitySchemaDigest, invalidateContextCapabilityEvidence,
+  contextCapabilityReceiptsComplete, contextCapabilityDiagnosticReceiptsComplete,
   installedContextCapabilitySchemaDigest, readContextCapabilityEvidence, readProviderContextCapabilityEvidence, runContextCapabilityVerification, saveContextCapabilityEvidence,
   type ContextCapabilityReceipts } from "../src/adapters/chatgpt-web/context-capability-verification";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -35,16 +35,24 @@ function fixture() {
 }
 const successMethods = { ordinary: { list: true, search: true, read: true }, compaction: { list: true, search: true, read: true } };
 const receipts = (): ContextCapabilityReceipts => {
-  const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: "test receipt source" }));
+  const snapshot = createContextSnapshot(parseRequest({ model: "gpt-6", input: [{ role: "user", content: "test receipt source" }, { role: "user", content: "second test receipt source" }] }));
   const read = (purpose: "normal" | "compaction") => contextTextReadReceipt(new ContextNavigator({ scopeId: "receipt-fixture", snapshot, purpose })
-    .read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }));
+    .read({ context_id: snapshot.context_id, reads: snapshot.targets.map(target => ({ read_ref: target.read_ref! })) }));
   return { ordinary: { ...successMethods.ordinary, text_read: read("normal") }, compaction: { ...successMethods.compaction, text_read: read("compaction") } };
 };
 function tools(mode: "automatic" | "manual" = "automatic") {
   const key = mode === "manual" ? "request_id" : "turn_token";
   return ["list", "search", "read"].map(method => ({ name: `codex_context_${method}`, description: `Read-only ${method} ${method === "read" ? CONTEXT_TEXT_READ_FORMAT : "directory"}`, annotations: { readOnlyHint: true }, inputSchema: {
-    type: "object", additionalProperties: false, properties: { [key]: { type: "string" }, compaction_token: { type: "string" }, context_id: { type: "string" } },
-    required: ["context_id"], oneOf: [{ required: [key], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [key] } }],
+    type: "object", additionalProperties: false, properties: {
+      [key]: { type: "string" }, compaction_token: { type: "string" }, context_id: { type: "string" },
+      ...(method === "read" ? { reads: { type: "array", minItems: 1, maxItems: 8,
+        items: { type: "object", additionalProperties: false, required: ["read_ref"], properties: {
+          read_ref: { type: "string", minLength: 1, maxLength: 256 },
+          cursor: { type: "string", minLength: 1, maxLength: 2048 },
+        } },
+      } } : {}),
+    },
+    required: method === "read" ? ["context_id", "reads"] : ["context_id"], oneOf: [{ required: [key], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [key] } }],
   } }));
 }
 function verificationStopped(signal: AbortSignal): Promise<string> {
@@ -70,6 +78,13 @@ describe("context capability evidence", () => {
     const operation = tools(); (operation[0]!.inputSchema.properties as Record<string, unknown>).operation_id = { type: "integer" };
     expect(() => contextCapabilitySchemaDigest(operation, "automatic")).toThrow("incompatible");
     expect(() => contextCapabilitySchemaDigest(tools(), "manual")).toThrow("incompatible");
+    for (const change of ["old_top_level", "unbounded_array", "loose_items"] as const) {
+      const catalog = tools(); const read = catalog[2]!.inputSchema as any;
+      if (change === "old_top_level") { read.properties.read_ref = { type: "string" }; delete read.properties.reads; }
+      if (change === "unbounded_array") delete read.properties.reads.maxItems;
+      if (change === "loose_items") read.properties.reads.items.additionalProperties = true;
+      expect(() => contextCapabilitySchemaDigest(catalog, "automatic")).toThrow("reads-array");
+    }
   });
   test("fingerprint binds descriptions, actual read format and optional output schema", () => {
     const current = contextCapabilitySchemaDigest(tools(), "automatic");
@@ -85,12 +100,16 @@ describe("context capability evidence", () => {
     const saved = saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
     expect(contextCapabilityReceiptsComplete(successMethods)).toBe(false);
     expect(() => saveContextCapabilityEvidence(f.config, schema, successMethods, f.home)).toThrow("six");
-    const malformed = receipts(); malformed.compaction.text_read!.body_content_index = 0 as 1;
+    const malformed = receipts(); malformed.compaction.text_read!.items[1]!.body_content_index = 1;
     expect(contextCapabilityReceiptsComplete(malformed)).toBe(false);
+    const single = receipts(); single.ordinary.text_read!.items.pop(); single.ordinary.text_read!.content_blocks--;
+    expect(contextCapabilityReceiptsComplete(single)).toBe(false);
     for (const store of [
       { version: 1, modes: { automatic: { ...saved, version: 1, receipts: successMethods } } },
       { version: 2, modes: { automatic: { ...saved, receipts: successMethods } } },
-      { version: 2, modes: { automatic: { ...saved, binding: { ...saved.binding, textReadFormat: "context-text-read-v1" } } } },
+      { version: 2, modes: { automatic: { ...saved, version: 2 } } },
+      { version: 3, modes: { automatic: { ...saved, version: 3, receipts: receipts() } } },
+      { version: CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes: { automatic: { ...saved, binding: { ...saved.binding, textReadFormat: "context-text-read-v2" } } } },
     ]) {
       writeFileSync(getContextCapabilityEvidencePath(f.home), JSON.stringify(store));
       expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
@@ -100,11 +119,42 @@ describe("context capability evidence", () => {
     const f = fixture(); const schema = contextCapabilitySchemaDigest(tools(), "automatic");
     const incomplete = receipts(); incomplete.compaction.read = false;
     expect(() => saveContextCapabilityEvidence(f.config, schema, incomplete, f.home)).toThrow("six");
-    const saved = saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
+    const fullReceipts = receipts();
+    const saved = saveContextCapabilityEvidence(f.config, schema, fullReceipts, f.home);
+    expect(contextCapabilityReceiptsComplete(saved.receipts)).toBe(false);
+    expect(contextCapabilityDiagnosticReceiptsComplete(saved.receipts)).toBe(true);
     expect(await assertContextCapabilityVerified(f.config, { home: f.home, schemaDigest: schema })).toEqual(saved);
     const json = readFileSync(getContextCapabilityEvidencePath(f.home), "utf8");
     expect(json).not.toContain("turn_token"); expect(json).not.toContain("compaction_token"); expect(json).not.toContain("runtime-key");
+    expect(json).not.toContain('"read_ref"'); expect(json).not.toContain('"cursor"'); expect(json).not.toContain("test receipt source");
+    for (const receipt of [fullReceipts.ordinary.text_read!, fullReceipts.compaction.text_read!]) {
+      for (const item of receipt.items) expect(json).not.toContain(item.read_ref);
+    }
     if (process.platform !== "win32") expect(statSync(getContextCapabilityEvidencePath(f.home)).mode & 0o777).toBe(0o600);
+  });
+  test("loading rejects sensitive or malformed diagnostic fields and saving does not retain unsafe modes", () => {
+    const f = fixture(), schema = contextCapabilitySchemaDigest(tools(), "automatic"), fullReceipts = receipts();
+    const saved = saveContextCapabilityEvidence(f.config, schema, fullReceipts, f.home);
+    const path = getContextCapabilityEvidencePath(f.home);
+    for (const mutation of ["read_ref", "cursor", "body", "credential", "invalid_digest"] as const) {
+      const evidence = structuredClone(saved) as any;
+      if (mutation === "read_ref" || mutation === "cursor") evidence.receipts.ordinary.text_read.items[0][mutation] = "sensitive-persistent-marker";
+      if (mutation === "body") evidence.body = "sensitive-persistent-marker";
+      if (mutation === "credential") evidence.binding.turn_token = "sensitive-persistent-marker";
+      if (mutation === "invalid_digest") evidence.receipts.ordinary.text_read.items[0].read_ref_digest = "not-a-digest";
+      writeFileSync(path, JSON.stringify({ version: CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes: { automatic: evidence } }));
+      expect(readContextCapabilityEvidence(f.config, schema, f.home)).toBeUndefined();
+    }
+    writeFileSync(path, JSON.stringify({ version: CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes: {
+      automatic: saved, manual: { ...saved, binding: { ...saved.binding, mode: "manual" }, receipts: fullReceipts },
+      unknown_mode: { body: "sensitive-persistent-marker" },
+    } }));
+    const resaved = saveContextCapabilityEvidence(f.config, schema, fullReceipts, f.home);
+    const json = readFileSync(path, "utf8");
+    expect(json).not.toContain("sensitive-persistent-marker"); expect(json).not.toContain('"read_ref"');
+    expect(JSON.parse(json).modes).not.toHaveProperty("manual");
+    expect(JSON.parse(json).modes).not.toHaveProperty("unknown_mode");
+    expect(readContextCapabilityEvidence(f.config, schema, f.home)).toEqual(resaved);
   });
   test("profile, interaction, plugin, tunnel, runtime and schema changes invalidate evidence", () => {
     const f = fixture(); const schema = contextCapabilitySchemaDigest(tools(), "automatic"); saveContextCapabilityEvidence(f.config, schema, receipts(), f.home);
@@ -170,10 +220,18 @@ describe("context capability evidence", () => {
           const match = /^Call (codex_context_\w+) with (\{.*\})\.$/.exec(line)!;
           const result = await client.callTool({ name: match[1]!, arguments: JSON.parse(match[2]!) });
           expect(result.isError).not.toBe(true);
+          if (match[1] === "codex_context_read") {
+            expect(JSON.parse(match[2]!).reads).toHaveLength(2);
+            const read = parseContextTextReadResult(result);
+            expect(read.bodies).toHaveLength(2);
+            expect(read.bodies[0]).toContain("context-verification-alpha");
+            expect(read.bodies[1]).toContain("context-verification-beta-tail");
+            expect(read.metadata.items.every(item => item.range.start === 0 && item.range.end_exclusive === item.utf8_bytes)).toBe(true);
+          }
         }
         return "A model's final prose is not used as evidence";
       } });
-      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true);
+      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityDiagnosticReceiptsComplete(evidence.receipts)).toBe(true);
       expect(readContextCapabilityEvidence(f.config, evidence.binding.schemaDigest, f.home)).toEqual(evidence);
     } finally { await client.close(); }
   });
@@ -225,7 +283,7 @@ describe("context capability evidence", () => {
     expect(observed.nativeConnector).toBe(true); expect(observed.preSubmitReadRejected).toBe(true);
     expect(observed.successful).toEqual(["codex_context_list", "codex_context_search", "codex_context_read",
       "codex_context_list", "codex_context_search", "codex_context_read"]);
-    expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true);
+    expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityDiagnosticReceiptsComplete(evidence.receipts)).toBe(true);
     expect(readContextCapabilityEvidence(f.config, evidence.binding.schemaDigest, f.home)).toEqual(evidence);
   }, 30_000);
   test("a typed success reply does not verify and a failed retry clears the previous proof", async () => {
@@ -344,7 +402,7 @@ describe("context capability evidence", () => {
       expect(calls).toEqual(["codex_context_list", "codex_context_search", "codex_context_read", "codex_context_list", "codex_context_search", "codex_context_read"]);
       const result = JSON.parse(out);
       expect(result.ok).toBe(true); expect(result.evidence.receipts).toMatchObject(successMethods);
-      expect(contextCapabilityReceiptsComplete(result.evidence.receipts)).toBe(true);
+      expect(contextCapabilityDiagnosticReceiptsComplete(result.evidence.receipts)).toBe(true);
       expect(out.trim().split("\n")).toHaveLength(1);
       expect(err).toContain("broker lifecycle"); expect(err).toContain('"event":"start_requested"');
       expect(err).toContain('"event":"close_complete"');
@@ -392,7 +450,7 @@ describe("context capability evidence", () => {
           async end(_descriptor, activity) { endStatus = activity.status; return { cancelledByUser: false }; },
         } });
       await userCalls;
-      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityReceiptsComplete(evidence.receipts)).toBe(true); expect(sentChecks).toBe(requireSent ? 1 : 0); expect(endStatus).toBe("completed");
+      expect(evidence.receipts).toMatchObject(successMethods); expect(contextCapabilityDiagnosticReceiptsComplete(evidence.receipts)).toBe(true); expect(sentChecks).toBe(requireSent ? 1 : 0); expect(endStatus).toBe("completed");
     } finally { allowReads(); await userCalls?.catch(() => {}); await client.close(); }
   });
   for (const manual of [false, true]) for (const development of [false, true])
@@ -440,12 +498,12 @@ describe("context capability evidence", () => {
         const target = (listing.structuredContent as any).entries.find((entry: any) => entry.call_id === "old-call");
         expect(target).toBeDefined();
         const { view, ...reference } = entry.first_call.arguments;
-        const result = await client.callTool({ name: "codex_context_read", arguments: { ...reference, read_ref: target.read_ref } });
+        const result = await client.callTool({ name: "codex_context_read", arguments: { ...reference, reads: [{ read_ref: target.read_ref }] } });
         expect(result.isError).not.toBe(true);
         const read = parseContextTextReadResult(result);
-        expect(read.body).toContain("Recorded tool evidence.");
+        expect(read.bodies[0]!).toContain("Recorded tool evidence.");
         plans.push({ navigation: true, requiredImages: entry.required_images,
-          sourceBytes: read.metadata.utf8_bytes, delivery: target.delivery });
+          sourceBytes: read.metadata.items[0]!.utf8_bytes, delivery: target.delivery });
         return entry;
       };
       const run = spyOn(worker, "run").mockImplementation(async turn => {
@@ -504,7 +562,7 @@ describe("context capability evidence", () => {
           if (variant === "runtime-replaced") writeFileSync(runtimeFile, runtimeSource + "// compatible runtime upgrade\n");
           if (variant === "missing") rmSync(evidencePath, { force: true });
           else writeFileSync(evidencePath, variant === "corrupt" ? "{invalid" : JSON.stringify({
-            version: variant === "old-version" ? 1 : 2, modes: { [f.config.browserInteractionMode]: evidence } }));
+            version: variant === "old-version" ? 1 : CONTEXT_CAPABILITY_VERIFICATION_VERSION, modes: { [f.config.browserInteractionMode]: evidence } }));
           expect(Boolean(readContextCapabilityEvidence(f.config, schema, f.home))).toBe(variant === "success");
           const before = existsSync(evidencePath) ? readFileSync(evidencePath, "utf8") : undefined;
           const firstPlan = plans.length, firstSend = sends;

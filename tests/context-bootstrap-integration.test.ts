@@ -9,6 +9,7 @@ import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+import type { ContextRequiredRead } from "../src/adapters/chatgpt-web/context-types";
 import { callTurnBroker, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import type { CodexParsedRequest } from "../src/types";
 
@@ -68,20 +69,28 @@ for (const contract of ["native", "safe"] as const) test(`short startup ${contra
       contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: "list", contextArgs: { context_id: plan.registration!.snapshot.context_id, view: "overview" } }))
       .rejects.toMatchObject({ code: "CONTEXT_INCOMPATIBLE" });
     const bodies = new Map<string, string>();
-    let ready = false;
-    for (let count = 0; count < 100; count++) {
-      const overview = await call("codex_context_list", { context_id: plan.registration!.snapshot.context_id, view: "overview" });
-      expect(overview.isError).not.toBe(true);
-      const manifest = overview.structuredContent as { live: { context_ready: boolean }; next_required_read: {
-        tool: string; arguments: { read_ref: string; [key: string]: unknown };
-      } | null };
-      if (manifest.live.context_ready) { ready = true; break; }
-      expect(manifest.next_required_read).not.toBeNull();
-      const next = manifest.next_required_read!;
-      const page = parseContextTextReadResult(await call(next.tool, next.arguments));
-      bodies.set(next.arguments.read_ref, (bodies.get(next.arguments.read_ref) ?? "") + page.body);
+    const overviewArgs = { context_id: plan.registration!.snapshot.context_id, view: "overview" };
+    const initial = await call("codex_context_list", overviewArgs);
+    expect(initial.isError).not.toBe(true);
+    const manifest = initial.structuredContent as { manifest_version: number; next_required_read: ContextRequiredRead | null };
+    expect(manifest.manifest_version).toBe(3);
+    expect(manifest).not.toHaveProperty("required_targets");
+    let next = manifest.next_required_read;
+    let batches = 0;
+    while (next) {
+      expect(batches++).toBeLessThan(100);
+      const page = parseContextTextReadResult(await call(next.tool, { ...next.arguments }));
+      for (const [index, item] of page.metadata.items.entries()) {
+        const previous = bodies.get(item.read_ref) ?? "";
+        expect(item.range.start).toBe(Buffer.byteLength(previous));
+        bodies.set(item.read_ref, previous + page.bodies[index]!);
+      }
+      expect(page.metadata.required_step).toBeDefined();
+      next = page.metadata.required_step!.next_required_read;
     }
-    expect(ready).toBe(true);
+    const final = await call("codex_context_list", overviewArgs);
+    expect(final.structuredContent).toMatchObject({ live: { context_ready: true }, next_required_read: null });
+    for (const [readRef, text] of bodies) expect(text).toBe(plan.snapshot.getText(readRef)!);
     const payload = [...bodies.values()].find(body => body.includes("末页证据"));
     expect(payload).toBeDefined();
     expect(JSON.parse(payload!).payload.messages[0].content).toBe(canonical.context.messages[0]!.content);

@@ -3,23 +3,32 @@ import { parseRequest } from "../src/responses/parser";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ContextNavigationStoppedError, ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
-import { assertContextNavigationBudget, CONTEXT_LIMITS, contextErrorReserve, contextLimits, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
+import { assertContextNavigationBudget, CONTEXT_LIMITS, contextErrorReserve, contextLimits, contextBudgetProfileLimits, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
 const snapshotOf = (input: unknown[]) => createContextSnapshot(parseRequest({ model: "gpt-6", input }));
 describe("complete context response budgets", () => {
+  test("trusted profiles freeze the published expanded and conservative ceilings", () => {
+    expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 8000, listBytes: 49152, listTokens: 6000, listEntries: 50,
+      searchHits: 10, searchBytes: 12288, searchTokens: 1500, maxTotalTokens: 96000, maxTotalWireBytes: 64 * 1024 * 1024 });
+    const configured = contextBudgetProfileLimits("conservative"), frozen = contextLimits(configured);
+    expect(frozen).toMatchObject({ readBytes: 24576, readTokens: 2500, listBytes: 12288, listTokens: 1500, listEntries: 20 });
+    configured.readTokens = 8000;
+    expect(frozen.readTokens).toBe(2500); expect(Object.isFrozen(frozen)).toBe(true);
+    expect(() => contextBudgetProfileLimits("untrusted" as never)).toThrow();
+  });
   test("escaped text and duplicated structured/text metadata fit complete JSON budgets", () => {
     const snapshot = snapshotOf([{ role: "user", content: '\\"\n\t中文😀'.repeat(700) }]);
-    const limits = { readBytes: 3000, readTokens: 900 };
+    const limits = { readBytes: 5000, readTokens: 1800 };
     const navigator = new ContextNavigator({ scopeId: "scope", snapshot, purpose: "normal", limits });
     let cursor: string | undefined, restored = "", count = 0;
     do {
-      const result = navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref!, ...(cursor ? { cursor } : {}) });
+      const result = navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref!, ...(cursor ? { cursor } : {}) }] });
       expect(result.isError).not.toBe(true);
       const cost = measureContextResponse(result);
       expect(cost.wire_bytes).toBe(Buffer.byteLength(JSON.stringify(result)) + CONTEXT_LIMITS.wireReserveBytes);
       expect(cost.wire_bytes).toBeLessThanOrEqual(limits.readBytes); expect(cost.text_tokens).toBeLessThanOrEqual(limits.readTokens);
-      const page = parseContextTextReadResult(result); restored += page.body; cursor = page.metadata.next_cursor ?? undefined;
+      const page = parseContextTextReadResult(result); restored += page.bodies[0]!; cursor = page.metadata.items[0]!.next_cursor ?? undefined;
       expect(++count).toBeLessThan(200);
     } while (cursor);
     expect(restored).toBe(snapshot.getText(snapshot.targets[0]!.read_ref!)!);
@@ -39,7 +48,7 @@ describe("complete context response budgets", () => {
     const search = navigator.search({ context_id: snapshot.context_id, query: "needle" }); expect(search.isError).not.toBe(true);
     expect(measureContextResponse(search).wire_bytes).toBeLessThanOrEqual(4500); expect(measureContextResponse(search).text_tokens).toBeLessThanOrEqual(1500);
     const small = new ContextNavigator({ scopeId: "small", snapshot, purpose: "normal", limits: { listBytes: 512, readBytes: 512, searchBytes: 512 } });
-    const errors = [small.list({ context_id: snapshot.context_id, view: "entries" }), small.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }), small.search({ context_id: snapshot.context_id, query: "needle" })];
+    const errors = [small.list({ context_id: snapshot.context_id, view: "entries" }), small.read({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] }), small.search({ context_id: snapshot.context_id, query: "needle" })];
     for (const error of errors) { expect(error.isError).toBe(true); expect(JSON.stringify(error)).toContain("BUDGET_EXCEEDED"); expect(measureContextResponse(error).wire_bytes).toBeLessThanOrEqual(512); }
   });
 
@@ -48,7 +57,7 @@ describe("complete context response budgets", () => {
     const target = snapshot.targets[0]!;
     expect(target.visual_token_reserve).toBe(8192); // Preserve raw original detail despite parser's high normalization.
     const navigator = new ContextNavigator({ scopeId: "scope", snapshot, purpose: "normal", deliveryByTarget: { [target.target_id]: { delivery: "mcp", media_route: "mcp", required: true } } });
-    const args = { context_id: snapshot.context_id, read_ref: target.read_ref! };
+    const args = { context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] };
     const result = navigator.read(args); expect(result.isError).not.toBe(true);
     expect(result.content.filter((c: any) => c.type === "image")).toEqual([{ type: "image", mimeType: "image/png", data: png }]);
     expect(JSON.stringify(result.structuredContent)).not.toContain(png); expect(JSON.stringify(result.content[0])).not.toContain(png);
@@ -67,7 +76,7 @@ describe("complete context response budgets", () => {
     const entries = (navigator.list({ context_id: snapshot.context_id, view: "entries" }).structuredContent as any).entries;
     expect(entries).toHaveLength(2); expect(entries.every((e: any) => e.read_ref === null)).toBe(true);
     expect(entries.map((e: any) => e.media_route)).toEqual(["unavailable", "attachment"]);
-    expect(navigator.read({ context_id: snapshot.context_id, read_ref: fixed.read_ref! }).isError).toBe(true);
+    expect(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: fixed.read_ref! }] }).isError).toBe(true);
     expect(() => new ContextNavigator({ scopeId: "compaction", snapshot, purpose: "compaction" })).toThrow("fully readable");
   });
 
@@ -75,13 +84,13 @@ describe("complete context response budgets", () => {
     const snapshot = snapshotOf([{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] }]);
     const target = snapshot.targets[0]!;
     const limited = new ContextNavigator({ scopeId: "limited", snapshot, purpose: "normal", limits: { maxImageReads: 1 } });
-    const args = { context_id: snapshot.context_id, read_ref: target.read_ref! };
+    const args = { context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] };
     expect(limited.read(args).isError).not.toBe(true); const before = limited.usage();
     expect(limited.read(args).isError).toBe(true); expect(limited.usage().image_reads).toBe(1); expect(limited.usage().image_bytes).toBe(before.image_bytes);
     expect(limited.usage().wire_bytes).toBeGreaterThan(before.wire_bytes); // Error transport is real cost too.
     const seen: string[] = [];
     const reserved = new ContextNavigator({ scopeId: "reserve", snapshot, purpose: "normal", remainingBudget: image => {
-      if (image) seen.push(image.target_id); return { tokens: 5384, wire_bytes: 10000, reserved_tokens: image ? 0 : 5000 };
+      if (image) seen.push(image[0]!.target_id); return { tokens: 5384, wire_bytes: 10000, reserved_tokens: image ? 0 : 5000 };
     } });
     expect(reserved.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
     expect(reserved.read(args).isError).not.toBe(true); expect(seen).toEqual([target.target_id]);
@@ -93,7 +102,7 @@ describe("complete context response budgets", () => {
     const overview = navigator.list({ context_id: snapshot.context_id, view: "overview" }); expect((overview.structuredContent as any).remaining_budget.reserved_tokens).toBe(500);
     const elapsed = navigator.usage().processing_ms;
     await new Promise(resolve => setTimeout(resolve, 15)); expect(navigator.usage().processing_ms).toBe(elapsed);
-    const read = navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }); expect(read.isError).not.toBe(true);
+    const read = navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] }); expect(read.isError).not.toBe(true);
     expect((read.structuredContent as any).remaining_budget.stop_hint).toBeString();
     const entries = (navigator.list({ context_id: snapshot.context_id, view: "entries" }).structuredContent as any).entries;
     expect(entries[0]).toMatchObject({ delivery: "source_on_demand", required: false });
@@ -101,7 +110,7 @@ describe("complete context response budgets", () => {
 
   test("a terminal text page fits its exact complete byte and token ceiling", () => {
     const snapshot = snapshotOf([{ role: "user", content: "a".repeat(100) }]);
-    const args = { context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! };
+    const args = { context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] };
     const complete = new ContextNavigator({ scopeId: "measure", snapshot, purpose: "normal" }).read(args);
     const cost = measureContextResponse(complete);
     const exact = new ContextNavigator({ scopeId: "exact", snapshot, purpose: "normal", limits: { readBytes: cost.wire_bytes, readTokens: cost.text_tokens } });
@@ -110,8 +119,8 @@ describe("complete context response budgets", () => {
     const result = small.read(args); expect(result.isError).toBe(true);
     expect(measureContextResponse(result).wire_bytes).toBeLessThanOrEqual(CONTEXT_LIMITS.errorResponseBytes);
     const agent = snapshotOf([{ type: "agent_message", author: "author".repeat(100), recipient: "recipient".repeat(100), content: "short" }]);
-    const read = new ContextNavigator({ scopeId: "agent", snapshot: agent, purpose: "normal" }).read({ context_id: agent.context_id, read_ref: agent.targets[0]!.read_ref! });
-    expect(read.isError).not.toBe(true); expect(parseContextTextReadResult(read).body).toBe("short");
+    const read = new ContextNavigator({ scopeId: "agent", snapshot: agent, purpose: "normal" }).read({ context_id: agent.context_id, reads: [{ read_ref: agent.targets[0]!.read_ref! }] });
+    expect(read.isError).not.toBe(true); expect(parseContextTextReadResult(read).bodies[0]).toBe("short");
   });
 
   test("corrective replies are finite, fully measured and do not consume summary reserves", () => {
@@ -135,22 +144,22 @@ describe("complete context response budgets", () => {
     expect(navigator.usage()).toMatchObject({ error_responses: 3, navigation_stopped: true, text_tokens: chargedTokens, wire_bytes: chargedBytes });
     expect(chargedTokens).toBeLessThanOrEqual(reserve.tokens); expect(chargedBytes).toBeLessThanOrEqual(reserve.wire_bytes);
     const before = navigator.usage();
-    expect(() => navigator.read({ context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! })).toThrow(ContextNavigationStoppedError);
+    expect(() => navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] })).toThrow(ContextNavigationStoppedError);
     expect(navigator.usage()).toEqual(before);
     expect(snapshot.getText(snapshot.targets[0]!.read_ref!)).toBe("summary source");
   });
 
   test("an overview rejection protects required image tokens and wire while its read credits only its own reserve", () => {
     const snapshot = snapshotOf([{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] }]);
-    const target = snapshot.targets[0]!, args = { context_id: snapshot.context_id, read_ref: target.read_ref! };
+    const target = snapshot.targets[0]!, args = { context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] };
     const image = new ContextNavigator({ scopeId: "measure", snapshot, purpose: "normal" }).read(args);
     const imageCost = measureContextResponse(image, { visualTokens: target.visual_token_reserve! }), reserve = contextErrorReserve();
     let navigator: ContextNavigator;
     navigator = new ContextNavigator({ scopeId: "required", snapshot, purpose: "normal", remainingBudget: source => ({
       tokens: imageCost.total_tokens + reserve.tokens + 1 - navigator.usage().text_tokens - navigator.usage().visual_token_reserve,
       wire_bytes: imageCost.wire_bytes + reserve.wire_bytes + 1 - navigator.usage().wire_bytes,
-      reserved_tokens: source?.target_id === target.target_id ? 0 : imageCost.total_tokens,
-      reserved_wire_bytes: source?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
+      reserved_tokens: source?.[0]?.target_id === target.target_id ? 0 : imageCost.total_tokens,
+      reserved_wire_bytes: source?.[0]?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
     }) });
     expect(navigator.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
     expect(navigator.usage().text_tokens).toBeGreaterThan(0); expect(navigator.usage().wire_bytes).toBeGreaterThan(0);
@@ -160,7 +169,7 @@ describe("complete context response budgets", () => {
     wireOnly = new ContextNavigator({ scopeId: "wire", snapshot, purpose: "normal", remainingBudget: source => ({
       tokens: 100000 - wireOnly.usage().text_tokens - wireOnly.usage().visual_token_reserve,
       wire_bytes: imageCost.wire_bytes + reserve.wire_bytes + 1 - wireOnly.usage().wire_bytes,
-      reserved_wire_bytes: source?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
+      reserved_wire_bytes: source?.[0]?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
     }) });
     expect(wireOnly.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
     expect(wireOnly.read(args).isError).not.toBe(true);
@@ -195,12 +204,12 @@ describe("complete context response budgets", () => {
       navigator = new ContextNavigator({ scopeId: dimension, snapshot, purpose: "normal", remainingBudget: target => ({
         tokens: 20000 - navigator.usage().text_tokens - navigator.usage().visual_token_reserve,
         wire_bytes: 20000 - navigator.usage().wire_bytes,
-        ...(dimension === "image_reads" ? { image_reads: 1 - navigator.usage().image_reads, reserved_image_reads: target?.target_id === required!.target_id ? 0 : 1 }
-          : { image_bytes: required!.image_bytes! - navigator.usage().image_bytes, reserved_image_bytes: target?.target_id === required!.target_id ? 0 : required!.image_bytes! }),
+        ...(dimension === "image_reads" ? { image_reads: 1 - navigator.usage().image_reads, reserved_image_reads: target?.[0]?.target_id === required!.target_id ? 0 : 1 }
+          : { image_bytes: required!.image_bytes! - navigator.usage().image_bytes, reserved_image_bytes: target?.[0]?.target_id === required!.target_id ? 0 : required!.image_bytes! }),
       }) });
-      expect(navigator.read({ context_id: snapshot.context_id, read_ref: optional!.read_ref! }).isError).toBe(true);
+      expect(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: optional!.read_ref! }] }).isError).toBe(true);
       expect(navigator.usage().image_bytes).toBe(0); expect(navigator.usage().image_reads).toBe(0);
-      expect(navigator.read({ context_id: snapshot.context_id, read_ref: required!.read_ref! }).isError).not.toBe(true);
+      expect(navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: required!.read_ref! }] }).isError).not.toBe(true);
       expect(navigator.usage().image_reads).toBe(1);
     }
     expect(() => assertContextNavigationBudget({ tokens: 10000, wire_bytes: 10000, image_reads: 0, reserved_image_reads: 1 })).toThrow();
@@ -209,13 +218,13 @@ describe("complete context response budgets", () => {
 
   test("single-target preflight uses real response limits without charging full-source cumulative reads", () => {
     const snapshot = snapshotOf([{ role: "user", content: "汉😀".repeat(3000) }]);
-    const navigator = new ContextNavigator({ scopeId: "prepare", snapshot, purpose: "compaction", limits: { readBytes: 3000, readTokens: 900, maxTotalTokens: 1000 } });
-    const args = { context_id: snapshot.context_id, read_ref: snapshot.targets[0]!.read_ref! }, before = navigator.usage();
+    const navigator = new ContextNavigator({ scopeId: "prepare", snapshot, purpose: "compaction", limits: { readBytes: 5000, readTokens: 1800, maxTotalTokens: 1000 } });
+    const args = { context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] }, before = navigator.usage();
     const first = navigator.preflightRead(args);
-    expect(first.isError).not.toBe(true); expect(measureContextResponse(first).wire_bytes).toBeLessThanOrEqual(3000);
+    expect(first.isError).not.toBe(true); expect(measureContextResponse(first).wire_bytes).toBeLessThanOrEqual(5000);
     expect(navigator.preflightRead(args)).toEqual(first);
     expect(navigator.usage()).toEqual(before);
-    expect(parseContextTextReadResult(first).body).not.toContain("�");
+    expect(parseContextTextReadResult(first).bodies[0]).not.toContain("�");
     const tooSmall = new ContextNavigator({ scopeId: "small", snapshot, purpose: "compaction", limits: { readBytes: 512 } });
     expect(tooSmall.preflightRead(args).isError).toBe(true); expect(tooSmall.usage().error_responses).toBe(0);
   });

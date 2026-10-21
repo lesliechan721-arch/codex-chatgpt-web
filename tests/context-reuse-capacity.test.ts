@@ -37,13 +37,24 @@ function deliver(result: ContextDeliveryPlan, baseline?: ContextReuseBaseline) {
   try {
     expect(scope.usageEvidence().reuse_delivery).toBeUndefined();
     scope.markEntryDelivered();
-    for (let count = 0; !scope.status().text_ready; count++) {
+    let next = scope.status().next_required_read;
+    for (let count = 0; next; count++) {
       if (count > 2000) throw Error("Required sources did not complete");
-      const page = scope.prepare("read", scope.status().next_required_read!.arguments);
+      const page = scope.prepare("read", next.arguments);
       const parsed = parseContextTextReadResult(page.result);
-      current.set(parsed.metadata.read_ref, (current.get(parsed.metadata.read_ref) ?? "") + parsed.body);
+      for (const [index, item] of parsed.metadata.items.entries()) {
+        const previous = current.get(item.read_ref) ?? "";
+        expect(item.range.start).toBe(Buffer.byteLength(previous));
+        current.set(item.read_ref, previous + parsed.bodies[index]!);
+      }
+      expect(parsed.metadata.required_step).toBeDefined();
+      next = parsed.metadata.required_step!.next_required_read;
       scope.finish(page.receiptId, true, contextTextReadReceipt(page.result));
     }
+    const final = scope.prepare("list", { context_id: result.snapshot.context_id, view: "overview" });
+    expect(final.result.structuredContent).toMatchObject({ live: { context_ready: true } });
+    scope.finish(final.receiptId, true);
+    for (const [readRef, text] of current) expect(text).toBe(result.snapshot.getText(readRef)!);
     expect(scope.status()).toMatchObject({ context_ready: true, text_ready: true, reuse_ready: true });
     const evidence = scope.usageEvidence().reuse_delivery;
     expect(evidence).toBeDefined();

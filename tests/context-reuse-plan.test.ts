@@ -62,7 +62,7 @@ for (const manual of [false, true]) test(`real request rules become exact full u
   const next = plan(request(), baseline(first), manual, 8000, more);
   expect(next.registration!.reuse!.mode).toBe("incremental");
   expect(next.registration!.reuse!.units.every(unit => unit.delivery === "reuse")).toBeTrue();
-  expect(next.registration!.requiredTextPageCosts).toEqual({});
+  expect(next.registration!.requiredTextBatches).toEqual([]);
   expect(next.compiled.text).toContain("<codex_inline_context_json>");
   expect(requiredText(next)).toBe("");
   expect(next.compiled.text).not.toContain(rule);
@@ -73,16 +73,17 @@ for (const manual of [false, true]) test(`real request rules become exact full u
     deliveryByTarget: next.registration!.deliveryByTarget,
     bootstrap: { planId: next.planId!, manifestDigest: next.manifestDigest!, reuse: next.registration!.reuse } });
   const overview = navigator.list({ context_id: next.snapshot.context_id, view: "overview" }, { context_ready: true, reuse_ready: true });
-  expect(overview.structuredContent).toMatchObject({ manifest_version: 2, mode: "incremental", protocol: "context-reuse-v1", reuse_ready: true,
-    required_targets: { entries: [], has_more: false } });
+  expect(overview.structuredContent).toMatchObject({ manifest_version: 3, mode: "incremental", protocol: "context-reuse-v1", reuse_ready: true,
+    text_read_format: "context-text-batch-v1", required_discovery: "batch-metadata", next_required_read: null });
   expect(JSON.stringify(overview)).not.toContain(rule);
   const unit = next.registration!.reuse!.units.find(item => item.kind === "instructions")!;
   const target = next.snapshot.getTarget(unit.target_id)!;
   let cursor: string | undefined, text = "";
   do {
-    const read = navigator.preflightRead({ context_id: next.snapshot.context_id, read_ref: target.read_ref!, ...(cursor ? { cursor } : {}) });
+    const read = navigator.preflightRead({ context_id: next.snapshot.context_id, reads: [{ read_ref: target.read_ref!, ...(cursor ? { cursor } : {}) }] });
     const page = parseContextTextReadResult(read);
-    text += page.body; cursor = page.metadata.next_cursor ?? undefined;
+    expect(page.metadata.items).toHaveLength(1);
+    text += page.bodies[0]; cursor = page.metadata.items[0]!.next_cursor ?? undefined;
   } while (cursor);
   expect(JSON.parse(text)).toBe(rule);
 });
@@ -97,7 +98,7 @@ for (const manual of [false, true]) test(`long repeated requests remain separate
     expect(result.compiled.text).not.toContain("<codex_inline_context_json>");
     expect(requiredText(result)).toContain("不能漏读尾页");
     expect(requiredText(result)).not.toContain(rule);
-    expect(Object.values(result.registration!.requiredTextPageCosts!).some(pages => pages.length > 2)).toBeTrue();
+    expect(result.registration!.requiredTextBatches!.length > 2).toBeTrue();
     expect(restore(result, bodies(first))).toEqual(result.compiled.bootstrapContent!.payload);
   }
 });

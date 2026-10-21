@@ -1,12 +1,14 @@
 interface Observation {
   wireBytes: number; tokens: number; successful: boolean; method: "list" | "read" | "search";
-  textBytes?: number; uniqueBytes?: number; reusedSource?: boolean; manifestOrder?: number;
+  textBytes?: number; uniqueBytes?: number; reusedBytes?: number; reusedSource?: boolean; manifestOrder?: number;
+  requestedItems?: number; returnedItems?: number;
 }
 const counters = () => ({ returned_calls: 0, returned_wire_bytes: 0, returned_estimated_tokens: 0,
   unique_text_bytes: 0, repeated_text_bytes: 0, reused_source_read_bytes: 0,
   reused_source_read_wire_bytes: 0, reused_source_read_estimated_tokens: 0,
   directory_calls: 0, directory_wire_bytes: 0, manifest_calls: 0, manifest_wire_bytes: 0,
-  startup_manifest_wire_bytes: 0, startup_manifest_estimated_tokens: 0 });
+  startup_manifest_wire_bytes: 0, startup_manifest_estimated_tokens: 0,
+  text_read_calls: 0, text_read_requested_items: 0, text_read_returned_items: 0 });
 
 function add(total: ReturnType<typeof counters>, value: Observation, startupOrder: number): number {
   total.returned_calls++;
@@ -16,8 +18,13 @@ function add(total: ReturnType<typeof counters>, value: Observation, startupOrde
   const unique = value.uniqueBytes ?? 0;
   total.unique_text_bytes += unique;
   total.repeated_text_bytes += Math.max(0, text - unique);
+  if (value.returnedItems !== undefined) {
+    total.text_read_calls++;
+    total.text_read_requested_items += value.requestedItems ?? value.returnedItems;
+    total.text_read_returned_items += value.returnedItems;
+  }
   if (value.reusedSource) {
-    total.reused_source_read_bytes += text;
+    total.reused_source_read_bytes += value.reusedBytes ?? text;
     total.reused_source_read_wire_bytes += value.wireBytes;
     total.reused_source_read_estimated_tokens += value.tokens;
   }
@@ -47,8 +54,12 @@ export class ContextReuseDiagnostics {
   private startupOrder = Infinity;
   private firstWorkStartupOrder = Infinity;
   private firstWork?: ReturnType<ContextReuseDiagnostics["current"]>;
+  private entryDeliveredAt?: number;
+  private firstWorkAfterEntry?: number;
 
   constructor(private readonly now: () => number = () => performance.now()) { this.started = now(); }
+
+  markEntryDelivered(): void { this.entryDeliveredAt ??= this.now(); }
 
   sent(value: Observation, beforeFirstWork = false): void {
     this.startupOrder = add(this.totals, value, this.startupOrder);
@@ -65,11 +76,14 @@ export class ContextReuseDiagnostics {
   freeze(): void {
     if (this.firstWork) return;
     this.firstWork = this.current();
+    if (this.entryDeliveredAt !== undefined) this.firstWorkAfterEntry = Math.max(0, this.now() - this.entryDeliveredAt);
     this.firstWorkStartupOrder = this.startupOrder;
   }
 
   snapshot() {
     return { ...this.current(), before_first_work: this.firstWork ? { ...this.firstWork } : null,
+      send_timing_start: this.entryDeliveredAt === undefined ? null : "entry_delivery_confirmed",
+      send_confirmed_to_first_work_ms: this.firstWorkAfterEntry ?? null,
       actual_model_input_tokens: null };
   }
 }

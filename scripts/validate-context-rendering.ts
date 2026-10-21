@@ -16,7 +16,8 @@ import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../s
 import { prepareWorkingTreeBrowserHelper } from "../src/dev-chat/driver";
 import { startDevChatTransport } from "../src/dev-chat/transport";
 import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
-import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+import { parseContextTextReadResult, type ContextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
+import { contextTextReadDiagnostic } from "../src/adapters/chatgpt-web/context-text-diagnostics";
 import { ChatGptBrowserWorker, closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
 import { responseRequest, compactRequest } from "../src/server";
@@ -39,6 +40,14 @@ export interface LiveFixture {
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const RUNNER_SOURCE_DIGEST = hash(readFileSync(import.meta.path));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+
+/** Retain only safe observation facts before the report is written to disk. */
+export function recordLiveTextTransport(pages: Record<string, unknown>[], receipt: ContextTextReadReceipt): void {
+  const diagnostic = contextTextReadDiagnostic(receipt), confirmedAt = new Date().toISOString();
+  for (const page of pages) {
+    page.transportConfirmed = true; page.transportConfirmedAt = confirmedAt; page.transportReceipt = diagnostic;
+  }
+}
 
 /** A DOM projection, without trimming or normalizing any readable source characters. */
 export function readLiveEditorDom(element: Element): { text: string | null; reason: string } {
@@ -225,8 +234,8 @@ export function createLiveFixture(name: LiveCase): LiveFixture {
   const task = [
     "This is an inert context transport test. Do not execute or repeat any work tool. Preserve the original call/result pairing by call_id, even when result records arrive in reverse order.",
     "Extract exactly the UTF-8 byte ranges below from the corresponding fixed source field. Web ordinary sources are separate user message fields supplied in this request; historical call/results identify their fixture_id. Other cases use fixed tool-result source bodies. Exclude wrapper bytes. Do not trim, normalize, parse or unescape source text.",
-    "When a requested source is externalized, list entries by its call_id, then use codex_context_read until all requested ranges are covered. Do not use codex_context_search. Never infer the answer from a directory label. The unrequested-source is irrelevant and must remain unread in mcp-partial.",
-    "For context-text-read-v2, content[0] is metadata and content[1] is the body at body_content_index=1. Keep range.start/end_exclusive and source identity distinct from payload wrappers. Follow next_cursor; do not join metadata into body.",
+    "When a requested source is externalized, list entries by its call_id, then use codex_context_read with reads:[{read_ref,cursor?}] until all requested ranges are covered. Do not use codex_context_search. Never infer the answer from a directory label. The unrequested-source is irrelevant and must remain unread in mcp-partial.",
+    "For context-text-batch-v1, content[0] is JSON metadata; each items entry selects its exact body using body_content_index. Validate every item and block. Keep each source identity and UTF-8 range distinct. For these on-demand reads continue remaining_reads; never join metadata or different sources into a body.",
     `Requested ranges: ${JSON.stringify(requests)}.`,
     "Return a JSON object between the literal lines <live_validation_result> and </live_validation_result>, with fragments [{fixture_id,start,end_exclusive,text}], priority naming the instruction role you followed, and call_pairs [{call_id,fixture_id}]. Put both literal boundary lines and the entire JSON object inside a single verbatim fenced code block. Use a tilde fence (~~~text followed by the result and a closing ~~~) so source backtick runs cannot close it. Preserve source characters through JSON string encoding; do not style, auto-link or Markdown-escape the result. Do not include credentials.",
     "fragments and call_pairs must contain only and all targets in Requested ranges, in that order. Do not add unrequested-source or any other unrequested target.",
@@ -484,9 +493,9 @@ async function runLive(args: string[]) {
     preflight: inspected.report, runnerDigest: RUNNER_SOURCE_DIGEST, case: name, purpose, format, repeat, model, reasoning: "low", fixtureDigest: hash(JSON.stringify(fixture)),
     taskVersion: LIVE_TASK_VERSION, taskDigest: hash(fixture.task),
     provenance: { browser: "real-default-DEV-Launcher", adapter: "current-source-createChatGptWebAdapter",
-      mcpFormat: "context-text-read-v2", workToolsExecuted: false, configChanged: false, privateVerificationScopeUsed: false },
+      mcpFormat: "context-text-batch-v1", workToolsExecuted: false, configChanged: false, privateVerificationScopeUsed: false },
     preparedPrompts: [], pages: [], events: [], stageUsage: {}, ...(purpose === "compaction" ? { primer: null } : {}),
-    limitations: ["模型实际输入 token 数未知；usage 是本地估算", "A7 observer 只比较 DOM 可读表示，不证明网络或模型实际输入", "Zero Risk 不读取 DOM；编辑器值和发送表示需要人工证据", "网页格式配对共用 MCP v2；不覆盖 MCP v1/v2 的真实配对", "LF、tab 和尾空白原文资格保持保守，本脚本不签发资格"],
+    limitations: ["模型实际输入 token 数未知；usage 是本地估算", "A7 observer 只比较 DOM 可读表示，不证明网络或模型实际输入", "Zero Risk 不读取 DOM；编辑器值和发送表示需要人工证据", "网页格式配对共用 MCP batch-v1；不覆盖旧/新 MCP 合同的真实配对", "LF、tab 和尾空白原文资格保持保守，本脚本不签发资格"],
     ...(webInline ? { a7: { compiledPayload: false, editorExact: null, submittedExact: null, modelExact: null, whitespaceQualificationGranted: false } } : {}) };
   const save = () => writeFileSync(join(output, "evidence.json"), redact(`${JSON.stringify(report, null, 2)}\n`), { mode: 0o600 });
   let activeStage: LiveStage = purpose === "compaction" ? "primer" : "ordinary";
@@ -496,7 +505,7 @@ async function runLive(args: string[]) {
   process.once("SIGINT", interrupt); process.once("SIGTERM", interrupt);
   const heartbeat = setInterval(() => console.log(`验收 ${runId} 仍在运行。${mode === "zero-risk" ? "等待用户完成 DEV Send/Sent；脚本不代办。" : ""}`), 30_000);
   heartbeat.unref();
-  const prepared = new Map<string, Record<string, any>>(), sourceBodies = new Map<string, FixtureBody>();
+  const prepared = new Map<string, Array<Record<string, any>>>(), sourceBodies = new Map<string, FixtureBody>();
   const originalPrepare = ContextScope.prototype.prepare, originalFinish = ContextScope.prototype.finish;
   const originalRun = ChatGptBrowserWorker.prototype.run;
   // Observation stays inside this dedicated process and retains the original scope/receipt behavior.
@@ -510,28 +519,34 @@ async function runLive(args: string[]) {
       }
     }
     if (method === "read" && !reply.result.isError) {
-      const { metadata, body: text } = parseContextTextReadResult(reply.result);
-      let source = sourceBodies.get(metadata.source.source_id as string);
-      if (!source && metadata.range.start === 0) {
-        source = fixture.bodies.find(candidate => Buffer.from(candidate.text).subarray(0, metadata.range.end_exclusive).equals(Buffer.from(text)));
-        if (source) sourceBodies.set(metadata.source.source_id as string, source);
-      }
-      const exact = source ? Buffer.from(source.text).subarray(metadata.range.start, metadata.range.end_exclusive).equals(Buffer.from(text)) : null;
-      if (exact === false) throw new Error("真实读取页与固定源字节不相等");
-      const page = { preparedAt: new Date().toISOString(), stage: activeStage, traceId: report.traceId ?? null, receiptFingerprint: hash(reply.receiptId),
-        purpose: metadata.purpose, format: metadata.format, contentBlocks: reply.result.content.length,
-        bodyContentIndex: metadata.body_content_index, metadataConsistent: true, fixtureId: source?.id ?? null,
-        range: metadata.range, bodyBytes: Buffer.byteLength(text), bodyDigest: hash(text), exactFixtureBytes: exact,
-        hasMore: metadata.has_more, transportConfirmed: false };
-      report.pages.push(page); prepared.set(reply.receiptId, page); save();
+      const { metadata, bodies } = parseContextTextReadResult(reply.result);
+      const pages = metadata.items.map((item, index) => {
+        const text = bodies[index]!;
+        let source = sourceBodies.get(item.source.source_id as string);
+        if (!source && item.range.start === 0) {
+          source = fixture.bodies.find(candidate => Buffer.from(candidate.text).subarray(0, item.range.end_exclusive).equals(Buffer.from(text)));
+          if (source) sourceBodies.set(item.source.source_id as string, source);
+        }
+        const exact = source ? Buffer.from(source.text).subarray(item.range.start, item.range.end_exclusive).equals(Buffer.from(text)) : null;
+        if (exact === false) throw new Error("真实读取页与固定源字节不相等");
+        return { preparedAt: new Date().toISOString(), stage: activeStage, traceId: report.traceId ?? null, receiptFingerprint: hash(reply.receiptId),
+          purpose: metadata.purpose, format: metadata.format, contentBlocks: reply.result.content.length,
+          requestedItems: (parameters[1] as { reads?: unknown[] }).reads?.length ?? null,
+          returnedItems: metadata.items.length, requestIndex: item.request_index,
+          bodyContentIndex: item.body_content_index, metadataConsistent: true, fixtureId: source?.id ?? null,
+          range: item.range, bodyBytes: Buffer.byteLength(text), bodyDigest: hash(text), exactFixtureBytes: exact,
+          hasMore: item.has_more, transportConfirmed: false };
+      });
+      report.pages.push(...pages); prepared.set(reply.receiptId, pages); save();
     }
     return reply;
   };
   ContextScope.prototype.finish = function (...parameters) {
     const result = originalFinish.apply(this, parameters);
-    const page = prepared.get(parameters[0]);
-    if (page && result?.method === "read" && result.textRead) {
-      page.transportConfirmed = true; page.transportConfirmedAt = new Date().toISOString(); page.transportReceipt = result.textRead; save();
+    const pages = prepared.get(parameters[0]);
+    if (pages && result?.method === "read" && result.textRead) {
+      recordLiveTextTransport(pages, result.textRead);
+      save();
     }
     return result;
   };
@@ -646,7 +661,7 @@ async function main() {
   if (action === "check") { if (args.length) throw new Error("check 不接受参数"); console.log(JSON.stringify(preflight().report, null, 2)); return; }
   if (action === "plan") {
     if (args.length) throw new Error("plan 不接受参数");
-    console.log(JSON.stringify({ schema: "context-rendering-live-plan/v1", taskVersion: LIVE_TASK_VERSION, rules: { pairedRepeats: 3, fixedModelModeReasoning: true, liveMcp: "v2 in both web variants", noAutomaticZeroRiskSend: true },
+    console.log(JSON.stringify({ schema: "context-rendering-live-plan/v1", taskVersion: LIVE_TASK_VERSION, rules: { pairedRepeats: 3, fixedModelModeReasoning: true, liveMcp: "context-text-batch-v1 in both web variants", noAutomaticZeroRiskSend: true },
       cases: LIVE_CASES.map(name => { const fixture = createLiveFixture(name); return { case: name, fixtureDigest: hash(JSON.stringify(fixture)),
         bodyBytes: fixture.bodies.map(value => ({ id: value.id, bytes: Buffer.byteLength(value.text) })), taskDigest: hash(fixture.task), task: fixture.task }; }), runs: livePairSchedule() }, null, 2)); return;
   }

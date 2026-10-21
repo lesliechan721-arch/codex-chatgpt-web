@@ -216,14 +216,15 @@ for (const terminal of [false, true]) test(`compaction rejects an oversized late
     ...(terminal ? [] : [{ role: "user", content: "Later source" }]),
   ] });
   const snapshot = createContextSnapshot(parsed);
-  const navigator = new ContextNavigator({ scopeId: "directory-regression", snapshot, purpose: "compaction" });
+  const limits = { listBytes: 12_288, listTokens: 1_500, listEntries: 20 };
+  const navigator = new ContextNavigator({ scopeId: "directory-regression", snapshot, purpose: "compaction", limits });
   const first = navigator.list({ context_id: snapshot.context_id, view: "entries" });
   expect(first.isError).not.toBe(true);
   expect(first.structuredContent).toMatchObject({ entries: [{ kind: "message_text" }], has_more: true });
   const firstPage = first.structuredContent as { next_cursor: string };
   const second = navigator.list({ context_id: snapshot.context_id, view: "entries", cursor: firstPage.next_cursor });
   expect(second.structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
-  expect(navigator.preflightRead({ context_id: snapshot.context_id, read_ref: snapshot.targets[1]!.read_ref! }).isError).not.toBe(true);
+  expect(navigator.preflightRead({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[1]!.read_ref! }] }).isError).not.toBe(true);
   const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-directory-admission-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
   const registration = spyOn(broker, "registerCompactionContext");
@@ -231,7 +232,7 @@ for (const terminal of [false, true]) test(`compaction rejects an oversized late
   try {
     await expect(registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
       handoffId: transaction.handoffId, historyRevision: 0, ownerGeneration: "directory-page",
-      expiresAt: Date.now() + 30_000, availableTokens: 96_000 }, "Summarize the original source"))
+      expiresAt: Date.now() + 30_000, availableTokens: 96_000, limits }, "Summarize the original source"))
       .rejects.toMatchObject({ code: "continuity_source_unproven" });
     expect(registration).not.toHaveBeenCalled();
   } finally {
@@ -246,7 +247,8 @@ test("compaction directory admission protects future signed cursor token costs",
     { type: "function_call", call_id: "c".repeat(236), name: "t".repeat(236), namespace: "n".repeat(236), arguments: "{}" },
     { role: "user", content: "Continue" },
   ] });
-  await expect(assertCompactionReadable(createContextSnapshot(parsed), 96_000)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  await expect(assertCompactionReadable(createContextSnapshot(parsed), 96_000,
+    { listBytes: 12_288, listTokens: 1_500, listEntries: 20 })).rejects.toMatchObject({ code: "continuity_source_unproven" });
 });
 
 test("navigation usage is monotone, idempotent and credits only the selected required-media reserve", () => {

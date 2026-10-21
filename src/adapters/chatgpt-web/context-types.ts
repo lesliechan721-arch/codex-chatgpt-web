@@ -108,7 +108,15 @@ export interface ContextListArgs extends ContextFilter {
   cursor?: string;
   required_only?: boolean;
 }
-export interface ContextReadArgs { context_id: string; read_ref: string; cursor?: string }
+export interface ContextReadItem { read_ref: string; cursor?: string }
+export interface ContextReadArgs { context_id: string; reads: ContextReadItem[] }
+/** Fixed offsets are re-signed in each authorized scope. No source text is cached here. */
+export interface ContextRequiredTextBatch {
+  reads: { target_id: string; start: number }[];
+  ranges: { target_id: string; start: number; end_exclusive: number }[];
+  tokens: number;
+  wire_bytes: number;
+}
 export interface ContextSearchArgs extends ContextFilter {
   context_id: string;
   query: string;
@@ -143,12 +151,6 @@ export interface ContextBootstrapControl {
   revision?: number;
   acknowledged_revision?: number;
   next_action?: string;
-}
-export interface ContextTextPageCost {
-  start: number;
-  end_exclusive: number;
-  tokens: number;
-  wire_bytes: number;
 }
 
 export interface ContextRemainingBudget {

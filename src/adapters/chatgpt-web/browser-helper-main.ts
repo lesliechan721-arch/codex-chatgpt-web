@@ -12,6 +12,8 @@ import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityClaim, sam
 import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
+import { CONTEXT_PROTOCOL_VERSION } from "./context-runtime";
+import { contextProtocolCapabilities } from "./context-protocol";
 
 interface RunMessage {
   type: "run";
@@ -795,4 +797,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", "preparation-termination-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });
+writeProtocol({ type: "ready", ...contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", "preparation-termination-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });

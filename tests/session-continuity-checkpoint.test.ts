@@ -260,7 +260,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     ]);
     compact._compactionRequest = true;
     const events = await f.run(compact);
-    const summary = events.find(event => event.type === "text_delta");
+    const summary = events.find(event => event.type === "text_delta" && event.phase === "final_answer");
     if (summary?.type !== "text_delta") throw new Error("Missing committed checkpoint");
     return { compact, summary: summary.text };
   };
@@ -388,7 +388,7 @@ test("real Codex captured active and completed checkpoint-only requests reuse pr
   expect(binding.checkpoints.size).toBe(2);
 });
 
-test("Automatic repeated-summary continuation replays the old result round for the same native instruction", async () => {
+for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automatic repeated-summary continuation replays the old result round for the same native instruction${reclamation ? ` before ${reclamation} reclamation` : ""}`, async () => {
   const f = fixture();
   f.controls.invokeSourceTools = true;
   const first = f.request();
@@ -403,7 +403,7 @@ test("Automatic repeated-summary continuation replays the old result round for t
     ]);
     compact._compactionRequest = true;
     const events = await f.run(compact);
-    const summary = events.find(event => event.type === "text_delta");
+    const summary = events.find(event => event.type === "text_delta" && event.phase === "final_answer");
     if (summary?.type !== "text_delta") throw new Error("Missing checkpoint summary");
     return summary.text;
   };
@@ -425,6 +425,7 @@ test("Automatic repeated-summary continuation replays the old result round for t
   while (snapshot.lastToolBatchRevision === priorBatch) snapshot = await progress.waitForChange(snapshot.revision);
   await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
   const accepted = await next;
+  const unacceptedCall = source.outstanding()[0]!;
   expect(await compactCurrent(result, "Next continuation result.")).toBe(summary);
   const submissions = f.submissions.length;
   const results = f.controls.toolResults.length;
@@ -433,6 +434,35 @@ test("Automatic repeated-summary continuation replays the old result round for t
   expect(retry._continuityHistoryRevision).toBe(1);
   expect(f.submissions).toHaveLength(submissions);
   expect(f.controls.toolResults).toHaveLength(results);
+  const changed = structuredClone(result);
+  ((changed._rawBody as { input: Record<string, unknown>[] }).input.at(-1)!).output = "Changed accepted result.";
+  await expect(f.run(changed)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  const unaccepted = f.request("", "turn-first", [
+    ...(result._rawBody as { input: unknown[] }).input,
+    recordedCall(unacceptedCall),
+    { type: "function_call_output", call_id: unacceptedCall.callId, output: "New result after source retirement." },
+  ]);
+  await expect(f.run(unaccepted)).rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(submissions);
+  expect(f.controls.toolResults).toHaveLength(results);
+  if (reclamation) {
+    const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(result)}`;
+    if (reclamation === "ttl") {
+      const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 60_000);
+      try { chatGptTurnSessions.activeCount(); }
+      finally { clock.mockRestore(); }
+    } else {
+      const capacity = chatGptTurnSessions as unknown as { maxEntries: number };
+      const originalMaxEntries = capacity.maxEntries;
+      capacity.maxEntries = 1;
+      try { chatGptTurnSessions.assertContinuityThreadAvailable(f.threadId, "cold-source-reclamation-probe"); }
+      finally { capacity.maxEntries = originalMaxEntries; }
+    }
+    expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
+    await expect(f.run(structuredClone(result))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(f.submissions).toHaveLength(submissions);
+    expect(f.controls.toolResults).toHaveLength(results);
+  }
 });
 
 for (const manual of [false, true]) test(`Round 9: first checkpoint transition accepts structured source key order ${manual}`, async () => {
@@ -824,7 +854,7 @@ for (const format of ["local", "v2"] as const) test(`public ended ZeroRisk ${for
     readStep = "read";
     const match = (search.structuredContent as { hits: Array<{ read_ref: string; read_cursor: string }> }).hits[0]!;
     const read = await client.callTool({ name: "codex_context_read", arguments: { ...credential,
-      read_ref: match.read_ref, cursor: match.read_cursor } });
+      reads: [{ read_ref: match.read_ref, cursor: match.read_cursor }] } });
     expect(read.isError).not.toBe(true);
     expect(JSON.stringify(read.content)).toContain(tail); successfulReads++;
     readStep = "complete";

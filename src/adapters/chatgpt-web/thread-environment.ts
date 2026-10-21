@@ -6,6 +6,8 @@ import { getCodexHome, getTrustedCodexHomes } from "../../codex-integration-shar
 import type { CodexParsedRequest } from "../../types";
 import {
   chatGptTurnUserRevisionHistory,
+  chatGptCurrentInstructionRevision,
+  bindNativeInstructionOwnership,
   extractChatGptTurnEnvironmentClaim,
   extractChatGptEnvironmentMessageClaim,
   extractChatGptNativeCompactionPhase,
@@ -456,6 +458,7 @@ export class ChatGptThreadEnvironmentStore {
     diagnostics.parent_cache_lookup = "not_attempted";
     delete parsed._chatGptMessageIdAliases;
     delete parsed._chatGptCompactionSourceTurnId;
+    bindNativeInstructionOwnership(parsed);
     const identity = extractChatGptTurnIdentity(parsed);
     const compactionPhase = extractChatGptNativeCompactionPhase(parsed);
     const nativeId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -554,6 +557,8 @@ export class ChatGptThreadEnvironmentStore {
           ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
           lineage: rolloutIdentity,
           turnId: identity.turnId,
+          ...(parsed._conversationPolicy === "task" && !parsed._compactionRequest
+            ? { currentInstruction: chatGptCurrentInstructionRevision(parsed) } : {}),
           ...(compactionSource?.turnId ? { compactionSourceTurnId: compactionSource.turnId } : {}),
           ...(compactionSource ? { compactionSource } : {}),
           ...(extractChatGptNativeCompactionPhase(parsed) ? { compactionPhase: extractChatGptNativeCompactionPhase(parsed) } : {}),
@@ -593,6 +598,7 @@ export class ChatGptThreadEnvironmentStore {
               `${source} environment conflicts with its current Codex rollout`,
             );
           }
+          bindNativeInstructionOwnership(parsed, rollout.currentInstructionOwnership);
           this.set(rolloutIdentity.threadId, rolloutEnvironment, parsed);
           return rolloutEnvironment;
         }

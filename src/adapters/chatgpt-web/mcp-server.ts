@@ -1,6 +1,7 @@
 import { CONTEXT_REUSE_PROTOCOL } from "./context-reuse-types";
 import { CONTEXT_PROTOCOL_VERSION, contextFailure, type ContextPreparedReply } from "./context-runtime";
 import { contextTextReadReceipt, type ContextTextReadReceipt } from "./context-text-result";
+import { CONTEXT_LIMITS } from "./context-budget";
 export { NATIVE_WAIT_INSTRUCTIONS } from "./native-tool-wait-protocol";
 import { CONTEXT_TEXT_READ_INSTRUCTIONS } from "./context-prompt";
 import { createHash, randomBytes } from "node:crypto";
@@ -158,12 +159,15 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
   for (const method of ["list", "read", "search"] as const) {
     const ordinaryKey = contract === "safe" ? "request_id" : "turn_token";
     const operationInput = method === "list" ? { ...contextFilters, view: z.enum(["overview", "entries"]), required_only: z.boolean().optional(), cursor: z.string().max(4096).optional() }
-      : method === "read" ? { read_ref: z.string().min(1).max(256), cursor: z.string().max(4096).optional() }
+      : method === "read" ? { reads: z.array(z.object({ read_ref: z.string().min(1).max(256),
+        cursor: z.string().min(1).max(2048).optional() }).strict()).min(1).max(8) }
       : { ...contextFilters, query: z.string().min(1).max(512), read_ref: z.string().min(1).max(256).optional(), cursor: z.string().max(4096).optional() };
     const inputSchema = z.object({
       [ordinaryKey]: turnTokenSchema.optional(), compaction_token: turnTokenSchema.optional(),
       context_id: z.string().min(1).max(256), ...operationInput,
     }).strict().refine(input => (typeof (input as Record<string, unknown>)[ordinaryKey] === "string") !== (typeof input.compaction_token === "string"), "Exactly one context credential is required")
+      .refine(input => method !== "read" || Buffer.byteLength(JSON.stringify(input), "utf8") <= CONTEXT_LIMITS.maxArgumentBytes,
+        "The complete context read arguments, including the credential, must not exceed 8 KiB")
       .meta({ oneOf: [{ required: [ordinaryKey], not: { required: ["compaction_token"] } }, { required: ["compaction_token"], not: { required: [ordinaryKey] } }] });
     server.registerTool(`codex_context_${method}`, {
       title: `Read existing Codex context: ${method}`,

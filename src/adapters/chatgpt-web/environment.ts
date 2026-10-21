@@ -493,6 +493,55 @@ function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnI
     ? recovered.source : carried;
 }
 
+export interface ChatGptNativeInstructionOwnership {
+  itemId: string;
+  turnId: string;
+  contentDigest: string;
+}
+
+interface BoundNativeInstructionOwnership {
+  proof: ChatGptNativeInstructionOwnership;
+  body: unknown;
+  input: unknown[];
+  item: unknown;
+  index: number;
+  digest: string;
+  scope?: string;
+  threadId?: string;
+}
+
+const nativeInstructionOwnership = new WeakMap<CodexParsedRequest, BoundNativeInstructionOwnership>();
+const instructionContentDigest = (content: unknown): string => createHash("sha256").update(canonicalJson(content)).digest("hex");
+
+/** Only the trusted rollout resolver may publish ownership; wire metadata stays unchanged. */
+export function bindNativeInstructionOwnership(parsed: CodexParsedRequest,
+  proof?: ChatGptNativeInstructionOwnership): void {
+  nativeInstructionOwnership.delete(parsed);
+  const input = record(parsed._rawBody)?.input;
+  if (Array.isArray(input)) continuityInstructionSelection(parsed, input)?.inputs.clear();
+  if (!proof) return;
+  const index = chatGptCurrentInstructionIndex(parsed), item = Array.isArray(input) ? record(input[index]) : undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  if (parsed._conversationPolicy !== "task" || parsed._compactionRequest || !Array.isArray(input) || !item
+    || inputItemType(item) !== "message" || item.role !== "user" || item.id !== proof.itemId
+    || identity.turnId !== proof.turnId || (itemTurnId(item) !== undefined && itemTurnId(item) !== proof.turnId)
+    || instructionContentDigest(item.content) !== proof.contentDigest) throw continuityError("continuity_source_unproven");
+  nativeInstructionOwnership.set(parsed, { proof: { ...proof }, body: parsed._rawBody, input, item, index,
+    digest: instructionContentDigest(input), scope: parsed._continuityScope, threadId: identity.threadId });
+}
+
+function currentNativeInstructionOwnership(parsed: CodexParsedRequest, input: unknown[]): BoundNativeInstructionOwnership | undefined {
+  const bound = nativeInstructionOwnership.get(parsed);
+  if (!bound) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  if (parsed._conversationPolicy !== "task" || parsed._compactionRequest || bound.body !== parsed._rawBody
+    || bound.input !== input || bound.item !== input[bound.index] || bound.digest !== instructionContentDigest(input)
+    || bound.scope !== parsed._continuityScope || bound.threadId !== identity.threadId || bound.proof.turnId !== identity.turnId) {
+    throw continuityError("continuity_source_unproven", "The authenticated current instruction input changed after native verification.");
+  }
+  return bound;
+}
+
 const durableQueuedInstructionSelections = new WeakMap<CodexParsedRequest, { input: unknown[]; digest: string; scope?: string; indices: number[] }>();
 
 /** Only the current checkpoint's durable inbox proof may establish this boundary. */
@@ -624,7 +673,7 @@ export function bindContinuityCheckpointSourceIndex(parsed: CodexParsedRequest, 
 /** Reintroduce all native instruction items belonging to the current incremental work. */
 export function continuityCurrentInstructionInput(
   parsed: CodexParsedRequest,
-  previous?: { instructionIdentity?: string; nativeTurnId?: string; trustedLowerBound?: number },
+  previous?: { instructionIdentity?: string; nativeTurnId?: string; trustedLowerBound?: number; rejectExecutionOutput?: boolean },
   includeRetainedSource = false,
   sourceInstructionIndex?: number,
 ): unknown[] {
@@ -636,9 +685,28 @@ export function continuityCurrentInstructionInput(
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const index = sourceInstructionIndex ?? chatGptCurrentInstructionIndex(parsed);
+  const ownership = currentNativeInstructionOwnership(parsed, input);
+  const owner = (candidate: number): string | undefined => itemTurnId(input[candidate])
+    ?? (ownership?.index === candidate ? ownership.proof.turnId : undefined);
+  const identity = extractChatGptTurnIdentity(parsed);
+  if (parsed._compactionRequest) {
+    identity.turnId = extractChatGptCompactionSourceRevision(parsed).turnId
+      ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId;
+  }
+  const prior = previous;
+  const checkpointIndex = prior?.trustedLowerBound;
+  // Native ownership authenticates this new human, not tool results carried across the
+  // checkpoint. Later results for the accepted current turn retain their normal replay path.
+  if (prior?.rejectExecutionOutput && ownership?.index === index && checkpointIndex !== undefined && checkpointIndex >= 0
+    && prior?.nativeTurnId !== undefined && prior.nativeTurnId !== identity.turnId
+    && input.slice(checkpointIndex + 1).some(value => {
+      const item = record(value);
+      return item?.role === "assistant" || ["function_call", "custom_tool_call", "function_call_output",
+        "custom_tool_call_output", "tool_search_call", "tool_search_output", "compaction"].includes(String(item?.type));
+    })) throw continuityError("continuity_source_unproven", "Native instruction ownership cannot authenticate checkpoint execution output.");
   const selection = continuityInstructionSelection(parsed, input);
   const selectionKey = JSON.stringify([previous?.instructionIdentity ?? null, previous?.nativeTurnId ?? null,
-    previous?.trustedLowerBound ?? null, sourceInstructionIndex ?? null, includeRetainedSource]);
+    previous?.trustedLowerBound ?? null, previous?.rejectExecutionOutput === true, sourceInstructionIndex ?? null, includeRetainedSource]);
   const cached = selection?.inputs.get(selectionKey);
   const clone = (candidate: number): unknown => {
     const item = structuredClone(input[candidate]);
@@ -655,14 +723,8 @@ export function continuityCurrentInstructionInput(
     return remember(queued.indices);
   }
   const retainCurrentSource = includeRetainedSource && isRetainedCompactionSourceInstruction(parsed, input[index]);
-  const identity = extractChatGptTurnIdentity(parsed);
-  if (parsed._compactionRequest) {
-    identity.turnId = extractChatGptCompactionSourceRevision(parsed).turnId
-      ?? parsed._chatGptCompactionSourceTurnId ?? identity.turnId;
-  }
   const metadata = clientTurnMetadata(parsed);
-  const prior = previous;
-  const currentTurnOwned = userRevision(input[index], identity.turnId, metadata)?.turnId === identity.turnId;
+  const currentTurnOwned = owner(index) === identity.turnId;
   // Codex reuses the instruction prefix of each execution-history window across turns.
   // Its turn_id records creation, while native content kinds identify persistent groups.
   const requestPrefix = new Set<number>();
@@ -675,7 +737,6 @@ export function continuityCurrentInstructionInput(
     "token_budget.context_window", "token_budget.context_window_guidance", "tools.deferred_namespaces",
     "git_attribution.instructions", "managed_config.developer_instructions", "model_switch.instructions",
     "agents_md.instructions", "environments.environment_context"]);
-  const checkpointIndex = prior?.trustedLowerBound;
   const prefixStarts = [0, ...(checkpointIndex !== undefined && checkpointIndex >= 0 ? [checkpointIndex + 1] : [])];
   for (const start of prefixStarts) {
     for (let candidate = start; candidate < input.length; candidate += 1) {
@@ -759,7 +820,7 @@ export function continuityCurrentInstructionInput(
     const grouped = Boolean(message && currentEnvironmentItems.has(message) && Array.isArray(message.content)
       && (chatGptInstructionContent(message) as unknown[]).length > 0);
     const supplemental = envelope || grouped || Boolean(message && isNativeAgentsMdContext(message));
-    const nativeTurnId = revision?.turnId ?? itemTurnId(item);
+    const nativeTurnId = revision?.turnId ?? owner(candidate);
     const requestWide = requestPrefix.has(candidate);
     if (candidate <= lowerBound && !requestWide && !(nativeTurnId === identity.turnId
       && (supplemental || (currentTurnOwned && prior?.nativeTurnId !== identity.turnId)))) continue;

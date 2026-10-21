@@ -301,7 +301,11 @@ Full/MCP compaction can supply a bounded navigation entry into a separate snapsh
 legal sources. An independent `compaction_token` permits only `codex_context_list`,
 `codex_context_read`, and `codex_context_search`; the original handoff or completion credential
 still submits the checkpoint. Historical instructions are summary evidence, not new business work.
-The model chooses which sources to inspect, with no minimum read count or full-coverage requirement.
+Reads use `reads: [{read_ref, cursor?}]`; text responses use `context-text-batch-v1` with
+independent bodies selected by `items[].body_content_index`. Optional continuation follows
+`remaining_reads`; compaction does not follow an ordinary required startup chain. Images remain
+single-item reads with their original result. The model chooses which sources to inspect, with no
+minimum read count or full-coverage requirement.
 New compaction admission does not read or require historical six-call diagnostic evidence.
 Replay keeps its original receipts and authorization. Optional diagnosis does not change source
 reading requirements or the original writer and Send rules.

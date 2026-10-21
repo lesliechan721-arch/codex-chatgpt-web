@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
+import type { ContextRequiredRead } from "../src/adapters/chatgpt-web/context-types";
 import type { ContextDeliveryPlan } from "../src/adapters/chatgpt-web/context-planner";
 import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { parseRequest } from "../src/responses/parser";
@@ -19,11 +20,11 @@ function rules(request: CodexParsedRequest, instructions: string): CodexParsedRe
 }
 
 type Manifest = { manifest_version: number; live: { context_ready: boolean; text_ready: boolean };
-  next_required_read: { tool: string; arguments: Record<string, unknown> } | null };
+  next_required_read: ContextRequiredRead | null };
 
 /** Read through the public MCP transport. The fixture never manufactures a receipt. */
 async function readCurrentContext(input: ContinuityContextModelInput,
-  prior = { calls: 0, wireBytes: 0, manifestCalls: 0, startupManifestWireBytes: 0 }) {
+  prior = { calls: 0, wireBytes: 0, manifestCalls: 0, startupManifestWireBytes: 0 }, byRef = new Map<string, string>()) {
   const bootstrap = JSON.parse(input.prompt.match(/<codex_bootstrap_json>\n([^\n]+)\n/)![1]!);
   const credential = input.manual ? { request_id: input.token } : { turn_token: input.token };
   let calls = prior.calls, wireBytes = prior.wireBytes;
@@ -36,24 +37,22 @@ async function readCurrentContext(input: ContinuityContextModelInput,
   const first = await call(bootstrap.first_call.name, bootstrap.first_call.arguments);
   let manifest = (input.manual ? (first.structuredContent as { context_bootstrap: Manifest }).context_bootstrap
     : first.structuredContent) as Manifest;
-  expect(manifest.manifest_version).toBe(2);
-  const bodies: string[] = [];
-  const readRefs: string[] = [];
-  for (let sources = 0; !manifest.live.context_ready && sources < 150; sources++) {
-    expect(manifest.next_required_read).not.toBeNull();
-    const next = manifest.next_required_read!;
-    let args = next.arguments;
-    let body = "";
-    for (let pages = 0; pages < 200; pages++) {
-      const page = parseContextTextReadResult(await call(next.tool, args));
-      body += page.body;
-      if (!page.metadata.next_cursor) break;
-      args = { ...next.arguments, cursor: page.metadata.next_cursor };
+  expect(manifest.manifest_version).toBe(3);
+  expect(manifest).not.toHaveProperty("required_targets");
+  let next = manifest.next_required_read;
+  for (let batches = 0; next; batches++) {
+    expect(batches).toBeLessThan(200);
+    const page = parseContextTextReadResult(await call(next.tool, { ...next.arguments }));
+    for (const [index, item] of page.metadata.items.entries()) {
+      const previous = byRef.get(item.read_ref) ?? "";
+      expect(item.range.start).toBe(Buffer.byteLength(previous));
+      byRef.set(item.read_ref, previous + page.bodies[index]!);
     }
-    bodies.push(body);
-    readRefs.push(String(next.arguments.read_ref));
-    manifest = (await call("codex_context_list", { context_id: bootstrap.context_id, view: "overview" })).structuredContent as Manifest;
+    expect(page.metadata.required_step).toBeDefined();
+    next = page.metadata.required_step!.next_required_read;
   }
+  const bodies = [...byRef.values()], readRefs = [...byRef.keys()];
+  manifest = (await call("codex_context_list", { context_id: bootstrap.context_id, view: "overview" })).structuredContent as Manifest;
   expect(manifest.live.context_ready).toBe(true);
   // The transport may deliver the response before its receipt IPC settles.
   // Wait on the production output-admission check; never manufacture coverage.
@@ -71,7 +70,7 @@ async function readCurrentContext(input: ContinuityContextModelInput,
   expect(observed.returned_calls).toBe(calls);
   expect(observed.returned_wire_bytes).toBe(wireBytes);
   expect(observed.startup_manifest_wire_bytes).toBe(prior.startupManifestWireBytes || Buffer.byteLength(JSON.stringify(first)));
-  expect(observed.manifest_calls).toBe(prior.manifestCalls + 1 + bodies.length);
+  expect(observed.manifest_calls).toBe(prior.manifestCalls + 2);
   expect(observed.directory_calls).toBe(0);
   expect(observed.actual_model_input_tokens).toBeNull();
   return { bootstrap, bodies, readRefs, calls, wireBytes, manifest };
@@ -240,12 +239,19 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
     const first = await call(bootstrap.first_call.name, bootstrap.first_call.arguments);
     let manifest = (manual ? (first.structuredContent as { context_bootstrap: Manifest }).context_bootstrap : first.structuredContent) as Manifest;
     let missingPage = false;
+    const byRef = new Map<string, string>();
     for (let sources = 0; sources < 20; sources++) {
       expect(manifest.next_required_read).not.toBeNull();
       const next = manifest.next_required_read!;
-      const page = parseContextTextReadResult(await call(next.tool, next.arguments));
-      if (page.metadata.next_cursor) { missingPage = true; break; }
-      manifest = (await call("codex_context_list", { context_id: bootstrap.context_id, view: "overview" })).structuredContent as Manifest;
+      const page = parseContextTextReadResult(await call(next.tool, { ...next.arguments }));
+      for (const [index, item] of page.metadata.items.entries()) {
+        const previous = byRef.get(item.read_ref) ?? "";
+        expect(item.range.start).toBe(Buffer.byteLength(previous));
+        byRef.set(item.read_ref, previous + page.bodies[index]!);
+      }
+      if (page.metadata.items.some(item => item.has_more)) { missingPage = true; break; }
+      expect(page.metadata.required_step).toBeDefined();
+      manifest = { ...manifest, next_required_read: page.metadata.required_step!.next_required_read };
     }
     expect(missingPage).toBe(true);
     const early = await call("codex_tool_inventory", { operation_id: 1, task_revision: 0 });
@@ -260,10 +266,10 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
     const previousCredential = old!.bootstrap.first_call.arguments;
     const retired = await input.client.callTool({ name: "codex_context_read", arguments: {
       ...(manual ? { request_id: previousCredential.request_id } : { turn_token: previousCredential.turn_token }),
-      context_id: old!.bootstrap.context_id, read_ref: old!.readRefs[0],
+      context_id: old!.bootstrap.context_id, reads: [{ read_ref: old!.readRefs[0] }],
     } });
     expect(retired.isError).toBe(true);
-    const completed = await readCurrentContext(input, prior);
+    const completed = await readCurrentContext(input, prior, byRef);
     expect(completed.bodies.join("\n")).toContain("REQUIRED_TAIL_a3f0");
     expect(await call("codex_tool_inventory", { operation_id: 1, task_revision: 0 })).toEqual(early);
     expect((await call("codex_tool_inventory", { operation_id: 2, task_revision: 0 })).isError).not.toBe(true);
@@ -273,6 +279,6 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   const next = f.next(first);
   const raw = structuredClone(next._rawBody) as { input: Array<Record<string, unknown>> };
-  raw.input.at(-1)!.content = "Long current event. ".repeat(1_200) + "REQUIRED_TAIL_a3f0";
+  raw.input.at(-1)!.content = "Long current event. ".repeat(4_000) + "REQUIRED_TAIL_a3f0";
   expect((await f.run(rules(parseRequest(raw), "Keep the exact stable rule."))).at(-1)).toMatchObject({ type: "done", endTurn: true });
 }, 60_000);

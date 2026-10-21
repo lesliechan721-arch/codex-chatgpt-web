@@ -6,6 +6,8 @@ import type { TaskInputIdentity } from "./continuity-task-input-types";
 import { restoreRecoveryTaskUpdates, recordRecoveryTaskDelivery, recordRecoveryTaskAck, recoveryTaskUpdateSeed } from "./continuity-task-update-journal";
 import { ContextScope, CONTEXT_PROTOCOL_VERSION, contextError, contextFailure, type ContextPlanRegistration, type ContextAttachmentConfirmation, type ContextStatus, type ContextUsageEvidence, type ContextVerificationRegistration, type ContextVerificationHandle, type ContextVerificationStatus, type CompactionContextRegistration, type CompactionContextHandle, type ContextMethod, type ContextArgs, type ContextPreparedReply } from "./context-runtime";
 import type { ContextTextReadReceipt } from "./context-text-result";
+import { CONTEXT_LIMITS } from "./context-budget";
+import { contextProtocolCapabilities, hasContextToolCapabilities, hasContextBootstrapCapabilities } from "./context-protocol";
 import { serializeContextSnapshot, restoreContextSnapshot, type ContextSnapshotWire } from "./context-snapshot";
 import { assertRecoveryWriter, withRecoveryWriter, recordRecoveryDelivery, recordRecoveryAppend, recoveryRecord, recoveryDigest, type RuntimeRecoveryReference } from "./continuity-recovery-runtime";
 import { continuityError, isRetiredWriterError, withRetiredWriterReason } from "./continuity-errors";
@@ -568,6 +570,7 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 
 export interface TurnBrokerOwner {
   /** Current local/remote ABI support; saved diagnostic records are not consulted. */
+  contextToolsAvailable?(): boolean | Promise<boolean>;
   contextBootstrapAvailable?(): boolean | Promise<boolean>;
   contextReuseAvailable?(): boolean | Promise<boolean>;
   commitContextReuse?(token: string): ContextReuseBaseline | undefined | Promise<ContextReuseBaseline | undefined>;
@@ -880,7 +883,8 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!Number.isSafeInteger(bytes) || bytes > 128 * 1024 * 1024) throw contextError("CONTEXT_BUDGET_EXCEEDED", "Active context storage is full");
   }
 
-  contextBootstrapAvailable(): boolean { return true; }
+  contextToolsAvailable(): boolean { return hasContextToolCapabilities(contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), CONTEXT_PROTOCOL_VERSION); }
+  contextBootstrapAvailable(): boolean { return hasContextBootstrapCapabilities(contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), CONTEXT_PROTOCOL_VERSION); }
   contextReuseAvailable(): boolean { return true; }
 
   private reuseDependencyValid(channel: TurnChannel, registration: ContextPlanRegistration): boolean {
@@ -1158,7 +1162,16 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private contextQuery(request: BrokerRequest): ContextPreparedReply {
     if (request.contextProtocol !== CONTEXT_PROTOCOL_VERSION || !request.contextArgs || !["list", "read", "search"].includes(request.contextMethod!)) throw contextError("CONTEXT_INVALID", "Refresh the connector context protocol");
-    if (!request.token || !["native", "safe"].includes(request.contract!)) throw contextError("CONTEXT_INVALID", "Invalid context credential");
+    if (typeof request.token !== "string" || request.token.length < 20 || request.token.length > 256
+      || !["native", "safe"].includes(request.contract!)) throw contextError("CONTEXT_INVALID", "Invalid context credential");
+    if (request.contextMethod === "read") {
+      const allowed = ["id", "method", "token", "contract", "credentialKind", "contextProtocol", "contextBootstrapProtocol", "contextReuseProtocol", "contextMethod", "contextArgs"];
+      const credential = request.credentialKind === "compaction" ? "compaction_token" : request.contract === "safe" ? "request_id" : "turn_token";
+      if (Object.keys(request).some(key => !allowed.includes(key))
+        || Buffer.byteLength(JSON.stringify({ [credential]: request.token, ...request.contextArgs }), "utf8") > CONTEXT_LIMITS.maxArgumentBytes) {
+        throw contextError("INVALID_ARGUMENT", "Invalid context read arguments or complete arguments exceed 8 KiB");
+      }
+    }
     let scope: ContextScope;
     if (request.credentialKind === "compaction") {
       const verification = this.verificationForToken(request.token);
@@ -1181,7 +1194,7 @@ export class TurnBroker implements TurnBrokerOwner {
     } else throw contextError("CONTEXT_INVALID", "Invalid context credential");
     if (scope.registration.reuse && request.contextReuseProtocol !== CONTEXT_REUSE_PROTOCOL) throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the connector for context-reuse-v1; the sent plan cannot change or resend");
     if (scope.registration.startupProtocol && request.contextBootstrapProtocol !== scope.registration.startupProtocol) {
-      throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current connector to obtain context-bootstrap-v1 and context-text-read-v2; this sent request cannot change delivery plans");
+      throw contextError("CONTEXT_INCOMPATIBLE", "Refresh the current connector to obtain context-bootstrap-v1 and context-text-batch-v1; this sent request cannot change delivery plans");
     }
     const channel = request.credentialKind === "ordinary" ? this.channels.get(request.token) : undefined;
     return scope.prepare(request.contextMethod!, request.contextArgs, channel?.taskUpdates ? {
@@ -1201,7 +1214,8 @@ export class TurnBroker implements TurnBrokerOwner {
       try { this.verificationSource(request.token); } catch { sent = false; }
       const scope = ordinary ? this.channels.get(verification.turnToken)?.contextScope : verification.scope;
       const returned = scope?.finish(request.receiptId, sent, request.textReadReceipt);
-      if (returned && (returned.method !== "read" || returned.textRead)) {
+      if (returned && (returned.method !== "read" || returned.textRead && returned.textRead.items.length >= 2
+        && returned.textRead.items.every(item => item.range.start === 0 && item.range.end_exclusive === item.utf8_bytes))) {
         (ordinary ? verification.ordinary : verification.compaction).add(returned.method);
         if (returned.textRead) {
           if (ordinary) verification.ordinaryTextRead = returned.textRead;
@@ -3064,7 +3078,7 @@ export class TurnBroker implements TurnBrokerOwner {
         recoveryProtocol: 2,
         nativeWaitProtocol: NATIVE_WAIT_PROTOCOL_VERSION,
         taskUpdateProtocol: TASK_UPDATE_PROTOCOL_VERSION,
-        contextProtocol: CONTEXT_PROTOCOL_VERSION,
+        ...contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION),
         contextBootstrapProtocol: "context-bootstrap-v1",
         contextReuseProtocol: CONTEXT_REUSE_PROTOCOL,
         acceptingExternalOwners: this.acceptingExternalOwners,
@@ -3831,15 +3845,20 @@ export async function callTurnBroker<T>(
 export class RemoteTurnBroker implements TurnBrokerOwner {
   constructor(readonly socketPath: string) {}
 
+  async contextToolsAvailable(): Promise<boolean> {
+    const status = await callTurnBroker(this.socketPath, { method: "owner_status" }, 5_000);
+    return hasContextToolCapabilities(status, CONTEXT_PROTOCOL_VERSION);
+  }
+
   async contextBootstrapAvailable(): Promise<boolean> {
-    const status = await callTurnBroker<{ contextProtocol?: number; contextBootstrapProtocol?: string }>(
+    const status = await callTurnBroker<{ contextBootstrapProtocol?: string }>(
       this.socketPath, { method: "owner_status" }, 5_000);
-    return status.contextProtocol === CONTEXT_PROTOCOL_VERSION && status.contextBootstrapProtocol === "context-bootstrap-v1";
+    return hasContextBootstrapCapabilities(status, CONTEXT_PROTOCOL_VERSION) && status.contextBootstrapProtocol === "context-bootstrap-v1";
   }
 
   async contextReuseAvailable(): Promise<boolean> {
-    const status = await callTurnBroker<{ contextProtocol?: number; contextReuseProtocol?: string }>(this.socketPath, { method: "owner_status" }, 5_000);
-    return status.contextProtocol === CONTEXT_PROTOCOL_VERSION && status.contextReuseProtocol === CONTEXT_REUSE_PROTOCOL;
+    const status = await callTurnBroker<{ contextReuseProtocol?: string }>(this.socketPath, { method: "owner_status" }, 5_000);
+    return hasContextBootstrapCapabilities(status, CONTEXT_PROTOCOL_VERSION) && status.contextReuseProtocol === CONTEXT_REUSE_PROTOCOL;
   }
   async commitContextReuse(token: string): Promise<ContextReuseBaseline | undefined> {
     const result = await callTurnBroker<{ baseline: ContextReuseBaseline | null }>(this.socketPath,

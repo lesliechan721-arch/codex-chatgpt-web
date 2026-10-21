@@ -96,7 +96,7 @@ place. Setup migrates known legacy local configuration transactionally and requi
 configuration steps for the selected identity.
 The user creates a new remote plugin. Exact browser selection never falls back to a retired
 identity. Production and DEV plugins can remain installed together. Future released public schema
-changes require another explicit connector identity. The current context-rendering/text-read-v2
+changes require another explicit connector identity. The current context-rendering/text-batch-v1
 work is an update to an unreleased feature and retains Native5 / Native5 DEV / Zero Risk4 and
 non-retired custom names. It upgrades the internal context protocol and capability evidence instead.
 
@@ -179,8 +179,15 @@ eligible long strings in length-bound raw blocks. It preserves the delivered val
 dynamic outer fences. Short/no-benefit fields stay JSON; unverified editor whitespace stays JSON.
 The [byte contract](context-rendering.md) defines decoding and collision checks. Selection measures
 complete inputs, fixes the actual format and bytes before Send, and records the format with coverage
-and costs. It does not change source choice, permissions, or retry policy. MCP text pages use a
-separate `context-text-read-v2` result with two metadata representations and one body block.
+and costs. It does not change source choice, permissions, or retry policy. MCP text reads accept a
+`reads` array of 1–8 distinct targets and use a separate
+`context-text-batch-v1` result with two metadata representations and one independent body block per
+returned item. A whole batch has one transaction and one validated successful-transport receipt;
+any invalid item prevents all new coverage. Single images retain their original result and
+confirmation through one-item arrays. Protocol 4 and manifest 3 publish a fixed required batch
+chain, so normal pure-text startup needs no required directory traversal. A final overview
+establishes settled readiness. The expanded profile caps a complete text response at 64 KiB and
+8,000 estimated tokens; it is a local budget, not proof of real platform acceptance.
 
 Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
 same choice remains available in Settings; changing it uses the transactional setup path, replaces

@@ -15,10 +15,11 @@ usable.
 - Run its browser smoke test and initialize the DEV profile. Complete MCP setup only when testing
   simulated tool rounds; browser, effort, context-limit, and compaction work in browser-only mode.
   The launcher stores any MCP credentials only in the DEV home and supervises only that isolated
-  tunnel. Create `Codex Native5 DEV` as a new ChatGPT plugin; keep production `Codex Native5`
-  separate. Preserve `Codex Native4 DEV` and earlier retired connectors unchanged. Never rename
-  or refresh an old DEV connector. Setup preserves custom names that are not retired defaults;
-  a custom plugin with an old cached schema needs a newly named plugin. Complete the required
+  tunnel. Use `Codex Native5 DEV` as the current ChatGPT plugin; keep production `Codex Native5`
+  separate. Preserve `Codex Native4 DEV` and earlier retired connectors unchanged. For the
+  `reads` array and `context-text-batch-v1` upgrade, refresh the current connector's tools in
+  ChatGPT Apps settings. Keep its existing identity. Setup also preserves current custom names.
+  Complete the required
   configuration steps. **Verify runtime** is optional for troubleshooting; when requested, it checks
   the installed schema and requires six successful read-only context returns over fixed small text,
   with ordinary and independent compaction credentials. Zero Risk keeps manual selection, Send,
@@ -28,7 +29,7 @@ The equivalent repository command is `bun run src/cli.ts verify-context --dev-pr
 matching DEV Launcher signed in and its isolated tunnel running. Production verification uses
 `codex-chatgpt-web verify-context` and never shares its result with DEV. The historical long-wait
 probe contract does not expose the three context tools and cannot pass this check. Use the normal
-DEV MCP contract and a newly created identity for context navigation; verification does not change
+DEV MCP contract and the current connector's refreshed schema for context navigation; verification does not change
 the configuration, rename a plugin, or refresh its remote cache. Bound
 profile/mode/plugin/tunnel/runtime/schema changes affect diagnostic comparison only; there is no
 time-based expiry. DEV tasks, navigation, compaction, and recovery do not require a saved result

@@ -1,3 +1,5 @@
+import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
+import { contextProtocolCapabilities } from "../src/adapters/chatgpt-web/context-protocol";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -158,7 +160,8 @@ test("old helpers and mismatched plan receipts never receive a Send acknowledgem
     const child = {};
     internal.child = child;
     internal.ensureChild = async () => {};
-    internal.helperFeatures = new Set(old ? [] : [LAUNCHER_CONTEXT_DELIVERY_FEATURE]);
+    internal.handleLine(child, JSON.stringify({ type: "ready", features: [LAUNCHER_CONTEXT_DELIVERY_FEATURE],
+      ...(old ? {} : contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION)) }));
     const sent: Record<string, unknown>[] = [];
     internal.send = async message => {
       sent.push(message);
@@ -185,7 +188,8 @@ test("cancellation during selected-plan publication prevents its acknowledgement
   const stop = new AbortController();
   internal.child = child;
   internal.ensureChild = async () => {};
-  internal.helperFeatures = new Set([LAUNCHER_CONTEXT_DELIVERY_FEATURE]);
+  internal.handleLine(child, JSON.stringify({ type: "ready", features: [LAUNCHER_CONTEXT_DELIVERY_FEATURE],
+    ...contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION) }));
   const sent: string[] = [];
   internal.send = async message => {
     sent.push(String(message.type));

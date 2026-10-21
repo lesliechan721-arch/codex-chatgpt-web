@@ -412,6 +412,7 @@ export async function requestRetainedCompactionHandoff(
   onProgress?: () => void,
   continuity?: {
     claim: ContinuityClaim;
+    recoveryStoreDirectory?: string;
     sourceSnapshot?: ContextSnapshot;
     onLease: (lease: ContinuityLease) => void;
     onPhysicalSettlement: (settlement: Promise<void>) => void;
@@ -475,6 +476,7 @@ export async function requestRetainedCompactionHandoff(
         continuity: continuityClaim!,
         onContinuityLease: continuity.onLease,
         onSendActivated: continuity.onSendActivated,
+        ...(continuity.recoveryStoreDirectory ? { recoveryStoreDirectory: continuity.recoveryStoreDirectory } : {}),
         retainConversation: true,
       } : {}),
       onSubmitted: () => {

@@ -51,14 +51,15 @@ The three context tools use the current `context_id` and exactly one credential:
 Automatic, `request_id` in Zero Risk, or the independent `compaction_token` for compaction reads.
 The public schema exposes mutually exclusive ordinary and compaction branches. Credentials and
 references cannot cross these scopes. List discovers bounded entries, search returns literal text
-matches, and read returns an exact UTF-8 page or one complete image. Directory labels and snippets
+matches, and read accepts `reads: [{read_ref, cursor?}]` for 1–8 distinct text targets under one shared
+response budget, or a single image without a cursor. Directory labels and snippets
 are not the full result. Reading an old result never repeats its action.
 
 Ordinary `context_ready` records delivery of required images through MCP return receipts, verified
 Automatic uploads, or Zero Risk's separate confirmation of its selected fallback-image manifest.
 Sent, start, and task-update ACK do not supply image-delivery evidence. Legacy and on-demand text
 have no mandatory coverage. In ordinary `context-bootstrap-v1` plans, required text also needs
-complete UTF-8 range coverage from matching pending v2 successful transport receipts. Empty sources
+complete UTF-8 range coverage from matching pending batch-v1 successful transport receipts. Empty sources
 need an actual empty-body receipt. Text and image readiness are independent, and text reads do not
 extend image deadlines. Until ready, new business execution and successful completion are blocked with
 `CONTEXT_NOT_READY`; existing operations can still wait, replay, and settle. Business inventory
@@ -83,9 +84,13 @@ Ordinary short-start Automatic tasks first call `codex_context_list(view: "overv
 current `turn_token` and `context_id`. Zero Risk first calls `codex_turn_start(request_id)`;
 `started`/`duplicate` also returns `context_bootstrap`. Repeated start preserves manifest identity
 and coverage. A configured Sent wait returns `read_state: "waiting"` without consuming reads.
-The user still chooses the connector and manually sends. List's `required_only: true` filter pages
-through required targets under the existing 20-target / 12-KiB / 1,500-token response limits.
-The startup entry carries minimum v2 read rules and the required execution protocol supplies the
+The user still chooses the connector and manually sends. Manifest 3 declares
+`text_read_format: "context-text-batch-v1"` and `required_discovery: "batch-metadata"`. Follow
+`next_required_read` then `required_step.next_required_read` unchanged; normal pure-text startup
+needs no required `entries` traversal. Read a final overview for settled readiness. Images use
+single-item arrays, their original result and confirmation, then overview recovery. Optional lists
+use 50 targets / 48 KiB / 6,000 estimated tokens under the expanded profile.
+The startup entry carries minimum batch read rules and the required execution protocol supplies the
 complete applicable wait, update, error and completion rules. Neither metadata roles nor source
 body text can change permissions or control state. See
 [short startup](context-navigation.md#short-startup-and-required-text) for the complete contract.
@@ -345,7 +350,10 @@ and capability revocation still occur; a rejected non-owning or older-generation
 gain cleanup authority from a capacity error.
 
 The implemented Broker protocol is 14. Native waiting and task update protocols are 1; the context
-protocol is 3 and requires `context-text-read-v2` for successful text pages.
+protocol is 4 and requires `context-text-batch-v1` for all successful text reads.
+Each text response has one metadata block and one independent body per `items` entry;
+`structuredContent` repeats metadata only. Every item/block is validated before one atomic
+transport receipt can cover the batch. Old top-level read parameters and v2 text results are rejected.
 The helper advertises `native-tool-wait-v1`, `task-updates-v1`, and `task-output-ack-v3`.
 For each negotiated turn the Broker publishes empty, immutable ACK files in a private temporary
 directory before returning an ACK. The same directory carries an atomically published revision /
@@ -366,14 +374,15 @@ Missing or invalid sources fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
 Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
 context tools with their mutually exclusive credential schemas on the selected connector before
-using navigation or dispatching work. The private owner must advertise `contextProtocol: 3`
+using navigation or dispatching work. The private owner must advertise `contextProtocol: 4`
 and `context-bootstrap-v1` for short-start plans.
 An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
-Optional Verify runtime requires six successful context transport returns over fixed small text, one
-list/search/read sequence per ordinary and independent compaction credential. Evidence version 2
-also binds both reads to the actual result digest, two text blocks, matching metadata, body index 1,
-and UTF-8 page range. The body exists only in `content[1].text`; `content[0].text` and
-`structuredContent` carry metadata. Empty bodies still have a second block. The verification
+Optional Verify runtime requires six successful context transport returns over fixed small text,
+one list/search/read sequence per ordinary and independent compaction credential. Each read
+requests at least two distinct text targets and validates every batch-v1 item/body, matching
+metadata, exact UTF-8 range and actual successful transport batch receipt. Body blocks are
+selected only through `items[].body_content_index`; metadata does not repeat their text. Empty
+sources still have actual empty blocks. Historical single-read evidence is inapplicable. The verification
 pair has no business or compaction-submission authority. A model's final reply cannot substitute
 for receipts. This optional diagnosis saves bound owner-only evidence for comparison; it does not
 gate normal tasks, navigation publication, compaction admission, or recovery. Missing, failed,

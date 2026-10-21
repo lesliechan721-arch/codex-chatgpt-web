@@ -878,7 +878,7 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
       const list = await query("list", { view: "entries", kind: "image" });
       const picture = (list.structuredContent as { entries: Array<{ read_ref: string; media_route: string }> }).entries[0]!;
       expect(picture.media_route).toBe("mcp");
-      expect((await query("read", { read_ref: picture.read_ref })).content.some((block: any) => block.type === "image")).toBe(true);
+      expect((await query("read", { reads: [{ read_ref: picture.read_ref }] })).content.some((block: any) => block.type === "image")).toBe(true);
       broker.completeSafeTurn(exactBinding!.request_id, "MCP image handoff completed");
     },
     async waitAttachments() { throw new Error("MCP images must not require manual confirmation"); },
