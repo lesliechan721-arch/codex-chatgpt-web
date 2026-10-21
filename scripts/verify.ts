@@ -1,23 +1,30 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { assertColdShardEnvironment, parseTestShard, type TestShard } from "./test-shards";
 
 const root = resolve(import.meta.dir, "..");
 export function verifyOptions(args: string[]) {
   let testMode: "full" | "timing" = "full";
+  let testShard: TestShard | undefined;
   for (const arg of args) {
+    if (arg.startsWith("--test-shard=")) {
+      if (testShard) throw new Error("Duplicate --test-shard option.");
+      testShard = parseTestShard(arg.slice(13));
+      continue;
+    }
     if (!arg.startsWith("--test-mode=")) throw new Error(`Unsupported verify option: ${arg}`);
     const value = arg.slice(12);
     if (value !== "full" && value !== "timing") throw new Error("--test-mode must be full or timing.");
     testMode = value;
   }
-  return { testMode };
+  return { testMode, ...(testShard ? { testShard } : {}) };
 }
 
-export function verificationCommands(testMode: "full" | "timing", scratch: string) {
+export function verificationCommands(testMode: "full" | "timing", scratch: string, testShard?: TestShard) {
   return [
     ["run", "check-version"], ["run", "audit"], ["run", "launcher:audit"], ["run", "typecheck"],
-    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`], ["run", "launcher:build"],
+    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : [])], ["run", "launcher:build"],
     ["run", "scripts/build-runtime-bundle.ts", join(scratch, "runtime")],
     ["run", "scripts/generate-third-party-notices.ts", join(scratch, "THIRD_PARTY_NOTICES.txt"), "--include-launcher"],
     ["run", "scripts/smoke-release.ts", join(scratch, "runtime")],
@@ -25,7 +32,11 @@ export function verificationCommands(testMode: "full" | "timing", scratch: strin
 }
 
 export async function verify(args: string[]) {
-  const { testMode } = verifyOptions(args);
+  const { testMode, testShard } = verifyOptions(args);
+  if (testShard) {
+    if (testShard.index !== 1) throw new Error("verify --test-shard is reserved for shard 1; run other shards with bun run test.");
+    assertColdShardEnvironment(process.env);
+  }
   const scratch = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-verify-"));
   const output = resolve(process.env.CGW_TEST_PROFILE_DIR || join(root, "output", "test-performance"));
   const startedAt = new Date().toISOString();
@@ -56,7 +67,7 @@ export async function verify(args: string[]) {
   const priorRuns = new Set<string>();
   try { for (const entry of readdirSync(output)) priorRuns.add(entry); } catch { /* First run. */ }
   try {
-    for (const command of verificationCommands(testMode, scratch)) await run(command);
+    for (const command of verificationCommands(testMode, scratch, testShard)) await run(command);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     process.exitCode = stages.at(-1)?.exitCode || 1;
@@ -73,13 +84,16 @@ export async function verify(args: string[]) {
             const value = JSON.parse(readFileSync(join(output, entry.name, "completion.json"), "utf8"));
             if (value.version === 1 && value.runId === summary.runId) completion = value;
           } catch { /* A missing completion stays visible in the verification report. */ }
-          return [{ reportPath, summaryVersion: summary.version, mode: summary.mode ?? "full", collection: summary.collection ?? null,
+          return [{ reportPath, runId: summary.runId, shard: summary.shard ?? null, summaryVersion: summary.version, mode: summary.mode ?? "full", collection: summary.collection ?? null,
             counts: summary.counts ?? null, fileTiming: summary.fileTiming ?? null, historyPublication: summary.historyPublication ?? null,
             scheduling: summary.scheduling ?? null, segments: summary.segments ?? null, completion,
             completionStatus: completion ? "available" : "missing", testResult: summary.testResult ?? null }];
         } catch { return []; }
       });
-      const report = { version: 1, startedAt, endedAt: new Date().toISOString(), success: failure === null, failure, testMode,
+      const report = { version: testShard ? 2 : 1, ...(testShard ? { fullSuite: false, testShard,
+          serverScope: "shard-only; remaining server files run in another job", scratch, workflowRun: { id: process.env.GITHUB_RUN_ID ?? null,
+            attempt: process.env.GITHUB_RUN_ATTEMPT ?? null, repository: process.env.GITHUB_REPOSITORY ?? null } } : {}),
+        startedAt, endedAt: new Date().toISOString(), success: failure === null, failure, testMode,
         totalMs: Number(process.hrtime.bigint() - start) / 1_000_000, stages, profiles,
         profileStatus: profiles.length ? "available" : "missing-or-tests-not-started" };
       const reportPath = join(output, "verify-summary.json");

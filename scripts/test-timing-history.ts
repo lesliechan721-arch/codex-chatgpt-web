@@ -181,7 +181,7 @@ export async function prepareTimingHistory(options: {
 export function finalizeFileTimings(options: {
   root: string; runDirectory: string; compatibility: TimingCompatibility; metadata: TimingMetadata; expectedFiles: string[];
   stderr: string; exitCode: number; signal: string | number | null; spawnError: string | null; fullSuiteRequested: boolean;
-  logsComplete: boolean; sourceStable: boolean; artifactDirectory?: string;
+  logsComplete: boolean; sourceStable: boolean; artifactDirectory?: string; shard?: boolean;
 }) {
   const reasons: string[] = [];
   const stderr = options.stderr.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
@@ -210,6 +210,7 @@ export function finalizeFileTimings(options: {
     if (record(data) && record(data.files)) data.files = Object.fromEntries(Object.entries(data.files).map(([file, duration]) => [file.replaceAll("\\", "/"), duration]));
     const raw = parseTimingData(data);
     parsedTimings = true;
+    if (options.shard && !sameFiles(Object.keys(raw.files), targetFiles)) reasons.push("unexpected-shard-measurements");
     // Bun merges untouched historical entries into its output. Those are not measurements from this run.
     timings.files = Object.fromEntries(executed.filter(file => Object.hasOwn(raw.files, file)).map(file => [file, raw.files[file]!]));
     if (!sameFiles(Object.keys(timings.files), executed)) reasons.push("missing-file-measurements");
@@ -220,7 +221,7 @@ export function finalizeFileTimings(options: {
   try { if (parsedTimings) writeFileSync(join(options.runDirectory, "file-timings.json"), JSON.stringify(timings, null, 2) + "\n"); }
   catch (error) { outputWriteError = error instanceof Error ? error.message : String(error); }
   const complete = reasons.length === 0;
-  const fullSuite = options.fullSuiteRequested && executionComplete;
+  const fullSuite = !options.shard && options.fullSuiteRequested && executionComplete;
   const publication: HistoryPublication = { status: "not-requested", stage: null, reasons: ["no-artifact-output-requested"],
     localPath: null, artifactPath: null, remoteUpload: "not-observed" };
   if (options.artifactDirectory) {
@@ -255,6 +256,6 @@ export function finalizeFileTimings(options: {
       }
     }
   }
-  return { fileTiming: { version: 2, complete, fullSuite, targetFiles, measuredFiles: Object.keys(timings.files), executedFiles: executed,
+  return { fileTiming: { version: options.shard ? 3 : 2, complete, fullSuite, targetFiles, measuredFiles: Object.keys(timings.files), executedFiles: executed,
     reportedFiles, reasons, logsComplete: options.logsComplete, sourceStable: options.sourceStable, outputWriteError }, historyPublication: publication };
 }

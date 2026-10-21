@@ -740,11 +740,15 @@ test("an ignored legacy abort uses target cleanup, keeps a bounded trace quarant
       onSubmitted: () => { received.resolve(); return new Promise<void>(() => {}); },
     }).catch(error => error);
     await received.promise;
-    timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
-      if (args[1] === 15_000) args[1] = 20;
-      return originalTimer(...args);
-    }) as typeof setTimeout);
-    stop.abort();
+    const abortWithFastWatchdog = (controller: AbortController) => {
+      timer = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+        if (args[1] === 15_000) args[1] = 20;
+        return originalTimer(...args);
+      }) as typeof setTimeout);
+      try { controller.abort(); }
+      finally { timer.mockRestore(); }
+    };
+    abortWithFastWatchdog(stop);
     expect(await first).toMatchObject({ name: "AbortError" });
     expect(internal.unfinishedAborts.size).toBe(1);
     for (let index = 1; index < 5; index++) {
@@ -754,7 +758,7 @@ test("an ignored legacy abort uses target cleanup, keeps a bounded trace quarant
         onSubmitted: () => { observed.resolve(); return new Promise<void>(() => {}); },
       }).catch(error => error);
       await observed.promise;
-      controller.abort();
+      abortWithFastWatchdog(controller);
       expect(await outcome).toMatchObject({ name: "AbortError" });
     }
     expect(internal.unfinishedAborts.size).toBe(5);

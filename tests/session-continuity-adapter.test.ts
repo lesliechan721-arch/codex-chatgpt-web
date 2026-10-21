@@ -885,7 +885,7 @@ for (const manual of [false, true]) for (const parentFirst of [false, true]) for
   expect(f.submissions).toHaveLength(checkpointOnly ? manual ? 2 : 3 : 1);
 });
 
-for (const manual of [false, true]) for (const entry of ["initial", "ordinary", "checkpoint"] as const) for (const trailing of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ${entry} rejects ${trailing ? "trailing" : "leading"} anonymous current instruction before submitting`, async () => {
+for (const manual of [false, true]) for (const entry of ["initial", "ordinary", "checkpoint"] as const) test(`${manual ? "Zero Risk" : "Automatic"} ${entry} rejects anonymous current instruction before submitting`, async () => {
   const f = fixture(manual);
   const first = f.request();
   let base: unknown[] = [];
@@ -912,12 +912,16 @@ for (const manual of [false, true]) for (const entry of ["initial", "ordinary", 
   const anonymous = { type: "message", role: "user", content: "Required current constraint without identity." };
   const current = { type: "message", role: "user", id: "current-task", content: "Current task.",
     internal_chat_message_metadata_passthrough: { turn_id: "turn-next" } };
-  const input = [...base, ...(trailing ? [current, anonymous] : [anonymous, current])];
   const submissions = f.submissions.length;
-  await expect(f.run(f.request("", "turn-next", input))).rejects.toMatchObject({ code: "continuity_source_unproven" });
-  const changed = input.map(item => item === anonymous ? { ...anonymous, content: "Conflicting anonymous constraint." } : item);
-  await expect(f.run(f.request("", "turn-next", changed))).rejects.toMatchObject({ code: "continuity_source_unproven" });
-  expect(f.submissions).toHaveLength(submissions);
+  // Keep real admission and no-Send checks for both layouts on each route. The
+  // complete parameter matrix also calls the production selector without I/O.
+  for (const trailing of [false, true]) {
+    const input = [...base, ...(trailing ? [current, anonymous] : [anonymous, current])];
+    await expect(f.run(f.request("", "turn-next", input))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    const changed = input.map(item => item === anonymous ? { ...anonymous, content: "Conflicting anonymous constraint." } : item);
+    await expect(f.run(f.request("", "turn-next", changed))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(f.submissions).toHaveLength(submissions);
+  }
   expect((await f.run(f.request("", "turn-next", [...base, current]))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(submissions + 1);
   expect(f.pages.size).toBe(1);

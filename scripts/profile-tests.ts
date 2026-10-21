@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { collectPerformanceReports } from "./test-performance-reports";
+import { assertColdShardEnvironment, coldShardFiles, parseTestShard, testFileSetDigest, testSkipIdentities, type TestShard } from "./test-shards";
 import { performanceSource } from "./test-performance-source";
 import { finalizeFileTimings, prepareTimingHistory, repositoryTestFiles, targetTestFiles, timingCompatibility, timingMetadata } from "./test-timing-history";
 
@@ -11,9 +12,13 @@ export function profileOptions(args: string[]) {
   let mode: "full" | "timing" = "full";
   let isolation: "default" | "isolate" | "shared" = "default";
   let bail: number | undefined;
+  let shard: TestShard | undefined;
   const files: string[] = [], filters: string[] = [];
   for (const arg of args) {
-    if (arg.startsWith("--parallel=")) workers = arg.slice("--parallel=".length);
+    if (arg.startsWith("--shard=")) {
+      if (shard) throw new Error("Duplicate --shard option.");
+      shard = parseTestShard(arg.slice(8));
+    } else if (arg.startsWith("--parallel=")) workers = arg.slice("--parallel=".length);
     else if (arg.startsWith("--mode=")) {
       const value = arg.slice(7);
       if (value !== "full" && value !== "timing") throw new Error("--mode must be full or timing.");
@@ -27,11 +32,12 @@ export function profileOptions(args: string[]) {
       if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error("--bail must be a positive safe integer.");
       bail = Number(value);
     } else if (arg.startsWith("--test-name-pattern=")) filters.push(arg);
-    else if (arg.startsWith("-")) throw new Error(`Unsupported option ${arg}; use --parallel=1|2, --mode=full|timing, --isolation=default|isolate|shared, --bail=N or --test-name-pattern=REGEX.`);
+    else if (arg.startsWith("-")) throw new Error(`Unsupported option ${arg}; use --parallel=1|2, --shard=i/n, --mode=full|timing, --isolation=default|isolate|shared, --bail=N or --test-name-pattern=REGEX.`);
     else files.push(arg);
   }
   if (workers !== "1" && workers !== "2") throw new Error("CGW_TEST_WORKERS / --parallel must be 1 or 2.");
-  return { workers: Number(workers) as 1 | 2, mode, isolation, bail, files, filters };
+  if (shard && (files.length || filters.length || bail !== undefined)) throw new Error("Shards cannot be combined with positional filters, name filters or bail.");
+  return { workers: Number(workers) as 1 | 2, mode, isolation, bail, files, filters, ...(shard ? { shard } : {}) };
 }
 
 export function profileEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -61,13 +67,17 @@ export async function finishProfileLogs(drains: Promise<unknown>, cancel: () => 
 
 export async function profileTests(args: string[]): Promise<number> {
   const entry = process.hrtime.bigint();
-  const { workers, mode, isolation, bail, files, filters } = profileOptions(args);
+  const { workers, mode, isolation, bail, files, filters, shard } = profileOptions(args);
+  if (shard) {
+    assertColdShardEnvironment(process.env);
+    if (Bun.version !== "1.4.3") throw new Error("Cold shard discovery is verified only for Bun 1.4.3.");
+  }
   const output = resolve(process.env.CGW_TEST_PROFILE_DIR || join(root, "output", "test-performance"));
   let run: string | undefined, reports: string | undefined;
   const diagnosticErrors = new Set<string>();
   try {
     mkdirSync(output, { recursive: true });
-    run = mkdtempSync(join(output, `workers-${workers}-`));
+    run = mkdtempSync(join(output, `workers-${workers}-${shard ? `shard-${shard.index}-of-${shard.total}-attempt-${process.env.GITHUB_RUN_ATTEMPT || "local"}-` : ""}`));
     if (mode === "full") { reports = join(run, "processes"); mkdirSync(reports); }
   } catch {
     reports = undefined;
@@ -80,13 +90,14 @@ export async function profileTests(args: string[]): Promise<number> {
   const compatibility = timingCompatibility({ workers, mode, isolation });
   const metadata = timingMetadata(root, source.revision, source.patchDigest);
   const expectedFiles = repositoryTestFiles(root);
-  const targetFiles = targetTestFiles(root, files, expectedFiles);
-  const history = run ? await prepareTimingHistory({ root, runDirectory: run, compatibility, files: expectedFiles })
+  const targetFiles = shard ? coldShardFiles(expectedFiles, shard) : targetTestFiles(root, files, expectedFiles);
+  const history = shard ? { scheduling: { source: "cold" as const, reason: "shard-cold-only", lookupMs: 0, inputDigest: null, from: null }, input: undefined } : run ? await prepareTimingHistory({ root, runDirectory: run, compatibility, files: expectedFiles })
     : { scheduling: { source: "cold" as const, reason: "report-directory-unavailable", lookupMs: 0, inputDigest: null, from: null } };
   const command = [process.execPath, "test", "--timeout", "30000",
     ...(reports ? ["--preload", join(root, "scripts", "test-performance-preload.ts")] : []),
     ...(run ? ["--timings", join(run, "file-timings.json"), ...(history.input ? ["--timings", history.input] : []), "--update-timings"] : []),
-    ...(workers === 2 ? ["--parallel=2"] : []),
+    ...(workers > 1 ? [`--parallel=${workers}`] : []),
+    ...(shard ? [`--shard=${shard.index}/${shard.total}`] : []),
     ...(isolation === "isolate" ? ["--isolate"] : isolation === "shared" ? ["--no-isolate"] : []),
     ...(bail !== undefined ? [`--bail=${bail}`] : []), ...filters, ...(files.length ? files : ["./tests"])];
   const startedAt = new Date().toISOString();
@@ -153,7 +164,7 @@ export async function profileTests(args: string[]): Promise<number> {
       expectedFiles: targetFiles, stderr, exitCode, signal, spawnError,
       fullSuiteRequested: filters.length === 0 && bail === undefined && (files.length === 0 || files.length === 1 && resolve(root, files[0]!) === join(root, "tests")),
       logsComplete: !diagnosticErrors.has("log-drain-timeout") && !diagnosticErrors.has("log-read-failed:stderr.log"), sourceStable,
-      artifactDirectory: process.env.CGW_TEST_TIMING_ARTIFACT_DIR });
+      artifactDirectory: shard ? undefined : process.env.CGW_TEST_TIMING_ARTIFACT_DIR, shard: Boolean(shard) });
     let metrics: ReturnType<typeof collectPerformanceReports> = { snapshots: 0, legacySnapshots: 0, invalidReports: [],
       incompleteReasons: [], complete: false, totals: {}, contexts: [], children: [], childResultIssues: [], unassignedParameterTests: 0 };
     if (mode === "full") {
@@ -179,13 +190,18 @@ export async function profileTests(args: string[]): Promise<number> {
     // Bun counts worker exits as failures too; aggregate counts cannot establish the cause.
     const testResult = spawnError ? "spawn-failed" : signal ? "signal" : exitCode === 0 ? "success" : "nonzero-exit";
     const reportMs = elapsed(reportStart);
-    const summary = { version: 4, runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
+    const summary = { version: shard ? 5 : 4,
+      ...(shard ? { fullSuite: false, shard: { ...shard, repositoryFiles: expectedFiles, repositoryFilesDigest: testFileSetDigest(expectedFiles),
+        expectedFiles: targetFiles }, workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        repository: process.env.GITHUB_REPOSITORY ?? null }, skipIdentities: testSkipIdentities(stderr),
+        evidence: { summary: "summary.json", completion: "completion.json", stdout: "stdout.log", stderr: "stderr.log", timings: "file-timings.json" } } : {}), runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
       nodeCompatibilityVersion: process.versions.node, runnerImage: process.env.ImageOS ?? null, runnerImageVersion: process.env.ImageVersion ?? null,
       ...source, workers, mode, isolation, bail: bail ?? null, command, cwd: root,
       executable: { path: process.execPath, sha256: executableDigest,
         embeddedBunSha256: digestFile(process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN),
         usesEmbeddedBun: process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN ? resolve(process.execPath) === resolve(process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN) : null },
       dependencyDigest: digestFile(join(root, "bun.lock")),
+      ...(shard ? { launcherDependencyDigest: digestFile(join(root, "launcher", "bun.lock")) } : {}),
       scheduling: history.scheduling, fileTiming, historyPublication,
       startedAt, endedAt: new Date().toISOString(), rootPid, signal, spawnError, exitCode, testResult, wallMs,
       wallValid: wallInvalidReasons.length === 0, wallInvalidReasons,

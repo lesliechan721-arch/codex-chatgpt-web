@@ -273,30 +273,196 @@ printf '#!/bin/sh\\nexit 0\\n' > squashfs-root/resources/app.asar.unpacked/asset
   }
 });
 
-test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
-  const ci = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8");
-  const release = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", "release.yml"), "utf8");
-  assert.match(ci, /macos-15, ubuntu-latest, windows-latest/);
-  assert.match(ci, /bun run app:package/);
-  assert.match(ci, /bun run app:smoke/);
-  assert.match(ci, /prepare-linux-libnotify\.sh/);
-  assert.match(ci, /prepare-linux-appimage-tools\.cjs/);
-  assert.match(ci, /archlinux:base/);
-  assert.match(ci, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.3/);
-  for (const runner of ["macos-15", "macos-15-intel", "ubuntu-latest", "ubuntu-24.04-arm", "windows-latest"]) {
-    assert.match(release, new RegExp(runner));
+function readWorkflow(name) {
+  const source = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", `${name}.yml`), "utf8");
+  const parsed = spawnSync("bun", ["-e", "console.log(JSON.stringify(Bun.YAML.parse(await Bun.stdin.text())))"], {
+    input: source, encoding: "utf8", timeout: 10_000,
+  });
+  assert.equal(parsed.status, 0, parsed.error?.message || parsed.stderr);
+  return { source, ...JSON.parse(parsed.stdout) };
+}
+
+function workflowExpression(value, { inputs = {}, matrix = {}, runner = {}, env = {} } = {}) {
+  if (typeof value !== "string") return value ?? true;
+  const expression = value.replace(/^\$\{\{\s*|\s*\}\}$/g, "");
+  return Function("inputs", "matrix", "runner", "env", "always", `return (${expression});`)(
+    inputs, matrix, runner, env, () => true,
+  );
+}
+
+function workflowStep(job, predicate) {
+  const steps = job.steps.filter(predicate);
+  assert.equal(steps.length, 1, "the workflow must retain exactly one matching step");
+  return steps[0];
+}
+
+const jobNeeds = job => [job.needs ?? []].flat();
+
+test("CI defaults to two timing shards and keeps the single-job and worker fallbacks", () => {
+  const ci = readWorkflow("ci");
+  const inputs = ci.on.workflow_dispatch.inputs;
+  assert.ok(Object.hasOwn(ci.on, "push") && Object.hasOwn(ci.on, "pull_request"));
+  assert.equal(inputs.windows_test_topology.default, "sharded");
+  assert.deepEqual(inputs.windows_test_topology.options, ["sharded", "single"]);
+  assert.deepEqual(inputs.test_workers.options, ["auto", "1", "2"]);
+  assert.equal(Object.hasOwn(inputs, "windows_skip_evidence"), false);
+  for (const topology of [undefined, inputs.windows_test_topology.default, "single"]) {
+    const context = { inputs: { windows_test_topology: topology } };
+    assert.equal(workflowExpression(ci.jobs["windows-test-shard"].if, context), topology !== "single");
+    assert.equal(workflowExpression(ci.jobs["windows-verify"].if, context), topology === "single");
+    assert.equal(workflowExpression(ci.jobs["windows-gate"].env.WINDOWS_TOPOLOGY, context), topology || "sharded");
   }
-  assert.match(release, /launcher\/build\/runtime/);
-  assert.match(release, /bun run app:smoke/);
-  assert.match(release, /prepare-linux-libnotify\.sh/);
-  assert.match(release, /prepare-linux-appimage-tools\.cjs/);
-  assert.match(release, /archlinux:base/);
-  assert.match(release, /runner: ubuntu-24\.04-arm\s+runtime_asset: codex-chatgpt-web-linux-arm64\.tar\.gz/);
-  assert.match(release, /Verify Linux AppImage ABI on current Arch\s+if: runner\.os == 'Linux' && runner\.arch == 'X64'/);
-  assert.match(release, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.3/);
-  assert.match(release, /codesign --verify --deep --strict --verbose=2/);
-  assert.match(release, /Codex Web GPT\.app/);
-  assert.doesNotMatch(release, /gh release create[\s\S]*?--draft/);
+  for (const name of ["verify", "windows-verify", "windows-test-shard", "windows-gate"]) {
+    for (const workers of [undefined, "auto", "1", "2"]) {
+      assert.equal(workflowExpression(ci.jobs[name].env.CGW_TEST_WORKERS, { inputs: { test_workers: workers } }),
+        workers === "1" ? "1" : "2", `${name} must retain the selected worker count`);
+    }
+  }
+  for (const name of ["verify", "windows-verify"]) {
+    assert.match(workflowStep(ci.jobs[name], step => /^bun run verify\b/.test(step.run)).run, /--test-mode=timing(?:\s|$)/);
+  }
+  assert.equal(ci.jobs["windows-verify"]["runs-on"], "windows-latest");
+});
+
+test("CI and Release preserve complete Windows verification, cold shards, and attempt-bound aggregation", () => {
+  for (const name of ["ci", "release"]) {
+    const workflow = readWorkflow(name);
+    const shards = workflow.jobs["windows-test-shard"];
+    const gate = workflow.jobs["windows-gate"];
+    assert.equal(shards["runs-on"], "windows-latest");
+    assert.deepEqual(shards.strategy.matrix.shard, [1, 2]);
+    assert.equal(shards.strategy["fail-fast"], false);
+    assert.ok(jobNeeds(gate).includes("windows-test-shard"));
+    assert.equal(gate.if, "always()");
+    assert.equal(gate.env.WINDOWS_SHARDS_RESULT, "${{ needs.windows-test-shard.result }}");
+    const verify = workflowStep(shards, step => /^bun run verify\b/.test(step.run));
+    const server = workflowStep(shards, step => /^bun run test\b/.test(step.run));
+    assert.match(verify.run, /--test-mode=timing(?:\s|$)/);
+    assert.match(verify.run, /--test-shard=1\/2(?:\s|$)/);
+    assert.match(server.run, /--mode=timing(?:\s|$)/);
+    assert.match(server.run, /--shard=2\/2(?:\s|$)/);
+    const installer = workflowStep(shards, step => step.shell === "powershell");
+    assert.match(installer.run, /PSVersionTable\.PSVersion\.Major -ne 5/);
+    assert.match(installer.run, /\[scriptblock\]::Create\(\$source\)/);
+    assert.match(installer.run, /scripts\/install-launcher\.ps1/);
+    for (const shard of [1, 2]) {
+      const context = { matrix: { shard } };
+      assert.equal(workflowExpression(verify.if, context), shard === 1);
+      assert.equal(workflowExpression(server.if, context), shard === 2);
+      assert.equal(workflowExpression(installer.if, context), shard === 1);
+    }
+    for (const scopedEnv of [workflow.env, shards.env, ...shards.steps.map(step => step.env)]) {
+      assert.equal(Object.keys(scopedEnv ?? {}).some(key => key.startsWith("CGW_TEST_TIMING_")), false,
+        `${name} shards must not inherit timing-history settings`);
+    }
+    for (const job of [shards, gate]) {
+      const configure = job.steps.findIndex(step => /git config --global core\.autocrlf false/.test(step.run));
+      const checkout = job.steps.findIndex(step => step.uses?.startsWith("actions/checkout@"));
+      assert.ok(configure >= 0 && checkout > configure, "shard evidence must use the original repository bytes");
+      assert.equal(job["continue-on-error"], undefined);
+      assert.ok(job.steps.every(step => !step["continue-on-error"]));
+    }
+    const evidence = workflowStep(shards, step => step.uses?.startsWith("actions/upload-artifact@"));
+    assert.equal(evidence.if, "always()");
+    assert.equal(evidence.with["if-no-files-found"], "error");
+    assert.ok(evidence.with.name.includes("${{ github.run_attempt }}"));
+    assert.equal(shards.steps.some(step => step.uses?.startsWith("actions/download-artifact@")), false);
+    const downloads = gate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
+    assert.equal(downloads.length, 2);
+    for (const shard of [1, 2]) {
+      const download = downloads.find(step => step.with.name.includes(`-shard-${shard}-of-2-`));
+      assert.ok(download, `the gate must download exact evidence for shard ${shard}`);
+      assert.equal(download.with.name, evidence.with.name.replace("${{ matrix.shard }}", String(shard)));
+      assert.ok(download.with.name.includes("${{ env.CGW_TEST_WORKERS }}"));
+    }
+    const aggregate = workflowStep(gate, step => /scripts\/aggregate-test-shards\.ts/.test(step.run));
+    assert.match(aggregate.run, /--skip-policy=\.github\/windows-test-skips\.json(?:\s|$)/);
+    assert.match(aggregate.run, /--mode=timing(?:\s|$)/);
+    assert.match(aggregate.run, /--job-results=/);
+    assert.doesNotMatch(aggregate.run, /--skip-evidence|WINDOWS_SKIP_EVIDENCE/);
+    const expectedNeeds = name === "ci" ? ["windows-verify", "windows-test-shard", "windows-package"] : ["build", "windows-test-shard"];
+    assert.deepEqual(jobNeeds(gate).sort(), expectedNeeds.sort());
+    const packageJob = name === "ci" ? "windows-package" : "build";
+    assert.equal(gate.env.WINDOWS_PACKAGE_RESULT, `\${{ needs.${packageJob}.result }}`);
+    const states = workflowStep(gate, step => /WINDOWS_PACKAGE_RESULT/.test(step.run) && !/bun /.test(step.run));
+    // These steps run under bash on Ubuntu. Execute them on POSIX hosts to check failure propagation.
+    if (process.platform !== "win32") {
+      const pass = { WINDOWS_TOPOLOGY: "sharded", WINDOWS_SHARDS_RESULT: "success", WINDOWS_FULL_RESULT: "skipped", WINDOWS_PACKAGE_RESULT: "success" };
+      const succeeds = env => spawnSync("bash", ["-e", "-o", "pipefail", "-c", states.run], {
+        env: { ...process.env, ...env }, encoding: "utf8", timeout: 10_000,
+      }).status === 0;
+      assert.equal(succeeds(pass), true);
+      for (const result of ["failure", "cancelled", "skipped"]) {
+        for (const key of ["WINDOWS_SHARDS_RESULT", "WINDOWS_PACKAGE_RESULT"]) {
+          assert.equal(succeeds({ ...pass, [key]: result }), false, `${name} must reject ${key}=${result}`);
+        }
+      }
+      if (name === "ci") {
+        const single = { ...pass, WINDOWS_TOPOLOGY: "single", WINDOWS_FULL_RESULT: "success", WINDOWS_SHARDS_RESULT: "skipped" };
+        assert.equal(succeeds(single), true);
+        assert.equal(succeeds({ ...single, WINDOWS_FULL_RESULT: "failure" }), false);
+        assert.equal(succeeds({ ...pass, WINDOWS_FULL_RESULT: "success" }), false);
+      }
+    }
+  }
+});
+
+test("CI and Release retain platform packages, smoke tests, signatures, and publication dependencies", () => {
+  const ci = readWorkflow("ci");
+  const release = readWorkflow("release");
+  assert.deepEqual(ci.jobs.verify.strategy.matrix.os, ["macos-15", "ubuntu-latest"]);
+  for (const job of [ci.jobs.verify, ci.jobs["windows-package"], release.jobs.build]) {
+    for (const command of ["bun run app:package", "bun run app:smoke"]) {
+      const step = workflowStep(job, step => step.run === command);
+      for (const os of job === ci.jobs.verify ? ["macOS", "Linux"] : job === ci.jobs["windows-package"] ? ["Windows"] : ["macOS", "Linux", "Windows"]) {
+        assert.equal(workflowExpression(step.if, { runner: { os } }), true, `${command} must run on ${os}`);
+      }
+    }
+  }
+  assert.equal(ci.jobs["windows-package"]["runs-on"], "windows-latest");
+  assert.deepEqual(release.jobs.build.strategy.matrix.include, [
+    { runner: "macos-15", runtime_asset: "codex-chatgpt-web-darwin-arm64.tar.gz" },
+    { runner: "macos-15-intel", runtime_asset: "codex-chatgpt-web-darwin-amd64.tar.gz" },
+    { runner: "ubuntu-latest", runtime_asset: "codex-chatgpt-web-linux-amd64.tar.gz" },
+    { runner: "ubuntu-24.04-arm", runtime_asset: "codex-chatgpt-web-linux-arm64.tar.gz" },
+    { runner: "windows-latest", runtime_asset: "codex-chatgpt-web-windows-amd64.zip" },
+  ]);
+  const verify = workflowStep(release.jobs.build, step => /^bun run verify\b/.test(step.run));
+  assert.match(verify.run, /--test-mode=timing(?:\s|$)/);
+  for (const os of ["macOS", "Linux", "Windows"]) {
+    assert.equal(workflowExpression(verify.if, { runner: { os } }), os !== "Windows");
+  }
+  assert.equal(verify.env.CGW_TEST_TIMING_RESTORE, "1");
+  assert.ok(verify.env.CGW_TEST_TIMING_TOKEN);
+  assert.ok(verify.env.CGW_TEST_TIMING_ARTIFACT_DIR);
+  const timings = workflowStep(release.jobs.build, step => step.with?.name === "test-timings-${{ matrix.runner }}");
+  assert.equal(workflowExpression(timings.if, { runner: { os: "Windows" } }), false);
+  assert.equal(workflowExpression(timings.if, { runner: { os: "Linux" } }), true);
+  for (const name of ["build", "windows-test-shard"]) {
+    assert.ok(jobNeeds(release.jobs[name]).includes("codex-model-gate"));
+  }
+  for (const name of ["build", "windows-test-shard", "windows-gate"]) {
+    assert.equal(release.jobs[name].env.CGW_TEST_WORKERS, "2");
+  }
+  assert.deepEqual(jobNeeds(release.jobs.publish).sort(), ["build", "windows-gate"]);
+  assert.deepEqual(jobNeeds(release.jobs["publish-image"]), ["publish"]);
+  for (const name of ["publish", "publish-image"]) {
+    assert.equal(release.jobs[name].if, undefined, `${name} must require all dependencies to succeed`);
+    assert.equal(release.jobs[name]["continue-on-error"], undefined);
+  }
+  for (const source of [ci.source, release.source]) {
+    assert.match(source, /prepare-linux-libnotify\.sh/);
+    assert.match(source, /prepare-linux-appimage-tools\.cjs/);
+    assert.match(source, /archlinux:base/);
+    assert.match(source, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.3/);
+  }
+  assert.match(release.source, /launcher\/build\/runtime/);
+  const abi = workflowStep(release.jobs.build, step => step.name === "Verify Linux AppImage ABI on current Arch");
+  assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "X64" } }), true);
+  assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "ARM64" } }), false);
+  assert.match(release.source, /codesign --verify --deep --strict --verbose=2/);
+  assert.match(release.source, /Codex Web GPT\.app/);
+  assert.doesNotMatch(release.source, /gh release create[\s\S]*?--draft/);
 });
 
 test("Linux AppImage fallback uses one owned extraction and removes it on exit", {

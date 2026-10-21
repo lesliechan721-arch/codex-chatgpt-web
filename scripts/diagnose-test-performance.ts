@@ -175,6 +175,7 @@ export function compareModePairs(runs: ModePairSample[], repetitions: number, ex
       absoluteSavingMs, relativeSaving: valid ? absoluteSavingMs! / full!.wrapperWallMs! : null };
   });
   const validPairs = pairs.filter(pair => pair.valid), issues: string[] = [];
+  if (runs.length !== repetitions * 2 || runs.some(run => !Number.isInteger(run.round) || run.round < 1 || run.round > repetitions)) issues.push("different-sample-plan");
   if (validPairs.length < 3) issues.push("fewer-than-three-valid-pairs");
   if (pairs.some(pair => !pair.valid)) issues.push("failed-or-incomplete-pairs-retained");
   if (validPairs.some(pair => pair.absoluteSavingMs! <= 0)) issues.push("no-net-benefit-in-every-valid-pair");

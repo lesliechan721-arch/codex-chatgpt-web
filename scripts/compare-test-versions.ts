@@ -73,7 +73,13 @@ const stringList = (value: unknown): value is string[] => Array.isArray(value) &
 function readCoverageMap(path: string | undefined, sources: Record<Version, Source>, files: string[]) {
   if (!path) throw new Error("missing-coverage-map");
   const contents = readFileSync(path), map = JSON.parse(contents.toString("utf8"));
-  if (map.version !== 1 || !map.sources || !map.files || !Array.isArray(map.scenarios) || map.scenarios.length === 0) throw new Error("invalid-coverage-map");
+  validateVersionCoverage(map, sources, files);
+  return { path, digest: createHash("sha256").update(contents).digest("hex"), map };
+}
+
+/** Coverage rules use captured identities; reading the document is a separate boundary. */
+export function validateVersionCoverage(map: any, sources: Record<Version, Source>, files: string[]) {
+  if (!map || typeof map !== "object" || map.version !== 1 || !map.sources || !map.files || !Array.isArray(map.scenarios) || map.scenarios.length === 0) throw new Error("invalid-coverage-map");
   for (const version of ["A", "B"] as const) {
     if (!["revision", "patchDigest", "toolDigest"].every(key => map.sources[version]?.[key] === sources[version][key as keyof Source])) throw new Error(`coverage-source-mismatch-${version}`);
     if (!stringList(map.files[version]) || (files.length && JSON.stringify(map.files[version]) !== JSON.stringify(files))) throw new Error(`coverage-scope-mismatch-${version}`);
@@ -97,7 +103,6 @@ function readCoverageMap(path: string | undefined, sources: Record<Version, Sour
     const B = sources.B.measurementFiles?.find(entry => entry.file === file)?.digest;
     if (A !== B && !measurementChanges.some(change => change.file === file)) throw new Error(`unexplained-measurement-change:${file}`);
   }
-  return { path, digest: createHash("sha256").update(contents).digest("hex"), map };
 }
 
 /** Persist this value before fixture migration and reuse it with --measurement-manifest. */
@@ -132,10 +137,16 @@ function expectedExecutionFiles(cwd: string, targets: string[]) {
 
 function readTestResults(cwd: string, output: string, files: string[], expectedCounts: ExpectedCounts, expectedSkips: unknown, reasons: string[]) {
   try {
-    const stderr = readFileSync(join(output, "stderr.log"), "utf8").replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
+    return parseVersionTestResults(readFileSync(join(output, "stderr.log"), "utf8"), expectedExecutionFiles(cwd, files), expectedCounts, expectedSkips, reasons);
+  } catch { reasons.push("missing-test-log-or-scope"); return { counts: null, expectedFiles: [], executedFiles: [], skips: [], reportedFiles: null }; }
+}
+
+/** Parse captured Bun output without starting a runtime or reading a checkout. */
+export function parseVersionTestResults(log: string, expected: string[], expectedCounts: ExpectedCounts, expectedSkips: unknown, reasons: string[]) {
+    const stderr = log.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "");
     const count = (kind: string) => [...stderr.matchAll(new RegExp(`(?:^|\\n)\\s*(\\d+) ${kind}(?:\\s|$)`, "g"))].at(-1)?.[1];
     const counts = { pass: count("pass") === undefined ? null : Number(count("pass")), skip: Number(count("skip") ?? 0), fail: Number(count("fail") ?? 0) };
-    const expected = expectedExecutionFiles(cwd, files), executed = new Set<string>(), skips: string[] = [];
+    const executed = new Set<string>(), skips: string[] = [];
     let current = "";
     for (const line of stderr.split("\n")) {
       // The final skip list repeats results already associated with real files.
@@ -156,7 +167,6 @@ function readTestResults(cwd: string, output: string, files: string[], expectedC
         || typeof skip.reason !== "string" || !skip.reason.trim()) || !sameFiles(skips, expectedSkips.map(skip => skip.test))) reasons.push("unknown-or-different-skips");
     }
     return { counts, expectedFiles: expected, executedFiles, skips, reportedFiles: Number.isFinite(reportedFiles) ? reportedFiles : null };
-  } catch { reasons.push("missing-test-log-or-scope"); return { counts: null, expectedFiles: [], executedFiles: [], skips: [], reportedFiles: null }; }
 }
 
 function changedFiles(baseline: string, candidate: string) {
@@ -328,6 +338,10 @@ export async function executeVersionSample(cwd: string, output: string, files: s
   return result;
 }
 
+export function validVersionPreparation(preparation: any) {
+  return ["installation", "warmup", "cache", "cleanup"].every(key => typeof preparation?.[key] === "string" && preparation[key].trim());
+}
+
 /** Check preparation, coverage and frozen tools before any wrapper can start. */
 export function prepareVersionComparison(args: string[], outputOverride?: string) {
   const { baseline, candidate, files, wallClock, coverageMap, settings, measurementManifest } = versionComparisonOptions(args);
@@ -342,8 +356,7 @@ export function prepareVersionComparison(args: string[], outputOverride?: string
   let coverage: ReturnType<typeof readCoverageMap> | null = null;
   if (wallClock) try { coverage = readCoverageMap(coverageMap, sources, files); }
   catch (error) { reasons.push(error instanceof Error ? error.message : String(error)); }
-  if (settings && !["installation", "warmup", "cache", "cleanup"].every(key => typeof coverage?.map.preparation?.[key] === "string"
-    && coverage.map.preparation[key].trim())) reasons.push("missing-or-invalid-preparation-policy");
+  if (settings && !validVersionPreparation(coverage?.map.preparation)) reasons.push("missing-or-invalid-preparation-policy");
   const driver = { version: 2, file: import.meta.path, digest: safeDigest(import.meta.path), executable: process.execPath, executableDigest: safeDigest(process.execPath) };
   if (wallClock && (!driver.digest || !driver.executableDigest)) reasons.push("unknown-external-driver");
   let commonTools: ReturnType<typeof freezeVersionMeasurementTools> | null = null;
@@ -377,7 +390,7 @@ export function summarizeVersionSamples(runs: ReturnType<typeof versionSampleRes
   settings: Settings | null, initialReasons: string[] = []) {
   const reasons = [...initialReasons];
   if (wallClock && new Set(runs.flatMap(run => run.environmentDigest ? [run.environmentDigest] : [])).size > 1) reasons.push("different-execution-environments");
-  if (runs.length !== order.length || runs.some(run => run.exitCode !== 0 || run.signal !== null || run.error || run.wallMs === null || settings && run.wrapperExitMs === null)) reasons.push("failed-or-incomplete-samples");
+  if (runs.length !== order.length || runs.some((run, index) => run.version !== order[index] || run.pair !== Math.floor(index / 2) + 1) || runs.some(run => run.invalidReasons.length > 0 || run.exitCode !== 0 || run.signal !== null || run.error || !Number.isFinite(run.wallMs) || run.wallMs! < 0 || settings && (!Number.isFinite(run.wrapperExitMs) || run.wrapperExitMs! <= 0))) reasons.push("failed-or-incomplete-samples");
   if (!wallClock && runs.length && new Set(runs.map(run => JSON.stringify(run.counts))).size !== 1) reasons.push("different-test-coverage-counts");
   if (!wallClock) {
     const current = runs.filter(run => run.summaryVersion !== null && run.summaryVersion >= 3);
@@ -398,7 +411,8 @@ export function summarizeVersionSamples(runs: ReturnType<typeof versionSampleRes
     const A = runs.find(run => run.pair === pair && run.version === "A"), B = runs.find(run => run.pair === pair && run.version === "B");
     const baselineMs = (settings ? A?.wrapperExitMs : A?.wallMs) ?? null, candidateMs = (settings ? B?.wrapperExitMs : B?.wallMs) ?? null;
     const valid = !!A && !!B && A.exitCode === 0 && B.exitCode === 0 && A.signal === null && B.signal === null
-      && !A.error && !B.error && baselineMs !== null && candidateMs !== null;
+      && !A.error && !B.error && !A.invalidReasons.length && !B.invalidReasons.length
+      && baselineMs !== null && candidateMs !== null && Number.isFinite(baselineMs) && Number.isFinite(candidateMs) && baselineMs >= 0 && candidateMs >= 0;
     const absoluteDifferenceMs = valid ? baselineMs! - candidateMs! : null;
     return { pair, order: order.slice((pair - 1) * 2, pair * 2), valid, baselineMs, candidateMs, absoluteDifferenceMs,
       relativeDifference: valid && baselineMs! > 0 ? absoluteDifferenceMs! / baselineMs! : null,

@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import { processFreeTest } from "./helpers/process-free-performance-test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,7 +7,7 @@ import { join } from "node:path";
 import { applySkipReasonEvidence, compareModePairs, diagnosticEnvironment, diagnosticOptions, modePairSampleIssues, observeDiagnosticWrapper, readDiagnosticSkips, readSkipReasonEvidence, type ModePairSample } from "../scripts/diagnose-test-performance";
 import { verificationCommands, verifyOptions } from "../scripts/verify";
 
-test("diagnostics preserve defaults and select reproducible file and condition scopes", () => {
+processFreeTest("diagnostics preserve defaults and select reproducible file and condition scopes", () => {
   const defaults = diagnosticOptions([]);
   expect(defaults.history).toBe("cold");
   expect(defaults.conditions).toHaveLength(6);
@@ -22,7 +23,7 @@ test("diagnostics preserve defaults and select reproducible file and condition s
   }
 });
 
-test("cross-run history requires explicit full-suite scope and one condition", () => {
+processFreeTest("cross-run history requires explicit full-suite scope and one condition", () => {
   const args = ["--suite=all", "--condition=original-2", "--repetitions=1", "--history=restore"];
   expect(diagnosticOptions(args)).toMatchObject({ files: ["./tests"], history: "restore", pattern: "" });
   for (const extra of ["--suite=cli", "--condition=all", "--test-name-pattern=source"]) {
@@ -30,7 +31,7 @@ test("cross-run history requires explicit full-suite scope and one condition", (
   }
 });
 
-test("diagnostic timing controls are opt-in and cannot inherit a local history override", () => {
+processFreeTest("diagnostic timing controls are opt-in and cannot inherit a local history override", () => {
   const env = { CGW_TEST_TIMING_TOKEN: "test-only-token", CGW_TEST_TIMING_RESTORE: "1",
     CGW_TEST_TIMING_HISTORY: "/old/history.json", CGW_TEST_TIMING_ARTIFACT_DIR: "/output/artifact",
     CGW_RUNTIME_PERFORMANCE_DIR: "/old/reports", CGW_PERFORMANCE_RUN_ID: "old-run" };
@@ -49,7 +50,7 @@ test("diagnostic timing controls are opt-in and cannot inherit a local history o
   expect(env.CGW_TEST_TIMING_HISTORY).toBe("/old/history.json");
 });
 
-test("CI mode pairing selects only full and timing at the same default isolation and worker count", () => {
+processFreeTest("CI mode pairing selects only full and timing at the same default isolation and worker count", () => {
   const args = ["--suite=all", "--condition=mode-pair"];
   const selected = diagnosticOptions(args);
   expect(selected.conditions).toEqual([
@@ -98,7 +99,7 @@ function pairedSamples(): ModePairSample[] {
   }));
 }
 
-test("mode comparison retains raw pair values and requires every valid pair to improve", () => {
+processFreeTest("mode comparison retains raw pair values and requires every valid pair to improve", () => {
   const runs = pairedSamples();
   const report = compareModePairs(runs, 3, files);
   expect(report).toMatchObject({ conclusion: "timing-switch-candidate", validPairs: 3, failures: { numerator: 0, denominator: 6 } });
@@ -111,9 +112,10 @@ test("mode comparison retains raw pair values and requires every valid pair to i
   expect(compareModePairs(runs, 3, files)).toMatchObject({ conclusion: "insufficient-evidence", validPairs: 3 });
   expect(compareModePairs(runs, 3, files).issues).toContain("no-net-benefit-in-every-valid-pair");
   expect(compareModePairs(runs.slice(0, 4), 2, files).conclusion).toBe("insufficient-evidence");
+  expect(compareModePairs([...runs, structuredClone(runs[0]!)], 3, files).conclusion).toBe("insufficient-evidence");
 });
 
-test("mode samples separate operation gaps from coverage, identity and result failures", () => {
+processFreeTest("mode samples separate operation gaps from coverage, identity and result failures", () => {
   expect(modePairSampleIssues(pairedSamples()[0]!, files)).toEqual([]);
   expect(modePairSampleIssues(pairedSamples()[1]!, files)).toEqual([]);
   const mutations: ((run: ModePairSample) => void)[] = [
@@ -156,7 +158,7 @@ test("mode samples separate operation gaps from coverage, identity and result fa
   expect(unverified.pairs[0]!.issues).not.toContain("different-test-results-or-skips");
 });
 
-test("reviewed skip reasons are bound to source and exactly cover the observed skipped tests", () => {
+processFreeTest("reviewed skip reasons are bound to source and exactly cover the observed skipped tests", () => {
   const output = mkdtempSync(join(tmpdir(), "cgw-skip-reasons-")), path = join(output, "reviewed.json");
   const runs = pairedSamples(), source = runs[0]!.before.source;
   const identity = { revision: source.revision, patchDigest: source.patchDigest, toolDigest: source.toolDigest };
@@ -208,7 +210,7 @@ test("reviewed skip reasons are bound to source and exactly cover the observed s
   } finally { rmSync(output, { recursive: true, force: true }); }
 });
 
-test("skip evidence ignores the final Bun skip list and preserves repeated body results", () => {
+processFreeTest("skip evidence ignores the final Bun skip list and preserves repeated body results", () => {
   const output = mkdtempSync(join(tmpdir(), "cgw-skip-footer-"));
   const body = "::group::tests/a.test.ts:\n(skip) first exclusion\n::group::tests/b.test.ts:\n(skip) second exclusion\n";
   try {

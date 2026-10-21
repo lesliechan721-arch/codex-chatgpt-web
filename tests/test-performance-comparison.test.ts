@@ -1,14 +1,19 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
+import { processFreeTest as test } from "./helpers/process-free-performance-test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { compareTestPerformance, comparisonOptions, readPerformanceSummary } from "../scripts/compare-test-performance";
-import { performanceSource, measurementFingerprint, MEASUREMENT_FILES } from "../scripts/test-performance-source";
+import { measurementFingerprint, MEASUREMENT_FILES } from "../scripts/test-performance-source";
 
+const fixedSource = { revision: "a".repeat(40), workflowRevision: null, nodeVersion: "v22.0.0", workingTreeDirty: false,
+  patchDigest: "b".repeat(64), toolVersion: 3, toolDigest: "c".repeat(64),
+  measurementFiles: [{ file: "scripts/profile-tests.ts", digest: "d".repeat(64) }], known: true };
+const source = () => structuredClone(fixedSource);
 function summary(workers: number, exitCode = 0) {
   return { version: 2, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
-    ...performanceSource(join(import.meta.dir, "..")), complete: true, incompleteReasons: [] as string[], workers, exitCode, wallMs: workers === 1 ? 20 : 10,
+    ...source(), complete: true, incompleteReasons: [] as string[], workers, exitCode, wallMs: workers === 1 ? 20 : 10,
     counts: { pass: 1, skip: 0, fail: 0 },
     snapshots: 1, invalidReports: [], totals: { "recovery.write": { count: 1, errors: 0, totalMs: 2, maxMs: 2, totalBytes: 7 } } };
 }
@@ -70,7 +75,7 @@ for (const history of ["same", "different"] as const) {
   test(`worker comparison handles ${history} history in separate run snapshots`, async () => {
     const output = mkdtempSync(join(tmpdir(), "cgw-comparison-history-"));
     try {
-      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, source, runner: async (workers, path, files) => {
         const report = fullSummary(workers, path, files), input = join(path, "workers-random", "history-input.json");
         const contents = JSON.stringify({ version: 1, files: { "tests/example.test.ts": history === "different" ? workers * 10 : 10 } });
         report.scheduling.source = "restored";
@@ -129,7 +134,7 @@ for (const defect of ["missing", "run", "boundary", "phase", "finite"] as const)
 test("controlled worker comparison rejects v2 rather than inferring isolation", async () => {
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-legacy-"));
   try {
-    const result = await compareTestPerformance(["--repetitions=1"], { output, runner: async (workers, path) => {
+    const result = await compareTestPerformance(["--repetitions=1"], { output, source, runner: async (workers, path) => {
       save(path, summary(workers)); return 0;
     } });
     expect(result.report.valid).toBe(false);
@@ -141,7 +146,7 @@ for (const defect of ["none", "mode", "isolation", "scope", "collection", "child
   test(`v3 full comparison validates ${defect} and keeps rejected reports`, async () => {
     const output = mkdtempSync(join(tmpdir(), "cgw-comparison-v3-"));
     try {
-      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+      const result = await compareTestPerformance(["--repetitions=1", "./tests/example.test.ts"], { output, source, runner: async (workers, path, files) => {
         const report = fullSummary(workers, path, files);
         if (workers === 1) {
           if (defect === "mode") report.mode = "timing";
@@ -170,7 +175,7 @@ test("timing comparison accepts only successful v3 wall clocks and keeps collect
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-timing-"));
   try {
     const result = await compareTestPerformance(["--repetitions=1", "--mode=timing", "./tests/example.test.ts"], {
-      output, runner: async (workers, path, files, settings) => {
+      output, source, runner: async (workers, path, files, settings) => {
         expect(settings).toEqual({ mode: "timing", isolation: "isolate" });
         const run = join(path, "workers-random");
         save(path, { ...summary(workers), version: 3, runId: `timing-workers-${workers}`, mode: "timing", isolation: "isolate",
@@ -195,7 +200,7 @@ test("comparison alternates worker order and preserves separate original reports
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-"));
   const order: number[] = [];
   try {
-    const result = await compareTestPerformance(["--isolation=default", "./tests/example.test.ts"], { output, runner: async (workers, path, files) => {
+    const result = await compareTestPerformance(["--isolation=default", "./tests/example.test.ts"], { output, source, runner: async (workers, path, files) => {
       order.push(workers);
       expect(files).toEqual(["./tests/example.test.ts"]);
       save(path, summary(workers));
@@ -218,7 +223,7 @@ test("comparison continues after test failures and preserves every exit code", a
   const exits = [23, 0, 7, 0];
   let calls = 0;
   try {
-    const result = await compareTestPerformance(["--isolation=default"], { output, runner: async (workers, path) => {
+    const result = await compareTestPerformance(["--isolation=default"], { output, source, runner: async (workers, path) => {
       const exitCode = exits[calls++]!;
       save(path, summary(workers, exitCode));
       return exitCode;
@@ -238,7 +243,7 @@ for (const defect of ["missing", "json", "snapshots", "invalidReports", "wallMs"
     const output = mkdtempSync(join(tmpdir(), "cgw-comparison-invalid-"));
     let calls = 0;
     try {
-      const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, runner: async (workers, path) => {
+      const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, source, runner: async (workers, path) => {
         calls++;
         if (calls === 1) {
           const report = summary(workers);
@@ -278,7 +283,7 @@ test("comparison records spawn failure and still runs the remaining measurements
   const output = mkdtempSync(join(tmpdir(), "cgw-comparison-spawn-"));
   let calls = 0;
   try {
-    const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, runner: async (workers, path) => {
+    const result = await compareTestPerformance(["--repetitions=1", "--isolation=default"], { output, source, runner: async (workers, path) => {
       if (++calls === 1) throw new Error("spawn failed");
       save(path, summary(workers));
       return 0;

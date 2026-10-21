@@ -1,10 +1,12 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
+import { processFreeTest } from "./helpers/process-free-performance-test";
 import { createHash } from "node:crypto";
 import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { compareTestVersions, executeVersionSample, externalWallClock, freezeVersionMeasurementTools, prepareVersionComparison,
-  qualifyVersionSample, scheduleVersionSamples, summarizeVersionSamples, versionComparisonOptions, versionSampleResult, versionTimerProtocol } from "../scripts/compare-test-versions";
+  qualifyVersionSample, scheduleVersionSamples, summarizeVersionSamples, parseVersionTestResults, validVersionPreparation, validateVersionCoverage, versionComparisonOptions, versionSampleResult, versionTimerProtocol } from "../scripts/compare-test-versions";
+import { readPerformanceSummary } from "../scripts/compare-test-performance";
 import { MEASUREMENT_FILES, performanceSource } from "../scripts/test-performance-source";
 
 function checkouts(candidateTest?: string) {
@@ -54,6 +56,12 @@ function prepareWrapper(fixture: ReturnType<typeof checkouts>) {
   fixture.map.sources = { A: performanceSource(fixture.A), B: performanceSource(fixture.B) };
   fixture.saveMap();
   return [...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`];
+}
+
+function reportSource(): ReturnType<typeof performanceSource> {
+  return { revision: "1".repeat(40), workflowRevision: null, nodeVersion: "v0.0.0", workingTreeDirty: false,
+    patchDigest: "2".repeat(64), toolVersion: 3, toolDigest: "3".repeat(64),
+    measurementFiles: MEASUREMENT_FILES.map(file => ({ file, digest: "4".repeat(64) })), known: true };
 }
 
 // Report-rule inputs have private real path objects but do not claim a Git
@@ -153,37 +161,54 @@ test("source identity accepts directory aliases but rejects a repository subdire
     expect(aliased).toEqual(original);
     expect(performanceSource(join(fixture.A, "tests")).known).toBe(false);
     if (process.platform === "win32") expect(performanceSource(fixture.A.toUpperCase())).toEqual(original);
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
-});
-
-test("cross-version wall clocks require explicit coverage bound to source and scope", async () => {
-  const fixture = checkouts();
-  try {
-    const missing = await compareTestVersions([...fixture.args, "--wall-clock"], fixture.output);
-    expect(missing.report.reasons).toContain("missing-coverage-map");
-    expect(missing.report.runs).toHaveLength(0);
-    fixture.map.sources.B.patchDigest = "0".repeat(64); fixture.saveMap();
-    const mismatch = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
-    expect(mismatch.report.reasons).toContain("coverage-source-mismatch-B");
-    fixture.map.sources.B = performanceSource(fixture.B); fixture.saveMap();
-    const scope = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`, "./tests/another.test.ts"], fixture.output);
-    expect(scope.report.reasons).toContain("coverage-scope-mismatch-A");
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
-});
-
-test("coverage maps require finite reviewed pass and skip counts for each source", async () => {
-  const fixture = checkouts();
-  try {
-    for (const counts of [null, { pass: 0, skip: 0 }, { pass: 2, skip: -1 }, { pass: 2.5, skip: 0 }, { pass: 2, skip: Infinity }]) {
-      writeFileSync(fixture.mapPath, JSON.stringify({ ...fixture.map, expectedCounts: { A: fixture.map.expectedCounts.A, B: counts } }));
-      const result = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
-      expect(result.report.reasons).toContain("invalid-expected-counts-B");
-      expect(result.report.runs).toHaveLength(0);
+    for (const args of [["add", "."], ["-c", "user.name=Performance Test", "-c", "user.email=performance@example.invalid", "commit", "-qm", "Frozen source"]]) {
+      expect(Bun.spawnSync(["git", ...args], { cwd: fixture.A, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
     }
+    const clean = performanceSource(fixture.A);
+    expect(clean.known).toBe(true); expect(clean.workingTreeDirty).toBe(false);
+    const tracked = join(fixture.A, "src/config.ts"), bytes = readFileSync(tracked);
+    writeFileSync(tracked, "// changed tracked measurement input\n");
+    const trackedChange = performanceSource(fixture.A);
+    expect(trackedChange.workingTreeDirty).toBe(true);
+    expect(trackedChange.revision).toBe(clean.revision);
+    expect(trackedChange.patchDigest).not.toBe(clean.patchDigest);
+    expect(trackedChange.toolDigest).not.toBe(clean.toolDigest);
+    writeFileSync(tracked, bytes);
+    const untracked = join(fixture.A, "untracked-input.txt");
+    writeFileSync(untracked, "one"); const first = performanceSource(fixture.A);
+    writeFileSync(untracked, "two"); const second = performanceSource(fixture.A);
+    expect(first.known).toBe(true); expect(second.known).toBe(true);
+    expect(first.workingTreeDirty).toBe(true); expect(second.workingTreeDirty).toBe(true);
+    expect(first.patchDigest).not.toBe(second.patchDigest);
+    expect(first.toolDigest).toBe(second.toolDigest);
   } catch (error) { preserveComparisonFailure(fixture, error); }
   finally { fixture.clean(); }
+});
+
+function controlledCoverage() {
+  const source = reportSource();
+  const sources = { A: source, B: structuredClone(source) };
+  const files = ["./tests/equivalent.test.ts", "./tests/second.test.ts"];
+  const map = { version: 1, sources: structuredClone(sources), files: { A: files, B: files },
+    expectedCounts: { A: { pass: 2, skip: 0 }, B: { pass: 2, skip: 0 } },
+    scenarios: [{ id: "equivalent behavior", A: ["A scenario"], B: ["B scenario"] }] };
+  return { source, sources, files, map };
+}
+
+processFreeTest("cross-version wall clocks require explicit coverage bound to source and scope", () => {
+  const { sources, files, map } = controlledCoverage();
+  validateVersionCoverage(map, sources, files);
+  map.sources.B.patchDigest = "0".repeat(64);
+  expect(() => validateVersionCoverage(map, sources, files)).toThrow("coverage-source-mismatch-B");
+  map.sources.B = structuredClone(sources.B);
+  expect(() => validateVersionCoverage(map, sources, ["./tests/another.test.ts"])).toThrow("coverage-scope-mismatch-A");
+});
+
+processFreeTest("coverage maps require finite reviewed pass and skip counts for each source", () => {
+  const { sources, files, map } = controlledCoverage();
+  for (const counts of [null, { pass: 0, skip: 0 }, { pass: 2, skip: -1 }, { pass: 2.5, skip: 0 }, { pass: 2, skip: Infinity }]) {
+    expect(() => validateVersionCoverage({ ...map, expectedCounts: { A: map.expectedCounts.A, B: counts } }, sources, files)).toThrow("invalid-expected-counts-B");
+  }
 });
 
 test("external driver runs AB BA AB with different fixture tools and equivalent split scenarios", async () => {
@@ -195,6 +220,8 @@ test("external driver runs AB BA AB with different fixture tools and equivalent 
     fixture.map.expectedCounts.B.pass = 3;
     fixture.map.measurementChanges = [{ file: "tests/helpers/session-continuity-fixture.ts", reason: "Candidate uses the mapped split scenarios with a cheaper fixture.", scenarioIds: ["equivalent behavior"] }];
     fixture.saveMap();
+    const missing = prepareVersionComparison([...fixture.args, "--wall-clock"], fixture.output);
+    expect(missing.reasons).toContain("missing-coverage-map");
     const full = await compareTestVersions(fixture.args, fixture.output);
     expect(full.report.reasons).toContain("different-measurement-tools");
     const result = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
@@ -219,35 +246,28 @@ test("external driver runs AB BA AB with different fixture tools and equivalent 
   finally { fixture.clean(); }
 });
 
-test("wall clocks reject candidate skips outside the reviewed coverage counts", async () => {
-  const fixture = checkouts('import { test } from "bun:test"; test.skip("B omitted scenario", () => {});\n');
-  try {
-    const result = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
-    expect(result.exitCode).toBe(1);
-    expect(result.report.speedup).toBeNull();
-    expect(result.report.runs.filter(run => run.version === "B").every(run => run.invalidReasons.includes("unexpected-test-coverage-counts"))).toBe(true);
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
+processFreeTest("wall clocks reject candidate skips outside the reviewed coverage counts", () => {
+  const reasons: string[] = [];
+  const results = parseVersionTestResults("tests/equivalent.test.ts:\n(skip) B omitted scenario\ntests/second.test.ts:\n(pass) second scenario\n1 pass\n1 skip\n0 fail\nRan 2 tests across 2 files.\n",
+    ["tests/equivalent.test.ts", "tests/second.test.ts"], { pass: 2, skip: 0 }, undefined, reasons);
+  expect(results.counts).toEqual({ pass: 1, skip: 1, fail: 0 });
+  expect(reasons).toContain("unexpected-test-coverage-counts");
+  const runs = ["A", "B", "B", "A", "A", "B"].map((version, index) => ({ ...versionSampleResult({ pair: Math.floor(index / 2) + 1, version: version as "A" | "B" }),
+    exitCode: 0, wallMs: 10, counts: version === "B" ? results.counts : { pass: 2, skip: 0, fail: 0 },
+    invalidReasons: version === "B" ? reasons : [] }));
+  const report = summarizeVersionSamples(runs, true, null);
+  expect(report.valid).toBe(false); expect(report.speedup).toBeNull();
+  expect(runs.filter(run => run.version === "B").every(run => run.invalidReasons.includes("unexpected-test-coverage-counts"))).toBe(true);
 });
 
-test("wall clocks reject coverage changes between repeated runs of one version", async () => {
-  const fixture = checkouts(`import { test } from "bun:test";
-    import { existsSync, readFileSync, writeFileSync } from "node:fs";
-    const marker = "../candidate-run-count.txt";
-    const count = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0;
-    writeFileSync(marker, String(count + 1));
-    test("B scenario", () => {});
-    if (count === 0) test("B intermittent scenario", () => {});
-  `);
-  try {
-    fixture.map.expectedCounts.B.pass = 3; fixture.saveMap();
-    const result = await compareTestVersions([...fixture.args, "--wall-clock", `--coverage-map=${fixture.mapPath}`], fixture.output);
-    expect(result.exitCode).toBe(1);
-    expect(result.report.reasons).toContain("unstable-test-coverage-counts-B");
-    expect(result.report.speedup).toBeNull();
-    expect(result.report.runs.filter(run => run.version === "B").map(run => (run.counts as any).pass)).toEqual([3, 2, 2]);
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
+processFreeTest("wall clocks reject coverage changes between repeated runs of one version", async () => {
+  let candidate = 0;
+  const runs = await scheduleVersionSamples(async slot => ({ ...versionSampleResult(slot), exitCode: 0, wallMs: 10,
+    counts: { pass: slot.version === "B" && candidate++ === 0 ? 3 : 2, skip: 0, fail: 0 } }));
+  const report = summarizeVersionSamples(runs, true, null);
+  expect(report.valid).toBe(false); expect(report.speedup).toBeNull();
+  expect(report.reasons).toContain("unstable-test-coverage-counts-B");
+  expect(runs.filter(run => run.version === "B").map(run => run.counts.pass)).toEqual([3, 2, 2]);
 });
 
 test("external wall clocks reject source changes during execution", async () => {
@@ -420,9 +440,10 @@ test("wrapper preparation requires every declared policy and identical actual lo
   const fixture = checkouts();
   try {
     const args = [...prepareWrapper(fixture), "--mode=timing", "--isolation=default"];
-    fixture.map.preparation.cache = ""; fixture.saveMap();
-    expect(prepareVersionComparison(args, fixture.output).reasons).toContain("missing-or-invalid-preparation-policy");
-    fixture.map.preparation.cache = "Cold timing inputs on every run."; fixture.saveMap();
+    expect(validVersionPreparation(fixture.map.preparation)).toBe(true);
+    for (const key of ["installation", "warmup", "cache", "cleanup"]) {
+      expect(validVersionPreparation({ ...fixture.map.preparation, [key]: "" })).toBe(false);
+    }
     writeFileSync(join(fixture.B, "bun.lock"), "different actual dependencies\n");
     expect(prepareVersionComparison(args, fixture.output).reasons).toContain("different-or-unknown-lockfiles");
   } catch (error) { preserveComparisonFailure(fixture, error); }
@@ -430,6 +451,7 @@ test("wrapper preparation requires every declared policy and identical actual lo
 });
 
 const qualificationCases: { name: string; reason: string; change: (e: ReturnType<typeof qualificationEvidence>, fixture: Pick<ReturnType<typeof checkouts>, "B">) => void }[] = [
+  { name: "partial shard semantics", reason: "wrapper-requires-v4-file-measurement-semantics", change: e => { e.summary.version = 5; } },
   { name: "old wrapper semantics", reason: "wrapper-requires-v4-file-measurement-semantics", change: e => { e.summary.version = 3; } },
   { name: "unknown source", reason: "different-or-unknown-source", change: e => { e.summary.known = false; } },
   { name: "changed revision", reason: "different-or-unknown-source", change: e => { e.summary.revision = "0".repeat(40); } },
@@ -450,7 +472,7 @@ const qualificationCases: { name: string; reason: string; change: (e: ReturnType
   { name: "different completion run", reason: "invalid-completion-segments", change: e => { e.completion.runId = "other"; } },
   { name: "completion moves execution time", reason: "invalid-completion-segments", change: e => { e.completion.segments.executionMs++; } },
 ];
-for (const { name, reason, change } of qualificationCases) test(`wrapper report qualification rejects ${name}`, () => {
+for (const { name, reason, change } of qualificationCases) processFreeTest(`wrapper report qualification rejects ${name}`, () => {
   const fixture = reportQualificationFixture();
   try {
     const evidence = qualificationEvidence(fixture, undefined, fixture.source);
@@ -461,11 +483,10 @@ for (const { name, reason, change } of qualificationCases) test(`wrapper report 
   finally { fixture.clean(); }
 });
 
-test("wrapper qualification validates actual timing files, body coverage and skip footer rules", () => {
-  const fixture = checkouts();
+processFreeTest("wrapper qualification validates actual timing files, body coverage and skip footer rules", () => {
+  const fixture = reportQualificationFixture();
   try {
-    prepareWrapper(fixture);
-    const evidence = qualificationEvidence(fixture), timingPath = join(evidence.run, "file-timings.json");
+    const evidence = qualificationEvidence(fixture, undefined, fixture.source), timingPath = join(evidence.run, "file-timings.json");
     const timing = readFileSync(timingPath);
     writeFileSync(timingPath, JSON.stringify({ version: 1, files: { "tests/equivalent.test.ts": -1 } }));
     expect(evidence.qualify().invalidReasons).toContain("invalid-file-measurements");
@@ -491,11 +512,10 @@ test("wrapper qualification validates actual timing files, body coverage and ski
   finally { fixture.clean(); }
 });
 
-test("timing qualification rejects operation collection and accepts not-requested", () => {
-  const fixture = checkouts();
+processFreeTest("timing qualification rejects operation collection and accepts not-requested", () => {
+  const fixture = reportQualificationFixture();
   try {
-    prepareWrapper(fixture);
-    const evidence = qualificationEvidence(fixture, { mode: "timing", isolation: "default" });
+    const evidence = qualificationEvidence(fixture, { mode: "timing", isolation: "default" }, fixture.source);
     expect(evidence.qualify().invalidReasons).toContain("different-collection-mode");
     evidence.summary.collection.status = "not-requested"; evidence.save();
     expect(evidence.qualify().invalidReasons).toEqual([]);
@@ -504,7 +524,7 @@ test("timing qualification rejects operation collection and accepts not-requeste
 });
 
 for (const outcome of ["success", "reversed", "failed-B", "failed-all", "signal-all", "identity-invalid", "incomplete"] as const) {
-  test(`fixed six-slot scheduling and summary preserve ${outcome} results`, async () => {
+  processFreeTest(`fixed six-slot scheduling and summary preserve ${outcome} results`, async () => {
     // Independent fixed expectations: AB=(120,100), BA=(90,110), AB=(130,110).
     const times = [120, 100, 90, 110, 130, 110], visits: string[] = [];
     const runs = await scheduleVersionSamples(async slot => {
@@ -625,44 +645,30 @@ test("wrapper comparisons preserve each failed attempt and its original logs", a
   finally { fixture.clean(); }
 }, 30_000);
 
-test("wall clocks require a known reason for each observed skip", async () => {
-  const fixture = checkouts();
-  try {
-    writeFileSync(join(fixture.A, "tests/equivalent.test.ts"), 'import { test } from "bun:test"; test.skip("platform contract", () => {});\n');
-    const unknownOutput = join(fixture.directory, "unknown-skip"), knownOutput = join(fixture.directory, "known-skip");
-    mkdirSync(unknownOutput); mkdirSync(knownOutput);
-    const unknown = await externalWallClock(fixture.A, unknownOutput, fixture.files, { pass: 1, skip: 1 });
-    expect(unknown.exitCode).toBe(0);
-    expect(unknown.invalidReasons).toContain("unknown-or-different-skips");
-    const known = await externalWallClock(fixture.A, knownOutput, fixture.files, { pass: 1, skip: 1 },
-      [{ test: "tests/equivalent.test.ts: platform contract", reason: "The fixture deliberately declares this existing platform exclusion." }]);
-    expect(known.valid).toBe(true);
-    expect(known.skips).toEqual(["tests/equivalent.test.ts: platform contract"]);
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { fixture.clean(); }
+processFreeTest("wall clocks require a known reason for each observed skip", () => {
+  const body = "tests/equivalent.test.ts:\n(skip) platform contract\ntests/second.test.ts:\n(pass) second scenario\n1 pass\n1 skip\n0 fail\nRan 2 tests across 2 files.\n";
+  const reasons: string[] = [], files = ["tests/equivalent.test.ts", "tests/second.test.ts"];
+  parseVersionTestResults(body, files, { pass: 1, skip: 1 }, undefined, reasons);
+  expect(reasons).toContain("unknown-or-different-skips");
+  const knownReasons: string[] = [];
+  const result = parseVersionTestResults(body, files, { pass: 1, skip: 1 },
+    [{ test: "tests/equivalent.test.ts: platform contract", reason: "Existing platform exclusion." }], knownReasons);
+  expect(knownReasons).toEqual([]);
+  expect(result.skips).toEqual(["tests/equivalent.test.ts: platform contract"]);
 });
 
-test("version skip parsing ignores the final Bun list without deduplicating body results", async () => {
-  const fixture = checkouts(), originalSpawn = Bun.spawn.bind(Bun);
-  let body = "tests/equivalent.test.ts:\n(skip) platform contract\ntests/second.test.ts:\n(pass) second scenario\n";
+processFreeTest("version skip parsing ignores the final Bun list without deduplicating body results", () => {
+  const body = "tests/equivalent.test.ts:\n(skip) platform contract\ntests/second.test.ts:\n(pass) second scenario\n";
   const footer = "\n1 test skipped:\n(skip) platform contract\n\n1 pass\n1 skip\n0 fail\nRan 2 tests across 2 files.\n";
-  const spawn = spyOn(Bun, "spawn").mockImplementation(((command: string[], options: any) => {
-    if (options?.cwd !== fixture.A || command[1] !== "test") return originalSpawn(command, options);
-    return { exited: Promise.resolve(0), signalCode: null,
-      stdout: new Blob([""]).stream(), stderr: new Blob([body + footer]).stream() };
-  }) as typeof Bun.spawn);
-  try {
-    mkdirSync(fixture.output);
-    const expected = [{ test: "tests/equivalent.test.ts: platform contract", reason: "Existing platform exclusion." }];
-    const result = await externalWallClock(fixture.A, fixture.output, fixture.files, { pass: 1, skip: 1 }, expected);
-    expect(result.invalidReasons).toEqual([]);
-    expect(result.skips).toEqual([expected[0]!.test]);
-    body = body.replace("(skip) platform contract", "(skip) platform contract\n(skip) platform contract");
-    const duplicate = await externalWallClock(fixture.A, fixture.output, fixture.files, { pass: 1, skip: 1 }, expected);
-    expect(duplicate.skips).toHaveLength(2);
-    expect(duplicate.invalidReasons).toContain("unknown-or-different-skips");
-  } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { spawn.mockRestore(); fixture.clean(); }
+  const expected = [{ test: "tests/equivalent.test.ts: platform contract", reason: "Existing platform exclusion." }];
+  const reasons: string[] = [], files = ["tests/equivalent.test.ts", "tests/second.test.ts"];
+  const result = parseVersionTestResults(body + footer, files, { pass: 1, skip: 1 }, expected, reasons);
+  expect(reasons).toEqual([]); expect(result.skips).toEqual([expected[0]!.test]);
+  const duplicateReasons: string[] = [];
+  const duplicate = parseVersionTestResults(body.replace("(skip) platform contract", "(skip) platform contract\n(skip) platform contract") + footer,
+    files, { pass: 1, skip: 1 }, expected, duplicateReasons);
+  expect(duplicate.skips).toHaveLength(2);
+  expect(duplicateReasons).toContain("unknown-or-different-skips");
 });
 
 for (const githubActions of [false, true]) test(`wall clocks accept repeated parallel file headers (${githubActions ? "GitHub Actions" : "ordinary"})`, async () => {
@@ -731,57 +737,73 @@ test("a signalled wrapper preserves its actual exit and measurement report", asy
   finally { fixture.clean(); }
 }, 30_000);
 
+processFreeTest("one reversed pair prevents a speedup claim even when the median paired difference improves", async () => {
+  const times = [300, 900, 1, 300, 300, 1];
+  const runs = await scheduleVersionSamples(async slot => ({ ...versionSampleResult(slot), exitCode: 0, wallMs: times[slot.index]!, counts: { pass: 2, skip: 0, fail: 0 } }));
+  const result = summarizeVersionSamples(runs, true, null);
+  expect(result.valid).toBe(true);
+  expect(result.pairs[0]!.absoluteDifferenceMs!).toBeLessThan(0);
+  expect(result.pairs.slice(1).every(pair => pair.absoluteDifferenceMs! > 0)).toBe(true);
+  expect(result.pairedStatistics.absoluteDifferenceMs.median!).toBeGreaterThan(0);
+  expect(result.pairedStatistics.absoluteDifferenceMs.range!.min).toBeLessThan(0);
+  expect(result.conclusion).toBe("insufficient-evidence");
+});
+
 for (const summaryVersion of [3, 4]) for (const history of ["same", "different"] as const) {
-  test(`strict v${summaryVersion} version comparisons require ${history} history snapshots to agree`, async () => {
-    const fixture = checkouts(), originalSpawn = Bun.spawn.bind(Bun);
-    let attempt = 0;
-    const spawn = spyOn(Bun, "spawn").mockImplementation(((command: string[], options: any) => {
-      const cwd = options?.cwd;
-      if (!Array.isArray(command) || ![fixture.A, fixture.B].includes(cwd) || command[1] !== join(cwd, "scripts/profile-tests.ts")) {
-        return originalSpawn(command, options);
-      }
-      const output = options.env.CGW_TEST_PROFILE_DIR, run = join(output, "workers-synthetic");
-      mkdirSync(run);
-      const input = join(run, "history-input.json"), files = ["tests/equivalent.test.ts"];
-      attempt++;
-      const contents = JSON.stringify({ version: 1, files: { [files[0]!]: history === "different" ? attempt : 1 } });
-      writeFileSync(input, contents);
-      const segments = { prepareMs: 1, executionMs: 10, logDrainMs: 1, reportMs: 1, totalMs: 13 };
-      const summary = { ...performanceSource(cwd), version: summaryVersion, runId: `full-${attempt}`,
-        platform: process.platform, arch: process.arch, bunVersion: Bun.version, workers: 2,
-        mode: "full", isolation: "default", exitCode: 0, wallMs: 10, testResult: "success", wallValid: true, wallInvalidReasons: [],
-        counts: { pass: 1, skip: 0, fail: 0 }, snapshots: 1, complete: true, incompleteReasons: [], invalidReports: [], childResultIssues: [],
-        totals: { "recovery.write": { count: 1, errors: 0, totalMs: 2, maxMs: 2, totalBytes: 7 } },
-        collection: { status: "complete" }, segments,
-        scheduling: { source: "restored", inputDigest: createHash("sha256").update(contents).digest("hex") },
-        fileTiming: { version: 2, complete: true, fullSuite: false, targetFiles: files, executedFiles: files, measuredFiles: files,
-          reportedFiles: 1, reasons: [], logsComplete: true, sourceStable: true },
-        command: [process.execPath, "test", "--timeout", "30000", "--preload", join(cwd, "scripts/test-performance-preload.ts"),
-          "--timings", join(run, "file-timings.json"), "--timings", input, "--update-timings", "--parallel=2", "./tests/equivalent.test.ts"] };
-      writeFileSync(join(run, "summary.json"), JSON.stringify(summary));
-      writeFileSync(join(run, "completion.json"), JSON.stringify({ version: 1, runId: summary.runId,
-        segments: { ...segments, reportMs: 2, totalMs: 14 }, endPoint: "after-summary-and-status-output", excludes: ["completion-write", "process-shutdown"] }));
-      return { exited: Promise.resolve(0), signalCode: null };
-    }) as typeof Bun.spawn);
+  processFreeTest(`strict v${summaryVersion} version comparisons require ${history} history snapshots to agree`, async () => {
+    const fixture = reportQualificationFixture();
     try {
-      const result = await compareTestVersions([...fixture.args, "./tests/equivalent.test.ts"], fixture.output);
-      expect(attempt).toBe(6);
-      expect(result.report.runs).toHaveLength(6);
-      expect(result.report.runs.every(run => run.summaryVersion === summaryVersion && run.error === null && run.invalidReasons.length === 0)).toBe(true);
-      const inputs = result.report.runs.flatMap(run => run.schedulingInputs!);
+      const inputs: { path: string; digest: string }[] = [];
+      const runs = await scheduleVersionSamples(async slot => {
+        const output = join(fixture.directory, `sample-${slot.index}`), run = join(output, "workers-synthetic");
+        mkdirSync(run, { recursive: true });
+        const input = join(run, "history-input.json"), files = ["tests/equivalent.test.ts"];
+        const contents = JSON.stringify({ version: 1, files: { [files[0]!]: history === "different" ? slot.index + 1 : 1 } });
+        writeFileSync(input, contents);
+        const segments = { prepareMs: 1, executionMs: 10, logDrainMs: 1, reportMs: 1, totalMs: 13 };
+        const summary = { ...fixture.source, version: summaryVersion, runId: `full-${slot.index}`,
+          platform: process.platform, arch: process.arch, bunVersion: Bun.version, workers: 2,
+          mode: "full", isolation: "default", exitCode: 0, wallMs: 10, testResult: "success", wallValid: true, wallInvalidReasons: [],
+          counts: { pass: 1, skip: 0, fail: 0 }, snapshots: 1, complete: true, incompleteReasons: [], invalidReports: [], childResultIssues: [],
+          totals: { "recovery.write": { count: 1, errors: 0, totalMs: 2, maxMs: 2, totalBytes: 7 } },
+          collection: { status: "complete" }, segments,
+          scheduling: { source: "restored", inputDigest: createHash("sha256").update(contents).digest("hex") },
+          fileTiming: { version: 2, complete: true, fullSuite: false, targetFiles: files, executedFiles: files, measuredFiles: files,
+            reportedFiles: 1, reasons: [], logsComplete: true, sourceStable: true },
+          command: [process.execPath, "test", "--timeout", "30000", "--preload", join(fixture.A, "scripts/test-performance-preload.ts"),
+            "--timings", join(run, "file-timings.json"), "--timings", input, "--update-timings", "--parallel=2", "./tests/equivalent.test.ts"] };
+        writeFileSync(join(run, "summary.json"), JSON.stringify(summary));
+        writeFileSync(join(run, "completion.json"), JSON.stringify({ version: 1, runId: summary.runId,
+          segments: { ...segments, reportMs: 2, totalMs: 14 }, endPoint: "after-summary-and-status-output", excludes: ["completion-write", "process-shutdown"] }));
+        const read = readPerformanceSummary(output, 2, 0, fixture.source, { mode: "full", isolation: "default", files: ["./tests/equivalent.test.ts"], cwd: fixture.A });
+        inputs.push(...read.schedulingInputs);
+        return { ...versionSampleResult(slot), exitCode: 0, wallMs: read.summary.wallMs,
+          counts: read.summary.counts, summaryVersion: read.summary.version, schedulingInputs: read.schedulingInputs };
+      });
+      const result = summarizeVersionSamples(runs, false, null);
+      expect(runs).toHaveLength(6);
+      expect(runs.every(run => run.summaryVersion === summaryVersion && run.error === null && run.invalidReasons.length === 0)).toBe(true);
       expect(new Set(inputs.map(input => input.path)).size).toBe(6);
       expect(new Set(inputs.map(input => input.digest)).size).toBe(history === "same" ? 1 : 6);
-      expect(JSON.parse(readFileSync(result.reportPath, "utf8")).runs).toHaveLength(6);
-      expect(result.report.valid).toBe(history === "same");
-      expect(result.exitCode).toBe(history === "same" ? 0 : 1);
-      if (history === "different") {
-        expect(result.report.reasons).toEqual(["different-scheduling-inputs"]);
-        expect(result.report.speedup).toBeNull();
-      } else {
-        expect(result.report.reasons).toEqual([]);
-        expect(result.report.speedup).toBe(1);
-      }
-    } catch (error) { preserveComparisonFailure(fixture, error); }
-  finally { spawn.mockRestore(); fixture.clean(); }
-  }, 30_000);
+      expect(result.valid).toBe(history === "same");
+      expect(result.reasons).toEqual(history === "same" ? [] : ["different-scheduling-inputs"]);
+      expect(result.speedup).toBe(history === "same" ? 1 : null);
+    } finally { fixture.clean(); }
+  });
 }
+
+processFreeTest("structured version summaries reject missing slots, changed order, invalid reasons and invalid clocks", async () => {
+  const good = await scheduleVersionSamples(async slot => ({ ...versionSampleResult(slot), exitCode: 0, wallMs: 10,
+    wrapperExitMs: 20, counts: { pass: 2, skip: 0, fail: 0 } }));
+  const mutations: ((runs: typeof good) => void)[] = [
+    runs => { runs.pop(); },
+    runs => { [runs[0], runs[1]] = [runs[1]!, runs[0]!]; },
+    runs => { runs[1]!.invalidReasons = ["invalid-completion-segments"]; },
+    runs => { runs[1]!.wallMs = Infinity; },
+    runs => { runs[1]!.wrapperExitMs = -1; },
+  ];
+  for (const mutate of mutations) {
+    const runs = structuredClone(good); mutate(runs);
+    expect(summarizeVersionSamples(runs, true, { mode: "full", isolation: "default" })).toMatchObject({ valid: false, conclusion: "invalid", speedup: null });
+  }
+});

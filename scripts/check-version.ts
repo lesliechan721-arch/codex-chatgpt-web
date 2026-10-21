@@ -48,9 +48,20 @@ for (const arch of ["amd64", "arm64"]) {
     throw new Error(`release.yml must build the native Linux ${arch} runtime`);
   }
 }
-if (releaseWorkflow.split(`bun-version: ${bunVersion}`).length - 1 !== 3) {
-  throw new Error(`release.yml must pin Bun ${bunVersion} in all three jobs`);
+const releaseJobs = (Bun.YAML.parse(releaseWorkflow) as {
+  jobs: Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>;
+}).jobs;
+let hasBunSetup = false;
+for (const [jobName, job] of Object.entries(releaseJobs)) {
+  for (const step of job.steps ?? []) {
+    if (!step.uses?.startsWith("oven-sh/setup-bun@")) continue;
+    hasBunSetup = true;
+    if (step.with?.["bun-version"] !== bunVersion) {
+      throw new Error(`release.yml job ${jobName} must pin Bun ${bunVersion} in every setup-bun step`);
+    }
+  }
 }
+if (!hasBunSetup) throw new Error("release.yml must contain a setup-bun step");
 const launcherVersion = (JSON.parse(readFileSync(resolve(root, "launcher/package.json"), "utf8")) as { version?: string }).version;
 if (launcherVersion !== packageVersion) throw new Error(`launcher/package.json is not synchronized to ${packageVersion}`);
 process.stdout.write(`VERSION_SYNC_OK ${packageVersion} bun@${bunVersion}\n`);

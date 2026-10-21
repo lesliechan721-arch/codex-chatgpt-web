@@ -9,7 +9,8 @@ import { join } from "node:path";
 export const MEASUREMENT_FILES = [
   "src/runtime-performance.ts", "src/config.ts",
   "src/adapters/chatgpt-web/continuity-recovery-store.ts", "src/adapters/chatgpt-web/recovery-durability.ts",
-  "scripts/profile-tests.ts", "scripts/test-performance-preload.ts", "scripts/test-performance-source.ts",
+  "scripts/profile-tests.ts", "scripts/test-shards.ts", "scripts/aggregate-test-shards.ts", "scripts/verify.ts",
+  "scripts/test-performance-preload.ts", "scripts/test-performance-source.ts",
   "scripts/test-performance-reports.ts", "scripts/test-performance-children.ts", "scripts/runtime-performance-preload.ts",
   "scripts/test-timing-history.ts", "scripts/test-timing-history-rest.ts",
   "scripts/compare-test-performance.ts", "scripts/compare-test-versions.ts", "tests/helpers/performance-test.ts",

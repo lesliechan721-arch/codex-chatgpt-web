@@ -6,7 +6,7 @@ import { validCounter } from "./test-performance-reports";
 import { repositoryTestFiles, targetTestFiles } from "./test-timing-history";
 
 const root = resolve(import.meta.dir, "..");
-export type Workers = 1 | 2;
+export type Workers = 1 | 2 | 4;
 export type MeasurementSettings = { mode: "full" | "timing"; isolation: "default" | "isolate" | "shared" };
 type Runner = (workers: Workers, output: string, files: string[], settings: MeasurementSettings) => Promise<number>;
 type SummaryScope = MeasurementSettings & { files: string[]; cwd?: string };
@@ -68,7 +68,7 @@ function commandScope(command: unknown, workers: Workers, scope: SummaryScope, r
   }
   if (timings.shift() !== (legacy ? "file-timings.json" : join(run, "file-timings.json"))
     || actual.shift() !== "--update-timings") throw new Error("different-timings-output");
-  if (workers === 2 && actual.shift() !== "--parallel=2") throw new Error("different-workers-command");
+  if (workers !== 1 && actual.shift() !== `--parallel=${workers}`) throw new Error("different-workers-command");
   const isolation = scope.isolation === "isolate" ? "--isolate" : scope.isolation === "shared" ? "--no-isolate" : null;
   if (isolation && actual.shift() !== isolation) throw new Error("different-isolation-command");
   const files = scope.files.length ? scope.files : ["./tests"];
@@ -182,12 +182,13 @@ export function durationStatistics(wallMs: number[]) {
     rangeWallMs: sorted.length ? { min: sorted[0]!, max: sorted.at(-1)! } : null };
 }
 
-export async function compareTestPerformance(args: string[], options: { output?: string; runner?: Runner } = {}) {
+export async function compareTestPerformance(args: string[], options: { output?: string; runner?: Runner; source?: () => ReturnType<typeof performanceSource> } = {}) {
   const { repetitions, files, mode, isolation } = comparisonOptions(args), settings = { mode, isolation };
   const output = resolve(options.output ?? process.env.CGW_TEST_PROFILE_DIR ?? join(root, "output", "test-performance"));
   mkdirSync(output, { recursive: true });
   const directory = mkdtempSync(join(output, "comparison-"));
-  const source = performanceSource(root);
+  const collectSource = options.source ?? (() => performanceSource(root));
+  const source = collectSource();
   const runs: { round: number; workers: Workers; output: string; exitCode: number | null; wallMs: number | null; summaryPath: string | null;
     wrapperExitMs: number | null; completionPath: string | null; completion: unknown;
     counts: unknown; collection: string | null; invalidReasons: string[]; summaryVersion: number | null;
@@ -222,7 +223,7 @@ export async function compareTestPerformance(args: string[], options: { output?:
       run.output = relative(directory, runOutput); runs.push(run);
     }
   }
-  const after = performanceSource(root), reasons: string[] = [];
+  const after = collectSource(), reasons: string[] = [];
   if (!source.known || !after.known || source.revision !== after.revision || source.patchDigest !== after.patchDigest || source.toolDigest !== after.toolDigest) reasons.push("unknown-or-changed-source");
   if (runs.some(run => run.exitCode !== 0 || run.error !== null || run.wallMs === null)) reasons.push("failed-or-incomplete-samples");
   if (new Set(runs.map(run => JSON.stringify(run.counts))).size !== 1) reasons.push("different-test-coverage-counts");

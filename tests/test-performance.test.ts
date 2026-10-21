@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -246,11 +246,43 @@ for (const workers of [1, 2]) test(`timing mode clears inherited collection and 
     expect(summary).toMatchObject({ version: 4, mode: "timing", isolation: "isolate", testResult: "success",
       snapshots: 0, complete: false, collection: { status: "not-requested" }, counts: { pass: 1, skip: 0, fail: 0 } });
     expect(summary.command).not.toContain("--preload");
+    if (workers > 1) expect(summary.command).toContain(`--parallel=${workers}`);
     expect(summary.segments.executionMs).toBe(summary.wallMs);
     expect(summary.segments.totalMs).toBeGreaterThanOrEqual(summary.wallMs);
     expect(readdirSync(run)).toContain("file-timings.json");
     expect(readdirSync(root)).not.toContain("inherited");
     expect(readdirSync(run)).not.toContain("processes");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the real wrapper writes distinct v5 shard reports without changing the v4 full-run contract", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-profile-shard-wrapper-"));
+  try {
+    for (const directory of ["scripts", "src", "tests"]) mkdirSync(join(root, directory));
+    const repository = fileURLToPath(new URL("..", import.meta.url));
+    for (const file of ["scripts/profile-tests.ts", "scripts/test-performance-source.ts", "scripts/test-performance-reports.ts",
+      "scripts/test-timing-history.ts", "scripts/test-shards.ts", "src/runtime-performance.ts"]) copyFileSync(join(repository, file), join(root, file));
+    for (const name of ["a", "b", "c"]) writeFileSync(join(root, "tests", `${name}.test.ts`), `import {test} from "bun:test";
+      test("actual shard test",()=>{}); ${name === "a" ? 'test.skip("declared skip",()=>{});' : ""}`);
+    const env = { ...process.env, CGW_TEST_PROFILE_DIR: join(root, "output"), GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "3", GITHUB_REPOSITORY: "owner/repo" };
+    for (const key of Object.keys(env)) if (key.startsWith("CGW_TEST_TIMING_")) delete env[key as keyof typeof env];
+    for (const index of [1, 2]) {
+      const child = spawnSync(process.execPath, [join(root, "scripts/profile-tests.ts"), "--mode=timing", `--shard=${index}/2`], { encoding: "utf8", timeout: 15_000, env });
+      expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
+    }
+    const runs = readdirSync(join(root, "output"));
+    expect(runs).toHaveLength(2);
+    const summaries = runs.map(run => JSON.parse(readFileSync(join(root, "output", run, "summary.json"), "utf8"))).sort((a, b) => a.shard.index - b.shard.index);
+    for (const [index, summary] of summaries.entries()) {
+      expect(summary).toMatchObject({ version: 5, fullSuite: false, shard: { index: index + 1, total: 2 },
+        workflowRun: { id: "42", attempt: "3", repository: "owner/repo" }, fileTiming: { version: 3, complete: true, fullSuite: false },
+        scheduling: { source: "cold", inputDigest: null, from: null }, historyPublication: { status: "not-requested" } });
+      expect(summary.command.filter((value: string) => value === "--timings")).toHaveLength(1);
+    }
+    expect(summaries[0].fileTiming.executedFiles).toEqual(["tests/a.test.ts", "tests/c.test.ts"]);
+    expect(summaries[1].fileTiming.executedFiles).toEqual(["tests/b.test.ts"]);
+    expect(summaries[0].skipIdentities).toEqual(["tests/a.test.ts::declared skip"]);
+    expect(summaries[1].skipIdentities).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

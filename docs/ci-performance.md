@@ -8,9 +8,11 @@ is `auto`; selecting `1` or `2` overrides the worker count on every OS in that r
 Launcher type checks and tests run first, so a Launcher failure does not wait for the full
 server suite. Each verification command prints its elapsed time and exit code.
 `verify-summary.json` preserves stage results, failures and test-report locations. Actions
-also shows a verification summary. Missing report artifacts produce a warning.
+also shows a verification summary. Missing artifacts from an ordinary unsharded run produce
+a warning. A sharded Windows gate fails when required evidence is missing.
 `bun run verify --test-mode=timing` selects timing collection for the server tests only.
-The default is `full`. Invalid mode values fail before verification starts.
+Local commands default to `full`. CI and Release explicitly select `timing` for server
+tests on every platform. Invalid mode values fail before verification starts.
 
 Continuity integration tests are split into adapter, HTTP, compaction, recovery and checkpoint
 files. Each file owns its fixture cleanup. Bun can distribute these files across workers;
@@ -22,14 +24,17 @@ registration/recovery files and helper HTTP. The default fixture uses CLI stdio.
 Process exit, cancellation, restart, ownership and persistence checks keep their real
 system boundaries. The paired MCP contracts also run through CLI stdio.
 
-CI uploads `test-performance-<OS>-workers-<N>`, and release builds upload
-`test-performance-release-<runner>`, even when tests fail. `CGW_TEST_PROFILE_DIR` selects the
+CI uploads `test-performance-<OS>-workers-<N>-attempt-<attempt>` for Linux/macOS and
+`test-performance-windows-latest-workers-<N>-full-attempt-<attempt>` for an unsharded
+Windows run. Release uploads `test-performance-release-<runner>` for unsharded platform
+verification. Windows shard artifacts include the shard number and run attempt. Reports
+are uploaded even when tests fail. `CGW_TEST_PROFILE_DIR` selects the
 report output directory; it does not change the test entry point or worker count. A run contains:
 
 - `file-timings.json`: Bun's measured duration for each test file.
 - `summary.json`: platform, Bun version, revision, worker count, test exit code, wall time,
   and aggregate operation counters.
-- `processes/*.json`: snapshots from test globals and child processes. They contain counts
+- `processes/*.json` in full mode: snapshots from test globals and child processes. They contain counts
   and durations, without paths, process start identities, request content or credentials.
 - `stdout.log` and `stderr.log`: original test output, including failed and filtered tests.
 
@@ -268,10 +273,10 @@ bun run scripts/diagnose-test-performance.ts --suite=continuity --repetitions=3
 
 Timing mode records execution, exit, command, file durations and logs. It removes inherited
 profiler variables and does not inject operation preloads into children. Its collection
-status is `not-requested`; absence of operation reports is expected. Full remains the
-Release default. Local runs are cold unless `CGW_TEST_TIMING_HISTORY` names a validated history envelope.
-Release enables artifact restoration; manual diagnosis stays cold so its conditions use
-the same scheduling input.
+status is `not-requested`; absence of operation reports is expected. CI and Release use
+this mode. Local commands retain full mode and cold scheduling unless
+`CGW_TEST_TIMING_HISTORY` names a validated history envelope. Release restores history
+only for unsharded Linux/macOS verification. Windows shards and manual diagnosis stay cold.
 
 For a full/timing comparison under the daily CI isolation condition, use:
 
@@ -291,8 +296,9 @@ for a switch candidate. Failures, changed inputs, unknown skips or opposite resu
 the conclusion as insufficient evidence. Bun logs name skipped tests but do not provide
 structured reasons; missing reason evidence remains unverified. A full operation report
 can be incomplete while its wall-clock sample is valid. Timing intentionally has no
-operation report. Neither result changes CI configuration automatically. Daily CI and
-Release stay full until platform-specific evidence supports an explicit CI change.
+operation report. A diagnostic result does not change workflow configuration automatically.
+Use full mode when operation counters or process ledgers are needed; daily CI and Release
+use timing mode.
 Use `--skip-evidence=/path/reviewed-skips.json` to supply reviewed reasons. Its version 1
 document binds `source.revision`, `source.patchDigest` and `source.toolDigest`, and lists
 `entries` with `file`, `name` and `reason`. Store it outside tracked source or in an ignored
@@ -314,8 +320,8 @@ source acceptance rules. Do not enable these diagnostic modes in timing comparis
 
 ## Timing history
 
-Release can restore the most recent compatible `test-timings-<runner>` artifact from this
-repository's Release or diagnostic workflow. `actions: read` is sufficient. The lookup and
+Unsharded Linux/macOS Release verification can restore the most recent compatible
+`test-timings-<runner>` artifact from this repository's Release or diagnostic workflow. `actions: read` is sufficient. The lookup and
 download have a combined 20-second limit. No permission, expiry, corruption, incompatible
 metadata and a first run all select cold scheduling and record the reason. Downloads contain
 bounded numeric JSON; artifact content is not executed. OS, architecture, exact Bun version,
@@ -342,18 +348,64 @@ For a repeatable local input, point `CGW_TEST_TIMING_HISTORY` at a prior compati
 digest and source SHA/run/artifact. Compare `wrapperExitMs`, including preparation and lookup,
 when assessing net scheduling benefit. A restored history is not proof of a performance gain.
 
-## Windows package checks
+## Windows verification and release gates
 
-`verify (windows-latest)` runs complete verify, including installer syntax validation.
-`Windows package and smoke` independently installs both frozen lockfiles, prepares the
-same Bun 1.4.3 baseline runtime, packages the installer and runs its existing artifact
-smoke. Neither Windows chain waits for the other. Linux/macOS keep their packaging and
-smoke coverage. Both Windows statuses must succeed before Windows acceptance; failure,
-cancellation or a skipped chain does not satisfy it. Configure both names as required
-checks in repository branch protection/rulesets. Workflow results alone do not configure
-that merge rule.
+CI and Release run the Windows server suite in two jobs, with two workers in each job
+and timing collection. Shard 1 also runs all other verify stages and the Windows
+PowerShell 5.1 installer syntax check. Shard 2 runs only its server-test subset.
+Packaging and smoke checks run in parallel with these jobs.
 
-For a successful run, report server test wall time, the span from the first Windows job
-start to the last Windows job finish, workflow creation to Windows readiness, total Windows
-runner time, and whole-CI readiness. Do not compare the new verify job alone with the old
-combined Windows job. Job queue time and additional preparation can reduce the net benefit.
+The CI check `verify (windows-latest)` requires both shards, complete aggregate evidence
+and `Windows package and smoke` to succeed. Release publication also requires all five
+platform builds and the Windows aggregate to succeed. Failure, cancellation, a missing
+artifact or a skipped required job cannot satisfy these gates. Linux/macOS retain full
+verification, packaging, smoke and platform-specific signature or ABI checks.
+
+Manual CI accepts `windows_test_topology=single` to run the complete Windows suite in one
+job. The default is `sharded`. `test_workers=auto|2` uses two workers per test job; `1`
+selects serial execution. Local `bun run test` and `bun run verify` still run the complete
+suite without a shard argument.
+
+```sh
+bun run test --mode=timing --shard=1/2 --parallel=2
+bun run test --mode=timing --shard=2/2 --parallel=2
+bun run verify --test-mode=timing --test-shard=1/2
+```
+
+Shards use Bun 1.4.3 cold file allocation. They reject path/name filters, bail, invalid or
+duplicate shard numbers, and explicit `CGW_TEST_TIMING_*` variables. They do not restore
+or publish history. Each shard has an independent output directory and artifact; artifacts
+from different workflow runs or attempts cannot be combined.
+
+Shard summaries use schema v5 and file-timing schema v3. `fullSuite=false` means that each
+report covers only its assigned subset. Unsharded reports retain schema v4. The independent
+aggregate checks the exact repository file union, each expected/executed/measured subset,
+source and tool identities, both lockfiles, runtime, workers, mode, isolation, exit state,
+logs, completion records and shard 1's non-server stages. Only a successful aggregate
+claims complete multi-job coverage. Windows checkouts preserve repository bytes before
+source hashes are computed.
+
+## Reviewed Windows skips
+
+`.github/windows-test-skips.json` stores each permitted Windows skip by test file, test
+name and reason, with a content hash for every source file. The gate checks those hashes
+against its checkout, binds the policy to the current source, and requires the observed
+skip identities to match exactly. It never generates an allowlist from the current run.
+
+When a listed test file changes, review its skip conditions and update the affected hash
+and entries in the same change. New skips require a reason; removing a test or enabling it
+also requires updating the policy. Do not refresh hashes without checking the conditions.
+Missing entries, duplicate identities, changed source bytes or unknown skips fail the gate.
+
+```sh
+bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts --job-results=/path/to/jobs.json --output=/path/to/aggregate.json --skip-policy=.github/windows-test-skips.json --mode=timing
+```
+
+`jobs.json` contains the actual final states of `shard1`, `shard2` and `package`.
+The CLI binds evidence to `GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`,
+`GITHUB_REPOSITORY` and `CGW_TEST_WORKERS=1|2` (default 2). `--mode` defaults to `full`
+for standalone use. An explicitly supplied `--skip-evidence` retains the source-bound
+version 1 evidence format; it cannot be combined with `--skip-policy`.
+
+Required-check settings are managed separately from workflow files. The CI retains
+`verify (windows-latest)` and `Windows package and smoke` check names.
