@@ -23,9 +23,9 @@
     "tests/launcher-viewport-browser.test.ts": "e6a19ee56653f4064adf52370f30da41bc564d3adab695a43031664ec0732799",
     "tests/multipart-history.test.ts": "bf7e7386489bafac7f26fbf5f4ba4bcdfcc89ad5654a37ed3ad1c1562af0931b",
     "tests/server-deploy.test.ts": "da2f8241519ff407bef78b562efe41b4d8d1fbf44905442408d43ac4380ee101",
-    "tests/session-continuity-checkpoint.test.ts": "d3fb8a66e68ad33f990420162fd0d25668e945eb92529e4f11828f617399ecbe",
+    "tests/session-continuity-checkpoint.test.ts": "e52491040233bb502ebd98aaa185862a2b7aa365b152888a6c7e2863d199aa0b",
     "tests/session-continuity-compaction.test.ts": "71da4831399f2f67330dbe2deddc8d5bd38233454d07ec09b5c8b24840950fc0",
-    "tests/session-continuity-recovery.test.ts": "cad6dc48e681fde4ce205bbf622c9a857a486ab519091d4da1c8a0d2f1082a68",
+    "tests/session-continuity-recovery.test.ts": "43baf0e23ea329c0d9d64c2b9672eca9b9409fb3c26e36671b7faa2d2e5d0d56",
     "tests/submission-error-alert.test.ts": "d6ac5074e3e32bcc44ac71d09152a67bf51b4c290719d1bd039ced2cf158395a",
     "tests/tool-approval-dom.test.ts": "7a06750046002a550d39231cdff851c29c0f0a33f54d190bb8fa91d64c50fde6",
     "tests/validate-context-rendering.test.ts": "27cbe3e193b2e5a51faa0c7ef71dc263a357fb592fb4471fabafddaf394bf126"

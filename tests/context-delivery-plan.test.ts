@@ -241,12 +241,20 @@ test("externalization threshold uses mixed field cost instead of escaped JSON sa
 });
 
 test("multiple medium fields can jointly repay the complete entry cost", () => {
+  // Leave room for token-count variation in random navigation IDs and read references.
+  // Each field alone must still cost less inline than with a complete navigation entry.
   const canonical = request(Array.from({ length: 6 }, (_, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
-    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(300)}`, isError: false, timestamp: index })));
-  const result = plan(canonical);
+    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(360)}`, isError: false, timestamp: index })));
+  for (const message of canonical.context.messages) {
+    expect(plan(request([message])).navigationEnabled).toBe(false);
+  }
+  const snapshot = createContextSnapshot(canonical);
+  const inline = plan(canonical, { snapshot, contextToolsAvailable: false });
+  const result = plan(canonical, { snapshot });
   expect(result.navigationEnabled).toBe(true);
   expect(result.externalizedTargetIds).toHaveLength(6);
   expect(result.costs.netSavedPromptBytes).toBeGreaterThan(0);
+  expect(result.costs.requiredTotalTokens).toBeLessThan(inline.costs.requiredTotalTokens);
 });
 
 test("resume and short second-round inputs publish a new visible entry for omitted readable history", () => {
