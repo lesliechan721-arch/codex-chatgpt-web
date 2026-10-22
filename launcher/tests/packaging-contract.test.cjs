@@ -422,7 +422,6 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
   assert.equal(ci.jobs["windows-package"]["runs-on"], "windows-latest");
   assert.deepEqual(release.jobs.build.strategy.matrix.include, [
     { runner: "macos-15", runtime_asset: "codex-chatgpt-web-darwin-arm64.tar.gz" },
-    { runner: "macos-15-intel", runtime_asset: "codex-chatgpt-web-darwin-amd64.tar.gz" },
     { runner: "ubuntu-latest", runtime_asset: "codex-chatgpt-web-linux-amd64.tar.gz" },
     { runner: "ubuntu-24.04-arm", runtime_asset: "codex-chatgpt-web-linux-arm64.tar.gz" },
     { runner: "windows-latest", runtime_asset: "codex-chatgpt-web-windows-amd64.zip" },
@@ -438,13 +437,13 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
   const timings = workflowStep(release.jobs.build, step => step.with?.name === "test-timings-${{ matrix.runner }}");
   assert.equal(workflowExpression(timings.if, { runner: { os: "Windows" } }), false);
   assert.equal(workflowExpression(timings.if, { runner: { os: "Linux" } }), true);
-  for (const name of ["build", "windows-test-shard"]) {
+  for (const name of ["build", "windows-test-shard", "intel"]) {
     assert.ok(jobNeeds(release.jobs[name]).includes("codex-model-gate"));
   }
   for (const name of ["build", "windows-test-shard", "windows-gate"]) {
     assert.equal(release.jobs[name].env.CGW_TEST_WORKERS, "2");
   }
-  assert.deepEqual(jobNeeds(release.jobs.publish).sort(), ["build", "windows-gate"]);
+  assert.deepEqual(jobNeeds(release.jobs.publish).sort(), ["build", "intel", "windows-gate"]);
   assert.deepEqual(jobNeeds(release.jobs["publish-image"]), ["publish"]);
   for (const name of ["publish", "publish-image"]) {
     assert.equal(release.jobs[name].if, undefined, `${name} must require all dependencies to succeed`);
@@ -463,6 +462,82 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
   assert.match(release.source, /codesign --verify --deep --strict --verbose=2/);
   assert.match(release.source, /Codex Web GPT\.app/);
   assert.doesNotMatch(release.source, /gh release create[\s\S]*?--draft/);
+});
+
+test("Intel release shards retain package signatures, complete coverage, and the same diagnostic workflow", () => {
+  const release = readWorkflow("release"), intel = readWorkflow("intel-release"), diagnostic = readWorkflow("windows-performance");
+  const shards = intel.jobs["test-shard"], gate = intel.jobs.gate, packaged = intel.jobs.package;
+  assert.equal(release.jobs.intel.uses, "./.github/workflows/intel-release.yml");
+  assert.equal(diagnostic.jobs["intel-shards"].uses, release.jobs.intel.uses);
+  assert.ok(Object.hasOwn(intel.on, "workflow_call"));
+  assert.equal(shards["runs-on"], "macos-15-intel");
+  assert.deepEqual(shards.strategy.matrix.shard, [1, 2]);
+  assert.equal(shards.strategy["fail-fast"], false);
+  assert.equal(shards.env.CGW_TEST_WORKERS, "2");
+  const verify = workflowStep(shards, step => /^bun run verify\b/.test(step.run));
+  const server = workflowStep(shards, step => /^bun run test\b/.test(step.run));
+  assert.equal(verify.run, "bun run verify --test-mode=timing --test-shard=1/2");
+  assert.equal(server.run, "bun run test --mode=timing --shard=2/2");
+  for (const shard of [1, 2]) {
+    assert.equal(workflowExpression(verify.if, { matrix: { shard } }), shard === 1);
+    assert.equal(workflowExpression(server.if, { matrix: { shard } }), shard === 2);
+  }
+  for (const job of [shards, diagnostic.jobs["intel-baseline"]]) {
+    for (const env of [intel.env, diagnostic.env, job.env, ...job.steps.map(step => step.env)]) {
+      assert.equal(Object.keys(env ?? {}).some(key => key.startsWith("CGW_TEST_TIMING_")), false);
+    }
+  }
+  assert.deepEqual(jobNeeds(packaged), []);
+  assert.equal(packaged["runs-on"], "macos-15-intel");
+  for (const command of ["bun run app:package", "bun run app:smoke",
+    "codesign --verify --deep --strict launcher/build/runtime/runtime/bun"]) {
+    assert.equal(workflowStep(packaged, step => step.run === command).if, undefined);
+  }
+  assert.match(workflowStep(packaged, step => step.name === "Verify packaged macOS application signature").run,
+    /codesign --verify --deep --strict --verbose=2/);
+  const archive = workflowStep(packaged, step => step.name === "Archive runtime");
+  assert.match(archive.run, /codex-chatgpt-web-darwin-amd64\.tar\.gz/);
+  const upload = workflowStep(packaged, step => step.uses?.startsWith("actions/upload-artifact@"));
+  assert.equal(upload.with.name, "release-macos-15-intel");
+  for (const asset of ["codex-chatgpt-web-darwin-amd64.tar.gz", "launcher/artifacts/*.dmg", "launcher/artifacts/*.zip"]) {
+    assert.ok(upload.with.path.includes(asset));
+  }
+  assert.equal(gate.if, "always()");
+  assert.deepEqual(jobNeeds(gate).sort(), ["package", "test-shard"]);
+  assert.equal(gate.env.INTEL_SHARDS_RESULT, "${{ needs.test-shard.result }}");
+  assert.equal(gate.env.INTEL_PACKAGE_RESULT, "${{ needs.package.result }}");
+  for (const job of [shards, gate, packaged]) {
+    assert.equal(job["continue-on-error"], undefined);
+    assert.ok(job.steps.every(step => !step["continue-on-error"]));
+  }
+  const evidence = workflowStep(shards, step => step.uses?.startsWith("actions/upload-artifact@"));
+  assert.equal(evidence.if, "always()");
+  assert.equal(evidence.with["if-no-files-found"], "error");
+  const downloads = gate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
+  assert.equal(downloads.length, 2);
+  for (const shard of [1, 2]) {
+    assert.ok(downloads.some(step => step.with.name === evidence.with.name.replace("${{ matrix.shard }}", String(shard))));
+  }
+  const aggregate = workflowStep(gate, step => /scripts\/aggregate-test-shards\.ts/.test(step.run));
+  assert.match(aggregate.run, /--skip-policy=\.github\/macos-intel-test-skips\.json --platform=darwin --arch=x64 --mode=timing/);
+  const states = workflowStep(gate, step => step.name === "Check complete Intel job states");
+  if (process.platform !== "win32") {
+    const pass = { INTEL_SHARDS_RESULT: "success", INTEL_PACKAGE_RESULT: "success" };
+    const succeeds = env => spawnSync("bash", ["-e", "-o", "pipefail", "-c", states.run], {
+      env: { ...process.env, ...env }, encoding: "utf8", timeout: 10_000,
+    }).status === 0;
+    assert.equal(succeeds(pass), true);
+    for (const key of Object.keys(pass)) for (const result of ["failure", "cancelled", "skipped", ""]) {
+      assert.equal(succeeds({ ...pass, [key]: result }), false);
+    }
+  }
+  for (const condition of ["intel-shards", "mode-pair", "all"]) {
+    const context = { inputs: { condition } };
+    assert.equal(workflowExpression(diagnostic.jobs.diagnose.if, context), condition !== "intel-shards");
+    for (const name of ["intel-shards", "intel-baseline"]) {
+      assert.equal(workflowExpression(diagnostic.jobs[name].if, context), condition === "intel-shards");
+    }
+  }
 });
 
 test("Linux AppImage fallback uses one owned extraction and removes it on exit", {
