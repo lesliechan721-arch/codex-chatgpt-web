@@ -14,9 +14,9 @@ on:
         options: ["continuity", "continuity-task", "continuity-adapter", "continuity-source", "cli", "all"]
         default: "continuity"
       condition:
-        description: "mode-pair: full/timing at default isolation, 2 workers; requires suite=all, cold, no filter"
+        description: "intel-shards: Intel release shards + full-suite baseline; ignores other inputs"
         type: choice
-        options: ["all", "mode-pair", "original-1", "original-2", "isolated-full-1", "isolated-full-2", "isolated-timing-1", "isolated-timing-2"]
+        options: ["all", "mode-pair", "intel-shards", "original-1", "original-2", "isolated-full-1", "isolated-full-2", "isolated-timing-1", "isolated-timing-2"]
         default: "all"
       test_name_pattern:
         description: "Optional Bun test name regex; filtered runs cannot publish complete-suite history"
@@ -48,6 +48,7 @@ permissions:
 
 jobs:
   diagnose:
+    if: inputs.condition != 'intel-shards'
     runs-on: ${{ inputs.platform }}
     timeout-minutes: 240
     steps:
@@ -122,3 +123,34 @@ jobs:
           name: test-diagnostics-${{ inputs.platform }}-${{ inputs.runtime }}-${{ github.sha }}
           path: ${{ runner.temp }}/test-performance
           if-no-files-found: warn
+
+  intel-shards:
+    if: inputs.condition == 'intel-shards'
+    uses: ./.github/workflows/intel-release.yml
+
+  intel-baseline:
+    name: Intel unsharded verification baseline
+    if: inputs.condition == 'intel-shards'
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      CGW_TEST_WORKERS: "2"
+      CGW_TEST_RUNNER_CLASS: macos-15-intel
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile
+        working-directory: launcher
+      - run: bun run verify --test-mode=timing
+        env:
+          CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
+      - name: Upload unsharded baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-performance-macos-15-intel-baseline-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-performance
+          if-no-files-found: error

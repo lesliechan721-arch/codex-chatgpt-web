@@ -36,8 +36,6 @@ jobs:
         include:
           - runner: macos-15
             runtime_asset: codex-chatgpt-web-darwin-arm64.tar.gz
-          - runner: macos-15-intel
-            runtime_asset: codex-chatgpt-web-darwin-amd64.tar.gz
           - runner: ubuntu-latest
             runtime_asset: codex-chatgpt-web-linux-amd64.tar.gz
           - runner: ubuntu-24.04-arm
@@ -130,6 +128,10 @@ jobs:
             launcher/artifacts/*.exe
             launcher/artifacts/*.AppImage
           if-no-files-found: error
+
+  intel:
+    needs: codex-model-gate
+    uses: ./.github/workflows/intel-release.yml
 
   windows-test-shard:
     name: Windows server tests (${{ matrix.shard }}/2)
@@ -233,7 +235,7 @@ jobs:
           if-no-files-found: warn
 
   publish:
-    needs: [build, windows-gate]
+    needs: [build, windows-gate, intel]
     runs-on: ubuntu-latest
     outputs:
       image_latest: ${{ steps.release.outputs.image_latest }}

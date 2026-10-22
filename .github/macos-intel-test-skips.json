@@ -1,0 +1,575 @@
+{
+  "version": 1,
+  "reviewedSource": {
+    "revision": "c5b7c81b75f97aaed3d81f269ca81cd1829226dd",
+    "patchDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "toolDigest": "efc53909842d9001328626ab1808b98b14cc25dccfd2be7f84b93aa27d11ee9a"
+  },
+  "fileHashes": {
+    "tests/attachment-upload-electron.test.ts": "eb2a83444b6ce9c266e5decf663953380fec1f15840e2915a2739a332ce9f71f",
+    "tests/attachment-upload.test.ts": "f22b7b2be79ef96e0a8284f93cd26a4dcbe06e426d17d9f5d619e64d484afcb2",
+    "tests/browser-generation.test.ts": "4785cfcc55d0532a802b06f336f12857e8014fc0df2e8a513dd8418cf905e361",
+    "tests/browser-live-progress.test.ts": "4492ee1bc5945e5b8317019f472b662d9c9d1f0c0a0b2fecdea2fc8582308415",
+    "tests/browser-turn-binding.test.ts": "bdd86c7bfc5eeb502543445aa2121f3ef90d044c4d950cfc3f364fd4ac885b64",
+    "tests/chatgpt-effort-browser.test.ts": "554d3a45f4ae9c5fa84ca8f648a9e18a205b4ec5f567f1d7c9abfeee2f45387c",
+    "tests/chatgpt-limits-browser.test.ts": "7c586f0a5ab8581fcfaa99dafee84e4d933832ea2eabe04374bbf1400ce67721",
+    "tests/chatgpt-markdown-parser.test.ts": "48ec43fbfb9dd5c579e9b1cb8307f806b6fc0f4c8ab7beea72527184f81cff9c",
+    "tests/chatgpt-model-family-browser.test.ts": "9f7e1193d77898775cfba5710e76d3df86e8ac6c00a363345ba367f721bc2eac",
+    "tests/composer-insert.test.ts": "a7978cbddb18bec51e4d272cd3bdf84e879ddd102d88a1cf3f7a875935e3d484",
+    "tests/context-markdown-regexp.test.ts": "a43edaf0928a23c61c8c4649d47b414e4a47ab2d435199d6845cb3fb56bc739e",
+    "tests/continuity-lock-windows.test.ts": "78b1cdfc76cb5e8853f8148d3898424bd9b436d509fe782bd2318437f83b3afb",
+    "tests/environment.test.ts": "c461d54e8ee162ec811fc5274dd93f24fab59d3543f4849194a83e9b6ac80168",
+    "tests/launcher-navigation-viewport.test.ts": "59ade91f7f1e0a32d24232a3830a4eefab40545b2586c439f847d91760e93607",
+    "tests/launcher-system-theme.test.ts": "f47587d58ad00d56b22abe97170e7ab35d18f41d28fcdee5d9372e2ad00ae20d",
+    "tests/launcher-viewport-browser.test.ts": "e6a19ee56653f4064adf52370f30da41bc564d3adab695a43031664ec0732799",
+    "tests/multipart-history.test.ts": "bf7e7386489bafac7f26fbf5f4ba4bcdfcc89ad5654a37ed3ad1c1562af0931b",
+    "tests/server-deploy.test.ts": "da2f8241519ff407bef78b562efe41b4d8d1fbf44905442408d43ac4380ee101",
+    "tests/session-continuity-checkpoint.test.ts": "cac2e7b827f1bf122fb5f18e89c4193b74f8c811341f5cb560ad20dd8a3880a1",
+    "tests/session-continuity-compaction.test.ts": "5dbd376c34a7cd1d93da565b5d65a2cb6711f8fd55c7bf17a922def0473b8e25",
+    "tests/session-continuity-recovery.test.ts": "cad6dc48e681fde4ce205bbf622c9a857a486ab519091d4da1c8a0d2f1082a68",
+    "tests/tool-approval-dom.test.ts": "c1bca1ccbc65fa958a93add671285b4e0d7321050ca0dbaef5f34fa419f99e43",
+    "tests/validate-context-rendering.test.ts": "d531127a79c86e7cdc7551cbf3a86ef68191ae991d6e82638753f58e93cc37d2"
+  },
+  "entries": [
+    {
+      "file": "tests/attachment-upload-electron.test.ts",
+      "name": "Electron handles already-finished upload response: file.processing.completed",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload-electron.test.ts",
+      "name": "Electron handles already-finished upload response: file.processing.error",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload-electron.test.ts",
+      "name": "Electron handles already-finished upload response: file.processing.file_ready",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "HTTP 200 processing errors fail and unrelated uploads cannot complete this turn",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "all owned files must complete, including a final event without a newline",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "an enabled send button cannot bypass delayed processing or an HTTP 503",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "an owned creation upload limit stops attachment preparation without sending or retrying",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "an owned processing upload limit stops attachment preparation without sending or retrying",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "file creation alone cannot complete an upload and unrelated creation failures are ignored",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "file-ready without terminal completion fails when the response ends",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "processing completion is required and accepted before the upload stream closes",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "saved-chat uploads use the active composer while the hidden home composer remains mounted",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/attachment-upload.test.ts",
+      "name": "unfinished processing is cancelled without leaking the browser observation",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-generation.test.ts",
+      "name": "Think buttons do not require the 6.1.8 icon shape or type slash commands",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选浏览器路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-generation.test.ts",
+      "name": "Think preserves both plugin pill formats and rejects plugin replacement",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选浏览器路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-generation.test.ts",
+      "name": "captured Stop is independent of language and excludes other composer actions",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选浏览器路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-generation.test.ts",
+      "name": "captured Think toggles independently of language without selecting other pills",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选浏览器路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-generation.test.ts",
+      "name": "hidden duplicate Stop controls cannot turn live generation into an idle timeout",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选浏览器路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-live-progress.test.ts",
+      "name": "an owned error survives removal of its assistant subtree without reading another turn",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-live-progress.test.ts",
+      "name": "picker diagnostics distinguish disabled, covered and stalled controls without exposing content",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-live-progress.test.ts",
+      "name": "real Enter accepts MCP while the renderer is still busy handling the key",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-live-progress.test.ts",
+      "name": "response diagnostics retain wrapper ownership but omit private text, classes and identifiers",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "CodeMirror language invalidates the response cache and incomplete code is not delivered",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "a Send acknowledged under a fallback key rebinds only to its exact submitted prompt",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "a known assistant cannot be replaced after a formal user was proved: user bubble=false",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "a known assistant cannot be replaced after a formal user was proved: user bubble=true",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "activity tone and collapsed content invalidate the response cache",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "an exchange rekeys only with the exact submitted prompt and no competing turn",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "auto-linked URLs preserve exact prompt text and reject changed labels or destinations",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "binds captured Activity before an answer exists and recognizes uploaded native-button tiles",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "collapsed plugin messages rebind only after their complete text is verified",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "compiled context navigation prompts rebind after collapsed message expansion",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: foreign-assistant",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: same-assistant",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: same-formal-user",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: second-foreign-user",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: temporary-foreign-assistant",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "fallback recovery preserves message identities: temporary-same-assistant",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "initial assistant binding preserves the formal user accepted by physical Send",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "native identity capture ends before asynchronous submission acknowledgement",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "paragraph identity survives file preview movement in both response layouts",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "plain user code blocks preserve the full submitted code and whitespace",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "preserves the accepted user identity across Activity's temporary fallback group",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "reading a collapsed message restores the viewport and remounts its virtualized active answer",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "rich-text rebind requires the exact prepared turn token after expansion",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "the physical Send identifies its formal user despite display escaping: match=false",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "the physical Send identifies its formal user despite display escaping: match=true",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "the submitted native user also constrains acceptance",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/browser-turn-binding.test.ts",
+      "name": "the submitted native user also constrains initial binding",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "GPT-6 and GPT-5.6 remain distinct across effort changes and pre-send verification",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "Think uses the active editor in both composer layouts and survives its replacement",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "model selection reuses the classic picker without racing Escape cleanup",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "model selection reuses the gpt6 picker without racing Escape cleanup",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "model selection reuses the power picker without racing Escape cleanup",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "real slider hydrate keeps the requested available effort",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "real slider locked keeps the requested available effort",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "real slider pro-disappears keeps the requested available effort",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-effort-browser.test.ts",
+      "name": "real slider shrink keeps the requested available effort",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account account-change preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account expired preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account http-error preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account payment-change preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account plan-change preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account pro preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account prolite preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account redirect preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-limits-browser.test.ts",
+      "name": "Limits account unknown preserves the page and rejects uncertain state",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-markdown-parser.test.ts",
+      "name": "encoded context avoids the Chromium Markdown parser stall",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "GPT-6 Pro fails closed when the picker's model evidence is conflicting",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "GPT-6 Pro fails closed when the picker's model evidence is future",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "GPT-6 Pro fails closed when the picker's model evidence is versionless",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "GPT-6 Pro is still verified from the older versioned slider announcement",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "GPT-6 Pro is verified from the current picker header when the slider announces only the effort",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "localized position punctuation works through actual picker selection and usage readback",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/chatgpt-model-family-browser.test.ts",
+      "name": "model evidence excludes inactive and foreign picker headers and rejects multiple active headers",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/composer-insert.test.ts",
+      "name": "a selected connector never appends a new request to an old draft",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/context-markdown-regexp.test.ts",
+      "name": "actual Chromium link regex stalls before encoding and remains responsive after lossless encoding",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/continuity-lock-windows.test.ts",
+      "name": "Windows native lock publication preserves an existing empty directory",
+      "reason": "process.platform !== win32：Windows 原生锁发布检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/continuity-lock-windows.test.ts",
+      "name": "Windows native lock publication preserves an existing file",
+      "reason": "process.platform !== win32：Windows 原生锁发布检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/continuity-lock-windows.test.ts",
+      "name": "Windows native lock publication preserves an existing owned directory",
+      "reason": "process.platform !== win32：Windows 原生锁发布检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/continuity-lock-windows.test.ts",
+      "name": "Windows native lock publication supports Unicode and long paths",
+      "reason": "process.platform !== win32：Windows 原生锁发布检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/environment.test.ts",
+      "name": "trusted Codex task environment continuity > resumed Windows tasks accept the same indexed rollout (namespaceHome=false, namespaceRollout=false)",
+      "reason": "process.platform !== win32：Windows 命名空间路径与任务恢复检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/environment.test.ts",
+      "name": "trusted Codex task environment continuity > resumed Windows tasks accept the same indexed rollout (namespaceHome=false, namespaceRollout=true)",
+      "reason": "process.platform !== win32：Windows 命名空间路径与任务恢复检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/environment.test.ts",
+      "name": "trusted Codex task environment continuity > resumed Windows tasks accept the same indexed rollout (namespaceHome=true, namespaceRollout=false)",
+      "reason": "process.platform !== win32：Windows 命名空间路径与任务恢复检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/environment.test.ts",
+      "name": "trusted Codex task environment continuity > resumed Windows tasks accept the same indexed rollout (namespaceHome=true, namespaceRollout=true)",
+      "reason": "process.platform !== win32：Windows 命名空间路径与任务恢复检查仅在 Windows 执行。"
+    },
+    {
+      "file": "tests/launcher-navigation-viewport.test.ts",
+      "name": "navigated Electron task pages stay usable before delayed resources finish",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/launcher-system-theme.test.ts",
+      "name": "launcher CDP attachments preserve native dark appearance across pages",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/launcher-viewport-browser.test.ts",
+      "name": "finishing another Electron tab preserves the open model picker and viewport",
+      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "a new multipart user message is accepted before ChatGPT mounts its assistant area",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "a previously acknowledged but unmounted stage cannot acknowledge the next Send when it returns",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "acknowledged multipart history can rekey without becoming a new submission",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "multipart history does not admit mismatched, unfinished, duplicated or unrelated exchanges",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "pending multipart submissions do not expand their transient user bubble while earlier stages remain accounted for",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/multipart-history.test.ts",
+      "name": "rekeyed multipart stages verify the full message behind a collapsed middle preview",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/server-deploy.test.ts",
+      "name": "server remote desktop deployment > keeps generated launcher directories out of the Docker build context",
+      "reason": "!dockerAvailable：源码要求 Docker 可执行文件存在、容器类型为 Linux 且 Buildx 命令成功；实际日志未区分哪一子条件不成立。"
+    },
+    {
+      "file": "tests/session-continuity-checkpoint.test.ts",
+      "name": "repair11 child checkpoint seed",
+      "reason": "!process.env.REPAIR11_CHECKPOINT_SEED_ROOT：独立子进程入口，普通全套根进程未提供非空 seed/root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/session-continuity-compaction.test.ts",
+      "name": "delegation restart child repeat",
+      "reason": "!process.env.DELEGATION_RESTART_ROOT：独立子进程入口，普通全套根进程未提供非空 seed/root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/session-continuity-compaction.test.ts",
+      "name": "delegation restart child seed",
+      "reason": "!process.env.DELEGATION_RESTART_ROOT：独立子进程入口，普通全套根进程未提供非空 seed/root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/session-continuity-recovery.test.ts",
+      "name": "recovery v3 worker: exit before acquisition failure receipt",
+      "reason": "!process.env.CGW_RECOVERY_CRASH_BUDGET_ROOT：独立子进程入口，普通全套根进程未提供非空 seed/root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "a pending current approval stays manual and respects cancellation",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "an approval waits for its actions to finish mounting",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "approval cannot choose another connector, a quoted alert, or ambiguous permission controls",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "automatic approval waits for the requesting message to finish streaming",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "current and earlier approval surfaces select only the visible one-time action",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/tool-approval-dom.test.ts",
+      "name": "streaming approval timeout and cancellation never click a permission button",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/validate-context-rendering.test.ts",
+      "name": "original assert plus observer reads real DOM strictly and preserves product returns",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/validate-context-rendering.test.ts",
+      "name": "production response DOM and Markdown preserve a complete fenced result in both code layouts",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    },
+    {
+      "file": "tests/validate-context-rendering.test.ts",
+      "name": "submitted observer treats target and outer user collapse states as unknown",
+      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
+    }
+  ]
+}

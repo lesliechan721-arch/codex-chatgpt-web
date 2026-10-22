@@ -13,7 +13,7 @@ export type ShardAggregationInput = {
   files: string[]; shards: ShardEvidence[]; verify: any; jobResults: Record<string, unknown>; skipEvidence?: any;
   expected: { revision: string; runId: string; attempt: string; repository: string;
     patchDigest?: string; toolDigest?: string; dependencyDigest?: string; launcherDependencyDigest?: string;
-    platform?: string; mode?: "full" | "timing"; isolation?: "default" | "isolate"; workers?: 1 | 2 };
+    platform?: string; arch?: string; mode?: "full" | "timing"; isolation?: "default" | "isolate"; workers?: 1 | 2 };
 };
 const canonical = (value: any): any => Array.isArray(value) ? value.map(canonical)
   : value !== null && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
@@ -76,7 +76,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
     for (const key of ["patchDigest", "toolDigest", "dependencyDigest", "launcherDependencyDigest"] as const) {
       if (expected[key] !== undefined) require(summary[key] === expected[key], `${label}:${key}-mismatch`);
     }
-    for (const key of ["platform", "mode", "isolation", "workers"] as const) {
+    for (const key of ["platform", "arch", "mode", "isolation", "workers"] as const) {
       if (expected[key] !== undefined) require(summary[key] === expected[key], `${label}:unexpected-${key}`);
     }
     require([1, 2].includes(summary.workers) && ["default", "isolate"].includes(summary.isolation)
@@ -215,14 +215,16 @@ export function loadShardArtifacts(directory: string) {
 export function aggregateShardOptions(args: string[]) {
   const options: Record<string, string> = {};
   for (const argument of args) {
-    const match = /^--(artifacts|job-results|output|skip-evidence|skip-policy|mode)=(.+)$/.exec(argument);
+    const match = /^--(artifacts|job-results|output|skip-evidence|skip-policy|mode|platform|arch)=(.+)$/.exec(argument);
     if (!match || options[match[1]!]) throw new Error(`Invalid or duplicate aggregation option: ${argument}`);
-    options[match[1]!] = match[1] === "mode" ? match[2]! : resolve(match[2]!);
+    options[match[1]!] = ["mode", "platform", "arch"].includes(match[1]!) ? match[2]! : resolve(match[2]!);
   }
-  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--mode=full|timing] [--skip-evidence=PATH | --skip-policy=PATH]");
+  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--mode=full|timing] [--platform=win32|darwin] [--arch=x64] [--skip-evidence=PATH | --skip-policy=PATH]");
   if (options["skip-evidence"] && options["skip-policy"]) throw new Error("--skip-evidence and --skip-policy are mutually exclusive.");
   if (options.mode !== undefined && options.mode !== "full" && options.mode !== "timing") throw new Error("Aggregation mode must be full or timing.");
-  return { ...options, mode: options.mode ?? "full" } as Record<string, string> & { mode: "full" | "timing" };
+  if (options.platform !== undefined && options.platform !== "win32" && options.platform !== "darwin") throw new Error("Aggregation platform must be win32 or darwin.");
+  if (options.arch !== undefined && options.arch !== "x64") throw new Error("Aggregation architecture must be x64.");
+  return { ...options, mode: options.mode ?? "full", platform: options.platform ?? "win32", arch: options.arch ?? "x64" } as Record<string, string> & { mode: "full" | "timing" };
 }
 
 if (import.meta.main) {
@@ -231,8 +233,8 @@ if (import.meta.main) {
     options = aggregateShardOptions(process.argv.slice(2));
     const root = resolve(import.meta.dir, "..");
     const workers = process.env.CGW_TEST_WORKERS || "2";
-    if (workers !== "1" && workers !== "2") throw new Error("Windows shard gate requires CGW_TEST_WORKERS=1|2 (default 2).");
-    // Bind code and tools to the gate checkout. Its Node/platform identity is unrelated to the Windows jobs.
+    if (workers !== "1" && workers !== "2") throw new Error("Shard gate requires CGW_TEST_WORKERS=1|2 (default 2).");
+    // Bind code and tools to the gate checkout, independently of its host platform.
     const source = performanceSource(root);
     if (!source.known || source.revision !== process.env.GITHUB_SHA) throw new Error("Unknown or different gate checkout source.");
     const digest = (path: string) => createHash("sha256").update(readFileSync(join(root, path))).digest("hex");
@@ -245,7 +247,7 @@ if (import.meta.main) {
       expected: { revision: process.env.GITHUB_SHA ?? "", runId: process.env.GITHUB_RUN_ID ?? "", attempt: process.env.GITHUB_RUN_ATTEMPT ?? "",
         repository: process.env.GITHUB_REPOSITORY ?? "", patchDigest: source.patchDigest!, toolDigest: source.toolDigest!,
         dependencyDigest: digest("bun.lock"), launcherDependencyDigest: digest("launcher/bun.lock"),
-        platform: "win32", mode: options.mode, isolation: "default", workers: Number(workers) as 1 | 2 } });
+        platform: options.platform, arch: options.arch, mode: options.mode, isolation: "default", workers: Number(workers) as 1 | 2 } });
     mkdirSync(dirname(options.output!), { recursive: true });
     writeFileSync(options.output!, JSON.stringify(result, null, 2) + "\n");
     console.info(`[test-shards] ${result.success ? "passed" : "failed"}: ${result.reasons.join(", ")}`);
