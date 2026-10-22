@@ -9,6 +9,7 @@ import { registerCompactionSource } from "../src/adapters/chatgpt-web/compaction
 import { createContextSnapshot, serializeContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ChatGptSuspensionClock, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
 import { RemoteTurnBroker, TurnBroker, callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
+import { estimateTokens } from "../src/lib/token-estimate";
 
 function virtualTime() {
   let wall = Date.now(), elapsed = 0;
@@ -47,9 +48,11 @@ for (const mode of ["native", "safe", "manual"] as const) {
       const source = await registerCompactionSource(f.remote, { snapshot: snapshot(),
         ...(transaction ? { contract: "native" as const, transactionToken: transaction.token, handoffId: transaction.handoffId }
           : { contract: "safe" as const, turnToken, handoffId: "safe:remote-source", ...(mode === "manual" ? { explicitManual: true as const } : {}) }),
-        historyRevision: 0, ownerGeneration: "page", availableTokens: 96_000,
+        historyRevision: 0, ownerGeneration: "page", availableTokens: 160_000,
         expiresAt: () => { const deadline = budget.deadlineAt; if (++reads === 1 && pause) queueMicrotask(() => f.time.sleep(601_000)); return deadline; },
       }, "Summarize the original source");
+      const entry = JSON.parse(source.instruction.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+      expect(entry.overview.remaining_tokens).toBe(160_000 - estimateTokens("Summarize the original source") - 4_096);
       expect(budget.remainingMs()).toBe(pause ? 59_000 : 60_000);
       if (mode === "safe") await f.remote.requestCompaction(turnToken!, { content: [{ type: "text", text: source.instruction }] });
       if (mode === "manual") f.broker.startSafeTurn(turnToken!);

@@ -89,8 +89,9 @@ successful completion. Required text cannot be silently summarized, trimmed, or 
 Complete sources need not fit as one browser prompt. The actual plan must fit its model and account
 window, composer/attachment limits, existing page cost, directory discovery, complete read replies,
 required images, error allowance, and work/summary reserve. HTTP, parsing, source readability,
-32 MiB snapshot storage, and durable-evidence limits remain separate. Navigation retains its
-96,000 estimated-token and 64 MiB wire cumulative limits. A small legal inline request remains valid.
+32 MiB snapshot storage, and durable-evidence limits remain separate. Navigation uses the remaining
+shared page context, with no separate cumulative token or wire ceiling. Single-response,
+image-resource and processing limits still apply. A small legal inline request remains valid.
 Navigation requires the configured Native5 / Native5 DEV / Zero Risk4 or supported custom connector
 and its current protocol, credentials, readable sources, and delivery checks. Historical
 **Verify runtime** results do not control admission or recovery. Full + Launcher and a past
@@ -109,7 +110,9 @@ The catalog publishes a finite 1,000,000-token Codex history window and 900,000-
 compaction threshold for applicable routes and equivalent ordinary aliases. Lower client limits
 still apply. Usage estimates the canonical history, not just a small retained-page increment.
 These values do not enlarge the actual ChatGPT window, per-message transport, source storage,
-read budget, or result cache, and do not claim platform billing or complete visual-token counts.
+single-response limits, or result cache, and do not claim platform billing or complete visual-token counts.
+The client initiates compaction. A server capacity refusal does not replace the normal response
+with a checkpoint or automatically compact the client's history.
 
 Fresh Conversation Per Turn selects a new page for each logical send that needs new browser input.
 It does not create a page for tool round trips, HTTP replay, or task updates, and cannot bypass

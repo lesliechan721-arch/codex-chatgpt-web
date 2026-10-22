@@ -4,18 +4,18 @@ import { createHash, randomBytes } from "node:crypto";
 import { withTokenEstimateCache } from "../../lib/token-estimate";
 import { ContextNavigator, ContextNavigationStoppedError, type ContextNavigationUsage } from "./context-navigator";
 import { deterministicContextJson, type ContextSnapshot } from "./context-snapshot";
-import { assertContextNavigationBudget, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextBudgetProfile } from "./context-budget";
+import { assertContextNavigationBudget, contextLimits, measureContextResponse, UNLIMITED_CONTEXT_ALLOWANCE, type ContextLimitOverrides, type ContextBudgetProfile } from "./context-budget";
 import type { ContextDelivery, ContextListArgs, ContextReadArgs, ContextSearchArgs, ContextRemainingBudget, ContextBootstrapControl, ContextRequiredRead, ContextRequiredTextBatch, ContextTarget } from "./context-types";
 import { measureBootstrapRequiredCosts } from "./context-bootstrap-plan";
 import type { BrokerToolResult } from "./turn-broker";
 import { NativeOperationError } from "./native-tool-operations";
 import { contextTextReadReceipt, contextTextReadReceiptsEqual, parseContextTextReadResult, type ContextTextReadReceipt } from "./context-text-result";
 import { ContextTextCoverage } from "./context-text-coverage";
+export { CONTEXT_PROTOCOL_VERSION } from "./context-protocol";
 
 import { CONTEXT_REUSE_PROTOCOL, type ContextReusePlan, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
 import { boundedContextReuse } from "./context-reuse-lifecycle";
 
-export const CONTEXT_PROTOCOL_VERSION = 4;
 export const CONTEXT_READY_TIMEOUT_MS = 120_000;
 export const CONTEXT_PROGRESS_TIMEOUT_MS = 45_000;
 export const CONTEXT_ATTACHMENT_TIMEOUT_MS = 300_000;
@@ -192,9 +192,9 @@ export class ContextScope {
     }
     const limits = contextLimits(registration.limits);
     const supplied = registration.remainingBudget;
-    this.effectiveBudget = { tokens: supplied?.tokens ?? limits.maxTotalTokens,
+    this.effectiveBudget = { tokens: supplied?.tokens ?? UNLIMITED_CONTEXT_ALLOWANCE,
       reserved_tokens: supplied?.reserved_tokens ?? 0,
-      wire_bytes: supplied?.wire_bytes ?? limits.maxTotalWireBytes,
+      wire_bytes: supplied?.wire_bytes ?? UNLIMITED_CONTEXT_ALLOWANCE,
       reserved_wire_bytes: supplied?.reserved_wire_bytes ?? 0 };
     for (const reserves of [registration.requiredImageTokenReserves, registration.requiredImageWireReserves]) {
       for (const [id, reserve] of Object.entries(reserves ?? {})) {
@@ -266,11 +266,6 @@ export class ContextScope {
     try {
       const initial = remainingBudget();
       assertContextNavigationBudget(initial, limits);
-      // The local navigation cap counts only navigation. Model work/summary reserves
-      // belong to the shared capacity and must not be charged against this cap twice.
-      assertContextNavigationBudget({ tokens: limits.maxTotalTokens, wire_bytes: limits.maxTotalWireBytes,
-        reserved_tokens: initial.reserved_tokens! - (this.effectiveBudget.reserved_tokens ?? 0),
-        reserved_wire_bytes: initial.reserved_wire_bytes! - (this.effectiveBudget.reserved_wire_bytes ?? 0) }, limits);
     }
     catch { throw contextError("BUDGET_EXCEEDED", "The context budget cannot protect required sources, completion and bounded corrective replies"); }
     this.navigator = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose,
@@ -340,10 +335,10 @@ export class ContextScope {
     }
     const controls = this.remainingControlCost(this.controlCredits(result));
     const spentTokens = (used?.text_tokens ?? 0) + (used?.visual_token_reserve ?? 0), spentWire = used?.wire_bytes ?? 0;
-    return { tokens: Math.max(0, Math.min(budget.tokens - spentTokens, limits.maxTotalTokens - spentTokens + (budget.reserved_tokens ?? 0))),
+    return { tokens: Math.max(0, budget.tokens - spentTokens),
       reserved_tokens: (budget.reserved_tokens ?? 0) + text.tokens + retry.tokens + controls.tokens + images.reduce((sum, target) =>
         sum + (this.registration.requiredImageTokenReserves?.[target.target_id] ?? (target.visual_token_reserve ?? 0) + limits.imageMetadataTokens), 0),
-      wire_bytes: Math.max(0, Math.min(budget.wire_bytes - spentWire, limits.maxTotalWireBytes - spentWire + (budget.reserved_wire_bytes ?? 0))),
+      wire_bytes: Math.max(0, budget.wire_bytes - spentWire),
       reserved_wire_bytes: (budget.reserved_wire_bytes ?? 0) + text.wire_bytes + retry.wire_bytes + controls.wire_bytes
         + images.reduce((sum, target) => sum + this.imageWireReserve(target), 0),
       image_reads: Math.max(0, limits.maxImageReads - (used?.image_reads ?? 0)), reserved_image_reads: images.length,

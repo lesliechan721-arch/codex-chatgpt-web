@@ -54,9 +54,6 @@ export interface ContextMediaPlanInput {
   selectedImageParts: ReadonlyMap<string, CodexImageContent>;
   limits?: ContextLimitOverrides;
   availableTokens: number;
-  /** Shared navigation capacity reserved for one directory overview and the bounded error pool. */
-  reservedNavigationTokens?: number;
-  reservedNavigationWireBytes?: number;
   attachmentSlotsReserved?: number;
   attachmentBytesReserved?: number;
 }
@@ -85,7 +82,6 @@ export function planContextMedia(input: ContextMediaPlanInput): ContextMediaPlan
     let mcpCost: ContextResponseCost | undefined;
     if (fixed && target.image_bytes !== null && target.image_bytes <= limits.maxImageBytes
       && result.mcpImages < limits.maxImageReads && result.mcpImageBytes + fixed.bytes.length <= limits.maxTotalImageBytes
-      && result.requiredMcpTokens + fixed.visual_token_reserve + (input.reservedNavigationTokens ?? 0) <= limits.maxTotalTokens
       && requiredCost + fixed.visual_token_reserve <= input.availableTokens) {
       const navigator = new ContextNavigator({ scopeId: "context-media-preflight", snapshot: input.snapshot, purpose: "normal", limits,
         deliveryByTarget: { [target.target_id]: { delivery: "source_on_demand", media_route: "mcp", required: isRequired } } });
@@ -96,8 +92,6 @@ export function planContextMedia(input: ContextMediaPlanInput): ContextMediaPlan
     // Optional images need room for one complete return, without taking undelivered required reserves.
     if (mcpCost && result.mcpImages < limits.maxImageReads
       && result.mcpImageBytes + fixed!.bytes.length <= limits.maxTotalImageBytes
-      && result.mcpWireBytes + mcpCost.wire_bytes + (input.reservedNavigationWireBytes ?? 0) <= limits.maxTotalWireBytes
-      && result.requiredMcpTokens + mcpCost.total_tokens + (input.reservedNavigationTokens ?? 0) <= limits.maxTotalTokens
       && requiredCost + mcpCost.total_tokens <= input.availableTokens) {
       result.deliveryByTarget[target.target_id] = { delivery: "source_on_demand", media_route: "mcp", required: isRequired };
       result.imageResponseCosts[target.target_id] = mcpCost;

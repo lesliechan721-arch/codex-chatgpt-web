@@ -2505,7 +2505,7 @@ export class ChatGptTurnSession {
 
   isContinuityReplayOnly(): boolean { return this.continuityReplayOnly; }
 
-  /** A fenced cold-compaction source keeps responses, never pending work or delivery authority. */
+  /** A retired compaction source keeps responses, never pending work or delivery authority. */
   retainCompletedContinuityReplay(): void {
     if (!this.runtime.continuityBinding || this.isActive() || !this.hasCompletedContinuityReplay()) {
       throw continuityError("continuity_source_unproven");
@@ -3199,6 +3199,7 @@ export class ChatGptTurnSessions {
     }
     this.forgetConversationHead(source);
     source.detachConversation(conversationKey);
+    if (source.hasCompletedContinuityReplay()) source.retainCompletedContinuityReplay();
     if (!preserveFinalResponse) source.supersededError = continuityError("continuity_source_unproven", "This execution ended at a checkpoint; its summary is not an ordinary answer.");
   }
 

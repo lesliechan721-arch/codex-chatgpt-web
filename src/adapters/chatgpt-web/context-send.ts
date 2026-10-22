@@ -118,8 +118,10 @@ export class ContextSend {
       pageGeneration: this.pageGeneration, planId: id, bodyDigest: plan.bodyDigest,
       contextFormat: plan.compiled.contextFormat ?? "legacy-json",
       manifestDigest: plan.manifestDigest ?? plan.bodyDigest,
+      // Work capacity is protected in the active scope, not retained as used input.
+      // The completed answer is accounted separately by the owning session.
       pageTokens: plan.costs.retainedTokens + plan.costs.promptTokens + navigationReserve
-        + plan.costs.attachmentVisualTokens + plan.costs.workReserveTokens,
+        + plan.costs.attachmentVisualTokens,
       navigationReservedTokens: navigationReserve,
       externalizedTargetIds: [...new Set([...plan.externalizedTargetIds,
         ...Object.entries(routes).filter(([, route]) => route.media_route === "mcp").map(([target]) => target)])],

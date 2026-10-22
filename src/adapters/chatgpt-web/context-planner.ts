@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, resolveChatGptWebMessageTokenBudget, resolveChatGptWebTransportLimits } from "../../chatgpt-web-models";
 import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import type { CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
-import { contextErrorReserve, contextLimits, contextBudgetProfileLimits, measureContextResponse, type ContextBudgetProfile, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
+import { contextErrorReserve, contextLimits, contextBudgetProfileLimits, measureContextResponse, UNLIMITED_CONTEXT_ALLOWANCE, type ContextBudgetProfile, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
 import { ContextDeliveryPlanningError, planContextMedia, type ContextMediaPlan } from "./context-media-plan";
 import { CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage,
@@ -20,6 +20,7 @@ import { measureBootstrapRequiredCosts } from "./context-bootstrap-plan";
 import { contextBootstrapRequestMessageIndices } from "./context-bootstrap-request";
 import type { ContextBootstrapInlineRequest } from "./context-prompt";
 import { resolveLocalCodexAppName } from "./execution-protocol";
+import { CONTEXT_PROTOCOL_VERSION } from "./context-protocol";
 
 /** A field must save this many estimated encoded bytes in its current presentation before full compilation. */
 export const CONTEXT_MIN_EXTERNALIZE_BYTES = 1_024;
@@ -150,12 +151,10 @@ function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits,
       throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "Context directory admission exceeded its bounded processing deadline");
     }
   };
-  // These instances measure complete discovery returns. Actual admission below uses
-  // the selected local caps; measurement must not turn a too-small total into an
-  // error reply whose smaller cost could be mistaken for the directory's cost.
-  const measurementLimits = { ...limits, maxTotalTokens: Number.MAX_SAFE_INTEGER, maxTotalWireBytes: Number.MAX_SAFE_INTEGER };
+  // Measure complete discovery returns under the selected per-response limits.
+  // Shared page capacity is checked after the complete plan has been measured.
   const costs = [0, requiredImages].map(deliveredImages => {
-    const nav = new ContextNavigator({ scopeId: "context-discovery-preflight", snapshot, purpose: "normal", limits: measurementLimits, deliveryByTarget });
+    const nav = new ContextNavigator({ scopeId: "context-discovery-preflight", snapshot, purpose: "normal", limits, deliveryByTarget });
     const response = nav.list({ context_id: snapshot.context_id, view: "overview" }, {
       context_ready: deliveredImages === requiredImages, required_images: requiredImages, delivered_images: deliveredImages,
       text_ready: true, images_ready: deliveredImages === requiredImages,
@@ -171,7 +170,7 @@ function discoveryResponseCost(snapshot: ContextSnapshot, limits: ContextLimits,
   const overviewCost = { ...result };
   const required = new Set(snapshot.targets.filter(target => target.kind === "image"
     && deliveryByTarget[target.target_id]?.required && deliveryByTarget[target.target_id]?.media_route === "mcp").map(target => target.target_id));
-  const nav = new ContextNavigator({ scopeId: "context-directory-preflight", snapshot, purpose: "normal", limits: measurementLimits, deliveryByTarget });
+  const nav = new ContextNavigator({ scopeId: "context-directory-preflight", snapshot, purpose: "normal", limits, deliveryByTarget });
   let cursor: string | undefined;
   do {
     checkDeadline();
@@ -592,7 +591,7 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
         deliveryByTarget[aggregate.target_id] = { delivery: inlineReusePayload ? "inline" : "source_required", required: !inlineReusePayload };
       }
       const manifestBasis = { context_id: snapshot.context_id, plan_id: planId, budget_profile: budgetProfile, limits,
-        context_protocol: 4, manifest_version: 3, read_arguments: "reads-array", text_read_format: "context-text-batch-v1",
+        context_protocol: CONTEXT_PROTOCOL_VERSION, manifest_version: 3, read_arguments: "reads-array", text_read_format: "context-text-batch-v1",
         targets: snapshot.targets.map(target => ({ ...target, ...deliveryByTarget[target.target_id] })) };
       let manifestDigest = hash(deterministicContextJson(manifestBasis));
       let required = measureBootstrapRequiredCosts({ snapshot, planId, manifestDigest, limits, deliveryByTarget,
@@ -634,24 +633,18 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       const routed = planContextMedia({ snapshot: source, selectedTargetIds: selected, selectedImageParts: imageParts, limits,
         availableTokens: Math.max(0, contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - retained - work - costs.promptTokens
           - required.text.total_tokens - required.discovery.total_tokens - errorReserve.tokens - required.retry.tokens),
-        reservedNavigationTokens: required.text.total_tokens + required.discovery.total_tokens + errorReserve.tokens + required.retry.tokens,
-        reservedNavigationWireBytes: required.text.wire_bytes + required.discovery.wire_bytes + errorReserve.wire_bytes + required.retry.wire_bytes,
         attachmentSlotsReserved: prepared.skillFiles?.length ?? 0,
         attachmentBytesReserved: (prepared.skillFiles ?? []).reduce((sum, file) => sum + Buffer.byteLength(file.text), 0) });
       if (deterministicContextJson(routed.deliveryByTarget) !== deterministicContextJson(media.deliveryByTarget)) {
         media = routed; continue;
       }
       assertCandidateCapacity(compiled, costs);
-      if (costs.requiredNavigationWireBytes > limits.maxTotalWireBytes
-        || costs.requiredMcpTokens + costs.discoveryReserveTokens + costs.errorReserveTokens + required.retry.tokens > limits.maxTotalTokens) {
-        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The complete required batches, controls, recovery and corrective replies exceed the navigation budget", { limit: "required_reads", costs });
-      }
       if (compiled.images.length !== media.attachmentCount || compiled.images.length + (compiled.skillFiles?.length ?? 0) > 10) {
         throw new ContextDeliveryPlanningError("CONTEXT_IMAGE_UNAVAILABLE", "The short bootstrap does not preserve its selected image attachment routes");
       }
       const registration: ContextPlanRegistration = { snapshot, planId, manifestDigest, startupProtocol: "context-bootstrap-v1", deliveryByTarget, limits, budgetProfile,
         ...(reuse ? { reuse } : {}),
-        remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: limits.maxTotalWireBytes, reserved_wire_bytes: 0 },
+        remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE, reserved_wire_bytes: 0 },
         requiredImageTokenReserves: media.requiredImageTokenReserves, requiredImageWireReserves: media.requiredImageWireReserves,
         requiredTextBatches: required.batches, requiredControlReserve: required.control, requiredReturnRetryReserve: required.retry };
       return { snapshot, compiled, projected, navigationEnabled: true, externalizedTargetIds: [...externalized, ...added],
@@ -697,7 +690,6 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
     let discovery = initialDiscovery;
     const available = contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - retained - work - discovery.total_tokens - errorReserve.tokens;
     const mediaInput = () => ({ snapshot: input.snapshot, selectedTargetIds: selected, selectedImageParts: imageParts, limits,
-      reservedNavigationTokens: discovery.total_tokens + errorReserve.tokens, reservedNavigationWireBytes: discovery.wire_bytes + errorReserve.wire_bytes,
       attachmentSlotsReserved: original.skillFiles?.length ?? 0, attachmentBytesReserved: (original.skillFiles ?? []).reduce((sum, file) => sum + Buffer.byteLength(file.text), 0) });
     let media = planContextMedia({ ...mediaInput(), availableTokens: Math.max(0, available) });
     let manifestDigest = "";
@@ -734,10 +726,6 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       discovery = { wire_bytes: Math.max(discovery.wire_bytes, measured.wire_bytes),
         text_tokens: Math.max(discovery.text_tokens, measured.text_tokens), visual_tokens: 0,
         total_tokens: Math.max(discovery.total_tokens, measured.total_tokens) };
-      if (discovery.wire_bytes + errorReserve.wire_bytes > limits.maxTotalWireBytes
-        || discovery.total_tokens + errorReserve.tokens > limits.maxTotalTokens) {
-        throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The context budget cannot carry its directory overview, useful entries and bounded error reserve");
-      }
       const routed = planContextMedia({ ...mediaInput(), availableTokens: Math.max(0, contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS
         - retained - work - discovery.total_tokens - errorReserve.tokens - promptTokens(chosen.compiled)) });
       if (deterministicContextJson(routed.deliveryByTarget) === deterministicContextJson(media.deliveryByTarget)) break;
@@ -747,15 +735,12 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
     const withoutEntry = compileProjected(externalized, false).compiled;
     const costs = baseCosts(chosen.compiled, media, promptBytes(chosen.compiled) - promptBytes(withoutEntry), discovery);
     assertCandidateCapacity(chosen.compiled, costs);
-    if (costs.requiredNavigationWireBytes > limits.maxTotalWireBytes || media.requiredMcpTokens + discovery.total_tokens + errorReserve.tokens > limits.maxTotalTokens) {
-      throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "The required context responses and bounded error reserve exceed the navigation budget", { costs });
-    }
     if (chosen.compiled.images.length !== media.attachmentCount || chosen.compiled.images.length + (chosen.compiled.skillFiles?.length ?? 0) > 10) {
       throw new ContextDeliveryPlanningError("CONTEXT_IMAGE_UNAVAILABLE", "The compiled attachment list does not preserve the selected image routes");
     }
     const deliveryByTarget = deliveryMap();
     const registration: ContextPlanRegistration = { snapshot: input.snapshot, planId, manifestDigest,
-      deliveryByTarget, limits, remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: limits.maxTotalWireBytes, reserved_wire_bytes: 0 },
+      deliveryByTarget, limits, remainingBudget: { tokens: costs.remainingNavigationTokens, reserved_tokens: work, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE, reserved_wire_bytes: 0 },
       requiredImageTokenReserves: media.requiredImageTokenReserves, requiredImageWireReserves: media.requiredImageWireReserves };
     return { snapshot: input.snapshot, ...chosen, navigationEnabled: true, externalizedTargetIds: [...externalized], registration, planId, manifestDigest,
       bodyDigest: hash(transportTexts(chosen.compiled).join("\n")), costs, limits };

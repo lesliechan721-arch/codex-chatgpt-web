@@ -374,7 +374,7 @@ Missing or invalid sources fail the turn. Helpers
 without `task-output-ack-v3` do not negotiate hot updates for a new execution.
 Check for `codex_tool_wait`, `operation_id`, `task_revision`, `codex_task_update_ack`, and all three
 context tools with their mutually exclusive credential schemas on the selected connector before
-using navigation or dispatching work. The private owner must advertise `contextProtocol: 4`
+using navigation or dispatching work. The private owner must advertise `contextProtocol: 5`
 and `context-bootstrap-v1` for short-start plans.
 An installed local `tools/list` proves local runtime support, not ChatGPT's cached remote schema.
 Optional Verify runtime requires six successful context transport returns over fixed small text,

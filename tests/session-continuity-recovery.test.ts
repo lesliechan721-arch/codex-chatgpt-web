@@ -1259,7 +1259,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) test
   expect(f.submissions).toHaveLength(previousSubmissions + 1);
 }, 30_000);
 
-for (const ordinaryRounds of [1, 2]) test(`review repair1: healthy checkpoint keeps its page only while its independent source and summary budget fits (${ordinaryRounds})`, async () => {
+for (const ordinaryRounds of [1, 2]) test(`healthy checkpoints retain their page across short continuations without accumulating work reserves (${ordinaryRounds})`, async () => {
   const f = fixture();
   const instruction = "Repeat the same continuity instruction.";
   const first = f.request(instruction);
@@ -1292,22 +1292,14 @@ for (const ordinaryRounds of [1, 2]) test(`review repair1: healthy checkpoint ke
   const checkpointEvents = await f.run(secondCompact);
   expect(checkpointEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
   const secondPage = f.submissions.at(-1)!;
-  expect(secondPage.reused).toBe(ordinaryRounds === 1);
-  if (ordinaryRounds === 1) {
-    expect(secondPage.key).toBe(physicalKey);
-  } else {
-    expect(secondPage.key).not.toBe(physicalKey);
-    expect(secondPage.claim.expected).toBeUndefined();
-    expect(secondPage.prompt).toContain("codex_context_navigation_json");
-    const turn = f.automatic.mock.calls.at(-1)![0];
-    expect(turn).toMatchObject({ compaction: true, nativeConnector: true, capabilities: { localToolsEnabled: false } });
-  }
+  expect(secondPage.reused).toBe(true);
+  expect(secondPage.key).toBe(physicalKey);
   const after = store.get(thread)!;
   const checkpoint = Object.values(after.checkpoints).find(value => value.targetHistoryRevision === 2)!;
   expect(checkpoint.sourceLogicalWorkId).toBe(sourceWork.logicalWorkId);
   expect(checkpoint.acceptedTaskRevision).toBe(sourceWork.acceptedTaskRevision);
   expect(after.historyRevision).toBe(2);
-  expect(after.epoch).toBe(before.epoch + (ordinaryRounds === 1 ? 0 : 1));
+  expect(after.epoch).toBe(before.epoch);
   const compactWork = after.works[`compaction:${checkpoint.compactionTargetId}`]!;
   expect(compactWork.attempts).toHaveLength(1);
   expect(compactWork.state).toBe("completed");

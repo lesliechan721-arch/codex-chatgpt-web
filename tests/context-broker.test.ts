@@ -227,7 +227,7 @@ test("overview refusals preserve complete required-image token and wire reserves
   } finally { scope.retire(); }
 });
 
-test("local navigation caps protect required images without charging shared work twice", () => {
+test("shared context capacity protects required images without charging work twice", () => {
   const registration = plan("local-required-reserve");
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("local-cost-probe", registration, "normal", () => {}, () => {});
@@ -237,9 +237,9 @@ test("local navigation caps protect required images without charging shared work
   probe.finish(sampled.receiptId, true); probe.retire();
   const errors = contextErrorReserve();
   const scope = new ContextScope("local-required-reserve", { ...registration,
-    limits: { maxTotalTokens: cost.total_tokens + errors.tokens + 1, maxTotalWireBytes: cost.wire_bytes + errors.wire_bytes + 1 },
     requiredImageTokenReserves: { [target.target_id]: cost.total_tokens }, requiredImageWireReserves: { [target.target_id]: cost.wire_bytes },
-    remainingBudget: { tokens: 100_000, reserved_tokens: 20_000, wire_bytes: 1_000_000, reserved_wire_bytes: 20_000 } }, "normal", () => {}, error => { throw error; });
+    remainingBudget: { tokens: cost.total_tokens + errors.tokens + 20_001, reserved_tokens: 20_000,
+      wire_bytes: cost.wire_bytes + errors.wire_bytes + 20_001, reserved_wire_bytes: 20_000 } }, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
     const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });

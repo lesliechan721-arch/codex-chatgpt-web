@@ -24,9 +24,8 @@ function plan(manual: boolean, inline: boolean, baseline?: ContextReuseBaseline,
       maxComposerCodePoints: inline ? 500_000 : 8000 }, turnToken: `turn_${"7".repeat(32)}`,
     contextToolsAvailable: true, contextBootstrapAvailable: true, contextReuseAvailable: true, reuseBaseline: baseline,
     compileOptions: manual ? { manualControl: true } : {}, experimentalBiggerContext: true,
-    // The paged cases isolate reuse metadata capacity from the independent navigation ceiling.
+    // The paged cases isolate reuse metadata capacity from shared context capacity.
     budget: { retainedTokens, ...(!inline ? { contextWindowTokens: 1_000_000 } : {}) },
-    ...(!inline ? { limits: { maxTotalTokens: 1_000_000 } } : {}),
   });
 }
 

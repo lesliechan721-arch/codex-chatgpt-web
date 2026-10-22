@@ -602,8 +602,7 @@ test("Bigger Context can route required images when the old attachment reserve p
   expect(entry(result).required_images).toBe(12);
   expect(result.costs.originalPromptTransport).toBe("ordinary_capacity_baseline");
   expect(result.costs.requiredMcpTokens).toBeGreaterThan(0);
-  expect(result.costs.requiredMcpTokens + result.costs.discoveryReserveTokens + result.costs.errorReserveTokens)
-    .toBeLessThanOrEqual(result.limits.maxTotalTokens);
+  expect(result.costs.requiredTotalTokens).toBeLessThanOrEqual(result.costs.contextWindowTokens);
 });
 
 test("trusted delegation and summary tool-shaped sources keep their original instruction contract", () => {
@@ -645,7 +644,7 @@ test("required-media reserve includes the exact complete MCP response and retain
     + measured.total_tokens + result.costs.discoveryReserveTokens + result.costs.errorReserveTokens);
 });
 
-test("image routes reserve the real directory and bounded errors before publication", () => {
+test("image routes reserve directory and errors and respect per-image response limits", () => {
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: paddedPng(5000) }], timestamp: 1 }]);
   const snapshot = createContextSnapshot(canonical), normal = plan(canonical, { snapshot });
   const required = normal.costs.requiredMcpWireBytes;
@@ -654,11 +653,8 @@ test("image routes reserve the real directory and bounded errors before publicat
   expect(directory).toBeGreaterThan(0);
   expect(normal.costs.errorReserveWireBytes).toBe(errors.wire_bytes);
   expect(normal.costs.requiredNavigationWireBytes).toBe(required + directory + errors.wire_bytes);
-  const byWire = plan(canonical, { snapshot, limits: { maxTotalWireBytes: required + directory + errors.wire_bytes - 1 } });
-  const byTokens = plan(canonical, { snapshot, limits: { maxTotalTokens:
-    // Unfiltered single-target pages include signed cursors. Their token count can
-    // vary between planners, so keep a clear margin below the MCP route budget.
-    normal.costs.requiredMcpTokens + normal.costs.discoveryReserveTokens + errors.tokens - 128 } });
+  const byWire = plan(canonical, { snapshot, limits: { imageWireBytes: required - 1 } });
+  const byTokens = plan(canonical, { snapshot, limits: { imageMetadataTokens: 128 } });
   for (const result of [byWire, byTokens]) {
     expect(result.compiled.images).toHaveLength(1);
     expect(result.costs.requiredMcpTokens).toBe(0);
@@ -672,14 +668,11 @@ test("image routes reserve the real directory and bounded errors before publicat
   }
 });
 
-test("exact directory and required-image reserves survive a corrective reply and keep model work separate", () => {
+test("directory and required-image reserves survive a corrective reply and keep model work separate", () => {
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: png, detail: "original" }], timestamp: 1 }]);
-  const snapshot = createContextSnapshot(canonical), normal = plan(canonical, { snapshot });
-  const limits = { maxTotalWireBytes: normal.costs.requiredNavigationWireBytes,
-    maxTotalTokens: normal.costs.requiredMcpTokens + normal.costs.discoveryReserveTokens + normal.costs.errorReserveTokens };
-  const result = plan(canonical, { snapshot, limits, budget: { workReserveTokens: 6000 } });
+  const snapshot = createContextSnapshot(canonical);
+  const result = plan(canonical, { snapshot, budget: { workReserveTokens: 6000 } });
   expect(result.compiled.images).toHaveLength(0);
-  expect(result.registration!.remainingBudget!.wire_bytes).toBe(limits.maxTotalWireBytes);
   const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
@@ -695,19 +688,17 @@ test("exact directory and required-image reserves survive a corrective reply and
     scope.finish(returned.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
     const used = scope.navigator.usage();
-    expect(used.wire_bytes).toBeLessThanOrEqual(limits.maxTotalWireBytes);
-    expect(used.text_tokens + used.visual_token_reserve).toBeLessThanOrEqual(limits.maxTotalTokens);
+    expect(used.wire_bytes).toBeLessThanOrEqual(result.costs.requiredNavigationWireBytes);
     expect(result.registration!.remainingBudget!.tokens - used.text_tokens - used.visual_token_reserve).toBeGreaterThanOrEqual(6000);
   } finally { scope.retire(); }
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} required image discovery reserves every filtered page without extra tokens`, () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} required image discovery reserves every filtered page`, () => {
   const canonical = request([{ role: "user", content: Array.from({ length: 6 }, () => ({ type: "image" as const, imageUrl: png })), timestamp: 1 }]);
   const compileOptions = manual ? { manualControl: true as const } : {};
   const discoveryCapabilities = { ...capabilities, proAvailable: true };
-  const snapshot = createContextSnapshot(canonical), normal = plan(canonical, { snapshot, compileOptions, capabilities: discoveryCapabilities, limits: { listEntries: 1 } });
-  const result = plan(canonical, { snapshot, compileOptions, capabilities: discoveryCapabilities, limits: { listEntries: 1, maxTotalWireBytes: normal.costs.requiredNavigationWireBytes,
-    maxTotalTokens: normal.costs.requiredMcpTokens + normal.costs.discoveryReserveTokens + normal.costs.errorReserveTokens } });
+  const snapshot = createContextSnapshot(canonical);
+  const result = plan(canonical, { snapshot, compileOptions, capabilities: discoveryCapabilities, limits: { listEntries: 1 } });
   expect(result.compiled.images).toHaveLength(0);
   const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
   try {
@@ -730,14 +721,14 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       expect(returned.result.isError).not.toBe(true); scope.finish(returned.receiptId, true);
     }
     expect(scope.status().context_ready).toBe(true);
-    expect(scope.navigator.usage().wire_bytes + result.costs.errorReserveWireBytes).toBeLessThanOrEqual(result.limits.maxTotalWireBytes);
+    expect(scope.navigator.usage().wire_bytes + result.costs.errorReserveWireBytes).toBeLessThanOrEqual(result.costs.requiredNavigationWireBytes);
   } finally { scope.retire(); }
 });
 
 test("an undeliverable directory fails required navigation while an optional optimization keeps the fast path", () => {
   const canonical = logRequest("old readable history"), snapshot = createContextSnapshot(canonical);
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
-  const limits = { maxTotalWireBytes: contextErrorReserve().wire_bytes };
+  const limits = { listBytes: 512, listTokens: 128 };
   expect(() => plan(canonical, { snapshot, candidate, limits })).toThrow("directory overview");
   const small = logRequest("x".repeat(1800));
   const unchanged = plan(small, { limits });
@@ -772,14 +763,13 @@ test("normal directory admission checks each target without reserving full trave
   ] });
   const snapshot = createContextSnapshot(canonical);
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
-  const limits = { maxTotalTokens: 10_000, maxTotalWireBytes: 40_000 };
-  const result = plan(canonical, { snapshot, candidate, limits });
+  const result = plan(canonical, { snapshot, candidate, budget: { contextWindowTokens: 25_000 } });
   expect(result.navigationEnabled).toBe(true);
-  expect(result.costs.discoveryReserveTokens).toBeLessThan(limits.maxTotalTokens);
+  expect(result.costs.discoveryReserveTokens).toBeLessThan(10_000);
   let now = 0;
   const clock = spyOn(performance, "now").mockImplementation(() => now += 2);
   try {
-    expect(() => plan(canonical, { snapshot, candidate, limits: { ...limits, totalProcessingMs: 1 } })).toThrow("processing deadline");
+    expect(() => plan(canonical, { snapshot, candidate, limits: { totalProcessingMs: 1 } })).toThrow("processing deadline");
   } finally { clock.mockRestore(); }
 });
 

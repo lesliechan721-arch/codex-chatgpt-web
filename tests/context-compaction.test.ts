@@ -133,7 +133,7 @@ for (const bigger of [false, true]) test(`compaction protects platform capacity 
   const first = new ContextSend(parsed, broker, capabilities, "capacity-page");
   const baseline = await first.prepare(parsed, token, options);
   const pageWindow = baseline.costs.contextWindowTokens;
-  const retained = pageWindow - 32_000 - baseline.costs.promptTokens - baseline.costs.workReserveTokens;
+  const retained = pageWindow - 32_000 - baseline.costs.promptTokens;
   const selected = await first.prepare(parsed, token, options, retained);
   await first.select(token, selected); await first.sent();
   expect(first.coverage.pageTokenReserve()).toBe(pageWindow - 32_000);
@@ -155,13 +155,13 @@ for (const bigger of [false, true]) test(`compaction protects platform capacity 
     const second = new ContextSend(parsed, broker, capabilities, "capacity-page", first.coverage);
     const next = await second.prepare(parsed, token, options, first.coverage.pageTokenReserve());
     await second.select(token, next); await second.sent();
-    expect(second.coverage.pageTokenReserve()).toBe(first.coverage.pageTokenReserve() + next.costs.promptTokens + next.costs.workReserveTokens);
+    expect(second.coverage.pageTokenReserve()).toBe(first.coverage.pageTokenReserve() + next.costs.promptTokens);
     expect(compactionAvailableTokens(parsed, selectedCapabilities, second.coverage.pageTokenReserve()))
       .toBe(pageWindow - second.coverage.pageTokenReserve() - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
     const boundary = new ContextSend(parsed, broker, capabilities, "capacity-page", second.coverage);
     const nearLimit = await boundary.prepare(parsed, token, options,
-      pageWindow - 18_000 - baseline.costs.promptTokens - baseline.costs.workReserveTokens);
-    expect(nearLimit.costs.requiredTotalTokens).toBe(pageWindow - 18_000 + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
+      pageWindow - 18_000 - baseline.costs.promptTokens);
+    expect(nearLimit.costs.requiredTotalTokens).toBe(pageWindow - 18_000 + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + baseline.costs.workReserveTokens);
     await boundary.select(token, nearLimit); await boundary.sent();
     const remaining = compactionAvailableTokens(parsed, selectedCapabilities, boundary.coverage.pageTokenReserve());
     expect(remaining).toBe(9_808);
@@ -206,7 +206,7 @@ test("compaction rejects unavailable images and inadequate reading capacity befo
   expect(() => captureCompactionSource(parsed, ledger)).toThrow("fixed readable bytes");
   await expect(assertCompactionReadable(createContextSnapshot(input()), 8_192)).rejects.toThrow("reading allowance");
   await expect(assertCompactionReadable(createContextSnapshot(input()), 8_192 + 384)).rejects.toThrow("overview");
-  await expect(assertCompactionReadable(createContextSnapshot(input()), 20_000, { maxTotalWireBytes: 1_536 })).rejects.toThrow("overview");
+  await expect(assertCompactionReadable(createContextSnapshot(input()), 20_000, { listBytes: 512, listTokens: 128 })).rejects.toThrow("overview");
 });
 
 for (const terminal of [false, true]) test(`compaction rejects an oversized later directory entry before publishing control (terminal=${terminal})`, async () => {

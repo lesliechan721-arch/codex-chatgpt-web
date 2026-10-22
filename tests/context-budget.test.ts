@@ -42,7 +42,7 @@ describe("complete context response budgets", () => {
 
   test("trusted profiles freeze the published expanded and conservative ceilings", () => {
     expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 8000, listBytes: 49152, listTokens: 6000, listEntries: 50,
-      searchHits: 10, searchBytes: 12288, searchTokens: 1500, maxTotalTokens: 96000, maxTotalWireBytes: 64 * 1024 * 1024 });
+      searchHits: 10, searchBytes: 12288, searchTokens: 1500 });
     const configured = contextBudgetProfileLimits("conservative"), frozen = contextLimits(configured);
     expect(frozen).toMatchObject({ readBytes: 24576, readTokens: 2500, listBytes: 12288, listTokens: 1500, listEntries: 20 });
     configured.readTokens = 8000;
@@ -250,7 +250,7 @@ describe("complete context response budgets", () => {
 
   test("single-target preflight uses real response limits without charging full-source cumulative reads", () => {
     const snapshot = snapshotOf([{ role: "user", content: "汉😀".repeat(3000) }]);
-    const navigator = new ContextNavigator({ scopeId: "prepare", snapshot, purpose: "compaction", limits: { readBytes: 5000, readTokens: 1800, maxTotalTokens: 1000 } });
+    const navigator = new ContextNavigator({ scopeId: "prepare", snapshot, purpose: "compaction", limits: { readBytes: 5000, readTokens: 1800 } });
     const args = { context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] }, before = navigator.usage();
     const first = navigator.preflightRead(args);
     expect(first.isError).not.toBe(true); expect(measureContextResponse(first).wire_bytes).toBeLessThanOrEqual(5000);

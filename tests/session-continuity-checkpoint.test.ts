@@ -448,7 +448,11 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
   await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
   const accepted = await next;
   const unacceptedCall = source.outstanding()[0]!;
-  expect(await compactCurrent(result, "Next continuation result.")).toBe(summary);
+  // Reclamation exercises a cold handoff with actual delivered content. The short
+  // variant exercises same-page retirement without accumulating unused reserves.
+  const nextOutput = "Next continuation result.\n".repeat(reclamation ? 2_000 : 1);
+  expect(await compactCurrent(result, nextOutput)).toBe(summary);
+  expect(f.submissions.at(-1)!.reused).toBe(!reclamation);
   const submissions = f.submissions.length;
   const results = f.controls.toolResults.length;
   const retry = structuredClone(result);

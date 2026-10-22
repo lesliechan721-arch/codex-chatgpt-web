@@ -33,7 +33,7 @@ export function measureBootstrapRequiredCosts(input: {
     && (!target.read_ref || target.source_completeness !== "complete")) throw new ContextDeliveryPlanningError(
     "CONTEXT_MAPPING_UNPROVEN", "A required text source is not complete and readable", { target_id: target.target_id });
   const options = { scopeId: "context-bootstrap-preflight", snapshot, purpose: "normal" as const, deliveryByTarget,
-    limits: { ...limits, maxTotalTokens: Number.MAX_SAFE_INTEGER, maxTotalWireBytes: Number.MAX_SAFE_INTEGER } };
+    limits };
   const bootstrap = { planId: input.planId, manifestDigest: input.manifestDigest, ...(input.reuse ? { reuse: input.reuse } : {}) };
   let batches: ContextRequiredTextBatch[];
   try { batches = new ContextNavigator({ ...options, bootstrap }).preflightRequiredTextBatches(); }
