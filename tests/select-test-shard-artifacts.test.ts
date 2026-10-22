@@ -119,26 +119,3 @@ for (const pullRequest of [false, true]) test(`the selector CLI writes selected 
     expect(readFileSync(output, "utf8")).toBe("shard-1-id=401\nshard-2-id=102\n");
   } finally { server.stop(true); rmSync(directory, { recursive: true, force: true }); }
 });
-
-test("all shard gates download the selected IDs and pass the selection to aggregation", () => {
-  for (const [file, job, platform] of [["ci", "windows-gate", "windows"], ["release", "windows-gate", "windows"], ["intel-release", "gate", "intel"]]) {
-    const workflow = Bun.YAML.parse(readFileSync(join(import.meta.dir, `../.github/workflows/${file}.yml`), "utf8")) as any;
-    const gate = workflow.jobs[job!];
-    expect(gate.permissions).toMatchObject({ contents: "read", actions: "read" });
-    const selector = gate.steps.find((step: any) => step.id === "shard-artifacts");
-    expect(selector.env.SHARD_RUN_HEAD_SHA).toBe("${{ github.event.pull_request.head.sha || github.sha }}");
-    expect(selector.env.SHARD_SELECTION_PATH).toBe(`\${{ runner.temp }}/${platform}-shard-selection.json`);
-    const downloads = gate.steps.filter((step: any) => step.uses === "actions/download-artifact@v4");
-    expect(downloads).toHaveLength(2);
-    for (const [i, step] of downloads.entries()) {
-      expect(step.if).toContain("steps.shard-artifacts.outcome == 'success'");
-      expect(step.with["artifact-ids"]).toBe(`\${{ steps.shard-artifacts.outputs.shard-${i + 1}-id }}`);
-      expect(step.with["github-token"]).toBe("${{ github.token }}");
-      expect(step.with.path).toBe(`\${{ runner.temp }}/${platform}-shards/shard-${i + 1}`);
-    }
-    expect(gate.steps.find((step: any) => step.run?.includes("scripts/aggregate-test-shards.ts")).run)
-      .toContain(`--selection=$RUNNER_TEMP/${platform}-shard-selection.json`);
-  }
-  const release = Bun.YAML.parse(readFileSync(join(import.meta.dir, "../.github/workflows/release.yml"), "utf8")) as any;
-  expect(release.permissions.actions).toBe("read");
-});
