@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   codex-model-gate:
@@ -195,6 +196,9 @@ jobs:
     if: always()
     needs: [build, windows-test-shard]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     env:
       WINDOWS_SHARDS_RESULT: ${{ needs.windows-test-shard.result }}
       WINDOWS_PACKAGE_RESULT: ${{ needs.build.result }}
@@ -209,29 +213,45 @@ jobs:
       - name: Check complete Windows job states
         run: |
           [[ "$WINDOWS_SHARDS_RESULT" == 'success' && "$WINDOWS_PACKAGE_RESULT" == 'success' ]]
-      - name: Download exact shard 1 evidence
+      - name: Select reports from effective shard attempts
+        id: shard-artifacts
         if: always()
+        run: bun run scripts/select-test-shard-artifacts.ts
+        env:
+          SHARD_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          SHARD_JOB_NAME: Windows server tests
+          SHARD_ARTIFACT_PREFIX: test-performance-windows-latest-workers-${{ env.CGW_TEST_WORKERS }}
+          SHARD_SELECTION_PATH: ${{ runner.temp }}/windows-shard-selection.json
+      - name: Download selected shard 1 evidence
+        if: always() && steps.shard-artifacts.outcome == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: test-performance-windows-latest-workers-${{ env.CGW_TEST_WORKERS }}-shard-1-of-2-attempt-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.shard-artifacts.outputs.shard-1-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/windows-shards/shard-1
-      - name: Download exact shard 2 evidence
-        if: always()
+      - name: Download selected shard 2 evidence
+        if: always() && steps.shard-artifacts.outcome == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: test-performance-windows-latest-workers-${{ env.CGW_TEST_WORKERS }}-shard-2-of-2-attempt-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.shard-artifacts.outputs.shard-2-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/windows-shards/shard-2
       - name: Verify shard provenance and complete coverage
         if: always()
         run: |
           bun -e 'import {writeFileSync} from "node:fs"; writeFileSync(process.env.RUNNER_TEMP + "/windows-shard-jobs.json", JSON.stringify({shard1:process.env.WINDOWS_SHARDS_RESULT,shard2:process.env.WINDOWS_SHARDS_RESULT,package:process.env.WINDOWS_PACKAGE_RESULT}));'
-          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/windows-shards" "--job-results=$RUNNER_TEMP/windows-shard-jobs.json" "--output=$RUNNER_TEMP/windows-shard-aggregate.json" --skip-policy=.github/windows-test-skips.json --mode=timing
+          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/windows-shards" "--job-results=$RUNNER_TEMP/windows-shard-jobs.json" "--selection=$RUNNER_TEMP/windows-shard-selection.json" "--output=$RUNNER_TEMP/windows-shard-aggregate.json" --skip-policy=.github/windows-test-skips.json --mode=timing
       - name: Upload independent Windows aggregate
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-shard-aggregate-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-shard-aggregate.json
+          path: |
+            ${{ runner.temp }}/windows-shard-aggregate.json
+            ${{ runner.temp }}/windows-shard-selection.json
           if-no-files-found: warn
 
   publish:

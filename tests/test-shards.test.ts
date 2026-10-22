@@ -92,6 +92,40 @@ test("a complete independent two-job result is the only report that claims full-
   expect(aggregateShardEvidence(fixture).success).toBe(true);
 });
 
+test("Windows and Intel gates accept selected mixed attempts and bind verify to shard 1", () => {
+  for (const platform of ["win32", "darwin"]) for (const attempts of [["2", "1"], ["1", "2"], ["1", "1"]]) {
+    const fixture = gateFixture("timing");
+    fixture.expected.platform = platform;
+    fixture.selection = { version: 1, repository: "owner/repo", runId: "42", revision, runHeadRevision: "f".repeat(40), gateAttempt: "2",
+      shards: attempts.map((attempt, i) => ({ index: i + 1, attempt, jobId: i + 10, artifactId: i + 20,
+        artifactName: `test-performance-shard-${i + 1}-of-2-attempt-${attempt}` })) };
+    for (const [i, shard] of fixture.shards.entries()) {
+      shard.summary.platform = platform;
+      shard.summary.workflowRun = { ...shard.summary.workflowRun, attempt: attempts[i] };
+    }
+    fixture.verify.workflowRun = { ...fixture.verify.workflowRun, attempt: attempts[0] };
+    expect(aggregateShardEvidence(fixture)).toMatchObject({ success: true, reasons: [], selection: fixture.selection });
+    const altered = structuredClone(fixture);
+    altered.verify.workflowRun.attempt = attempts[0] === "1" ? "2" : "1";
+    expect(aggregateShardEvidence(altered).reasons).toContain("invalid-or-missing-verify-summary");
+    for (const change of [
+      (input: ShardAggregationInput) => { input.shards[1]!.summary.workflowRun.attempt = "3"; },
+      (input: ShardAggregationInput) => { input.shards[1]!.summary.workflowRun.id = "41"; },
+      (input: ShardAggregationInput) => { input.selection!.shards[0]!.attempt = "3"; },
+      (input: ShardAggregationInput) => { input.selection!.runId = "41"; },
+      (input: ShardAggregationInput) => { input.selection!.revision = "f".repeat(40); },
+      (input: ShardAggregationInput) => { input.shards[1]!.summary.revision = "f".repeat(40); },
+      (input: ShardAggregationInput) => { input.selection!.runHeadRevision = "invalid"; },
+      (input: ShardAggregationInput) => { input.selection!.gateAttempt = "1"; },
+      (input: ShardAggregationInput) => { input.selection!.shards.pop(); },
+      (input: ShardAggregationInput) => { input.jobResults.shard2 = "failure"; },
+    ]) {
+      const invalid = structuredClone(fixture); change(invalid);
+      expect(aggregateShardEvidence(invalid).success).toBe(false);
+    }
+  }
+});
+
 test("Intel aggregation accepts macOS evidence and rejects Windows or ARM substitution", () => {
   const fixture = gateFixture("timing");
   fixture.expected = { ...fixture.expected, platform: "darwin", arch: "x64" };

@@ -298,6 +298,30 @@ function workflowStep(job, predicate) {
 
 const jobNeeds = job => [job.needs ?? []].flat();
 
+function assertShardReportSelection(gate, platform, jobName, artifactPrefix) {
+  assert.deepEqual(gate.permissions, { contents: "read", actions: "read" });
+  const selector = workflowStep(gate, step => step.id === "shard-artifacts");
+  assert.equal(selector.run, "bun run scripts/select-test-shard-artifacts.ts");
+  assert.equal(selector.env.SHARD_JOB_NAME, jobName);
+  assert.equal(selector.env.SHARD_ARTIFACT_PREFIX, artifactPrefix);
+  assert.equal(selector.env.SHARD_RUN_HEAD_SHA, "${{ github.event.pull_request.head.sha || github.sha }}");
+  assert.equal(selector.env.GH_TOKEN, "${{ github.token }}");
+  assert.equal(selector.env.SHARD_SELECTION_PATH, `\${{ runner.temp }}/${platform}-shard-selection.json`);
+  const downloads = gate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
+  assert.equal(downloads.length, 2);
+  for (const shard of [1, 2]) {
+    const download = downloads.find(step => step.with["artifact-ids"] === `\${{ steps.shard-artifacts.outputs.shard-${shard}-id }}`);
+    assert.ok(download, `the gate must download the selected evidence for shard ${shard}`);
+    assert.equal(download.with.name, undefined);
+    assert.equal(download.with["github-token"], "${{ github.token }}");
+    assert.equal(download.with["merge-multiple"], true);
+    assert.equal(download.with.path, `\${{ runner.temp }}/${platform}-shards/shard-${shard}`);
+    assert.ok(download.if.includes("steps.shard-artifacts.outcome == 'success'"));
+  }
+  const aggregate = workflowStep(gate, step => /scripts\/aggregate-test-shards\.ts/.test(step.run));
+  assert.ok(aggregate.run.includes(`--selection=$RUNNER_TEMP/${platform}-shard-selection.json`));
+}
+
 test("CI defaults to two timing shards and keeps the single-job and worker fallbacks", () => {
   const ci = readWorkflow("ci");
   const inputs = ci.on.workflow_dispatch.inputs;
@@ -324,7 +348,7 @@ test("CI defaults to two timing shards and keeps the single-job and worker fallb
   assert.equal(ci.jobs["windows-verify"]["runs-on"], "windows-latest");
 });
 
-test("CI and Release preserve complete Windows verification, cold shards, and attempt-bound aggregation", () => {
+test("CI and Release preserve complete Windows verification, cold shards, and selected-attempt aggregation", () => {
   for (const name of ["ci", "release"]) {
     const workflow = readWorkflow(name);
     const shards = workflow.jobs["windows-test-shard"];
@@ -367,14 +391,8 @@ test("CI and Release preserve complete Windows verification, cold shards, and at
     assert.equal(evidence.with["if-no-files-found"], "error");
     assert.ok(evidence.with.name.includes("${{ github.run_attempt }}"));
     assert.equal(shards.steps.some(step => step.uses?.startsWith("actions/download-artifact@")), false);
-    const downloads = gate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
-    assert.equal(downloads.length, 2);
-    for (const shard of [1, 2]) {
-      const download = downloads.find(step => step.with.name.includes(`-shard-${shard}-of-2-`));
-      assert.ok(download, `the gate must download exact evidence for shard ${shard}`);
-      assert.equal(download.with.name, evidence.with.name.replace("${{ matrix.shard }}", String(shard)));
-      assert.ok(download.with.name.includes("${{ env.CGW_TEST_WORKERS }}"));
-    }
+    assertShardReportSelection(gate, "windows", "Windows server tests",
+      "test-performance-windows-latest-workers-${{ env.CGW_TEST_WORKERS }}");
     const aggregate = workflowStep(gate, step => /scripts\/aggregate-test-shards\.ts/.test(step.run));
     assert.match(aggregate.run, /--skip-policy=\.github\/windows-test-skips\.json(?:\s|$)/);
     assert.match(aggregate.run, /--mode=timing(?:\s|$)/);
@@ -410,6 +428,7 @@ test("CI and Release preserve complete Windows verification, cold shards, and at
 test("CI and Release retain platform packages, smoke tests, signatures, and publication dependencies", () => {
   const ci = readWorkflow("ci");
   const release = readWorkflow("release");
+  assert.equal(release.permissions.actions, "read");
   assert.deepEqual(ci.jobs.verify.strategy.matrix.os, ["macos-15", "ubuntu-latest"]);
   for (const job of [ci.jobs.verify, ci.jobs["windows-package"], release.jobs.build]) {
     for (const command of ["bun run app:package", "bun run app:smoke"]) {
@@ -513,11 +532,7 @@ test("Intel release shards retain package signatures, complete coverage, and the
   const evidence = workflowStep(shards, step => step.uses?.startsWith("actions/upload-artifact@"));
   assert.equal(evidence.if, "always()");
   assert.equal(evidence.with["if-no-files-found"], "error");
-  const downloads = gate.steps.filter(step => step.uses?.startsWith("actions/download-artifact@"));
-  assert.equal(downloads.length, 2);
-  for (const shard of [1, 2]) {
-    assert.ok(downloads.some(step => step.with.name === evidence.with.name.replace("${{ matrix.shard }}", String(shard))));
-  }
+  assertShardReportSelection(gate, "intel", "Intel server tests", "test-performance-macos-15-intel-workers-2");
   const aggregate = workflowStep(gate, step => /scripts\/aggregate-test-shards\.ts/.test(step.run));
   assert.match(aggregate.run, /--skip-policy=\.github\/macos-intel-test-skips\.json --platform=darwin --arch=x64 --mode=timing/);
   const states = workflowStep(gate, step => step.name === "Check complete Intel job states");

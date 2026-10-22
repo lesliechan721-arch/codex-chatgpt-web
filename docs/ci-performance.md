@@ -375,8 +375,22 @@ bun run verify --test-mode=timing --test-shard=1/2
 
 Shards use Bun 1.4.3 cold file allocation. They reject path/name filters, bail, invalid or
 duplicate shard numbers, and explicit `CGW_TEST_TIMING_*` variables. They do not restore
-or publish history. Each shard has an independent output directory and artifact; artifacts
-from different workflow runs or attempts cannot be combined.
+or publish history. Each shard has an independent output directory and artifact. Windows
+CI/Release and Intel release gates support partial reruns: each gate resolves the latest
+effective job for each shard and downloads its report by immutable artifact ID. Retained
+successful jobs can supply reports from earlier attempts of the same workflow run. The
+selection records each original job ID, attempt and artifact ID in the aggregate artifact.
+GitHub can list a retained job under later attempts with new IDs; matching start and
+completion times identify its original execution. A failed, cancelled or unfinished latest
+job, or a missing or expired selected report, fails the gate without an older-report fallback.
+Reports from different workflow runs or source revisions cannot be combined. All other
+source, dependency, runtime and coverage checks remain required. Shard 1's non-server
+verification must match shard 1's selected attempt. Without an explicit `--selection=PATH`,
+local aggregation still requires both reports to match `GITHUB_RUN_ATTEMPT`.
+
+For pull requests, selection binds REST job and artifact metadata to the PR head SHA
+(`runHeadRevision`). The tested source (`revision`) and report aggregation stay bound to
+`GITHUB_SHA`, the PR merge commit. For other events, both revisions use `GITHUB_SHA`.
 
 Shard summaries use schema v5 and file-timing schema v3. `fullSuite=false` means that each
 report covers only its assigned subset. Unsharded reports retain schema v4. The independent

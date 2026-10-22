@@ -83,6 +83,9 @@ jobs:
     if: always()
     needs: [test-shard, package]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     env:
       INTEL_SHARDS_RESULT: ${{ needs.test-shard.result }}
       INTEL_PACKAGE_RESULT: ${{ needs.package.result }}
@@ -95,27 +98,43 @@ jobs:
       - name: Check complete Intel job states
         run: |
           [[ "$INTEL_SHARDS_RESULT" == 'success' && "$INTEL_PACKAGE_RESULT" == 'success' ]]
-      - name: Download exact shard 1 evidence
+      - name: Select reports from effective shard attempts
+        id: shard-artifacts
         if: always()
+        run: bun run scripts/select-test-shard-artifacts.ts
+        env:
+          SHARD_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          SHARD_JOB_NAME: Intel server tests
+          SHARD_ARTIFACT_PREFIX: test-performance-macos-15-intel-workers-2
+          SHARD_SELECTION_PATH: ${{ runner.temp }}/intel-shard-selection.json
+      - name: Download selected shard 1 evidence
+        if: always() && steps.shard-artifacts.outcome == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: test-performance-macos-15-intel-workers-2-shard-1-of-2-attempt-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.shard-artifacts.outputs.shard-1-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/intel-shards/shard-1
-      - name: Download exact shard 2 evidence
-        if: always()
+      - name: Download selected shard 2 evidence
+        if: always() && steps.shard-artifacts.outcome == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: test-performance-macos-15-intel-workers-2-shard-2-of-2-attempt-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.shard-artifacts.outputs.shard-2-id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
           path: ${{ runner.temp }}/intel-shards/shard-2
       - name: Verify shard provenance and complete coverage
         if: always()
         run: |
           bun -e 'import {writeFileSync} from "node:fs"; writeFileSync(process.env.RUNNER_TEMP + "/intel-shard-jobs.json", JSON.stringify({shard1:process.env.INTEL_SHARDS_RESULT,shard2:process.env.INTEL_SHARDS_RESULT,package:process.env.INTEL_PACKAGE_RESULT}));'
-          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/intel-shards" "--job-results=$RUNNER_TEMP/intel-shard-jobs.json" "--output=$RUNNER_TEMP/intel-shard-aggregate.json" --skip-policy=.github/macos-intel-test-skips.json --platform=darwin --arch=x64 --mode=timing
+          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/intel-shards" "--job-results=$RUNNER_TEMP/intel-shard-jobs.json" "--selection=$RUNNER_TEMP/intel-shard-selection.json" "--output=$RUNNER_TEMP/intel-shard-aggregate.json" --skip-policy=.github/macos-intel-test-skips.json --platform=darwin --arch=x64 --mode=timing
       - name: Upload independent Intel aggregate
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: intel-shard-aggregate-attempt-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/intel-shard-aggregate.json
+          path: |
+            ${{ runner.temp }}/intel-shard-aggregate.json
+            ${{ runner.temp }}/intel-shard-selection.json
           if-no-files-found: warn
