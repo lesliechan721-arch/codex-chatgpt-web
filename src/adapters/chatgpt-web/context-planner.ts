@@ -19,6 +19,7 @@ import type { ContextReuseBaseline, ContextReusePlan } from "./context-reuse-typ
 import { measureBootstrapRequiredCosts } from "./context-bootstrap-plan";
 import { contextBootstrapRequestMessageIndices } from "./context-bootstrap-request";
 import type { ContextBootstrapInlineRequest } from "./context-prompt";
+import { resolveLocalCodexAppName } from "./execution-protocol";
 
 /** A field must save this many estimated encoded bytes in its current presentation before full compilation. */
 export const CONTEXT_MIN_EXTERNALIZE_BYTES = 1_024;
@@ -502,7 +503,8 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       if (!prepared.bootstrapContent) throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "This ordinary task cannot prepare an exact short bootstrap source");
       const provisionalDescriptor = { planId, contextId: source.context_id, manifestDigest: "0".repeat(64), requiredAttachments: media.requiredAttachments };
       const credential = input.compileOptions?.manualControl ? { request_id: input.turnToken! } : { turn_token: input.turnToken! };
-      const entryInput = { credential, taskUpdateInitialState: input.compileOptions?.taskUpdateProtocol === 1
+      const entryInput = { appName: resolveLocalCodexAppName(ordinaryOptions.appName, ordinaryOptions.manualControl === true),
+        credential, taskUpdateInitialState: input.compileOptions?.taskUpdateProtocol === 1
         ? input.compileOptions.taskUpdateInitialState ?? { acceptedRevision: 0, acknowledgedRevision: 0 } : undefined,
         requiredMcpImages: Object.values(media.deliveryByTarget).filter(route => route.required && route.media_route === "mcp").length };
       let inlineRequest: ContextBootstrapInlineRequest | undefined;

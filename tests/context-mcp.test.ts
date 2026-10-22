@@ -109,10 +109,15 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
       expect((await f.client.callTool({ name: "codex_context_list", arguments: { ...readArgs, view: "overview", ...f.reference } })).isError).toBe(true);
       expect((await f.client.callTool({ name: "codex_tool_inventory", arguments: { compaction_token: handle.compactionToken, operation_id: 1 } })).isError).toBe(true);
       if (transaction) {
+        expect(transaction.token).toMatch(/^turn_[a-f0-9]{32}$/);
         const controlArgs = { wire_name: "codex.control.compaction_handoff",
           arguments: { handoff_id: transaction.handoffId, summary: "must not submit" } };
+        // The Broker enforces purpose independently of the MCP token-shape check.
+        await expect(callTurnBroker(f.broker.socketPath, { method: "submit_compaction_handoff",
+          token: f.token, handoffId: transaction.handoffId, summary: "ordinary authority must not submit" }))
+          .rejects.toThrow("compaction control token is invalid, expired, or consumed");
         for (const wrongToken of [f.token, handle.compactionToken, transaction.token.slice(0, -1),
-          transaction.token.replace("control_", "control_A")]) {
+          transaction.token.replace("turn_", "turn_A"), transaction.token.replace("turn_", "control_")]) {
           expect((await f.client.callTool({ name: "codex_tool_call", arguments: { ...controlArgs, turn_token: wrongToken } })).isError).toBe(true);
         }
         // A control credential must never reach the ordinary Native dispatcher.
@@ -121,7 +126,9 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
             turn_token: wrongToken, operation_id: 1, wire_name: "functions.exec_command", arguments: { cmd: "must not execute" },
           } });
           expect(rejected.isError).toBe(true);
-          expect(JSON.stringify(rejected.content)).toContain("Copy turn_token exactly from the current request");
+          if (wrongToken !== transaction.token) {
+            expect(JSON.stringify(rejected.content)).toContain("Copy turn_token exactly from the current request");
+          }
         }
         for (const [name, args] of [
           ["codex_tool_wait", { operation_id: 1 }],
@@ -134,6 +141,14 @@ for (const contract of ["native", "safe"] as const) describe(`stdio ${contract} 
         ? await f.client.callTool({ name: "codex_tool_call", arguments: { turn_token: transaction!.token, wire_name: "codex.control.compaction_handoff", arguments: { handoff_id: transaction!.handoffId, summary: "Chosen partial evidence marker-zeta" } } })
         : await f.client.callTool({ name: "codex_turn_complete", arguments: { ...f.reference, final_answer: "Chosen partial evidence marker-zeta" } });
       expect(submitted.isError).not.toBe(true);
+      if (transaction) {
+        expect(await f.broker.waitForCompactionHandoff(transaction.token)).toBe("Chosen partial evidence marker-zeta");
+        const replay = await f.client.callTool({ name: "codex_tool_call", arguments: {
+          turn_token: transaction.token, wire_name: "codex.control.compaction_handoff",
+          arguments: { handoff_id: transaction.handoffId, summary: "must not submit again" },
+        } });
+        expect(replay.isError).toBe(true);
+      }
       expect((await f.client.callTool({ name: "codex_context_list", arguments: { ...readArgs, view: "overview" } })).isError).toBe(true);
     } finally { await f.close(); }
   });

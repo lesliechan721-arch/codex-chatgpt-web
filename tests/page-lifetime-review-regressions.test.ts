@@ -340,7 +340,7 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
     await turn.onSendActivated?.();
     if (turn.nativeConnector) {
       await turn.onSubmitted?.();
-      const token = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+      const token = compiled.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
       const handoffId = compiled.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
       expect(token).toBeDefined();
       expect(handoffId).toBeDefined();

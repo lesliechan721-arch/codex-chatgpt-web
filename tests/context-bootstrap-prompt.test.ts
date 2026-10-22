@@ -2,6 +2,10 @@ import { expect, test } from "bun:test";
 import { compactionContextPrompt, shortContextBootstrapPrompt, shortContextReuseBootstrapPrompt } from "../src/adapters/chatgpt-web/context-prompt";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
+import { planContextDelivery } from "../src/adapters/chatgpt-web/context-planner";
+import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
+import type { ContextReuseBaseline } from "../src/adapters/chatgpt-web/context-reuse-types";
+import { estimateTokens } from "../src/lib/token-estimate";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import type { CodexParsedRequest } from "../src/types";
 
@@ -45,7 +49,9 @@ test("bootstrap preparation preserves the complete existing normalized candidate
 
 test.each(["automatic", "zero-risk"] as const)("%s short entry has a usable first call, one credential and the pre-read contract", mode => {
   const credential = mode === "automatic" ? { turn_token: token } : { request_id: requestId };
-  const entry = shortContextBootstrapPrompt({ plan, credential });
+  const entry = shortContextBootstrapPrompt({ appName: "Codex Work", plan, credential });
+  expect(entry.text.indexOf('Call only plugin "Codex Work"')).toBeLessThan(entry.text.indexOf("<codex_bootstrap_json>"));
+  expect(entry.text).toContain("never send credentials to another plugin");
   const data = JSON.parse(entry.text.match(/<codex_bootstrap_json>\n(.+)\n<\/codex_bootstrap_json>/)![1]!);
   expect(data.first_call).toEqual(mode === "automatic"
     ? { name: "codex_context_list", arguments: { turn_token: token, context_id: plan.contextId, view: "overview" } }
@@ -69,12 +75,49 @@ test.each(["automatic", "zero-risk"] as const)("%s short entry has a usable firs
   if (mode === "zero-risk") expect(entry.text).toContain("Sent");
 });
 
+test.each([false, true])("configured plugin reaches the first read, budget and reused protocol (manual=%s)", manual => {
+  const parsed = request();
+  if (manual) parsed.modelId = "chatgpt-web-zero-risk";
+  const makePlan = (appName: string, reuse: boolean, baseline?: ContextReuseBaseline) => planContextDelivery({
+    canonical: parsed, candidate: parsed, snapshot: createContextSnapshot(parsed), capabilities,
+    turnToken: manual ? requestId : token, contextToolsAvailable: true, contextBootstrapAvailable: true,
+    contextReuseAvailable: reuse, reuseBaseline: baseline,
+    compileOptions: { appName, ...(manual ? { manualControl: true as const } : {}) },
+  });
+  const firstName = 'Codex "Work" 測試';
+  const changedName = "Codex Other Work";
+  const ordinary = makePlan(firstName, false);
+  expect(ordinary.registration!.startupProtocol).toBe("context-bootstrap-v1");
+  expect(ordinary.compiled.text).toContain(`Call only plugin ${JSON.stringify(firstName)} for first_call`);
+  expect(ordinary.compiled.bootstrapContent!.protocol).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(firstName)}.`);
+  const full = makePlan(firstName, true);
+  const baseline: ContextReuseBaseline = {
+    baseline_id: "plugin-baseline", page_identity: "plugin-page", predecessor: "plugin-predecessor",
+    units: full.registration!.reuse!.units.map(({ target_id: _target, delivery: _delivery, ...unit }) => unit),
+    snapshots: full.registration!.reuse!.snapshots,
+  };
+  const same = makePlan(firstName, true, baseline);
+  expect(same.registration!.reuse!.units.find(unit => unit.scope === "common")!.delivery).toBe("reuse");
+  const changed = makePlan(changedName, true, baseline);
+  const current = changed.registration!.reuse!.units.find(unit => unit.scope === "common")!;
+  expect(current.delivery).not.toBe("reuse");
+  const body = changed.snapshot.getText(changed.snapshot.getTarget(current.target_id)!.read_ref!)!;
+  expect(body).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(changedName)}.`);
+  expect(body).not.toContain(firstName);
+  for (const plan of [ordinary, full, same, changed]) {
+    expect(plan.costs.promptTokens).toBe(estimateTokens(plan.compiled.text));
+    expect(plan.costs.promptCodePoints).toBe(points(plan.compiled.text));
+    expect(plan.costs.fixedBootstrapCodePoints).toBeLessThanOrEqual(3_000);
+  }
+  expect(changed.compiled.text).toContain(`Call only plugin ${JSON.stringify(changedName)} for first_call`);
+});
+
 test("inline request records retain their values and order through safe final rendering", () => {
   const messages = [
     { role: "user", content: "```js\nconst x = '`';\n``` 😀 中文\\u0060", unknown: { empty: "", value: null, enabled: false } },
     { role: "user", content: "\n  Follow up.\t  " },
   ];
-  const entry = shortContextBootstrapPrompt({ plan, credential: { turn_token: token },
+  const entry = shortContextBootstrapPrompt({ appName: "Codex Work", plan, credential: { turn_token: token },
     inlineRequest: { message_indices: [3, 5], messages } });
   const encoded = entry.text.match(/<codex_inline_request_json>\n```json\n(.+)\n```\n<\/codex_inline_request_json>/)![1]!;
   expect(encoded).not.toContain("`");
@@ -158,7 +201,7 @@ test("prepared source positions follow superseded-contract removal and do not in
   expect(compiled.bootstrapContent!.payload.messages.map(message => message.content)).toEqual([
     "keep project rules", "<model_switch>current</model_switch>",
   ]);
-  const short = shortContextBootstrapPrompt({ plan, credential: { turn_token: token } });
+  const short = shortContextBootstrapPrompt({ appName: "Codex Work", plan, credential: { turn_token: token } });
   expect(short.text).not.toContain("codex_inline_request_json");
   expect(short.text).not.toContain("User request:");
 });
@@ -166,7 +209,7 @@ test("prepared source positions follow superseded-contract removal and do not in
 // Both startup variants must fit with every conditional control branch enabled.
 test.each(["automatic", "zero-risk"] as const)("%s fixed startup and reuse entries fit with images and updates", mode => {
   const credential = mode === "automatic" ? { turn_token: token } : { request_id: requestId };
-  const input = { plan: { ...plan, planId: `plan_${"d".repeat(32)}`, contextId: `context_${"e".repeat(32)}` },
+  const input = { appName: "Codex "+"x".repeat(74), plan: { ...plan, planId: `plan_${"d".repeat(32)}`, contextId: `context_${"e".repeat(32)}` },
     credential, requiredMcpImages: 1, taskUpdateInitialState: {
       acceptedRevision: Number.MAX_SAFE_INTEGER, acknowledgedRevision: Number.MAX_SAFE_INTEGER } };
   for (const entry of [shortContextBootstrapPrompt(input), shortContextReuseBootstrapPrompt({ ...input,

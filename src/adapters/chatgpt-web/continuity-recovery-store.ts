@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -45,7 +46,7 @@ export interface RecoveryPreparationTermination {
   requestId: string; traceId: string; helperPid: number; lease: ContinuityLease; recovery: ContinuityRecoveryIdentity;
   receiptId: string; status: "pending" | "settled";
 }
-export interface RecoveryRetryBudget { attempts: number; startedAt: number; lastFailureAt?: number; deadlineAt?: number }
+export interface RecoveryRetryBudget { attempts: number; startedAt: number; lastFailureAt?: number; deadlineAt?: number; suspendedMs?: number; expired?: true }
 /** The accepted boundary used to select the current instruction payload. No input positions or bodies. */
 export interface RecoveryInstructionPrevious {
   instructionIdentity: string;
@@ -441,7 +442,7 @@ function validateThread(value: unknown): asserts value is RecoveryThreadRecord {
     if (work.stopReason !== undefined) oneOf(work.stopReason, ["user-stop", "mode-exit", "page-close", "native-interrupt"]);
     if (!Array.isArray(work.attempts) || work.attempts.length === 0 || work.attempts.length > 512) throw invalid("Continuity work attempts are invalid.");
     work.attempts.forEach((attempt, i) => { validateAttempt(attempt); if (attempt.attempt !== i) throw invalid("Continuity attempt sequence is invalid."); });
-    if (work.retryBudget !== undefined) { exact(work.retryBudget, ["attempts", "startedAt"], ["lastFailureAt", "deadlineAt"]); if (work.retryBudget.deadlineAt !== undefined) integer(work.retryBudget.deadlineAt); integer(work.retryBudget.attempts); integer(work.retryBudget.startedAt); if (work.retryBudget.lastFailureAt !== undefined) integer(work.retryBudget.lastFailureAt); }
+    if (work.retryBudget !== undefined) { exact(work.retryBudget, ["attempts", "startedAt"], ["lastFailureAt", "deadlineAt", "suspendedMs", "expired"]); if (work.retryBudget.expired !== undefined && (work.retryBudget.expired !== true || work.purpose !== "compaction")) throw invalid("Only a compaction retry budget may be expired."); if (work.retryBudget.suspendedMs !== undefined) integer(work.retryBudget.suspendedMs); if (work.retryBudget.deadlineAt !== undefined) integer(work.retryBudget.deadlineAt); integer(work.retryBudget.attempts); integer(work.retryBudget.startedAt); if (work.retryBudget.lastFailureAt !== undefined) integer(work.retryBudget.lastFailureAt); }
   }
   for (const [key, lineage] of Object.entries(value.lineages as Record<string, unknown>)) {
     identity(key); exact(lineage, ["rootLogicalWorkId", "headLogicalWorkId", "acceptedTaskRevision", "toolBatchHeadSequence", "taskMappings", "batchMappings"]);
@@ -566,7 +567,7 @@ function proveCompactionActivation(record: RecoveryThreadRecord, work: RecoveryW
   if (Object.values(record.calls).some(call => call.workLineageId === work.workLineageId && !["settled", "cancelled-before-delivery"].includes(call.state))) throw unproven("Compaction activation requires real settlement of every issued source tool call.");
 }
 function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
-  knownUnsentReservation?: { logicalWorkId: string; attempt: number }): void {
+  knownUnsentReservation?: { logicalWorkId: string; attempt: number }, suspensionWorkId?: string): void {
   if (previous.thread !== next.thread || previous.scope !== next.scope || previous.canonicalScope !== undefined && previous.canonicalScope !== next.canonicalScope || next.epoch < previous.epoch || next.historyRevision < previous.historyRevision
     || previous.legacyUnproven && !next.legacyUnproven) throw unproven("Durable identity or unproved legacy evidence cannot be replaced.");
   for (const reservation of previous.contextCoverageReservations ?? []) {
@@ -644,6 +645,12 @@ function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
     }
     if (!sameInstructionSelection(old, work)) throw unproven("The accepted instruction source selection cannot be replaced.");
     if (canonicalJson(old.taskInputRetry ?? null) !== canonicalJson(work.taskInputRetry ?? null)) throw unproven("Explicit user retry provenance cannot be changed.");
+    if ((old.retryBudget?.suspendedMs ?? 0) !== (work.retryBudget?.suspendedMs ?? 0) && work.retryBudget
+      && (id !== suspensionWorkId || work.purpose !== "compaction" || !sameProcess(previous.owner, next.owner)
+        || (work.retryBudget.suspendedMs ?? 0) < (old.retryBudget?.suspendedMs ?? 0))) throw unproven("Only the current process suspension clock may pause a compaction budget.");
+    if (old.retryBudget?.expired !== work.retryBudget?.expired && work.retryBudget
+      && (id !== suspensionWorkId || work.purpose !== "compaction" || old.retryBudget?.expired === true
+        || work.retryBudget.expired !== true || !sameProcess(previous.owner, next.owner))) throw unproven("An expired compaction budget cannot be reset or invented.");
     if (old.retryBudget?.deadlineAt !== undefined && work.retryBudget && old.retryBudget.deadlineAt !== work.retryBudget.deadlineAt) throw unproven("The original compaction deadline cannot be changed.");
     if (old.activationState !== work.activationState) {
       if (old.activationState !== "shadow" || work.activationState !== "active") throw unproven("Compaction shadow activation cannot be reset or invented.");
@@ -726,6 +733,9 @@ function transition(previous: RecoveryThreadRecord, next: RecoveryThreadRecord,
       || before.representationDigests.some(representation => !after.representationDigests.includes(representation))) throw unproven("A stable compaction target or its accepted representation cannot be replaced.");
   }
 }
+
+// One budget per durable identity in this process, including separate store instances and retries.
+const compactionDeadlines = new Map<string, { file: string; thread: string; logicalWorkId: string; owner: string; original: number; deadline: CompactionDeadline; stop: () => void }>();
 
 /** Content-free recovery admission evidence. This store never creates or revives Native operations. */
 export class ContinuityRecoveryStore {
@@ -1513,7 +1523,9 @@ export class ContinuityRecoveryStore {
   }
   reserveRecovery(thread: string, guard: RecoveryGuard, input: { logicalWorkId: string; owner: ContinuityProcessInstance; snapshotDigest: string }): RecoveryThreadRecord {
     validateProcess(input.owner); hash(input.snapshotDigest);
-    return this.transact(thread, guard, record => {
+    const retry = this.prepareCompactionRetry(thread, guard, input.logicalWorkId);
+    const compactionRemaining = retry.remaining;
+    return this.transact(thread, retry.guard, record => {
       noPendingPreparation(record);
       if (record.legacyUnproven) throw unproven("The old v1 registration has no complete dispatch or stop evidence.");
       const work = this.activeWork(record, input.logicalWorkId); const before = work.attempts.at(-1)!;
@@ -1527,7 +1539,7 @@ export class ContinuityRecoveryStore {
       this.requireRetired(record, work.workLineageId);
       this.requireSettled(record, work.workLineageId);
       if (before.stage !== "interrupted-settled") before.stage = "interrupted-settled";
-      this.retry(work); record.owner = structuredClone(input.owner); const sourceEpoch = record.epoch; record.epoch++;
+      this.retry(work, compactionRemaining); record.owner = structuredClone(input.owner); const sourceEpoch = record.epoch; record.epoch++;
       const next: RecoveryAttemptRecord = { attempt: work.attempts.length, epoch: record.epoch, historyRevision: record.historyRevision,
         snapshotVersion: before.snapshotVersion + 1, snapshotDigest: input.snapshotDigest, stage: "prepared", dispatchProtocolComplete: true, writerRetired: false };
       const previousTransaction = record.transaction?.logicalWorkId === work.logicalWorkId ? record.transaction : undefined;
@@ -1551,12 +1563,77 @@ export class ContinuityRecoveryStore {
   }
   setCompactionDeadline(thread: string, guard: RecoveryGuard, logicalWorkId: string, deadlineAt: number): RecoveryThreadRecord {
     integer(deadlineAt);
-    return this.transact(thread, guard, record => {
+    const record = this.transact(thread, guard, record => {
       const work = this.activeWork(record, logicalWorkId);
       if (work.purpose !== "compaction" || !work.retryBudget || deadlineAt < work.retryBudget.startedAt) throw unproven("A compaction deadline requires its admitted work and original start.");
       if (work.retryBudget.deadlineAt !== undefined && work.retryBudget.deadlineAt !== deadlineAt) throw unproven("The original compaction deadline cannot be changed.");
       work.retryBudget.deadlineAt = deadlineAt;
     });
+    this.compactionDeadline(thread, logicalWorkId);
+    return record;
+  }
+  compactionDeadline(thread: string, logicalWorkId: string): CompactionDeadline {
+    const record = this.get(thread);
+    const work = record?.works[logicalWorkId];
+    if (!record || !work || work.purpose !== "compaction" || work.retryBudget?.deadlineAt === undefined || terminal(work)) {
+      throw unproven("A live admitted compaction budget is required.");
+    }
+    if (work.retryBudget.expired) return new CompactionDeadline(this.now(), { start() {}, suspendedMs: () => 0 }, this.now);
+    const original = work.retryBudget.deadlineAt;
+    // Before takeover, another process can inspect only the already persisted deadline.
+    // Its clock cannot compensate time spent outside the admitted owner's lifetime.
+    if (!sameProcess(record.owner, continuityProcessInstance(record.owner.id))) {
+      return new CompactionDeadline(original + (work.retryBudget.suspendedMs ?? 0),
+        { start() {}, suspendedMs: () => 0 }, this.now);
+    }
+    const key = `${this.file}:${thread}:${logicalWorkId}`;
+    const existing = compactionDeadlines.get(key);
+    if (existing?.owner === record.owner.id && existing.original === original) return existing.deadline;
+    const initialSuspended = work.retryBudget.suspendedMs ?? 0;
+    const deadline = new CompactionDeadline(original + initialSuspended, undefined, this.now, totalMs => {
+      this.exclusive(() => {
+        const document = this.read();
+        const current = document.threads[thread];
+        const active = current?.works[logicalWorkId];
+        if (!current || !active || terminal(active) || !sameProcess(current.owner, record.owner)
+          || active.retryBudget?.deadlineAt !== original) throw unproven("The compaction suspension owner is no longer current.");
+        const suspendedMs = initialSuspended + totalMs;
+        if ((active.retryBudget.suspendedMs ?? 0) === suspendedMs) return;
+        const previous = structuredClone(current);
+        active.retryBudget.suspendedMs = suspendedMs;
+        current.version++;
+        validateThread(current); transition(previous, current, undefined, logicalWorkId);
+        this.write(document);
+      });
+    });
+    if (deadline.remainingMs() > 0) {
+      const entry = { file: this.file, thread, logicalWorkId, owner: record.owner.id, original, deadline, stop: () => {} };
+      compactionDeadlines.set(key, entry);
+      entry.stop = deadline.watch(() => {
+        try {
+          this.expireCompactionBudget(thread, logicalWorkId, record.owner, original);
+          if (compactionDeadlines.get(key) === entry) compactionDeadlines.delete(key);
+        } catch { /* Keep the expired local latch if its durable marker could not be saved. */ }
+      });
+    } else this.expireCompactionBudget(thread, logicalWorkId, record.owner, original);
+    return deadline;
+  }
+  /** Refresh only this owner's saved pause; all business and identity changes remain fenced. */
+  refreshCompactionObservation(observed: RecoveryThreadRecord, logicalWorkId: string): RecoveryThreadRecord {
+    const before = observed.works[logicalWorkId]?.retryBudget;
+    if (before?.deadlineAt !== undefined) this.compactionRetryRemaining(observed.thread, logicalWorkId);
+    const current = this.get(observed.thread);
+    if (!current) throw unproven("The observed compaction no longer exists.");
+    if (current.version === observed.version) return current;
+    const after = current.works[logicalWorkId]?.retryBudget;
+    if (!before || !after || observed.works[logicalWorkId]?.purpose !== "compaction"
+      || before.deadlineAt === undefined || !sameProcess(current.owner, continuityProcessInstance(observed.owner.id))
+      || (after.suspendedMs ?? 0) <= (before.suspendedMs ?? 0)) throw unproven("The compaction observation changed.");
+    const compensated = structuredClone(observed);
+    compensated.version = current.version;
+    compensated.works[logicalWorkId]!.retryBudget!.suspendedMs = after.suspendedMs;
+    if (canonicalJson(compensated) !== canonicalJson(current)) throw unproven("The compaction observation changed beyond its saved pause.");
+    return current;
   }
   recordFailure(thread: string, guard: RecoveryGuard, logicalWorkId: string): RecoveryThreadRecord {
     return this.transact(thread, guard, record => {
@@ -1631,12 +1708,14 @@ export class ContinuityRecoveryStore {
   /** A retry gets a fresh writer and transaction while the same physical page is retained. */
   retryTerminatedPreparation(thread: string, guard: RecoveryGuard, logicalWorkId: string, snapshotDigest: string): RecoveryThreadRecord {
     hash(snapshotDigest);
-    return this.transact(thread, guard, record => {
+    const retry = this.prepareCompactionRetry(thread, guard, logicalWorkId);
+    const compactionRemaining = retry.remaining;
+    return this.transact(thread, retry.guard, record => {
       noPendingPreparation(record);
       const work = this.activeWork(record, logicalWorkId), before = work.attempts.at(-1)!;
       if (record.currentWorkId !== logicalWorkId || record.state !== "ready" || before.preparationTermination?.status !== "settled"
         || !before.writerRetired || before.stage !== "interrupted-settled") throw unproven("The preparation has no settled same-page retry.");
-      this.retry(work);
+      this.retry(work, compactionRemaining);
       const next: RecoveryAttemptRecord = { attempt: work.attempts.length, epoch: record.epoch, historyRevision: record.historyRevision,
         snapshotVersion: before.snapshotVersion + 1, snapshotDigest, stage: "prepared", dispatchProtocolComplete: true, writerRetired: false };
       work.attempts.push(next); work.state = "prepared"; record.state = "running";
@@ -1881,11 +1960,41 @@ export class ContinuityRecoveryStore {
   private requireRetired(record: RecoveryThreadRecord, lineageId: string, attachedAttempt?: RecoveryAttemptRecord): void {
     if (Object.values(record.works).some(work => work.workLineageId === lineageId && work.attempts.some(attempt => !attempt.dispatchProtocolComplete || attempt !== attachedAttempt && !attempt.writerRetired))) throw unproven("The old lineage writer or complete dispatch coverage is not proved retired.");
   }
-  private retry(work: RecoveryWorkRecord): void {
+  private expireCompactionBudget(thread: string, logicalWorkId: string, owner: ContinuityProcessInstance, original: number): void {
+    this.exclusive(() => {
+      const document = this.read();
+      const record = document.threads[thread], work = record?.works[logicalWorkId];
+      if (!record || !work || terminal(work) || !sameProcess(record.owner, owner)
+        || work.retryBudget?.deadlineAt !== original || work.retryBudget.expired) return;
+      const previous = structuredClone(record);
+      work.retryBudget.expired = true;
+      record.version++;
+      validateThread(record); transition(previous, record, undefined, logicalWorkId); this.write(document);
+    });
+  }
+  private prepareCompactionRetry(thread: string, guard: RecoveryGuard, logicalWorkId: string): { guard: RecoveryGuard; remaining?: number } {
+    const observed = this.get(thread);
+    if (observed?.works[logicalWorkId]?.purpose !== "compaction") return { guard };
+    this.guard(observed, guard);
+    const remaining = this.compactionRetryRemaining(thread, logicalWorkId);
+    const current = this.refreshCompactionObservation(observed, logicalWorkId);
+    return { guard: guard.expectedVersion === undefined ? guard : { ...guard, expectedVersion: current.version }, remaining };
+  }
+  private compactionRetryRemaining(thread: string, logicalWorkId: string): number | undefined {
+    const work = this.get(thread)?.works[logicalWorkId];
+    if (work?.purpose !== "compaction" || work.retryBudget?.deadlineAt === undefined || terminal(work)) return undefined;
+    const remaining = this.compactionDeadline(thread, logicalWorkId).remainingMs();
+    if (remaining <= 0) throw continuityError("continuity_retry_exhausted");
+    return remaining;
+  }
+  private retry(work: RecoveryWorkRecord, compactionRemaining?: number): void {
     const budget = work.retryBudget ?? { attempts: 1, startedAt: this.now() };
     // A long-running initial turn has not spent any recovery window before its first failure.
     if (work.purpose !== "compaction" && budget.attempts === 1 && budget.lastFailureAt === undefined) budget.startedAt = this.now();
-    if (budget.deadlineAt !== undefined && this.now() >= budget.deadlineAt || budget.attempts >= MAX_CONTINUITY_RECOVERY_RETRIES + 1 || this.now() - budget.startedAt > CONTINUITY_RECOVERY_RETRY_WINDOW_MS) throw continuityError("continuity_retry_exhausted");
+    const timeExpired = compactionRemaining !== undefined ? compactionRemaining <= 0
+      : budget.deadlineAt !== undefined && this.now() >= budget.deadlineAt + (budget.suspendedMs ?? 0)
+        || this.now() - budget.startedAt - (work.purpose === "compaction" ? budget.suspendedMs ?? 0 : 0) > CONTINUITY_RECOVERY_RETRY_WINDOW_MS;
+    if (budget.expired || timeExpired || budget.attempts >= MAX_CONTINUITY_RECOVERY_RETRIES + 1) throw continuityError("continuity_retry_exhausted");
     budget.attempts++; work.retryBudget = budget;
   }
   private newTransaction(record: RecoveryThreadRecord, work: RecoveryWorkRecord, attempt: RecoveryAttemptRecord, sourceEpoch: number, previous?: RecoveryTransactionRecord): void {
@@ -2061,6 +2170,14 @@ export class ContinuityRecoveryStore {
       const encoded = JSON.stringify(document);
       this.options.beforeWrite?.(); durableWrite(this.file, encoded, () => { replaced = true; this.options.afterAtomicReplace?.(); });
       rememberRecoveryDurability(this.file, encoded);
+      for (const [key, entry] of compactionDeadlines) {
+        if (entry.file !== this.file) continue;
+        const current = document.threads[entry.thread];
+        const work = current?.works[entry.logicalWorkId];
+        if (!current || !work || terminal(work) || current.owner.id !== entry.owner) {
+          entry.stop(); compactionDeadlines.delete(key);
+        }
+      }
     } catch {
       throw Object.assign(invalid("Continuity recovery evidence could not be confirmed as saved; no new side effect is permitted."), { writeMayHaveCommitted: replaced });
     }

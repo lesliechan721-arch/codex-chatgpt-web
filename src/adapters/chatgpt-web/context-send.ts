@@ -8,7 +8,7 @@ import { planContextDelivery, type ContextDeliveryPlan } from "./context-planner
 import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
 import type { ChatGptWebCapabilities } from "./model";
 import type { CompileChatGptWebPromptOptions } from "./prompt";
-import type { TurnBrokerOwner } from "./turn-broker";
+import type { BrokerWaitOptions, TurnBrokerOwner } from "./turn-broker";
 import type { TaskUpdateOwnerContext } from "./task-update-protocol";
 import type { ContextPlanDescriptor } from "./context-prompt";
 
@@ -26,7 +26,7 @@ export class ContextSend {
   private readonly manualPlans = new WeakSet<ContextDeliveryPlan>();
   private selected?: { id: string; token: string; plan: ContextDeliveryPlan };
   private reuseToken?: string;
-  private usageBinding?: { id: string; token: string; contextId: string };
+  private usageBinding?: { id: string; token: string; contextId: string; finalAccounted?: true };
   private usageQueue: Promise<void> = Promise.resolve();
   constructor(private readonly canonical: CodexParsedRequest, private readonly broker: TurnBrokerOwner,
     private readonly capabilities: ChatGptWebCapabilities, private readonly pageGeneration: string,
@@ -157,24 +157,32 @@ export class ContextSend {
     this.coverage.markDelivered(id);
   }
   /** Cost evidence outlives the readable snapshot and is serialized before page reuse. */
-  syncUsage(): Promise<void> {
+  syncUsage(options?: BrokerWaitOptions): Promise<void> {
+    // Each queued invocation owns its clock. A later compaction must not change
+    // an ordinary synchronization that is already queued or in flight.
+    const wait = options?.compaction ? { compaction: true as const } : undefined;
     const update = async () => {
       const binding = this.usageBinding;
       if (!binding) return;
-      const evidence = await this.broker.contextUsage!(binding.token);
-      if (!evidence || evidence.plan_id !== binding.id || evidence.context_id !== binding.contextId
-        || evidence.purpose !== "normal") throw new Error("The selected context navigation cost evidence is unavailable");
-      // An unsubmitted candidate cannot have successful model reads. It contributes no page cost.
-      const record = this.coverage.metadata().find(value => value.planId === binding.id);
-      if (record?.delivered) this.coverage.recordNavigationUsage(binding.id, {
-        tokens: evidence.usage.text_tokens + evidence.usage.visual_token_reserve,
-        wireBytes: evidence.usage.wire_bytes, reservedTokensUsed: evidence.reserved_tokens_used,
-      });
-      if (evidence.final) {
+      if (!binding.finalAccounted) {
+        const evidence = await this.broker.contextUsage!(binding.token, wait);
+        if (!evidence || evidence.plan_id !== binding.id || evidence.context_id !== binding.contextId
+          || evidence.purpose !== "normal") throw new Error("The selected context navigation cost evidence is unavailable");
+        // An unsubmitted candidate cannot have successful model reads. It contributes no page cost.
+        const record = this.coverage.metadata().find(value => value.planId === binding.id);
+        if (record?.delivered) this.coverage.recordNavigationUsage(binding.id, {
+          tokens: evidence.usage.text_tokens + evidence.usage.visual_token_reserve,
+          wireBytes: evidence.usage.wire_bytes, reservedTokensUsed: evidence.reserved_tokens_used,
+        });
+        if (!evidence.final) return;
         if (evidence.reuse_diagnostics) console.info(`[chatgpt-web] context_delivery_observed ${JSON.stringify(evidence.reuse_diagnostics)}`);
-        await this.broker.releaseContextUsage?.(binding.token);
-        this.usageBinding = undefined;
+        // Release can succeed at the owner before its reply is lost. The next
+        // synchronization retries only that idempotent release, never a deleted
+        // evidence read or a second ledger update. This invocation still fails.
+        binding.finalAccounted = true;
       }
+      await this.broker.releaseContextUsage?.(binding.token, wait);
+      this.usageBinding = undefined;
     };
     const result = this.usageQueue.then(update, update);
     this.usageQueue = result.catch(() => {});

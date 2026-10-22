@@ -1,3 +1,4 @@
+import { CompactionDeadline, compactionProcessingNow } from "./compaction-deadline";
 import { createHash } from "node:crypto";
 import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, type ChatGptWebBackendModel, type ChatGptWebAdapterEffort } from "../../chatgpt-web-models";
@@ -371,7 +372,7 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
     reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 };
   try { assertContextNavigationBudget(budget, overrides); }
   catch { throw continuityError("continuity_input_limit", "There is no bounded source reading allowance after the summary reserve."); }
-  const started = performance.now(); let yieldedAt = started;
+  const started = compactionProcessingNow(); let yieldedAt = performance.now();
   const navigator: ContextNavigator = new ContextNavigator({ scopeId: "compaction-preflight", snapshot,
     purpose: "compaction", limits: overrides, remainingBudget: () => {
       const usage = navigator.usage();
@@ -382,7 +383,7 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
   // real single-page serializer and per-response limits without accumulating all-source reads.
   const overview = navigator.list({ context_id: snapshot.context_id, view: "overview" });
   const entries = navigator.list({ context_id: snapshot.context_id, view: "entries" });
-  if (performance.now() - started > limits.totalProcessingMs) {
+  if (compactionProcessingNow() - started > limits.totalProcessingMs) {
     throw continuityError("continuity_resource_capacity", "Compaction source admission exceeded its bounded processing deadline.");
   }
   if (overview.isError || entries.isError) {
@@ -390,7 +391,7 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
   }
   const directory = navigator.usage();
   for (const [index, target] of snapshot.targets.entries()) {
-    if (performance.now() - started > limits.totalProcessingMs) {
+    if (compactionProcessingNow() - started > limits.totalProcessingMs) {
       throw continuityError("continuity_resource_capacity", "Compaction source admission exceeded its bounded processing deadline.");
     }
     // Page sizing and admission measure the same response. Share exact token
@@ -420,23 +421,29 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
       await new Promise<void>(resolve => setImmediate(resolve)); yieldedAt = performance.now();
     }
   }
+  if (compactionProcessingNow() - started > limits.totalProcessingMs) {
+    throw continuityError("continuity_resource_capacity", "Compaction source admission exceeded its bounded processing deadline.");
+  }
 }
 
-export async function registerCompactionSource(broker: TurnBrokerOwner, input: Omit<CompactionContextRegistration, "remainingBudget"> & {
+export async function registerCompactionSource(broker: TurnBrokerOwner, input: Omit<CompactionContextRegistration, "remainingBudget" | "expiresAt"> & {
   availableTokens: number;
+  expiresAt: number | (() => number);
 }, instruction: string, ownerContext?: Parameters<NonNullable<TurnBrokerOwner["registerCompactionContext"]>>[1]): Promise<{
   instruction: string; token: string;
 }> {
   if (!broker.registerCompactionContext || !broker.revokeCompactionContext || !broker.markCompactionContextDelivered
     || !broker.guardCompactionContextCommit) unavailable("The connector has no compaction source capability.");
   // Charge a fixed entry reserve before creating credentials; charge the exact control below.
-  const { availableTokens, ...registration } = input;
+  const { availableTokens, expiresAt, ...registration } = input;
+  const localBudget = typeof expiresAt === "number" ? new CompactionDeadline(expiresAt) : undefined;
+  const currentDeadline = typeof expiresAt === "function" ? expiresAt : () => localBudget!.deadlineAt;
   const limits = contextLimits({ ...contextBudgetProfileLimits(configuredContextBudgetProfile()), ...input.limits });
   const remaining = Math.min(limits.maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
   await assertCompactionReadable(input.snapshot, remaining, limits);
-  const handle = await broker.registerCompactionContext({ ...registration, limits,
+  const handle = await broker.registerCompactionContext({ ...registration, expiresAt: currentDeadline(), limits,
     remainingBudget: { tokens: remaining, wire_bytes: limits.maxTotalWireBytes,
-      reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 } }, ownerContext);
+      reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 } }, ownerContext, currentDeadline);
   try {
     if (handle.contextId !== input.snapshot.context_id) unavailable("The compaction source registration changed its fixed context identity.");
     const selectedInstruction = compactionSourceInstruction(input.snapshot, instruction, availableTokens,
@@ -476,7 +483,7 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
   capabilities: ChatGptWebCapabilities, options: {
     historyRevision: number; ownerGeneration: string; traceId: string; timeoutMs?: number;
     signal?: AbortSignal;
-    deadlineAt?: number;
+    deadlineAt?: number | (() => number);
     recovery?: import("./continuity-recovery-runtime").RuntimeRecoveryReference;
     sourceCoverage?: CompactionSourceCoverage;
     /** Independent fixed source captured after the original live source proof. */
@@ -486,7 +493,7 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
     assertFullInput?: (compiled: CompiledChatGptWebPrompt, input: CodexParsedRequest) => void | Promise<void>;
     turnToken?: string;
     /** Trusted acceptance path; cannot change source, authority or send policy. */
-    contextPresentation?: Pick<CompileChatGptWebPromptOptions, "contextRendering" | "contextRawTextPolicy">;
+    contextPresentation?: Pick<CompileChatGptWebPromptOptions, "contextRendering" | "contextRawTextPolicy" | "appName">;
   }): Promise<{ instruction: string; markDelivered(): Promise<void>; acceptSummary(summary: string): Promise<string>; cleanup(): Promise<void> }> {
   options.signal?.throwIfAborted();
   const snapshot = options.sourceSnapshot ?? (options.sourceCoverage ? captureCompactionSource(parsed, options.sourceCoverage) : createContextSnapshot(parsed));
@@ -504,7 +511,10 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
   if (!options.turnToken && (!broker.beginCompactionTransaction || !broker.abortCompactionTransaction || !broker.commitCompactionContext)) {
     unavailable("The connector cannot bind a fresh compaction transaction; upgrade the connector.");
   }
-  const transaction = options.turnToken ? undefined : await broker.beginCompactionTransaction!(options.traceId, timeout);
+  const budget = new CompactionDeadline(typeof options.deadlineAt === "function" ? options.deadlineAt() : options.deadlineAt ?? Date.now() + timeout);
+  const remainingMs = budget.remainingMs();
+  if (remainingMs <= 0) unavailable("The original compaction deadline expired.");
+  const transaction = options.turnToken ? undefined : await broker.beginCompactionTransaction!(options.traceId, remainingMs);
   let sourceToken: string | undefined;
   const onAbort = (): void => { void cleanup().catch(() => {}); };
   const cleanup = async (): Promise<void> => {
@@ -531,14 +541,14 @@ export async function prepareFreshCompactionSource(parsed: CodexParsedRequest, b
         handoffId: `manual:${options.traceId}` } : { contract: "native" as const, transactionToken: transaction!.token,
         handoffId: transaction!.handoffId }),
       historyRevision: options.historyRevision, ownerGeneration: options.ownerGeneration,
-      expiresAt: options.deadlineAt ?? Date.now() + timeout, availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
+      expiresAt: () => budget.deadlineAt, availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
       ...(options.recovery ? { recovery: options.recovery } : {}),
     }, instruction);
     sourceToken = registered.token;
     const selectedInput: CodexParsedRequest = { ...parsed, context: { ...parsed.context, systemPrompt: [], tools: [],
       messages: [{ role: "user", content: registered.instruction, timestamp: 0 }] } };
     const compiled = compileChatGptWebPrompt(selectedInput, { ...capabilities, localToolsEnabled: Boolean(options.turnToken) }, options.turnToken,
-      { ...options.contextPresentation, ...(options.turnToken ? { manualControl: true } : {}) });
+      { ...options.contextPresentation, compactionReadOnly: true, ...(options.turnToken ? { manualControl: true } : {}) });
     if (options.assertFullInput) await options.assertFullInput(compiled, selectedInput);
     else assertContinuityCompiledInput(compiled, selectedInput, capabilities);
     options.signal?.throwIfAborted();

@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import { createHash } from "node:crypto";
 import { estimateTokens } from "../../lib/token-estimate";
 import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
@@ -37,7 +38,7 @@ import {
 async function readyPage(prepared: PreparedContinuityRequest): Promise<void> {
   const { binding } = prepared;
   if (!binding.lease) throw continuityError("continuity_session_lost");
-  const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease);
+  const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease, { compaction: true });
   if (physical.state !== "ready") {
     throw continuityError("continuity_session_lost");
   }
@@ -146,14 +147,12 @@ export function runContinuityCompaction(
     let durableCompactionWorkId: string | undefined;
     let noControlDelivered = false;
     const timeoutMs = Math.min(configuredTimeout ?? MAX_COMPACTION_HANDOFF_TIMEOUT_MS, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
-    let deadlineAt = Date.now() + timeoutMs;
+    let budget = new CompactionDeadline(Date.now() + timeoutMs);
     const deadline = new AbortController();
-    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let stopDeadline = budget.watch(() => deadline.abort(continuityError("continuity_session_lost", "The handoff exceeded its original deadline.")));
     const reportProgress = (): void => {
       if (deadline.signal.aborted) return;
-      clearTimeout(timeout);
-      timeout = setTimeout(() => deadline.abort(continuityError("continuity_session_lost", "The handoff exceeded its original deadline.")), Math.max(0, deadlineAt - Date.now()));
-      timeout.unref?.();
+      if (budget.remainingMs() <= 0) deadline.abort(continuityError("continuity_session_lost", "The handoff exceeded its original deadline."));
       onProgress?.();
     };
     reportProgress();
@@ -172,7 +171,7 @@ export function runContinuityCompaction(
           throw continuityError("continuity_source_unproven");
         }
         if (source.taskUpdatesEnabled() && source.runtime.mode === "tools") {
-          const liveState = await broker.taskUpdateState?.(await source.runtime.token);
+          const liveState = await broker.taskUpdateState?.(await source.runtime.token, { compaction: true });
           // A completed source retains its admitted completion receipt in the page
           // Session; its retired Broker no longer owns an update journal or ACK files.
           const receipt = !source.isActive() ? source.runtime.taskUpdates?.outputReceipt : undefined;
@@ -191,7 +190,7 @@ export function runContinuityCompaction(
         const resultReplay = source.continuityToolResultReplayEvidence(parsed);
         source.assertContinuityGeneration(prepared.verifiedSourceGeneration);
         signal.throwIfAborted();
-        await source.runtime.syncContextUsage?.();
+        await source.runtime.syncContextUsage?.({ compaction: true });
         signal.throwIfAborted();
         if (!manual || source.isActive()) {
           const coverage = source.runtime.compactionSourceCoverage;
@@ -209,9 +208,11 @@ export function runContinuityCompaction(
         const accepted = bindings.beginCompaction(binding, executionKey, sourceExecutionKey, sourceEvidenceBytes);
         try {
           if (!manual || source.isActive()) {
-            durableCompactionWorkId = beginHealthyRecoveryCompaction(parsed, prepared, timeoutMs);
+            durableCompactionWorkId = beginHealthyRecoveryCompaction(parsed, prepared, budget.remainingMs());
             if (durableCompactionWorkId) {
-              deadlineAt = bindings.recoveryStore.get(binding.thread)!.works[durableCompactionWorkId]!.retryBudget!.deadlineAt!;
+              stopDeadline();
+              budget = bindings.recoveryStore.compactionDeadline(binding.thread, durableCompactionWorkId);
+              stopDeadline = budget.watch(() => deadline.abort(continuityError("continuity_session_lost", "The handoff exceeded its original deadline.")));
               reportProgress();
             }
           }
@@ -270,13 +271,13 @@ export function runContinuityCompaction(
           preserveFinalResponse = true;
         }
         if (!claim) throw continuityError("continuity_source_unproven");
-        await source.runtime.retireCapability?.();
+        await source.runtime.retireCapability?.({ compaction: true });
         const ordinaryFinal = preserveFinalResponse ? source.settledOutcome() : undefined;
         durableCompactionWorkId = admitHealthyRecoveryCompaction(parsed, prepared,
           ordinaryFinal?.type === "final" ? ordinaryFinal.answer : undefined);
         reportProgress();
         rawSummary = await requestRetainedCompactionHandoff(worker, parsed, source, broker as TurnBroker,
-          capabilities, handoffTraceId, signal, timeoutMs, reportProgress, {
+          capabilities, handoffTraceId, signal, budget.remainingMs(), reportProgress, {
             claim, sourceSnapshot,
             ...(durableCompactionWorkId ? {
               recoveryStoreDirectory: bindings.registrations.directory,
@@ -337,11 +338,11 @@ export function runContinuityCompaction(
       try { assertRecoveryCompactionNotStopped(parsed, prepared); }
       catch (stopped) {
         source.cancel(stopped instanceof Error ? stopped : continuityError("continuity_stopped"));
-        await source.runtime.retireCapability?.();
+        await source.runtime.retireCapability?.({ compaction: true });
         const lease = binding.lease ? { ...binding.lease } : undefined;
         if (lease) {
           const release = source.physicalSettlement.then(() => releaseLauncherRetainedConversation(
-            prepared.descriptor, prepared.conversationKey, undefined, lease,
+            prepared.descriptor, prepared.conversationKey, undefined, lease, { compaction: true },
           )).then(() => undefined);
           retainOwnershipUntil(release);
           void release.catch(() => {});
@@ -360,11 +361,11 @@ export function runContinuityCompaction(
       try { bindings.lose(binding); }
       catch { /* The in-memory lost state is already terminal even if the durable store failed. */ }
       source.cancel(continuityError("continuity_session_lost"));
-      await source.runtime.retireCapability?.();
+      await source.runtime.retireCapability?.({ compaction: true });
       await failHealthyRecoveryCompaction(parsed, prepared);
       if (lease) {
         const release = source.physicalSettlement.then(() => releaseLauncherRetainedConversation(
-          prepared.descriptor, prepared.conversationKey, undefined, lease,
+          prepared.descriptor, prepared.conversationKey, undefined, lease, { compaction: true },
         )).then(() => undefined);
         retainOwnershipUntil(release);
         void release.catch(() => {});
@@ -372,7 +373,7 @@ export function runContinuityCompaction(
       if (error instanceof ChatGptWebAdapterError) throw error;
       throw continuityError("continuity_source_unproven", "The handoff did not commit; already accepted results were not re-executed.");
     } finally {
-      clearTimeout(timeout);
+      stopDeadline();
     }
   });
 }

@@ -20,6 +20,7 @@ import {
   hasCurrentChatGptRolloutEnvironmentMarker,
   hasCurrentChatGptEnvironmentContext,
   extractChatGptCalendarEnvironmentDelta,
+  extractChatGptNativeCompactionEnvironment,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   nativeChatGptCompactionEnvironmentMessages,
@@ -530,13 +531,16 @@ export class ChatGptThreadEnvironmentStore {
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction
         ? extractChatGptCalendarEnvironmentDelta(parsed) : undefined;
+      const nativeCompaction = hasCurrentContext && !currentCompaction && !initialClaim && !steeringClaim && !calendarDelta
+        ? extractChatGptNativeCompactionEnvironment(parsed) : undefined;
       if (hasCurrentContext && !currentCompaction
-        && !initialClaim && !historicalMessages && !rolloutMarker && !steeringClaim && !calendarDelta) {
+        && !initialClaim && !historicalMessages && !rolloutMarker && !steeringClaim && !calendarDelta && !nativeCompaction) {
         diagnostics.recovery_stage = "current_update_rejected";
         throw error;
       }
-      if (currentCompaction) diagnostics.recovery_stage = "compaction_claim";
-      const currentClaim = initialClaim ?? (currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim);
+      if (currentCompaction || nativeCompaction) diagnostics.recovery_stage = "compaction_claim";
+      const currentClaim = initialClaim ?? (currentCompaction
+        ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim ?? nativeCompaction?.claim);
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       diagnostics.rollout_lookup = "identity_unavailable";
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -570,6 +574,7 @@ export class ChatGptThreadEnvironmentStore {
               throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
             }
           },
+          ...(nativeCompaction ? { compactedEnvironmentItems: nativeCompaction.items } : {}),
           tools: parsed.context.tools,
           publicationPendingIsTransient: waitForPublication,
         });
@@ -583,7 +588,7 @@ export class ChatGptThreadEnvironmentStore {
           const rolloutEnvironment = currentWorkspaceContext(rollout.environment, rollout.workspaceRootsDeclared, currentClaim);
           if (calendarDelta) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
-            if (rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess"
+            if (calendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
               || calendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
                 || roots.some(root => !nativeRoots.has(root)))) {
               throw new TrustedCodexEnvironmentValidationError("Calendar environment delta conflicts with its current Codex rollout");
@@ -591,7 +596,7 @@ export class ChatGptThreadEnvironmentStore {
           }
           const conflicts = currentClaim ? conflictingAuthorityFields(currentClaim, rolloutEnvironment) : [];
           if (conflicts.length > 0) {
-            const source = currentCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
+            const source = currentCompaction || nativeCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
             // Export fixed field names only; keep paths and permission contents private.
             console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);
             throw new TrustedCodexEnvironmentValidationError(

@@ -99,7 +99,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
   }
 
   function createFixture(manual = false, options: { codexHome?: string; threadId?: string; turnTimeoutMs?: number; taskUpdates?: boolean; root?: string; waitForRetirement?: boolean; launcherInstance?: ContinuityLauncherInstance; cleanupMode?: "release-page" | "backend-exit"; mcpTransport?: ContinuityMcpTransport;
-    zeroRiskPro?: boolean; contextModel?: (input: ContinuityContextModelInput) => Promise<void> } = {}) {
+    zeroRiskPro?: boolean; reasoning?: "low" | "medium"; contextModel?: (input: ContinuityContextModelInput) => Promise<void> } = {}) {
     const profileContext = runtimePerformanceContext();
     const root = options.root ?? mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-cont-adapter-"));
     const statePath = join(root, "continuity");
@@ -373,7 +373,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       await turn.onSendActivated?.();
       if (turn.nativeConnector) {
         await turn.onSubmitted?.();
-        const token = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+        const token = compiled.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
         const handoffId = compiled.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
         expect(token).toBeDefined();
         expect(handoffId).toBeDefined();
@@ -537,7 +537,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
     const request = (text = "First continuity instruction.", turnId = "turn-first", input?: unknown[]): CodexParsedRequest => {
       const parsed = parseRequest({
         model: manual ? (options.zeroRiskPro ? CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL : CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL) : "gpt-5.6-sol", stream: false,
-        reasoning: { effort: "low" }, tools: [{
+        reasoning: { effort: options.reasoning ?? "low" }, tools: [{
           type: "function", name: "exec_command", description: "Fixture command; Native execution is simulated by the test.",
           parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
         }],

@@ -7,7 +7,7 @@ import { COMPACT_PROMPT, isReadableCompactionSummaryText } from "../../responses
 import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
 import { createContextSnapshot } from "./context-snapshot";
-import type { BrokerToolRequest } from "./turn-broker";
+import type { BrokerToolRequest, BrokerWaitOptions } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserErrorLog, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
 import {
   chatGptCurrentInstructionIndex,
@@ -204,7 +204,7 @@ interface ChatGptTurnRuntimeBase {
   /** Digest-only selected/delivered source evidence survives ordinary capability retirement. */
   compactionSourceCoverage?: import("./compaction-context").CompactionSourceCoverage;
   /** Synchronize actual cumulative navigation cost before page capacity or source capture. */
-  syncContextUsage?: () => Promise<void>;
+  syncContextUsage?: (wait?: BrokerWaitOptions) => Promise<void>;
   /** Commit reuse only after normal final and the physical owner has settled. */
   commitContextReuse?: () => Promise<void>;
   browser: Promise<string>;
@@ -225,11 +225,11 @@ interface ChatGptTurnRuntimeBase {
   recoveryBaselineResults?: Readonly<Record<string, string>>;
   recoveryCoveredCallIds?: ReadonlySet<string>;
   conversationKey?: string;
-  releaseRetainedConversation?: () => Promise<void>;
+  releaseRetainedConversation?: (wait?: BrokerWaitOptions) => Promise<void>;
   /** A durable preparation fence or a healthy unresolved Send retains the owned page. */
   retainsContinuityAfterFailure?: () => boolean;
   /** Idempotently retire the turn-bound MCP capability after browser and observer settlement. */
-  retireCapability?: () => void | Promise<void>;
+  retireCapability?: (wait?: BrokerWaitOptions) => void | Promise<void>;
   submission?: { phase: "prepared" | "send_activated" | "accepted" };
   /** Present only when the visible ChatGPT tab is driven manually through the Codex Zero Risk2 MCP contract. */
   manualControl?: { surfaceNonce: string };
@@ -257,12 +257,12 @@ function executionKey(parsed: CodexParsedRequest, payload: unknown): string {
     || parsed._continuityHistoryRevision! < 0)) throw continuityError("continuity_source_unproven");
   return createHash("sha256").update(canonicalJson({
     modelId: parsed.modelId,
+    modelFamily: parsed._chatgptModelFamily,
     reasoning: parsed.options.reasoning,
     ...(continuity ? {
       policy: "task", historyRevision: parsed._continuityHistoryRevision,
       ...(parsed._continuityAttempt ? { attempt: parsed._continuityAttempt } : {}),
       ...(parsed._continuityPageGeneration ? { generation: parsed._continuityPageGeneration } : {}),
-      modelFamily: parsed._chatgptModelFamily,
     } : {}),
     payload,
   })).digest("hex");
@@ -3177,8 +3177,8 @@ export class ChatGptTurnSessions {
     if (pending) await awaitWithAbort(pending, signal);
   }
 
-  async retireConversationAndWait(conversationKey: string): Promise<number> {
-    return this.closeConversationAndWait(conversationKey);
+  async retireConversationAndWait(conversationKey: string, wait?: BrokerWaitOptions): Promise<number> {
+    return this.closeConversationAndWait(conversationKey, undefined, wait);
   }
 
   /** Retire only the settled execution after a same-page handoff. Never release its surface. */
@@ -3193,7 +3193,7 @@ export class ChatGptTurnSessions {
       || source.settledOutcome()?.type !== "final" || source.outstanding().length > 0) {
       throw continuityError("continuity_source_unproven");
     }
-    await source.runtime.retireCapability?.();
+    await source.runtime.retireCapability?.({ compaction: true });
     if (this.entries.get(executionKey) !== source || this.conversationHeads.get(conversationKey) !== source) {
       throw continuityError("continuity_source_unproven");
     }
@@ -3212,6 +3212,7 @@ export class ChatGptTurnSessions {
     conversationKey: string,
     preserved: ChatGptTurnSession,
     preservedExecutionKey: string,
+    wait?: BrokerWaitOptions,
   ): Promise<number> {
     if (!preservedExecutionKey) throw new Error("Preserved ChatGPT response execution key is required");
     const outcome = preserved.settledOutcome();
@@ -3221,7 +3222,7 @@ export class ChatGptTurnSessions {
     const retired = await this.closeConversationAndWait(conversationKey, {
       session: preserved,
       executionKey: preservedExecutionKey,
-    });
+    }, wait);
     if (this.entries.get(preservedExecutionKey) !== preserved) throw taskUpdateSourceError("task_update_source_conflict", "The preserved final source changed during physical retirement.");
     preserved.retainPreservedCompactionFinal(preservedExecutionKey);
     return retired;
@@ -3230,6 +3231,7 @@ export class ChatGptTurnSessions {
   private async closeConversationAndWait(
     conversationKey: string,
     preserved?: { session: ChatGptTurnSession; executionKey: string },
+    wait?: BrokerWaitOptions,
   ): Promise<number> {
     const pending = this.conversationRetirements.get(conversationKey);
     if (pending) {
@@ -3264,7 +3266,7 @@ export class ChatGptTurnSessions {
       session.runtime.releaseRetainedConversation !== undefined
     ))?.[1].runtime.releaseRetainedConversation;
     const retirement = Promise.all(matches.map(([, session]) => session.physicalSettlement))
-      .then(async () => { await release?.(); });
+      .then(async () => { await release?.(wait); });
     this.conversationRetirements.set(conversationKey, retirement);
     try {
       await retirement;

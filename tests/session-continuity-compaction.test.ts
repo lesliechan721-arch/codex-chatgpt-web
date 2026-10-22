@@ -1,3 +1,5 @@
+import { mock as timerMock } from "node:test";
+import { ChatGptSuspensionClock, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
 import { ContinuityRecoveryStore, continuityProcessInstance, continuityProcessInstanceStatus } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 import { recoveryResultDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
 import { afterEach, expect, spyOn } from "bun:test";
@@ -30,6 +32,10 @@ const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
 
+test("healthy continuity compaction retains its remaining budget after ten minutes of process suspension", async () => {
+  await compactionBudgetScenario(compactionBudgetCases[0], 0, 601_000);
+});
+
 const compactionBudgetCases = [
   { name: "completes source settlement and checkpoint within the original budget", sourceDelay: 300, checkpointDelay: 300, succeeds: true },
   { name: "preserves the original deadline across source settlement and checkpoint", sourceDelay: 700, checkpointDelay: 700, succeeds: false },
@@ -37,8 +43,8 @@ const compactionBudgetCases = [
   { name: "still times out during the checkpoint", sourceDelay: 0, checkpointDelay: 1600, succeeds: false },
 ] as const;
 
-async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds }: typeof compactionBudgetCases[number], preparationDelayMs = 0): Promise<void> {
-  const f = fixture(false, { turnTimeoutMs: 1000, waitForRetirement: true });
+async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds }: typeof compactionBudgetCases[number], preparationDelayMs = 0, suspensionMs = 0): Promise<void> {
+  const f = fixture(false, { turnTimeoutMs: suspensionMs ? 10_000 : 1000, waitForRetirement: true });
   const first = f.request();
   await f.run(first);
   const stored = f.registrations.get(continuityDigest(f.threadId))!;
@@ -57,7 +63,17 @@ async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds
   let settleSource!: () => void;
   Object.defineProperty(source, "physicalSettlement", { value: new Promise<void>(resolve => { settleSource = resolve; }) });
   let checkpoint: Promise<string> | undefined;
-  const clock = controlledClock();
+  const clock = suspensionMs ? (() => {
+    timerMock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    const elapsed = spyOn(performance, "now").mockImplementation(() => Date.now());
+    return { tick: (ms: number) => timerMock.timers.tick(ms), restore() { elapsed.mockRestore(); timerMock.timers.reset(); } };
+  })() : controlledClock();
+  const suspension = new ChatGptSuspensionClock(1_000, 5_000, () => performance.now(), () => Date.now());
+  const suspensionSpies = suspensionMs ? [
+    spyOn(chatGptSuspensionClock, "start").mockImplementation(() => {}),
+    spyOn(chatGptSuspensionClock, "suspendedMs").mockImplementation(() => suspension.suspendedMs()),
+    spyOn(chatGptSuspensionClock, "recentSuspension").mockImplementation(() => suspension.recentSuspension()),
+  ] : [];
   f.automatic.mockImplementation(turn => {
     if (!turn.nativeConnector) return ordinary(turn);
     checkpoint = (async () => {
@@ -90,6 +106,7 @@ async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds
       expect(Date.now()).toBe(wallStart);
       expect(performance.now()).toBe(monotonicStart);
     }
+    if (suspensionMs) clock.tick(suspensionMs);
     clock.tick(sourceDelay);
     settleSource();
     if (!succeeds) {
@@ -106,6 +123,7 @@ async function compactionBudgetScenario({ sourceDelay, checkpointDelay, succeeds
     expect(binding.state).toBe("ready");
     expect(f.submissions).toHaveLength(2);
   } finally {
+    for (const spy of suspensionSpies.reverse()) spy.mockRestore();
     clock.restore();
     settleSource();
     await run?.catch(() => {});

@@ -11,6 +11,7 @@ import {
 } from "./adapters/chatgpt-web/continuity-contract";
 import { continuityError } from "./adapters/chatgpt-web/continuity-errors";
 import { ChatGptWebAdapterError } from "./adapters/chatgpt-web/adapter-error";
+import { CompactionDeadline } from "./adapters/chatgpt-web/compaction-deadline";
 
 export const LAUNCHER_BROWSER_HOST_KIND = "codex-web-gpt-launcher";
 export const LAUNCHER_CONTEXT_DELIVERY_FEATURE = "context-delivery-plan-v1";
@@ -499,6 +500,24 @@ export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
 export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
 
+/** Local HTTP waiting only; this does not renew Launcher authorization or leases. */
+export interface LauncherWaitOptions { compaction?: boolean }
+
+function watchLauncherRequestTimeout(timeoutMs: number, expired: () => void, wait?: LauncherWaitOptions): () => void {
+  if (wait?.compaction) return new CompactionDeadline(Date.now() + timeoutMs).watch(expired);
+  const timer = setTimeout(expired, timeoutMs);
+  return () => clearTimeout(timer);
+}
+
+function launcherRequestSignal(timeoutMs: number, wait?: LauncherWaitOptions): { signal: AbortSignal; stop(): void } {
+  // Keep ordinary callers' native timeout errors and timing unchanged.
+  if (!wait?.compaction) return { signal: AbortSignal.timeout(timeoutMs), stop() {} };
+  const controller = new AbortController();
+  const stop = watchLauncherRequestTimeout(timeoutMs,
+    () => controller.abort(new DOMException("Launcher request timed out", "TimeoutError")), wait);
+  return { signal: controller.signal, stop };
+}
+
 export interface LauncherManualTurnOwner {
   traceId: string;
   helperPid: number;
@@ -574,12 +593,13 @@ async function launcherManualRequest(
   body: LauncherManualTurnStart | LauncherManualTurnOwner | LauncherManualTurnEnd | LauncherManualAttachmentsOwner,
   timeoutMs: number,
   abortSignal?: AbortSignal,
+  wait?: LauncherWaitOptions,
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   const controller = new AbortController();
   const abort = () => controller.abort();
   if (abortSignal?.aborted) abort();
   abortSignal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(abort, timeoutMs);
+  const stopTimeout = watchLauncherRequestTimeout(timeoutMs, abort, wait);
   try {
     const response = await fetch(`${descriptor.control.endpoint}/v1/manual/${action}`, {
       method: "POST",
@@ -602,7 +622,7 @@ async function launcherManualRequest(
     }
     return { response, body: decoded };
   } finally {
-    clearTimeout(timer);
+    stopTimeout();
     abortSignal?.removeEventListener("abort", abort);
   }
 }
@@ -615,12 +635,13 @@ async function reconcileLauncherManualMutation(
   validAcknowledgement: (body: Record<string, unknown>) => boolean,
   invalidAcknowledgementMessage: string,
   onInvalidAcknowledgement?: () => Promise<void>,
+  wait?: LauncherWaitOptions,
 ): Promise<{ response: Response; body: Record<string, unknown> }> {
   let ambiguousError: unknown;
   let observedInvalidAcknowledgement = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const result = await launcherManualRequest(descriptor, action, body, timeoutMs);
+      const result = await launcherManualRequest(descriptor, action, body, timeoutMs, undefined, wait);
       if (!result.response.ok) {
         if (observedInvalidAcknowledgement && onInvalidAcknowledgement) {
           try { await onInvalidAcknowledgement(); } catch { /* preserve the causal mutation error */ }
@@ -634,7 +655,7 @@ async function reconcileLauncherManualMutation(
       if (error instanceof LauncherKnownUnsentReceiptError || (error instanceof ChatGptWebAdapterError && error.code === "continuity_unverified")) throw error;
       ambiguousError = error;
       if (action === "start" && "continuity" in body && body.continuity?.recovery) {
-        const observed = await launcherContinuityRequestWithDescriptor(descriptor, "query", body.continuity.recovery, undefined, body.recoveryStoreDirectory);
+        const observed = await launcherContinuityRequestWithDescriptor(descriptor, "query", body.continuity.recovery, undefined, body.recoveryStoreDirectory, wait);
         if (observed.state === "unknown") throw continuityError("continuity_unverified");
       }
     }
@@ -670,6 +691,7 @@ export async function startLauncherManualTurn(
   descriptorPath: string,
   activity: LauncherManualTurnStart,
   timeoutMs = LAUNCHER_MANUAL_TURN_START_TIMEOUT_MS,
+  wait: LauncherWaitOptions = { compaction: activity.compaction },
 ): Promise<LauncherManualTurnLease> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   if (activity.contextPlans) {
@@ -700,9 +722,10 @@ export async function startLauncherManualTurn(
           helperPid: activity.helperPid,
           ...(activity.continuity?.recovery ? { recovery: activity.continuity.recovery } : {}),
           status: "failed",
-        });
+        }, undefined, wait);
       } catch { /* the lease validation error remains authoritative */ }
     },
+    wait,
   );
   if (!response.ok) throwManualControlError(response, body);
   if (body.sentConfirmationRequired !== activity.sentConfirmationRequired) {
@@ -712,7 +735,7 @@ export async function startLauncherManualTurn(
         helperPid: activity.helperPid,
         ...(activity.continuity?.recovery ? { recovery: activity.continuity.recovery } : {}),
         status: "failed",
-      });
+      }, undefined, wait);
     } catch { /* the policy mismatch remains authoritative */ }
     throw new LauncherManualTurnFailedError(
       "Launcher Sent confirmation policy does not match the caller expectation",
@@ -801,7 +824,7 @@ export async function waitForLauncherManualAttachments(
 export async function waitForLauncherManualSent(
   descriptorPath: string,
   owner: LauncherManualTurnOwner,
-  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+  options: { abortSignal?: AbortSignal; timeoutMs?: number; compaction?: boolean } = {},
 ): Promise<{ sentAt: string | null }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const timeoutMs = options.timeoutMs ?? LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS;
@@ -813,6 +836,7 @@ export async function waitForLauncherManualSent(
       owner,
       timeoutMs,
       options.abortSignal,
+      options,
     );
     if (response.status === 202 && body.status === "pending") continue;
     if (!response.ok) throwManualControlError(response, body);
@@ -828,6 +852,7 @@ export async function markLauncherManualTurnStarted(
   descriptorPath: string,
   owner: LauncherManualTurnOwner,
   timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+  wait?: LauncherWaitOptions,
 ): Promise<void> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const { response, body } = await reconcileLauncherManualMutation(
@@ -837,6 +862,8 @@ export async function markLauncherManualTurnStarted(
     timeoutMs,
     body => body.ok === true,
     "Launcher returned an invalid manual started acknowledgement",
+    undefined,
+    wait,
   );
   if (!response.ok) throwManualControlError(response, body);
 }
@@ -844,7 +871,7 @@ export async function markLauncherManualTurnStarted(
 export async function waitForLauncherManualTerminal(
   descriptorPath: string,
   owner: LauncherManualTurnOwner,
-  options: { abortSignal?: AbortSignal; timeoutMs?: number } = {},
+  options: { abortSignal?: AbortSignal; timeoutMs?: number; compaction?: boolean } = {},
 ): Promise<LauncherManualTurnTerminal> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const timeoutMs = options.timeoutMs ?? LAUNCHER_MANUAL_SENT_REQUEST_TIMEOUT_MS;
@@ -856,6 +883,7 @@ export async function waitForLauncherManualTerminal(
       owner,
       timeoutMs,
       options.abortSignal,
+      options,
     );
     if (response.status === 202 && body.status === "pending") continue;
     if (!response.ok) throwManualControlError(response, body);
@@ -870,6 +898,7 @@ export async function endLauncherManualTurn(
   descriptorPath: string,
   activity: LauncherManualTurnEnd,
   timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+  wait?: LauncherWaitOptions,
 ): Promise<{ cancelledByUser: boolean }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const { response, body } = await reconcileLauncherManualMutation(
@@ -879,6 +908,8 @@ export async function endLauncherManualTurn(
     timeoutMs,
     body => body.ok === true && typeof body.cancelledByUser === "boolean",
     "Launcher returned an invalid manual turn release result",
+    undefined,
+    wait,
   );
   if (!response.ok) throwManualControlError(response, body);
   return { cancelledByUser: body.cancelledByUser as boolean };
@@ -888,9 +919,10 @@ export async function cancelLauncherManualTurn(
   descriptorPath: string,
   owner: LauncherManualTurnOwner,
   timeoutMs = LAUNCHER_MANUAL_TURN_END_TIMEOUT_MS,
+  wait?: LauncherWaitOptions,
 ): Promise<void> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
-  const { response, body } = await launcherManualRequest(descriptor, "cancel", owner, timeoutMs);
+  const { response, body } = await launcherManualRequest(descriptor, "cancel", owner, timeoutMs, undefined, wait);
   if (!response.ok) throwManualControlError(response, body);
 }
 
@@ -903,6 +935,7 @@ export async function notifyLauncherTurn(
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
   signal?: AbortSignal,
+  wait?: LauncherWaitOptions,
 ): Promise<{
   surfaceId?: string;
   reused?: boolean;
@@ -921,7 +954,7 @@ export async function notifyLauncherTurn(
   const reconcileInitialStart = activity.phase === "start" && Boolean(activity.continuity && (!activity.continuity.expected || activity.continuity.recovery));
   for (let attempt = 0; attempt < (reconcileInitialStart ? 2 : 1); attempt += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const stopTimeout = watchLauncherRequestTimeout(timeoutMs, () => controller.abort(), wait);
     let deterministicResponse = false;
     try {
       const response = await fetch(`${descriptor.control.endpoint}/v1/turn/${activity.phase}`, {
@@ -1007,7 +1040,7 @@ export async function notifyLauncherTurn(
       if (reconcileInitialStart && attempt === 0 && !deterministicResponse) {
         if (activity.phase === "start" && activity.continuity?.recovery) {
           // Query the original transaction first. A new trace cannot resolve an ambiguous Send.
-          const observed = await queryLauncherContinuityTransaction(descriptorPath, activity.continuity.recovery, activity.recoveryStoreDirectory);
+          const observed = await queryLauncherContinuityTransaction(descriptorPath, activity.continuity.recovery, activity.recoveryStoreDirectory, wait);
           if (observed.state === "unknown") throw continuityError("continuity_unverified");
           if (["retired", "completed", "missing"].includes(observed.state)) throw continuityError("continuity_execution_unsettled");
         }
@@ -1020,7 +1053,7 @@ export async function notifyLauncherTurn(
       if ((activity.phase === "start" && activity.continuity?.recovery) || activity.recovery) throw continuityError("continuity_unverified");
       throw new Error(`Launcher browser control channel failed: ${normalized instanceof Error ? normalized.message : String(normalized)}`);
     } finally {
-      clearTimeout(timer);
+      stopTimeout();
     }
   }
   throw new Error("Launcher browser control start reconciliation failed");
@@ -1031,13 +1064,14 @@ export async function releaseLauncherRetainedConversation(
   conversationKey: string,
   timeoutMs = LAUNCHER_TURN_END_TIMEOUT_MS,
   expected?: ContinuityLease,
+  wait?: LauncherWaitOptions,
 ): Promise<number> {
   if (!/^[a-f0-9]{64}$/.test(conversationKey)) {
     throw new Error("Launcher retained conversation key is invalid");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const stopTimeout = watchLauncherRequestTimeout(timeoutMs, () => controller.abort(), wait);
   try {
     const response = await fetch(`${descriptor.control.endpoint}/v1/turn/release`, {
       method: "POST",
@@ -1057,7 +1091,7 @@ export async function releaseLauncherRetainedConversation(
   } catch (error) {
     throw new Error(`Launcher retained conversation release failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    clearTimeout(timer);
+    stopTimeout();
   }
 }
 
@@ -1095,13 +1129,14 @@ async function launcherContinuityRequest(
   recovery: ContinuityRecoveryIdentity,
   expected?: ContinuityRecoveryIdentity,
   recoveryStoreDirectory?: string,
+  wait?: LauncherWaitOptions,
 ): Promise<ContinuityTransactionReceipt & { sendAuthorized?: boolean }> {
   if (!isContinuityRecoveryIdentity(recovery) || (expected && !isContinuityRecoveryIdentity(expected))) {
     throw continuityError("continuity_source_unproven");
   }
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   assertLauncherContinuityFeature(descriptor, true);
-  return launcherContinuityRequestWithDescriptor(descriptor, action, recovery, expected, recoveryStoreDirectory);
+  return launcherContinuityRequestWithDescriptor(descriptor, action, recovery, expected, recoveryStoreDirectory, wait);
 }
 
 async function launcherContinuityRequestWithDescriptor(
@@ -1110,13 +1145,15 @@ async function launcherContinuityRequestWithDescriptor(
   recovery: ContinuityRecoveryIdentity,
   expected?: ContinuityRecoveryIdentity,
   recoveryStoreDirectory?: string,
+  wait?: LauncherWaitOptions,
 ): Promise<ContinuityTransactionReceipt & { sendAuthorized?: boolean }> {
+  const timeout = launcherRequestSignal(action === "retire" ? LAUNCHER_TURN_END_TIMEOUT_MS : LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS, wait);
   try {
     const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-${action}`, {
       method: "POST", headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
       body: JSON.stringify({ recovery, ...(expected ? { expected } : {}),
         ...(recoveryStoreDirectory ? { recoveryStoreDirectory } : {}) }),
-      signal: AbortSignal.timeout(action === "retire" ? LAUNCHER_TURN_END_TIMEOUT_MS : LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+      signal: timeout.signal,
     });
     const body = await response.json() as Record<string, unknown>;
     if (!response.ok) {
@@ -1156,71 +1193,81 @@ async function launcherContinuityRequestWithDescriptor(
   } catch (error) {
     if (error instanceof Error && "code" in error && String(error.code).startsWith("continuity_")) throw error;
     throw continuityError("continuity_unverified", "The local Launcher connection could not be verified; coordinate the original transaction before retrying.");
+  } finally {
+    timeout.stop();
   }
 }
 
-export function queryLauncherContinuityTransaction(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "query", recovery, undefined, recoveryStoreDirectory);
+export function queryLauncherContinuityTransaction(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string, wait?: LauncherWaitOptions): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "query", recovery, undefined, recoveryStoreDirectory, wait);
 }
 
 export function updateLauncherContinuityPreparation(descriptorPath: string, update: {
   expected: ContinuityRecoveryIdentity; recovery: ContinuityRecoveryIdentity;
-}, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "prepare", update.recovery, update.expected, recoveryStoreDirectory);
+}, recoveryStoreDirectory?: string, wait?: LauncherWaitOptions): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "prepare", update.recovery, update.expected, recoveryStoreDirectory, wait);
 }
 
 /** Call after the durable send-possible write, and await before the actual Send activation. */
-export async function markLauncherContinuitySendPossible(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
-  const result = await launcherContinuityRequest(descriptorPath, "send-possible", recovery, undefined, recoveryStoreDirectory);
+export async function markLauncherContinuitySendPossible(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string, wait?: LauncherWaitOptions): Promise<ContinuityTransactionReceipt> {
+  const result = await launcherContinuityRequest(descriptorPath, "send-possible", recovery, undefined, recoveryStoreDirectory, wait);
   if (!result.sendAuthorized) throw continuityError("continuity_execution_unsettled", "This page may already have been sent; attach or retire its original attempt.");
   return result;
 }
 
 /** Confirms logical isolation. Exact page cleanup proceeds independently; tools still need settlement. */
-export function retireLauncherContinuityWriter(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string): Promise<ContinuityTransactionReceipt> {
-  return launcherContinuityRequest(descriptorPath, "retire", recovery, undefined, recoveryStoreDirectory);
+export function retireLauncherContinuityWriter(descriptorPath: string, recovery: ContinuityRecoveryIdentity, recoveryStoreDirectory?: string, wait?: LauncherWaitOptions): Promise<ContinuityTransactionReceipt> {
+  return launcherContinuityRequest(descriptorPath, "retire", recovery, undefined, recoveryStoreDirectory, wait);
 }
 
 /** Repeating this exact operation recovers a lost termination reply without granting Send. */
 export async function terminateLauncherContinuityPreparation(descriptorPath: string, recovery: ContinuityRecoveryIdentity,
-  recoveryStoreDirectory: string, expected: { requestId: string; receiptId: string; traceId: string; helperPid: number; lease: ContinuityLease }): Promise<ContinuityLease> {
+  recoveryStoreDirectory: string, expected: { requestId: string; receiptId: string; traceId: string; helperPid: number; lease: ContinuityLease }, wait?: LauncherWaitOptions): Promise<ContinuityLease> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   if (!descriptor.features?.includes(CONTINUITY_PREPARATION_TERMINATION_FEATURE)) throw continuityError("continuity_configuration_conflict", "Update and restart Launcher to recover a local preparation failure.");
-  const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-terminate-preparation`, {
-    method: "POST", headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
-    body: JSON.stringify({ recovery, recoveryStoreDirectory }), signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
-  });
-  const body = await response.json() as Record<string, unknown>;
-  if (!response.ok) throw continuityError(isContinuityControlCode(body.code) ? body.code : "continuity_unverified");
-  if (body.ok !== true || body.state !== "preparation-terminated" || !isContinuityRecoveryIdentity(body.recovery)
-    || !sameContinuityRecoveryIdentity(body.recovery, recovery) || body.requestId !== expected.requestId
-    || body.receiptId !== expected.receiptId || body.traceId !== expected.traceId || body.helperPid !== expected.helperPid
-    || !isContinuityLease(body.continuity) || body.continuity.owner !== expected.lease.owner
-    || body.continuity.leaseId !== expected.lease.leaseId || body.continuity.traceId !== expected.lease.traceId
-    || Boolean(body.continuity.recovery) !== Boolean(expected.lease.recovery)
-    || expected.lease.recovery && !sameContinuityRecoveryIdentity(body.continuity.recovery!, expected.lease.recovery)) {
-    throw continuityError("continuity_unverified", "Launcher did not confirm the exact preparation termination and lease.");
+  const timeout = launcherRequestSignal(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS, wait);
+  try {
+    const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-terminate-preparation`, {
+      method: "POST", headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ recovery, recoveryStoreDirectory }), signal: timeout.signal,
+    });
+    const body = await response.json() as Record<string, unknown>;
+    if (!response.ok) throw continuityError(isContinuityControlCode(body.code) ? body.code : "continuity_unverified");
+    if (body.ok !== true || body.state !== "preparation-terminated" || !isContinuityRecoveryIdentity(body.recovery)
+      || !sameContinuityRecoveryIdentity(body.recovery, recovery) || body.requestId !== expected.requestId
+      || body.receiptId !== expected.receiptId || body.traceId !== expected.traceId || body.helperPid !== expected.helperPid
+      || !isContinuityLease(body.continuity) || body.continuity.owner !== expected.lease.owner
+      || body.continuity.leaseId !== expected.lease.leaseId || body.continuity.traceId !== expected.lease.traceId
+      || Boolean(body.continuity.recovery) !== Boolean(expected.lease.recovery)
+      || expected.lease.recovery && !sameContinuityRecoveryIdentity(body.continuity.recovery!, expected.lease.recovery)) {
+      throw continuityError("continuity_unverified", "Launcher did not confirm the exact preparation termination and lease.");
+    }
+    return body.continuity;
+  } finally {
+    timeout.stop();
   }
-  return body.continuity;
 }
 
 /** Reject known capacity exhaustion before consuming a new thread's creation registration. */
-export async function assertLauncherContinuityCapacity(descriptorPath: string): Promise<void> {
+export async function assertLauncherContinuityCapacity(descriptorPath: string, wait?: LauncherWaitOptions): Promise<void> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   assertLauncherContinuityFeature(descriptor);
   let available: boolean;
+  const timeout = launcherRequestSignal(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS, wait);
   try {
     const response = await fetch(`${descriptor.control.endpoint}/v1/turn/continuity-capacity`, {
       method: "POST",
       headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
       body: "{}",
-      signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+      signal: timeout.signal,
     });
     const body = await response.json() as Record<string, unknown>;
     if (!response.ok || body.ok !== true || body.executionProtocol !== 1 || typeof body.available !== "boolean") throw new Error("Invalid capacity acknowledgement");
     available = body.available;
   } catch {
     throw continuityError("continuity_configuration_conflict", "Launcher cannot confirm the continuity capacity contract. Update or restore the local control connection before starting this mode.");
+  } finally {
+    timeout.stop();
   }
   if (!available) throw continuityError("continuity_resource_capacity", "Close an existing browser page before starting another task.");
 }
@@ -1230,7 +1277,9 @@ export async function inspectLauncherContinuityConversation(
   descriptorPath: string,
   conversationKey: string,
   expected: ContinuityLease,
+  wait?: LauncherWaitOptions,
 ): Promise<{ continuity: ContinuityLease; state: "ready" | "running" }> {
+  const timeout = launcherRequestSignal(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS, wait);
   try {
     const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
     assertLauncherContinuityFeature(descriptor, Boolean(expected.recovery));
@@ -1238,7 +1287,7 @@ export async function inspectLauncherContinuityConversation(
       method: "POST",
       headers: { authorization: `Bearer ${descriptor.control.token}`, "content-type": "application/json" },
       body: JSON.stringify({ conversationKey, expected }),
-      signal: AbortSignal.timeout(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS),
+      signal: timeout.signal,
     });
     const body = await response.json() as Record<string, unknown>;
     if (!response.ok) {
@@ -1256,5 +1305,7 @@ export async function inspectLauncherContinuityConversation(
   } catch (error) {
     if (error instanceof Error && "code" in error && String(error.code).startsWith("continuity_")) throw error;
     throw continuityError("continuity_unverified");
+  } finally {
+    timeout.stop();
   }
 }

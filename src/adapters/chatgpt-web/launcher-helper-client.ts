@@ -908,7 +908,7 @@ export class LauncherBrowserHelperClient {
         message: "Launcher browser helper did not finish the aborted turn",
         ...(pending.turn.continuity?.recovery ? { recovery: pending.turn.continuity.recovery } : {}),
         ...(pending.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: pending.turn.recoveryStoreDirectory } : {}),
-      }).then(() => {});
+      }, undefined, undefined, { compaction: pending.turn.compaction }).then(() => {});
       void pending.retirement.then(() => {
         if (this.pending.get(id) !== pending) return;
         if (pending.terminalReceived) this.unfinishedAborts.delete(id);
@@ -1012,7 +1012,7 @@ export class LauncherBrowserHelperClient {
         message: "Launcher browser helper exited before completing the turn",
         ...(pending.turn.continuity?.recovery ? { recovery: pending.turn.continuity.recovery } : {}),
         ...(pending.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: pending.turn.recoveryStoreDirectory } : {}),
-      });
+      }, undefined, undefined, { compaction: pending.turn.compaction });
       void retirement.then(
         () => { if (this.pending.get(id) === pending) this.finishWithError(id, pending.localFailure ?? error); },
         controlError => {

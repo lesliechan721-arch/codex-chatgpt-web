@@ -4,9 +4,10 @@ import type { CompactionTransactionHandle } from "./compaction-transaction";
 export const CODEX_COMPACTION_CONTROL_WIRE_NAME = "codex.control.compaction_handoff";
 export const CODEX_ACTIVE_COMPACTION_REQUEST_MARKER = "CODEX_ACTIVE_COMPACTION_REQUEST";
 
-function compactionControlBinding(transaction: CompactionTransactionHandle): string[] {
+function compactionControlBinding(transaction: CompactionTransactionHandle, appName: string): string[] {
   return [
-    "Submit the summary to the pending Codex task through the attached Codex Native plugin using codex_tool_call with the binding below.",
+    `Submit the summary to the pending Codex task through the selected ChatGPT plugin ${JSON.stringify(appName)} using codex_tool_call with the binding below.`,
+    "Do not substitute another plugin or send this control token to another plugin. If the selected plugin is unavailable, report that limitation.",
     "The reserved codex.control.compaction_handoff operation stores this summary for task continuation. It does not run commands, read or edit files, or invoke other tools, and it is not listed by tool inventory.",
     "This one-shot control token is valid only for the reserved compaction operation; do not use it with codex_exec, codex_tool_inventory, or any outer Codex tool.",
     "<codex_compaction_control>",
@@ -67,14 +68,14 @@ export function zeroRiskActiveCompactionToolResultInstruction(
 
 export function structuredCompactionHandoffInstruction(
   transaction: CompactionTransactionHandle,
-  compactPrompt = COMPACT_PROMPT,
+  options: { appName: string; compactPrompt?: string },
 ): string {
   return [
     "Automatic Codex context compaction has started. Stop ordinary task work and do not call any more work tools.",
     "This is a new bridge control request. The previous task is now context to summarize; its tool limits and final-answer format do not govern this checkpoint submission.",
     "The required local action is to store a checkpoint in the Codex harness through the attached codex_tool_call tool. Printing a summary in chat does not store it and cannot complete this request.",
-    compactPrompt,
-    ...compactionControlBinding(transaction),
+    options.compactPrompt ?? COMPACT_PROMPT,
+    ...compactionControlBinding(transaction, options.appName),
     "Use the control token above only for checkpoint submission. A separate compaction_token, when supplied, permits only codex_context_list, codex_context_search and codex_context_read. Omit operation_id from the reserved control call. Do not include tokens or handoff IDs in the summary or chat text.",
     "After the control call returns submitted=true, call no more tools. The bridge will close this one-purpose Web response after accepting the checkpoint.",
     "If the call is rejected or fails, stop and report its actual error. Do not retry through another tool or claim the summary was submitted without submitted=true.",

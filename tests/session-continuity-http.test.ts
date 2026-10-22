@@ -1281,7 +1281,7 @@ test("repair4: HTTP public uncommitted compaction retry starts a new generation 
     tailBody = body;
     preCommit = store.get(thread)!;
     expect(Object.values(preCommit.checkpoints)).toHaveLength(0);
-    const token = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
+    const token = compiled.text.match(/turn_token (turn_[a-f0-9]{32})/)![1]!;
     const handoffId = compiled.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
     await callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "submit_compaction_handoff", token, handoffId,
       summary: `Checkpoint from the actual read: ${body.slice(body.indexOf(tail))}` });

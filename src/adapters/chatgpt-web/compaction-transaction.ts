@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import { randomBytes } from "node:crypto";
 
 export interface CompactionTransactionHandle {
@@ -16,10 +17,11 @@ interface CompactionTransaction extends CompactionTransactionHandle {
   traceId: string;
   summary?: string;
   waiter?: TransactionWaiter;
-  timer?: ReturnType<typeof setTimeout>;
+  deadline: CompactionDeadline;
+  stopDeadline?: () => void;
 }
 
-function opaqueId(prefix: "control" | "handoff"): string {
+function opaqueId(prefix: "turn" | "handoff"): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
 }
 
@@ -35,26 +37,34 @@ export class CompactionTransactionStore {
       throw new Error("compaction transaction TTL must be a positive finite number");
     }
     const transaction: CompactionTransaction = {
-      token: opaqueId("control"),
+      // The native MCP contract accepts turn_ capabilities. Authority comes from
+      // this summary-only store; this token never enters the ordinary tool registry.
+      token: opaqueId("turn"),
       handoffId: opaqueId("handoff"),
       traceId,
+      deadline: new CompactionDeadline(Date.now() + ttlMs),
     };
-    transaction.timer = setTimeout(() => {
-      this.finishError(transaction, new Error("compaction transaction timed out"));
-    }, ttlMs);
-    transaction.timer.unref?.();
     this.transactions.set(transaction.token, transaction);
+    transaction.stopDeadline = transaction.deadline.watch(() => {
+      this.finishError(transaction, new Error("compaction transaction timed out"));
+    });
     return { token: transaction.token, handoffId: transaction.handoffId };
   }
 
   /** Owner-side read authority is separate from this one-shot submission token. */
   isActive(token: string, handoffId: string): boolean {
-    const transaction = this.transactions.get(token);
+    const transaction = this.activeTransaction(token);
     return !!transaction && transaction.handoffId === handoffId && transaction.summary === undefined;
   }
 
+  remainingMs(token: string, handoffId: string): number {
+    const transaction = this.activeTransaction(token);
+    return transaction && transaction.handoffId === handoffId && transaction.summary === undefined
+      ? transaction.deadline.remainingMs() : 0;
+  }
+
   submit(token: string, handoffId: string, summary: string): void {
-    const transaction = this.transactions.get(token);
+    const transaction = this.activeTransaction(token);
     if (!transaction) throw new Error("compaction control token is invalid, expired, or consumed");
     if (transaction.summary !== undefined) throw new Error("compaction handoff was already submitted");
     if (handoffId !== transaction.handoffId) {
@@ -64,13 +74,13 @@ export class CompactionTransactionStore {
     if (!normalized) throw new Error("compaction handoff summary is empty");
     transaction.summary = normalized;
     console.info(`[chatgpt-web] broker trace=${transaction.traceId} accepted structured compaction handoff`);
-    if (transaction.timer) clearTimeout(transaction.timer);
-    transaction.timer = undefined;
+    transaction.stopDeadline?.();
+    transaction.stopDeadline = undefined;
     if (transaction.waiter) this.consume(transaction);
   }
 
   wait(token: string, signal?: AbortSignal): Promise<string> {
-    const transaction = this.transactions.get(token);
+    const transaction = this.activeTransaction(token);
     if (!transaction) return Promise.reject(new Error("compaction control token is invalid, expired, or consumed"));
     if (transaction.waiter) return Promise.reject(new Error("compaction transaction already has a waiter"));
     if (transaction.summary !== undefined) return Promise.resolve(this.consume(transaction));
@@ -93,13 +103,13 @@ export class CompactionTransactionStore {
   }
 
   abort(token: string): void {
-    const transaction = this.transactions.get(token);
+    const transaction = this.activeTransaction(token);
     if (!transaction) return;
     if (transaction.summary !== undefined) {
       this.transactions.delete(token);
       this.onRetired?.(token);
-      if (transaction.timer) clearTimeout(transaction.timer);
-      transaction.timer = undefined;
+      transaction.stopDeadline?.();
+      transaction.stopDeadline = undefined;
       this.detachWaiter(transaction);
       transaction.waiter = undefined;
       return;
@@ -121,6 +131,15 @@ export class CompactionTransactionStore {
     }
   }
 
+  private activeTransaction(token: string): CompactionTransaction | undefined {
+    const transaction = this.transactions.get(token);
+    if (transaction && transaction.summary === undefined && transaction.deadline.remainingMs() <= 0) {
+      this.finishError(transaction, new Error("compaction transaction timed out"));
+      return undefined;
+    }
+    return transaction;
+  }
+
   private consume(transaction: CompactionTransaction): string {
     if (transaction.summary === undefined) throw new Error("compaction transaction is not ready");
     const summary = transaction.summary;
@@ -136,8 +155,8 @@ export class CompactionTransactionStore {
   private finishError(transaction: CompactionTransaction, error: Error): void {
     if (!this.transactions.delete(transaction.token)) return;
     this.onRetired?.(transaction.token);
-    if (transaction.timer) clearTimeout(transaction.timer);
-    transaction.timer = undefined;
+    transaction.stopDeadline?.();
+    transaction.stopDeadline = undefined;
     const waiter = transaction.waiter;
     this.detachWaiter(transaction);
     transaction.waiter = undefined;

@@ -24,7 +24,11 @@ Setup preserves custom names that are not retired defaults. If a custom plugin c
 pre-navigation schema, follow the original migration above. The still-unreleased context-rendering,
 text-batch-v1, and short-start update keeps `Codex Native5`, `Codex Native5 DEV`, `Codex Zero Risk4`, and current
 non-retired custom names. Ordinary Native tool tokens use the exact `turn_` prefix and 32 case-sensitive
-characters. The independent `control_` token remains limited to compaction handoff submission;
+characters. Compaction submission also uses `turn_`, followed by 32 hexadecimal characters.
+Its independent one-shot transaction remains limited to compaction handoff submission;
+the shared prefix does not grant ordinary tool authority. Ordinary task tokens cannot submit a
+compaction handoff. Legacy `control_` submission tokens are no longer issued or accepted;
+in-flight credentials cannot be carried across a runtime upgrade.
 `compaction_token` remains limited to context reads. Refresh or reconnect that same connector to load the current token schema and copying
 instructions if its current contract is incompatible. If the client cannot update or consume batch-v1, stop context reads and report the missing
 capability. This update does not introduce another connector name. A local name change uses
@@ -476,8 +480,12 @@ Required MCP images have a 120-second readiness deadline and a 45-second no-prog
 starting when the selected entry is delivered and the original start/Sent conditions allow reading.
 Only a newly delivered required image advances progress. Required fallback confirmation has its
 own five-minute deadline from presentation of the selected list. An in-flight MCP return has a
-90-second settlement deadline. Compaction retains its existing finite control deadline, at most
-five minutes; reads do not restart it. Processing budgets exclude human waiting and idle time
+90-second settlement deadline. Compaction retains its finite control budget, at most five minutes
+of awake process time; reads, progress, and retries do not restart that total budget. Suspension
+detected by the same running process pauses the related operation, submission, source-read, and
+recovery deadlines. Resume uses their remaining budget. This does not restore cancelled or revoked
+credentials, waive source or owner checks, or refund time across a process restart.
+Processing budgets exclude human waiting and idle time
 between authorized calls. Once images are ready, navigation adds no overall business-task timeout.
 Existing task deadlines, Native leases, cancellation, and owner-liveness rules still apply.
 

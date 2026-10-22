@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import { CONTEXT_REUSE_PROTOCOL, type ContextReuseBaseline, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
 import { contextReusePageIdentity, contextReuseMatches, contextReuseBaseline, contextReusePredecessor } from "./context-reuse-lifecycle";
 import { recoveryStore } from "./continuity-recovery-runtime";
@@ -39,6 +40,20 @@ import {
   type TaskUpdateAckResult, type TaskOutputReceipt,
 } from "./task-update-protocol";
 export type { TaskUpdateOwnerContext, TaskUpdateState, TaskUpdateTransfer, TaskUpdateTransferOutcome, TaskOutputReceipt } from "./task-update-protocol";
+
+type CompactionBudgetIdentity = Pick<CompactionContextRegistration,
+  "contract" | "transactionToken" | "turnToken" | "handoffId" | "historyRevision" | "ownerGeneration" | "explicitManual" | "recovery">;
+interface CompactionBudgetHandle { budgetToken: string; remainingMs: number }
+interface CompactionBudgetClaim { budgetToken: string; deadlineDebitMs: number }
+interface CompactionContextBinding {
+  readToken?: string;
+  handoffId: string;
+  contract: "native" | "safe";
+  budget?: { token: string; identity: string; deadline: CompactionDeadline; retired: boolean };
+}
+
+/** Local wait accounting only; never sent as capability authority. */
+export interface BrokerWaitOptions { compaction?: true }
 
 export interface TaskUpdateStateSnapshot { revision: number; state: TaskUpdateState }
 
@@ -223,6 +238,7 @@ interface TurnChannel {
   nativeOperations: NativeToolOperations;
   nativeQueryCount: number;
   deadlineTimer?: ReturnType<typeof setTimeout>;
+  compactionDeadline?: CompactionDeadline;
   nativeWaitingObservers: Set<SafeWaiter<NativeWaitingSnapshot>>;
   batchTimer?: ReturnType<typeof setTimeout>;
   taskUpdates?: TaskUpdateControl;
@@ -236,7 +252,7 @@ interface BrokerRequest {
     | "owner_context_register" | "owner_context_select" | "owner_context_discard_unselected" | "owner_context_sent" | "owner_context_attachments" | "owner_context_status" | "owner_context_usage" | "owner_context_usage_release"
     | "owner_context_verification_arm" | "owner_context_verification_delivered" | "owner_context_verification_status" | "owner_context_verification_revoke"
     | "owner_compaction_transaction_begin" | "owner_compaction_transaction_abort"
-    | "owner_compaction_context_register" | "owner_compaction_context_delivered" | "owner_compaction_context_guard" | "owner_compaction_context_commit" | "owner_compaction_context_revoke"
+    | "owner_compaction_context_prepare" | "owner_compaction_context_register" | "owner_compaction_context_delivered" | "owner_compaction_context_guard" | "owner_compaction_context_commit" | "owner_compaction_context_revoke"
     | "claim"
     | "resolve"
     | "release"
@@ -286,6 +302,8 @@ interface BrokerRequest {
   verificationRegistration?: Omit<ContextVerificationRegistration, "normal" | "compactionSnapshot"> & { normal: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire }; compactionSnapshot: ContextSnapshotWire };
   contextRegistration?: Omit<ContextPlanRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
   compactionRegistration?: Omit<CompactionContextRegistration, "snapshot"> & { snapshot: ContextSnapshotWire };
+  compactionBudgetIdentity?: CompactionBudgetIdentity;
+  compactionBudgetClaim?: CompactionBudgetClaim;
   contextMethod?: ContextMethod;
   contextArgs?: ContextArgs;
   credentialKind?: "ordinary" | "compaction";
@@ -324,6 +342,7 @@ interface BrokerRequest {
   summary?: string;
   surfaceNonce?: string;
   requireSentConfirmation?: boolean;
+  compaction?: true;
   requireOpenBoundary?: boolean;
   finalAnswer?: string;
   contract?: "native" | "safe";
@@ -586,15 +605,15 @@ export interface TurnBrokerOwner {
   markContextPlanSent?(token: string, planId: string, context?: TaskUpdateOwnerContext): void | Promise<void>;
   confirmContextAttachments?(token: string, confirmation: ContextAttachmentConfirmation, context?: TaskUpdateOwnerContext): void | Promise<void>;
   contextStatus?(token: string): ContextStatus | undefined | Promise<ContextStatus | undefined>;
-  contextUsage?(token: string): ContextUsageEvidence | undefined | Promise<ContextUsageEvidence | undefined>;
-  releaseContextUsage?(token: string): void | Promise<void>;
-  registerCompactionContext?(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): CompactionContextHandle | Promise<CompactionContextHandle>;
+  contextUsage?(token: string, wait?: BrokerWaitOptions): ContextUsageEvidence | undefined | Promise<ContextUsageEvidence | undefined>;
+  releaseContextUsage?(token: string, wait?: BrokerWaitOptions): void | Promise<void>;
+  registerCompactionContext?(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext, currentDeadline?: () => number): CompactionContextHandle | Promise<CompactionContextHandle>;
   markCompactionContextDelivered?(token: string): void | Promise<void>;
   guardCompactionContextCommit?(token: string): void | Promise<void>;
   commitCompactionContext?(token: string): void | Promise<void>;
   revokeCompactionContext?(token: string): void | Promise<void>;
-  assertRecoveryFencing?(): Promise<void>;
-  retireRecoveryWriter?(reference: RuntimeRecoveryReference): Promise<boolean>;
+  assertRecoveryFencing?(wait?: BrokerWaitOptions): Promise<void>;
+  retireRecoveryWriter?(reference: RuntimeRecoveryReference, wait?: BrokerWaitOptions): Promise<boolean>;
   waitForNativeWaiting(token: string, afterRevision: number, signal?: AbortSignal): Promise<NativeWaitingSnapshot>;
   register(environment: ChatGptTurnCapability, ttlMs?: number, traceId?: string, options?: TaskUpdateRegistrationOptions): Promise<string>;
   registerSafe(
@@ -602,7 +621,7 @@ export interface TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId?: string,
-    options?: { requireSentConfirmation?: boolean } & TaskUpdateRegistrationOptions,
+    options?: { requireSentConfirmation?: boolean; compaction?: true } & TaskUpdateRegistrationOptions,
   ): Promise<string>;
   updateEnvironment(token: string, environment: ChatGptTurnCapability, context?: TaskUpdateOwnerContext): void | Promise<void>;
   confirmSafeTurnSent(
@@ -621,9 +640,10 @@ export interface TurnBrokerOwner {
   beginCompletionFence(token: string, context?: TaskUpdateOwnerContext): number | undefined | Promise<number | undefined>;
   commitCompletionFence(token: string, revision: number, context?: TaskUpdateOwnerContext): boolean | Promise<boolean>;
   waitForRetirement(token: string, signal?: AbortSignal): Promise<BrokerRetirementFailure | undefined>;
-  revoke(token: string, reason?: Error, context?: TaskUpdateOwnerContext): void | Promise<void>;
-  revokeTrusted?(token: string, reason?: Error): void | Promise<void>;
-  taskUpdateState?(token: string): TaskUpdateState | undefined | Promise<TaskUpdateState | undefined>;
+  revoke(token: string, reason?: Error, context?: TaskUpdateOwnerContext, wait?: BrokerWaitOptions): void | Promise<void>;
+  /** The third slot is reserved for local retirement diagnostics, not a remote protocol. */
+  revokeTrusted?(token: string, reason?: Error, _reserved?: undefined, wait?: BrokerWaitOptions): void | Promise<void>;
+  taskUpdateState?(token: string, wait?: BrokerWaitOptions): TaskUpdateState | undefined | Promise<TaskUpdateState | undefined>;
   waitForTaskUpdateState?(token: string, afterRevision: number, signal?: AbortSignal): Promise<TaskUpdateStateSnapshot>;
   reserveTaskUpdate?(token: string, transferId: string, payloadDigest: string, context: TaskUpdateOwnerContext, requireOpenBoundary?: boolean): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
   acceptTaskUpdate?(token: string, transfer: TaskUpdateTransfer): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
@@ -631,7 +651,7 @@ export interface TurnBrokerOwner {
   taskUpdateTransferOutcome?(token: string, transferId: string): TaskUpdateTransferOutcome | Promise<TaskUpdateTransferOutcome>;
   checkFinalOutputCandidate?(token: string, context: TaskUpdateOwnerContext): void | Promise<void>;
   beginFinalOutput?(token: string, context: TaskUpdateOwnerContext): TaskOutputReceipt | Promise<TaskOutputReceipt>;
-  taskOutputReceipt?(token: string): TaskOutputReceipt | undefined | Promise<TaskOutputReceipt | undefined>;
+  taskOutputReceipt?(token: string, wait?: BrokerWaitOptions): TaskOutputReceipt | undefined | Promise<TaskOutputReceipt | undefined>;
 }
 
 /**
@@ -668,15 +688,16 @@ export class TurnBroker implements TurnBrokerOwner {
   private readonly channels = new Map<string, TurnChannel>();
   private readonly reuseBaselines = new Map<string, ContextReuseBaseline>();
   private readonly completedReuse = new Map<string, { evidence: ContextReuseDeliveryEvidence; recovery: RuntimeRecoveryReference; expiresAt: number }>();
-  private readonly retiredContextUsage = new Map<string, { evidence: ContextUsageEvidence; expiresAt: number }>();
+  private readonly retiredContextUsage = new Map<string, { evidence: ContextUsageEvidence; expiresAt: number;
+    ordinaryExpired: boolean; compactionDeadline: CompactionDeadline }>();
   private readonly pending = new Map<string, TurnChannel>();
   private readonly compactionTransactions = new CompactionTransactionStore(token => {
     const binding = this.compactionContextBindings.get(token);
-    if (binding) this.revokeCompactionContext(binding.readToken);
+    if (binding?.readToken) this.revokeCompactionContext(binding.readToken);
     this.compactionContextBindings.delete(token);
   });
-  private readonly compactionContextBindings = new Map<string, { readToken: string; handoffId: string; contract: "native" | "safe" }>();
-  private readonly compactionContexts = new Map<string, { scope: ContextScope; registration: CompactionContextRegistration; ownerContext?: TaskUpdateOwnerContext; deliveryReceiptId: string; timer: ReturnType<typeof setTimeout> }>();
+  private readonly compactionContextBindings = new Map<string, CompactionContextBinding>();
+  private readonly compactionContexts = new Map<string, { scope: ContextScope; registration: CompactionContextRegistration; ownerContext?: TaskUpdateOwnerContext; deliveryReceiptId: string; stopDeadline: () => void }>();
   private readonly bindings = new Map<string, { token: string; channel: TurnChannel }>();
   // The Codex context replayed into ChatGPT still carries the handles of finished turns, so a model
   // can present one. Remembering which turn retired a handle is what separates "you are holding a
@@ -821,7 +842,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.pending.set(token, channel);
     const enforceDeadline = (): void => {
       if (this.channels.get(token) !== channel || channel.authority.expiresAt === undefined) return;
-      const remaining = channel.authority.expiresAt - Date.now();
+      const remaining = channel.compactionDeadline?.remainingMs() ?? channel.authority.expiresAt - Date.now();
       if (remaining <= 0) {
         this.revokeTrusted(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
         return;
@@ -839,7 +860,7 @@ export class TurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
-    optionsOrExternalOwner: { requireSentConfirmation?: boolean; externalOwner?: boolean } & TaskUpdateRegistrationOptions | boolean = {},
+    optionsOrExternalOwner: { requireSentConfirmation?: boolean; externalOwner?: boolean; compaction?: true } & TaskUpdateRegistrationOptions | boolean = {},
   ): Promise<string> {
     const options = typeof optionsOrExternalOwner === "boolean"
       ? { externalOwner: optionsOrExternalOwner }
@@ -847,7 +868,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const requireSentConfirmation = options.requireSentConfirmation !== false;
     const externalOwner = options.externalOwner === true;
     assertSurfaceNonce(surfaceNonce);
-    const token = await this.register(environment, ttlMs, traceId, { externalOwner, taskUpdateProtocol: options.taskUpdateProtocol, recovery: options.recovery, recoveryTaskUpdateSources: options.recoveryTaskUpdateSources }, "request");
+    const token = await this.register(environment, ttlMs, traceId, { externalOwner, taskUpdateProtocol: options.taskUpdateProtocol, recovery: options.recovery, recoveryTaskUpdateSources: options.recoveryTaskUpdateSources }, options.compaction ? "request_compaction" : "request");
     const channel = this.channels.get(token);
     if (!channel) throw new Error("Zero Risk turn registration was revoked before initialization");
     channel.safe = {
@@ -1040,16 +1061,29 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!record) return;
     this.revokeTrusted(record.turnToken, contextError("CONTEXT_RETIRED", "Connector verification ended"));
   }
-  contextUsage(token: string): ContextUsageEvidence | undefined {
+  contextUsage(token: string, wait?: BrokerWaitOptions): ContextUsageEvidence | undefined {
     const scope = this.channels.get(token)?.contextScope ?? this.compactionContexts.get(token)?.scope;
     const retired = this.retiredContextUsage.get(token);
-    if (retired && retired.expiresAt <= Date.now()) this.retiredContextUsage.delete(token);
-    const evidence = scope?.usageEvidence() ?? (retired && retired.expiresAt > Date.now() ? retired.evidence : undefined);
+    let retained: ContextUsageEvidence | undefined;
+    if (retired) {
+      retired.ordinaryExpired ||= retired.expiresAt <= Date.now();
+      const compactionLive = retired.compactionDeadline.remainingMs() > 0;
+      // This digest-only accounting record cannot authorize source reads or tools.
+      // Ordinary callers keep the original wall-clock retention. Compaction has
+      // the same fixed duration, excluding only pauses detected in this process.
+      if (wait?.compaction || retired.evidence.purpose === "compaction") {
+        if (compactionLive) retained = retired.evidence;
+      } else if (!retired.ordinaryExpired) retained = retired.evidence;
+      if (retired.ordinaryExpired && !compactionLive) this.retiredContextUsage.delete(token);
+    }
+    const evidence = scope?.usageEvidence() ?? retained;
     return evidence ? structuredClone(evidence) : undefined;
   }
-  releaseContextUsage(token: string): void { this.retiredContextUsage.delete(token); }
+  releaseContextUsage(token: string, _wait?: BrokerWaitOptions): void { this.retiredContextUsage.delete(token); }
   private retainContextUsage(token: string, scope: ContextScope): void {
-    this.retiredContextUsage.set(token, { evidence: scope.usageEvidence(true), expiresAt: Date.now() + 300_000 });
+    const expiresAt = Date.now() + 300_000;
+    this.retiredContextUsage.set(token, { evidence: scope.usageEvidence(true), expiresAt,
+      ordinaryExpired: false, compactionDeadline: new CompactionDeadline(expiresAt) });
     while (this.retiredContextUsage.size > MAX_RETIRED_TURN_HANDLES) this.retiredContextUsage.delete(this.retiredContextUsage.keys().next().value!);
   }
   private retireTurnContext(token: string, channel: TurnChannel, successful = false): void {
@@ -1078,14 +1112,13 @@ export class TurnBroker implements TurnBrokerOwner {
     if (channel.contextScope?.inFlight) throw contextError("CONTEXT_BUSY", "Wait for in-flight context returns before final output");
   }
 
-  registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): CompactionContextHandle {
+  private assertCompactionBudgetOwner(registration: CompactionBudgetIdentity, context?: TaskUpdateOwnerContext): string {
     if (registration.recovery) assertRecoveryWriter(registration.recovery);
-    for (const [submissionToken, binding] of this.compactionContextBindings) if (binding.contract === "native" && !this.compactionTransactions.isActive(submissionToken, binding.handoffId)) {
-      this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
+    if (!Number.isSafeInteger(registration.historyRevision) || registration.historyRevision < 0
+      || typeof registration.ownerGeneration !== "string" || !registration.ownerGeneration || registration.ownerGeneration.length > 256
+      || typeof registration.handoffId !== "string" || !registration.handoffId || registration.handoffId.length > 256) {
+      throw contextError("CONTEXT_INVALID", "Invalid compaction source identity");
     }
-    if (this.compactionContexts.size >= 16 || this.compactionContextBindings.size >= 64) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded compaction source limit was reached");
-    if (!Number.isSafeInteger(registration.historyRevision) || registration.historyRevision < 0 || typeof registration.ownerGeneration !== "string" || !registration.ownerGeneration || registration.ownerGeneration.length > 256
-      || !Number.isFinite(registration.expiresAt) || registration.expiresAt <= Date.now() || registration.expiresAt > Date.now() + 300_000) throw contextError("CONTEXT_INVALID", "Invalid compaction source binding or deadline");
     if (registration.contract === "native") {
       if (registration.explicitManual !== undefined) throw contextError("CONTEXT_INVALID", "Manual preparation requires the Zero Risk contract");
       if (registration.turnToken || !registration.transactionToken || !this.compactionTransactions.isActive(registration.transactionToken, registration.handoffId)) throw contextError("CONTEXT_INVALID", "A live compaction transaction is required");
@@ -1100,12 +1133,65 @@ export class TurnBroker implements TurnBrokerOwner {
         }
       } else if (channel.safe?.state !== "running") throw contextError("CONTEXT_INVALID", "The Zero Risk reply must already be active");
     } else throw contextError("CONTEXT_INVALID", "Invalid compaction mode");
+    return taskUpdateDigest({ contract: registration.contract, transactionToken: registration.transactionToken,
+      turnToken: registration.turnToken, handoffId: registration.handoffId, historyRevision: registration.historyRevision,
+      ownerGeneration: registration.ownerGeneration, explicitManual: registration.explicitManual, recovery: registration.recovery,
+      ownerContext: context, registryGeneration: registration.turnToken ? this.channels.get(registration.turnToken)?.authority.registryGeneration : undefined });
+  }
+
+  /** Reserves only a source budget. It grants no read or ordinary tool permission. */
+  prepareCompactionContext(identity: CompactionBudgetIdentity, remainingMs: number, context?: TaskUpdateOwnerContext): CompactionBudgetHandle {
+    const fingerprint = this.assertCompactionBudgetOwner(identity, context);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0 || remainingMs > 300_000) throw contextError("CONTEXT_INVALID", "Invalid compaction source budget");
+    const submissionToken = identity.transactionToken ?? identity.turnToken!;
+    let binding = this.compactionContextBindings.get(submissionToken);
+    if (binding) {
+      if (!binding.budget || binding.budget.retired || binding.readToken || binding.budget.identity !== fingerprint) {
+        throw contextError("CONTEXT_INVALID", "The compaction source budget cannot be replaced");
+      }
+    } else {
+      if (this.compactionContextBindings.size >= 64) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded compaction source limit was reached");
+      const parentRemaining = identity.transactionToken ? this.compactionTransactions.remainingMs(identity.transactionToken, identity.handoffId) : remainingMs;
+      binding = { handoffId: identity.handoffId, contract: identity.contract,
+        budget: { token: opaqueId("compaction_budget"), identity: fingerprint, retired: false,
+          deadline: new CompactionDeadline(Date.now() + Math.min(remainingMs, parentRemaining)) } };
+      this.compactionContextBindings.set(submissionToken, binding);
+    }
+    const remaining = binding.budget!.deadline.remainingMs();
+    if (remaining <= 0) { binding.budget!.retired = true; throw contextError("CONTEXT_RETIRED", "The original compaction source budget expired"); }
+    return { budgetToken: binding.budget!.token, remainingMs: remaining };
+  }
+
+  registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext,
+    _currentDeadline?: () => number, claim?: CompactionBudgetClaim): CompactionContextHandle {
+    const fingerprint = this.assertCompactionBudgetOwner(registration, context);
+    for (const [submissionToken, binding] of this.compactionContextBindings) if (binding.contract === "native" && !this.compactionTransactions.isActive(submissionToken, binding.handoffId)) {
+      if (binding.readToken) this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
+    }
+    const existingBinding = this.compactionContextBindings.get(registration.transactionToken ?? registration.turnToken!);
+    if (this.compactionContexts.size >= 16 || !existingBinding && this.compactionContextBindings.size >= 64) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded compaction source limit was reached");
+    if (claim) {
+      const budget = existingBinding?.budget;
+      if (!budget || budget.retired || existingBinding!.readToken || budget.token !== claim.budgetToken || budget.identity !== fingerprint
+        || !Number.isFinite(claim.deadlineDebitMs) || claim.deadlineDebitMs < 0 || claim.deadlineDebitMs > 300_000) {
+        throw contextError("CONTEXT_INVALID", "The compaction source budget claim is invalid or consumed");
+      }
+      // Consume before source cloning/validation. A failed registration cannot get a new budget.
+      budget.retired = true;
+      const remaining = budget.deadline.remainingMs() - claim.deadlineDebitMs;
+      if (remaining <= 0) throw contextError("CONTEXT_RETIRED", "The original compaction source budget expired");
+      registration = { ...registration, expiresAt: Date.now() + remaining };
+    } else if (existingBinding) throw contextError("CONTEXT_INVALID", "The compaction source binding cannot be replaced");
+    if (!Number.isFinite(registration.expiresAt) || registration.expiresAt <= Date.now() || registration.expiresAt > Date.now() + 300_000) {
+      throw contextError("CONTEXT_INVALID", "Invalid compaction source deadline");
+    }
     for (const record of this.compactionContexts.values()) if ((registration.transactionToken && record.registration.transactionToken === registration.transactionToken)
       || (registration.turnToken && record.registration.turnToken === registration.turnToken)) throw contextError("CONTEXT_INVALID", "The compaction attempt already has a source binding");
     this.assertContextStorage(registration.snapshot.storage_bytes);
     const submissionToken = registration.transactionToken ?? registration.turnToken!;
-    if (this.compactionContextBindings.has(submissionToken)) throw contextError("CONTEXT_INVALID", "The compaction source binding cannot be replaced");
+    const deadline = new CompactionDeadline(registration.expiresAt);
     const snapshot = restoreContextSnapshot(serializeContextSnapshot(registration.snapshot));
+    registration = { ...registration, expiresAt: deadline.deadlineAt };
     if (snapshot.targets.some(target => !target.read_ref)) throw contextError("CONTEXT_SOURCE_UNAVAILABLE", "Every compaction source target must remain readable");
     const token = opaqueId("compaction");
     const deliveryByTarget = Object.fromEntries(snapshot.targets.map(target => [target.target_id, { delivery: "on_demand_source", required: false, ...(target.kind === "image" ? { media_route: "mcp" as const } : {}) }]));
@@ -1113,11 +1199,15 @@ export class TurnBroker implements TurnBrokerOwner {
       limits: registration.limits, remainingBudget: registration.remainingBudget }, "compaction", () => {
         if (registration.turnToken) { const channel = this.channels.get(registration.turnToken); if (channel) channel.activityRevision += 1; }
       }, () => this.revokeCompactionContext(token), registration.expiresAt);
-    const timer = setTimeout(() => this.revokeCompactionContext(token), registration.expiresAt - Date.now()); timer.unref?.();
-    this.compactionContextBindings.set(submissionToken, { readToken: token, handoffId: registration.handoffId, contract: registration.contract });
-    this.compactionContexts.set(token, { scope, registration: { ...registration, snapshot }, ownerContext: context ? structuredClone(context) : undefined, deliveryReceiptId: opaqueId("context_control"), timer });
+    if (deadline.remainingMs() <= 0) { scope.retire(); throw contextError("CONTEXT_RETIRED", "The compaction source expired during registration"); }
+    this.compactionContextBindings.set(submissionToken, { ...existingBinding, readToken: token, handoffId: registration.handoffId, contract: registration.contract });
+    const record = { scope, registration: { ...registration, snapshot }, ownerContext: context ? structuredClone(context) : undefined,
+      deliveryReceiptId: opaqueId("context_control"), stopDeadline: () => {} };
+    this.compactionContexts.set(token, record);
+    record.stopDeadline = deadline.watch(() => this.revokeCompactionContext(token));
     if (registration.explicitManual) {
       const channel = this.channels.get(registration.turnToken!)!;
+      channel.compactionDeadline = deadline;
       channel.compactionRequested = true;
       channel.compactionResult = contextFailure("CONTEXT_COMPACTION_READ_ONLY", "This explicit manual compaction request allows only source navigation and its original summary completion");
     }
@@ -1148,13 +1238,22 @@ export class TurnBroker implements TurnBrokerOwner {
   }
   revokeCompactionContext(token: string): void {
     const record = this.compactionContexts.get(token);
-    if (!record) return;
+    if (!record) {
+      for (const binding of this.compactionContextBindings.values()) if (binding.budget?.token === token) {
+        binding.budget.retired = true;
+        // The registration may have committed before its socket reply was lost.
+        if (binding.readToken) this.revokeCompactionContext(binding.readToken);
+      }
+      return;
+    }
     this.retainContextUsage(token, record.scope);
-    clearTimeout(record.timer); record.scope.retire(); this.compactionContexts.delete(token);
+    record.stopDeadline(); record.scope.retire(); this.compactionContexts.delete(token);
   }
 
   private compactionScopeForSubmission(token: string): [string, ContextScope] | undefined {
-    const readToken = this.compactionContextBindings.get(token)?.readToken;
+    const binding = this.compactionContextBindings.get(token);
+    const readToken = binding?.readToken;
+    if (binding && !readToken) throw contextError("CONTEXT_NOT_READY", "The compaction source registration has not completed");
     if (!readToken) return undefined;
     this.guardCompactionContextCommit(readToken);
     return [readToken, this.compactionContexts.get(readToken)!.scope];
@@ -1255,7 +1354,7 @@ export class TurnBroker implements TurnBrokerOwner {
   revokeCompactionTransactions(traceId: string): void {
     this.compactionTransactions.abortTrace(traceId);
     for (const [submissionToken, binding] of this.compactionContextBindings) if (binding.contract === "native" && !this.compactionTransactions.isActive(submissionToken, binding.handoffId)) {
-      this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
+      if (binding.readToken) this.revokeCompactionContext(binding.readToken); this.compactionContextBindings.delete(submissionToken);
     }
   }
 
@@ -1741,7 +1840,7 @@ export class TurnBroker implements TurnBrokerOwner {
     return structuredClone(updates.outputReceipt);
   }
 
-  taskOutputReceipt(token: string): TaskOutputReceipt | undefined {
+  taskOutputReceipt(token: string, _wait?: BrokerWaitOptions): TaskOutputReceipt | undefined {
     this.prune();
     const updates = this.channels.get(token)?.taskUpdates ?? this.retiredTaskUpdates.get(token);
     const receipt = updates?.completionReceipt ?? updates?.outputReceipt;
@@ -2090,7 +2189,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (safe.state === "revoked") throw new Error("Zero Risk turn is already terminal");
     if (safe.state !== "running") throw new Error("Zero Risk turn has not started");
-    const compactionScope = channel.compactionRequested ? this.compactionScopeForSubmission(requestId) : undefined;
+    const compactionScope = this.compactionScopeForSubmission(requestId);
     if (!channel.compactionRequested) this.assertContextReady(channel);
     if (channel.invocations.size > 0) {
       throw new Error(`Zero Risk turn cannot complete with ${channel.invocations.size} pending Codex tool invocation(s)`);
@@ -2151,14 +2250,14 @@ export class TurnBroker implements TurnBrokerOwner {
     return this.waitForSafeState(safe.completionWaiters, signal, "Zero Risk turn completion wait aborted");
   }
 
-  revoke(token: string, reason = new Error("Codex turn binding was revoked"), context?: TaskUpdateOwnerContext): void {
+  revoke(token: string, reason = new Error("Codex turn binding was revoked"), context?: TaskUpdateOwnerContext, _wait?: BrokerWaitOptions): void {
     const channel = this.channels.get(token);
     if (!channel) return;
     this.assertDriver(channel, context);
     this.revokeTrusted(token, reason);
   }
 
-  revokeTrusted(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure): void {
+  revokeTrusted(token: string, reason = new Error("Codex turn binding was revoked"), failure?: BrokerRetirementFailure, _wait?: BrokerWaitOptions): void {
     const channel = this.channels.get(token);
     if (!channel) return;
     if (channel.verificationPair) this.retireContextVerification(channel.verificationPair);
@@ -2374,6 +2473,7 @@ export class TurnBroker implements TurnBrokerOwner {
         if (updates.state.acknowledgementDirectory) this.removeAcknowledgementDirectory(updates.state.acknowledgementDirectory);
       }
       this.retiredTaskUpdates.clear();
+      this.retiredContextUsage.clear();
       for (const directory of this.pendingAcknowledgementCleanup) this.removeAcknowledgementDirectory(directory);
       await this.closeEndpoint();
     }).then(() => {
@@ -2862,7 +2962,7 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_context_reuse_commit","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_observer_attach", "owner_observer_detach", "owner_task_input_boundary", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
+    if (!["owner_context_verification_arm","owner_context_verification_delivered","owner_context_verification_status","owner_context_verification_revoke","owner_compaction_transaction_begin","owner_compaction_transaction_abort","context_query","context_return","context_return_check","context_control_return","owner_context_register","owner_context_select","owner_context_discard_unselected","owner_context_sent","owner_context_attachments","owner_context_status","owner_context_usage","owner_context_usage_release","owner_context_reuse_commit","owner_compaction_context_prepare","owner_compaction_context_register","owner_compaction_context_delivered","owner_compaction_context_guard","owner_compaction_context_commit","owner_compaction_context_revoke","claim", "resolve", "release", "invoke", "owner_status", "owner_recovery_retire", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_observer_attach", "owner_observer_detach", "owner_task_input_boundary", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff", "dev_long_wait_probe_start", "dev_long_wait_probe_wait", "native_operation_start", "native_operation_wait", "owner_native_waiting", "owner_task_update_state", "owner_task_update_observe", "owner_task_update_reserve", "owner_task_update_accept", "owner_task_update_reject", "owner_task_update_outcome", "owner_final_output_check", "owner_final_output_begin", "owner_output_receipt", "owner_revoke_trusted", "task_update_ack"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -2900,9 +3000,13 @@ export class TurnBroker implements TurnBrokerOwner {
             compactionSnapshot: restoreContextSnapshot(registration.compactionSnapshot) }, request.ownerContext);
         } catch (error) { this.revokeTrusted(request.token); throw error; }
       }
+      if (request.method === "owner_compaction_context_prepare") {
+        if (!request.compactionBudgetIdentity || request.ttlMs === undefined) throw contextError("CONTEXT_INVALID", "Missing compaction source budget");
+        return this.prepareCompactionContext(request.compactionBudgetIdentity, request.ttlMs, request.ownerContext);
+      }
       if (request.method === "owner_compaction_context_register") {
         if (!request.compactionRegistration) throw contextError("CONTEXT_INVALID", "Missing compaction source registration");
-        return this.registerCompactionContext({ ...request.compactionRegistration, snapshot: restoreContextSnapshot(request.compactionRegistration.snapshot) }, request.ownerContext);
+        return this.registerCompactionContext({ ...request.compactionRegistration, snapshot: restoreContextSnapshot(request.compactionRegistration.snapshot) }, request.ownerContext, undefined, request.compactionBudgetClaim);
       }
       if (!request.token) throw contextError("CONTEXT_INVALID", "Missing context owner");
       switch (request.method) {
@@ -2917,7 +3021,9 @@ export class TurnBroker implements TurnBrokerOwner {
         case "owner_context_sent": this.markContextPlanSent(request.token, request.planId!, request.ownerContext); break;
         case "owner_context_attachments": this.confirmContextAttachments(request.token, { planId: request.planId!, manifestDigest: request.manifestDigest! }, request.ownerContext); break;
         case "owner_context_status": return { status: this.contextStatus(request.token) ?? null };
-        case "owner_context_usage": return { usage: this.contextUsage(request.token) ?? null };
+        case "owner_context_usage":
+          if (request.compaction !== undefined && request.compaction !== true) throw contextError("CONTEXT_INVALID", "Invalid usage accounting purpose");
+          return { usage: this.contextUsage(request.token, request.compaction ? { compaction: true } : undefined) ?? null };
         case "owner_context_reuse_commit": return { baseline: this.commitContextReuse(request.token) ?? null };
         case "owner_context_usage_release": this.releaseContextUsage(request.token); break;
         case "owner_compaction_context_delivered": this.markCompactionContextDelivered(request.token); break;
@@ -2940,6 +3046,7 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       const safeControl = request.credentialKind === "ordinary" && this.compactionContextBindings.get(request.token);
       if (safeControl && request.contract === "safe") {
+        if (!safeControl.readToken) throw contextError("CONTEXT_NOT_READY", "The compaction source registration has not completed");
         const record = this.compactionContext(safeControl.readToken);
         if (record.deliveryReceiptId === request.receiptId) return { active: true };
       }
@@ -3098,6 +3205,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "owner_register_safe") {
       const environment = ownerCapability(request.environment);
+      if (request.compaction !== undefined && request.compaction !== true) throw new Error("Invalid Safe compaction purpose");
       assertSurfaceNonce(request.surfaceNonce);
       if (request.requireSentConfirmation !== undefined
         && typeof request.requireSentConfirmation !== "boolean") {
@@ -3113,6 +3221,7 @@ export class TurnBroker implements TurnBrokerOwner {
         request.traceId,
         {
           requireSentConfirmation: request.requireSentConfirmation !== false,
+          ...(request.compaction ? { compaction: true as const } : {}),
           externalOwner: true,
           taskUpdateProtocol: request.taskUpdateProtocol as 1 | undefined,
           recovery: request.recovery,
@@ -3710,7 +3819,8 @@ export class TurnBroker implements TurnBrokerOwner {
   private prune(): void {
     const now = Date.now();
     for (const [token, channel] of this.channels) {
-      if (channel.authority.expiresAt === undefined || channel.authority.expiresAt > now) continue;
+      if (channel.compactionDeadline ? channel.compactionDeadline.remainingMs() > 0
+        : channel.authority.expiresAt === undefined || channel.authority.expiresAt > now) continue;
       this.revokeTrusted(token, new NativeOperationError("codex_tool_native_deadline", "The Native turn deadline was reached"));
     }
   }
@@ -3729,11 +3839,25 @@ export class TurnBrokerTimeoutError extends Error {
   }
 }
 
+function compactionRpcWait(request: Omit<BrokerRequest, "id">, wait?: BrokerWaitOptions): boolean {
+  if (wait?.compaction || request.method.startsWith("owner_compaction_") || request.method === "submit_compaction_handoff"
+    || request.method === "context_control_return" || request.method === "owner_register_safe" && request.compaction === true) return true;
+  if (["context_query", "context_return", "context_return_check"].includes(request.method)
+    && request.credentialKind === "compaction" && /^compaction_[A-Za-z0-9_-]{32}$/.test(request.token ?? "")) return true;
+  if (["owner_context_usage", "owner_context_usage_release"].includes(request.method)
+    && /^compaction_[A-Za-z0-9_-]{32}$/.test(request.token ?? "")) return true;
+  // Fresh Safe compaction has a dedicated opaque reference. The marker selects
+  // only the transport clock; every owner/source/permission check still runs.
+  return /^request_compaction_[A-Za-z0-9_-]{32}$/.test(request.token ?? "")
+    && ["safe_start", "owner_safe_sent", "owner_revoke", "owner_revoke_trusted"].includes(request.method);
+}
+
 export async function callTurnBroker<T>(
   socketPath: string,
   request: Omit<BrokerRequest, "id">,
   timeoutMs: number | null = 5_000,
   signal?: AbortSignal,
+  wait?: BrokerWaitOptions,
 ): Promise<T> {
   const id = opaqueId("request");
   const settleOnResponseFrame = timeoutMs === null;
@@ -3749,15 +3873,16 @@ export async function callTurnBroker<T>(
     let bufferedChars = 0;
     let settled = false;
     let response: BrokerResponse | undefined;
+    let stopWait = () => {};
     const onAbort = () => finishError(new DOMException("ChatGPT web turn broker call aborted", "AbortError"));
     const cleanup = () => {
+      stopWait();
       fragments.length = 0;
       signal?.removeEventListener("abort", onAbort);
     };
     const finishError = (error: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
       cleanup();
       socket.destroy();
       rejectCall(error);
@@ -3769,7 +3894,6 @@ export async function callTurnBroker<T>(
         return;
       }
       settled = true;
-      clearTimeout(timer);
       cleanup();
       if (response.error) {
         rejectCall(response.errorKind === "recovery_writer_retired" ? withRetiredWriterReason(new Error(response.error))
@@ -3780,14 +3904,6 @@ export async function callTurnBroker<T>(
       }
       else resolveCall(response.result as T);
     };
-    const timer = timeoutMs === null
-      ? undefined
-      : setTimeout(() => finishError(new TurnBrokerTimeoutError()), timeoutMs);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) {
-      finishError(new DOMException("ChatGPT web turn broker call aborted", "AbortError"));
-      return;
-    }
     socket.setEncoding("utf8");
     socket.once("error", error => finishError(Object.assign(
       new Error(`ChatGPT web turn broker unavailable: ${error.message}`, { cause: error }),
@@ -3796,6 +3912,21 @@ export async function callTurnBroker<T>(
     // The server owns response termination. Waiting for the pipe/socket to close before resolving
     // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
     socket.once("close", finishResponse);
+    if (timeoutMs !== null) {
+      const expired = () => finishError(new TurnBrokerTimeoutError());
+      if (compactionRpcWait(request, wait)) stopWait = new CompactionDeadline(Date.now() + timeoutMs).watch(expired);
+      else {
+        const timer = setTimeout(expired, timeoutMs);
+        stopWait = () => clearTimeout(timer);
+      }
+    }
+    // watch may synchronously reject an already exhausted finite wait.
+    if (settled) return;
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      finishError(new DOMException("ChatGPT web turn broker call aborted", "AbortError"));
+      return;
+    }
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", (chunk: string) => {
       if (settled || response) return;
@@ -3906,15 +4037,40 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
   async contextStatus(token: string): Promise<ContextStatus | undefined> {
     const result = await callTurnBroker<{ status: ContextStatus | null }>(this.socketPath, { method: "owner_context_status", token, contextProtocol: CONTEXT_PROTOCOL_VERSION }); return result.status ?? undefined;
   }
-  async contextUsage(token: string): Promise<ContextUsageEvidence | undefined> {
-    const result = await callTurnBroker<{ usage: ContextUsageEvidence | null }>(this.socketPath, { method: "owner_context_usage", token, contextProtocol: CONTEXT_PROTOCOL_VERSION }); return result.usage ?? undefined;
+  async contextUsage(token: string, wait?: BrokerWaitOptions): Promise<ContextUsageEvidence | undefined> {
+    const result = await callTurnBroker<{ usage: ContextUsageEvidence | null }>(this.socketPath, { method: "owner_context_usage", token, contextProtocol: CONTEXT_PROTOCOL_VERSION,
+        ...(wait?.compaction ? { compaction: true as const } : {}) }, 5_000, undefined, wait); return result.usage ?? undefined;
   }
-  async releaseContextUsage(token: string): Promise<void> {
-    await callTurnBroker(this.socketPath, { method: "owner_context_usage_release", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
+  async releaseContextUsage(token: string, wait?: BrokerWaitOptions): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_context_usage_release", token, contextProtocol: CONTEXT_PROTOCOL_VERSION }, 5_000, undefined, wait);
   }
-  registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext): Promise<CompactionContextHandle> {
-    return callTurnBroker(this.socketPath, { method: "owner_compaction_context_register", contextProtocol: CONTEXT_PROTOCOL_VERSION,
-      compactionRegistration: { ...registration, snapshot: serializeContextSnapshot(registration.snapshot) }, ownerContext: context });
+  async registerCompactionContext(registration: CompactionContextRegistration, context?: TaskUpdateOwnerContext,
+    currentDeadline?: () => number): Promise<CompactionContextHandle> {
+    const localBudget = currentDeadline ? undefined : new CompactionDeadline(registration.expiresAt);
+    const initialRemaining = registration.expiresAt - Date.now();
+    if (!Number.isFinite(initialRemaining) || initialRemaining <= 0 || initialRemaining > 300_000) throw contextError("CONTEXT_INVALID", "Invalid compaction source deadline");
+    const { contract, transactionToken, turnToken, handoffId, historyRevision, ownerGeneration, explicitManual, recovery } = registration;
+    const prepared = await callTurnBroker<CompactionBudgetHandle>(this.socketPath, {
+      method: "owner_compaction_context_prepare", contextProtocol: CONTEXT_PROTOCOL_VERSION, ttlMs: initialRemaining,
+      compactionBudgetIdentity: { contract, transactionToken, turnToken, handoffId, historyRevision, ownerGeneration, explicitManual, recovery }, ownerContext: context,
+    });
+    try {
+      if (typeof prepared.budgetToken !== "string" || !Number.isFinite(prepared.remainingMs) || prepared.remainingMs <= 0 || prepared.remainingMs > 300_000) {
+        throw contextError("CONTEXT_INVALID", "Invalid owner compaction budget");
+      }
+      // The owner began this budget before replying. Any response transit is
+      // conservatively charged; later request transit is charged by its live clock.
+      const mirror = new CompactionDeadline(Date.now() + prepared.remainingMs);
+      const remaining = currentDeadline ? currentDeadline() - Date.now() : localBudget!.remainingMs();
+      if (!Number.isFinite(remaining) || remaining <= 0) throw contextError("CONTEXT_RETIRED", "The original compaction source budget expired");
+      const deadlineDebitMs = Math.max(0, mirror.remainingMs() - remaining);
+      return await callTurnBroker(this.socketPath, { method: "owner_compaction_context_register", contextProtocol: CONTEXT_PROTOCOL_VERSION,
+        compactionRegistration: { ...registration, snapshot: serializeContextSnapshot(registration.snapshot) },
+        compactionBudgetClaim: { budgetToken: prepared.budgetToken, deadlineDebitMs }, ownerContext: context });
+    } catch (error) {
+      if (typeof prepared.budgetToken === "string") await this.revokeCompactionContext(prepared.budgetToken).catch(() => {});
+      throw error;
+    }
   }
   async markCompactionContextDelivered(token: string): Promise<void> {
     await callTurnBroker(this.socketPath, { method: "owner_compaction_context_delivered", token, contextProtocol: CONTEXT_PROTOCOL_VERSION });
@@ -3957,16 +4113,16 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
-  async assertRecoveryFencing(): Promise<void> {
-    const status = await callTurnBroker<{ protocolVersion?: number; recoveryProtocol?: number }>(this.socketPath, { method: "owner_status" });
+  async assertRecoveryFencing(wait?: BrokerWaitOptions): Promise<void> {
+    const status = await callTurnBroker<{ protocolVersion?: number; recoveryProtocol?: number }>(this.socketPath, { method: "owner_status" }, 5_000, undefined, wait);
     if (status.protocolVersion !== TURN_BROKER_PROTOCOL_VERSION || status.recoveryProtocol !== 2) {
       throw new NativeOperationError("continuity_configuration_conflict", "The running Broker does not support execution generation fencing; update and restart it.");
     }
   }
 
-  async retireRecoveryWriter(reference: RuntimeRecoveryReference): Promise<boolean> {
-    await this.assertRecoveryFencing();
-    const reply = await callTurnBroker<{ writerRetired?: boolean }>(this.socketPath, { method: "owner_recovery_retire", recovery: reference });
+  async retireRecoveryWriter(reference: RuntimeRecoveryReference, wait?: BrokerWaitOptions): Promise<boolean> {
+    await this.assertRecoveryFencing(wait);
+    const reply = await callTurnBroker<{ writerRetired?: boolean }>(this.socketPath, { method: "owner_recovery_retire", recovery: reference }, 5_000, undefined, wait);
     return reply.writerRetired === true;
   }
 
@@ -3992,11 +4148,12 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     surfaceNonce: string,
     ttlMs?: number,
     traceId = "unknown",
-    options: { requireSentConfirmation?: boolean } & TaskUpdateRegistrationOptions = {},
+    options: { requireSentConfirmation?: boolean; compaction?: true } & TaskUpdateRegistrationOptions = {},
   ): Promise<string> {
     assertSurfaceNonce(surfaceNonce);
     const response = await callTurnBroker<{ token?: unknown; recoveryProtocol?: number }>(this.socketPath, {
       method: "owner_register_safe",
+      ...(options.compaction ? { compaction: true as const } : {}),
       environment,
       surfaceNonce,
       requireSentConfirmation: options.requireSentConfirmation !== false,
@@ -4164,16 +4321,16 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return response.failure;
   }
 
-  async revoke(token: string, _reason?: Error, context?: TaskUpdateOwnerContext): Promise<void> {
-    await callTurnBroker(this.socketPath, { method: "owner_revoke", token, ownerContext: context });
+  async revoke(token: string, _reason?: Error, context?: TaskUpdateOwnerContext, wait?: BrokerWaitOptions): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_revoke", token, ownerContext: context }, 5_000, undefined, wait);
   }
 
-  async revokeTrusted(token: string, reason?: Error): Promise<void> {
-    await callTurnBroker(this.socketPath, { method: "owner_revoke_trusted", token, cancelled: reason?.name === "AbortError" });
+  async revokeTrusted(token: string, reason?: Error, _reserved?: undefined, wait?: BrokerWaitOptions): Promise<void> {
+    await callTurnBroker(this.socketPath, { method: "owner_revoke_trusted", token, cancelled: reason?.name === "AbortError" }, 5_000, undefined, wait);
   }
 
-  async taskUpdateState(token: string): Promise<TaskUpdateState | undefined> {
-    const response = await callTurnBroker<{ state: TaskUpdateState | null }>(this.socketPath, { method: "owner_task_update_state", token });
+  async taskUpdateState(token: string, wait?: BrokerWaitOptions): Promise<TaskUpdateState | undefined> {
+    const response = await callTurnBroker<{ state: TaskUpdateState | null }>(this.socketPath, { method: "owner_task_update_state", token }, 5_000, undefined, wait);
     return response.state ?? undefined;
   }
 
@@ -4207,8 +4364,8 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     return callTurnBroker(this.socketPath, { method: "owner_final_output_begin", token, ownerContext: context });
   }
 
-  async taskOutputReceipt(token: string): Promise<TaskOutputReceipt | undefined> {
-    const response = await callTurnBroker<{ receipt: TaskOutputReceipt | null }>(this.socketPath, { method: "owner_output_receipt", token });
+  async taskOutputReceipt(token: string, wait?: BrokerWaitOptions): Promise<TaskOutputReceipt | undefined> {
+    const response = await callTurnBroker<{ receipt: TaskOutputReceipt | null }>(this.socketPath, { method: "owner_output_receipt", token }, 5_000, undefined, wait);
     return response.receipt ?? undefined;
   }
 }

@@ -14,6 +14,7 @@ import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
 import { CONTEXT_PROTOCOL_VERSION } from "./context-runtime";
 import { contextProtocolCapabilities } from "./context-protocol";
+import { CompactionDeadline } from "./compaction-deadline";
 
 interface RunMessage {
   type: "run";
@@ -144,13 +145,13 @@ const sendActivationWaiters = new Map<string, {
 }>();
 const submissionReceiptWaiters = new Map<string, {
   promise: Promise<void>;
-  timer: ReturnType<typeof setTimeout>;
+  stopTimeout: () => void;
   resolve: () => void;
   reject: (error: Error) => void;
 }>();
 function clearSubmissionReceiptWaiter(id: string): ReturnType<typeof submissionReceiptWaiters.get> {
   const waiter = submissionReceiptWaiters.get(id);
-  if (waiter) clearTimeout(waiter.timer);
+  waiter?.stopTimeout();
   submissionReceiptWaiters.delete(id);
   return waiter;
 }
@@ -325,7 +326,7 @@ async function run(message: RunMessage): Promise<void> {
       message: "Browser helper did not finish the aborted turn",
       ...(recovery ? { recovery } : {}),
       ...(message.turn.recoveryStoreDirectory ? { recoveryStoreDirectory: message.turn.recoveryStoreDirectory } : {}),
-    });
+    }, undefined, undefined, { compaction: message.turn.compaction });
   } };
   runControls.set(message.id, control);
   const assertActiveOutput = () => {
@@ -458,11 +459,18 @@ async function run(message: RunMessage): Promise<void> {
       // The real worker awaits this callback. Also retain a handled promise if a substituted
       // worker returns early, so run() can still enforce the terminal receipt barrier.
       void promise.catch(() => {});
-      const timer = setTimeout(() => {
+      const timedOut = () => {
         clearSubmissionReceiptWaiter(message.id)?.reject(new Error("Browser helper submission receipt acknowledgement timed out"));
-      }, 15_000);
-      timer.unref?.();
-      submissionReceiptWaiters.set(message.id, { promise, timer, resolve, reject });
+      };
+      let stopTimeout: () => void;
+      if (message.turn.compaction) {
+        stopTimeout = new CompactionDeadline(Date.now() + 15_000).watch(timedOut);
+      } else {
+        const timer = setTimeout(timedOut, 15_000);
+        timer.unref?.();
+        stopTimeout = () => clearTimeout(timer);
+      }
+      submissionReceiptWaiters.set(message.id, { promise, stopTimeout, resolve, reject });
       if (!writeTurnProtocol({ type: "event", id: message.id, event: "submitted" })) {
         clearSubmissionReceiptWaiter(message.id)?.reject(new Error("Browser helper could not persist ChatGPT submission evidence"));
       }

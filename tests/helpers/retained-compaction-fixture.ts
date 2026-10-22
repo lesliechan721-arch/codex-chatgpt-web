@@ -97,7 +97,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
     try {
       if (turn.nativeConnector) {
         expect(turn.capabilities.localToolsEnabled).toBe(false);
-        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+        const token = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
         const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
         expect(token).toBeDefined(); expect(handoffId).toBeDefined();
         await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId, summary });
