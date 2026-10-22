@@ -357,9 +357,10 @@ Packaging and smoke checks run in parallel with these jobs.
 
 The CI check `verify (windows-latest)` requires both shards, complete aggregate evidence
 and `Windows package and smoke` to succeed. Release publication also requires all five
-platform builds and the Windows aggregate to succeed. Failure, cancellation, a missing
-artifact or a skipped required job cannot satisfy these gates. Linux/macOS retain full
-verification, packaging, smoke and platform-specific signature or ABI checks.
+platform builds and both Windows and Intel aggregates to succeed. Failure, cancellation,
+a missing artifact or a skipped required job cannot satisfy these gates. Linux and ARM
+macOS retain single-job verification; all platforms retain packaging, smoke and their
+platform-specific signature or ABI checks.
 
 Manual CI accepts `windows_test_topology=single` to run the complete Windows suite in one
 job. The default is `sharded`. `test_workers=auto|2` uses two workers per test job; `1`
@@ -385,10 +386,32 @@ logs, completion records and shard 1's non-server stages. Only a successful aggr
 claims complete multi-job coverage. Windows checkouts preserve repository bytes before
 source hashes are computed.
 
-## Reviewed Windows skips
+## Intel release shards and independent measurements
+
+Release calls `intel-release.yml` at the same commit. Two `macos-15-intel` jobs each use
+two workers and cold allocation: shard 1 runs `verify --test-mode=timing --test-shard=1/2`,
+and shard 2 runs `test --mode=timing --shard=2/2`. A separate job builds and smoke-tests
+the Intel package, verifies both macOS signatures, and uploads `release-macos-15-intel`.
+The independent gate requires all three jobs and complete evidence before publication.
+
+For an Intel-only comparison, dispatch **Release test diagnostics** with
+`condition=intel-shards`. This condition ignores the other diagnostic inputs. It runs
+the exact reusable release workflow and an unsharded `verify --test-mode=timing` baseline
+at the same commit, both with two workers and no timing history. It does not publish a
+release. Compare the baseline verification time with the maximum of shard 1 verification
+and shard 2 testing; report package, gate and queue times separately. Keep every artifact,
+including failed runs. One comparison does not establish a stable speedup across runners.
+
+```sh
+gh workflow run windows-performance.yml --repo OWNER/REPO --ref BRANCH -f condition=intel-shards
+```
+
+## Reviewed platform skips
 
 `.github/windows-test-skips.json` stores each permitted Windows skip by test file, test
-name and reason, with a content hash for every source file. The gate checks those hashes
+name and reason, with a content hash for every source file. Intel uses the separate
+`.github/macos-intel-test-skips.json` policy, including Windows-only skips and the macOS
+tests that must run. The gate checks those hashes
 against its checkout, binds the policy to the current source, and requires the observed
 skip identities to match exactly. It never generates an allowlist from the current run.
 
@@ -404,7 +427,9 @@ bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts
 `jobs.json` contains the actual final states of `shard1`, `shard2` and `package`.
 The CLI binds evidence to `GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`,
 `GITHUB_REPOSITORY` and `CGW_TEST_WORKERS=1|2` (default 2). `--mode` defaults to `full`
-for standalone use. An explicitly supplied `--skip-evidence` retains the source-bound
+for standalone use. `--platform=win32|darwin` defaults to `win32`; `--arch=x64` binds
+both platforms to x64. The Intel gate explicitly selects `darwin` and its skip policy,
+so Windows or ARM evidence cannot satisfy it. An explicitly supplied `--skip-evidence` retains the source-bound
 version 1 evidence format; it cannot be combined with `--skip-policy`.
 
 Required-check settings are managed separately from workflow files. The CI retains

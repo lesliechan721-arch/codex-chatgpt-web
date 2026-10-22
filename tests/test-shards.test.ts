@@ -62,11 +62,14 @@ test("shard options reject ambiguous scope and preserve default full runs and wo
 test("aggregation options select full/timing and one explicit skip source", () => {
   const required = ["--artifacts=artifacts", "--job-results=jobs.json", "--output=gate.json"];
   expect(aggregateShardOptions(required).mode).toBe("full");
+  expect(aggregateShardOptions(required)).toMatchObject({ platform: "win32", arch: "x64" });
+  expect(aggregateShardOptions([...required, "--platform=darwin", "--arch=x64"])).toMatchObject({ platform: "darwin", arch: "x64" });
   expect(aggregateShardOptions([...required, "--mode=timing", "--skip-policy=.github/windows-test-skips.json"])).toMatchObject({
     mode: "timing", "skip-policy": join(process.cwd(), ".github/windows-test-skips.json"),
   });
   expect(aggregateShardOptions([...required, "--mode=full"]).mode).toBe("full");
   for (const extra of [["--mode=other"], ["--mode=timing", "--mode=timing"], ["--mode="],
+    ["--platform=linux"], ["--arch=arm64"], ["--platform=darwin", "--platform=darwin"],
     ["--skip-evidence=old.json", "--skip-policy=new.json"], ["--skip-policy=a.json", "--skip-policy=b.json"]]) {
     expect(() => aggregateShardOptions([...required, ...extra])).toThrow();
   }
@@ -87,6 +90,24 @@ test("a complete independent two-job result is the only report that claims full-
   // Collection may be incomplete while the independently checked file and wall evidence remain valid.
   fixture.shards[0]!.summary.collection = { status: "incomplete" };
   expect(aggregateShardEvidence(fixture).success).toBe(true);
+});
+
+test("Intel aggregation accepts macOS evidence and rejects Windows or ARM substitution", () => {
+  const fixture = gateFixture("timing");
+  fixture.expected = { ...fixture.expected, platform: "darwin", arch: "x64" };
+  for (const shard of fixture.shards) {
+    shard.summary.platform = "darwin";
+    shard.summary.cwd = "/Users/runner/work/repo";
+    shard.summary.executable.path = "/Users/runner/.bun/bin/bun";
+    shard.summary.command[0] = shard.summary.executable.path;
+    shard.summary.command[5] = `${shard.directory}/file-timings.json`;
+  }
+  expect(aggregateShardEvidence(fixture)).toMatchObject({ success: true, fullSuite: true, reasons: [] });
+  for (const [key, value] of [["platform", "win32"], ["arch", "arm64"]]) {
+    const altered = structuredClone(fixture);
+    for (const shard of altered.shards) shard.summary[key!] = value;
+    expect(aggregateShardEvidence(altered).reasons).toContain(`shard-1:unexpected-${key}`);
+  }
 });
 
 test("two timing shards require a timing request and commands without the full preload", () => {
