@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompactionDeadline } from "../src/adapters/chatgpt-web/compaction-deadline";
 import { chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
+import { suspensionTestClock } from "./helpers/suspension-test-clock";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, type ContinuityRecoveryIdentity } from "../src/adapters/chatgpt-web/continuity-contract";
 import {
   assertLauncherContinuityCapacity, cancelLauncherManualTurn, CONTINUITY_EXECUTION_FENCING_FEATURE, CONTINUITY_PREPARATION_TERMINATION_FEATURE,
@@ -155,35 +156,48 @@ function observeWatches() {
 }
 
 test("compaction HTTP requests still expire while awake, keep mutation retries bounded, and stop every watch", async () => {
-  const release = deferred();
+  const release = deferred(), arrived = deferred(), retried = deferred();
   const paths: string[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     paths.push(new URL(request.url).pathname);
+    if (paths.length === 6) arrived.resolve();
+    if (paths.length === 7) retried.resolve();
     await release.promise;
     return Response.json({ ok: true });
   } });
   const path = descriptorFile(`http://127.0.0.1:${server.port}`);
+  const time = suspensionTestClock();
   const watches = observeWatches(), startedAt = performance.now();
   try {
-    const results = await Promise.all([
-      inspectLauncherContinuityConversation(path, key, lease, { compaction: true }), // Default five-second native-signal wrapper.
+    let inspectionSettled = false;
+    const pending = Promise.all([
+      inspectLauncherContinuityConversation(path, key, lease, { compaction: true }) // Default five-second native-signal wrapper.
+        .finally(() => { inspectionSettled = true; }),
       notifyLauncherTurn(path, { ...owner, phase: "end", status: "completed" }, 80, undefined, { compaction: true }),
       markLauncherManualTurnStarted(path, owner, 80, { compaction: true }), // Original maximum two mutation attempts.
       cancelLauncherManualTurn(path, owner, 80, { compaction: true }),
       releaseLauncherRetainedConversation(path, key, 80, lease, { compaction: true }),
       notifyLauncherTurn(path, { ...owner, phase: "end", status: "completed" }, 80, undefined, { compaction: false }),
     ].map(promise => promise.catch(error => error)));
+    // Advance only after the real requests (and then the mutation retry) arrive.
+    await arrived.promise;
+    time.tick(80);
+    await retried.promise;
+    time.tick(4_919);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(inspectionSettled).toBe(false);
+    time.tick(1);
+    const results = await pending;
     expect(results.every(result => result instanceof Error)).toBeTrue();
     expect(results[0]).toMatchObject({ code: "continuity_unverified" });
     expect(results[1].message).toContain("end timed out after 80ms");
     expect(results[5].message).toContain("end timed out after 80ms");
-    expect(performance.now() - startedAt).toBeGreaterThan(4_800);
-    expect(performance.now() - startedAt).toBeLessThan(8_000);
+    expect(performance.now() - startedAt).toBeCloseTo(5_000, 6);
     expect(paths.filter(path => path === "/v1/manual/started")).toHaveLength(2);
     expect(paths).toHaveLength(7);
     expect(watches.budgets).toHaveLength(6);
     expect(watches.active()).toBe(0);
-  } finally { release.resolve(); server.stop(true); watches.restore(); }
+  } finally { time.restore(); release.resolve(); server.stop(true); watches.restore(); }
 }, 10_000);
 
 test("caller cancellation stops compaction request watches without retrying acquisition or polling", async () => {

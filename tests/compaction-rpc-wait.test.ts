@@ -12,24 +12,27 @@ import { RemoteTurnBroker, TurnBroker, TurnBrokerTimeoutError, callTurnBroker } 
 
 import { CONTEXT_PROTOCOL_VERSION, type ContextPreparedReply } from "../src/adapters/chatgpt-web/context-runtime";
 import { createContinuityMcpClient } from "./helpers/continuity-mcp-client";
+import { suspensionTestClock } from "./helpers/suspension-test-clock";
 
 const environment = { authorityMode: "delegated" as const, threadId: "thread", turnId: "turn", tools: [] };
 const snapshot = () => createContextSnapshot({ modelId: "gpt-5.6-sol", stream: false, options: {}, context: {
   messages: [{ role: "user", content: "Original source evidence", timestamp: 0 }],
 } });
 const suspend = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6_100);
-async function fixture() {
+async function fixture(realTime = false) {
   const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-rpc-wait-"));
   const socket = defaultBrokerEndpoint(directory);
   const broker = TurnBroker.forSocket(socket);
   await broker.listen();
-  return { socket, broker, remote: new RemoteTurnBroker(socket), async close() {
+  const time = realTime ? undefined : suspensionTestClock();
+  return { socket, broker, remote: new RemoteTurnBroker(socket), pause: () => time ? time.sleep(6_100) : suspend(), async close() {
+    time?.restore();
     await broker.close(); rmSync(directory, { recursive: true, force: true });
   } };
 }
 
 for (const mode of ["native", "safe", "manual"] as const) for (const phase of ["prepare", "register"] as const) {
-  test(`actual event-loop suspension retains the finite source RPC (${mode}, ${phase})`, async () => {
+  test(`simulated suspension retains the finite source RPC (${mode}, ${phase})`, async () => {
     const f = await fixture();
     try {
       const budget = new CompactionDeadline(Date.now() + 60_000);
@@ -43,7 +46,7 @@ for (const mode of ["native", "safe", "manual"] as const) for (const phase of ["
         ...(transaction ? { contract: "native" as const, transactionToken: transaction.token, handoffId: transaction.handoffId }
           : { contract: "safe" as const, turnToken, handoffId: "safe:rpc-wait", ...(mode === "manual" ? { explicitManual: true as const } : {}) }),
         historyRevision: 0, ownerGeneration: "page", availableTokens: 96_000,
-        expiresAt: () => { const value = budget.deadlineAt; if (++reads === (phase === "prepare" ? 1 : 2)) queueMicrotask(suspend); return value; },
+        expiresAt: () => { const value = budget.deadlineAt; if (++reads === (phase === "prepare" ? 1 : 2)) queueMicrotask(f.pause); return value; },
       }, "Summarize the original source");
       expect(chatGptSuspensionClock.suspendedMs() - before).toBeGreaterThan(5_000);
       expect(budget.remainingMs()).toBeGreaterThan(55_000);
@@ -67,7 +70,7 @@ async function nativeSource(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 test("finite compaction RPCs retain their remaining wait across one actual pause", async () => {
-  const f = await fixture();
+  const f = await fixture(true);
   try {
     const [read, checked, returned, usage, released, guarded, committed, revoked, submitted] =
       await Promise.all(Array.from({ length: 9 }, () => nativeSource(f)));
@@ -79,6 +82,7 @@ test("finite compaction RPCs retain their remaining wait across one actual pause
     const started = await f.remote.registerSafe(environment, surface, 60_000, "manual", { compaction: true, requireSentConfirmation: false });
     const retiring = await f.remote.registerSafe(environment, surface, 60_000, "manual", { compaction: true });
     const retiringOrdinary = await f.remote.registerSafe(environment, surface, 60_000, "retained-safe");
+    const ordinary = await f.remote.registerSafe(environment, surface, 60_000, "ordinary", { requireSentConfirmation: false });
     const aborting = await f.remote.beginCompactionTransaction("abort", 60_000);
     const calls = [
       f.remote.beginCompactionTransaction("begin-after-pause", 60_000),
@@ -103,9 +107,11 @@ test("finite compaction RPCs retain their remaining wait across one actual pause
     ];
     // All client timers exist before the owner can receive any request.
     const results = Promise.all(calls);
+    const expiredOrdinary = callTurnBroker(f.socket, { method: "safe_start", token: ordinary }).catch(error => error);
     const before = chatGptSuspensionClock.suspendedMs();
     suspend();
     const values = await results;
+    expect(await expiredOrdinary).toBeInstanceOf(TurnBrokerTimeoutError);
     expect(chatGptSuspensionClock.suspendedMs() - before).toBeGreaterThan(5_000);
     expect(values[1]).toMatch(/^request_compaction_[A-Za-z0-9_-]{32}$/);
     expect(values[2]).toHaveProperty("receiptId");
@@ -119,7 +125,7 @@ test("finite compaction RPCs retain their remaining wait across one actual pause
 }, 20_000);
 
 // Delay only bytes on the real socket boundary. Owner and MCP methods remain intact.
-async function pausingProxy(target: string, method: string) {
+async function pausingProxy(target: string, method: string, pause: () => void) {
   const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-rpc-proxy-"));
   const path = defaultBrokerEndpoint(directory);
   if (process.platform !== "win32") mkdirSync(dirname(path), { recursive: true });
@@ -136,7 +142,7 @@ async function pausingProxy(target: string, method: string) {
       if (buffered === "forwarded") { upstream.write(chunk); return; }
       buffered += chunk.toString();
       if (!buffered.includes("\n")) return;
-      if (!paused && JSON.parse(buffered.split("\n")[0]!).method === method) { paused = true; suspend(); }
+      if (!paused && JSON.parse(buffered.split("\n")[0]!).method === method) { paused = true; pause(); }
       upstream.write(buffered); buffered = "forwarded";
     });
     downstream.on("end", () => upstream.end());
@@ -153,7 +159,7 @@ async function pausingProxy(target: string, method: string) {
 for (const phase of ["context_return_check", "context_control_return"] as const) {
   test(`actual MCP Safe control receipt survives suspension at ${phase}`, async () => {
     const f = await fixture();
-    const proxy = await pausingProxy(f.socket, phase);
+    const proxy = await pausingProxy(f.socket, phase, f.pause);
     const mcp = await createContinuityMcpClient({ brokerSocketPath: proxy.path, contract: "safe", transport: "in-process" });
     try {
       const token = await f.remote.registerSafe(environment, "rpc-control-surface-1234567890", 60_000, "retained-safe", { requireSentConfirmation: false });
@@ -218,7 +224,7 @@ test("an ordinary RPC keeps its original finite timeout across the same pause", 
       { compaction: true, requireSentConfirmation: false });
     const authority = callTurnBroker(f.socket, { method: "safe_start", token: tagged }).catch(error => error);
     const rejected = callTurnBroker(f.socket, { method: "safe_start", token: ordinary }).catch(error => error);
-    suspend(); expect(await rejected).toBeInstanceOf(TurnBrokerTimeoutError);
+    f.pause(); expect(await rejected).toBeInstanceOf(TurnBrokerTimeoutError);
     // The purpose marker pauses transport waiting, never an ordinary Safe TTL.
     const expired = await authority;
     expect(expired).toBeInstanceOf(Error);

@@ -1,6 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { createSessionContinuityFixtures } from "./helpers/session-continuity-fixture";
+import { suspensionTestClock } from "./helpers/suspension-test-clock";
 import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { ChatGptTurnSessions, chatGptTurnSessions, ChatGptTraceFeed, ChatGptTextFeed } from "../src/adapters/chatgpt-web/turn-execution";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
@@ -14,6 +15,7 @@ for (const manual of [false, true]) test(`${manual ? "Safe" : "Native"} compacti
   const first = f.request();
   await f.run(first);
   const originalEndpoint = f.descriptor.control.endpoint;
+  const time = suspensionTestClock();
   let pauses = 0;
   const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
@@ -21,7 +23,7 @@ for (const manual of [false, true]) test(`${manual ? "Safe" : "Native"} compacti
     // adapter admission, compaction source and checkpoint code all execute.
     if (path === "/v1/turn/continuity" && pauses === 0) {
       pauses++;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6100);
+      time.sleep(6_100);
     }
     return fetch(new Request(`${originalEndpoint}${path}`, request));
   } });
@@ -34,6 +36,7 @@ for (const manual of [false, true]) test(`${manual ? "Safe" : "Native"} compacti
     expect(f.pages.size).toBe(1);
     expect(f.submissions).toHaveLength(2);
   } finally {
+    time.restore();
     writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor));
     await proxy.stop(true);
   }
@@ -123,12 +126,13 @@ test("an active Safe handoff uses compaction waits when its original ordinary ru
   let settledUsageWait: BrokerWaitOptions | undefined;
   let pauses = 0;
   const originalEndpoint = f.descriptor.control.endpoint;
+  const time = suspensionTestClock();
   const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === "/v1/turn/continuity" && binding.state === "compacting" && end.mock.calls.length && !pauses) {
       settledUsageWait = usage.mock.calls.at(-1)?.[0];
       pauses++;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6100);
+      time.sleep(6_100);
     }
     return fetch(new Request(`${originalEndpoint}${path}`, request));
   } });
@@ -147,6 +151,7 @@ test("an active Safe handoff uses compaction waits when its original ordinary ru
     expect(f.submissions).toHaveLength(1);
     expect(source.outstanding()).toHaveLength(0);
   } finally {
+    time.restore();
     end.mockRestore(); usage.mockRestore(); receipt.mockRestore();
     writeFileSync(f.descriptorPath, JSON.stringify(f.descriptor));
     await proxy.stop(true);

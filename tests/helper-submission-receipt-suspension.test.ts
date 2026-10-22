@@ -24,6 +24,7 @@ function helperFixture(body: string, compaction = true) {
   writeFileSync(script, `
     import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
     import { chatGptSuspensionClock } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/suspension-clock.ts", import.meta.url).href)};
+    import { controlledClock } from ${JSON.stringify(new URL("./helpers/controlled-clock.ts", import.meta.url).href)};
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       if (Boolean(turn.compaction) !== ${compaction}) throw new Error("Compaction purpose lost in IPC");
       await turn.onPreparedSelected(false);
@@ -111,14 +112,39 @@ test("real helper receipt pauses only the compaction deadline across a detected 
 }, 30_000);
 
 test("a compaction receipt with no awake ACK expires and duplicate or late receipt settlement cannot publish output", async () => {
-  const f = helperFixture(`
-    const receipt = turn.onSubmitted();
-    process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "submitted" }) + "\\n");
-    await receipt;
-    turn.onTextDelta("unacknowledged output");
-    return "unacknowledged output";
-  `);
   const entered = deferred(), receipt = deferred(), callbackEnded = deferred();
+  type Report = { pendingBefore: boolean; expired: boolean; elapsedMs: number; suspendedMs: number };
+  const reported = deferred<Report>();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (new URL(request.url).pathname === "/ready") await entered.promise;
+    else reported.resolve(await request.json() as Report);
+    return Response.json({ ok: true });
+  } });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  const f = helperFixture(`
+    // This clock lives in the helper process. The receipt timer and IPC are production code.
+    const time = controlledClock({ intervals: true });
+    try {
+      let settled = false;
+      const before = chatGptSuspensionClock.suspendedMs(), startedAt = performance.now();
+      const receipt = turn.onSubmitted();
+      void receipt.then(() => { settled = true; }, () => { settled = true; });
+      process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "submitted" }) + "\\n");
+      await fetch(${JSON.stringify(endpoint + "/ready")});
+      time.tick(14_999);
+      await Promise.resolve();
+      const pendingBefore = !settled;
+      time.tick(1);
+      await Promise.resolve();
+      await fetch(${JSON.stringify(endpoint + "/report")}, { method: "POST", body: JSON.stringify({
+        pendingBefore, expired: settled, elapsedMs: performance.now() - startedAt,
+        suspendedMs: chatGptSuspensionClock.suspendedMs() - before,
+      }) });
+      await receipt;
+      turn.onTextDelta("unacknowledged output");
+      return "unacknowledged output";
+    } finally { time.restore(); }
+  `);
   let callbacks = 0;
   f.turn.onSubmitted = async () => {
     callbacks++; entered.resolve();
@@ -126,13 +152,13 @@ test("a compaction receipt with no awake ACK expires and duplicate or late recei
   };
   try {
     const outcome = f.client.run(f.turn).catch(error => error);
-    await entered.promise;
-    const startedAt = performance.now();
+    const report = await Promise.race([reported.promise, outcome.then(result => {
+      throw new Error(`Helper exited before reporting its receipt deadline: ${String(result)}`);
+    })]);
+    expect(report).toEqual({ pendingBefore: true, expired: true, elapsedMs: 15_000, suspendedMs: 0 });
     const result = await outcome;
     expect(result).toBeInstanceOf(Error);
     expect(result.message).toContain("submission receipt acknowledgement timed out");
-    expect(performance.now() - startedAt).toBeGreaterThan(14_000);
-    expect(performance.now() - startedAt).toBeLessThan(25_000);
     receipt.resolve();
     await callbackEnded.promise;
     await Bun.sleep(25);
@@ -142,8 +168,8 @@ test("a compaction receipt with no awake ACK expires and duplicate or late recei
     expect(f.deltas).toEqual([]);
     expect(f.releases()).toBe(1);
     await expect(f.client.assertContinuityCompatible()).resolves.toBeUndefined();
-  } finally { receipt.resolve(); await f.client.close(); }
-}, 30_000);
+  } finally { receipt.resolve(); entered.resolve(); await f.client.close(); server.stop(true); }
+});
 
 test("a compaction helper that returns early still waits for its one persisted receipt before its terminal", async () => {
   const f = helperFixture(`

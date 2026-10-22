@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { join } from "node:path";
@@ -8,7 +8,8 @@ import { parseRequest } from "../src/responses/parser";
 import { CONTEXT_REUSE_PROTOCOL } from "../src/adapters/chatgpt-web/context-reuse-types";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
 import { CompactionDeadline } from "../src/adapters/chatgpt-web/compaction-deadline";
-import { ChatGptSuspensionClock, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
+import { chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
+import { suspensionTestClock } from "./helpers/suspension-test-clock";
 import { RemoteTurnBroker, TurnBroker, TurnBrokerTimeoutError, callTurnBroker, type BrokerWaitOptions } from "../src/adapters/chatgpt-web/turn-broker";
 
 import { ChatGptTurnSession, ChatGptTurnSessions, ChatGptTraceFeed, ChatGptTextFeed } from "../src/adapters/chatgpt-web/turn-execution";
@@ -21,10 +22,9 @@ const canonical = () => parseRequest({ model: "gpt-5.6-sol", reasoning: { effort
   instructions: "Preserve the original source. ".repeat(1100),
   input: [{ role: "user", id: "source-item", content: "Original user source" }],
 });
-const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6_100);
 type Request = { method: string; token?: string; compaction?: true };
 
-/** Only socket bytes are delayed. ContextSend, RemoteTurnBroker and the owner are real. */
+/** Simulate time only after preparation. ContextSend, sockets and the owner remain real. */
 async function fixture() {
   const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-source-usage-"));
   const endpoint = defaultBrokerEndpoint(root);
@@ -63,7 +63,8 @@ async function fixture() {
   const plan = await send.prepare(input, token, { manualControl: true });
   expect(plan.registration).toBeDefined();
   await send.select(token, plan); await send.sent(); broker.startSafeTurn(token);
-  return { root, broker, remote, token, send, input, hooks, requests,
+  const time = suspensionTestClock();
+  return { root, broker, remote, token, send, input, hooks, requests, time, pause: () => time.sleep(6_100),
     async readOverview() {
       const credential = { token, contract: "safe" as const, credentialKind: "ordinary" as const, contextProtocol: CONTEXT_PROTOCOL_VERSION,
         contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: CONTEXT_REUSE_PROTOCOL };
@@ -72,6 +73,7 @@ async function fixture() {
       await callTurnBroker(path, { ...credential, method: "context_return", receiptId: reply.receiptId, sent: true });
     },
     async close() {
+      time.restore();
       send.retire(); for (const socket of sockets) socket.destroy();
       await new Promise<void>(resolve => proxy.close(() => resolve()));
       await broker.close(); rmSync(root, { recursive: true, force: true });
@@ -79,14 +81,14 @@ async function fixture() {
 }
 
 for (const method of ["owner_context_usage", "owner_context_usage_release"] as const) {
-  test(`known compaction source synchronization survives a real pause at ${method}`, async () => {
+  test(`known compaction source synchronization survives a simulated pause at ${method}`, async () => {
     const f = await fixture();
     try {
       if (method === "owner_context_usage_release") await f.remote.revokeTrusted(f.token);
       const before = chatGptSuspensionClock.suspendedMs();
       const budget = new CompactionDeadline(Date.now() + 60_000);
       let paused = false;
-      f.hooks.request = request => { if (!paused && request.method === method) { paused = true; pause(); } };
+      f.hooks.request = request => { if (!paused && request.method === method) { paused = true; f.pause(); } };
       await f.send.syncUsage({ compaction: true });
       expect(paused).toBe(true);
       expect(chatGptSuspensionClock.suspendedMs() - before).toBeGreaterThan(5_000);
@@ -96,29 +98,15 @@ for (const method of ["owner_context_usage", "owner_context_usage_release"] as c
   }, 20_000);
 }
 
-function virtualTime() {
-  let wall = Date.now(), elapsed = 0;
-  const clock = new ChatGptSuspensionClock(1_000, 5_000, () => elapsed, () => wall);
-  const spies = [spyOn(Date, "now").mockImplementation(() => wall),
-    spyOn(performance, "now").mockImplementation(() => elapsed),
-    spyOn(chatGptSuspensionClock, "start").mockImplementation(() => {}),
-    spyOn(chatGptSuspensionClock, "suspendedMs").mockImplementation(() => clock.suspendedMs())];
-  return { sleep(ms: number) { wall += ms; elapsed += ms; },
-    awake(ms: number) { while (ms > 0) { const step = Math.min(ms, 1_000); wall += step; elapsed += step; clock.tick(elapsed); ms -= step; } },
-    rollback(ms: number) { wall -= ms; },
-    restore() { for (const spy of spies.reverse()) spy.mockRestore(); } };
-}
-
 test("a known compaction retains final source cost evidence across a long detected pause", async () => {
   const f = await fixture();
-  const time = virtualTime();
   try {
     await f.remote.revokeTrusted(f.token);
-    f.hooks.request = request => { if (request.method === "owner_context_usage") { f.hooks.request = undefined; time.sleep(601_000); } };
+    f.hooks.request = request => { if (request.method === "owner_context_usage") { f.hooks.request = undefined; f.time.sleep(601_000); } };
     await f.send.syncUsage({ compaction: true });
     expect(f.send.coverage.pageTokenReserve()).toBeGreaterThan(0);
     expect(await f.remote.contextUsage(f.token)).toBeUndefined();
-  } finally { time.restore(); await f.close(); }
+  } finally { await f.close(); }
 });
 
 
@@ -133,7 +121,7 @@ test("the real active Safe compaction entry propagates usage purpose before its 
       usageInput: f.input, compactionSourceCoverage: f.send.coverage, syncContextUsage: wait => f.send.syncUsage(wait), cancel() {},
     });
     let paused = false;
-    f.hooks.request = request => { if (!paused && request.method === "owner_context_usage") { paused = true; pause(); } };
+    f.hooks.request = request => { if (!paused && request.method === "owner_context_usage") { paused = true; f.pause(); } };
     let handoffQueued!: () => void;
     const queued = new Promise<void>(resolve => { handoffQueued = resolve; });
     f.hooks.response = request => { if (request.method === "owner_request_compaction") handoffQueued(); };
@@ -165,7 +153,7 @@ for (const executed of [false, true]) test(`queued compaction retries only relea
     const before = f.requests.length;
     let delayed = false;
     const delay = (request: Request) => {
-      if (!delayed && request.method === "owner_context_usage_release") { delayed = true; pause(); return false; }
+      if (!delayed && request.method === "owner_context_usage_release") { delayed = true; f.pause(); return false; }
     };
     if (executed) f.hooks.response = request => { delay(request); };
     else f.hooks.request = delay;
@@ -193,7 +181,7 @@ test("an already queued ordinary usage read cannot inherit a later compaction cl
     f.hooks.request = async request => {
       if (request.method !== "owner_context_usage") return;
       if (++reads === 1) { enter(); await gate; }
-      else if (reads === 2) pause();
+      else if (reads === 2) f.pause();
     };
     const first = f.send.syncUsage(); await entered;
     const options: BrokerWaitOptions = {};
@@ -220,11 +208,11 @@ test("known compaction task-state and Session retirement keep their finite wait 
       }, cancel() {},
     }));
     await source.browserOutcome; await source.physicalSettlement;
-    // Both real RPC timers exist before the event loop stops. Session retirement
+    // Both real RPC calls have installed their timers before simulated suspension. Session retirement
     // supplies its own explicit purpose; ordinary automatic retirement remains separate.
     const state = f.remote.taskUpdateState(token, { compaction: true });
     const retired = sessions.retireContinuityExecution("source", source, "usage-page", true);
-    pause();
+    f.pause();
     expect(await state).toHaveProperty("acceptedRevision", 0);
     await retired;
     expect(source.conversationKey()).toBeUndefined();
@@ -236,38 +224,49 @@ test("an awake compaction usage wait fails finitely without an automatic retry",
   const f = await fixture();
   try {
     let reads = 0;
-    f.hooks.request = request => { if (request.method === "owner_context_usage") { reads++; return false; } };
-    await expect(f.send.syncUsage({ compaction: true })).rejects.toBeInstanceOf(TurnBrokerTimeoutError);
+    let arrive!: () => void;
+    const arrived = new Promise<void>(resolve => { arrive = resolve; });
+    f.hooks.request = request => { if (request.method === "owner_context_usage") { reads++; arrive(); return false; } };
+    let settled = false;
+    const pending = f.send.syncUsage({ compaction: true }).catch(error => error).finally(() => { settled = true; });
+    await arrived;
+    f.time.tick(4_999);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    f.time.tick(1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(settled).toBe(true);
+    expect(await pending).toBeInstanceOf(TurnBrokerTimeoutError);
     expect(reads).toBe(1);
   } finally { await f.close(); }
 }, 10_000);
 
 for (const awakeBeforePause of [0, 300_000]) test(`compaction usage retention is bounded and cannot revive expired evidence (awake=${awakeBeforePause})`, async () => {
   const f = await fixture();
-  const time = virtualTime();
+  const time = f.time;
   try {
     await f.remote.revokeTrusted(f.token);
-    time.awake(awakeBeforePause); time.sleep(601_000);
+    time.tick(awakeBeforePause); time.sleep(601_000);
     expect(await f.remote.contextUsage(f.token)).toBeUndefined();
     const retained = await f.remote.contextUsage(f.token, { compaction: true });
     await expect(callTurnBroker(f.remote.socketPath, { method: "safe_start", token: f.token })).rejects.toThrow();
     if (awakeBeforePause) expect(retained).toBeUndefined();
     else {
       expect(retained?.final).toBe(true);
-      time.awake(199_000);
+      time.tick(199_000);
       expect(await f.remote.contextUsage(f.token, { compaction: true })).toEqual(retained);
       time.sleep(601_000);
       expect(await f.remote.contextUsage(f.token, { compaction: true })).toEqual(retained);
-      time.awake(99_000);
+      time.tick(99_000);
       expect(await f.remote.contextUsage(f.token, { compaction: true })).toBeUndefined();
-      time.rollback(1_500_000);
+      time.shiftWall(-1_500_000);
       expect(await f.remote.contextUsage(f.token, { compaction: true })).toBeUndefined();
       expect(await f.remote.contextUsage(f.token)).toBeUndefined();
       // Repeated retirement of an already retired owner cannot create a new record.
       await f.remote.revokeTrusted(f.token);
       expect(await f.remote.contextUsage(f.token, { compaction: true })).toBeUndefined();
     }
-  } finally { time.restore(); await f.close(); }
+  } finally { await f.close(); }
 });
 
 
@@ -277,6 +276,7 @@ test("a replacement Broker owner cannot recover retained usage from the previous
   try {
     await f.remote.revokeTrusted(f.token);
     expect((await f.remote.contextUsage(f.token, { compaction: true }))?.final).toBe(true);
+    f.time.restore();
     await f.broker.close();
     replacement = TurnBroker.forSocket(f.broker.socketPath);
     await replacement.listen();
@@ -309,7 +309,7 @@ for (const compaction of [false, true]) test(`settled Safe output receipt retain
     const expected = f.broker.taskOutputReceipt(token);
     expect(expected).toBeDefined();
     let paused = false;
-    f.hooks.request = request => { if (request.method === "owner_output_receipt") { paused = true; pause(); } };
+    f.hooks.request = request => { if (request.method === "owner_output_receipt") { paused = true; f.pause(); } };
     const outcome = await f.remote.taskOutputReceipt(token, compaction ? { compaction: true } : undefined)
       .then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
     expect(paused).toBe(true);
