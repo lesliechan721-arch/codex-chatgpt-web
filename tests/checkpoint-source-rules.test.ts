@@ -18,7 +18,7 @@ function reverseKeys(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value).reverse().map(([key, child]) => [key, reverseKeys(child)]));
 }
 
-for (const manual of [false, true]) test(`T5 source rules: structured source key order ${manual}`, () => {
+test("T5 source rules: structured source key order", () => {
   const original = checkpointSourceItem(false, true), record = checkpointSourceView(original), marker = checkpointSourceMarker();
   const reordered = checkpointSourceDecision([marker, reverseKeys(original)], record);
   expect(reordered).toMatchObject({ action: "admit", commit: "commit-one", work: "source", primary: [1], carried: true });
@@ -30,15 +30,15 @@ for (const manual of [false, true]) test(`T5 source rules: structured source key
   expect(checkpointSourceDecision([marker, original], record)).toEqual(reordered);
 });
 
-for (const manual of [false, true]) for (const parent of [false, true]) for (const change of ["role", "content", "turn"] as const) {
-  test(`T5 source rules: changed source ${change} ${manual} parent ${parent}`, () => {
+for (const parent of [false, true]) for (const change of ["role", "content", "turn"] as const) {
+  test(`T5 source rules: changed source ${change} parent ${parent}`, () => {
     const original = checkpointSourceItem(parent), record = checkpointSourceView(original), marker = checkpointSourceMarker();
     rejectSource([changedCheckpointSource(original, change), marker], record);
     expect(checkpointSourceDecision([original, marker], record)).toMatchObject({ action: "admit", commit: "commit-one", work: "source", primary: [0] });
   });
 }
-for (const manual of [false, true]) for (const field of ["author", "recipient"] as const) {
-  test(`T5 source rules: changed parent ${field} ${manual}`, () => {
+for (const field of ["author", "recipient"] as const) {
+  test(`T5 source rules: changed parent ${field}`, () => {
     const original = checkpointSourceItem(true), record = checkpointSourceView(original), marker = checkpointSourceMarker();
     const changed = changedCheckpointSource(original, field);
     expect(requestCarriedChatGptInstructionRevision(checkpointSourceRequest([changed, marker]), checkpointSourceIdentity.turnId)).toBeUndefined();

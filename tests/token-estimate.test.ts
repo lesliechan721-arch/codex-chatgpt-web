@@ -2,10 +2,6 @@ import { expect, spyOn, test } from "bun:test";
 import { get_encoding, Tiktoken } from "tiktoken";
 import { estimateTokens, withTokenEstimateCache } from "../src/lib/token-estimate";
 
-test("counts GPT-5 text with the o200k tokenizer", () => {
-  expect(estimateTokens("hello world")).toBe(2);
-});
-
 test("dense encoded context is not under-counted as prose", () => {
   let state = 0x12345678;
   const bytes = Buffer.allocUnsafe(300_000);

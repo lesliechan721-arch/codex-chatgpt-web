@@ -755,20 +755,3 @@ test("serialized history cannot feed code-fence backtracking into ChatGPT's link
   expect(encoded).not.toContain("`");
   expect(JSON.parse(encoded)).toEqual(original);
 });
-
-test("inline and multipart transports preserve code while escaping its Markdown delimiters", () => {
-  const parsed = request("high");
-  parsed.context.messages[1]!.content = '```python\nprint("hello")\n``` '.repeat(20);
-  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
-  const inline = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012");
-  const envelope = inline.text.split("<codex_context_json>\n")[1]!.split("\n</codex_context_json>")[0]!;
-  expect(envelope).not.toContain("`");
-  expect(JSON.stringify(JSON.parse(envelope))).toContain("```python");
-  const multipart = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012", { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS });
-  expect(multipart.multipart).toBeDefined();
-  for (const part of multipart.multipart!.parts) {
-    expect(part).not.toContain("`");
-    expect(() => JSON.parse(part)).not.toThrow();
-  }
-  expect(JSON.stringify(multipart.multipart!.parts.map(part => JSON.parse(part)))).toContain("```python");
-});

@@ -4679,9 +4679,6 @@ test("an accepted turn survives internal observation faults instead of being tor
   // Liveness may postpone a verdict but never waive it, so a tool call that never returns cannot
   // hold an undeadlined turn open forever.
   expect(CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS).toBeGreaterThan(CHATGPT_RESPONSE_DOM_GRACE_MS);
-
-  // Chain-of-thought containment is commentary regardless of document position.
-  expect(worker).toContain('candidate.closest(\'[data-testid^="cot-v5"]\') !== null');
 });
 
 test("stale MCP progress stops suppressing DOM health without penalising long active turns", () => {

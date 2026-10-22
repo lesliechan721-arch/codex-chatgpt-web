@@ -13,10 +13,9 @@
     "tests/browser-turn-binding.test.ts": "bdd86c7bfc5eeb502543445aa2121f3ef90d044c4d950cfc3f364fd4ac885b64",
     "tests/chatgpt-effort-browser.test.ts": "4d2f62c37a28cfd2d77a4fa3a6e7d7255bb4e31c75a74c5341a0321571598261",
     "tests/chatgpt-limits-browser.test.ts": "7c586f0a5ab8581fcfaa99dafee84e4d933832ea2eabe04374bbf1400ce67721",
-    "tests/chatgpt-markdown-parser.test.ts": "48ec43fbfb9dd5c579e9b1cb8307f806b6fc0f4c8ab7beea72527184f81cff9c",
+    "tests/chatgpt-markdown-parser.test.ts": "a33e69d8d33fa50a7435dee4361c61d11bc4af03deb7c3a3dabf002e9d0d1f72",
     "tests/chatgpt-model-family-browser.test.ts": "9f7e1193d77898775cfba5710e76d3df86e8ac6c00a363345ba367f721bc2eac",
     "tests/composer-insert.test.ts": "a7978cbddb18bec51e4d272cd3bdf84e879ddd102d88a1cf3f7a875935e3d484",
-    "tests/context-markdown-regexp.test.ts": "a43edaf0928a23c61c8c4649d47b414e4a47ab2d435199d6845cb3fb56bc739e",
     "tests/continuity-lock-windows.test.ts": "78b1cdfc76cb5e8853f8148d3898424bd9b436d509fe782bd2318437f83b3afb",
     "tests/environment.test.ts": "a46b8d431ff2bda2733bed4212f1b15e3f708128f5f6e467d6caaac24a653465",
     "tests/launcher-navigation-viewport.test.ts": "59ade91f7f1e0a32d24232a3830a4eefab40545b2586c439f847d91760e93607",
@@ -441,11 +440,6 @@
       "file": "tests/composer-insert.test.ts",
       "name": "a selected connector never appends a new request to an old draft",
       "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/context-markdown-regexp.test.ts",
-      "name": "actual Chromium link regex stalls before encoding and remains responsive after lossless encoding",
-      "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
     },
     {
       "file": "tests/continuity-lock-windows.test.ts",
