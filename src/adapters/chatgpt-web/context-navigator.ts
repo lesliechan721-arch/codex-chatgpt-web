@@ -299,7 +299,7 @@ export class ContextNavigator {
             reserved_wire_bytes: Number.MAX_SAFE_INTEGER, stop_hint: "Stop reading before consuming the summary and submission reserve" } : hint } : {}) }, candidateBodies);
     };
     const fits = (result: BrokerToolResult): boolean => {
-      const cost = this.#costBound(result);
+      const cost = this.#costBound(result, this.#limits.readTokens - allowance.tokens);
       if (cost.wire_bytes + allowance.wire_bytes > this.#limits.readBytes) this.#hit("read_bytes");
       if (cost.text_tokens + allowance.tokens > this.#limits.readTokens) this.#hit("read_tokens");
       return cost.wire_bytes + allowance.wire_bytes <= this.#limits.readBytes && cost.text_tokens + allowance.tokens <= this.#limits.readTokens;
@@ -506,14 +506,14 @@ export class ContextNavigator {
     this.#activeBudgetHits = undefined;
     return result;
   }
-  #costBound(result: BrokerToolResult) { return measureContextResponse(result, { wireReserveBytes: this.#limits.wireReserveBytes, tokenReserve: this.#limits.tokenReserve, boundCursorTokens: !!this.#bootstrap }); }
+  #costBound(result: BrokerToolResult, tokenCeiling?: number) { return measureContextResponse(result, { wireReserveBytes: this.#limits.wireReserveBytes, tokenReserve: this.#limits.tokenReserve, boundCursorTokens: !!this.#bootstrap, tokenCeiling }); }
   #cost(result: BrokerToolResult, visualTokens = 0) { return measureContextResponse(result, {
     wireReserveBytes: this.#limits.wireReserveBytes, tokenReserve: this.#limits.tokenReserve, visualTokens }); }
   #fits(result: BrokerToolResult, tool: "list" | "read" | "search", image = false, boundCursorTokens = false): boolean {
-    const cost = measureContextResponse(result, { wireReserveBytes: this.#limits.wireReserveBytes,
-      tokenReserve: this.#limits.tokenReserve, boundCursorTokens });
     const bytes = image ? this.#limits.imageWireBytes : tool === "list" ? this.#limits.listBytes : tool === "search" ? this.#limits.searchBytes : this.#limits.readBytes;
     const tokens = image ? this.#limits.imageMetadataTokens : tool === "list" ? this.#limits.listTokens : tool === "search" ? this.#limits.searchTokens : this.#limits.readTokens;
+    const cost = measureContextResponse(result, { wireReserveBytes: this.#limits.wireReserveBytes,
+      tokenReserve: this.#limits.tokenReserve, boundCursorTokens, tokenCeiling: tokens });
     if (cost.wire_bytes > bytes) this.#hit(`${tool}_bytes`);
     if (cost.text_tokens > tokens) this.#hit(`${tool}_tokens`);
     return cost.wire_bytes <= bytes && cost.text_tokens <= tokens;

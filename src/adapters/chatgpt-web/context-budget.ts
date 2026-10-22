@@ -106,8 +106,14 @@ export function measureContextResponse(result: BrokerToolResult, options: {
   wireReserveBytes?: number; tokenReserve?: number; visualTokens?: number;
   /** Trusted directory admission: cover a future scope binding and cursor signature. */
   boundCursorTokens?: boolean;
+  /** Fit checks only: return a conservative token bound when it fits this total
+   * ceiling. Omit for usage accounting; tighter ceilings still use the tokenizer. */
+  tokenCeiling?: number;
 } = {}): ContextResponseCost {
   const json = JSON.stringify(result);
+  const wireBytes = Buffer.byteLength(json, "utf8") + (options.wireReserveBytes ?? CONTEXT_LIMITS.wireReserveBytes);
+  const visual = options.visualTokens ?? 0;
+  if (!Number.isSafeInteger(visual) || visual < 0) throw new Error("Invalid visual token reserve");
   // Base64 is part of wire size, but is not model text or a visual token estimate.
   const textResult = { ...result, content: result.content.map(block => {
     if (block && typeof block === "object" && (block as { type?: unknown }).type === "image") {
@@ -117,6 +123,12 @@ export function measureContextResponse(result: BrokerToolResult, options: {
     return block;
   }) };
   const serializedText = JSON.stringify(textResult);
+  // Byte-level tokens cannot outnumber UTF-8 bytes. This also bounds cursor
+  // fragments and signatures without changing any near-limit admission decision.
+  const tokenBound = Buffer.byteLength(serializedText, "utf8") + (options.tokenReserve ?? CONTEXT_LIMITS.tokenReserve);
+  if (options.tokenCeiling !== undefined && tokenBound + visual <= options.tokenCeiling) {
+    return { wire_bytes: wireBytes, text_tokens: tokenBound, visual_tokens: visual, total_tokens: tokenBound + visual };
+  }
   const cursors = new Set<string>();
   const collectCursors = (value: unknown): void => {
     if (!value || typeof value !== "object") return;
@@ -159,8 +171,6 @@ export function measureContextResponse(result: BrokerToolResult, options: {
   });
   const textTokens = fragments.reduce((sum, fragment) => sum + estimateTokens(fragment), 0) + cursorTokens
     + (options.tokenReserve ?? CONTEXT_LIMITS.tokenReserve);
-  const visual = options.visualTokens ?? 0;
-  if (!Number.isSafeInteger(visual) || visual < 0) throw new Error("Invalid visual token reserve");
-  return { wire_bytes: Buffer.byteLength(json, "utf8") + (options.wireReserveBytes ?? CONTEXT_LIMITS.wireReserveBytes),
+  return { wire_bytes: wireBytes,
     text_tokens: textTokens, visual_tokens: visual, total_tokens: textTokens + visual };
 }

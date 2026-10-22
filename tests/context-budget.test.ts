@@ -8,6 +8,38 @@ import { assertContextNavigationBudget, CONTEXT_LIMITS, contextErrorReserve, con
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
 const snapshotOf = (input: unknown[]) => createContextSnapshot(parseRequest({ model: "gpt-6", input }));
 describe("complete context response budgets", () => {
+  test("fit checks use a safe byte bound and fall back to exact costs at token boundaries", () => {
+    const body = { text: '"\\\n中文😀'.repeat(20), next_cursor: "opaque-future-cursor" };
+    const result = { content: [{ type: "text", text: JSON.stringify(body) }], structuredContent: body };
+    const wireReserveBytes = 137, tokenReserve = 41, visualTokens = 257;
+    const bound = Buffer.byteLength(JSON.stringify(result)) + tokenReserve + visualTokens;
+    for (const boundCursorTokens of [false, true]) {
+      const options = { wireReserveBytes, tokenReserve, visualTokens, boundCursorTokens };
+      const exact = measureContextResponse(result, options);
+      const fast = measureContextResponse(result, { ...options, tokenCeiling: bound });
+      expect(fast).toEqual({ wire_bytes: Buffer.byteLength(JSON.stringify(result)) + wireReserveBytes,
+        text_tokens: bound - visualTokens, visual_tokens: visualTokens, total_tokens: bound });
+      expect(fast.total_tokens).toBeGreaterThanOrEqual(exact.total_tokens);
+      for (const tokenCeiling of [bound - 1, exact.total_tokens, exact.total_tokens - 1]) {
+        expect(measureContextResponse(result, { ...options, tokenCeiling })).toEqual(exact);
+      }
+    }
+  });
+
+  test("fit bounds exclude image data from text but retain wire and visual costs", () => {
+    const metadata = { type: "image", mimeType: "image/png" };
+    const result = { content: [{ ...metadata, data: png }] };
+    const tokenReserve = 37, visualTokens = 512;
+    const textBound = Buffer.byteLength(JSON.stringify({ content: [metadata] })) + tokenReserve;
+    const options = { tokenReserve, visualTokens, tokenCeiling: textBound + visualTokens };
+    const cost = measureContextResponse(result, options);
+    expect(cost).toEqual({ wire_bytes: Buffer.byteLength(JSON.stringify(result)) + CONTEXT_LIMITS.wireReserveBytes,
+      text_tokens: textBound, visual_tokens: visualTokens, total_tokens: textBound + visualTokens });
+    expect(measureContextResponse(result, { ...options, tokenCeiling: cost.total_tokens - 1 }))
+      .toEqual(measureContextResponse(result, { tokenReserve, visualTokens }));
+    expect(() => measureContextResponse(result, { ...options, visualTokens: -1 })).toThrow("Invalid visual token reserve");
+  });
+
   test("trusted profiles freeze the published expanded and conservative ceilings", () => {
     expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 8000, listBytes: 49152, listTokens: 6000, listEntries: 50,
       searchHits: 10, searchBytes: 12288, searchTokens: 1500, maxTotalTokens: 96000, maxTotalWireBytes: 64 * 1024 * 1024 });

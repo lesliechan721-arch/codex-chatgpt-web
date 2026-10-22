@@ -398,7 +398,8 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
     // counts only during this synchronous check; release them before yielding.
     withTokenEstimateCache(() => {
       const entry = navigator.preflightListEntry(index);
-      const entryCost = measureContextResponse(entry, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve, boundCursorTokens: true });
+      const entryCost = measureContextResponse(entry, { wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve,
+        boundCursorTokens: true, tokenCeiling: budget.tokens - COMPACTION_SUMMARY_RESERVE - directory.text_tokens - errors.tokens });
       if (entry.isError) {
         unavailable("A compaction source cannot be discovered within a bounded directory page.");
       }
@@ -408,7 +409,8 @@ export async function assertCompactionReadable(snapshot: ContextSnapshot, availa
       }
       const result = navigator.preflightRead({ context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref ?? "" }] });
       const cost = measureContextResponse(result, { wireReserveBytes: limits.wireReserveBytes,
-        tokenReserve: limits.tokenReserve, visualTokens: target.kind === "image" ? target.visual_token_reserve ?? 0 : 0 });
+        tokenReserve: limits.tokenReserve, visualTokens: target.kind === "image" ? target.visual_token_reserve ?? 0 : 0,
+        tokenCeiling: budget.tokens - COMPACTION_SUMMARY_RESERVE - directory.text_tokens - directory.visual_token_reserve - errors.tokens });
       if (result.isError) {
         unavailable("A compaction source cannot be returned within a bounded read.");
       }

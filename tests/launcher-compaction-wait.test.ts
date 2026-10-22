@@ -249,10 +249,12 @@ test("compaction manual policy mismatch releases its original turn and stops bot
 test("the real worker applies default 30s start and 15s end compaction waits without changing heartbeat or ordinary requests", async () => {
   const { ChatGptBrowserWorker } = await import("../src/adapters/chatgpt-web/browser-worker");
   const requests: Array<Record<string, unknown>> = [];
+  let heartbeatArrived = deferred();
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.json() as Record<string, unknown>;
     requests.push(body);
     expect(Object.hasOwn(body, "compaction")).toBeFalse();
+    if (body.phase === "heartbeat") heartbeatArrived.resolve();
     return Response.json(body.phase === "start"
       ? { surfaceId: "s".repeat(32), reused: false, connectorBound: false }
       : { cancelledByUser: false });
@@ -261,10 +263,15 @@ test("the real worker applies default 30s start and 15s end compaction waits wit
   try {
     const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
       config: { browserHost: "launcher", browserHostDescriptorPath: path },
-      runBrowserTurn: async () => "one completed browser turn",
+      // Heartbeats are sent asynchronously. Keep this turn active until its
+      // heartbeat arrives instead of assuming HTTP requests arrive in order.
+      runBrowserTurn: async () => { await heartbeatArrived.promise; return "one completed browser turn"; },
     });
-    for (const compaction of [true, false]) await expect(worker.runExclusive({ ...owner,
-      compaction, capabilities: { localToolsEnabled: false } })).resolves.toBe("one completed browser turn");
+    for (const compaction of [true, false]) {
+      heartbeatArrived = deferred();
+      await expect(worker.runExclusive({ ...owner,
+        compaction, capabilities: { localToolsEnabled: false } })).resolves.toBe("one completed browser turn");
+    }
     expect(requests.map(body => body.phase)).toEqual(["start", "heartbeat", "end", "start", "heartbeat", "end"]);
     expect(watches.budgets).toHaveLength(2);
     expect(watches.budgets[0]).toBeGreaterThan(29_900);
