@@ -58,6 +58,7 @@ import {
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { NativeTurnIdleRegistry } from "../src/native-turn-idle";
 import { retainedTaskFixture } from "./helpers/retained-compaction-fixture";
+import { controlledClock } from "./helpers/controlled-clock";
 import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
 import { parseRequest } from "../src/responses/parser";
@@ -489,16 +490,20 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
     },
   };
 
-  await expect(requestRetainedCompactionHandoff(
-    worker as never,
-    compactRequest,
-    source,
-    broker,
-    { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
-    "trace_handoff",
-    undefined,
-    60 * 60_000,
-  )).resolves.toBe("Retained agent checkpoint");
+  // Keep the exact budget-cap assertion independent of scheduler timing.
+  const clock = controlledClock();
+  try {
+    await expect(requestRetainedCompactionHandoff(
+      worker as never,
+      compactRequest,
+      source,
+      broker,
+      { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      "trace_handoff",
+      undefined,
+      60 * 60_000,
+    )).resolves.toBe("Retained agent checkpoint");
+  } finally { clock.restore(); }
   expect(captured?.modelFamily).toBe(family);
   expect(captured?.conversationKey).toBe(conversationKey);
   expect(captured?.requireRetainedConversation).toBeTrue();
