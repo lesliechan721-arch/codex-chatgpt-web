@@ -5,12 +5,13 @@ import { performanceSource } from "./test-performance-source";
 import { parseTimingData, repositoryTestFiles } from "./test-timing-history";
 import { coldShardFiles, testFileSetDigest, testLogResult } from "./test-shards";
 import { verificationCommands } from "./verify";
+import { validateShardSelection, type ShardSelection } from "./select-test-shard-artifacts";
 
 export type ShardEvidence = {
   directory: string; summary: any; completion: any; timings: string | null; stdout: string | null; stderr: string | null;
 };
 export type ShardAggregationInput = {
-  files: string[]; shards: ShardEvidence[]; verify: any; jobResults: Record<string, unknown>; skipEvidence?: any;
+  files: string[]; shards: ShardEvidence[]; verify: any; jobResults: Record<string, unknown>; skipEvidence?: any; selection?: ShardSelection;
   expected: { revision: string; runId: string; attempt: string; repository: string;
     patchDigest?: string; toolDigest?: string; dependencyDigest?: string; launcherDependencyDigest?: string;
     platform?: string; arch?: string; mode?: "full" | "timing"; isolation?: "default" | "isolate"; workers?: 1 | 2 };
@@ -52,6 +53,15 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   const expected = input.expected;
   require(hash(expected.revision, 40) && /^[1-9]\d*$/.test(expected.runId) && /^[1-9]\d*$/.test(expected.attempt)
     && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expected.repository), "missing-expected-workflow-identity");
+  const attempts = new Map<number, string>();
+  if (input.selection !== undefined) {
+    try {
+      validateShardSelection(input.selection, { repository: expected.repository, runId: expected.runId,
+        revision: expected.revision, gateAttempt: expected.attempt });
+      for (const shard of input.selection.shards) attempts.set(shard.index, shard.attempt);
+    } catch { reasons.push("invalid-shard-artifact-selection"); }
+  }
+  const workflowRun = (index: number) => ({ id: expected.runId, attempt: attempts.get(index) ?? expected.attempt, repository: expected.repository });
   const indexes = new Set<number>(), runIds = new Set<string>(), executed: string[] = [], skipped: string[] = [];
   let common: unknown;
   let shardOne: any;
@@ -72,7 +82,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
     require(summary.known === true && hash(summary.revision, 40) && hash(summary.patchDigest, 64) && hash(summary.toolDigest, 64)
       && hash(summary.dependencyDigest, 64) && hash(summary.launcherDependencyDigest, 64), `${label}:unknown-source`);
     require(summary.revision === expected.revision && summary.workflowRevision === expected.revision, `${label}:source-revision-mismatch`);
-    require(equal(summary.workflowRun, { id: expected.runId, attempt: expected.attempt, repository: expected.repository }), `${label}:workflow-attempt-mismatch`);
+    require(equal(summary.workflowRun, workflowRun(index)), `${label}:workflow-attempt-mismatch`);
     for (const key of ["patchDigest", "toolDigest", "dependencyDigest", "launcherDependencyDigest"] as const) {
       if (expected[key] !== undefined) require(summary[key] === expected[key], `${label}:${key}-mismatch`);
     }
@@ -83,7 +93,8 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
       && ["full", "timing"].includes(summary.mode) && summary.bunVersion === "1.4.3" && hash(summary.executable?.sha256, 64), `${label}:unsupported-execution-configuration`);
     const identity = { revision: summary.revision, patchDigest: summary.patchDigest, toolDigest: summary.toolDigest,
       workflowRevision: summary.workflowRevision, dependencyDigest: summary.dependencyDigest, launcherDependencyDigest: summary.launcherDependencyDigest,
-      workflowRun: summary.workflowRun, platform: summary.platform, arch: summary.arch, bunVersion: summary.bunVersion,
+      workflowRun: { id: summary.workflowRun?.id, repository: summary.workflowRun?.repository },
+      platform: summary.platform, arch: summary.arch, bunVersion: summary.bunVersion,
       executableDigest: summary.executable?.sha256, workers: summary.workers, isolation: summary.isolation, mode: summary.mode };
     if (common === undefined) common = identity;
     else require(equal(common, identity), `${label}:different-source-or-execution-input`);
@@ -138,7 +149,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   }
   const verify = input.verify;
   require(verify?.version === 2 && verify.success === true && verify.failure === null && verify.fullSuite === false
-    && equal(verify.testShard, { index: 1, total: 2 }) && equal(verify.workflowRun, { id: expected.runId, attempt: expected.attempt, repository: expected.repository }),
+    && equal(verify.testShard, { index: 1, total: 2 }) && equal(verify.workflowRun, workflowRun(1)),
   "invalid-or-missing-verify-summary");
   if (verify?.version === 2 && typeof verify.scratch === "string" && Array.isArray(verify.stages)) {
     const commands = verificationCommands(shardOne?.mode, verify.scratch.replaceAll("\\", "/"), { index: 1, total: 2 })
@@ -152,8 +163,10 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   } else reasons.push("missing-verify-stage-evidence");
   return { version: 1, kind: "test-shard-aggregate", success: reasons.length === 0, fullSuite: reasons.length === 0,
     source: common ?? null, repositoryFiles: files, repositoryFilesDigest: testFileSetDigest(files), executedFiles: [...executed].sort(),
-    skipIdentities: [...skipped].sort(), skipEvidence: skipEvidence ?? null, jobResults: input.jobResults, reasons: [...new Set(reasons)],
+    skipIdentities: [...skipped].sort(), skipEvidence: skipEvidence ?? null, jobResults: input.jobResults,
+    selection: input.selection ?? null, reasons: [...new Set(reasons)],
     shards: input.shards.map(evidence => ({ directory: evidence.directory, runId: evidence.summary?.runId ?? null,
+      workflowRun: evidence.summary?.workflowRun ?? null,
       shard: evidence.summary?.shard ?? null, runnerImage: evidence.summary?.runnerImage ?? null, runnerImageVersion: evidence.summary?.runnerImageVersion ?? null })),
     historyPublication: "forbidden", createdAt: new Date().toISOString() };
 }
@@ -215,11 +228,11 @@ export function loadShardArtifacts(directory: string) {
 export function aggregateShardOptions(args: string[]) {
   const options: Record<string, string> = {};
   for (const argument of args) {
-    const match = /^--(artifacts|job-results|output|skip-evidence|skip-policy|mode|platform|arch)=(.+)$/.exec(argument);
+    const match = /^--(artifacts|job-results|output|selection|skip-evidence|skip-policy|mode|platform|arch)=(.+)$/.exec(argument);
     if (!match || options[match[1]!]) throw new Error(`Invalid or duplicate aggregation option: ${argument}`);
     options[match[1]!] = ["mode", "platform", "arch"].includes(match[1]!) ? match[2]! : resolve(match[2]!);
   }
-  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--mode=full|timing] [--platform=win32|darwin] [--arch=x64] [--skip-evidence=PATH | --skip-policy=PATH]");
+  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--selection=PATH] [--mode=full|timing] [--platform=win32|darwin] [--arch=x64] [--skip-evidence=PATH | --skip-policy=PATH]");
   if (options["skip-evidence"] && options["skip-policy"]) throw new Error("--skip-evidence and --skip-policy are mutually exclusive.");
   if (options.mode !== undefined && options.mode !== "full" && options.mode !== "timing") throw new Error("Aggregation mode must be full or timing.");
   if (options.platform !== undefined && options.platform !== "win32" && options.platform !== "darwin") throw new Error("Aggregation platform must be win32 or darwin.");
@@ -243,6 +256,7 @@ if (import.meta.main) {
       revision: source.revision!, patchDigest: source.patchDigest!, toolDigest: source.toolDigest!,
     }) : options["skip-evidence"] ? json(options["skip-evidence"]) : undefined;
     const result = aggregateShardEvidence({ files, ...loadShardArtifacts(options.artifacts!),
+      ...(options.selection ? { selection: json(options.selection) } : {}),
       jobResults: json(options["job-results"]!) ?? {}, ...(skipEvidence !== undefined ? { skipEvidence } : {}),
       expected: { revision: process.env.GITHUB_SHA ?? "", runId: process.env.GITHUB_RUN_ID ?? "", attempt: process.env.GITHUB_RUN_ATTEMPT ?? "",
         repository: process.env.GITHUB_REPOSITORY ?? "", patchDigest: source.patchDigest!, toolDigest: source.toolDigest!,

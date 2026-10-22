@@ -1,9 +1,18 @@
 # GitHub added this standard public-repository Intel label after actionlint v1.7.7's label table.
 # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 paths:
+  # download-artifact v4 added this input after actionlint v1.7.7's action table.
+  # https://github.com/actions/download-artifact/blob/v4/action.yml
+  .github/workflows/ci.yml:
+    ignore:
+      - 'input "artifact-ids" is not defined in action "actions/download-artifact@v4"'
+  .github/workflows/release.yml:
+    ignore:
+      - 'input "artifact-ids" is not defined in action "actions/download-artifact@v4"'
   .github/workflows/intel-release.yml:
     ignore:
       - 'label "macos-15-intel" is unknown'
+      - 'input "artifact-ids" is not defined in action "actions/download-artifact@v4"'
   .github/workflows/windows-performance.yml:
     ignore:
       - 'label "macos-15-intel" is unknown'
