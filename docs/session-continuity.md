@@ -324,6 +324,13 @@ a new execution without resolving that old Send; old calls are not automatically
 Restart invalidates old read credentials and references; new sources require actual verified
 content. See [context navigation](context-navigation.md).
 
+Compaction uses a fixed remaining awake-time budget across source settlement, summary submission,
+source reads, and checkpoint commit. Suspension detected by the running process pauses these
+deadlines, including the current persisted recovery budget. Reads, observed progress, and retries
+do not grant a fresh total budget. A process restart does not refund the time while the process
+was absent or restore its old credentials. The current owner, source, revision, cancellation,
+and Send checks still apply after resume.
+
 ## Retention and recovery evidence
 
 A healthy ready page has a 24-hour idle limit measured from successful ordinary work or a

@@ -65,7 +65,7 @@ test("public Responses preserves commentary phases and persists the actual final
 });
 
 test("synthetic final evidence redacts actual opaque credentials and excludes reasoning, prompts and commentary body", () => {
-  const opaque = "9a".repeat(24), token = "control_" + "c".repeat(32);
+  const opaque = "9a".repeat(24), token = "turn_" + "c".repeat(32);
   const response = { status: "completed", end_turn: true, output: [
     { type: "reasoning", content: [{ type: "reasoning_text", text: "private reasoning must not be copied" }], encrypted_content: "private ciphertext" },
     { type: "message", role: "assistant", status: "completed", phase: "commentary", content: [{ type: "output_text", text: "progress body must not be copied" }] },

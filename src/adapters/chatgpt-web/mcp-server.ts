@@ -22,12 +22,10 @@ export type { ChatGptMcpContract } from "./native-tool-contract";
 
 const turnTokenSchema = z.string().min(20).max(256);
 const nativeTurnTokenPattern = /^turn_[A-Za-z0-9_-]{32}$/;
-const compactionControlTokenPattern = /^control_[a-f0-9]{32}$/;
+const compactionControlTokenPattern = /^turn_[a-f0-9]{32}$/;
 const nativeTurnTokenSchema = z.string().regex(nativeTurnTokenPattern,
   "Copy turn_token exactly from the current request: turn_ followed by 32 case-sensitive characters. Do not guess or reuse an earlier token.")
   .describe("Opaque capability for this request. Copy the complete turn_token from the current request unchanged, including case, hyphens and underscores. Never infer it from another turn or from an error.");
-const compactionControlTokenSchema = z.string().regex(compactionControlTokenPattern)
-  .describe("Independent one-shot submission token. Copy it exactly from the current compaction instruction; use it only for codex.control.compaction_handoff.");
 const operationIdSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
   .describe("New logical calls use the next positive ID. Retry and wait retain the original ID; keep the counter across reconnects.");
 const taskRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
@@ -139,7 +137,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
     try { if (sent) textReadReceipt = transportedTextReceipt(pending, result); } catch { sent = false; }
     await callTurnBroker(options.brokerSocketPath, { method: pending.control ? "context_control_return" : "context_return", token: pending.token,
       contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId,
-      contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt, sent: sent && !pending.signal?.aborted }, 5_000)
+      contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt, sent: sent && !pending.signal?.aborted }, 5_000, undefined, pending.control ? { compaction: true } : undefined)
       .catch(() => console.error("[chatgpt-web-mcp] context return receipt unavailable"));
   };
   const checkContextReturn = async (requestId: string | number, result?: unknown) => {
@@ -148,7 +146,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
     if (pending.signal?.aborted) throw new DOMException("Context return aborted", "AbortError");
     const textReadReceipt = transportedTextReceipt(pending, result);
     await callTurnBroker(options.brokerSocketPath, { method: "context_return_check", token: pending.token,
-      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId, contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt }, 5_000, pending.signal);
+      contract, credentialKind: pending.credentialKind, receiptId: pending.receiptId, contextProtocol: CONTEXT_PROTOCOL_VERSION, textReadReceipt }, 5_000, pending.signal, pending.control ? { compaction: true } : undefined);
   };
   const contextFilters = {
     kind: z.enum(["message_text", "tool_arguments", "tool_result", "image"]).optional(),
@@ -287,16 +285,14 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
     }).strict();
     const inputSchema = contract === "native" && entry === "codex_tool_call"
       ? z.object({
-        turn_token: z.union([nativeTurnTokenSchema, compactionControlTokenSchema], {
-          error: "Copy turn_token exactly from the current request. For compaction handoff, copy its independent control_ token unchanged.",
-        }),
+        turn_token: nativeTurnTokenSchema.describe("Copy the complete turn_token from the current request unchanged. For codex.control.compaction_handoff, use only the independent one-shot submission token from its compaction instruction; it cannot authorize ordinary tools."),
         operation_id: operationIdSchema.optional(),
         task_revision: taskRevisionSchema.optional(),
         ...nativeToolInputSchemas.codex_tool_call,
       }).strict().refine(input => (input.wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME
         ? compactionControlTokenPattern : nativeTurnTokenPattern).test(input.turn_token), {
         path: ["turn_token"],
-        message: "Copy turn_token exactly from the current request. Use the independent control_ token only for codex.control.compaction_handoff.",
+        message: "Copy turn_token exactly from the current request. For codex.control.compaction_handoff, use its independent one-shot submission token.",
       }).meta({
         anyOf: [
           {

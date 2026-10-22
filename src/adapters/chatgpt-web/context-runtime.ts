@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import { ContextReuseDiagnostics } from "./context-reuse-diagnostics";
 import { createHash, randomBytes } from "node:crypto";
 import { withTokenEstimateCache } from "../../lib/token-estimate";
@@ -116,7 +117,7 @@ interface ContextPendingReturn {
   recoveryClaim?: ContextReservedCost;
   replayCharged?: boolean;
   requestedItems?: number;
-  timer: ReturnType<typeof setTimeout>;
+  stopTimer: () => void;
 }
 
 export function contextFailure(code: string, message: string, detail: Record<string, unknown> = {}): BrokerToolResult {
@@ -156,6 +157,7 @@ export class ContextScope {
   private readyStarted?: number;
   private lastProgress?: number;
   private attachmentStarted?: number;
+  private compactionDeadline?: CompactionDeadline;
   private readinessTimer?: ReturnType<typeof setTimeout>;
   constructor(
     readonly scopeId: string,
@@ -166,6 +168,7 @@ export class ContextScope {
     readonly expiresAt?: number,
     private readonly reuseValid: () => boolean = () => !registration.reuse?.dependency,
   ) {
+    if (purpose === "compaction" && expiresAt !== undefined) this.compactionDeadline = new CompactionDeadline(expiresAt);
     // A plan and its effective limits do not change after this scope is published.
     registration = this.registration = { ...registration, limits: contextLimits(registration.limits),
       deliveryByTarget: structuredClone(registration.deliveryByTarget),
@@ -358,7 +361,7 @@ export class ContextScope {
     if (pending.textRead && !contextTextReadReceiptsEqual(pending.textRead, textRead)) throw contextError("CONTEXT_INVALID", "The transported text result does not match the complete fixed batch");
   }
   get inFlight(): number { return this.pending.size; }
-  get isLive(): boolean { return this.live && (this.expiresAt === undefined || Date.now() < this.expiresAt); }
+  get isLive(): boolean { return this.live && (this.compactionDeadline ? this.compactionDeadline.remainingMs() > 0 : this.expiresAt === undefined || Date.now() < this.expiresAt); }
   usageEvidence(final = false): ContextUsageEvidence {
     const reuseDelivery = this.reuseDeliveryEvidence();
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
@@ -377,9 +380,9 @@ export class ContextScope {
     if (this.pending.size >= 8) throw contextError("CONTEXT_BUSY", "Wait for in-flight context returns");
     const result = { content: [{ type: "text", text: JSON.stringify(response) }], structuredContent: response };
     const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
-    const timer = setTimeout(() => this.finish(receiptId, false), CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
+    const stopTimer = this.returnTimer(() => this.finish(receiptId, false));
     this.pending.set(receiptId, { targetIds: [], manifestOrder: this.manifestSequence++, method: "list", successful: true,
-      observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), timer });
+      observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), stopTimer });
     this.changed();
     return receiptId;
   }
@@ -574,7 +577,7 @@ export class ContextScope {
       if (["IMAGE_UNAVAILABLE", "CONTEXT_IMAGE_UNAVAILABLE", "CONTEXT_SOURCE_UNAVAILABLE", "CONTEXT_RETIRED", "CONTEXT_EXPIRED"].includes(String(code))) this.permanentFailure = true;
     }
     const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
-    const timer = setTimeout(() => this.finish(receiptId, false), CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
+    const stopTimer = this.returnTimer(() => this.finish(receiptId, false));
     const canonicalBatch = batchIndex === undefined ? undefined : this.textBatches[batchIndex];
     const replay = canonicalBatch !== undefined && this.batchCovered(canonicalBatch);
     const requiredImage = validImage && this.purpose === "normal" && this.registration.deliveryByTarget[target!.target_id]?.required
@@ -593,7 +596,7 @@ export class ContextScope {
       successful: !result.isError, observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), textRead,
       requestedItems: method === "read" ? inputReads.length : undefined,
       ...(cost ? { requiredCost: { tokens: cost.total_tokens, wire_bytes: cost.wire_bytes },
-        ...(replay ? { replayCharged: true } : { recoveryClaim: claim }) } : {}), timer });
+        ...(replay ? { replayCharged: true } : { recoveryClaim: claim }) } : {}), stopTimer });
     this.changed();
     return { result, receiptId };
   }
@@ -601,7 +604,7 @@ export class ContextScope {
     const pending = this.pending.get(receiptId);
     if (!pending) return;
     const beforeFirstWork = this.firstWorkReturns?.delete(receiptId) ?? false;
-    clearTimeout(pending.timer); this.pending.delete(receiptId);
+    pending.stopTimer(); this.pending.delete(receiptId);
     const successful = sent && this.isLive && pending.successful && (!pending.textRead || contextTextReadReceiptsEqual(pending.textRead, textRead));
     let textBytes = 0, uniqueBytes = 0, reusedBytes = 0;
     if (successful) {
@@ -649,8 +652,13 @@ export class ContextScope {
   retire(): void {
     this.live = false; this.navigator.retire();
     if (this.readinessTimer) clearTimeout(this.readinessTimer);
-    for (const pending of this.pending.values()) clearTimeout(pending.timer);
+    for (const pending of this.pending.values()) pending.stopTimer();
     this.pending.clear(); this.changed();
+  }
+  private returnTimer(finish: () => void): () => void {
+    if (this.purpose === "compaction") return new CompactionDeadline(Date.now() + CONTEXT_RETURN_TIMEOUT_MS).watch(finish);
+    const timer = setTimeout(finish, CONTEXT_RETURN_TIMEOUT_MS); timer.unref?.();
+    return () => clearTimeout(timer);
   }
   private assertLive(): void {
     if (!this.isLive) throw contextError("CONTEXT_RETIRED", "Context access is invalid or no longer active");

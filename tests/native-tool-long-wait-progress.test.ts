@@ -44,17 +44,25 @@ test("waiting-only IPC revisions are valid without tool batches and a stale proo
   expect(chatGptExternalToolCallsAreInFlight(mirror.snapshot())).toBe(false);
 });
 
-test("system resume allows one short proof-recovery grace, not indefinite renewal of a stale helper snapshot", () => {
-  const clock = new ChatGptSuspensionClock(1_000, 5_000);
-  clock.tick(1_000);
+test("system resume allows one short wall-clock proof-recovery grace before the interval ticks", () => {
+  const epoch = 1_800_000_000_000;
+  let elapsed = 0;
+  let wall = epoch;
+  const clock = new ChatGptSuspensionClock(1_000, 5_000, () => elapsed, () => wall);
+  wall = epoch + (elapsed = 1_000);
+  clock.tick(elapsed);
   const progress = new ChatGptExternalTurnProgress();
-  progress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 }, 1_000);
-  clock.tick(1_201_000);
+  progress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 }, epoch + 1_000);
+  // No interval callback ran during the suspension. A lease read must detect it immediately.
+  elapsed = 1_201_000;
+  wall = epoch + elapsed;
   const resumed = clock.recentSuspension();
-  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), 1_202_000, resumed)).toBe(true);
-  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), 1_206_000, resumed)).toBe(false);
-  progress.recordNativeWaiting({ revision: 2, activeOperations: 1, unreadResults: 0, remainingMs: 119_000 }, 1_202_000);
-  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), 1_207_000, resumed)).toBe(true);
+  expect(resumed).toEqual({ startedAt: epoch + 2_000, endedAt: epoch + 1_201_000 });
+  expect(clock.suspendedMs()).toBe(1_199_000);
+  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), epoch + 1_202_000, resumed)).toBe(true);
+  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), epoch + 1_206_000, resumed)).toBe(false);
+  progress.recordNativeWaiting({ revision: 2, activeOperations: 1, unreadResults: 0, remainingMs: 119_000 }, epoch + 1_202_000);
+  expect(chatGptExternalProgressSuppressesDomHealth(progress.snapshot(), epoch + 1_207_000, resumed)).toBe(true);
   expect(chatGptNativeWaitingLeaseIsLive(progress.snapshot(), -100_000)).toBe(false);
 });
 

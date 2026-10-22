@@ -411,7 +411,7 @@ for (const read of [false, true]) test(`retained control exposes an independent 
       expect(prepared.text).not.toContain("UNIQUE_DATABASE_MARKER");
       entry = JSON.parse(prepared.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
       const credential = entry!.first_call.arguments;
-      const control = prepared.text.match(/turn_token (control_\w+)/)![1]!;
+      const control = prepared.text.match(/turn_token (turn_\w+)/)![1]!;
       const handoffId = prepared.text.match(/handoff_id (handoff_\w+)/)![1]!;
       await expect(callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token: control, handoffId, summary: "too early" }))
         .rejects.toMatchObject({ code: "CONTEXT_NOT_READY" });

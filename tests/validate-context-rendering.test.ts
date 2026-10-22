@@ -114,7 +114,7 @@ test("compaction pipeline reuses real accepted source and settlement for every f
       expect(turn.requireRetainedConversation).toBe(true);
       await turn.onSendActivated?.();
       await turn.onSubmitted?.();
-      const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
+      const token = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)![1]!;
       const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
       prepared.release();
       await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId, summary });
@@ -176,7 +176,7 @@ test("live compaction rejects changed source while an unknown thread uses its cu
       await turn.onSendActivated?.();
       await turn.onSubmitted?.(); sends++;
       if (turn.compaction) {
-        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
+        const token = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)![1]!;
         const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
         prepared.release();
         await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId,

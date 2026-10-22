@@ -1,3 +1,4 @@
+import { ChatGptSuspensionClock, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
 import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { afterEach, expect, spyOn } from "bun:test";
 import { performanceTest } from "./helpers/performance-test";
@@ -112,6 +113,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
   const pages = new Map<string, { continuity: ContinuityLease; state: "running" | "ready" }>();
   let sends = 0;
   let capacityAvailable = true;
+  let onCapacity: (() => void) | undefined;
   let acquisitionRejections = 0;
   let mismatchedAcquisitionReceipt = false;
   let inspectCalls = 0;
@@ -119,7 +121,10 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
   const recoveryHost = { continuityLauncherInstance: launcherInstance, turnTabs: new Map() };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(incoming) {
     const path = new URL(incoming.url).pathname;
-    if (path === "/v1/turn/continuity-capacity") return Response.json({ ok: true, executionProtocol: 1, available: capacityAvailable });
+    if (path === "/v1/turn/continuity-capacity") {
+      onCapacity?.();
+      return Response.json({ ok: true, executionProtocol: 1, available: capacityAvailable });
+    }
     if (path === "/v1/turn/start") {
       const body = await incoming.json() as { recovery: unknown; requestId: string; traceId: string; helperPid: number };
       expect(incoming.headers.get("authorization")).toBe(`Bearer ${"a".repeat(43)}`);
@@ -190,7 +195,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     prompts.push(compiled.text);
     expect(turn.nativeConnector).toBe(true);
     expect(turn.capabilities.localToolsEnabled).toBe(false);
-    expect(compiled.text).not.toContain("turn_token turn_");
+    expect(compiled.text).toMatch(/turn_token turn_[a-f0-9]{32}/);
     expect(compiled.text).toContain("codex_context_navigation_json");
     expect(compiled.text).not.toContain("system instructions");
     if (failBeforeSend) { failBeforeSend = false; throw new Error("Injected prepare failure before Send"); }
@@ -250,7 +255,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     sources.push(source);
     expect(source).toContain("Continue the accepted task");
     expect(source).toContain("system instructions");
-    const token = compiled.text.match(/turn_token (control_[A-Za-z0-9_-]+)/)![1]!;
+    const token = compiled.text.match(/turn_token (turn_[a-f0-9]{32})/)![1]!;
     const handoffId = compiled.text.match(/handoff_id (handoff_[A-Za-z0-9_-]+)/)![1]!;
     await callTurnBroker(provider.chatgptWeb!.brokerSocketPath!, { method: "submit_compaction_handoff", token, handoffId,
       summary: "Checkpoint with the completed results and the unfinished instruction." });
@@ -269,6 +274,7 @@ function fixture(options: { manual?: boolean; delivered?: boolean; grouped?: boo
     descriptor, launcherInstance,
     actualRetirement: () => { actualRetirement = true; },
     capacity: (available: boolean) => { capacityAvailable = available; },
+    onCapacity: (callback: () => void) => { onCapacity = callback; },
     rejectAcquisitions: (count: number, mismatched = false) => { acquisitionRejections = count; mismatchedAcquisitionReceipt = mismatched; },
     prepare, pages, prompts, sources, sends: () => sends, inspectCalls: () => inspectCalls,
     failBeforeSend: () => { failBeforeSend = true; }, failSettlement: () => { failSettlement = true; } };
@@ -433,6 +439,144 @@ test("the first healthy compaction admission fixes its original configured deadl
   expect(f.store.get(f.thread)!.works[workId]!.retryBudget).toEqual(budget);
 });
 
+test("durable compaction pauses once across store instances and retries without renewing its original budget", async () => {
+  let wall = Date.now(), elapsed = 0;
+  const clock = new ChatGptSuspensionClock(1_000, 5_000, () => elapsed, () => wall);
+  const spies = [spyOn(Date, "now").mockImplementation(() => wall),
+    spyOn(performance, "now").mockImplementation(() => elapsed),
+    spyOn(chatGptSuspensionClock, "start").mockImplementation(() => {}),
+    spyOn(chatGptSuspensionClock, "suspendedMs").mockImplementation(() => clock.suspendedMs()),
+    spyOn(chatGptSuspensionClock, "recentSuspension").mockImplementation(() => clock.recentSuspension())];
+  try {
+    const f = fixture();
+    f.failBeforeSend();
+    const first = (await f.prepare())!;
+    await expect(runContinuityCompaction(f.request, first, f.worker, f.broker, capabilities, f.namespace, 10_000))
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
+    await Bun.sleep(0);
+    const original = f.store.get(f.thread)!;
+    const workId = original.currentWorkId!;
+    const budget = original.works[workId]!.retryBudget!;
+    const deadline = f.store.compactionDeadline(f.thread, workId);
+    for (let i = 0; i < 2; i++) { wall += 1_000; elapsed += 1_000; clock.tick(elapsed); }
+    wall += 601_000; elapsed += 601_000;
+    expect(deadline.remainingMs()).toBe(7_000);
+    const secondStore = new ContinuityRecoveryStore(f.state);
+    expect(secondStore.compactionDeadline(f.thread, workId)).toBe(deadline);
+    expect(secondStore.compactionDeadline(f.thread, workId).remainingMs()).toBe(7_000);
+    const persisted = secondStore.get(f.thread)!.works[workId]!.retryBudget!;
+    expect(persisted.deadlineAt).toBe(budget.deadlineAt);
+    expect(persisted.suspendedMs).toBe(600_000);
+    // A new process inherits saved compensation, but cannot add its own clock gap
+    // to the previous process's deadline or gain another recovery window.
+    const child = Bun.spawnSync([process.execPath, "-e", `
+      import { ContinuityRecoveryStore } from "./src/adapters/chatgpt-web/continuity-recovery-store";
+      const [directory, thread, work, wall] = process.argv.slice(1);
+      const store = new ContinuityRecoveryStore(directory, { now: () => Number(wall) });
+      process.stdout.write(String(store.compactionDeadline(thread, work).remainingMs()));
+    `, f.state, f.thread, workId, String(wall + 8_000)], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    expect(child.exitCode).toBe(0);
+    expect(child.stdout.toString()).toBe("0");
+    expect(secondStore.get(f.thread)!.works[workId]!.retryBudget).toEqual(persisted);
+    expect(() => secondStore.transact(f.thread, { scope: original.scope }, record => {
+      record.works[workId]!.retryBudget!.suspendedMs! += 10_000;
+    })).toThrow("Only the current process suspension clock");
+    wall += 3_600_000; // A running process keeps its original awake budget after system time correction.
+    expect(deadline.remainingMs()).toBe(7_000);
+    let retryTtl: number | undefined;
+    const begin = f.broker.beginCompactionTransaction.bind(f.broker);
+    const observe = spyOn(f.broker, "beginCompactionTransaction").mockImplementation((traceId, ttl) => {
+      retryTtl = ttl;
+      expect(f.store.get(f.thread)!.works[workId]!.retryBudget!.deadlineAt).toBe(budget.deadlineAt);
+      return begin(traceId, ttl);
+    });
+    try {
+      const next = (await f.prepare())!;
+      f.onCapacity(() => {
+        wall += 601_000; elapsed += 601_000;
+        expect(deadline.remainingMs()).toBe(6_000);
+      });
+      await runContinuityCompaction(f.request, next, f.worker, f.broker, capabilities, f.namespace, 60_000);
+      expect(retryTtl).toBe(6_000);
+      expect(() => f.store.compactionDeadline(f.thread, workId)).toThrow("live admitted");
+      expect(f.store.get(f.thread)!.works[workId]!.attempts).toHaveLength(2);
+    } finally { observe.mockRestore(); }
+  } finally { for (const spy of spies.reverse()) spy.mockRestore(); }
+});
+
+test("a saved pause cannot hide a business change during recovery capacity admission", async () => {
+  let wall = Date.now(), elapsed = 0;
+  const clock = new ChatGptSuspensionClock(1_000, 5_000, () => elapsed, () => wall);
+  const spies = [spyOn(Date, "now").mockImplementation(() => wall),
+    spyOn(performance, "now").mockImplementation(() => elapsed),
+    spyOn(chatGptSuspensionClock, "start").mockImplementation(() => {}),
+    spyOn(chatGptSuspensionClock, "suspendedMs").mockImplementation(() => clock.suspendedMs())];
+  try {
+    const f = fixture();
+    f.failBeforeSend();
+    const first = (await f.prepare())!;
+    await expect(runContinuityCompaction(f.request, first, f.worker, f.broker, capabilities, f.namespace, 10_000))
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
+    await Bun.sleep(0);
+    const original = f.store.get(f.thread)!;
+    const workId = original.currentWorkId!;
+    const deadline = f.store.compactionDeadline(f.thread, workId);
+    const next = (await f.prepare())!;
+    f.onCapacity(() => {
+      wall += 601_000; elapsed += 601_000;
+      expect(deadline.remainingMs()).toBe(9_000);
+      // A real concurrent failure changes business state as well as record.version.
+      f.store.recordFailure(f.thread, { scope: f.scope }, workId);
+    });
+    await expect(runContinuityCompaction(f.request, next, f.worker, f.broker, capabilities, f.namespace, 60_000))
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(f.starts).toHaveLength(1);
+    expect(f.store.get(f.thread)!.works[workId]!.attempts).toHaveLength(1);
+  } finally { for (const spy of spies.reverse()) spy.mockRestore(); }
+});
+
+test("an expired durable budget remains retired after wall rewind, local cleanup and process restart", async () => {
+  let wall = Date.now(), elapsed = 0;
+  const clock = new ChatGptSuspensionClock(1_000, 5_000, () => elapsed, () => wall);
+  const spies = [spyOn(Date, "now").mockImplementation(() => wall),
+    spyOn(performance, "now").mockImplementation(() => elapsed),
+    spyOn(chatGptSuspensionClock, "start").mockImplementation(() => {}),
+    spyOn(chatGptSuspensionClock, "suspendedMs").mockImplementation(() => clock.suspendedMs())];
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const f = fixture();
+    f.failBeforeSend();
+    await expect(runContinuityCompaction(f.request, (await f.prepare())!, f.worker, f.broker, capabilities, f.namespace, 10_000))
+      .rejects.toMatchObject({ code: "continuity_source_unproven" });
+    await Bun.sleep(0);
+    const original = f.store.get(f.thread)!;
+    const workId = original.currentWorkId!;
+    const originalDeadline = original.works[workId]!.retryBudget!.deadlineAt;
+    wall -= 3_600_000;
+    for (let i = 0; i < 10; i++) { wall += 1_000; elapsed += 1_000; clock.tick(elapsed); }
+    mock.timers.tick(10_000); // Expiry persists its marker and removes the local timer/cache entry.
+    const expired = f.store.get(f.thread)!;
+    expect(expired.works[workId]!.retryBudget).toMatchObject({ deadlineAt: originalDeadline, expired: true });
+    const freshStore = new ContinuityRecoveryStore(f.state);
+    expect(freshStore.compactionDeadline(f.thread, workId).remainingMs()).toBe(0);
+    expect(() => freshStore.transact(f.thread, { scope: expired.scope }, record => {
+      delete record.works[workId]!.retryBudget!.expired;
+    })).toThrow("cannot be reset");
+    const child = Bun.spawnSync([process.execPath, "-e", `
+      import { ContinuityRecoveryStore } from "./src/adapters/chatgpt-web/continuity-recovery-store";
+      const [directory, thread, work, wall] = process.argv.slice(1);
+      const store = new ContinuityRecoveryStore(directory, { now: () => Number(wall) });
+      process.stdout.write(String(store.compactionDeadline(thread, work).remainingMs()));
+    `, f.state, f.thread, workId, String(wall)], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    expect(child.exitCode).toBe(0);
+    expect(child.stdout.toString()).toBe("0");
+    await expect(runContinuityCompaction(f.request, (await f.prepare())!, f.worker, f.broker, capabilities, f.namespace, 60_000))
+      .rejects.toMatchObject({ code: "continuity_retry_exhausted" });
+    expect(f.starts).toHaveLength(1);
+    expect(f.store.get(f.thread)!.works[workId]!.attempts).toHaveLength(1);
+  } finally { mock.timers.reset(); for (const spy of spies.reverse()) spy.mockRestore(); }
+});
+
 for (const previousFailure of [false, true]) test(`review repair1: five capacity waits preserve isolation and the original compaction budget (${previousFailure})`, async () => {
   const f = fixture();
   if (previousFailure) {
@@ -588,7 +732,7 @@ test("cold recovery compaction sends only its read-only entry and retains comple
     { role: "user", content: "Original task" },
   ] });
   parsed._compactionRequest = true;
-  const compiled = compileRecoveryCompactionInput(parsed, capabilities, { token: "control_placeholder", handoffId: "handoff_placeholder" });
+  const compiled = compileRecoveryCompactionInput(parsed, capabilities, { token: "turn_placeholder", handoffId: "handoff_placeholder" });
   expect(compiled.text).not.toContain("keep-first-history");
   expect(compiled.text).toContain("codex_context_navigation_json");
   expect(compiled.text).toContain("codex_context_list");
@@ -732,6 +876,7 @@ test("a compaction transaction acquired after the deadline is revoked without op
   cleanup.push(async () => { delayed.mockRestore(); revoke.mockRestore(); });
   const first = (await f.prepare())!;
   mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  const monotonic = spyOn(performance, "now").mockImplementation(() => Date.now());
   try {
     const outcome = runContinuityCompaction(f.request, first, f.worker, f.broker, capabilities, f.namespace, 100)
       .catch(error => error);
@@ -746,7 +891,7 @@ test("a compaction transaction acquired after the deadline is revoked without op
     expect(revoke).toHaveBeenCalledWith(token!);
     expect(f.starts).toHaveLength(0);
     expect(f.store.get(f.thread)!.historyRevision).toBe(0);
-  } finally { release(); mock.timers.reset(); }
+  } finally { release(); monotonic.mockRestore(); mock.timers.reset(); }
 });
 
 test("identical summary text does not collapse different history targets", async () => {

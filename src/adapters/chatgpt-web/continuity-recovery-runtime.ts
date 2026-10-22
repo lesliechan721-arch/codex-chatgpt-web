@@ -490,7 +490,7 @@ export async function retireRecoveryWriter(
   const attempt = work?.attempts.at(-1);
   if (attempt) {
     // A live instance must prove this protocol, not merely be running new files on disk.
-    if (bindings.broker?.assertRecoveryFencing) await bindings.broker.assertRecoveryFencing();
+    if (bindings.broker?.assertRecoveryFencing) await bindings.broker.assertRecoveryFencing(compaction ? { compaction: true } : undefined);
     else if (continuityProcessInstanceStatus(observed.owner) !== "exited") throw continuityError("continuity_configuration_conflict", "The running Broker cannot prove execution generation fencing; update and restart it.");
     // This CAS and dispatch registration use the same storage lock. After this commit,
     // every old process observes the fence even if cancellation or cleanup loses its reply.
@@ -509,12 +509,12 @@ export async function retireRecoveryWriter(
     if (preserveSourceReplay) retainContinuityOrdinaryReplayTombstone(binding!, compactionReplaySource!.executionKey,
       compactionReplaySource!.historyRevision, source!.acceptedContinuityInstructionIdentity(), source!.nativeTurnId);
     if (source) {
-      try { await source.runtime.retireCapability?.(); }
+      try { await source.runtime.retireCapability?.(compaction ? { compaction: true } : undefined); }
       catch { /* The durable fence already denies effects; late coverage cannot delay isolation. */ }
       if (source.isActive()) source.cancel(Object.assign(new Error("The previous task writer is retired for recovery."), { code: "continuity_recovery_retired" }));
     }
     if (bindings.broker?.retireRecoveryWriter) await bindings.broker.retireRecoveryWriter({ directory: bindings.registrations.directory,
-      thread: observed.thread, logicalWorkId: work!.logicalWorkId, attempt: attempt.attempt });
+      thread: observed.thread, logicalWorkId: work!.logicalWorkId, attempt: attempt.attempt }, compaction ? { compaction: true } : undefined);
     if (observed.transaction) {
       const original = recoveryIdentity(observed, bindings.recoveryStore.installationId());
       const retiredPreparation = observed.retiredPreparation;
@@ -524,9 +524,9 @@ export async function retireRecoveryWriter(
       let receipt;
       if (work!.state === "stopped" && archivedExpected && canonicalJson(archivedExpected) === canonicalJson(original)) {
         const target = recoveryIdentity({ ...observed, ...retiredPreparation!.target }, bindings.recoveryStore.installationId());
-        try { receipt = await retireLauncherContinuityWriter(descriptor, target, bindings.registrations.directory); }
-        catch { receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory); }
-      } else receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory);
+        try { receipt = await retireLauncherContinuityWriter(descriptor, target, bindings.registrations.directory, compaction ? { compaction: true } : undefined); }
+        catch { receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory, compaction ? { compaction: true } : undefined); }
+      } else receipt = await retireLauncherContinuityWriter(descriptor, original, bindings.registrations.directory, compaction ? { compaction: true } : undefined);
       if (receipt.writerRetired !== true) throw continuityError("continuity_unverified", "The page execution fence could not be verified.");
       if (receipt.physicalCleanup !== "destroyed") {
         const isolated = bindings.recoveryStore.get(observed.thread)!;

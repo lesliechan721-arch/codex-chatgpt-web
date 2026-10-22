@@ -1,6 +1,7 @@
 import {
   NATIVE_EXECUTION_INSTRUCTIONS, SKILL_ATTACHMENT_INSTRUCTIONS, TASK_OUTPUT_INSTRUCTIONS,
   TASK_ROLE_INSTRUCTIONS, TASK_UPDATE_INSTRUCTIONS, bootstrapExecutionProtocol, bootstrapExecutionProtocolUnits, taskContinuityInstructions,
+  localCodexPluginInstructions, resolveLocalCodexAppName,
   type BootstrapProtocolUnit,
 } from "./execution-protocol";
 import { normalContextPrompt, type ContextPlanDescriptor, type ContextPromptNavigation } from "./context-prompt";
@@ -78,6 +79,8 @@ export interface CompileChatGptWebPromptOptions {
   contextNavigation?: ContextPromptNavigation;
   /** Prepare exact normalized records and applicable execution rules for an ordinary short start. */
   bootstrapPreparation?: true;
+  /** The same display name used to select the ChatGPT plugin for this turn. */
+  appName?: string;
   captureLunaCheckpoint?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
@@ -523,6 +526,7 @@ function compileChatGptWebPromptCandidate(
     && (options.taskUpdateProtocol !== 1 || parsed._compactionRequest)) {
     throw new Error("task-updates-v1 requires a new ordinary Full Native execution");
   }
+  const appName = resolveLocalCodexAppName(options?.appName, manualControl);
   const attachSkills = options?.experimentalSkillAttachments === true;
   if (attachSkills && (manualControl || isChatGptWebZeroRiskBackendModel(parsed.modelId))) {
     throw new Error("Skills as files is unavailable in Zero Risk mode");
@@ -593,6 +597,10 @@ function compileChatGptWebPromptCandidate(
         : "Each image_attachment in the context refers to the correspondingly named image attached to this ChatGPT message; inspect it directly.",
     ...TASK_OUTPUT_INSTRUCTIONS,
     ...taskContinuityInstructions(options ?? {}),
+    ...(mode.localTools || parsed._compactionRequest && options?.compactionReadOnly
+      ? localCodexPluginInstructions(appName) : []),
+    ...(parsed._compactionRequest && options?.compactionReadOnly
+      ? ["The compaction_token belongs only to this selected plugin. Never send it to another plugin."] : []),
   ];
   const transportContract = parsed._compactionRequest
     ? manualControl
@@ -619,7 +627,7 @@ function compileChatGptWebPromptCandidate(
       ] : []),
     ]
     : [
-      `This is ChatGPT Web ${mode.displayLabel} with no Codex Native bridge to the user's local computer attached to this response. This restriction applies only to local Codex files, commands, processes, and computer mutations.`,
+      `This is ChatGPT Web ${mode.displayLabel} with no local Codex bridge attached to this response. This restriction applies only to local Codex files, commands, processes, and computer mutations.`,
       "Use any ChatGPT-native capabilities available in this chat—including web search, browsing, research, and other first-party tools—whenever they help complete the request. The missing local-computer bridge says nothing about whether those ChatGPT capabilities are available.",
       "The task history below already contains everything Codex collected from the user's local workspace. Treat prior local tool results as authoritative snapshots of that earlier work.",
       "Do not claim a new local inspection, command, edit, or verification unless it actually appears in the task history. If the latest request requires fresh local-computer access or a local mutation, state only that exact limitation instead of inventing success.",
@@ -688,7 +696,7 @@ function compileChatGptWebPromptCandidate(
     ? [
       "<codex_transport_resume>",
       // DOM rebinding requires one token occurrence; the navigation entry already carries it.
-      `${options?.contextNavigation ? "The selected task input and its context navigation entry are ready; read required images before acting and historical references as needed." : "The task context is complete."} Pass ${options?.contextNavigation ? "the turn_token value from codex_context_navigation_json" : `turn_token ${turnToken}`} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
+      `${options?.contextNavigation ? "The selected task input and its context navigation entry are ready; read required images before acting and historical references as needed." : "The task context is complete."} Pass ${options?.contextNavigation ? "the turn_token value from codex_context_navigation_json" : `turn_token ${turnToken}`} unchanged to every tool call through the selected local Codex plugin in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`,
       "</codex_transport_resume>",
     ]
     : [
@@ -733,7 +741,7 @@ function compileChatGptWebPromptCandidate(
       ...prepared.messages.map((message, message_index) => ({ kind: "message" as const, message_index, message })),
     ];
     const bootstrapInput = options?.bootstrapPreparation ? {
-      manualControl: options.manualControl, taskUpdateProtocol: options.taskUpdateProtocol,
+      appName, manualControl: options.manualControl, taskUpdateProtocol: options.taskUpdateProtocol,
       retainedContinuity: options.retainedContinuity, recoveredContinuity: options.recoveredContinuity,
       requiredMcpImages: options.contextNavigation?.requiredMcpImages ?? options.contextNavigation?.requiredImages ?? 0,
       imageAttachments: images.length > 0, skillAttachments: skillFiles.length > 0,

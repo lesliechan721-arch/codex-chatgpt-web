@@ -3,6 +3,7 @@ import {
   CHATGPT_ZERO_RISK_CONTINUITY_INPUT_CHAR_LIMIT, chatGptPromptJsonBytes, compileChatGptWebPrompt,
 } from "../src/adapters/chatgpt-web/prompt";
 import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
+import { ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { assertContinuityCompiledInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
@@ -37,6 +38,7 @@ test("Zero Risk prompt carries only a neutral request id while MCP metadata owns
     manualControl: true,
   });
   expect(compiled.multipart).toBeUndefined();
+  expect(compiled.text).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(ZERO_RISK_CHATGPT_CONNECTOR_NAME)}.`);
   expect(compiled.text).toContain("<codex_zero_risk_request_json>");
   expect(compiled.text).toContain(`\"request_id\":\"${requestId}\"`);
   expect(compiled.text).not.toContain("turn_token");
@@ -46,7 +48,19 @@ test("Zero Risk prompt carries only a neutral request id while MCP metadata owns
   expect(compiled.text).not.toContain("exactly once");
   expect(compiled.text).not.toContain("codex_turn_start");
   expect(compiled.text).not.toContain("codex_turn_complete");
-  expect(compiled.text).not.toContain("ChatGPT Web Medium with no Codex Native bridge");
+  expect(compiled.text).not.toContain("ChatGPT Web Medium with no local Codex bridge");
+});
+
+test("custom Zero Risk plugin is named in normal and compaction requests without automatic turn tokens", () => {
+  for (const compaction of [false, true]) {
+    const compiled = compileChatGptWebPrompt(request(compaction), capabilities, requestId, {
+      manualControl: true, appName: "Codex Manual Work",
+    });
+    expect(compiled.text).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
+    expect(compiled.text).not.toContain("Codex Native");
+    expect(compiled.text).not.toContain("turn_token");
+    expect(compiled.text).toContain(`"request_id":"${requestId}"`);
+  }
 });
 
 test("Zero Risk compaction prompt stays task-focused while MCP metadata owns completion", () => {

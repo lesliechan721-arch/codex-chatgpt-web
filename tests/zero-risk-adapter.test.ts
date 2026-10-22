@@ -173,6 +173,7 @@ for (const scenario of [
     root,
     `environment-${scenario.format}-${scenario.finalWins}-${scenario.apiKey}-${scenario.delegated}-${latestNative}.json`,
   );
+  config.chatgptWeb!.appName = "Codex Manual Work";
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
   const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
@@ -228,6 +229,7 @@ for (const scenario of [
   let modelAction: Promise<void> | undefined;
   const control: ChatGptZeroRiskManualControl = {
     async start(path, activity) {
+      expect(activity.prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
       // The authenticated control endpoint binds the real private journal before acquisition.
       const receipt = unified ? await startLauncherManualTurn(path, activity)
         : host.beginManualTurn(activity.traceId, activity.helperPid, activity.prompt,
@@ -988,6 +990,7 @@ test("a Zero Risk launcher failure remains failed when its own capability cleanu
 
 test("Zero Risk offers only the new Codex suffix when the launcher reuses its retained ChatGPT chat", async () => {
   const config = provider("incremental-resume");
+  config.chatgptWeb!.appName = "Codex Manual Work";
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
   const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const input = request("turn_safe_incremental");
@@ -1022,6 +1025,9 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
     async start(_path, activity) {
       fullPrompt = activity.prompt;
       resumePrompt = activity.resumePrompt ?? "";
+      for (const prompt of [fullPrompt, resumePrompt]) {
+        expect(prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
+      }
       exactBinding = binding(resumePrompt);
     },
     async waitSent() {

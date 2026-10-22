@@ -1,3 +1,4 @@
+import { CompactionDeadline } from "./compaction-deadline";
 import type { ContextSnapshot } from "./context-snapshot";
 import { parseDataUrl } from "../image";
 import type {
@@ -292,7 +293,7 @@ export async function settleActiveCompactionSource(
       if (signal?.aborted) source.cancel(abortReason(signal));
       throw error;
     } finally {
-      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext);
+      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext, { compaction: true });
     }
   };
   return alreadyExclusive ? settle() : source.runExclusive(settle);
@@ -342,7 +343,7 @@ export async function settleActiveZeroRiskCompactionSource(
     let compactionAccepted = false;
     try {
       token = await source.runtime.token;
-      await source.runtime.syncContextUsage?.();
+      await source.runtime.syncContextUsage?.({ compaction: true });
       const coverage = source.runtime.compactionSourceCoverage;
       if (!coverage || !capabilities) throw continuityError("continuity_source_unproven", "Zero Risk compaction requires verified source coverage and page capacity.");
       const snapshot = sourceSnapshot ?? captureRetainedCompactionSource(parsed, source);
@@ -394,7 +395,7 @@ export async function settleActiveZeroRiskCompactionSource(
       throw error;
     } finally {
       if (sourceToken) await broker.revokeCompactionContext?.(sourceToken);
-      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext);
+      if (token && compactionAccepted) await broker.revoke(token, undefined, driverContext, { compaction: true });
     }
   };
   return alreadyExclusive ? settle() : source.runExclusive(settle);
@@ -426,11 +427,10 @@ export async function requestRetainedCompactionHandoff(
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
   const operationTimeoutMs = boundedCompactionTimeout(timeoutMs);
   const deadline = new AbortController();
-  const deadlineTimer = setTimeout(
+  const budget = new CompactionDeadline(Date.now() + operationTimeoutMs);
+  const stopDeadline = budget.watch(
     () => deadline.abort(new Error(`ChatGPT compaction handoff timed out after ${operationTimeoutMs}ms`)),
-    operationTimeoutMs,
   );
-  deadlineTimer.unref?.();
   const operationSignal = signal
     ? AbortSignal.any([signal, deadline.signal])
     : deadline.signal;
@@ -442,23 +442,23 @@ export async function requestRetainedCompactionHandoff(
   if (operationSignal.aborted) abortBrowser();
   else operationSignal.addEventListener("abort", abortBrowser, { once: true });
   try {
-    const transactionPromise = broker.beginCompactionTransaction(traceId, operationTimeoutMs);
+    const transactionPromise = broker.beginCompactionTransaction(traceId, budget.remainingMs());
     void transactionPromise.then(lateTransaction => {
       if (operationSignal.aborted && transaction !== lateTransaction) {
         broker.abortCompactionTransaction(lateTransaction.token);
       }
     }, () => {});
     transaction = await withCompactionAbort(transactionPromise, operationSignal);
-    await source.runtime.syncContextUsage?.();
+    await source.runtime.syncContextUsage?.({ compaction: true });
     const coverage = source.runtime.compactionSourceCoverage;
     if (!coverage) throw continuityError("continuity_source_unproven", "Retained compaction requires accepted source coverage evidence.");
     const snapshot = continuity?.sourceSnapshot ?? captureRetainedCompactionSource(parsed, source);
     const latest = coverage.latest()!;
     const registered = await registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
       handoffId: transaction.handoffId, historyRevision: latest.historyRevision, ownerGeneration: latest.pageGeneration,
-      expiresAt: Date.now() + operationTimeoutMs,
+      expiresAt: () => budget.deadlineAt,
       availableTokens: compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) },
-    structuredCompactionHandoffInstruction(transaction, compactionPrompt(parsed)));
+    structuredCompactionHandoffInstruction(transaction, { appName: worker.appName, compactPrompt: compactionPrompt(parsed) }));
     sourceToken = registered.token;
     const instruction = registered.instruction;
     if (continuity) assertContinuityCompiledInput({ text: instruction, images: [] }, {
@@ -538,7 +538,7 @@ export async function requestRetainedCompactionHandoff(
       ).catch(() => {});
     }
     operationSignal.removeEventListener("abort", abortBrowser);
-    clearTimeout(deadlineTimer);
+    stopDeadline();
   }
 }
 
@@ -742,13 +742,18 @@ export function runStructuredCompactionOnce<T = string>(
   });
   // Return a deadline failure promptly, while its physical browser owner still blocks retries
   // and cancel-all completion. A cancelled queued run must also retain its predecessor's gate.
-  const ownerSettlement = promise.then(() => false, () => true).then(async failed => {
+  const ownerSettlement = promise.then(() => false, error => {
+    // Native retries of the identical oversized input cannot fix a size rejection. Replay that
+    // terminal result under the existing cache lifetime; reduced input/model changes get a new key.
+    return !(error instanceof ChatGptWebAdapterError
+      && error.code === "context_length_exceeded" && !error.retryable);
+  }).then(async evict => {
     await Promise.allSettled(physicalSettlements);
     run.active = false;
     if (structuredCompactionOwners.get(owner.ownerKey) === ownerSettlement) {
       structuredCompactionOwners.delete(owner.ownerKey);
     }
-    if (failed && !run.retainFailedResult && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
+    if (evict && !run.retainFailedResult && structuredCompactionRuns.get(key) === run) structuredCompactionRuns.delete(key);
   });
   const run: CachedCompactionRun = {
     createdAt: Date.now(),

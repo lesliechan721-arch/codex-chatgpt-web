@@ -92,8 +92,9 @@ function directBrowserFixture(readText: () => Promise<string>, onSourceBoundary?
     chatgptWeb: { appName: CHATGPT_CONNECTOR_NAME, browserDiagnosticsPath: root },
   }) as any;
   const hidden: any = {
-    last: () => hidden, filter: () => hidden, getByText: () => hidden, getByTestId: () => hidden,
-    isVisible: async () => false,
+    last: () => hidden, filter: () => hidden, locator: () => hidden,
+    getByText: () => hidden, getByTestId: () => hidden,
+    isVisible: async () => false, count: async () => 0,
   };
   const page = Object.assign(new EventEmitter(), {
     isClosed: () => false, locator: () => hidden, url: () => "https://chatgpt.com/",

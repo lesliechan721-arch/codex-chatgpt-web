@@ -225,10 +225,13 @@ test("a new instruction immediately after a checkpoint sends only its increment 
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} repeated-summary checkpoint-only transition follows the second active source`, async () => {
-  const f = fixture(manual, { mcpTransport: "in-process" });
+  // Two retained tool turns plus compaction controls need the Thinking window.
+  // This case checks checkpoint ownership; input limits have separate coverage.
+  const f = fixture(manual, { mcpTransport: "in-process", reasoning: manual ? "low" : "medium" });
   f.controls.invokeSourceTools = true;
   const compactActive = async (ordinary: CodexParsedRequest, turnId: string) => {
     const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(ordinary)}`)!;
+    expect(source.isActive()).toBe(true);
     const call = source.outstanding()[0]!;
     const compact = f.request("", turnId, [
       ...(ordinary._rawBody as { input: unknown[] }).input,
@@ -237,6 +240,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     ]);
     compact._compactionRequest = true;
     const events = await f.run(compact);
+    expect(f.pages.size).toBe(1);
+    expect(new Set(f.submissions.map(submission => submission.key)).size).toBe(1);
     const summary = events.find(event => event.type === "text_delta");
     if (summary?.type !== "text_delta") throw new Error("Missing accepted checkpoint");
     return summary.text;

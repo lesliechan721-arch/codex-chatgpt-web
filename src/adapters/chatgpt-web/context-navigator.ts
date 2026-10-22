@@ -1,3 +1,4 @@
+import { compactionProcessingNow } from "./compaction-deadline";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { BrokerToolResult } from "./turn-broker";
 import { assertContextNavigationBudget, CONTEXT_CREDENTIAL_ARGUMENT_BYTES, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
@@ -64,6 +65,7 @@ export class ContextNavigator {
     if (typeof options.scopeId !== "string" || !options.scopeId || options.scopeId.length > 4096
       || !["normal", "compaction"].includes(options.purpose) || !(options.snapshot instanceof ContextSnapshot)) throw new Error("Invalid context navigator binding");
     this.#snapshot = options.snapshot; this.#purpose = options.purpose;
+    this.#planningStarted = this.#processingNow();
     this.#limits = contextLimits(options.limits);
     this.#delivery = Object.freeze(structuredClone(options.deliveryByTarget ?? {}));
     for (const [targetId, delivery] of Object.entries(this.#delivery)) {
@@ -243,7 +245,7 @@ export class ContextNavigator {
             if (item.has_more) { start = item.range.end_exclusive; break; }
             position++; start = 0;
           }
-          if (performance.now() - this.#planningStarted > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
+          if (this.#processingNow() - this.#planningStarted > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
         }
         return batches;
       } catch (error) {
@@ -252,7 +254,8 @@ export class ContextNavigator {
     }
     throw new NavigationError("BUDGET_EXCEEDED");
   }
-  readonly #planningStarted = performance.now();
+  readonly #planningStarted: number;
+  #processingNow(): number { return this.#purpose === "compaction" ? compactionProcessingNow() : performance.now(); }
 
   #validateReads(args: unknown): ValidatedRead[] {
     const input = this.#validate(args, ["context_id", "reads"]);
@@ -382,7 +385,7 @@ export class ContextNavigator {
       if (targetIndex < 0 || position.t === null && position.n !== 0) throw new NavigationError("INVALID_CURSOR");
       let offset = position.n;
       const hits: Record<string, unknown>[] = [];
-      const searchStart = performance.now();
+      const searchStart = this.#processingNow();
       let finalCursor: string | null = null;
       const make = (cursor: string | null) => response({ context_id: this.#snapshot.context_id, purpose: this.#purpose, query: input.query,
         hits, has_more: cursor !== null, next_cursor: cursor });
@@ -393,7 +396,7 @@ export class ContextNavigator {
         let utf16Offset = bytes.subarray(0, offset).toString("utf8").length;
         const text = bytes.toString("utf8");
         for (;;) {
-          if (performance.now() - searchStart > this.#limits.callProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
+          if (this.#processingNow() - searchStart > this.#limits.callProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
           const index = text.indexOf(input.query, utf16Offset);
           if (index < 0) break;
           const matchStart = Buffer.byteLength(text.slice(0, index));
@@ -432,7 +435,7 @@ export class ContextNavigator {
   }
 
   #run(tool: "list" | "read" | "search", action: () => { result: BrokerToolResult; meteredResult?: BrokerToolResult; targets?: readonly ContextTarget[]; requestedItems?: number; returnedItems?: number; visual?: number; imageBytes?: number }, preflight = false, requestedReadItems = 0): BrokerToolResult {
-    const started = performance.now();
+    const started = this.#processingNow();
     this.#activeBudgetHits = preflight ? undefined : new Set();
     if (this.#usage.navigation_stopped) throw new ContextNavigationStoppedError();
     // A standalone caller receives the same fail-closed admission as the Broker.
@@ -452,7 +455,7 @@ export class ContextNavigator {
       const image = imageBytes > 0;
       if (!this.#fits(meteredResult ?? result, tool, image, preflight && tool === "list")) throw new NavigationError("BUDGET_EXCEEDED");
       if (preflight) {
-        if (performance.now() - started > this.#limits.callProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
+        if (this.#processingNow() - started > this.#limits.callProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
         return result;
       }
       const cost = this.#cost(meteredResult ?? result, visual);
@@ -470,7 +473,7 @@ export class ContextNavigator {
         || image && remaining && (remaining.image_reads !== undefined && remaining.image_reads - (remaining.reserved_image_reads ?? 0) < 1
           || remaining.image_bytes !== undefined && imageBytes > remaining.image_bytes - (remaining.reserved_image_bytes ?? 0))) throw new NavigationError("BUDGET_EXCEEDED");
       if (this.#retired) throw new NavigationError("CONTEXT_EXPIRED");
-      if (performance.now() - started > this.#limits.callProcessingMs || this.#usage.processing_ms + performance.now() - started > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
+      if (this.#processingNow() - started > this.#limits.callProcessingMs || this.#usage.processing_ms + this.#processingNow() - started > this.#limits.totalProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
     } catch (error) {
       if (error instanceof ContextNavigationStoppedError) throw error;
       const code = error instanceof NavigationError ? error.code : "INVALID_ARGUMENT";
@@ -497,7 +500,7 @@ export class ContextNavigator {
     this.#usage.wire_bytes += cost.wire_bytes; this.#usage.text_tokens += cost.text_tokens;
     this.#usage.visual_token_reserve += visual; this.#usage.image_bytes += imageBytes;
     if (imageBytes > 0) this.#usage.image_reads++;
-    this.#usage.processing_ms += performance.now() - started;
+    this.#usage.processing_ms += this.#processingNow() - started;
     if (tool === "read") { this.#usage.read_calls++; this.#usage.read_requested_items += requestedItems; this.#usage.read_returned_items += returnedItems; }
     for (const name of this.#activeBudgetHits ?? []) this.#usage.budget_hits[name] = (this.#usage.budget_hits[name] ?? 0) + 1;
     this.#activeBudgetHits = undefined;

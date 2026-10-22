@@ -2110,7 +2110,7 @@ for (const generationProgress of [true, false]) {
         expect(turn.requireRetainedConversation).toBeTrue();
         expect(turn.compaction).toBeTrue();
         prepared = await turn.prepareResume!();
-        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+        const token = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
         const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
         expect(token).toBeDefined();
         expect(handoffId).toBeDefined();
@@ -2252,7 +2252,7 @@ async function remoteRetainedCheckpointLease(generationProgress: boolean, option
         f.pages.set(turn.conversationKey!, { continuity: lease, state: "running" });
         turn.onContinuityLease!(lease);
         prepared = await turn.prepareResume!();
-        const token = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+        const token = prepared.text.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
         const handoffId = prepared.text.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
         expect(token).toBeDefined();
         expect(handoffId).toBeDefined();

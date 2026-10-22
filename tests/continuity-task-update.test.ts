@@ -170,7 +170,7 @@ async function fixture(manual = false, protocol = true, search = false,
     turn.onContinuityLease!(lease);
     const compiled = await turn.prepare();
     if (turn.nativeConnector) {
-      const control = compiled.text.match(/turn_token (control_[a-f0-9]{32})/)![1]!;
+      const control = compiled.text.match(/turn_token (turn_[a-f0-9]{32})/)![1]!;
       const handoffId = compiled.text.match(/handoff_id (handoff_[a-f0-9]{32})/)![1]!;
       const aborted = new Promise<void>(resolve => turn.abortSignal!.addEventListener("abort", () => resolve(), { once: true }));
       await turn.onSendActivated?.();

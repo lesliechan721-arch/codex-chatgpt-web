@@ -154,7 +154,7 @@ async function probe(index: number): Promise<void> {
     const transaction = await broker.beginCompactionTransaction(traceId, 300_000);
     const browserAbort = new AbortController();
     const signal = AbortSignal.any([controller.signal, browserAbort.signal]);
-    const instruction = structuredCompactionHandoffInstruction(transaction);
+    const instruction = structuredCompactionHandoffInstruction(transaction, { appName: worker.appName });
     const prepare = async () => ({ text: instruction, images: [], release() {} });
     const browser = worker.run({ traceId, modelId: "gpt-5.6-sol", reasoning: "low",
       capabilities: { ...capabilities, localToolsEnabled: false }, nativeConnector: true,

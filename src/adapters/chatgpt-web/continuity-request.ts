@@ -15,7 +15,7 @@ import { isChatGptWebZeroRiskBackendModel } from "../../chatgpt-web-models";
 import { expandUserPath } from "../../config";
 import {
   assertLauncherContinuityCapacity, assertLauncherContinuityFeature, inspectLauncherContinuityConversation,
-  readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
+  type LauncherWaitOptions, readLauncherBrowserHostDescriptor, queryLauncherContinuityTransaction, updateLauncherContinuityPreparation, retireLauncherContinuityWriter,
   terminateLauncherContinuityPreparation,
 } from "../../launcher-browser-host";
 import type { CodexParsedRequest, CodexProviderConfig } from "../../types";
@@ -577,7 +577,7 @@ async function reconcilePage(bindings: ContinuityBindings, thread: string, descr
       && leaseIdentity.snapshotDigest === leaseAttempt.snapshotDigest;
     if (currentLease && binding?.lease && binding.conversation) {
       try {
-        const page = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, binding.lease);
+        const page = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, binding.lease, parsed._compactionRequest ? { compaction: true } : undefined);
         live = page.state === "ready" || page.state === "running";
       } catch { /* Closed and unknown pages both revoke the old generation. */ }
     }
@@ -586,7 +586,7 @@ async function reconcilePage(bindings: ContinuityBindings, thread: string, descr
         const identities = [recoveryIdentity(record, store.installationId())];
         if (record.pendingPreparation) identities.push(recoveryIdentity({ ...record, ...record.pendingPreparation.target }, store.installationId()));
         for (const identity of identities) {
-          const page = await queryLauncherContinuityTransaction(descriptor, identity, bindings.registrations.directory).catch(() => undefined);
+          const page = await queryLauncherContinuityTransaction(descriptor, identity, bindings.registrations.directory, parsed._compactionRequest ? { compaction: true } : undefined).catch(() => undefined);
           if (page?.continuity && !["missing", "unknown", "retired"].includes(page.state)) { live = true; break; }
         }
       } catch { /* A historical receipt alone does not prove a live document. */ }
@@ -609,11 +609,11 @@ async function reconcilePage(bindings: ContinuityBindings, thread: string, descr
     forgetRecoveryPage(bindings.registrations.directory, thread);
     const old = record.transaction && !record.legacyUnproven ? recoveryIdentity(record, store.installationId()) : undefined;
     const cleanup: Array<Promise<unknown>> = [];
-    if (old) cleanup.push(retireLauncherContinuityWriter(descriptor, old, bindings.registrations.directory).catch(() => {}));
+    if (old) cleanup.push(retireLauncherContinuityWriter(descriptor, old, bindings.registrations.directory, parsed._compactionRequest ? { compaction: true } : undefined).catch(() => {}));
     const work = record.currentWorkId && record.works[record.currentWorkId];
     if (work && bindings.broker?.retireRecoveryWriter) cleanup.push(bindings.broker.retireRecoveryWriter({
       directory: bindings.registrations.directory, thread, logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt,
-    }).catch(() => {}));
+    }, parsed._compactionRequest ? { compaction: true } : undefined).catch(() => {}));
     // Cleanup does not prove external command settlement and does not gate admission.
     await Promise.all(cleanup);
     if (store.get(thread)) continue;
@@ -721,7 +721,7 @@ async function prepareContinuityRequestUnlocked(
   if (durable && termination && durable.owner.id === bindings.owner && durable.state !== "stopped"
     && (termination.status === "pending" || binding?.state === "unverified" || binding?.state === "running")) {
     try {
-      const lease = await terminateLauncherContinuityPreparation(descriptor, termination.recovery, bindings.registrations.directory, termination);
+      const lease = await terminateLauncherContinuityPreparation(descriptor, termination.recovery, bindings.registrations.directory, termination, parsed._compactionRequest ? { compaction: true } : undefined);
       const settled = bindings.recoveryStore.settlePreparationTermination(termination.recovery, termination.receiptId);
       if (!settled) throw continuityError("continuity_source_unproven");
       if (binding?.executionKey) {
@@ -953,7 +953,7 @@ async function prepareContinuityRequestUnlocked(
       || source.supersededError || (binding.state === "compacting" && binding.compactionKey !== executionKey)) {
       if (config.toolAuthorityMode === "delegated" && source && source.taskRevision() === 0) {
         source.cancel(continuityError("continuity_source_unproven"));
-        await source.runtime.retireCapability?.();
+        await source.runtime.retireCapability?.({ compaction: true });
         bindings.lose(binding, sourceExecutionKey);
       }
       throw continuityError("continuity_source_unproven");
@@ -964,7 +964,7 @@ async function prepareContinuityRequestUnlocked(
       if (config.toolAuthorityMode === "delegated" && source.taskRevision() === 0) {
         const reason = error instanceof Error ? error : continuityError("continuity_source_unproven");
         source.cancel(reason);
-        await source.runtime.retireCapability?.();
+        await source.runtime.retireCapability?.({ compaction: true });
         bindings.lose(binding, sourceExecutionKey);
       }
       throw error;
@@ -974,12 +974,12 @@ async function prepareContinuityRequestUnlocked(
   if (binding && expected && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     const compactionLossIdentity = parsed._compactionRequest && expected.recovery
       ? { ownerId: binding.owner, identity: structuredClone(expected.recovery) } : undefined;
-    try { await inspectLauncherContinuityConversation(descriptor, conversationKey, expected); }
+    try { await inspectLauncherContinuityConversation(descriptor, conversationKey, expected, parsed._compactionRequest ? { compaction: true } : undefined); }
     catch (inspectionError) {
       if (!sameLease(binding.lease, expected)) {
         if (!exactCurrentWork() || !binding.lease) throw continuityError("continuity_source_unproven");
         expected = { ...binding.lease };
-        await inspectLauncherContinuityConversation(descriptor, conversationKey, expected);
+        await inspectLauncherContinuityConversation(descriptor, conversationKey, expected, parsed._compactionRequest ? { compaction: true } : undefined);
       } else {
         // The wrapper rechecks the actual page and retries closed/unknown pages
         // through fresh admission. Historical loss receipts do not grant recovery.
@@ -1202,10 +1202,10 @@ export function acceptContinuityResponseLease(prepared: PreparedContinuityReques
   return { ...value };
 }
 
-export async function finishContinuityResponse(prepared: PreparedContinuityRequest): Promise<void> {
+export async function finishContinuityResponse(prepared: PreparedContinuityRequest, wait?: LauncherWaitOptions): Promise<void> {
   const { binding, bindings } = prepared;
   if (!binding.lease || binding.executionKey !== prepared.executionKey) throw continuityError("continuity_session_lost");
-  const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease);
+  const physical = await inspectLauncherContinuityConversation(prepared.descriptor, prepared.conversationKey, binding.lease, wait);
   if (physical.state !== "ready") throw continuityError("continuity_unverified");
   if (binding.state === "unverified") binding.state = "running";
   bindings.responseReady(binding, prepared.executionKey);
