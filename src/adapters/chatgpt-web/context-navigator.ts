@@ -1,7 +1,7 @@
 import { compactionProcessingNow } from "./compaction-deadline";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { BrokerToolResult } from "./turn-broker";
-import { assertContextNavigationBudget, CONTEXT_CREDENTIAL_ARGUMENT_BYTES, contextLimits, measureContextResponse, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
+import { assertContextNavigationBudget, CONTEXT_CREDENTIAL_ARGUMENT_BYTES, contextLimits, measureContextResponse, UNLIMITED_CONTEXT_ALLOWANCE, type ContextLimitOverrides, type ContextLimits } from "./context-budget";
 import { ContextSnapshot, deterministicContextJson } from "./context-snapshot";
 import { createContextTextReadResult, parseContextTextReadResult, type ContextTextReadItem, type ContextTextReadMetadata } from "./context-text-result";
 import type { ContextReusePlan } from "./context-reuse-types";
@@ -462,10 +462,8 @@ export class ContextNavigator {
       const remaining = this.#remaining?.(value.targets, result);
       if (remaining) this.#validateRemaining(remaining);
       const errors = this.#errorReserve();
-      const exceedsWireBudget = this.#usage.wire_bytes + cost.wire_bytes + errors.wire_bytes > this.#limits.maxTotalWireBytes
-        || remaining && cost.wire_bytes + errors.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0);
-      const exceedsTokenBudget = this.#usage.text_tokens + this.#usage.visual_token_reserve + cost.total_tokens + errors.tokens > this.#limits.maxTotalTokens
-        || remaining && cost.total_tokens + errors.tokens > remaining.tokens - (remaining.reserved_tokens ?? 0);
+      const exceedsWireBudget = remaining && cost.wire_bytes + errors.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0);
+      const exceedsTokenBudget = remaining && cost.total_tokens + errors.tokens > remaining.tokens - (remaining.reserved_tokens ?? 0);
       if (exceedsWireBudget) this.#hit("total_wire");
       if (exceedsTokenBudget) this.#hit("total_tokens");
       if (exceedsWireBudget || exceedsTokenBudget
@@ -488,9 +486,7 @@ export class ContextNavigator {
       try { this.#validateRemaining(remaining); } catch { this.#usage.navigation_stopped = true; throw new ContextNavigationStoppedError(); }
       if (cost.text_tokens > this.#limits.errorResponseTokens || cost.wire_bytes > this.#limits.errorResponseBytes
         || cost.total_tokens > remaining.tokens - (remaining.reserved_tokens ?? 0)
-        || cost.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0)
-        || this.#usage.wire_bytes + cost.wire_bytes > this.#limits.maxTotalWireBytes
-        || this.#usage.text_tokens + this.#usage.visual_token_reserve + cost.total_tokens > this.#limits.maxTotalTokens) {
+        || cost.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0)) {
         this.#usage.navigation_stopped = true; throw new ContextNavigationStoppedError();
       }
       this.#usage.error_responses++;
@@ -607,7 +603,7 @@ export class ContextNavigator {
   }
   #errorReserve() { const count = this.#limits.maxErrorResponses - this.#usage.error_responses;
     return { tokens: count * this.#limits.errorResponseTokens, wire_bytes: count * this.#limits.errorResponseBytes }; }
-  #localRemaining(): ContextRemainingBudget { return { tokens: Math.max(0, this.#limits.maxTotalTokens - this.#usage.text_tokens - this.#usage.visual_token_reserve), wire_bytes: Math.max(0, this.#limits.maxTotalWireBytes - this.#usage.wire_bytes) }; }
+  #localRemaining(): ContextRemainingBudget { return { tokens: UNLIMITED_CONTEXT_ALLOWANCE, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE }; }
   #budgetHint(targets?: readonly ContextTarget[]) {
     const budget = this.#remaining?.(targets) ?? this.#localRemaining();
     this.#validateRemaining(budget);

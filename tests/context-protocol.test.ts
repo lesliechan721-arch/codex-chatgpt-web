@@ -29,6 +29,7 @@ test("remote capabilities require the current read ABI and manifest rather than 
   try {
     for (const changed of [
       { contextProtocol: 3, contextBootstrapProtocol: "context-bootstrap-v1" },
+      { ...current, contextProtocol: 4 },
       { ...current, contextReadArguments: "single-read-ref" },
       { ...current, contextTextReadFormat: "context-text-read-v2" },
     ]) {

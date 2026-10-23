@@ -9,6 +9,8 @@ import { nativePublicResult, type NativeToolEntry } from "../src/adapters/chatgp
 import { type NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 import { defaultBrokerEndpoint } from "../src/config";
 import type { CodexTool } from "../src/types";
+import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapters/chatgpt-web/continuity-recovery-store";
+import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 
 const root = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-native-wait-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -49,6 +51,43 @@ async function fixture(contract: "native" | "safe", tools: CodexTool[] = [{
 }
 
 for (const contract of ["native", "safe"] as const) describe(`${contract} Native waiting integration`, () => {
+  for (const fence of ["stopped", "retired"] as const) {
+    test(`a durable ${fence} fence remains terminal before its Broker capability is cleaned up`, async () => {
+      const directory = join(root, String(++sequence));
+      const socket = defaultBrokerEndpoint(directory);
+      const recoveryDirectory = join(directory, "continuity");
+      new ContinuityRegistrationStore(recoveryDirectory).initialize();
+      const store = new ContinuityRecoveryStore(recoveryDirectory);
+      const thread = "1".repeat(64), scope = "2".repeat(64), owner = continuityProcessInstance("3".repeat(64));
+      store.admitWork({ thread, scope, owner, logicalWorkId: "work", instructionIdentity: "instruction", nativeTurnId: "turn",
+        workPayloadDigest: "4".repeat(64), snapshotDigest: "5".repeat(64), dispatchProtocolComplete: true, createPage: true });
+      const recovery = { directory: recoveryDirectory, thread, logicalWorkId: "work", attempt: 0, ownerId: owner.id };
+      const broker = TurnBroker.forSocket(socket);
+      const capability = { authorityMode: "delegated" as const, threadId: "durable-fence", turnId: "turn", tools: [] };
+      const token = contract === "native"
+        ? await broker.register(capability, undefined, "durable-fence", { recovery })
+        : await broker.registerSafe(capability, "durable-fence-surface-0123456789", undefined, "durable-fence", { recovery, requireSentConfirmation: false });
+      if (contract === "safe") broker.startSafeTurn(token);
+      const client = new Client({ name: "durable-fence-test", version: "1" });
+      try {
+        await client.connect(new StdioClientTransport({ command: process.execPath,
+          args: ["src/cli.ts", "mcp", "--contract", contract, "--broker-socket", socket], cwd: process.cwd(), stderr: "pipe" }));
+        if (fence === "stopped") store.stopWork(thread, { scope }, "work", "user-stop");
+        else store.retireAttempt(thread, { scope }, "work", 0);
+        for (const entry of ["codex_exec", "codex_tool_wait"] as const) {
+          const reply = await client.callTool({ name: entry, arguments: {
+            ...(contract === "native" ? { turn_token: token } : { request_id: token }), operation_id: 1,
+            ...(entry === "codex_exec" ? { cmd: "never admitted" } : {}),
+          } });
+          expect(reply).toMatchObject({ isError: true, structuredContent: {
+            code: fence === "stopped" ? "continuity_stopped" : "continuity_source_unproven", retryable: false,
+          } });
+        }
+        expect(store.get(thread)!.calls).toEqual({});
+      } finally { await client.close().catch(() => {}); await broker.close(); }
+    }, 15_000);
+  }
+
   test("one admitted call survives multiple waits, registry changes, and owner transport reconnect", async () => {
     const f = await fixture(contract);
     try {
@@ -239,6 +278,39 @@ for (const contract of ["native", "safe"] as const) describe(`${contract} Native
     } finally { await client.close().catch(() => {}); await f.close(); }
   }, 15_000);
 });
+
+for (const entry of ["codex_exec", "codex_tool_wait"] as const) {
+  test(`${entry} keeps cancellation and retirement terminal while Zero Risk waits for Sent`, async () => {
+    for (const cancelled of [true, false]) {
+      const socket = defaultBrokerEndpoint(join(root, String(++sequence)));
+      const broker = TurnBroker.forSocket(socket);
+      const token = await broker.registerSafe({ authorityMode: "delegated", threadId: "sent-wait", turnId: `turn-${sequence}`, tools: [] },
+        "sent-wait-surface-0123456789", undefined, "sent-wait", { requireSentConfirmation: true });
+      const client = new Client({ name: "sent-wait-terminal-test", version: "1" });
+      try {
+        await client.connect(new StdioClientTransport({
+          command: process.execPath, args: ["src/cli.ts", "mcp", "--contract", "safe", "--broker-socket", socket],
+          cwd: process.cwd(), stderr: "pipe",
+        }));
+        expect(broker.beginCompletionFence(token)).toBeNumber();
+        const waiting = client.callTool({ name: entry, arguments: { request_id: token, operation_id: 1,
+          ...(entry === "codex_exec" ? { cmd: "never admitted" } : {}),
+        } });
+        // The only in-flight activity is this query, held behind the real Sent boundary.
+        for (let attempt = 0; attempt < 200 && broker.beginCompletionFence(token) !== undefined; attempt += 1) await Bun.sleep(5);
+        expect(broker.beginCompletionFence(token)).toBeUndefined();
+        broker.revoke(token, cancelled ? new DOMException("private cancellation", "AbortError") : new Error("private retirement"));
+        const reply = await waiting;
+        expect(reply).toMatchObject({ isError: true, structuredContent: {
+          code: cancelled ? "codex_tool_cancelled" : "codex_tool_operation_retired", retryable: false,
+          broker_state_at_retirement: { queuedTools: 0, deliveredTools: 0 },
+        } });
+        expect(JSON.stringify(reply)).not.toContain("private cancellation");
+        expect(JSON.stringify(reply)).not.toContain("private retirement");
+      } finally { await client.close().catch(() => {}); await broker.close(); }
+    }
+  }, 15_000);
+}
 
 test("a legacy MCP process cannot claim Native dispatch authority", async () => {
   const f = await fixture("native");

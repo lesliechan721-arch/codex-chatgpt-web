@@ -423,6 +423,8 @@ preparing a new plan. The selected profile and effective limits are frozen in th
 Both use arrays and batch-v1; neither can change a published plan. These are runtime ceilings,
 not measured ChatGPT limits or a promise of more image capacity.
 The selected model's existing context and composer budgets can impose smaller effective allowances.
+Context protocol 5 identifies the shared-capacity contract. The driver, Launcher runtime and helper
+must support that version; an older owner cannot authorize a new navigation plan.
 
 | Return | Maximum items | Complete response bytes | Estimated text tokens |
 | --- | --- | --- | --- |
@@ -434,7 +436,7 @@ The selected model's existing context and composer budgets can impose smaller ef
 | Shared limit | Effective value |
 | --- | --- |
 | Snapshot source storage | 32 MiB |
-| Cumulative navigation wire / estimated tokens | 64 MiB / 96,000 tokens, including the corrective-reply reserve |
+| Cumulative navigation tokens | Use the remaining shared page context; no separate reading ceiling |
 | Image returns / cumulative raw image bytes | 64 / 32 MiB |
 | Search query / complete serialized MCP arguments including credential | 512 UTF-8 bytes / 8 KiB |
 | Navigation entry JSON / label / search snippet | 8 KiB / 120 characters / 160 characters |
@@ -453,9 +455,16 @@ final overview, the protected error reserve and one maximum required-return retr
 list/search/read cannot spend remaining required or workspace reserves. Each image uses a conservative
 visual reserve of 4,096 tokens,
 or 8,192 for original detail. These reserves are estimates, not observed vision usage or billing.
+The work reserve protects current execution capacity. It is not added to the retained-page ledger
+on every send; completed answer text is accounted separately. Navigation returns still contribute
+to the retained-page estimate, with prepaid required returns credited once. There is no separate
+cumulative navigation token or wire ceiling. Wire bytes remain measured for diagnostics and
+per-response transport checks.
 Compaction deducts its instruction and a 4,096-token entry reserve from available page capacity,
-caps the shared allowance at 96,000 tokens, and reserves 8,192 of that allowance for summary and
+and reserves 8,192 of the remaining shared allowance for summary and
 submission. Unread sources need not all fit within the remaining reading allowance.
+The client owns automatic compaction admission. A normal server response does not substitute a
+checkpoint or start an unsolicited compaction when a local capacity check fails.
 
 Wire measurement includes the complete result's content, structured content, JSON escaping,
 cursors, base64, and framing reserve. Text batches are charged once, not once per item. The

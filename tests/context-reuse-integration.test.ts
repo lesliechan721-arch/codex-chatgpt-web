@@ -142,7 +142,8 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
   f.provider.chatgptWeb!.maxComposerCodePoints = 8_000;
   let request = rules(f.request("continue"), stable);
   let fellBack = false;
-  for (let turn = 1; turn <= 20; turn++) {
+  // Unused work reserves no longer consume the page on each completed turn.
+  for (let turn = 1; turn <= 40; turn++) {
     expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
     if (turn > 1 && !f.submissions.at(-1)!.reused) {
       expect(observations.at(-1)!.bodies.join("\n")).toContain("BUDGET_RULE_f734");

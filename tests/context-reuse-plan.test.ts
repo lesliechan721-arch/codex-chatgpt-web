@@ -181,7 +181,7 @@ test("large source sets stay bounded and units outside capacity remain in the ex
     { type: "message", id: "user", role: "user", content: "new event" },
   ] });
   const result = plan(parsed, undefined, false, 8000,
-    { budget: { contextWindowTokens: 1_000_000 }, limits: { maxTotalTokens: 1_000_000 } });
+    { budget: { contextWindowTokens: 1_000_000 } });
   expect(result.registration!.reuse!.units.length).toBe(CONTEXT_REUSE_MAX_UNITS);
   expect(result.costs.reuse!.missReasons.cache_capacity).toBeGreaterThan(0);
   expect(restore(result)).toEqual(result.compiled.bootstrapContent!.payload);

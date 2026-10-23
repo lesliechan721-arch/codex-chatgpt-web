@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { defaultBrokerEndpoint } from "../src/config";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
+import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
 const credential = `turn_${"a".repeat(32)}`;
@@ -91,14 +92,36 @@ test("long and unproven user text is exact required source data without role or 
   }
 });
 
-test("short bootstrap admission protects the full read and source storage budgets", () => {
+test("short bootstrap admission protects shared context capacity and source storage", () => {
   const canonical = fixture();
   const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical), capabilities,
     turnToken: credential, contextToolsAvailable: true };
-  expect(() => planContextDelivery({ ...input, limits: { maxTotalTokens: 1000 } })).toThrow("navigation budget");
+  expect(() => planContextDelivery({ ...input, budget: { contextWindowTokens: 1000 } })).toThrow("context budget");
   expect(() => planContextDelivery({ ...input, limits: { maxStorageBytes: 2000 } })).toThrow("storage budget");
   expect(() => planContextDelivery({ ...input, contextBootstrapAvailable: false })).toThrow("does not support context-bootstrap-v1");
   expect(() => planContextDelivery({ ...input, capabilities: { ...capabilities, maxComposerCodePoints: 0 } })).toThrow("configuration");
+});
+
+test("required reads can exceed 96000 tokens when the complete plan fits the shared context", () => {
+  const canonical = fixture(undefined, true, 30_000);
+  const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical), capabilities,
+    turnToken: credential, contextToolsAvailable: true, budget: { contextWindowTokens: 350_000 } };
+  const result = planContextDelivery(input);
+  expect(result.costs.requiredMcpTokens).toBeGreaterThan(96_000);
+  const scope = new ContextScope("large-required-plan", result.registration!, "normal", () => {}, () => {});
+  let delivered = 0;
+  try {
+    scope.markEntryDelivered();
+    for (let count = 0; !scope.status().text_ready && count < 200; count++) {
+      const reply = scope.prepare("read", scope.status().next_required_read!.arguments);
+      expect(reply.result.isError).not.toBe(true);
+      expect(scope.finish(reply.receiptId, true, contextTextReadReceipt(reply.result))).toBeDefined();
+      delivered++;
+    }
+    expect(delivered).toBeGreaterThan(1);
+    expect(scope.status().context_ready).toBe(true);
+    expect(scope.navigator.usage().text_tokens).toBeGreaterThan(96_000);
+  } finally { scope.retire(); }
 });
 
 test("the independent composer limit can select a short plan with a larger complete token cost", () => {

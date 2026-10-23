@@ -1,5 +1,8 @@
 import { CONTEXT_TEXT_READ_FORMAT } from "./context-text-result";
 
+/** Version 5 uses shared page capacity without an independent cumulative read ceiling. */
+export const CONTEXT_PROTOCOL_VERSION = 5;
+
 /** Current source-navigation ABI, shared by Broker status and the browser helper. */
 export function contextProtocolCapabilities(version: number) {
   return { contextProtocol: version, contextReadArguments: "reads-array" as const,

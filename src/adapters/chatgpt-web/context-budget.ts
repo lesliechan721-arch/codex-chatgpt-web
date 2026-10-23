@@ -12,7 +12,6 @@ export const CONTEXT_LIMITS = Object.freeze({
   wireReserveBytes: 128, tokenReserve: 32, labelChars: 120, snippetChars: 160,
   maxImageBytes: 4 * 1024 * 1024, imageWireBytes: 6 * 1024 * 1024,
   imageMetadataTokens: 1_500, maxImageReads: 64, maxTotalImageBytes: 32 * 1024 * 1024,
-  maxTotalWireBytes: 64 * 1024 * 1024, maxTotalTokens: 96_000,
   callProcessingMs: 2_000, totalProcessingMs: 20_000,
   maxStorageBytes: 32 * 1024 * 1024, maxQueryBytes: 512, maxArgumentBytes: 8 * 1024,
   // Three bounded corrective replies have a separate finite reserve. Success pages cannot
@@ -21,6 +20,9 @@ export const CONTEXT_LIMITS = Object.freeze({
 });
 export type ContextLimits = { readonly [K in keyof typeof CONTEXT_LIMITS]: number };
 export type ContextLimitOverrides = { -readonly [K in keyof ContextLimits]?: number };
+/** The numeric protocol requires a finite allowance even when no cumulative ceiling applies.
+ * Production scopes supply their shared page token allowance; wire bytes remain diagnostic. */
+export const UNLIMITED_CONTEXT_ALLOWANCE = Number.MAX_SAFE_INTEGER;
 
 export const CONTEXT_BUDGET_PROFILES = Object.freeze({
   expanded: Object.freeze({ readBytes: 64 * 1024, readTokens: 8_000, listBytes: 48 * 1024, listTokens: 6_000, listEntries: 50 }),
@@ -59,9 +61,7 @@ export function contextLimits(overrides: ContextLimitOverrides = {}): ContextLim
   for (const key of ["listTokens", "searchTokens", "readTokens", "imageMetadataTokens"] as const) {
     if (result[key] < result.tokenReserve + 32) throw new Error("Context budget cannot carry an error");
   }
-  if (result.errorResponseBytes < result.wireReserveBytes + 128 || result.errorResponseTokens < result.tokenReserve + 32
-    || result.maxErrorResponses * result.errorResponseTokens > result.maxTotalTokens
-    || result.maxErrorResponses * result.errorResponseBytes > result.maxTotalWireBytes) throw new Error("Context budget cannot reserve bounded corrective replies");
+  if (result.errorResponseBytes < result.wireReserveBytes + 128 || result.errorResponseTokens < result.tokenReserve + 32) throw new Error("Context budget cannot reserve bounded corrective replies");
   // Validate actual complete duplicated error structures, including the final stop
   // hint. Custom framing/reserve ceilings must not admit an untransmittable reply.
   for (const code of ["CONTEXT_EXPIRED", "INVALID_ARGUMENT", "INVALID_REFERENCE", "INVALID_CURSOR", "IMAGE_UNAVAILABLE", "UNSUPPORTED_TYPE", "BUDGET_EXCEEDED", "PROCESSING_BUDGET_EXCEEDED"]) {

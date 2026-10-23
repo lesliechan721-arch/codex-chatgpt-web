@@ -94,7 +94,7 @@ describe("MCP task-update public-result projection", () => {
 });
 
 type WireRequest = Record<string, unknown> & { id: string; method: string };
-async function mcpFixture(contract: "native" | "safe", respond: (request: WireRequest) => Record<string, unknown>) {
+async function mcpFixture(contract: "native" | "safe", respond: (request: WireRequest) => Record<string, unknown> | null) {
   const socketPath = defaultBrokerEndpoint(join(root, String(++sequence)));
   if (process.platform !== "win32") mkdirSync(dirname(socketPath), { recursive: true });
   const calls: WireRequest[] = [];
@@ -110,7 +110,9 @@ async function mcpFixture(contract: "native" | "safe", respond: (request: WireRe
       if (newline < 0) return;
       const request = JSON.parse(buffered.slice(0, newline)) as WireRequest;
       calls.push(request);
-      socket.end(JSON.stringify({ id: request.id, ...respond(request) }) + "\n");
+      const response = respond(request);
+      if (response === null) socket.destroy();
+      else socket.end(JSON.stringify({ id: request.id, ...response }) + "\n");
     });
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); });
@@ -130,6 +132,58 @@ async function mcpFixture(contract: "native" | "safe", respond: (request: WireRe
 }
 
 for (const contract of ["native", "safe"] as const) describe(`${contract} task-update MCP wire contract`, () => {
+  for (const fault of ["owner_status", "native_operation_start", "native_operation_wait", "invalid_reply"] as const) {
+    test(`${fault} failure permits recovery with the original operation and revision`, async () => {
+      const original = nativePublicResult({ completed: true });
+      let failed = false;
+      const f = await mcpFixture(contract, request => {
+        if (!failed && request.method === (fault === "invalid_reply" ? "native_operation_start" : fault)) {
+          failed = true;
+          return fault === "invalid_reply" ? { result: { kind: "invalid" } } : null;
+        }
+        return { result: request.method === "owner_status" ? { nativeWaitProtocol: 1 } : { kind: "result", result: original } };
+      });
+      const start = { name: "codex_exec", arguments: { ...f.reference, operation_id: 8, task_revision: 3, cmd: "private original command" } };
+      const query = fault === "native_operation_wait"
+        ? { name: "codex_tool_wait", arguments: { ...f.reference, operation_id: 8 } }
+        : start;
+      try {
+        if (fault === "native_operation_wait") expect<unknown>(await f.client.callTool(start)).toEqual(original);
+        const unavailable = await f.client.callTool(query);
+        expect(unavailable).toMatchObject({ isError: true, structuredContent: {
+          code: "codex_tool_infrastructure_failure", retryable: true, operation_id: 8, tool: query.name,
+        } });
+        expect(JSON.stringify(unavailable)).not.toContain("private original command");
+        expect(JSON.stringify(unavailable)).not.toContain(token);
+        expect<unknown>(await f.client.callTool(query)).toEqual(original);
+        const starts = f.calls.filter(request => request.method === "native_operation_start");
+        expect(starts.length).toBeGreaterThan(0);
+        for (const request of starts) expect(request).toMatchObject({
+          operationId: 8, taskRevision: 3, nativeInput: { cmd: "private original command" },
+        });
+        for (const request of f.calls.filter(request => request.method === "native_operation_wait")) {
+          expect(request.operationId).toBe(8);
+          expect(request).not.toHaveProperty("taskRevision");
+        }
+      } finally { await f.close(); }
+    }, 15_000);
+  }
+
+  test("terminal Native failures remain non-retryable and retain task updates", async () => {
+    let code = "";
+    const f = await mcpFixture(contract, request => request.method === "owner_status"
+      ? { result: { nativeWaitProtocol: 1 } }
+      : { error: "Native terminal failure", errorCode: code, taskUpdate: delivery() });
+    try {
+      for (code of ["codex_tool_cancelled", "codex_tool_operation_retired", "codex_tool_wait_lease_expired", "codex_tool_admission_rejected", "codex_tool_result_unavailable", "codex_tool_resource_limit"]) {
+        const reply = await f.client.callTool({ name: "codex_tool_wait", arguments: { ...f.reference, operation_id: 8 } });
+        expect(reply).toMatchObject({ isError: true, structuredContent: {
+          native_result: { isError: true, structuredContent: { code, retryable: false } }, task_update: delivery(),
+        } });
+      }
+    } finally { await f.close(); }
+  }, 15_000);
+
   test("forwards exact start revisions, preserves old waits, and registers a strict non-Native ACK", async () => {
     const original = nativePublicResult({ tool_data: true });
     const f = await mcpFixture(contract, request => {

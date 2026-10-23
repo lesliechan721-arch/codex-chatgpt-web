@@ -292,12 +292,12 @@ for (const [name, change] of policyDefects) test(`persistent skip policy rejects
   } finally { rmSync(fixture.root, { recursive: true, force: true }); }
 });
 
-test("the repository Windows skip policy loads current reviewed test sources", () => {
+for (const policy of ["windows-test-skips.json", "macos-intel-test-skips.json"]) test(`the repository ${policy} loads current reviewed test sources`, () => {
   const root = join(import.meta.dir, "..");
-  const evidence = loadSkipPolicy(root, join(root, ".github/windows-test-skips.json"), repositoryTestFiles(root), { revision, patchDigest, toolDigest });
+  const evidence = loadSkipPolicy(root, join(root, ".github", policy), repositoryTestFiles(root), { revision, patchDigest, toolDigest });
   expect(evidence.entries.length).toBeGreaterThan(0);
   expect(evidence.source).toEqual({ revision, patchDigest, toolDigest });
-  expect(evidence.policy.path).toBe(".github/windows-test-skips.json");
+  expect(evidence.policy.path).toBe(`.github/${policy}`);
 });
 
 for (const heading of ["ordinary", "GitHub Actions"] as const) test(`reviewed shard skips accept the final repeated skip footer with ${heading} file headings`, () => {

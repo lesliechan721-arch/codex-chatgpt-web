@@ -5,7 +5,7 @@ import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, resolveChatGptWebContextLimits, ty
 import type { CodexParsedRequest } from "../../types";
 import { parseRequest } from "../../responses/parser";
 import type { ChatGptTurnSession } from "./turn-execution";
-import { configuredContextBudgetProfile, contextBudgetProfileLimits, contextLimits, assertContextNavigationBudget, contextErrorReserve, measureContextResponse, type ContextLimitOverrides } from "./context-budget";
+import { configuredContextBudgetProfile, contextBudgetProfileLimits, contextLimits, assertContextNavigationBudget, contextErrorReserve, measureContextResponse, UNLIMITED_CONTEXT_ALLOWANCE, type ContextLimitOverrides } from "./context-budget";
 import { ContextNavigator } from "./context-navigator";
 import { compactionContextPrompt } from "./context-prompt";
 import { createContextSnapshot, deterministicContextJson, type ContextSnapshot } from "./context-snapshot";
@@ -30,7 +30,7 @@ export interface CompactionSourcePlan {
   manifestDigest: string;
   /** Fixed with the selected input; absent only for legacy coverage. */
   contextFormat?: ContextCoverageMetadata["contextFormat"];
-  /** Actual retained page estimate, including selected input and reserved output,
+  /** Actual retained page estimate, including selected input and delivered output,
    * excluding the platform reserve shared by the whole context window. */
   pageTokens: number;
   navigationReservedTokens?: number;
@@ -368,7 +368,7 @@ export function compactionAvailableTokens(parsed: CodexParsedRequest, capabiliti
 export async function assertCompactionReadable(snapshot: ContextSnapshot, availableTokens: number,
   overrides: ContextLimitOverrides = {}): Promise<void> {
   const limits = contextLimits(overrides); const errors = contextErrorReserve(overrides);
-  const budget = { tokens: Math.min(availableTokens, limits.maxTotalTokens), wire_bytes: limits.maxTotalWireBytes,
+  const budget = { tokens: availableTokens, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE,
     reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 };
   try { assertContextNavigationBudget(budget, overrides); }
   catch { throw continuityError("continuity_input_limit", "There is no bounded source reading allowance after the summary reserve."); }
@@ -441,15 +441,15 @@ export async function registerCompactionSource(broker: TurnBrokerOwner, input: O
   const localBudget = typeof expiresAt === "number" ? new CompactionDeadline(expiresAt) : undefined;
   const currentDeadline = typeof expiresAt === "function" ? expiresAt : () => localBudget!.deadlineAt;
   const limits = contextLimits({ ...contextBudgetProfileLimits(configuredContextBudgetProfile()), ...input.limits });
-  const remaining = Math.min(limits.maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
+  const remaining = availableTokens - estimateTokens(instruction) - 4_096;
   await assertCompactionReadable(input.snapshot, remaining, limits);
   const handle = await broker.registerCompactionContext({ ...registration, expiresAt: currentDeadline(), limits,
-    remainingBudget: { tokens: remaining, wire_bytes: limits.maxTotalWireBytes,
+    remainingBudget: { tokens: remaining, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE,
       reserved_tokens: COMPACTION_SUMMARY_RESERVE, reserved_wire_bytes: 0 } }, ownerContext, currentDeadline);
   try {
     if (handle.contextId !== input.snapshot.context_id) unavailable("The compaction source registration changed its fixed context identity.");
     const selectedInstruction = compactionSourceInstruction(input.snapshot, instruction, availableTokens,
-      handle.compactionToken, limits);
+      handle.compactionToken);
     compactionPageEntries.set(input.snapshot, { token: handle.compactionToken, instructionTokens: estimateTokens(selectedInstruction) });
     return { instruction: selectedInstruction, token: handle.compactionToken };
   } catch (error) { await broker.revokeCompactionContext(handle.compactionToken); throw error; }
@@ -469,8 +469,8 @@ export async function compactionSourcePageCost(broker: TurnBrokerOwner, snapshot
 /** The exact read-only entry used for cold compaction admission. It contains no
  * historical task text; the independently verified snapshot remains readable. */
 export function compactionSourceInstruction(snapshot: ContextSnapshot, instruction: string, availableTokens: number,
-  compactionToken = `compaction_${"0".repeat(32)}`, overrides: ContextLimitOverrides = {}): string {
-  const remaining = Math.min(contextLimits(overrides).maxTotalTokens, availableTokens - estimateTokens(instruction) - 4_096);
+  compactionToken = `compaction_${"0".repeat(32)}`): string {
+  const remaining = availableTokens - estimateTokens(instruction) - 4_096;
   const navigation = compactionContextPrompt({ contextId: snapshot.context_id, compactionToken,
     overview: { sources: snapshot.sources.length, targets: snapshot.targets.length,
       images: snapshot.targets.filter(target => target.kind === "image").length,

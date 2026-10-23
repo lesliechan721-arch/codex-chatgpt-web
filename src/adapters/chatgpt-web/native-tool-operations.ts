@@ -136,8 +136,14 @@ function deepCanonicalFingerprint(value: unknown): string {
   return hash.digest("hex");
 }
 
-export function nativeOperationFailure(code: string, message: string, tool?: string, diagnostics?: BrokerRetirementDiagnostics): BrokerToolResult {
-  return nativePublicResult({ code, message, retryable: false, ...(tool ? { tool } : {}),
+export function nativeOperationFailure(code: string, message: string, tool?: string, diagnostics?: BrokerRetirementDiagnostics, operationId?: number): BrokerToolResult {
+  // Infrastructure errors describe a failed query; they do not settle the Native operation.
+  const retryable = code === "codex_tool_infrastructure_failure";
+  const publicMessage = retryable
+    ? `${message} Native execution status is unconfirmed. Retry the identical call with the same capability and operation_id; start retries must also keep all arguments and task_revision. You may query that ID with codex_tool_wait without a prior pending receipt. Do not use a new operation_id to recover this result.`
+    : message;
+  return nativePublicResult({ code, message: publicMessage, retryable,
+    ...(retryable && operationId !== undefined ? { operation_id: operationId } : {}), ...(tool ? { tool } : {}),
     ...(diagnostics ? { broker_state_at_retirement: diagnostics } : {}) }, true);
 }
 
@@ -281,7 +287,7 @@ export class NativeToolOperations {
     if (!Number.isInteger(waitMs) || waitMs < 1 || waitMs > NATIVE_WAIT_WINDOW_MS) throw new Error("Invalid Native wait window");
     if (signal?.aborted) return Promise.reject(new DOMException("Native query aborted", "AbortError"));
     if (operation.result) return Promise.resolve(this.deliver(operation));
-    if (this.waiterCount >= NATIVE_WAITER_LIMIT) throw this.capacityError();
+    if (this.waiterCount >= NATIVE_WAITER_LIMIT) throw new NativeOperationError("codex_tool_infrastructure_failure", "The Native wait query resource limit was reached; retry after an active query settles");
     operation.leaseUntil = this.now() + NATIVE_WAIT_LEASE_MS;
     this.changed();
     return new Promise((resolve, reject) => {
