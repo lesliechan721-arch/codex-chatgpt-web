@@ -144,7 +144,7 @@ test("Pro preserves the same native Codex delegation contract as Extra High", ()
   }
 });
 
-test("local task prompts batch content and retry unexplained safety-check rejections without replacing other error rules", () => {
+test("local task prompts preserve scoped recovery rules for infrastructure and safety-check failures", () => {
   const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   const token = "turn_12345678901234567890123456789012";
   const manual = request("high");
@@ -157,6 +157,10 @@ test("local task prompts batch content and retry unexplained safety-check reject
   ];
 
   for (const { text } of prompts) {
+    expect(text).toContain("attempt this receipt recovery before ending the task");
+    expect(text).toContain("Recovery does not require a prior pending receipt");
+    expect(text).toContain("same capability, operation_id, arguments and task_revision");
+    expect(text).toContain("report the unresolved operation and its unconfirmed execution status");
     expect(text).toContain("small batches by file or independent content unit");
     expect(text).toContain("Preserve required content and atomic changes");
     expect(text).toContain("When a tool result or platform error explicitly reports an unexplained platform safety-check rejection");

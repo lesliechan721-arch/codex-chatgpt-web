@@ -221,11 +221,15 @@ describe("Native operation identity and independent result queries", () => {
     try {
       f.store.start(1, "codex_exec", {}, f.admit);
       for (let index = 0; index < NATIVE_WAITER_LIMIT; index += 1) pending.push(f.store.wait(1).catch(error => error));
-      expect(() => f.store.wait(1)).toThrow("resource limit");
+      let queryFailure: unknown;
+      try { f.store.wait(1); } catch (error) { queryFailure = error; }
+      expect(queryFailure).toMatchObject({ code: "codex_tool_infrastructure_failure" });
       f.store.complete(1, nativePublicResult({ original: true }));
       await Promise.all(pending);
       for (let id = 2; id <= NATIVE_OPERATION_LIMIT; id += 1) f.store.start(id, "codex_tool_inventory", {}, () => ({ result: nativePublicResult({ tools: [] }) }));
-      expect(() => f.store.start(NATIVE_OPERATION_LIMIT + 1, "codex_exec", {}, f.admit)).toThrow("resource limit");
+      let operationFailure: unknown;
+      try { f.store.start(NATIVE_OPERATION_LIMIT + 1, "codex_exec", {}, f.admit); } catch (error) { operationFailure = error; }
+      expect(operationFailure).toMatchObject({ code: "codex_tool_resource_limit" });
       expect(await f.store.wait(1)).toMatchObject({ kind: "result", result: { structuredContent: { original: true } } });
     } finally { f.store.retire(new Error("test cleanup")); await Promise.all(pending); }
   });

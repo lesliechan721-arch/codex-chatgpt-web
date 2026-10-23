@@ -31,7 +31,7 @@ import {
 import type { ChatGptTurnCapability, ChatGptTurnEnvironment } from "./environment";
 import { NativeToolAdmissionError, nativePublicResult, nativeToolInputSchemas, planNativeTool, type NativeToolEntry } from "./native-tool-contract";
 import { NativeOperationError, NativeToolOperations, NATIVE_WAIT_PROTOCOL_VERSION, nativeOperationFailure, nativeControlResult, type NativeWaitingSnapshot } from "./native-tool-operations";
-import { chatGptToolTimeoutError } from "./adapter-error";
+import { ChatGptWebAdapterError, chatGptToolTimeoutError } from "./adapter-error";
 import {
   TASK_UPDATE_PROTOCOL_VERSION, TASK_UPDATE_LIMIT, TASK_UPDATE_TOTAL_BYTES,
   TASK_UPDATE_TRANSFER_LIMIT, TASK_UPDATE_DELIVERY_LIMIT, TASK_UPDATE_BATCH_LIMIT_BYTES, isTaskRevision,
@@ -2309,7 +2309,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (channel.safe) {
       channel.safe.state = "revoked";
-      this.rejectSafeWaiters(channel.safe.sentWaiters, reason);
+      this.rejectSafeWaiters(channel.safe.sentWaiters, nativeReason);
       this.rejectSafeWaiters(channel.safe.startWaiters, reason);
       this.rejectSafeWaiters(channel.safe.completionWaiters, reason);
     }
@@ -3563,7 +3563,7 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new NativeOperationError("codex_tool_operation_unknown", "The operation does not belong to this MCP contract");
     }
     if (channel.verificationPair) throw contextError("CONTEXT_VERIFICATION_ONLY", "Connector verification cannot start or wait for business operations");
-    if (channel.nativeQueryCount >= 64) throw new NativeOperationError("codex_tool_resource_limit", "The Native query limit was reached; existing operations remain available");
+    if (channel.nativeQueryCount >= 64) throw new NativeOperationError("codex_tool_infrastructure_failure", "The Native query resource limit was reached; retry after an active query settles");
     // A query owns this count, not an MCP process or a Responses round. Socket cancellation and
     // every return path release it. No per-query activity tombstones accumulate during long waits.
     channel.nativeQueryCount += 1;
@@ -3649,6 +3649,13 @@ export class TurnBroker implements TurnBrokerOwner {
           && typeof (block as { text?: unknown }).text === "string" && (block as { text: string }).text.includes(compactionReadToken!))
         ? compactionSource.deliveryReceiptId : undefined;
       return { ...reply, ...(taskUpdate ? { taskUpdate } : {}), ...(contextControlReceipt ? { contextControlReceipt } : {}) };
+    } catch (error) {
+      // Durable fences can reject a still-live capability before its asynchronous cleanup.
+      // Preserve their known failure class across the Native query wire boundary.
+      if (error instanceof ChatGptWebAdapterError) {
+        throw new NativeOperationError(error.retryable ? "codex_tool_infrastructure_failure" : error.code, error.message);
+      }
+      throw error;
     } finally {
       channel.nativeQueryCount -= 1;
       channel.activityRevision += 1;

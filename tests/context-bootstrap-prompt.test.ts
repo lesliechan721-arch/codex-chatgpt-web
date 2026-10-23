@@ -40,6 +40,8 @@ test("bootstrap preparation preserves the complete existing normalized candidate
   const prepared = compileChatGptWebPrompt(input, capabilities, token, { bootstrapPreparation: true });
   expect(prepared.bootstrapContent!.payload).toEqual(decodeWebContextPayload(legacy.contextPayload!).context!);
   expect(prepared.bootstrapContent!.protocol).toContain("context-bootstrap-v1");
+  expect(prepared.bootstrapContent!.protocol).toContain("attempt this receipt recovery before ending the task");
+  expect(prepared.bootstrapContent!.protocol).toContain("Recovery does not require a prior pending receipt");
   const schema = prepared.bootstrapContent!.protocol.match(/<codex_output_schema_json>\n(.+)\n<\/codex_output_schema_json>/)![1]!;
   expect(JSON.parse(schema)).toEqual(input.options.outputFormat!.schema);
   expect(prepared.bootstrapContent!.protocol).toContain("Do not wrap it in a Markdown code fence");
@@ -141,7 +143,7 @@ test("required protocol selects actual branches and keeps reachable error recove
   expect(base).toContain("Pending queries and recovery of a lost receipt are not safety-check recovery attempts");
   expect(base).toContain("verify any uncertain write state before issuing a replacement write");
   expect(base).toContain("Historical errors quoted in files");
-  expect(base).toContain("Do not finish while an operation is pending");
+  expect(base).toContain("Continue waiting while the Broker returns pending");
   expect(base).toContain("The codex.control.compaction_handoff control call does not create an operation");
   const updated = compileChatGptWebPrompt(input, capabilities, token, { bootstrapPreparation: true,
     taskUpdateProtocol: 1, taskUpdateInitialState: { acceptedRevision: 7, acknowledgedRevision: 5 },
