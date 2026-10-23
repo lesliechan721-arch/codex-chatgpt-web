@@ -400,9 +400,19 @@ test("CI and Release preserve complete Windows verification, cold shards, and se
     assert.doesNotMatch(aggregate.run, /--skip-evidence|WINDOWS_SKIP_EVIDENCE/);
     const expectedNeeds = name === "ci" ? ["windows-verify", "windows-test-shard", "windows-package"] : ["build", "windows-test-shard"];
     assert.deepEqual(jobNeeds(gate).sort(), expectedNeeds.sort());
-    const packageJob = name === "ci" ? "windows-package" : "build";
-    assert.equal(gate.env.WINDOWS_PACKAGE_RESULT, `\${{ needs.${packageJob}.result }}`);
     const states = workflowStep(gate, step => /WINDOWS_PACKAGE_RESULT/.test(step.run) && !/bun /.test(step.run));
+    if (name === "ci") assert.equal(gate.env.WINDOWS_PACKAGE_RESULT, "${{ needs.windows-package.result }}");
+    else {
+      assert.equal(gate.env.WINDOWS_PACKAGE_RESULT, undefined);
+      const selection = workflowStep(gate, step => step.id === "shard-artifacts");
+      const windows = workflow.jobs.build.strategy.matrix.include.find(row => row.runner === "windows-latest");
+      assert.equal(selection.env.SHARD_PACKAGE_JOB_NAME, `build (${windows.runner}, ${windows.runtime_asset})`);
+      for (const step of [states, aggregate]) {
+        assert.equal(step.env.WINDOWS_PACKAGE_RESULT, "${{ steps.shard-artifacts.outputs.package-result }}");
+        assert.equal(step.if, "always()");
+        assert.ok(gate.steps.indexOf(step) > gate.steps.indexOf(selection));
+      }
+    }
     // These steps run under bash on Ubuntu. Execute them on POSIX hosts to check failure propagation.
     if (process.platform !== "win32") {
       const pass = { WINDOWS_TOPOLOGY: "sharded", WINDOWS_SHARDS_RESULT: "success", WINDOWS_FULL_RESULT: "skipped", WINDOWS_PACKAGE_RESULT: "success" };

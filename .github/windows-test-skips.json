@@ -24,7 +24,7 @@
     "tests/release-image.test.ts": "9cbbf6e11d5872a3a4eb256608784e659fc5f7573c34b9843433c7ca4ad0b5a0",
     "tests/server-deploy.test.ts": "da2f8241519ff407bef78b562efe41b4d8d1fbf44905442408d43ac4380ee101",
     "tests/session-continuity-checkpoint.test.ts": "fdf465a9da2c93fca364f53d9a05637b0c3a1c84db522f144c80111284d8bd7c",
-    "tests/session-continuity-compaction.test.ts": "bcfe859d1e1dea417dc39d093a8b37c0227e8b14c32f0a0514e6af524791221c",
+    "tests/session-continuity-compaction.test.ts": "d789f4392d2bea0b679f7b95f6f3e16ea57d5aed7fe1d91e7dc76cfdb3020246",
     "tests/session-continuity-recovery.test.ts": "e64546a032edcb67ae55890e3fcc0b3a7ac8073f568c3e7d8521685347b8307c",
     "tests/setup-lifecycle.test.ts": "632125e522dc27c77ea839386453ce350a0ac484438a0ac5a3fc024f2ae1f64b",
     "tests/submission-error-alert.test.ts": "d6ac5074e3e32bcc44ac71d09152a67bf51b4c290719d1bd039ced2cf158395a",

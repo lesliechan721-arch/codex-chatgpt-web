@@ -309,6 +309,26 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       modelMcp = await modelMcpConnection;
       return modelMcp.client;
     };
+    const readStartup = async (prompt: string) => {
+      const value = await readContinuityStartup(prompt, await manualMcp());
+      const bootstrap = /<codex_bootstrap_json>\n([^\n]+)/.exec(prompt);
+      if (!bootstrap) return value;
+      const credential = JSON.parse(bootstrap[1]!).first_call.arguments;
+      const token = credential.request_id ?? credential.turn_token;
+      // Receiving the MCP body does not prove that its return receipt reached
+      // the Broker. Wait through the production guard before direct tool IPC.
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        try {
+          broker.checkFinalOutputCandidate(token, {
+            expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 });
+          return value;
+        } catch (error) {
+          if ((error as { code?: string }).code !== "CONTEXT_BUSY" || Date.now() >= deadline) throw error;
+          await Bun.sleep(1);
+        }
+      }
+    };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const compatible = spyOn(worker, "assertContinuityCompatible").mockResolvedValue();
     // Legacy lifecycle cases do not negotiate task updates. Regression cases opt in explicitly.
@@ -483,7 +503,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       }
       if (options.contextModel) await options.contextModel({ prompt: compiled.text, token: compiled.turnToken!,
         manual, client: await manualMcp(), broker });
-      else if (compiled.contextPlan) await readContinuityStartup(compiled.text, await manualMcp());
+      else if (compiled.contextPlan) await readStartup(compiled.text);
       if (controls.invokeSourceTools) {
         const token = compiled.turnToken;
         expect(token).toBeDefined();
@@ -492,9 +512,15 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         // The real worker captures the current answer before acknowledging a delivered batch.
         // This fixture has no DOM, but must still cross the same causal boundary.
         let progress = turn.externalProgress!.snapshot();
-        while (progress.lastToolBatchRevision === 0) {
-          progress = await turn.externalProgress!.waitForChange(progress.revision, turn.abortSignal);
-        }
+        const waiting = new AbortController();
+        const signal = turn.abortSignal ? AbortSignal.any([turn.abortSignal, waiting.signal]) : waiting.signal;
+        try {
+          await Promise.race([calls, (async () => {
+            while (progress.lastToolBatchRevision === 0) {
+              progress = await turn.externalProgress!.waitForChange(progress.revision, signal);
+            }
+          })()]);
+        } finally { waiting.abort(); }
         await turn.externalProgress!.acknowledgeToolBatch(progress.lastToolBatchRevision);
         await calls;
         if (controls.failAfterToolsOnce) { controls.failAfterToolsOnce = false; if (!controls.failAfterToolsKeepPage) pages.delete(turn.conversationKey!); throw continuityError("continuity_session_lost"); }
@@ -582,7 +608,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         if (options.contextModel) await options.contextModel({ prompt: submissions.at(-1)!.prompt,
           token: controls.safeToken, manual, client: await manualMcp(), broker });
         else if (submissions.at(-1)!.prompt.includes("<codex_bootstrap_json>")) {
-          await readContinuityStartup(submissions.at(-1)!.prompt, await manualMcp());
+          await readStartup(submissions.at(-1)!.prompt);
         }
         if (controls.invokeSourceTools) {
           const token = controls.safeToken;
@@ -672,7 +698,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       return request();
     });
     return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost, root, manualControl,
-      readStartup: async (prompt: string) => readContinuityStartup(prompt, await manualMcp()) };
+      readStartup };
   }
 
   function httpFixture(manual = false, taskUpdates = false, options: { root?: string; threadId?: string; mcpTransport?: ContinuityMcpTransport } = {}) {

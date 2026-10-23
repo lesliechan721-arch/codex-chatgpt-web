@@ -996,6 +996,13 @@ test("Round 7: verified compaction retry honors established source item aliases"
   } finally {resolver.mockRestore();}
 });
 
+test("a rejected fixture source tool reports an error without waiting for a tool batch", async () => {
+  const f = fixture();
+  f.controls.invokeSourceTools = true;
+  f.controls.reviewWireName = "not_currently_advertised";
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "error" });
+});
+
 for (const manual of [false,true]) test(`Round 7: completed foreign tool search history cannot expand current capability ${manual}`, async ()=>{
   const f=fixture(manual);
   const first=f.request();

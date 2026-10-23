@@ -201,7 +201,6 @@ jobs:
       actions: read
     env:
       WINDOWS_SHARDS_RESULT: ${{ needs.windows-test-shard.result }}
-      WINDOWS_PACKAGE_RESULT: ${{ needs.build.result }}
       CGW_TEST_WORKERS: "2"
     steps:
       - name: Preserve repository source bytes
@@ -210,9 +209,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
-      - name: Check complete Windows job states
-        run: |
-          [[ "$WINDOWS_SHARDS_RESULT" == 'success' && "$WINDOWS_PACKAGE_RESULT" == 'success' ]]
       - name: Select reports from effective shard attempts
         id: shard-artifacts
         if: always()
@@ -221,8 +217,15 @@ jobs:
           SHARD_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
           SHARD_JOB_NAME: Windows server tests
+          SHARD_PACKAGE_JOB_NAME: build (windows-latest, codex-chatgpt-web-windows-amd64.zip)
           SHARD_ARTIFACT_PREFIX: test-performance-windows-latest-workers-${{ env.CGW_TEST_WORKERS }}
           SHARD_SELECTION_PATH: ${{ runner.temp }}/windows-shard-selection.json
+      - name: Check complete Windows job states
+        if: always()
+        env:
+          WINDOWS_PACKAGE_RESULT: ${{ steps.shard-artifacts.outputs.package-result }}
+        run: |
+          [[ "$WINDOWS_SHARDS_RESULT" == 'success' && "$WINDOWS_PACKAGE_RESULT" == 'success' ]]
       - name: Download selected shard 1 evidence
         if: always() && steps.shard-artifacts.outcome == 'success'
         uses: actions/download-artifact@v4
@@ -241,6 +244,8 @@ jobs:
           path: ${{ runner.temp }}/windows-shards/shard-2
       - name: Verify shard provenance and complete coverage
         if: always()
+        env:
+          WINDOWS_PACKAGE_RESULT: ${{ steps.shard-artifacts.outputs.package-result }}
         run: |
           bun -e 'import {writeFileSync} from "node:fs"; writeFileSync(process.env.RUNNER_TEMP + "/windows-shard-jobs.json", JSON.stringify({shard1:process.env.WINDOWS_SHARDS_RESULT,shard2:process.env.WINDOWS_SHARDS_RESULT,package:process.env.WINDOWS_PACKAGE_RESULT}));'
           bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/windows-shards" "--job-results=$RUNNER_TEMP/windows-shard-jobs.json" "--selection=$RUNNER_TEMP/windows-shard-selection.json" "--output=$RUNNER_TEMP/windows-shard-aggregate.json" --skip-policy=.github/windows-test-skips.json --mode=timing

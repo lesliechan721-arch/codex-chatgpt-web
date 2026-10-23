@@ -17,6 +17,15 @@ type Artifact = { id: number; name: string; expired: boolean; workflow_run?: { i
 type ShardFetch = (url: string, init: RequestInit) => Promise<Response>;
 const positive = (value: unknown) => typeof value === "string" && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
 
+/** A platform gate must use its package job, rather than the whole build matrix. */
+export function packageJobResult(jobs: Job[], expected: Pick<ShardSelection, "gateAttempt" | "runHeadRevision">, name: string): "success" | "failure" {
+  const candidates = jobs.filter(job => job.name === name && job.run_attempt <= Number(expected.gateAttempt));
+  const attempt = Math.max(...candidates.map(job => job.run_attempt));
+  const latest = candidates.filter(job => job.run_attempt === attempt);
+  if (latest.length !== 1 || latest[0]!.head_sha !== expected.runHeadRevision || latest[0]!.status !== "completed") return "failure";
+  return latest[0]!.conclusion === "success" ? "success" : "failure";
+}
+
 export function validateShardSelection(selection: any, expected: Identity): asserts selection is ShardSelection {
   if (selection?.version !== 1 || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expected.repository)
     || !/^[a-f0-9]{40}$/.test(expected.revision) || !/^[a-f0-9]{40}$/.test(selection.runHeadRevision)
@@ -93,6 +102,10 @@ if (import.meta.main) {
       listRunItems(api, expected.repository, expected.runId, "jobs", token),
       listRunItems(api, expected.repository, expected.runId, "artifacts", token),
     ]);
+    if (process.env.SHARD_PACKAGE_JOB_NAME) {
+      const result = packageJobResult(jobs, expected, process.env.SHARD_PACKAGE_JOB_NAME);
+      appendFileSync(required("GITHUB_OUTPUT"), `package-result=${result}\n`);
+    }
     const selection = selectShardArtifacts(jobs, artifacts, expected, required("SHARD_JOB_NAME"), required("SHARD_ARTIFACT_PREFIX"));
     writeFileSync(required("SHARD_SELECTION_PATH"), JSON.stringify(selection, null, 2) + "\n");
     for (const shard of selection.shards) {

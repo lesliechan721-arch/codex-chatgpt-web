@@ -2,10 +2,25 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listRunItems, selectShardArtifacts } from "../scripts/select-test-shard-artifacts";
+import { listRunItems, packageJobResult, selectShardArtifacts } from "../scripts/select-test-shard-artifacts";
 
 const revision = "a".repeat(40);
 const identity = { repository: "owner/repo", runId: "42", revision, runHeadRevision: revision, gateAttempt: "4" };
+test("package result selects the Windows job across partial reruns and ignores other platforms", () => {
+  const name = "build (windows-latest, codex-chatgpt-web-windows-amd64.zip)";
+  const job = { id: 1, name, run_attempt: 1, head_sha: revision, status: "completed", conclusion: "success",
+    started_at: "2026-10-23T01:00:00Z", completed_at: "2026-10-23T01:10:00Z" };
+  const jobs = [job, { ...job, id: 2, name: "build (ubuntu-latest, linux.tar.gz)", conclusion: "failure" }];
+  expect(packageJobResult(jobs, identity, name)).toBe("success");
+  jobs.push({ ...job, id: 3, run_attempt: 4, conclusion: "failure" });
+  expect(packageJobResult(jobs, identity, name)).toBe("failure");
+  expect(packageJobResult(jobs, { ...identity, gateAttempt: "3" }, name)).toBe("success");
+  for (const defect of [
+    { status: "in_progress" }, { head_sha: "b".repeat(40) }, { conclusion: "cancelled" },
+  ]) expect(packageJobResult([{ ...job, ...defect }], identity, name)).not.toBe("success");
+  expect(packageJobResult([], identity, name)).toBe("failure");
+  expect(packageJobResult([job, { ...job, id: 4 }], identity, name)).toBe("failure");
+});
 function fixture(intel = false) {
   const jobName = intel ? "Intel server tests" : "Windows server tests";
   const prefix = intel ? "test-performance-macos-15-intel-workers-2" : "test-performance-windows-latest-workers-2";
@@ -95,6 +110,9 @@ test("the API reader paginates jobs with filter=all and artifacts before selecti
 for (const pullRequest of [false, true]) test(`the selector CLI writes selected IDs for ${pullRequest ? "PR merge" : "push"} reports`, async () => {
   const input = fixture(true), directory = mkdtempSync(join(tmpdir(), "shard-selection-"));
   const runHeadRevision = pullRequest ? "b".repeat(40) : revision;
+  const packageName = "build (windows-latest, codex-chatgpt-web-windows-amd64.zip)";
+  input.jobs.push({ ...input.jobs[0]!, id: 99, name: packageName, conclusion: "success" },
+    { ...input.jobs[0]!, id: 100, name: "build (ubuntu-latest, linux.tar.gz)", conclusion: "failure" });
   for (const job of input.jobs) job.head_sha = runHeadRevision;
   for (const artifact of input.artifacts) artifact.workflow_run.head_sha = runHeadRevision;
   const server = Bun.serve({ port: 0, fetch(request) {
@@ -110,12 +128,13 @@ for (const pullRequest of [false, true]) test(`the selector CLI writes selected 
       env: { ...process.env, GITHUB_API_URL: server.url.origin, GH_TOKEN: "test-token", GITHUB_REPOSITORY: "owner/repo",
         GITHUB_RUN_ID: "42", GITHUB_SHA: revision, SHARD_RUN_HEAD_SHA: runHeadRevision, GITHUB_RUN_ATTEMPT: "4", GITHUB_OUTPUT: output,
         SHARD_JOB_NAME: "Intel server tests", SHARD_ARTIFACT_PREFIX: "test-performance-macos-15-intel-workers-2",
+        SHARD_PACKAGE_JOB_NAME: packageName,
         SHARD_SELECTION_PATH: manifest }, stdout: "pipe", stderr: "pipe",
     });
     const [, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
     expect(JSON.parse(readFileSync(manifest, "utf8"))).toEqual(selectShardArtifacts(input.jobs, input.artifacts,
       { ...identity, runHeadRevision }, "Intel server tests", "test-performance-macos-15-intel-workers-2"));
-    expect(readFileSync(output, "utf8")).toBe("shard-1-id=401\nshard-2-id=102\n");
+    expect(readFileSync(output, "utf8")).toBe("package-result=success\nshard-1-id=401\nshard-2-id=102\n");
   } finally { server.stop(true); rmSync(directory, { recursive: true, force: true }); }
 });
