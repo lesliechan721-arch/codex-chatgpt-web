@@ -14,14 +14,13 @@ export const CONTEXT_LIMITS = Object.freeze({
   imageMetadataTokens: 1_500, maxImageReads: 64, maxTotalImageBytes: 32 * 1024 * 1024,
   callProcessingMs: 2_000, totalProcessingMs: 20_000,
   maxStorageBytes: 32 * 1024 * 1024, maxQueryBytes: 512, maxArgumentBytes: 8 * 1024,
-  // Three bounded corrective replies have a separate finite reserve. Success pages cannot
-  // consume unused reply slots; errors never borrow required-media or summary reserves.
+  // Corrective replies have finite count and per-response limits.
   maxErrorResponses: 3, errorResponseTokens: 128, errorResponseBytes: 512,
 });
 export type ContextLimits = { readonly [K in keyof typeof CONTEXT_LIMITS]: number };
 export type ContextLimitOverrides = { -readonly [K in keyof ContextLimits]?: number };
-/** The numeric protocol requires a finite allowance even when no cumulative ceiling applies.
- * Production scopes supply their shared page token allowance; wire bytes remain diagnostic. */
+/** Internal compatibility value for fields with no cumulative allowance semantics.
+ * Never present this number as remaining model capacity. */
 export const UNLIMITED_CONTEXT_ALLOWANCE = Number.MAX_SAFE_INTEGER;
 
 export const CONTEXT_BUDGET_PROFILES = Object.freeze({
@@ -79,15 +78,13 @@ export function contextErrorReserve(overrides: ContextLimitOverrides = {}): { to
   return { tokens: limits.maxErrorResponses * limits.errorResponseTokens, wire_bytes: limits.maxErrorResponses * limits.errorResponseBytes };
 }
 
-/** Call before publishing a navigation capability, with all required media protected.
- * The callback used during reads may refer to the already constructed runtime navigator. */
+/** Protect finite image resources before publishing a navigation capability.
+ * Legacy token and wire fields are diagnostic and do not control admission. */
 export function assertContextNavigationBudget(budget: ContextRemainingBudget, overrides: ContextLimitOverrides = {}): void {
-  for (const value of [budget.tokens, budget.wire_bytes, budget.reserved_tokens ?? 0, budget.reserved_wire_bytes ?? 0, budget.image_reads ?? 0, budget.reserved_image_reads ?? 0, budget.image_bytes ?? 0, budget.reserved_image_bytes ?? 0]) {
+  contextLimits(overrides);
+  for (const value of [budget.image_reads ?? 0, budget.reserved_image_reads ?? 0, budget.image_bytes ?? 0, budget.reserved_image_bytes ?? 0]) {
     if (!Number.isSafeInteger(value) || value < 0) throw new Error("Invalid context navigation budget");
   }
-  const reserve = contextErrorReserve(overrides);
-  if (budget.tokens - (budget.reserved_tokens ?? 0) < reserve.tokens
-    || budget.wire_bytes - (budget.reserved_wire_bytes ?? 0) < reserve.wire_bytes) throw new Error("Context navigation budget cannot protect required sources and corrective replies");
   if (budget.reserved_image_reads !== undefined && budget.image_reads === undefined || budget.reserved_image_bytes !== undefined && budget.image_bytes === undefined
     || (budget.image_reads ?? 0) < (budget.reserved_image_reads ?? 0) || (budget.image_bytes ?? 0) < (budget.reserved_image_bytes ?? 0)) throw new Error("Context navigation budget cannot protect required image reads and bytes");
 }

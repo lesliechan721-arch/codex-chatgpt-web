@@ -23,7 +23,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-for (const boundary of ["response", "dom", "submit", "multipart", "observation-loop"] as const) for (const userClosed of [false, true]) {
+for (const boundary of ["response", "dom", "submit", "observation-loop"] as const) for (const userClosed of [false, true]) {
   test(`repair6: real helper classifies ${boundary} physical page loss with user-close=${userClosed}`, async () => {
     let ended: Record<string, unknown> | undefined;
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
@@ -63,7 +63,6 @@ for (const boundary of ["response", "dom", "submit", "multipart", "observation-l
           this.activeComposer = async () => ({ locator: () => ({ locator: () => ({ waitFor: async () => {} }) }) });
           return this.sendAttachedPrompt(page, {});
         }
-        if (${JSON.stringify(boundary)} === "multipart") return this.waitForMultipartAcknowledgement(page, {}, {}, "ACK");
         return this.waitForNewAssistantTurn(page, {}, Date.now() + 1000);
       };
     `, `http://127.0.0.1:${server.port}`);
@@ -491,10 +490,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
       if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
-      if (prepared.multipart.parts.length !== 6) throw new Error("Multipart context was lost");
-      for (let index = 1; index < prepared.multipart.parts.length; index++) {
-        await turn.onMultipartStageAcknowledged?.(index);
-      }
+      if (prepared.text !== "inspect" || Object.hasOwn(prepared, "multipart")) throw new Error("Single input was lost in IPC");
       // An old run can share a trace. Its late Send observation must not invoke the new hook.
       process.stdout.write(JSON.stringify({ type: "event", id: turn.traceId, event: "send_activated",
         recovery: { ...turn.continuity.recovery, snapshotVersion: 1 } }) + "\\n");
@@ -563,7 +559,6 @@ test("daemon streams browser lifecycle through the real helper process", async (
   const reasoning: Array<{ text: string; continuation: boolean }> = [];
   const deltas: string[] = [];
   const checkpoints: unknown[] = [];
-  const acknowledgedStages: number[] = [];
   let sendActivated = false;
   let activations = 0;
   let submitted = false;
@@ -590,10 +585,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
         skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
           content: "<skill>\n<name>ipc</name>\n<path>/skills/ipc/SKILL.md</path>\ncheck IPC\n</skill>",
         })],
-        multipart: { parts: ["part one", "part two", "part three", "part four", "part five", "part six"], commit: "inspect" },
         release: () => { released = true; },
       }),
-      onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
       onSendActivated: async () => { await Bun.sleep(5); sendActivated = true; activations++; },
       onSubmitted: () => {
         submitted = true;
@@ -620,7 +613,6 @@ test("daemon streams browser lifecycle through the real helper process", async (
     expect(submitted).toBe(true);
     expect(heartbeats).toBe(1);
     expect(generationProgress).toBe(1);
-    expect(acknowledgedStages).toEqual([1, 2, 3, 4, 5]);
     expect(checkpoints).toEqual([{
       answerHash: "a".repeat(64),
       checkpoint: {
@@ -796,7 +788,7 @@ test("an older helper rejects Native waiting before turn preparation or IPC disp
   expect(internal.pending.size).toBe(0);
 });
 
-test("launcher helper protocol preserves multipart context, broker identity and the compaction flag", async () => {
+test("launcher helper protocol preserves one complete prompt, broker identity and the compaction flag", async () => {
   const sent: Record<string, unknown>[] = [];
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native5 DEV",
@@ -840,7 +832,7 @@ test("launcher helper protocol preserves multipart context, broker identity and 
   };
 
   await expect(client.run({
-    traceId: "multipart-123",
+    traceId: "inline-123",
     modelId: "gpt-5.6-sol",
     reasoning: "high",
     capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
@@ -849,7 +841,6 @@ test("launcher helper protocol preserves multipart context, broker identity and 
       text: "commit",
       images: [],
       turnToken: "turn_0123456789abcdef0123456789abcdef",
-      multipart: { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "commit" },
       trimmedCompactionMessages: 4,
       release() {},
     }),
@@ -867,10 +858,44 @@ test("launcher helper protocol preserves multipart context, broker identity and 
     prepared: {
         text: "commit",
         turnToken: "turn_0123456789abcdef0123456789abcdef",
-        multipart: { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "commit" },
-        trimmedCompactionMessages: 4,
+          trimmedCompactionMessages: 4,
     },
   });
+});
+
+test.each(["daemon", "wire"] as const)("a retired staged prompt from the %s is rejected before Send by the real helper connection", async boundary => {
+  const fixture = fencedHelperFixture(`
+    ChatGptBrowserWorker.prototype.run = async function(turn) {
+      await turn.onPreparedSelected(false);
+      await turn.prepare();
+      await turn.onSendActivated();
+      return "unexpected staged submission";
+    };
+  `);
+  const retired = { parts: ["old source one", "old source two"], commit: "old commit" };
+  let releases = 0;
+  let activations = 0;
+  fixture.turn.prepare = async () => ({ text: "old commit", images: [],
+    ...(boundary === "daemon" ? { multipart: retired } : {}), release() { releases++; } });
+  fixture.turn.onSendActivated = () => { activations++; };
+  const internal = fixture.client as unknown as { send(frame: Record<string, unknown>): Promise<void> };
+  const send = internal.send.bind(fixture.client);
+  const frames: string[] = [];
+  internal.send = async frame => {
+    frames.push(String(frame.type));
+    return send(boundary === "wire" && frame.type === "prepared_selected_ack"
+      ? { ...frame, prepared: { ...(frame.prepared as object), multipart: retired } } : frame);
+  };
+  try {
+    await expect(fixture.client.run(fixture.turn)).rejects.toMatchObject({
+      code: "codex_context_upgrade_required", retryable: false,
+      message: expect.stringContaining("Staged context transport is retired"),
+    });
+    expect(activations).toBe(0);
+    expect(releases).toBe(1);
+    expect(frames.filter(type => type === "run")).toHaveLength(1);
+    expect(frames.filter(type => type === "prepared_selected_ack")).toHaveLength(boundary === "wire" ? 1 : 0);
+  } finally { await fixture.client.close(); }
 });
 
 test("an abort dispatched during run submission cannot overtake the run frame", async () => {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseRequest } from "../src/responses/parser";
 import { defaultBrokerEndpoint } from "../src/config";
-import { CompactionSourceCoverage, captureCompactionSource, captureRetainedCompactionSource, assertCompactionReadable, compactionAvailableTokens, prepareFreshCompactionSource, registerCompactionSource } from "../src/adapters/chatgpt-web/compaction-context";
+import { CompactionSourceCoverage, captureCompactionSource, captureRetainedCompactionSource, assertCompactionReadable, prepareFreshCompactionSource, registerCompactionSource } from "../src/adapters/chatgpt-web/compaction-context";
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { requestRetainedCompactionHandoff, settleActiveZeroRiskCompactionSource } from "../src/adapters/chatgpt-web/compaction-handoff";
@@ -13,9 +13,6 @@ import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, chatGptTurnRound
 import { callTurnBroker, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import type { ContextPreparedReply } from "../src/adapters/chatgpt-web/context-runtime";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
-import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
-import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
-import { estimateTokens } from "../src/lib/token-estimate";
 import { contextLimits } from "../src/adapters/chatgpt-web/context-budget";
 
 // Keep these retained-capacity cases on the existing inline/on-demand path.
@@ -110,68 +107,27 @@ function coverage(parsed = input(), planId = "selected") {
   return ledger;
 }
 
-test("retained reading capacity uses the selected Bigger Context window", async () => {
-  const parsed = input(); parsed._chatgptModelFamily = "6";
-  const snapshot = createContextSnapshot(parsed);
-  const ordinary = compactionAvailableTokens(parsed, capabilities, 150_000);
-  const bigger = compactionAvailableTokens(parsed, { ...capabilities, experimentalBiggerContext: true }, 150_000);
-  expect(ordinary).toBe(0);
-  expect(bigger).toBe(90_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-  await expect(assertCompactionReadable(snapshot, ordinary)).rejects.toMatchObject({ code: "continuity_input_limit" });
-  await expect(assertCompactionReadable(snapshot, bigger)).resolves.toBeUndefined();
-});
-
-for (const bigger of [false, true]) test(`compaction protects platform capacity once across physical sends (bigger=${bigger})`, async () => {
-  const parsed = parseRequest({ model: "gpt-5.6-sol", input: [{ role: "user", content: "Summarize this source" }] });
-  parsed._chatgptModelFamily = "6";
-  const selectedCapabilities = { ...capabilities, experimentalBiggerContext: bigger };
-  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-platform-capacity-"));
+test("compaction registration ignores retained page delivery estimates", async () => {
+  const parsed = input(), snapshot = createContextSnapshot(parsed);
+  const ledger = coverage(parsed); ledger.markDelivered("selected");
+  ledger.recordNavigationUsage("selected", { tokens: 1_000_000, wireBytes: 10_000_000, reservedTokensUsed: 0 });
+  expect(ledger.pageTokenReserve()).toBeGreaterThan(600_000);
+  await expect(assertCompactionReadable(snapshot)).resolves.toBeUndefined();
+  const directory = mkdtempSync(join(process.platform === "win32" ? tmpdir() : "/tmp", "cgw-diagnostic-page-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));
-  const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
-  const options = bigger ? { experimentalMultipartParts: 2 as const } : {};
-  const token = "capacity-test-token";
-  const first = new ContextSend(parsed, broker, capabilities, "capacity-page");
-  const baseline = await first.prepare(parsed, token, options);
-  const pageWindow = baseline.costs.contextWindowTokens;
-  const retained = pageWindow - 32_000 - baseline.costs.promptTokens;
-  const selected = await first.prepare(parsed, token, options, retained);
-  await first.select(token, selected); await first.sent();
-  expect(first.coverage.pageTokenReserve()).toBe(pageWindow - 32_000);
-  expect(compactionAvailableTokens(parsed, selectedCapabilities, first.coverage.pageTokenReserve()))
-    .toBe(32_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-  const transaction = await broker.beginCompactionTransaction("capacity-test", 30_000);
+  const transaction = await broker.beginCompactionTransaction("diagnostic-page", 30_000);
   const registration = spyOn(broker, "registerCompactionContext");
-  const instruction = "Summarize this fixed source and submit the checkpoint";
-  const sourceInput = { snapshot: first.snapshot, contract: "native" as const, transactionToken: transaction.token,
-    handoffId: transaction.handoffId, historyRevision: 0, ownerGeneration: "capacity-page", expiresAt: Date.now() + 30_000 };
   try {
-    const available = compactionAvailableTokens(parsed, selectedCapabilities, first.coverage.pageTokenReserve());
-    const control = await registerCompactionSource(broker, { ...sourceInput, availableTokens: available }, instruction);
-    const registered = registration.mock.calls[0]![0];
-    expect(registered.remainingBudget!.tokens).toBe(available - estimateTokens(instruction) - 4_096);
-    expect(registered.remainingBudget!.reserved_tokens).toBe(8_192);
-    expect(control.instruction).toContain("codex_context");
-    await broker.revokeCompactionContext(control.token);
-    const second = new ContextSend(parsed, broker, capabilities, "capacity-page", first.coverage);
-    const next = await second.prepare(parsed, token, options, first.coverage.pageTokenReserve());
-    await second.select(token, next); await second.sent();
-    expect(second.coverage.pageTokenReserve()).toBe(first.coverage.pageTokenReserve() + next.costs.promptTokens);
-    expect(compactionAvailableTokens(parsed, selectedCapabilities, second.coverage.pageTokenReserve()))
-      .toBe(pageWindow - second.coverage.pageTokenReserve() - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-    const boundary = new ContextSend(parsed, broker, capabilities, "capacity-page", second.coverage);
-    const nearLimit = await boundary.prepare(parsed, token, options,
-      pageWindow - 18_000 - baseline.costs.promptTokens);
-    expect(nearLimit.costs.requiredTotalTokens).toBe(pageWindow - 18_000 + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + baseline.costs.workReserveTokens);
-    await boundary.select(token, nearLimit); await boundary.sent();
-    const remaining = compactionAvailableTokens(parsed, selectedCapabilities, boundary.coverage.pageTokenReserve());
-    expect(remaining).toBe(9_808);
-    registration.mockClear();
-    await expect(registerCompactionSource(broker, { ...sourceInput, snapshot: boundary.snapshot, availableTokens: remaining }, instruction))
-      .rejects.toMatchObject({ code: "continuity_input_limit" });
-    expect(registration).not.toHaveBeenCalled();
-    await first.retire(); await second.retire(); await boundary.retire();
+    const control = await registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
+      handoffId: transaction.handoffId, historyRevision: 0, ownerGeneration: "diagnostic-page", expiresAt: Date.now() + 30_000 },
+      "Summarize the fixed source and submit the checkpoint");
+    expect(registration.mock.calls[0]![0].remainingBudget).toBeUndefined();
+    expect(control.instruction).not.toContain("remaining_tokens");
+    expect(control.instruction).not.toContain("Near the budget limit");
+    await broker.markCompactionContextDelivered(control.token);
+    await broker.commitCompactionContext(control.token);
   } finally {
-    registration.mockRestore(); reuseCapability.mockRestore(); await broker.abortCompactionTransaction(transaction.token);
+    registration.mockRestore(); await broker.abortCompactionTransaction(transaction.token);
     await broker.close(); rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -198,15 +154,13 @@ test("source coverage separates selected preparation from delivery and retains v
   expect(next.metadata()).toEqual([]);
 });
 
-test("compaction rejects unavailable images and inadequate reading capacity before control publication", async () => {
+test("compaction rejects unavailable images and oversized responses before control publication", async () => {
   const parsed = parseRequest({ model: "gpt-5.6-sol", input: [{ role: "user", content: [
     { type: "input_text", text: "Use the original image" }, { type: "input_image", image_url: "https://unavailable.invalid/image.png" },
   ] }] });
   const ledger = coverage(parsed); ledger.markDelivered("selected");
   expect(() => captureCompactionSource(parsed, ledger)).toThrow("fixed readable bytes");
-  await expect(assertCompactionReadable(createContextSnapshot(input()), 8_192)).rejects.toThrow("reading allowance");
-  await expect(assertCompactionReadable(createContextSnapshot(input()), 8_192 + 384)).rejects.toThrow("overview");
-  await expect(assertCompactionReadable(createContextSnapshot(input()), 20_000, { listBytes: 512, listTokens: 128 })).rejects.toThrow("overview");
+  await expect(assertCompactionReadable(createContextSnapshot(input()), { listBytes: 512, listTokens: 128 })).rejects.toThrow("overview");
 });
 
 for (const terminal of [false, true]) test(`compaction rejects an oversized later directory entry before publishing control (terminal=${terminal})`, async () => {
@@ -232,7 +186,7 @@ for (const terminal of [false, true]) test(`compaction rejects an oversized late
   try {
     await expect(registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
       handoffId: transaction.handoffId, historyRevision: 0, ownerGeneration: "directory-page",
-      expiresAt: Date.now() + 30_000, availableTokens: 96_000, limits }, "Summarize the original source"))
+      expiresAt: Date.now() + 30_000, limits }, "Summarize the original source"))
       .rejects.toMatchObject({ code: "continuity_source_unproven" });
     expect(registration).not.toHaveBeenCalled();
   } finally {
@@ -247,7 +201,7 @@ test("compaction directory admission protects future signed cursor token costs",
     { type: "function_call", call_id: "c".repeat(236), name: "t".repeat(236), namespace: "n".repeat(236), arguments: "{}" },
     { role: "user", content: "Continue" },
   ] });
-  await expect(assertCompactionReadable(createContextSnapshot(parsed), 96_000,
+  await expect(assertCompactionReadable(createContextSnapshot(parsed),
     { listBytes: 12_288, listTokens: 1_500, listEntries: 20 })).rejects.toMatchObject({ code: "continuity_source_unproven" });
 });
 
@@ -276,7 +230,7 @@ test("compaction admission checks thousands of targets while yielding and respec
   let timerObserved = false; let timerDelay = Infinity;
   const started = performance.now();
   const timer = setTimeout(() => { timerObserved = true; timerDelay = performance.now() - started; }, 0);
-  try { await assertCompactionReadable(snapshot, 96_000); }
+  try { await assertCompactionReadable(snapshot); }
   finally { clearTimeout(timer); }
   expect(snapshot.targets).toHaveLength(3_000);
   expect(timerObserved).toBeTrue();
@@ -285,7 +239,7 @@ test("compaction admission checks thousands of targets while yielding and respec
   let now = 0;
   const clock = spyOn(performance, "now").mockImplementation(() => now += 2);
   try {
-    await expect(assertCompactionReadable(snapshot, 96_000, { totalProcessingMs: 1 })).rejects.toThrow("processing deadline");
+    await expect(assertCompactionReadable(snapshot, { totalProcessingMs: 1 })).rejects.toThrow("processing deadline");
   } finally { clock.mockRestore(); }
 }, 30_000);
 

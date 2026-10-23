@@ -133,7 +133,8 @@ test("proxies official /models auth and query, then appends grouped and legacy W
   expect(body.models[0]!.multi_agent_version).toBe("v2");
   for (const [index, model] of body.models.slice(1).entries()) {
     const route = availableChatGptWebModelRoutes(config, true)[index]!;
-    const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
+    const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config,
+      route.interactionMode === "automatic" ? route.modelFamily : undefined);
     expect(model.context_window).toBe(limits.contextWindow);
     expect(model.max_context_window).toBe(limits.contextWindow);
     expect(model.effective_context_window_percent).toBe(limits.effectiveContextWindowPercent);
@@ -204,10 +205,10 @@ test("Zero Risk returns one generic Web row without using scanned capabilities",
     upgrade: null,
     default_reasoning_level: "low",
     input_modalities: ["text"],
-    context_window: 123_000,
-    max_context_window: 123_000,
-    effective_context_window_percent: 78,
-    auto_compact_token_limit: 96_000,
+    context_window: 300_000,
+    max_context_window: 300_000,
+    effective_context_window_percent: 90,
+    auto_compact_token_limit: 270_000,
     additional_speed_tiers: [],
     service_tiers: [],
     default_service_tier: null,

@@ -7,7 +7,7 @@ import { defaultBrokerEndpoint } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
-import { contextErrorReserve, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
+import { contextLimits, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 import { ContextScope, type ContextPreparedReply, type ContextPlanRegistration } from "../src/adapters/chatgpt-web/context-runtime";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
 
@@ -167,9 +167,10 @@ test("navigation never extends the required-image no-progress deadline", () => {
   } finally { scope.retire(); Date.now = now; globalThis.setTimeout = setTimer; globalThis.clearTimeout = clearTimer; }
 });
 
-test("compaction budget rejection allows stopping, while permanent source failure forbids success", () => {
+test("single-image refusal permits compaction submission, while permanent source failure forbids it", () => {
   const a = plan("compaction-budget", false);
-  const scope = new ContextScope("compaction-budget", { ...a, remainingBudget: { tokens: 2_000, reserved_tokens: 1_000, wire_bytes: 64 * 1024 * 1024 } }, "compaction", () => {}, () => {});
+  const scope = new ContextScope("compaction-budget", { ...a, limits: { maxImageBytes: 1 },
+    remainingBudget: { tokens: 1, reserved_tokens: 1_000, wire_bytes: 1 } }, "compaction", () => {}, () => {});
   try {
     scope.markEntryDelivered();
     const imageRef = a.snapshot.targets.find(t => t.kind === "image")!.read_ref!;
@@ -199,7 +200,7 @@ test("original compaction transaction expiry releases source capacity immediatel
 });
 
 
-test("overview refusals preserve complete required-image token and wire reserves", () => {
+test("overview delivery leaves required image resources available despite diagnostic totals", () => {
   const registration = plan("protected-image");
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("image-cost-probe", registration, "normal", () => {}, () => {});
@@ -207,27 +208,26 @@ test("overview refusals preserve complete required-image token and wire reserves
   const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
   const cost = measureContextResponse(sampled.result, { visualTokens: target.visual_token_reserve! });
   probe.finish(sampled.receiptId, true); probe.retire();
-  const errors = contextErrorReserve();
   const scope = new ContextScope("protected-image", { ...registration,
     requiredImageTokenReserves: { [target.target_id]: cost.total_tokens }, requiredImageWireReserves: { [target.target_id]: cost.wire_bytes },
-    remainingBudget: { tokens: cost.total_tokens + errors.tokens + 501, reserved_tokens: 500,
-      wire_bytes: cost.wire_bytes + errors.wire_bytes + 101, reserved_wire_bytes: 100 } }, "normal", () => {}, error => { throw error; });
+    remainingBudget: { tokens: 1, reserved_tokens: 500, wire_bytes: 1, reserved_wire_bytes: 100 } }, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
-    expect(rejected.result.isError).toBe(true); scope.finish(rejected.receiptId, true);
-    const errorCost = scope.navigator.usage(); expect(errorCost.wire_bytes).toBeGreaterThan(0); expect(errorCost.text_tokens).toBeGreaterThan(0);
+    const overview = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
+    expect(overview.result.isError).not.toBe(true); scope.finish(overview.receiptId, true);
+    expect(scope.status().context_ready).toBe(false);
+    const overviewCost = scope.navigator.usage(); expect(overviewCost.wire_bytes).toBeGreaterThan(0); expect(overviewCost.text_tokens).toBeGreaterThan(0);
     const read = scope.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
     expect(read.result.isError).not.toBe(true); scope.finish(read.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
     const usage = scope.navigator.usage();
-    expect(usage.error_responses).toBe(1); expect(usage.wire_bytes).toBe(cost.wire_bytes + errorCost.wire_bytes); expect(usage.text_tokens).toBe(cost.text_tokens + errorCost.text_tokens);
-    expect(usage.wire_bytes).toBeLessThanOrEqual(cost.wire_bytes + errors.wire_bytes + 1);
-    expect(usage.text_tokens + usage.visual_token_reserve).toBeLessThanOrEqual(cost.total_tokens + errors.tokens + 1);
+    expect(usage.error_responses).toBe(0); expect(usage.wire_bytes).toBe(cost.wire_bytes + overviewCost.wire_bytes); expect(usage.text_tokens).toBe(cost.text_tokens + overviewCost.text_tokens);
+    expect(usage.image_reads).toBe(1); expect(usage.image_bytes).toBe(target.image_bytes!);
+    expect(scope.usageEvidence().reserved_tokens_used).toBe(cost.total_tokens);
   } finally { scope.retire(); }
 });
 
-test("shared context capacity protects required images without charging work twice", () => {
+test("diagnostic work reserves do not gate required images or readiness", () => {
   const registration = plan("local-required-reserve");
   const target = registration.snapshot.targets.find(target => target.kind === "image")!;
   const probe = new ContextScope("local-cost-probe", registration, "normal", () => {}, () => {});
@@ -235,31 +235,33 @@ test("shared context capacity protects required images without charging work twi
   const sampled = probe.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
   const cost = measureContextResponse(sampled.result, { visualTokens: target.visual_token_reserve! });
   probe.finish(sampled.receiptId, true); probe.retire();
-  const errors = contextErrorReserve();
   const scope = new ContextScope("local-required-reserve", { ...registration,
     requiredImageTokenReserves: { [target.target_id]: cost.total_tokens }, requiredImageWireReserves: { [target.target_id]: cost.wire_bytes },
-    remainingBudget: { tokens: cost.total_tokens + errors.tokens + 20_001, reserved_tokens: 20_000,
-      wire_bytes: cost.wire_bytes + errors.wire_bytes + 20_001, reserved_wire_bytes: 20_000 } }, "normal", () => {}, error => { throw error; });
+    remainingBudget: { tokens: 1, reserved_tokens: 20_000, wire_bytes: 1, reserved_wire_bytes: 20_000 } }, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
-    expect(rejected.result.isError).toBe(true); scope.finish(rejected.receiptId, true);
+    const overview = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
+    expect(overview.result.isError).not.toBe(true); scope.finish(overview.receiptId, true);
     const image = scope.prepare("read", { context_id: registration.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
     expect(image.result.isError).not.toBe(true); scope.finish(image.receiptId, true);
     expect(scope.status().context_ready).toBe(true);
+    expect(() => scope.assertReady()).not.toThrow();
+    expect(scope.usageEvidence().reserved_tokens_used).toBe(cost.total_tokens);
   } finally { scope.retire(); }
 });
 
-test("finite compaction refusals retire only navigation and preserve summary token and wire reserves", () => {
-  const registration = plan("protected-summary", false); const errors = contextErrorReserve();
-  expect(() => new ContextScope("invalid-publication", { ...registration, remainingBudget: { tokens: 501, reserved_tokens: 500, wire_bytes: 64 * 1024 * 1024 } }, "compaction", () => {}, () => {})).toThrow();
+test("finite corrective replies retire only compaction navigation despite diagnostic summary reserves", () => {
+  const registration = plan("protected-summary", false);
   const scope = new ContextScope("protected-summary", { ...registration,
-    remainingBudget: { tokens: errors.tokens + 501, reserved_tokens: 500, wire_bytes: errors.wire_bytes + 101, reserved_wire_bytes: 100 } }, "compaction", () => {}, () => {});
+    remainingBudget: { tokens: 1, reserved_tokens: 500, wire_bytes: 1, reserved_wire_bytes: 100 } }, "compaction", () => {}, () => {});
   try {
     scope.markEntryDelivered();
-    for (let count = 0; count < 3; count++) {
-      const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
+    const overview = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "overview" });
+    expect(overview.result.isError).not.toBe(true); scope.finish(overview.receiptId, true);
+    for (let count = 0; count < contextLimits().maxErrorResponses; count++) {
+      const rejected = scope.prepare("list", { context_id: registration.snapshot.context_id, view: "entries", cursor: "invalid" });
       expect(rejected.result.isError).toBe(true); scope.finish(rejected.receiptId, true);
+      expect(rejected.result.structuredContent).toMatchObject({ error: { code: "INVALID_CURSOR" } });
       expect(() => scope.guardCommit()).not.toThrow();
     }
     expect(scope.navigator.usage().navigation_stopped).toBe(true);
@@ -317,7 +319,7 @@ test("in-flight required images spend their reserve once and gain coverage only 
     const read = (index: number) => scope.prepare("read", { context_id: source.context_id, reads: [{ read_ref: targets[index]!.read_ref! }] });
     const first = read(0); expect(first.result.isError).not.toBe(true);
     const usage = scope.navigator.usage();
-    expect(() => read(0)).toThrow("in-flight return"); expect(scope.navigator.usage()).toEqual(usage);
+    expect(() => read(0)).toThrow("in-flight required source return"); expect(scope.navigator.usage()).toEqual(usage);
     const second = read(1); expect(second.result.isError).not.toBe(true);
     expect(scope.status().delivered_images).toBe(0);
     scope.finish(first.receiptId, true); expect(scope.status().delivered_images).toBe(1);

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { compileChatGptWebPrompt, withoutRetiredTurnHandles } from "../src/adapters/chatgpt-web/prompt";
-import { decodeWebContextPayload, decodeWebContextTransaction } from "../src/adapters/chatgpt-web/context-renderer";
+import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 
 // #806 (@xianengqi): link parsing stalls on repeated code spans inside JSON arrays.
 // Its code-span branch was verified in ChatGPT's public 257798.4db0db71a9.js asset.
@@ -31,17 +31,14 @@ test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("encoded context avoids the Chr
     };
     const encoded: string[] = [cleaned];
     for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
-      for (const parts of [undefined, 2, 6] as const) {
-        const compiled = compileChatGptWebPrompt(parsed,
-          { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
-          "turn_12345678901234567890123456789012", { contextRendering: format, experimentalMultipartParts: parts });
-        const payloads = compiled.multipart?.parts ?? [compiled.contextPayload!];
-        const records = compiled.multipart ? decodeWebContextTransaction(payloads, format)
-          : decodeWebContextPayload(payloads[0]!, format).records;
-        expect(records.find(record => record.kind === "message")!.message.content).toBe(code);
-        for (const payload of payloads) expect(payload).not.toContain("`");
-        encoded.push(...payloads);
-      }
+      const compiled = compileChatGptWebPrompt(parsed,
+        { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+        "turn_12345678901234567890123456789012", { contextRendering: format });
+      const payload = compiled.contextPayload!;
+      const records = decodeWebContextPayload(payload, format).records;
+      expect(records.find(record => record.kind === "message")!.message.content).toBe(code);
+      expect(payload).not.toContain("`");
+      encoded.push(payload);
     }
     const originals = [JSON.stringify([{ role: "user", content: code }]), JSON.stringify(source)];
     const pattern = JSON.parse(readFileSync(new URL("./fixtures/chatgpt-markdown-link-regexp.json", import.meta.url), "utf8"));

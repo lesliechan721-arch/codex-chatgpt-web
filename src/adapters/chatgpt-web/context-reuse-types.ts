@@ -30,7 +30,7 @@ export interface ContextReuseDependency {
 
 export interface ContextReusePlan {
   protocol: typeof CONTEXT_REUSE_PROTOCOL;
-  payload_format: "context-bootstrap-payload-v2";
+  payload_format: "context-bootstrap-payload-v3";
   mode: "full" | "incremental";
   dependency?: ContextReuseDependency;
   units: readonly (ContextReuseUnit & {

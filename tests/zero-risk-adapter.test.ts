@@ -12,6 +12,8 @@ import {
   createChatGptWebAdapter,
   type ChatGptZeroRiskManualControl,
 } from "./helpers/chatgpt-web-adapter";
+import { createContinuityMcpClient } from "./helpers/continuity-mcp-client";
+import { readContinuityStartup } from "./helpers/session-continuity-fixture";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
 import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
@@ -19,6 +21,7 @@ import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE } from "../src/adapters/chatgpt-web/continuity-contract";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import type { ContextArgs, ContextMethod } from "../src/adapters/chatgpt-web/context-runtime";
+import { contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { extractChatGptCompactionSourceRevision, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -32,8 +35,8 @@ import { parseRequest } from "../src/responses/parser";
 import type { ProviderAdapter } from "../src/adapters/base";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 
-// These fixtures exercise the existing inline/on-demand contract. Short startup
-// and its default composer limit have separate production MCP integration tests.
+// Launcher capability determines the selected inline or bootstrap candidate.
+// Bootstrap continuations complete the published MCP read chain before business work.
 const testTempRoot = process.platform === "win32" ? tmpdir() : "/tmp";
 const root = mkdtempSync(join(testTempRoot, "cgw-zero-risk-adapter-"));
 afterAll(() => {
@@ -75,6 +78,8 @@ function request(turnId: string): CodexParsedRequest {
 }
 
 function binding(prompt: string): { request_id: string } {
+  const bootstrap = /<codex_bootstrap_json>\n([^\n]+)/.exec(prompt);
+  if (bootstrap) return { request_id: JSON.parse(bootstrap[1]!).first_call.arguments.request_id };
   const match = prompt.match(/<codex_zero_risk_request_json>\n(\{[^\n]+\})\n<\/codex_zero_risk_request_json>/);
   if (!match) throw new Error("Zero Risk prompt did not expose its request id");
   return JSON.parse(match[1]!) as { request_id: string };
@@ -93,7 +98,6 @@ function provider(name: string): CodexProviderConfig {
       localToolsEnabled: true,
       solAvailable: false,
       extraHighAvailable: false, proAvailable: false,
-      experimentalBiggerContext: false,
     },
   };
 }
@@ -226,10 +230,13 @@ for (const scenario of [
   }), { mode: 0o600 });
   const starts: string[] = [];
   const bindings = new Map<string, string>();
+  const sentPrompts = new Map<string, string>();
   let modelAction: Promise<void> | undefined;
   const control: ChatGptZeroRiskManualControl = {
     async start(path, activity) {
-      expect(activity.prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
+      expect(activity.prompt).toContain(activity.prompt.includes("<codex_bootstrap_json>")
+        ? 'Call only plugin "Codex Manual Work" for first_call and local tools.'
+        : 'The selected local Codex plugin for this turn is "Codex Manual Work".');
       // The authenticated control endpoint binds the real private journal before acquisition.
       const receipt = unified ? await startLauncherManualTurn(path, activity)
         : host.beginManualTurn(activity.traceId, activity.helperPid, activity.prompt,
@@ -239,22 +246,37 @@ for (const scenario of [
       starts.push(activity.traceId);
       const tab = [...host.turnTabs.values()].find((item: any) => item.traceId === activity.traceId);
       bindings.set(activity.traceId, binding(tab.prompt).request_id);
+      // Started clears the Launcher prompt; retain only the model's submitted copy.
+      sentPrompts.set(activity.traceId, tab.prompt);
       return receipt;
     },
     async waitSent(_path, owner) {
       const tab = [...host.turnTabs.values()].find((item: any) => item.traceId === owner.traceId);
-      host.confirmManualSent(tab.id);
+      // Match the Launcher UI confirmation, including the current context plan and nonce.
+      host.confirmManualSent(tab.id, tab.manualContextPlan ? {
+        traceId: tab.traceId, nonce: tab.manualAttachmentsNonce,
+        planId: tab.manualContextPlan.planId, manifestDigest: tab.manualContextPlan.manifestDigest,
+      } : undefined);
       broker.startSafeTurn(bindings.get(owner.traceId)!);
     },
     waitTerminal: noManualTerminal,
     async markStarted(_path, owner) {
       host.markManualTurnStarted(owner.traceId, owner.helperPid);
       const token = bindings.get(owner.traceId)!;
+      const prompt = sentPrompts.get(owner.traceId)!;
       if (starts.length > 1) {
-        broker.completeSafeTurn(token, "Final answer after compaction");
+        modelAction = (async () => {
+          if (prompt.includes("<codex_bootstrap_json>")) await readContinuityStartup(prompt, mcp);
+          const completed = await mcp.callTool({ name: "codex_turn_complete", arguments: {
+            request_id: token, task_revision: 0, final_answer: "Final answer after compaction",
+          } });
+          expect(completed.isError).not.toBe(true);
+        })();
+        void modelAction.catch(() => {});
         return;
       }
       modelAction = (async () => {
+        if (prompt.includes("<codex_bootstrap_json>")) await readContinuityStartup(prompt, mcp);
         let result = await mcp.callTool({ name: "codex_exec", arguments: {
           request_id: token, task_revision: 0, operation_id: 1, cmd: "pwd",
         } });
@@ -593,6 +615,7 @@ for (const scenario of [
     }
     const final: AdapterEvent[] = [];
     await runOrdinary(continuation, final);
+    await modelAction;
     const continuationStarts = nativeLocal && scenario.finalWins ? 3 : 2;
     expect(starts).toHaveLength(continuationStarts);
     expect(starts[1]).not.toBe(starts[0]);
@@ -867,20 +890,30 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
     async waitSent() { broker.startSafeTurn(exactBinding!.request_id); },
     waitTerminal: noManualTerminal,
     async markStarted() {
-      const entry = JSON.parse(/<codex_context_navigation_json>\n([^\n]+)/.exec(manualPrompt)![1]!);
+      const entry = JSON.parse(/<codex_bootstrap_json>\n([^\n]+)/.exec(manualPrompt)![1]!);
       const query = async (method: ContextMethod, args: Record<string, unknown>) => {
         const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(config.chatgptWeb!.brokerSocketPath!, {
           method: "context_query", token: entry.first_call.arguments.request_id, contract: "safe", credentialKind: "ordinary",
+          contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1",
           contextProtocol: CONTEXT_PROTOCOL_VERSION, contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as ContextArgs,
         });
         await callTurnBroker(config.chatgptWeb!.brokerSocketPath!, { method: "context_return", token: entry.first_call.arguments.request_id,
-          contract: "safe", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true });
+          contract: "safe", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION, receiptId: reply.receiptId, sent: true,
+          ...((reply.result.structuredContent as { format?: string } | undefined)?.format === "context-text-batch-v1"
+            ? { textReadReceipt: contextTextReadReceipt(reply.result) } : {}) });
         return reply.result;
       };
       const list = await query("list", { view: "entries", kind: "image" });
       const picture = (list.structuredContent as { entries: Array<{ read_ref: string; media_route: string }> }).entries[0]!;
       expect(picture.media_route).toBe("mcp");
       expect((await query("read", { reads: [{ read_ref: picture.read_ref }] })).content.some((block: any) => block.type === "image")).toBe(true);
+      let next = (await query("list", { view: "overview" })).structuredContent as { next_required_read: { arguments: ContextArgs } | null };
+      for (let count = 0; next.next_required_read; count++) {
+        expect(count).toBeLessThan(100);
+        const page = parseContextTextReadResult(await query("read", next.next_required_read.arguments as unknown as Record<string, unknown>));
+        next = { next_required_read: page.metadata.required_step!.next_required_read };
+      }
+      expect((await query("list", { view: "overview" })).structuredContent).toMatchObject({ live: { context_ready: true } });
       broker.completeSafeTurn(exactBinding!.request_id, "MCP image handoff completed");
     },
     async waitAttachments() { throw new Error("MCP images must not require manual confirmation"); },
@@ -894,7 +927,7 @@ test("Zero Risk delivers a supported image through MCP without a manual attachme
       { headers: new Headers() },
       event => events.push(event),
     );
-    expect(manualPrompt).toContain("codex_context_navigation_json");
+    expect(manualPrompt).toContain("codex_bootstrap_json");
     expect(manualPrompt).not.toContain('"type":"image_attachment"');
     expect(events.some(event => event.type === "text_delta"
       && event.phase === "commentary"
@@ -993,6 +1026,7 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
   config.chatgptWeb!.appName = "Codex Manual Work";
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
   const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
+  const mcp = await createContinuityMcpClient({ brokerSocketPath: config.chatgptWeb!.brokerSocketPath!, contract: "safe" });
   const input = request("turn_safe_incremental");
   input.context.messages.push(
     { role: "assistant", content: [{ type: "text", text: "Earlier answer already visible in ChatGPT." }], timestamp: 3 },
@@ -1021,21 +1055,30 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
   let exactBinding: ReturnType<typeof binding> | undefined;
   let fullPrompt = "";
   let resumePrompt = "";
+  let resumedContext: unknown;
   const control: ChatGptZeroRiskManualControl = {
     async start(_path, activity) {
       fullPrompt = activity.prompt;
       resumePrompt = activity.resumePrompt ?? "";
       for (const prompt of [fullPrompt, resumePrompt]) {
-        expect(prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
+        expect(prompt).toContain(prompt.includes("<codex_bootstrap_json>")
+          ? 'Call only plugin "Codex Manual Work" for first_call and local tools.'
+          : 'The selected local Codex plugin for this turn is "Codex Manual Work".');
       }
       exactBinding = binding(resumePrompt);
+      expect(activity.contextPlans?.resume).toBeDefined();
+      return { selectedPlanId: activity.contextPlans!.resume!.planId, reused: true };
     },
     async waitSent() {
       broker.startSafeTurn(exactBinding!.request_id);
     },
     waitTerminal: noManualTerminal,
     async markStarted() {
-      broker.completeSafeTurn(exactBinding!.request_id, "Incremental answer");
+      resumedContext = await readContinuityStartup(resumePrompt, mcp.client);
+      const completed = await mcp.client.callTool({ name: "codex_turn_complete", arguments: {
+        request_id: exactBinding!.request_id, task_revision: 0, final_answer: "Incremental answer",
+      } });
+      expect(completed.isError).not.toBe(true);
     },
     async end() {},
     async cancel() {},
@@ -1049,10 +1092,12 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
     expect(fullPrompt).toContain("Earlier answer already visible in ChatGPT.");
     expect(fullPrompt).toContain("Continue with only this new request.");
     expect(resumePrompt).not.toContain("Earlier answer already visible in ChatGPT.");
-    expect(resumePrompt).toContain("Continue with only this new request.");
+    expect(JSON.stringify(resumedContext)).not.toContain("Earlier answer already visible in ChatGPT.");
+    expect(JSON.stringify(resumedContext)).toContain("Continue with only this new request.");
   } finally {
     chatGptTurnSessions.clear();
     reuseSupport.mockRestore();
+    await mcp.close();
     await broker.close();
   }
 });

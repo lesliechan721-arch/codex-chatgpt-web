@@ -1,10 +1,8 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import {
-  chatGptPromptJsonBytes, compileChatGptWebPrompt, formatChatGptWebMultipartCommit,
-  formatChatGptWebMultipartStage,
+  chatGptPromptJsonBytes, compileChatGptWebPrompt,
 } from "../src/adapters/chatgpt-web/prompt";
-import { decodeWebContextPayload, decodeWebContextTransaction } from "../src/adapters/chatgpt-web/context-renderer";
+import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { resolveChatGptWebMessageTokenBudget, resolveChatGptWebTransportLimits } from "../src/chatgpt-web-models";
@@ -65,57 +63,17 @@ test("cleanup is shared across renderers and keeps the active credential outside
   expect(mixed.contextPayload).toContain("[retired turn handle]");
 });
 
-test("two and six parts preserve complete records, fixed bytes, manifest and ACK hashes", () => {
-  for (const count of [2, 6] as const) {
-    const parsed = request();
-    parsed.context.messages = Array.from({ length: 8 }, (_, index) => ({
-      role: "user" as const, content: `record-${index} ` + body, timestamp: index,
-    }));
-    const options = { experimentalMultipartParts: count, contextRendering: "codex-context-text-v1" as const };
-    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, options);
-    expect(compiled.multipart!.parts).toHaveLength(count);
-    const decoded = decodeWebContextTransaction(compiled.multipart!.parts, compiled.contextFormat);
-    expect(decoded.filter(record => record.kind === "message").map(record => record.message.content))
-      .toEqual(parsed.context.messages.map(message => message.content));
-    const transaction = `ctx_${"f".repeat(32)}`;
-    const commit = formatChatGptWebMultipartCommit(compiled.multipart!, transaction);
-    expect(commit.match(new RegExp(token, "g"))).toHaveLength(1);
-    for (const [index, payload] of compiled.multipart!.parts.entries()) {
-      const sha = createHash("sha256").update(payload, "utf8").digest("hex");
-      expect(commit).toContain(`${index + 1}/${count}:${sha}`);
-      if (index === count - 1) continue;
-      const first = formatChatGptWebMultipartStage(payload, transaction, index + 1, count);
-      const retry = formatChatGptWebMultipartStage(payload, transaction, index + 1, count);
-      expect(first).toEqual(retry);
-      expect(first.sha256).toBe(sha);
-      expect(first.acknowledgement).toBe(`CODEX_MULTIPART_ACK ${transaction} ${index + 1}/${count} ${sha}`);
-      expect(first.text).toContain("The later commit has not been sent yet");
-      expect(first.text).toContain("<codex_context_part_text>");
-      expect(first.text).not.toContain("<codex_context_part_json>");
-      expect(first.text).not.toContain(token);
-    }
-    expect(compileChatGptWebPrompt(parsed, capabilities, token, options).multipart!.parts).toEqual(compiled.multipart!.parts);
-  }
-});
-
-test("final inline and two/six-part renderers escape code spans and preserve source semantics", () => {
+test("inline renderers escape code spans and preserve source semantics", () => {
   const parsed = request(body + " ``` ```` ````````  ```text");
   const original = structuredClone(parsed);
   for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
-    for (const parts of [undefined, 2, 6] as const) {
-      const compiled = compileChatGptWebPrompt(parsed, capabilities, token, {
-        contextRendering: format, experimentalMultipartParts: parts,
-      });
-      const payloads = compiled.multipart?.parts ?? [compiled.contextPayload!];
-      for (const payload of payloads) expect(payload).not.toContain("`");
-      const records = compiled.multipart ? decodeWebContextTransaction(payloads, format)
-        : decodeWebContextPayload(payloads[0]!, format).records;
-      expect(records.find(record => record.kind === "message")!.message.content).toBe(parsed.context.messages[0]!.content);
-      const sent = compiled.multipart ? formatChatGptWebMultipartCommit(compiled.multipart, `ctx_${"0".repeat(32)}`) : compiled.text;
-      expect(sent).toMatch(/\n```(?:text|json)\n/);
-      expect(sent).not.toMatch(/\n +```(?:text|json)\n/);
-      expect(parsed).toEqual(original);
-    }
+    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { contextRendering: format });
+    expect(compiled.contextPayload).not.toContain("`");
+    const records = decodeWebContextPayload(compiled.contextPayload!, format).records;
+    expect(records.find(record => record.kind === "message")!.message.content).toBe(parsed.context.messages[0]!.content);
+    expect(compiled.text).toMatch(/\n```(?:text|json)\n/);
+    expect(compiled.text).not.toMatch(/\n +```(?:text|json)\n/);
+    expect(parsed).toEqual(original);
   }
 });
 
@@ -128,17 +86,6 @@ test("unverified whitespace and mismatched evidence cannot enable raw text", () 
     contextRawTextPolicy: { verifiedPath: "zero-risk", evidence: "unit-test mismatched path fixture", allowLf: true },
   })).toThrow("different input path");
 });
-
-test("format-forcing cannot split oversized records or admit an invalid multipart header", () => {
-  const parsed = request("x ".repeat(140_000));
-  const plus = { ...capabilities, proAvailable: false };
-  for (const format of ["legacy-json", "codex-context-text-v1"] as const) {
-    expect(() => compileChatGptWebPrompt(parsed, plus, token, { experimentalMultipartParts: 2, contextRendering: format })).toThrow();
-  }
-  expect(() => formatChatGptWebMultipartStage('{"context":"unknown"}', `ctx_${"0".repeat(32)}`, 1, 2)).toThrow();
-  const source = compileChatGptWebPrompt(request("OK"), capabilities, token, { experimentalMultipartParts: 2 });
-  expect(() => formatChatGptWebMultipartStage(source.multipart!.parts[0]!, `ctx_${"0".repeat(32)}`, 2, 2)).toThrow();
-}, 30_000);
 
 test("only-mixed capacity preserves the complete selected input", () => {
   const parsed = request("\\".repeat(64_000));

@@ -56,7 +56,6 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   setConnectorNameSuffix: (suffix) => ipcRenderer.invoke("launcher:connector-name", suffix),
   setMcpStep: (step) => ipcRenderer.invoke("launcher:set-mcp-step", step),
   setAutostart: (enabled) => ipcRenderer.invoke("launcher:autostart", enabled),
-  setBiggerContext: (enabled) => ipcRenderer.invoke("launcher:bigger-context", enabled),
   setComposerPredictions: (enabled) => ipcRenderer.invoke("launcher:composer-predictions", enabled),
   setSkillAttachments: (enabled) => ipcRenderer.invoke("launcher:skill-attachments", enabled),
   setFreshConversationPerTurn: (enabled) => ipcRenderer.invoke("launcher:fresh-conversation-per-turn", enabled),

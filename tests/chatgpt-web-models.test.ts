@@ -10,7 +10,6 @@ import {
   CHATGPT_WEB_LUNA_MODEL_ROUTES,
   CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE,
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
-  CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW,
   CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
@@ -20,7 +19,10 @@ import {
   resolveChatGptWebContextLimits,
   resolveChatGptWebHistoryLimits,
   resolveChatGptWebTransportLimits,
-  supportsChatGptWebBiggerContext,
+  resolveChatGptWebMessageTokenBudget,
+  chatGptWebRouteEfforts,
+  type ChatGptWebBackendModel,
+  type ChatGptWebModelFamily,
 } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
 import { routeChatGptWebRequest } from "../src/server";
@@ -101,63 +103,81 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(request.modelId).toBe(CHATGPT_WEB_BACKEND_MODEL);
     expect(request.options.reasoning).toBe("medium");
     expect(resolveChatGptWebHistoryLimits(route, config)).toEqual({
-      contextWindow: 1_000_000, autoCompactTokenLimit: 900_000, effectiveContextWindowPercent: 90,
+      contextWindow: 500_000, autoCompactTokenLimit: 450_000, effectiveContextWindowPercent: 90,
     });
-    expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config).contextWindow).toBe(90_000);
+    expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config).contextWindow).toBe(500_000);
     expect(resolveChatGptWebTransportLimits(route.backendModel, route.adapterEffort, config).browserComposerCharLimit).toBe(500_000);
     const ordinary = parsed("chatgpt-web/gpt-5.6-sol", "medium");
     ordinary._conversationPolicy = "task";
     ordinary._rawBody = { metadata: { conversationPolicy: "task" }, _conversationPolicy: "task" };
     const ordinaryRoute = routeChatGptWebRequest(ordinary, { ...config, mode: "browser-only" });
     expect(ordinary).toMatchObject({ _conversationPolicy: "recoverable" });
-    expect(resolveChatGptWebHistoryLimits(ordinaryRoute, { ...config, mode: "browser-only" }).contextWindow).toBe(90_000);
+    expect(resolveChatGptWebHistoryLimits(ordinaryRoute, { ...config, mode: "browser-only" }).contextWindow).toBe(500_000);
   });
 
-  test("GPT-6 task routes retain their history budget and exact browser family without expanding one message", () => {
+  test("GPT-6 task routes use account history tiers and preserve one-message boundaries", () => {
     const config = { ...defaultConfig("full"), ...pro, browserHost: "launcher" as const };
-    for (const [suffix, effort, contextWindow, messageTokens] of [
-      ["sol-instant", "low", 111_193, 103_000],
-      ["sol", "medium", 111_193, 103_000],
-      ["sol", "high", 111_193, 103_000],
-      ["sol", "xhigh", 111_193, 103_000],
-      ["pro", "max", 112_193, 104_000],
+    for (const [suffix, effort, historyWindow, messageTokens] of [
+      ["sol-instant", "low", 300_000, 103_000],
+      ["sol", "medium", 500_000, 103_000],
+      ["sol", "high", 500_000, 103_000],
+      ["sol", "xhigh", 500_000, 103_000],
+      ["pro", "max", 600_000, 104_000],
     ] as const) {
       const request = parsed(`chatgpt-web/gpt-6-${suffix}`, effort);
       const route = routeChatGptWebRequest(request, config);
       expect(request).toMatchObject({ _conversationPolicy: "task", _chatgptModelFamily: "6" });
       expect(resolveChatGptWebHistoryLimits(route, config)).toEqual({
-        contextWindow: 1_000_000, autoCompactTokenLimit: 900_000, effectiveContextWindowPercent: 90,
+        contextWindow: historyWindow, autoCompactTokenLimit: historyWindow * 0.9, effectiveContextWindowPercent: 90,
       });
-      expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config, "6").contextWindow)
-        .toBe(contextWindow);
+      expect(resolveChatGptWebMessageTokenBudget(route.backendModel, route.adapterEffort, config)).toBe(messageTokens);
       expect(resolveChatGptWebTransportLimits(route.backendModel, route.adapterEffort, config).browserMessageTokenLimit)
         .toBe(messageTokens);
-      const biggerConfig = {
-        ...config, experimentalBiggerContext: true,
-      };
-      expect(requireChatGptWebModelRoute(route.slug, biggerConfig, effort)).toEqual(route);
-      expect(resolveChatGptWebHistoryLimits(route, biggerConfig))
-        .toEqual(resolveChatGptWebHistoryLimits(route, config));
-      expect(availableChatGptWebModelRoutes(biggerConfig).map(candidate => candidate.slug)).toContain(route.slug);
     }
   });
 
-  test("ordinary history metadata uses GPT-6 product limits for the selected account and effort", () => {
-    for (const proAvailable of [false, true]) {
-      const config = { ...defaultConfig("full"), ...pro, proAvailable, experimentalBiggerContext: true };
-      for (const effort of ["medium", "high", "xhigh"] as const) {
-        const route = requireChatGptWebModelRoute("chatgpt-web/gpt-6-sol", config, effort);
-        expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({
-          contextWindow: proAvailable ? 240_000 : 120_000,
-          autoCompactTokenLimit: proAvailable ? 220_000 : 110_000,
-        });
-      }
-      const instant = requireChatGptWebModelRoute("chatgpt-web/gpt-6-sol-instant", config, "low");
-      expect(resolveChatGptWebHistoryLimits(instant, config)).toMatchObject({
-        contextWindow: proAvailable ? 111_193 : 41_000,
-        autoCompactTokenLimit: proAvailable ? 95_000 : 32_000,
-      });
-    }
+  test("all available routes use the explicit history matrix across hosts and policies", () => {
+    const expected: Record<string, readonly [number, number]> = {
+      "chatgpt-web/gpt-6-sol-instant": [200_000, 300_000],
+      "chatgpt-web/gpt-6-sol": [300_000, 500_000],
+      "chatgpt-web/gpt-5.6-sol-instant": [300_000, 600_000],
+      "chatgpt-web/gpt-5.6-sol": [500_000, 600_000],
+      "chatgpt-web/gpt-5.6-pro": [600_000, 600_000],
+      "chatgpt-web/gpt-6-pro": [600_000, 600_000],
+      "chatgpt-web/light": [300_000, 600_000],
+      "chatgpt-web/medium": [500_000, 600_000],
+      "chatgpt-web/high": [500_000, 600_000],
+      "chatgpt-web/extra-high": [500_000, 600_000],
+      "chatgpt-web/pro": [600_000, 600_000],
+      "chatgpt-web/gpt-5.6-luna": [200_000, 200_000],
+      "chatgpt-web/luna": [200_000, 200_000],
+      "chatgpt-web/think": [200_000, 200_000],
+      "chatgpt-web/zero-risk": [300_000, 300_000],
+      "chatgpt-web/zero-risk-pro": [600_000, 600_000],
+    };
+    for (const mode of ["full", "browser-only"] as const)
+      for (const browserHost of ["launcher", "managed-chrome"] as const)
+        for (const browserInteractionMode of ["automatic", "manual"] as const)
+          for (const solAvailable of [false, true])
+            for (const proAvailable of [false, true])
+              for (const extraHighAvailable of [false, true])
+                for (const zeroRiskProEnabled of [false, true]) {
+                  const config = { ...defaultConfig(mode), browserHost, browserInteractionMode,
+                    solAvailable, proAvailable, extraHighAvailable, zeroRiskProEnabled };
+                  for (const advertised of availableChatGptWebModelRoutes(config, true)) {
+                    for (const effort of chatGptWebRouteEfforts(advertised, config)) {
+                      const route = requireChatGptWebModelRoute(advertised.slug, config, effort);
+                      const contextWindow = expected[route.slug]![proAvailable ? 1 : 0];
+                      const limits = { contextWindow, autoCompactTokenLimit: contextWindow * 0.9,
+                        effectiveContextWindowPercent: 90 };
+                      expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config,
+                        route.interactionMode === "automatic" ? route.modelFamily : undefined)).toEqual(limits);
+                      for (const conversationPolicy of ["task", "recoverable"] as const) {
+                        expect(resolveChatGptWebHistoryLimits({ ...route, conversationPolicy }, config)).toEqual(limits);
+                      }
+                    }
+                  }
+                }
   });
 
   test("exposes only Plus-eligible routes without the Pro account capability", () => {
@@ -229,46 +249,29 @@ describe("fixed ChatGPT Web model routes", () => {
       .toThrow("only available while Zero Risk is enabled");
   });
 
-  test("Zero Risk always publishes its fixed three-turn compaction interval and rejects multipart Bigger Context", () => {
-    const manual = {
-      solAvailable: true,
-      extraHighAvailable: true, proAvailable: true,
-      browserInteractionMode: "manual" as const,
-    };
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", manual)).toEqual({
-      contextWindow: 123_000,
-      effectiveContextWindowPercent: 78,
-      autoCompactTokenLimit: 96_000,
-    });
-    expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", manual)).toEqual({});
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, "low", manual)).toEqual({
-      contextWindow: 336_579,
-      effectiveContextWindowPercent: 85,
-      autoCompactTokenLimit: 285_000,
-    });
-    expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, "low", manual)).toEqual({});
-    expect(() => availableChatGptWebModelRoutes({
-      ...manual,
-      experimentalBiggerContext: true,
-    })).toThrow("does not support Bigger Context");
+  test("Zero Risk uses explicit history tiers independently of observed account capabilities", () => {
+    for (const solAvailable of [false, true]) for (const proAvailable of [false, true]) {
+      const manual = { solAvailable, proAvailable, browserInteractionMode: "manual" as const };
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", manual)).toEqual({
+        contextWindow: 300_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 270_000,
+      });
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, "low", manual)).toEqual({
+        contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000,
+      });
+      expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", manual)).toEqual({});
+      expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, "low", manual)).toEqual({});
+    }
   });
 
-  test("publishes measured Plus browser windows and compacts before the transport ceiling", () => {
+  test("Plus history tiers preserve independent browser character limits", () => {
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
-      contextWindow: 41_000,
-      effectiveContextWindowPercent: 78,
-      autoCompactTokenLimit: 32_000,
+      contextWindow: 300_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 270_000,
     });
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toEqual({
-      contextWindow: 90_000,
-      effectiveContextWindowPercent: 89,
-      autoCompactTokenLimit: 80_000,
-    });
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toEqual({
-      contextWindow: 90_000,
-      effectiveContextWindowPercent: 89,
-      autoCompactTokenLimit: 80_000,
-    });
+    for (const effort of ["medium", "high"] as const) {
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus)).toEqual({
+        contextWindow: 500_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 450_000,
+      });
+    }
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
       browserComposerCharLimit: 211_256,
     });
@@ -279,107 +282,111 @@ describe("fixed ChatGPT Web model routes", () => {
       .toThrow("unavailable effort");
   });
 
-  test("publishes the usable Pro browser window instead of the unreachable underlying model window", () => {
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", pro)).toEqual({
-      contextWindow: 111_193,
-      effectiveContextWindowPercent: 85,
-      autoCompactTokenLimit: 95_000,
-    });
-    for (const effort of ["medium", "high", "xhigh"] as const) {
+  test("Pro history tiers preserve independent browser token and character limits", () => {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
       expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toEqual({
-        contextWindow: 111_193,
-        effectiveContextWindowPercent: 85,
-        autoCompactTokenLimit: 95_000,
+        contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000,
       });
     }
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", pro)).toEqual({
-      contextWindow: 112_193,
-      effectiveContextWindowPercent: 85,
-      autoCompactTokenLimit: 95_000,
-    });
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", pro)).toEqual({
-      browserMessageTokenLimit: 103_000,
-      browserComposerCharLimit: 545_000,
+      browserMessageTokenLimit: 103_000, browserComposerCharLimit: 545_000,
     });
     for (const effort of ["medium", "high", "xhigh"] as const) {
       expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, pro)).toEqual({
-        browserMessageTokenLimit: 103_000,
-        browserComposerCharLimit: 500_000,
+        browserMessageTokenLimit: 103_000, browserComposerCharLimit: 500_000,
       });
     }
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "max", pro)).toEqual({
-      browserMessageTokenLimit: 104_000,
-      browserComposerCharLimit: 1_635_000,
+      browserMessageTokenLimit: 104_000, browserComposerCharLimit: 1_635_000,
     });
   });
 
-  test("GPT-6 Plus expands retained context without enlarging one message or unlocking unavailable efforts", () => {
-    const enabled = { ...plus, experimentalBiggerContext: true };
-    for (const effort of ["medium", "high"] as const) {
-      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus, "6"))
-        .toMatchObject({ contextWindow: 90_000, autoCompactTokenLimit: 80_000 });
-      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled, "6"))
-        .toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
-      expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, enabled))
-        .toEqual(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, plus));
+  test("unavailable backends, efforts, interactions and unknown families cannot obtain history tiers", () => {
+    for (const resolve of [resolveChatGptWebContextLimits, resolveChatGptWebMessageTokenBudget,
+      resolveChatGptWebTransportLimits]) {
+      expect(() => resolve(CHATGPT_WEB_BACKEND_MODEL, "max", plus)).toThrow("unavailable effort");
+      expect(() => resolve(CHATGPT_WEB_BACKEND_MODEL, "xhigh", { ...pro, extraHighAvailable: false }))
+        .toThrow("unavailable effort");
+      expect(() => resolve(CHATGPT_WEB_BACKEND_MODEL, "low", { ...plus, solAvailable: false }))
+        .toThrow("Luna-only account");
+      expect(() => resolve(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", plus)).toThrow("Luna-only accounts");
+      expect(() => resolve(CHATGPT_WEB_LUNA_BACKEND_MODEL, "high", { ...plus, solAvailable: false }))
+        .toThrow("unavailable effort");
+      expect(() => resolve(CHATGPT_WEB_BACKEND_MODEL, "medium", { ...plus, browserInteractionMode: "manual" }))
+        .toThrow("Zero Risk");
+      expect(() => resolve(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "medium", plus)).toThrow("technical low");
+      expect(() => resolve(CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", { ...plus, browserInteractionMode: "automatic" }))
+        .toThrow("manual interaction");
+      expect(() => resolve("unknown" as ChatGptWebBackendModel, "low", pro)).toThrow("not defined");
     }
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", enabled, "6"))
-      .toEqual(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus, "6"));
-    expect(() => resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", enabled, "6"))
-      .toThrow("unavailable effort");
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "xhigh", {
-      ...enabled, extraHighAvailable: true,
-    }, "6")).toMatchObject({ contextWindow: 120_000, autoCompactTokenLimit: 110_000 });
+    expect(() => resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus,
+      "future" as ChatGptWebModelFamily)).toThrow("model family");
   });
 
-  test("publishes Luna's real model window without early native compaction", () => {
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
-      solAvailable: false,
-      extraHighAvailable: false, proAvailable: false,
-    })).toEqual({
-      contextWindow: 1_050_000,
-      effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 1_050_000,
-    });
-  });
-
-  test("Luna and Think enable experimental context only for their supported efforts across account flags", () => {
+  test("Luna and Think use the same 200k history tier and 28k input contract", () => {
     for (const proAvailable of [false, true]) for (const extraHighAvailable of [false, true]) {
       const capabilities = { solAvailable: false, proAvailable, extraHighAvailable };
       for (const effort of ["low", "medium"] as const) {
-        expect(supportsChatGptWebBiggerContext(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, "6")).toBe(true);
-        expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, capabilities))
-          .toMatchObject({ contextWindow: 1_050_000, autoCompactTokenLimit: 1_050_000 });
-        expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, {
-          ...capabilities, experimentalBiggerContext: true,
-        })).toMatchObject({ contextWindow: 84_000, autoCompactTokenLimit: 59_424 });
+        expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, capabilities)).toEqual({
+          contextWindow: 200_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 180_000,
+        });
         expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, capabilities))
           .toEqual({ browserMessageTokenLimit: 19_808 });
       }
     }
-    for (const effort of ["high", "xhigh", "max"] as const) {
-      expect(supportsChatGptWebBiggerContext(CHATGPT_WEB_LUNA_BACKEND_MODEL, effort, "6")).toBe(false);
+  });
+
+  test("single-message text budgets retain the old inclusive boundaries and image deductions", () => {
+    const manual = { ...plus, browserInteractionMode: "manual" as const };
+    const rows = [
+      [CHATGPT_WEB_BACKEND_MODEL, "low", plus, 32_807],
+      [CHATGPT_WEB_BACKEND_MODEL, "medium", plus, 81_807],
+      [CHATGPT_WEB_BACKEND_MODEL, "high", plus, 81_807],
+      [CHATGPT_WEB_BACKEND_MODEL, "xhigh", { ...plus, extraHighAvailable: true }, 81_807],
+      [CHATGPT_WEB_BACKEND_MODEL, "low", pro, 103_000],
+      [CHATGPT_WEB_BACKEND_MODEL, "medium", pro, 103_000],
+      [CHATGPT_WEB_BACKEND_MODEL, "high", pro, 103_000],
+      [CHATGPT_WEB_BACKEND_MODEL, "xhigh", pro, 103_000],
+      [CHATGPT_WEB_BACKEND_MODEL, "max", pro, 104_000],
+      [CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", { ...plus, solAvailable: false }, 19_808],
+      [CHATGPT_WEB_LUNA_BACKEND_MODEL, "medium", { ...plus, solAvailable: false }, 19_808],
+      [CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, "low", manual, 114_807],
+      [CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL, "low", manual, 328_386],
+    ] as const;
+    for (const [backend, effort, capabilities, expected] of rows) {
+      const budget = (images: number) => resolveChatGptWebMessageTokenBudget(backend, effort, capabilities, images);
+      expect(budget(0)).toBe(expected);
+      expect(budget(4_096)).toBe(expected - 4_096);
+      expect(budget(8_192)).toBe(expected - 8_192);
+      expect(budget(expected - 1)).toBe(1);
+      expect(budget(expected)).toBe(0);
+      expect(budget(expected + 1)).toBe(0);
+      for (const mode of ["full", "browser-only"] as const)
+        for (const browserHost of ["launcher", "managed-chrome"] as const) {
+          expect(resolveChatGptWebMessageTokenBudget(backend, effort, { ...capabilities, mode, browserHost }))
+            .toBe(expected);
+        }
     }
   });
 
-  test("triples Sol context and compaction limits only when Bigger Context is enabled", () => {
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", {
-      ...pro,
-      experimentalBiggerContext: true,
-    })).toEqual({
-      contextWindow: 336_579,
-      effectiveContextWindowPercent: 85,
-      autoCompactTokenLimit: 285_000,
-    });
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
-      solAvailable: false,
-      extraHighAvailable: false, proAvailable: false,
-      experimentalBiggerContext: true,
-    })).toEqual({
-      contextWindow: 84_000,
-      effectiveContextWindowPercent: 71,
-      autoCompactTokenLimit: 59_424,
-    });
+  test("legacy aliases keep the same history and message policies as their named routes", () => {
+    for (const capabilities of [plus, pro]) {
+      for (const [alias, canonical, effort] of [
+        ["light", "gpt-5.6-sol-instant", "low"],
+        ["medium", "gpt-5.6-sol", "medium"],
+        ["high", "gpt-5.6-sol", "high"],
+        ["extra-high", "gpt-5.6-sol", "xhigh"],
+        ["pro", "gpt-5.6-pro", "max"],
+      ] as const) {
+        if (effort === "xhigh" && !capabilities.extraHighAvailable) continue;
+        if (effort === "max" && !capabilities.proAvailable) continue;
+        const old = requireChatGptWebModelRoute(`chatgpt-web/${alias}`, capabilities);
+        const named = requireChatGptWebModelRoute(`chatgpt-web/${canonical}`, capabilities, effort);
+        expect(resolveChatGptWebHistoryLimits(old, capabilities)).toEqual(resolveChatGptWebHistoryLimits(named, capabilities));
+        expect(resolveChatGptWebMessageTokenBudget(old.backendModel, old.adapterEffort, capabilities))
+          .toBe(resolveChatGptWebMessageTokenBudget(named.backendModel, named.adapterEffort, capabilities));
+      }
+    }
   });
 
   test("binds the selected model authoritatively and ignores a conflicting request effort", () => {

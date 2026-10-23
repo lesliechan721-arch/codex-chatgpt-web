@@ -60,7 +60,6 @@ export interface SetupOptions {
   refreshAccountCapabilities?: boolean;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
-  experimentalBiggerContext?: boolean;
   composerPredictionsEnabled?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalFreshConversationPerTurn?: boolean;
@@ -159,7 +158,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     solAvailable: before.solAvailable,
     extraHighAvailable: before.extraHighAvailable,
     proAvailable: before.proAvailable,
-    experimentalBiggerContext: before.experimentalBiggerContext,
     composerPredictionsEnabled: before.composerPredictionsEnabled,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
@@ -193,7 +191,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     solAvailable: after.solAvailable,
     extraHighAvailable: after.extraHighAvailable,
     proAvailable: after.proAvailable,
-    experimentalBiggerContext: after.experimentalBiggerContext,
     composerPredictionsEnabled: after.composerPredictionsEnabled,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
@@ -323,9 +320,6 @@ function baseConfig(
   if (options.experimentalFreshConversationPerTurn !== undefined) {
     config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
   }
-  if (options.experimentalBiggerContext !== undefined) {
-    config.experimentalBiggerContext = options.experimentalBiggerContext;
-  }
   if (options.zeroRiskProEnabled !== undefined) {
     if (config.browserInteractionMode !== "manual") {
       throw new Error("Zero Risk Pro can be configured only with --zero-risk-browser-interaction");
@@ -351,16 +345,12 @@ function baseConfig(
     if (options.experimentalSkillAttachments === true) {
       throw new Error("Zero Risk does not support Skills as files");
     }
-    if (options.experimentalBiggerContext === true) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
     if (config.mode !== "full") {
       throw new Error("Zero Risk requires --full so Codex Zero Risk3 can signal start, tools, and completion");
     }
     if (config.browserHost !== "launcher") {
       throw new Error("Zero Risk requires the Launcher; pass --browser-host-descriptor from the running Launcher");
     }
-    config.experimentalBiggerContext = false;
     config.experimentalSkillAttachments = false;
   }
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();

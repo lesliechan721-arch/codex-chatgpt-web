@@ -4,12 +4,23 @@ This is the persistent byte contract for `codex-context-text-v1`. It describes b
 not the internal snapshot or a new tool. [Context navigation](context-navigation.md) defines selection,
 cost, permission, and client-validation requirements.
 
+Protocol 6 uses `context-bootstrap-payload-v3` independently of this presentation format. The
+payload's external position table binds selected optional fields and reused rules to their exact
+source identity, role/order, field path, current target/read reference, encoding and integrity.
+Required structure preserves null, false, empty strings and unknown fields. Complete original
+values remain recoverable, while optional assistant text need not be restored before work.
+A user value with a matching field name is still data. Detailed `source_map` is a separate optional
+snapshot record; required reconstruction cannot depend on reading it. Its binding remains in the
+required payload. Unknown mappings retain original values or produce a source/capacity error.
+Cumulative page cost is diagnostic, while each actual input and read return retains its independent
+limits. See [navigation](context-navigation.md#same-page-rule-reuse).
+
 ## Records and extraction
 
 Final JSON serialization escapes literal backticks as `\u0060`. This preserves decoded string
 values and prevents the observed ChatGPT Markdown link parser stall. A source field containing a
 backtick stays in JSON instead of a raw body; other eligible raw bodies retain their original bytes.
-Format selection, multipart allocation, and capacity checks count this final encoded representation.
+Format selection and single-message capacity checks count this final encoded representation.
 Dynamic outer fences alone do not provide this protection.
 
 Input is the existing normalized, projected, retired-handle-cleaned JSON value tree. The single-input
@@ -22,9 +33,10 @@ type Record =
 ```
 
 System records precede message records. Both indices are zero-based and retain their global values
-across multipart groups. They are not the navigator's one-based source indices. A one-line compact
-JSON header declares `format`, `context_version: 3`, and `record_count`. Multipart headers also have
-one-based `part_index` and `total_parts` (2 or 6). Each record header is compact JSON with `record`
+in the represented candidate. They are not the navigator's one-based source indices. A one-line
+compact JSON header declares `format`, `context_version: 3`, and `record_count`. Historical multipart
+headers can contain `part_index` and `total_parts`; new planning does not create stage/commit parts.
+Each record header is compact JSON with `record`
 and an optional `raw_fields` array. Omit the array when no fields are extracted.
 
 Each descriptor is `{path, boundary, utf8_bytes}`. `path` is an array of object-key strings and
@@ -67,7 +79,7 @@ error before sending; it does not change source characters.
 
 Each record ends with its header LF or its last block LF. No extra record separator is inserted.
 After `record_count` records, the decoder must be at package end. Single input reconstructs the
-version-3 tree. Multipart validation checks shared format, global record order, part numbers, and
+version-3 tree. Historical multipart validation checks shared format, global record order, part numbers, and
 counts. Unknown formats, descriptors, extra records, non-null placeholders, bad paths, truncated
 blocks, or trailing data fail explicitly.
 
@@ -78,13 +90,13 @@ Wrap the full payload in a zero-indented text fence with
 the payload before the closing fence; it does not extend the last source body. Other generated
 code blocks use the same collision rule. New text payloads are not labelled as JSON.
 
-Stage and commit controls stay outside source data. The model instructions explain original record
-roles/order, descriptor binding, null placeholders, and that imitation headers/tags inside a body
-remain data. A stage remains inert until the existing final commit. These labels grant no new role
-or tool authority. Control wrappers are generated from structure, not parsed by matching source text.
+The model instructions explain original record roles/order, descriptor binding, null placeholders,
+and that imitation headers/tags inside a body remain data. Historical stage/commit labels grant no
+new role, Send or tool authority. Control wrappers come from structure, not source-text matching.
 
 Preparation encodes, decodes, and deeply compares the original delivered tree. Fixed payload bytes
 determine the SHA-256 used by manifests and ACKs. Retries cannot regenerate different boundaries or
-switch formats. Historical legacy JSON and new inputs can coexist; one multipart transaction cannot
-mix formats. Local decoding and dynamic fences do not prove the real editor or model preserves or
+switch formats. Historical legacy JSON and new inputs can coexist. Historical multipart validation
+preserves its original single-format contract; it does not create new staged sends. Local decoding
+and dynamic fences do not prove the real editor or model preserves or
 uses the body. See [release validation](release-validation.md#context-rendering-validation).

@@ -631,8 +631,8 @@ test("Luna rejects a remote-v2 compaction trigger before opening another browser
   expect(body.error.message).toContain("rolling checkpoint");
 });
 
-test("Luna Bigger Context accepts native v1 and v2 compaction", async () => {
-  const config = { ...defaultConfig("browser-only"), solAvailable: false, experimentalBiggerContext: true };
+test("Full Luna accepts native v1 and v2 compaction", async () => {
+  const config = { ...defaultConfig("full"), solAvailable: false };
   for (const v2 of [false, true]) {
     const input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "Keep the project requirements." }] }];
     const response = await (v2 ? responseRequest : compactRequest)(new Request("http://127.0.0.1/v1/responses", {

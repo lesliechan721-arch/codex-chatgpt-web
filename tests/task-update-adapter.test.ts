@@ -774,7 +774,7 @@ describe("Automatic Adapter task updates", () => {
             let length = Math.floor((room - traceOverhead - 600 - 24) / 2);
             for (let attempt = 0; attempt < 3; attempt++) {
               const usage = estimateChatGptWebUsage(f.initial, { reasoning: [padding(length)], toolRequests: requests },
-                turn.capabilities, false, false);
+                turn.capabilities, false);
               const events: AdapterEvent[] = requests.flatMap(request => [
                 { type: "tool_call_start", id: request.callId, name: request.wireName },
                 { type: "tool_call_delta", arguments: JSON.stringify(request.arguments ?? {}) },

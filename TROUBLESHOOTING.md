@@ -195,9 +195,12 @@ mean that the ChatGPT UI did not expose a structure the bridge can safely prove.
 
 Free and Go accounts normally expose Luna and Think without the paid-account effort selector. A
 missing paid selector on those accounts is not itself a sign-in failure.
-Luna and Think use rolling summaries with **Settings → Bigger Context** off. Experimental Bigger
-Context keeps the temporary conversation and sends large histories in parts. If earlier details
-are lost in long Free-account chats, turn Bigger Context off and restart Codex.
+Full/MCP Luna and Think use canonical history estimates with a 200,000-token history window and
+180,000-token client compaction threshold. They support default on-demand reads and independent
+compaction. Browser-only Luna keeps rolling checkpoints and projected usage. Bigger Context and
+its multipart sending are removed. A larger history window does not raise the 28,000-token Luna
+single-message input limit or guarantee recall of earlier details. If required evidence is missing,
+read its legal source or report the gap. See [context navigation](docs/context-navigation.md).
 
 ## Personalization or connector controls are not found
 
@@ -402,7 +405,7 @@ max_concurrent_threads_per_session = 1
 If the table already exists, add or change only the key; do not create a second `[agents]` table.
 If it contains `max_threads`, replace that old name with `max_concurrent_threads_per_session`;
 do not keep both. Codex treats them as aliases and may reject the configuration as a duplicate field.
-Bigger Context can make one turn larger and longer, but does not increase safe account concurrency.
+On-demand reading can add calls and processing time. History windows do not increase safe account concurrency.
 
 ## Images from earlier turns are attached again
 

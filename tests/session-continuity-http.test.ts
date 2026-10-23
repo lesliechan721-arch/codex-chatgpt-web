@@ -1075,7 +1075,7 @@ for (const manual of [false, true]) test(`HTTP ${manual ? "Zero Risk" : "Automat
 for (const route of [
   { source: "chatgpt-web/gpt-6-sol-instant", successor: "chatgpt-web/gpt-6-sol-instant" },
   { source: "chatgpt-web/gpt-5.6-sol-instant", successor: "chatgpt-web/gpt-5.6-sol-instant" },
-]) test(`repair4: HTTP public routed source echo recovers through its actual new navigation entry (${route.source} -> ${route.successor})`, async () => {
+]) test(`repair4: HTTP public routed source echo recovers through its actual new bootstrap entry (${route.source} -> ${route.successor})`, async () => {
   const f = httpFixture();
   f.body.model = route.source;
   f.body.reasoning = { effort: "low" };
@@ -1125,12 +1125,17 @@ for (const route of [
     expect(successor.workLineageId).not.toBe(work.workLineageId);
     expect(successor.attempts).toHaveLength(1);
     expect(active.calls).toEqual({});
-    const entry = JSON.parse(compiled.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+    const entry = JSON.parse(compiled.text.match(/<codex_bootstrap_json>\n([^\n]+)\n/)![1]!);
+    expect(entry).toMatchObject({ startup_protocol: "context-bootstrap-v1", context_id: compiled.contextPlan!.contextId });
     const credential = entry.first_call.arguments;
+    expect(credential.turn_token).toBe(compiled.turnToken);
+    const task = await f.readStartup(compiled.text) as { messages: Array<{ role: string; content: unknown }> };
+    expect(task.messages.find(message => message.role === "user")!.content).toBe("First continuity instruction.");
     const query = async (method: "search" | "read", args: Record<string, unknown>) => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
         method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
-        contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
+        contextBootstrapProtocol: "context-bootstrap-v1",
+        contextMethod: method, contextArgs: { context_id: entry.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       expect(reply.result.isError).not.toBe(true);
       const { contextTextReadReceipt } = await import("../src/adapters/chatgpt-web/context-text-result");

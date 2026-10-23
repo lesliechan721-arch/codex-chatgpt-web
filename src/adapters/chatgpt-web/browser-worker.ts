@@ -12,7 +12,7 @@ import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from ".
 import { chatGptInteractionState } from "./browser-interaction-state";
 import { BrowserDiagnosticHistory } from "./browser-diagnostic-history";
 import { readChatGptUserMessage } from "./browser-user-message";
-import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
+import { validateSkillFiles } from "./skill-attachments";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, supportsChatGptUsageTracking, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type JSHandle, type Locator, type Page, type Request, type Response } from "playwright-core";
 import {
@@ -26,7 +26,6 @@ import {
   legacyChatGptConnectorMigrationMessage,
   LEGACY_CHATGPT_CONNECTOR_NAMES,
 } from "../../config";
-import { estimateTokens } from "../../lib/token-estimate";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "./ui-labels";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
@@ -44,17 +43,12 @@ import {
 } from "./model";
 import {
   compiledChatGptWebMaxMessageChars,
-  estimateChatGptWebImageTokens,
   estimateCompiledChatGptWebMessageTokens,
 } from "./input-tokens";
 import {
   CHATGPT_MAX_INPUT_IMAGES,
-  formatChatGptWebMultipartCommit,
-  formatChatGptWebMultipartStage,
-  isChatGptWebMultipartPartCount,
   type CompiledChatGptWebPrompt,
   type ChatGptWebPromptImage,
-  type ChatGptWebMultipartStage,
 } from "./prompt";
 import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
@@ -94,12 +88,8 @@ import {
 import {
   CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
   CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
-  CHATGPT_WEB_GPT6_INSTANT_BIGGER_CONTEXT_ERROR,
-  resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
-  resolveChatGptWebStagingTokenBudget,
   resolveChatGptWebTransportLimits,
-  supportsChatGptWebBiggerContext,
   type ChatGptWebModelFamily,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
@@ -147,13 +137,6 @@ export async function closeChatGptBrowserWorkers(): Promise<void> {
 }
 
 export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
-/**
- * How long a staged Bigger Context part may take to produce its assistant turn. A staged part is two
- * orders of magnitude larger than an ordinary prompt and ChatGPT reads all of it before answering.
- * No MCP activity exists while that inert part is being ingested, so the response grace matches
- * the bounded staged-send budget.
- */
-export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
@@ -1173,11 +1156,10 @@ export function assertChatGptWebInputWithinLimits(
     && estimatedInputTokens > CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET
   ) {
     throw new ChatGptWebAdapterError(
-      `This Luna turn requires ${estimatedInputTokens.toLocaleString("en-US")} estimated input tokens, which exceeds the measured ${CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET.toLocaleString("en-US")}-token ChatGPT Free browser transport budget. Completed Luna history is already replaced by its rolling checkpoint; the remaining payload is the current Codex turn and cannot be reduced by /compact.`,
+      `This Luna turn requires ${estimatedInputTokens.toLocaleString("en-US")} estimated input tokens, which exceeds the measured ${CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET.toLocaleString("en-US")}-token single-message browser transport budget. Reduce this message's text or attachments, then retry.`,
       { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
     );
   }
-  const { contextWindow } = resolveChatGptWebContextLimits(modelId, effort, capabilities);
   const { browserMessageTokenLimit, browserComposerCharLimit } = resolveChatGptWebTransportLimits(
     modelId,
     effort,
@@ -1195,134 +1177,15 @@ export function assertChatGptWebInputWithinLimits(
   }
   if (browserMessageTokenLimit !== undefined && estimatedMessageTokens > browserMessageTokenLimit) {
     throw new ChatGptWebAdapterError(
-      `This prompt requires ${estimatedMessageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT browser message boundary for this account and effort. The model context window is ${contextWindow.toLocaleString("en-US")} tokens; run /compact to reduce the next browser message without changing that model window.`,
+      `This prompt requires ${estimatedMessageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT browser message boundary for this account and effort. Run /compact to reduce the next browser message.`,
       { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
     );
   }
-  if (estimatedInputTokens < contextWindow) return;
+  const imageTokens = Math.max(0, estimatedInputTokens - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - estimatedMessageTokens);
+  const messageBudget = resolveChatGptWebMessageTokenBudget(modelId, effort, capabilities, imageTokens);
+  if (estimatedMessageTokens <= messageBudget) return;
   throw new ChatGptWebAdapterError(
-    `This task is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds the ${contextWindow.toLocaleString("en-US")}-token context window for this ChatGPT Web model. Switch to a model with a larger context window, run /compact, then retry this Web model.`,
-    { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-  );
-}
-
-export function assertChatGptWebMultipartInputWithinLimits(
-  estimatedInputTokens: number,
-  estimatedMessageTokens: number,
-  modelId: string,
-  effort: ChatGptWebModelMode["effort"],
-  capabilities: ChatGptWebCapabilities,
-  maxMessageChars: number,
-  partCount: number,
-  transport?: {
-    stagingEffort: ChatGptWebModelMode["effort"];
-    maxStageMessageTokens: number;
-    maxStageChars: number;
-    finalMessageTokens: number;
-    finalMessageChars: number;
-    finalImageTokens?: number;
-  },
-  modelFamily?: ChatGptWebModelFamily,
-): void {
-  if (!isChatGptWebMultipartPartCount(partCount)) {
-    throw new Error("Bigger Context requires two or six context parts");
-  }
-  if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
-    throw new Error(`ChatGPT Bigger Context limit is not defined for model: ${modelId}`);
-  }
-  if (!supportsChatGptWebBiggerContext(modelId, effort, modelFamily)) {
-    throw new Error(CHATGPT_WEB_GPT6_INSTANT_BIGGER_CONTEXT_ERROR);
-  }
-  const baseContextWindow = resolveChatGptWebMessageTokenBudget(modelId, effort, capabilities)
-    + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
-  const assertMessageBoundary = (
-    label: "stage" | "final part",
-    messageTokens: number,
-    messageChars: number,
-    messageEffort: ChatGptWebModelMode["effort"],
-    imageTokens = 0,
-  ): void => {
-    const { browserMessageTokenLimit, browserComposerCharLimit } = resolveChatGptWebTransportLimits(
-      modelId,
-      messageEffort,
-      capabilities,
-    );
-    if (browserComposerCharLimit !== undefined && messageChars > browserComposerCharLimit) {
-      throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} contains ${messageChars.toLocaleString("en-US")} characters, which exceeds the measured ${browserComposerCharLimit.toLocaleString("en-US")}-character ChatGPT composer boundary. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
-        { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-      );
-    }
-    if (browserMessageTokenLimit !== undefined && messageTokens > browserMessageTokenLimit) {
-      throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds the measured ${browserMessageTokenLimit.toLocaleString("en-US")}-token ChatGPT message boundary. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
-        { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-      );
-    }
-    const messageBudget = label === "stage"
-      ? resolveChatGptWebStagingTokenBudget(modelId, messageEffort, capabilities)
-      : resolveChatGptWebMessageTokenBudget(modelId, messageEffort, capabilities, imageTokens);
-    if (messageTokens > messageBudget) {
-      throw new ChatGptWebAdapterError(
-        `A Bigger Context ${label} requires ${messageTokens.toLocaleString("en-US")} visible message tokens, which exceeds its ${messageBudget.toLocaleString("en-US")}-token input budget after reserving space for ChatGPT and attachments. The bridge will not split an individual Codex message or JSON record; compact the task before retrying.`,
-        { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-      );
-    }
-  };
-  if (transport) {
-    assertMessageBoundary(
-      "stage",
-      transport.maxStageMessageTokens,
-      transport.maxStageChars,
-      transport.stagingEffort,
-    );
-    assertMessageBoundary(
-      "final part",
-      transport.finalMessageTokens,
-      transport.finalMessageChars,
-      effort,
-      transport.finalImageTokens,
-    );
-  } else {
-    assertMessageBoundary("stage", estimatedMessageTokens, maxMessageChars, effort);
-  }
-  // More transport messages do not enlarge the model's advertised context window.
-  const { contextWindow } = resolveChatGptWebContextLimits(
-    modelId, effort, { ...capabilities, experimentalBiggerContext: true }, modelFamily,
-  );
-  const experimentalContextWindow = Math.min(contextWindow, baseContextWindow * partCount);
-  if (estimatedInputTokens < experimentalContextWindow) return;
-  const partLabel = partCount === 2 ? "two-part" : "six-part";
-  throw new ChatGptWebAdapterError(
-    `This Bigger Context transaction is estimated at ${estimatedInputTokens.toLocaleString("en-US")} input tokens, which exceeds its experimental ${experimentalContextWindow.toLocaleString("en-US")}-token ${partLabel} ceiling. Run /compact, then retry.`,
-    { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-  );
-}
-
-/** Select the cheapest account-visible mode that can carry every inert multipart stage. */
-export function resolveChatGptWebMultipartStagingMode(
-  modelId: string,
-  capabilities: ChatGptWebCapabilities,
-  maxStageMessageTokens: number,
-  maxStageChars: number,
-): ChatGptWebModelMode {
-  if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
-    throw new Error(`ChatGPT Bigger Context staging mode is not defined for model: ${modelId}`);
-  }
-  const efforts: readonly ChatGptWebModelMode["effort"][] = modelId === CHATGPT_WEB_LUNA_MODEL_ID ? ["low"] : capabilities.proAvailable
-    ? ["low", "medium", "max"]
-    : ["low", "medium"];
-  for (const effort of efforts) {
-    const mode = resolveChatGptWebModelMode(modelId, effort, capabilities);
-    const limits = resolveChatGptWebTransportLimits(modelId, effort, capabilities);
-    const messageTokenLimit = resolveChatGptWebStagingTokenBudget(modelId, effort, capabilities);
-    const tokenFits = maxStageMessageTokens <= messageTokenLimit;
-    const charsFit = limits.browserComposerCharLimit === undefined
-      || maxStageChars <= limits.browserComposerCharLimit;
-    if (tokenFits && charsFit) return mode;
-  }
-  throw new ChatGptWebAdapterError(
-    `No ChatGPT effort available to this account can carry a Bigger Context stage with ${maxStageMessageTokens.toLocaleString("en-US")} estimated tokens and ${maxStageChars.toLocaleString("en-US")} characters.`,
+    `This prompt requires ${estimatedMessageTokens.toLocaleString("en-US")} visible message tokens, which exceeds its ${messageBudget.toLocaleString("en-US")}-token single-message input budget after reserving space for ChatGPT and attachments. Run /compact, then retry this Web model.`,
     { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
   );
 }
@@ -1333,11 +1196,8 @@ export const browserStageTimeouts = {
   effortSelection: 120_000,
   promptAttachment: 60_000,
   fileAttachment: 120_000,
-  // Inline prompts can be as large as Bigger Context stages. Both need the same bounded
-  // acceptance budget; transport selection must not cut off an already submitted large prompt.
+  // Large inline prompts need a bounded acceptance budget after Send.
   send: 180_000,
-  // Staging asks for one transaction-bound acknowledgement, not an open-ended model answer.
-  multipartStageAcknowledgement: CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
 } as const;
 
 /**
@@ -1488,8 +1348,6 @@ export interface BrowserTurn {
   dispatchWithExecutionAuthority?: <T>(dispatch: () => T) => T;
   /** Semantic submission evidence proved that ChatGPT accepted the prompt. */
   onSubmitted?: () => void | Promise<void>;
-  /** One inert Bigger Context stage completed its exact acknowledgement boundary. */
-  onMultipartStageAcknowledged?: (stageIndex: number) => void | Promise<void>;
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
   onReasoningSummary?: (text: string, continuation?: boolean) => void;
   /** Stable visible ChatGPT prose between status/tool rows. */
@@ -1512,12 +1370,6 @@ export interface BrowserTurn {
   onLunaCheckpoint?: (captured: CapturedChatGptLunaCheckpoint) => void;
 }
 
-interface ChatGptAcknowledgedMultipartStage {
-  text: string;
-  acknowledgement: string;
-  identities: string[];
-}
-
 interface ChatGptSubmissionBaseline {
   userTurns: Locator;
   responseTurns: Locator;
@@ -1527,7 +1379,6 @@ interface ChatGptSubmissionBaseline {
   turnToken?: string;
   acceptedUserIdentity?: string;
   submittedUserMessage?: ChatGptSubmittedUserMessage;
-  acknowledgedStages?: readonly ChatGptAcknowledgedMultipartStage[];
 }
 
 function chatGptSubmittedUserIdentity(baseline: ChatGptSubmissionBaseline): string | undefined {
@@ -3420,7 +3271,6 @@ export class ChatGptBrowserWorker {
   ): Promise<ChatGptSubmissionEvidence | undefined> {
     const submittedUserIdentity = chatGptSubmittedUserIdentity(baseline);
     const state = await this.submissionDomState(page, baseline.domCache, signal);
-    await this.reconcileMultipartHistory(page, baseline, state, signal);
     const evidence = chatGptSubmissionEvidence({
       initialTurnIdentities: baseline.initialTurnIdentities,
       userIdentities: state.userIdentities,
@@ -3449,7 +3299,6 @@ export class ChatGptBrowserWorker {
     signal?: AbortSignal,
   ): Promise<ChatGptResponseDomSnapshot | undefined> {
     const state = await this.submissionDomState(page, baseline.domCache, signal);
-    await this.reconcileMultipartHistory(page, baseline, state, signal);
     const identity = chatGptNewTurnIdentity(
       baseline.initialTurnIdentities,
       state.responseIdentities,
@@ -3459,76 +3308,9 @@ export class ChatGptBrowserWorker {
     return this.responseDomSnapshot(locator, {});
   }
 
-  private async reconcileMultipartHistory(
-    page: Page,
-    baseline: ChatGptSubmissionBaseline,
-    state: ChatGptSubmissionDomState,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const stages = baseline.acknowledgedStages;
-    if (!stages?.length) return;
-    for (const stage of stages) {
-      if (stage.identities.filter(identity => state.turnIdentities.includes(identity)).length > 1) {
-        throw new Error("ChatGPT duplicated an acknowledged Bigger Context exchange");
-      }
-    }
-    const known = new Set(baseline.initialTurnIdentities);
-    const candidates = state.turnIdentities.filter(identity => identity.startsWith("group:assistant:")
-      && !known.has(identity));
-    for (const identity of candidates) {
-      const previousStage = stages.find(stage => stage.identities.includes(identity));
-      if (previousStage) {
-        known.add(identity);
-        known.add(`group:user:${identity.slice("group:assistant:".length)}`);
-        continue;
-      }
-      // A newly submitted group already has a user bubble while its assistant area may
-      // not exist yet. Inspect the existing group; waiting for an assistant here turns
-      // normal response startup into repeated DOM observation timeouts.
-      const locator = page.locator(`[data-turn-key=${JSON.stringify(identity.slice("group:assistant:".length))}]`);
-      const snapshot = await this.responseDomSnapshot(locator, {});
-      const ackStage = stages.find(candidate => candidate.acknowledgement === snapshot.visibleText.trim());
-      // An unfinished group without a stage acknowledgement cannot prove a history
-      // rebind, including when virtualization has unmounted earlier stages. Its
-      // bubble can disappear into Activity after Send; expanding it blocks acceptance
-      // on a control that ChatGPT has already removed. Completed exchanges and
-      // previous acknowledgements still undergo the full duplicate/content checks.
-      if (!snapshot.completionActionVisible && !ackStage) {
-        continue;
-      }
-      const observed = await this.withExpandedUserMessage(locator, content =>
-        withChatGptBrowserObservationTimeout(withBrowserTurnAbort(content.evaluate(readChatGptUserMessage), signal)), signal);
-      const text = observed?.text.replace(/\r\n?/g, "\n");
-      // Only this transaction's already completed stages may acquire a new identity. A
-      // matching acknowledgement alone cannot prove that the uploaded context survived.
-      const verifiedSnapshot = await this.responseDomSnapshot(locator, {});
-      const stage = stages.find(candidate => candidate.text.replace(/\r\n?/g, "\n") === text);
-      const verifiedAckStage = stages.find(candidate => candidate.acknowledgement === verifiedSnapshot.visibleText.trim());
-      if (!stage && !verifiedAckStage) continue;
-      if (!stage || stage !== verifiedAckStage || !verifiedSnapshot.completionActionVisible) {
-        throw new Error("ChatGPT changed an acknowledged Bigger Context exchange");
-      }
-      // Expanding the message yields to the page. A concurrent new/duplicated turn
-      // must not disappear from the caller's earlier submission snapshot.
-      const current = await this.submissionDomState(page, baseline.domCache, signal);
-      if (current.turnIdentities.length !== state.turnIdentities.length
-        || current.turnIdentities.some(turn => !state.turnIdentities.includes(turn))) {
-        throw new Error("ChatGPT changed conversation turns while verifying an acknowledged Bigger Context exchange");
-      }
-      if (stage.identities.some(previous => state.turnIdentities.includes(previous))) {
-        throw new Error("ChatGPT duplicated an acknowledged Bigger Context exchange");
-      }
-      stage.identities.push(identity);
-      known.add(identity);
-      known.add(`group:user:${identity.slice("group:assistant:".length)}`);
-    }
-    baseline.initialTurnIdentities = [...known];
-  }
-
   private async captureSubmissionBaseline(
     page: Page,
     submittedText?: string,
-    acknowledgedStages: readonly ChatGptAcknowledgedMultipartStage[] = [],
     turnToken?: string,
   ): Promise<ChatGptSubmissionBaseline> {
     if (turnToken !== undefined && (!/^turn_[A-Za-z0-9_-]{32}$/.test(turnToken) || !submittedText?.includes(turnToken))) {
@@ -3545,17 +3327,8 @@ export class ChatGptBrowserWorker {
       domCache,
       submittedText,
       turnToken,
-      acknowledgedStages: [...acknowledgedStages],
     };
-    // A stage can persist under its new key before the next baseline is captured.
-    await this.reconcileMultipartHistory(page, baseline, state);
-    // A completed stage can be entirely unmounted at this point. Remember its
-    // verified identities so remounting it cannot acknowledge this next Send.
-    baseline.initialTurnIdentities = [...new Set([
-      ...state.turnIdentities,
-      ...acknowledgedStages.flatMap(stage => stage.identities.flatMap(identity => identity.startsWith("group:assistant:")
-        ? [identity, `group:user:${identity.slice("group:assistant:".length)}`] : [identity])),
-    ])];
+    baseline.initialTurnIdentities = [...state.turnIdentities];
     return baseline;
   }
 
@@ -3605,8 +3378,7 @@ export class ChatGptBrowserWorker {
           observationBaseline.domCache,
           signal,
         );
-        await this.reconcileMultipartHistory(observationPage, observationBaseline, state, signal);
-      } catch (error) {
+          } catch (error) {
         const latestProgress = externalProgress?.snapshot();
         if (error instanceof ChatGptBrowserObservationTimeoutError && recoverObservation) {
           recoveryAttempts += 1;
@@ -3717,7 +3489,6 @@ export class ChatGptBrowserWorker {
     }
     const state = await this.submissionDomState(page, baseline.domCache, signal);
     observeBinding?.(chatGptTurnBindingDiagnostic("detached", baseline, binding, state));
-    await this.reconcileMultipartHistory(page, baseline, state, signal);
     const acceptedTurns = new Set([...binding.acceptedTurnIdentities, ...baseline.initialTurnIdentities]);
     const identity = chatGptReboundTurnIdentity(
       baseline.initialTurnIdentities,
@@ -4450,121 +4221,6 @@ export class ChatGptBrowserWorker {
       submissionObserver?.endSubmissionIdentity();
       sendAbort.abort();
       if (!submissionBegan) await alertBaseline?.dispose().catch(() => {});
-    }
-  }
-
-  private async waitForMultipartAcknowledgement(
-    page: Page,
-    initialResponseTurn: ChatGptAssistantTurnBinding,
-    submissionBaseline: ChatGptSubmissionBaseline,
-    stage: ChatGptWebMultipartStage,
-    deadline: number | undefined,
-    abortSignal?: AbortSignal,
-    externalProgress?: ChatGptTurnProgressReader,
-    completionTracker = new ChatGptCompletionTracker(),
-    generation?: { active(): boolean; progress(): void; checkFailure?(): Promise<void> },
-  ): Promise<ChatGptAssistantTurnBinding> {
-    // A staged message may briefly create an assistant shell and then replace it while ChatGPT
-    // ingests the attached context. The ordinary 60-second missing-response verdict would cut the
-    // dedicated multipart acknowledgement budget back down after that transient shell appears.
-    // Keep DOM absence bounded by the same per-stage budget that owns this protocol step.
-    const domHealthTracker = new ChatGptTurnDomHealthTracker(
-      CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
-    );
-    const responseDomCache: ChatGptResponseDomCache = {};
-    let responseTurn = initialResponseTurn;
-    for (;;) {
-      if (page.isClosed()) throw new ChatGptBrowserPageClosedError();
-      if (abortSignal?.aborted) {
-        const stop = chatGptStopButton(page);
-        if (await stop.isVisible().catch(() => false)) await stop.press("Enter").catch(() => {});
-        throw new DOMException("ChatGPT multipart stage aborted", "AbortError");
-      }
-      if (deadline !== undefined && Date.now() >= deadline) {
-        throw new Error("ChatGPT Bigger Context transaction timed out while awaiting a stage acknowledgement");
-      }
-      await throwIfChatGptSessionFailureAlert(page);
-      await generation?.checkFailure?.();
-      // ChatGPT can replace the assistant subtree with an error. Its owning turn
-      // remains valid even though the answer-only locator no longer matches.
-      await throwIfChatGptTerminalErrorAlert(page.locator(chatGptTurnContainerSelector(responseTurn.identity)));
-      let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
-      if (!snapshot.responsePresent && await responseTurn.locator.count() !== 1) {
-        const rebound = await this.reconcileAssistantTurnBinding(
-          page,
-          submissionBaseline,
-          responseTurn,
-          abortSignal,
-        );
-        if (rebound.identity !== responseTurn.identity) {
-          responseTurn = rebound;
-          responseDomCache.key = undefined;
-          responseDomCache.snapshot = undefined;
-          snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
-        }
-      }
-      if (snapshot.stoppedThinkingVisible) throw chatGptStoppedThinkingError();
-      const externalProgressSnapshot = externalProgress?.snapshot();
-      if (externalProgress
-        && externalProgressSnapshot
-        && completionTracker.needsToolBatchObservation(externalProgressSnapshot.lastToolBatchRevision)) {
-        completionTracker.observeToolBatch(
-          externalProgressSnapshot.lastToolBatchRevision,
-          snapshot.visibleText,
-        );
-        await externalProgress.acknowledgeToolBatch(externalProgressSnapshot.lastToolBatchRevision);
-      }
-      const externalProgressLive = chatGptExternalProgressSuppressesDomHealth(
-        externalProgressSnapshot,
-        Date.now(),
-      );
-      const externalToolCallsInFlight = chatGptExternalToolCallsAreInFlight(externalProgressSnapshot);
-      if (!snapshot.responsePresent && externalProgressLive) {
-        // Proven MCP activity outranks a momentarily unavailable staging DOM, exactly as it does
-        // in the main turn loop.
-        domHealthTracker.suspendForProgress();
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
-        continue;
-      }
-      const running = await chatGptStopButton(page).isVisible().catch(() => false);
-      const responseStreamActive = generation?.active() ?? false;
-      if (running || responseStreamActive) generation?.progress();
-      const domError = domHealthTracker.update({
-        responsePresent: snapshot.responsePresent,
-        running,
-        currentText: snapshot.visibleText,
-        completionActionVisible: snapshot.completionActionVisible,
-        externalProgressLive,
-        responseStreamActive,
-        activityText: JSON.stringify(snapshot.traceBlocks),
-      });
-      if (domError) throw chatGptResponseIncompleteError(domError);
-      if (completionTracker.update({
-        responsePresent: snapshot.responsePresent,
-        running,
-        currentText: snapshot.visibleText,
-        currentHtml: snapshot.fullHtml,
-        completionActionVisible: snapshot.completionActionVisible,
-        externalToolCallsInFlight,
-      })) {
-        const actual = snapshot.visibleText.trim();
-        if (actual !== stage.acknowledgement) {
-          throw new ChatGptWebAdapterError(
-            "ChatGPT did not confirm the Bigger Context handoff. Disable Bigger Context or retry the task.",
-            {
-              status: 502,
-              errorType: "server_error",
-              code: "multipart_protocol_violation",
-              retryable: false,
-              cause: new Error(
-                `Bigger Context acknowledgement mismatch (actualChars=${actual.length.toLocaleString("en-US")})`,
-              ),
-            },
-          );
-        }
-        return responseTurn;
-      }
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
     }
   }
 
@@ -5744,77 +5400,17 @@ export class ChatGptBrowserWorker {
       }
       // Validate only the selected physical message, not canonical history used for usage estimates.
       assertChatGptPromptAttachments(prepared);
-      const multipartTransactionId = prepared.multipart
-        ? `ctx_${randomUUID().replaceAll("-", "")}`
-        : undefined;
-      const multipartStages = prepared.multipart && multipartTransactionId
-        ? prepared.multipart.parts.slice(0, -1).map((payload, index) => formatChatGptWebMultipartStage(
-          payload,
-          multipartTransactionId,
-          index + 1,
-          prepared.multipart!.parts.length,
-        ))
-        : undefined;
-      const multipartFinalPrompt = prepared.multipart && multipartTransactionId
-        ? formatChatGptWebMultipartCommit(prepared.multipart, multipartTransactionId)
-        : undefined;
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
       const estimatedMessageTokens = estimateCompiledChatGptWebMessageTokens(prepared, turn.modelId);
-      const finalMessageTokens = multipartFinalPrompt
-        ? estimateTokens(multipartFinalPrompt, turn.modelId) + skillFileTokens(prepared.skillFiles, turn.modelId)
-        : estimatedMessageTokens;
       const maxMessageChars = compiledChatGptWebMaxMessageChars(prepared);
-      const stageMessageTokens = multipartStages?.map(stage => estimateTokens(stage.text, turn.modelId));
-      const maxStageMessageTokens = stageMessageTokens ? Math.max(...stageMessageTokens) : undefined;
-      const maxStageChars = multipartStages
-        ? Math.max(...multipartStages.map(stage => stage.text.length))
-        : undefined;
-      const stagingMode = multipartStages
-        ? resolveChatGptWebMultipartStagingMode(
-          turn.modelId,
-          browserCapabilities,
-          maxStageMessageTokens!,
-          maxStageChars!,
-        )
-        : requestedMode;
-      // Pro's inert context uploads have always used 5.6 Sol. Pin that existing
-      // transport explicitly now that Latest/GPT-6 uses 6 Sol at lower efforts.
-      // The final answer still selects and verifies the requested Pro family.
-      const stagingFamily = multipartStages && turn.modelFamily === "6"
-        && requestedMode.effort === "max" && stagingMode.effort !== "max"
-        ? "5.6" : turn.modelFamily;
-      if (prepared.multipart) {
-        assertChatGptWebMultipartInputWithinLimits(
-          estimatedInputTokens,
-          estimatedMessageTokens,
-          turn.modelId,
-          requestedMode.effort,
-          browserCapabilities,
-          maxMessageChars,
-          prepared.multipart.parts.length,
-          multipartStages
-            && multipartFinalPrompt
-            && maxStageMessageTokens !== undefined
-            && maxStageChars !== undefined ? {
-            stagingEffort: stagingMode.effort,
-            maxStageMessageTokens,
-            maxStageChars,
-            finalMessageTokens,
-            finalMessageChars: multipartFinalPrompt.length,
-            finalImageTokens: estimateChatGptWebImageTokens(prepared),
-          } : undefined,
-          turn.modelFamily,
-        );
-      } else {
-        assertChatGptWebInputWithinLimits(
-          estimatedInputTokens,
-          estimatedMessageTokens,
-          turn.modelId,
-          requestedMode.effort,
-          browserCapabilities,
-          maxMessageChars,
-        );
-      }
+      assertChatGptWebInputWithinLimits(
+        estimatedInputTokens,
+        estimatedMessageTokens,
+        turn.modelId,
+        requestedMode.effort,
+        browserCapabilities,
+        maxMessageChars,
+      );
       const deadline = this.config.turnTimeoutMs === undefined
         ? undefined
         : Date.now() + this.config.turnTimeoutMs;
@@ -5951,14 +5547,8 @@ export class ChatGptBrowserWorker {
         && this.config.browserHostDescriptorPath !== undefined;
       await diagnostics.capture(page, "browser-page-acquired");
       console.info(
-        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${prepared.multipart ? `multipart-${prepared.multipart.parts.length}` : "inline"}, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
+        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=inline, maxMessageChars=${maxMessageChars}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
       );
-      if (multipartStages) {
-        console.info(
-          `[chatgpt-web] browser turn ${turn.traceId} multipart staging effort=${stagingMode.effort}`
-          + ` maxStageMessageTokens=${maxStageMessageTokens} maxStageChars=${maxStageChars}`,
-        );
-      }
       if (!reuseConversation) {
         await this.runStage(
           turn.traceId,
@@ -5974,18 +5564,18 @@ export class ChatGptBrowserWorker {
       }
       // A retained lease proves conversation ownership. Model selection and plugin attachment
       // must still be established for each new submission on that page.
-      const selectStagingMode = () => (
+      const selectMode = () => (
         this.selectModelAndEffort(
           page,
           turn.modelId,
-          stagingMode.effort,
+          requestedMode.effort,
           browserCapabilities,
           checkpoint => diagnostics.capture(page, checkpoint),
           trackUsage,
-          stagingFamily,
+          turn.modelFamily,
         )
       );
-      let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, selectStagingMode);
+      let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, selectMode);
       await diagnostics.capture(page, "effort-selection-complete");
 
       // One receipt per physical Send, not per native tool call or stream attachment.
@@ -6019,145 +5609,8 @@ export class ChatGptBrowserWorker {
       };
 
       let finalPrompt = prepared.text;
-      const acknowledgedStages: ChatGptAcknowledgedMultipartStage[] = [];
-      if (prepared.multipart && multipartStages && multipartTransactionId && multipartFinalPrompt) {
-        for (let index = 0; index < multipartStages.length; index += 1) {
-          const stage = multipartStages[index]!;
-          // Each acknowledgement can replace the picker controls. Establish a fresh model/effort
-          // proof for the next physical submission, retaining family selection and usage evidence.
-          if (index > 0) mode = await this.runStage(
-            turn.traceId, `multipart_stage_${index + 1}_effort_selection`,
-            browserStageTimeouts.effortSelection, selectStagingMode,
-          );
-          console.info(`[chatgpt-web] multipart_stage_prepared ${JSON.stringify({
-            traceId: turn.traceId, part: index + 1, total: prepared.multipart.parts.length,
-            effort: mode.effort, modelFamily: mode.modelFamily,
-            messageChars: stage.text.length, estimatedMessageTokens: stageMessageTokens![index],
-          })}`);
-          let stageBaseline = await this.captureSubmissionBaseline(page, stage.text, acknowledgedStages);
-          await this.runStage(
-            turn.traceId,
-            `multipart_stage_${index + 1}_attachment`,
-            browserStageTimeouts.promptAttachment,
-            (stageSignal) => this.attachPrompt(
-              page,
-              stage.text,
-              false,
-              checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
-              turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
-            ),
-            chatGptSuspensionClock,
-            true,
-          );
-          await diagnostics.capture(page, `multipart-stage-${index + 1}-attachment-complete`);
-          const recordStageUsage = await usageSubmission();
-          const evidence = await this.runStage(
-            turn.traceId,
-            `multipart_stage_${index + 1}_send`,
-            browserStageTimeouts.send,
-            (stageSignal) => this.sendAttachedPrompt(
-              page,
-              stageBaseline,
-              checkpoint => diagnostics.capture(page, `multipart-${index + 1}-${checkpoint}`),
-              turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal,
-              undefined,
-              { assertExecutionAuthority: turn.assertExecutionAuthority,
-                dispatchWithExecutionAuthority: turn.dispatchWithExecutionAuthority,
-                onSubmitted: recordStageUsage, onSendActivated: async () => {
-                await this.assertSelectedEffort(page, mode);
-              } },
-              undefined,
-              launcherObservationRecovery
-                ? async (...args) => {
-                  const recovered = await recoverSubmissionObservation(...args);
-                  stageBaseline = recovered.baseline;
-                  return recovered;
-                }
-                : undefined,
-              undefined,
-              submissionRejection,
-            ),
-          );
-          console.info(
-            `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length} submission accepted evidence=${evidence}`,
-          );
-          const acknowledgedResponse = await this.runStage(
-            turn.traceId,
-            `multipart_stage_${index + 1}_acknowledgement`,
-            browserStageTimeouts.multipartStageAcknowledgement,
-            async (stageSignal) => {
-              const acknowledgementSignal = turn.abortSignal
-                ? AbortSignal.any([stageSignal, turn.abortSignal])
-                : stageSignal;
-              const responseTurn = await this.waitForNewAssistantTurn(
-                page,
-                stageBaseline,
-                deadline,
-                acknowledgementSignal,
-                // A part still being ingested has produced no MCP activity, so there is no progress
-                // to consult here; the dedicated acknowledgement stage owns this wait.
-                undefined,
-                CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
-                undefined,
-                launcherObservationRecovery
-                  ? async (...args) => {
-                    const recovered = await recoverAssistantObservation(...args);
-                    stageBaseline = recovered.baseline;
-                    return recovered;
-                  }
-                  : undefined,
-                undefined,
-                undefined,
-                generation,
-              );
-              return this.waitForMultipartAcknowledgement(
-                page,
-                responseTurn,
-                stageBaseline,
-                stage,
-                deadline,
-                acknowledgementSignal,
-                turn.externalProgress,
-                undefined,
-                generation,
-              );
-            },
-            chatGptSuspensionClock,
-          );
-          const stageRejection = await submissionRejection.failure();
-          if (stageRejection) throw stageRejection;
-          acknowledgedStages.push({
-            text: stage.text,
-            acknowledgement: stage.acknowledgement,
-            identities: [acknowledgedResponse.identity],
-          });
-          await diagnostics.capture(page, `multipart-stage-${index + 1}-acknowledged`);
-          await turn.onMultipartStageAcknowledged?.(index + 1);
-        }
-        // The first saved message changes / to /c/<id>. Re-prove the selection on
-        // that conversation even when staging and final effort are identical.
-        if (mode.effort !== requestedMode.effort || (mode.selection && mode.selection.url !== page.url())) {
-          mode = await this.runStage(
-            turn.traceId,
-            "final_part_effort_selection",
-            browserStageTimeouts.effortSelection,
-            () => this.selectModelAndEffort(
-              page,
-              turn.modelId,
-              requestedMode.effort,
-              browserCapabilities,
-              checkpoint => diagnostics.capture(page, `final-part-${checkpoint}`),
-              trackUsage,
-              turn.modelFamily,
-            ),
-          );
-          await diagnostics.capture(page, "final-part-effort-selected");
-        }
-        finalPrompt = multipartFinalPrompt;
-      }
-
-      let submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, acknowledgedStages, prepared.turnToken);
-      let catalogRefreshAvailable = mode.localTools && !reuseConversation && !prepared.multipart;
+      let submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, prepared.turnToken);
+      let catalogRefreshAvailable = mode.localTools && !reuseConversation;
       const connectorAttemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 };
       for (;;) {
         try {
@@ -6212,7 +5665,7 @@ export class ChatGptBrowserWorker {
                 trackUsage,
                 turn.modelFamily,
               );
-              submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, [], prepared.turnToken);
+              submissionBaseline = await this.captureSubmissionBaseline(page, finalPrompt, prepared.turnToken);
             },
           );
           await diagnostics.capture(page, "connector-catalog-refreshed");
@@ -6238,8 +5691,6 @@ export class ChatGptBrowserWorker {
       const finalSubmissionEvidence = await this.runStage(
         turn.traceId,
         "send",
-        // A multipart commit lands on a conversation already carrying every staged part, so it
-        // needs the same acceptance headroom the stages themselves get.
         browserStageTimeouts.send,
         (stageSignal) => this.sendAttachedPrompt(
           page,
@@ -6254,9 +5705,8 @@ export class ChatGptBrowserWorker {
             await this.assertSelectedEffort(page, mode);
             console.info(`[chatgpt-web] final_submission_prepared ${JSON.stringify({
               traceId: turn.traceId, modelFamily: mode.modelFamily, effort: mode.effort,
-              parts: prepared.multipart?.parts.length ?? 1,
-              messageChars: (multipartFinalPrompt ?? prepared.text).length,
-              estimatedMessageTokens: finalMessageTokens,
+              messageChars: prepared.text.length,
+              estimatedMessageTokens,
               estimatedInputTokens, proAvailable: browserCapabilities.proAvailable,
             })}`);
             await turn.onSendActivated?.();

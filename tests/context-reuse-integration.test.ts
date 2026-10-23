@@ -103,7 +103,6 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
     }
   } });
   f.provider.chatgptWeb!.maxComposerCodePoints = 8_000;
-  f.provider.chatgptWeb!.experimentalBiggerContext = !manual;
   try {
     let request = rules(f.request("继续"), stable);
     const contextIds = new Set<string>();
@@ -133,7 +132,7 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
   } finally { prepare.mockRestore(); }
 }, 120_000);
 
-for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automatic"}: the default page budget still causes a complete cold send`, async () => {
+for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automatic"}: cumulative page delivery never causes a cold send`, async () => {
   const stable = "BUDGET_RULE_f734 " + "x".repeat(30_000);
   const observations: Awaited<ReturnType<typeof readCurrentContext>>[] = [];
   const f = fixture(manual, { taskUpdates: true, mcpTransport: "in-process", contextModel: async input => {
@@ -141,19 +140,16 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
   } });
   f.provider.chatgptWeb!.maxComposerCodePoints = 8_000;
   let request = rules(f.request("continue"), stable);
-  let fellBack = false;
-  // Unused work reserves no longer consume the page on each completed turn.
+  // Repeated delivery passes the former page threshold without losing reuse.
   for (let turn = 1; turn <= 40; turn++) {
     expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
-    if (turn > 1 && !f.submissions.at(-1)!.reused) {
-      expect(observations.at(-1)!.bodies.join("\n")).toContain("BUDGET_RULE_f734");
-      fellBack = true;
-      break;
+    if (turn > 1) {
+      expect(f.submissions.at(-1)!.reused).toBeTrue();
+      expect(observations.at(-1)!.bodies.join("\n")).not.toContain("BUDGET_RULE_f734");
     }
-    if (turn > 1) expect(observations.at(-1)!.bodies.join("\n")).not.toContain("BUDGET_RULE_f734");
     request = rules(f.next(request, `budget-${turn}`, `Completed response ${turn}.`), stable);
   }
-  expect(fellBack).toBe(true);
+  expect(observations).toHaveLength(40);
 }, 120_000);
 
 for (const manual of [false, true]) for (const changed of ["page_identity", "predecessor"] as const)
@@ -201,7 +197,6 @@ for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automa
     observations.push(await readCurrentContext(input));
   } });
   f.provider.chatgptWeb!.maxComposerCodePoints = 8_000;
-  f.provider.chatgptWeb!.experimentalBiggerContext = !manual;
   let request = rules(f.request("first"), stable);
   expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   request = rules(f.next(request), changed);

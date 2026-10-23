@@ -24,7 +24,7 @@ import type { ContinuityClaim, ContinuityLease } from "./continuity-contract";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import { continuityError } from "./continuity-errors";
 import { taskUpdateSourceError } from "./task-update-source";
-import { captureRetainedCompactionSource, compactionAvailableTokens, registerCompactionSource } from "./compaction-context";
+import { captureRetainedCompactionSource, registerCompactionSource } from "./compaction-context";
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -345,13 +345,12 @@ export async function settleActiveZeroRiskCompactionSource(
       token = await source.runtime.token;
       await source.runtime.syncContextUsage?.({ compaction: true });
       const coverage = source.runtime.compactionSourceCoverage;
-      if (!coverage || !capabilities) throw continuityError("continuity_source_unproven", "Zero Risk compaction requires verified source coverage and page capacity.");
+      if (!coverage || !capabilities) throw continuityError("continuity_source_unproven", "Zero Risk compaction requires verified source coverage.");
       const snapshot = sourceSnapshot ?? captureRetainedCompactionSource(parsed, source);
       const latest = coverage.latest()!;
       const registered = await registerCompactionSource(broker, { snapshot, contract: "safe", turnToken: token,
         handoffId: `safe:${source.traceId ?? token}`, historyRevision: latest.historyRevision,
-        ownerGeneration: latest.pageGeneration, expiresAt: Date.now() + MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
-        availableTokens: compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) }, compactPrompt, driverContext);
+        ownerGeneration: latest.pageGeneration, expiresAt: Date.now() + MAX_COMPACTION_HANDOFF_TIMEOUT_MS }, compactPrompt, driverContext);
       compactPrompt = registered.instruction;
       sourceToken = registered.token;
       const interruptedQueued = await broker.requestCompaction(
@@ -406,7 +405,7 @@ export async function requestRetainedCompactionHandoff(
   parsed: CodexParsedRequest,
   source: ChatGptTurnSession,
   broker: TurnBroker,
-  capabilities: ChatGptWebCapabilities & { experimentalBiggerContext?: boolean },
+  capabilities: ChatGptWebCapabilities,
   traceId: string,
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
@@ -456,8 +455,7 @@ export async function requestRetainedCompactionHandoff(
     const latest = coverage.latest()!;
     const registered = await registerCompactionSource(broker, { snapshot, contract: "native", transactionToken: transaction.token,
       handoffId: transaction.handoffId, historyRevision: latest.historyRevision, ownerGeneration: latest.pageGeneration,
-      expiresAt: () => budget.deadlineAt,
-      availableTokens: compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) },
+      expiresAt: () => budget.deadlineAt },
     structuredCompactionHandoffInstruction(transaction, { appName: worker.appName, compactPrompt: compactionPrompt(parsed) }));
     sourceToken = registered.token;
     const instruction = registered.instruction;

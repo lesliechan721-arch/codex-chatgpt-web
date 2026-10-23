@@ -42,8 +42,8 @@ const browserLogCodes = new Set([
   "continuity_stopped", "continuity_retry_exhausted", "continuity_session_lost", "continuity_source_unproven",
   "continuity_manual_handoff_required", "continuity_configuration_conflict", "continuity_input_limit",
   "continuity_resource_capacity", "continuity_recovery_retired", "invalid_output_schema", "manual_handoff_timeout",
-  "manual_launcher_failed", "manual_multipart_unsupported", "manual_turn_cancelled", "missing_delegated_turn_identity",
-  "model_version_unavailable", "multipart_protocol_violation", "prompt_attachment_integrity", "rate_limit_exceeded",
+  "manual_launcher_failed", "manual_turn_cancelled", "missing_delegated_turn_identity",
+  "model_version_unavailable", "prompt_attachment_integrity", "rate_limit_exceeded",
   "structured_output_validation_failed", "task_update_capacity", "task_update_compaction_pending", "task_update_driver_stale",
   "task_update_final_output_started", "task_update_invalid", "task_update_message_conflict", "task_update_no_boundary",
   "task_update_not_executed", "task_update_output_stale", "task_update_output_unproven", "task_update_pending",
@@ -75,7 +75,7 @@ export function chatGptBrowserErrorLog(error: Error): Record<string, string | nu
   else if (error.name === "AbortError" || status === 499 || code?.includes("cancel") || code === "continuity_stopped"
     || code === "CONTEXT_NAVIGATION_STOPPED") reason = "task_cancelled";
   else if (code?.includes("upgrade_required") || code === "task_update_protocol_missing"
-    || code === "multipart_protocol_violation" || code === "continuity_configuration_conflict") reason = "protocol_incompatible";
+    || code === "continuity_configuration_conflict") reason = "protocol_incompatible";
   else if (code?.includes("source") || code === "continuity_context_missing" || code === "continuity_session_lost"
     || code === "continuity_replay_unavailable" || code === "CONTEXT_IMAGE_UNAVAILABLE"
     || code === "CONTEXT_SOURCE_UNAVAILABLE") reason = "source_unavailable";

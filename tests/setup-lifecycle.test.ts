@@ -387,7 +387,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
 }
 
 for (const development of [false, true]) {
-  test(`${development ? "DEV" : "production"} allows Luna Bigger Context and preserves it across account refresh`, async () => {
+  test(`${development ? "DEV" : "production"} loads old Luna configuration and removes the retired context setting`, async () => {
     const root = mkdtempSync(join(tmpdir(), "codex-web-luna-setup-"));
     const configPath = join(root, "config.json");
     const existing = {
@@ -395,6 +395,7 @@ for (const development of [false, true]) {
       browserHost: "launcher" as const,
       solAvailable: false, extraHighAvailable: false, proAvailable: false,
       experimentalBiggerContext: true,
+      browserHostDescriptorPath: join(root, "launcher-browser.json"),
       ...(development ? { purpose: "dev-harness" as const } : {}),
     };
     writeFileSync(configPath, JSON.stringify(existing));
@@ -403,7 +404,7 @@ for (const development of [false, true]) {
     const integrate = spyOn(integration, "installCodexIntegration").mockImplementation(() => ({} as never));
     const mocks = [save, integrate,
       spyOn(configModule, "getConfigPath").mockReturnValue(configPath),
-      spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(existing)),
+      spyOn(configModule, "loadConfigForSetup").mockImplementation(() => configModule.loadConfigFromPath(configPath)),
       spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {}),
       spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
       spyOn(service, "removeLegacyRuntimeArtifacts").mockImplementation(() => {}),
@@ -419,20 +420,17 @@ for (const development of [false, true]) {
         browserHostDescriptorPath: join(root, "launcher-browser.json"), acknowledgedUnofficial: true };
       const configure = development ? setupDevProfile : setup;
       await configure(options);
-      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
-      await configure({ ...options, experimentalBiggerContext: true });
-      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
-      // Refreshing a previously paid account preserves the explicitly enabled feature on Free.
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false });
+      expect(save.mock.calls.at(-1)?.[0]).not.toHaveProperty("experimentalBiggerContext");
       existing.solAvailable = true;
+      writeFileSync(configPath, JSON.stringify(existing));
       await configure({ ...options, refreshAccountCapabilities: true });
-      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
-      existing.solAvailable = false;
-      await configure({ ...options, experimentalBiggerContext: false });
-      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: false });
-      expect(existing.experimentalBiggerContext).toBeTrue();
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false });
+      expect(save.mock.calls.at(-1)?.[0]).not.toHaveProperty("experimentalBiggerContext");
       scannedSolAvailable = true;
-      await configure({ ...options, refreshAccountCapabilities: true, experimentalBiggerContext: true });
-      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: true, experimentalBiggerContext: true });
+      await configure({ ...options, refreshAccountCapabilities: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: true });
+      expect(save.mock.calls.at(-1)?.[0]).not.toHaveProperty("experimentalBiggerContext");
     } finally {
       for (const mock of mocks.reverse()) mock.mockRestore();
       rmSync(root, { recursive: true, force: true });

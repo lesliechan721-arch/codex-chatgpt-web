@@ -18,7 +18,7 @@ test("supported launcher locales return complete, nonempty dictionaries", () => 
       const placeholders = (value: string) => [...value.matchAll(/\{[a-zA-Z]+\}/g)].map(match => match[0]).sort();
       expect(placeholders(translated[key])).toEqual(placeholders(english[key]));
     }
-    expect(translated.biggerContextBody).not.toContain("TXT");
+    expect(Object.keys(translated).some(key => /biggerContext/i.test(key))).toBe(false);
     expect(translated.manualPromptInstruction).toContain("Codex Zero Risk3");
   }
 });

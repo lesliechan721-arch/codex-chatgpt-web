@@ -664,8 +664,6 @@ function smokePassedForCurrentVersion(state) {
 }
 
 function syncBrowserPreferences(stateStore, config) {
-  const biggerContextAvailable = typeof config?.solAvailable === "boolean";
-  const biggerContextEnabled = config?.experimentalBiggerContext === true;
   const composerPredictionsEnabled = config?.composerPredictionsEnabled === true;
   const useSavedChats = config?.useSavedChats !== false;
   const enabled = config?.experimentalFreshConversationPerTurn === true;
@@ -673,21 +671,16 @@ function syncBrowserPreferences(stateStore, config) {
   const current = stateStore.read();
   if (runtimeHost?.currentOperation()) return current;
   const persistenceChanged = current.experimentalFreshConversationPerTurn !== enabled || current.useSavedChats !== useSavedChats;
-  const retentionChanged = persistenceChanged || current.experimentalBiggerContext !== biggerContextEnabled;
-  if (!retentionChanged && current.composerPredictionsEnabled === composerPredictionsEnabled
-    && current.autoApproveToolCalls === autoApproveToolCalls
-    && current.biggerContextAvailable === biggerContextAvailable) return current;
+  if (!persistenceChanged && current.composerPredictionsEnabled === composerPredictionsEnabled
+    && current.autoApproveToolCalls === autoApproveToolCalls) return current;
   // Runtime restarts leave browser views alive. Retire completed chats when their
   // persistence policy changes, including changes made by the CLI.
-  // Bigger Context changes ordinary checkpoint reuse; Continuity has its own history contract.
-  const retainedKeys = new Set((retentionChanged ? [...browserHost.turnTabs.values()] : [])
+  const retainedKeys = new Set((persistenceChanged ? [...browserHost.turnTabs.values()] : [])
     .filter(tab => tab.status === "ready" && tab.conversationKey
-      && (persistenceChanged || !tab.continuityOwner)
       && (current.useSavedChats !== useSavedChats || tab.interactionMode === "automatic"))
     .map(tab => tab.conversationKey));
   for (const key of retainedKeys) releaseRetainedConversation(browserHost, key);
-  const state = stateStore.update({ composerPredictionsEnabled, experimentalFreshConversationPerTurn: enabled, useSavedChats, autoApproveToolCalls, biggerContextAvailable,
-    experimentalBiggerContext: biggerContextEnabled });
+  const state = stateStore.update({ composerPredictionsEnabled, experimentalFreshConversationPerTurn: enabled, useSavedChats, autoApproveToolCalls });
   send("launcher:state-changed", state);
   return state;
 }
@@ -704,7 +697,7 @@ function syncZeroRiskSentConfirmationPreference(stateStore, config) {
 function registerIpc({ logger, stateStore }) {
   const runtimeChannels = new Set([
     "launcher:setup-core", "launcher:setup-mcp", "launcher:uninstall-integration",
-    "launcher:composer-predictions", "launcher:bigger-context", "launcher:skill-attachments", "launcher:fresh-conversation-per-turn",
+    "launcher:composer-predictions", "launcher:skill-attachments", "launcher:fresh-conversation-per-turn",
     "launcher:use-saved-chats", "launcher:zero-risk-pro", "launcher:zero-risk-sent-confirmation",
     "launcher:browser-interaction-mode", "launcher:tool-authority-mode", "launcher:connector-name",
     "launcher:mcp-verify", "launcher:complete-mcp-setup", "launcher:doctor", "launcher:cancel-turns",
@@ -1017,7 +1010,6 @@ function registerIpc({ logger, stateStore }) {
       codexRestartRequired: true,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
-      experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: true,
@@ -1064,7 +1056,6 @@ function registerIpc({ logger, stateStore }) {
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
-      biggerContextAvailable: typeof runtimeHost.runtimeConfigSnapshot().config?.solAvailable === "boolean",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
@@ -1115,9 +1106,8 @@ function registerIpc({ logger, stateStore }) {
       : await runSetup();
     const state = stateStore.update({
       browserInteractionMode: interactionMode,
-      ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
+      ...(interactionMode === "manual" ? { experimentalSkillAttachments: false } : {}),
       toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
-      biggerContextAvailable: typeof runtimeHost.runtimeConfigSnapshot().config?.solAvailable === "boolean",
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       zeroRiskRequireSentConfirmation: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskRequireSentConfirmation !== false,
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
@@ -1162,18 +1152,6 @@ function registerIpc({ logger, stateStore }) {
       state: stateStore.update({ autoStart: desired }),
       ...autostart,
     };
-  });
-  handle("launcher:bigger-context", async (_event, enabled) => {
-    const result = await runtimeHost.setBiggerContext(enabled === true);
-    syncBrowserPreferences(stateStore, runtimeHost.runtimeConfigSnapshot().config);
-    const state = stateStore.update({
-      experimentalBiggerContext: result.enabled,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
-    send("launcher:state-changed", state);
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return state;
   });
   handle("launcher:tool-authority-mode", async (_event, rawMode) => {
     const mode = validateToolAuthorityMode(rawMode);
@@ -1302,11 +1280,10 @@ function registerIpc({ logger, stateStore }) {
     );
     const state = stateStore.update({
       browserInteractionMode: mode,
-      biggerContextAvailable: typeof runtimeHost.runtimeConfigSnapshot().config?.solAvailable === "boolean",
       experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
       useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats !== false,
       autoApproveToolCalls: runtimeHost.runtimeConfigSnapshot().config?.autoApproveToolCalls === true,
-      ...(mode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
+      ...(mode === "manual" ? { experimentalSkillAttachments: false } : {}),
       ...(result.configured ? {
         codexCatalogVerified: IS_DEV_PROFILE,
         codexRestartRequired: !IS_DEV_PROFILE,
@@ -1669,7 +1646,6 @@ async function start() {
       codexRestartRequired: false,
       autoStart: false,
       toolAuthorityMode: config?.toolAuthorityMode ?? stateStore.read().toolAuthorityMode,
-      experimentalBiggerContext: config?.experimentalBiggerContext === true,
       composerPredictionsEnabled: config?.composerPredictionsEnabled === true,
       experimentalSkillAttachments: config?.experimentalSkillAttachments === true,
       experimentalFreshConversationPerTurn: config?.experimentalFreshConversationPerTurn === true,
@@ -1701,7 +1677,6 @@ async function start() {
         codexCatalogVerified: false,
         codexRestartRequired: true,
         toolAuthorityMode: runtimeHost.runtimeConfigSnapshot().config?.toolAuthorityMode ?? "verified-environment",
-        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
         experimentalFreshConversationPerTurn: runtimeHost.runtimeConfigSnapshot().config?.experimentalFreshConversationPerTurn === true,
         useSavedChats: runtimeHost.runtimeConfigSnapshot().config?.useSavedChats !== false,
@@ -1729,7 +1704,6 @@ async function start() {
     }
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
-      const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
       const composerPredictionsEnabled = configuredRuntime.config?.composerPredictionsEnabled === true;
       const experimentalSkillAttachments = configuredRuntime.config?.experimentalSkillAttachments === true;
       const experimentalFreshConversationPerTurn = configuredRuntime.config?.experimentalFreshConversationPerTurn === true;
@@ -1744,13 +1718,11 @@ async function start() {
         || saved.experimentalFreshConversationPerTurn !== experimentalFreshConversationPerTurn
         || saved.useSavedChats !== useSavedChats
         || saved.autoApproveToolCalls !== autoApproveToolCalls
-        || saved.experimentalBiggerContext !== enabled
         || saved.zeroRiskProEnabled !== zeroRiskProEnabled
         || saved.zeroRiskRequireSentConfirmation !== zeroRiskRequireSentConfirmation
         || saved.toolAuthorityMode !== toolAuthorityMode) {
         const state = stateStore.update({
           composerPredictionsEnabled,
-          experimentalBiggerContext: enabled,
           experimentalSkillAttachments,
           experimentalFreshConversationPerTurn,
           useSavedChats,
@@ -1777,7 +1749,6 @@ async function start() {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
         toolAuthorityMode: config.toolAuthorityMode ?? "verified-environment",
-        experimentalBiggerContext: config.experimentalBiggerContext === true,
         composerPredictionsEnabled: config.composerPredictionsEnabled === true,
         experimentalSkillAttachments: config.experimentalSkillAttachments === true,
         experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn === true,

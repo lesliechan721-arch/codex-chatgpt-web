@@ -19,6 +19,7 @@ import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/la
 import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { CONTEXT_TEXT_READ_FORMAT, contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+import { readContinuityStartup } from "./helpers/session-continuity-fixture";
 
 import type { AdapterEvent } from "../src/types";
 
@@ -488,21 +489,38 @@ describe("context capability evidence", () => {
       const inspectPrompt = async (prompt: string) => {
         sends++;
         expect(prompt).not.toContain("Read-only capability verification");
-        const match = /<codex_context_navigation_json>\n([^\n]+)\n<\/codex_context_navigation_json>/.exec(prompt);
+        const bootstrap = /<codex_bootstrap_json>\n([^\n]+)\n<\/codex_bootstrap_json>/.exec(prompt);
+        const match = bootstrap ?? /<codex_context_navigation_json>\n([^\n]+)\n<\/codex_context_navigation_json>/.exec(prompt);
         expect(Boolean(match)).toBe(expectedNavigation);
         if (!match) { plans.push({ navigation: false }); return undefined; }
         const entry = JSON.parse(match[1]!);
-        const listing = await client.callTool({ name: entry.first_call.name,
-          arguments: { ...entry.first_call.arguments, view: "entries", kind: "tool_result" } });
+        if (bootstrap) await readContinuityStartup(prompt, client);
+        const credential = entry.first_call.arguments;
+        const token: string = manual ? credential.request_id : credential.turn_token;
+        const reference = { ...(manual ? { request_id: credential.request_id } : { turn_token: credential.turn_token }),
+          context_id: entry.context_id };
+        const listing = await client.callTool({ name: "codex_context_list",
+          arguments: { ...reference, view: "entries", kind: "tool_result" } });
         expect(listing.isError).not.toBe(true);
         const target = (listing.structuredContent as any).entries.find((entry: any) => entry.call_id === "old-call");
         expect(target).toBeDefined();
-        const { view, ...reference } = entry.first_call.arguments;
         const result = await client.callTool({ name: "codex_context_read", arguments: { ...reference, reads: [{ read_ref: target.read_ref }] } });
         expect(result.isError).not.toBe(true);
         const read = parseContextTextReadResult(result);
         expect(read.bodies[0]!).toContain("Recorded tool evidence.");
-        plans.push({ navigation: true, requiredImages: entry.required_images,
+        // Public returns can precede their receipt IPC. Keep the production guard intact.
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          try {
+            broker.checkFinalOutputCandidate(token, {
+              expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 });
+            break;
+          } catch (error) {
+            if (!["CONTEXT_BUSY", "task_update_tools_pending"].includes(String((error as { code?: string }).code)) || Date.now() >= deadline) throw error;
+            await Bun.sleep(1);
+          }
+        }
+        plans.push({ navigation: true,
           sourceBytes: read.metadata.items[0]!.utf8_bytes, delivery: target.delivery });
         return entry;
       };

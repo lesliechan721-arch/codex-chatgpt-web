@@ -18,8 +18,6 @@ export interface WebContextRawTextPolicy {
 }
 
 export interface WebContextPayloadOptions {
-  partIndex?: number;
-  totalParts?: 2 | 6;
   rawTextPolicy?: WebContextRawTextPolicy;
 }
 
@@ -218,15 +216,11 @@ export function hasWebContextRawFields(records: readonly WebContextRecord[], pol
 }
 
 export function encodeWebContextPayload(records: readonly WebContextRecord[], format: WebContextFormat, options: WebContextPayloadOptions = {}): string {
-  const multipart = options.partIndex !== undefined || options.totalParts !== undefined;
-  if (multipart && (!index(options.partIndex) || options.partIndex < 1 || (options.totalParts !== 2 && options.totalParts !== 6)
-    || options.partIndex > options.totalParts)) invalid("part header");
   const normalized = JSON.parse(JSON.stringify(records)) as WebContextRecord[];
-  assertRecordOrder(normalized, !multipart);
+  assertRecordOrder(normalized, true);
   let payload: string;
   if (format === "legacy-json") {
-    payload = stringifyWebContextJson(multipart ? { version: 1, part_index: options.partIndex, total_parts: options.totalParts, records: normalized }
-      : contextFromRecords(normalized));
+    payload = stringifyWebContextJson(contextFromRecords(normalized));
   } else if (format === WEB_CONTEXT_TEXT_FORMAT) {
     const source = JSON.stringify(normalized);
     if (Buffer.byteLength(source, "utf8") > WEB_CONTEXT_MAX_PAYLOAD_BYTES) throw new WebContextPreparationLimitError();
@@ -239,8 +233,7 @@ export function encodeWebContextPayload(records: readonly WebContextRecord[], fo
       if (reserve) { used.add(boundary); next += 1; }
       return boundary;
     };
-    payload = stringifyWebContextJson({ format: WEB_CONTEXT_TEXT_FORMAT, context_version: 3, record_count: normalized.length,
-      ...(multipart ? { part_index: options.partIndex, total_parts: options.totalParts } : {}) }) + "\n"
+    payload = stringifyWebContextJson({ format: WEB_CONTEXT_TEXT_FORMAT, context_version: 3, record_count: normalized.length }) + "\n"
       + normalized.map(record => renderRecord(record, allocate, options.rawTextPolicy)).join("");
   } else throw new Error("Unknown web context format");
   if (Buffer.byteLength(payload, "utf8") > WEB_CONTEXT_MAX_PAYLOAD_BYTES) throw new WebContextPreparationLimitError();

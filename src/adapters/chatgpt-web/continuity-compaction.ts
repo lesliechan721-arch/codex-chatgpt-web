@@ -16,7 +16,7 @@ import { continuitySourceRepresentationDigest, type ContinuityClaim, type Contin
 import { continuityError } from "./continuity-errors";
 import { compactionSourceWasDelegation, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isDurableCompactionSourceIdentity } from "./compaction-continuation";
 import { taskUpdateSourceError } from "./task-update-source";
-import { assertCompactionReadable, captureRetainedCompactionSource, compactionAvailableTokens, compactionSourcePageCost } from "./compaction-context";
+import { assertCompactionReadable, captureRetainedCompactionSource, compactionSourcePageCost } from "./compaction-context";
 import {
   acceptHealthyRecoveryCompactionLease, admitHealthyRecoveryCompaction, assertHealthyRecoveryCompactionAuthority, assertRecoveryCompactionResult,
   beginHealthyRecoveryCompaction, commitRecoveryCompaction, failHealthyRecoveryCompaction,
@@ -197,7 +197,7 @@ export function runContinuityCompaction(
           if (!coverage) throw continuityError("continuity_source_unproven", "Compaction has no accepted source coverage evidence.");
           source.prepareCompactionToolResults(parsed, source.outstanding().map(request => request.callId));
           sourceSnapshot = captureRetainedCompactionSource(parsed, source);
-          await assertCompactionReadable(sourceSnapshot, compactionAvailableTokens(parsed, capabilities, coverage.pageTokenReserve()) - 8_192);
+          await assertCompactionReadable(sourceSnapshot);
           signal.throwIfAborted();
         }
         // The checkpoint budget retains one exact source plus bounded local result comparison data.

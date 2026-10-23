@@ -35,6 +35,7 @@ export interface ContextPlanRegistration {
   requiredImageWireReserves?: Readonly<Record<string, number>>;
   requiredTextBatches?: readonly ContextRequiredTextBatch[];
   requiredControlReserve?: { overview: ContextReservedCost; start: ContextReservedCost; count: number };
+  /** Cost diagnostic only. Transport recovery uses a finite failure count. */
   requiredReturnRetryReserve?: { tokens: number; wire_bytes: number };
   remainingBudget?: ContextRemainingBudget;
 }
@@ -113,9 +114,7 @@ interface ContextPendingReturn {
   successful: boolean;
   observedCost: { wire_bytes: number; total_tokens: number };
   textRead?: ContextTextReadReceipt;
-  requiredCost?: ContextReservedCost;
-  recoveryClaim?: ContextReservedCost;
-  replayCharged?: boolean;
+  requiredReturn?: boolean;
   requestedItems?: number;
   stopTimer: () => void;
 }
@@ -144,16 +143,13 @@ export class ContextScope {
   private firstWorkReturns?: Set<string>;
   private readonly textBatches: readonly ContextRequiredTextBatch[];
   private readonly controlReserve?: ContextPlanRegistration["requiredControlReserve"];
-  private readonly generatedControls = new Set<string>();
-  private readonly retryReserve: ContextReservedCost;
-  private readonly recoverySpent = { tokens: 0, wire_bytes: 0 };
+  private requiredReturnFailures = 0;
   private reservedTokensUsed = 0;
   private readonly pending = new Map<string, ContextPendingReturn>();
   private live = true;
   private deliveredEntry = false;
   private permanentFailure = false;
-  private budgetStopped = false;
-  private readonly effectiveBudget: ContextRemainingBudget;
+  private returnRecoveryExhausted = false;
   private readyStarted?: number;
   private lastProgress?: number;
   private attachmentStarted?: number;
@@ -181,7 +177,7 @@ export class ContextScope {
     identifier(registration.planId); identifier(registration.manifestDigest);
     if (registration.reuse) {
       const reuse = registration.reuse;
-      if (reuse.protocol !== CONTEXT_REUSE_PROTOCOL || reuse.payload_format !== "context-bootstrap-payload-v2"
+      if (reuse.protocol !== CONTEXT_REUSE_PROTOCOL || reuse.payload_format !== "context-bootstrap-payload-v3"
         || !boundedContextReuse(reuse) || new Set(reuse.units.map(unit => unit.unit_id)).size !== reuse.units.length
         || reuse.units.some(unit => !registration.snapshot.getTarget(unit.target_id)
           || !["inline", "required", "reuse"].includes(unit.delivery)
@@ -191,11 +187,6 @@ export class ContextScope {
       }
     }
     const limits = contextLimits(registration.limits);
-    const supplied = registration.remainingBudget;
-    this.effectiveBudget = { tokens: supplied?.tokens ?? UNLIMITED_CONTEXT_ALLOWANCE,
-      reserved_tokens: supplied?.reserved_tokens ?? 0,
-      wire_bytes: supplied?.wire_bytes ?? UNLIMITED_CONTEXT_ALLOWANCE,
-      reserved_wire_bytes: supplied?.reserved_wire_bytes ?? 0 };
     for (const reserves of [registration.requiredImageTokenReserves, registration.requiredImageWireReserves]) {
       for (const [id, reserve] of Object.entries(reserves ?? {})) {
         const target = registration.snapshot.getTarget(id);
@@ -247,15 +238,6 @@ export class ContextScope {
       throw contextError("CONTEXT_INVALID", "Required text batches do not cover the fixed sources");
     }
     const requiredMcpImages = this.requiredTargets().filter(t => registration.deliveryByTarget[t.target_id]?.media_route === "mcp");
-    const minimumRetry = {
-      tokens: Math.max(0, ...this.textBatches.map(batch => batch.tokens), ...requiredMcpImages.map(target =>
-        registration.requiredImageTokenReserves?.[target.target_id] ?? (target.visual_token_reserve ?? 0) + limits.imageMetadataTokens)),
-      wire_bytes: Math.max(0, ...this.textBatches.map(batch => batch.wire_bytes), ...requiredMcpImages.map(target => this.imageWireReserve(target))) };
-    this.retryReserve = registration.startupProtocol && purpose === "normal"
-      ? registration.requiredReturnRetryReserve ?? minimumRetry : { tokens: 0, wire_bytes: 0 };
-    if (Object.entries(this.retryReserve).some(([key, n]) => !Number.isSafeInteger(n) || n < 0 || registration.startupProtocol && purpose === "normal" && n < minimumRetry[key as keyof typeof minimumRetry])) {
-      throw contextError("CONTEXT_INVALID", "Invalid required return recovery reserve");
-    }
     if (this.controlReserve && (this.controlReserve.count !== requiredMcpImages.length + 2
       || [this.controlReserve.overview, this.controlReserve.start].some(cost =>
         !Number.isSafeInteger(cost.tokens) || cost.tokens < 0 || !Number.isSafeInteger(cost.wire_bytes) || cost.wire_bytes < 0))) {
@@ -267,86 +249,25 @@ export class ContextScope {
       const initial = remainingBudget();
       assertContextNavigationBudget(initial, limits);
     }
-    catch { throw contextError("BUDGET_EXCEEDED", "The context budget cannot protect required sources, completion and bounded corrective replies"); }
+    catch { throw contextError("BUDGET_EXCEEDED", "The context image resources cannot protect required sources"); }
     this.navigator = new ContextNavigator({ scopeId, snapshot: registration.snapshot, purpose,
       deliveryByTarget: registration.deliveryByTarget, limits: registration.limits, remainingBudget,
       ...(registration.startupProtocol ? { bootstrap: { planId: registration.planId, manifestDigest: registration.manifestDigest, requiredTextBatches: this.textBatches, ...(registration.reuse ? { reuse: registration.reuse } : {}) } } : {}) });
   }
 
-  private imageWireReserve(target: ContextTarget): number {
-    return this.registration.requiredImageWireReserves?.[target.target_id]
-      ?? Math.ceil((target.image_bytes ?? 0) / 3) * 4 + 2 * Buffer.byteLength(JSON.stringify(target)) + 1024
-        + contextLimits(this.registration.limits).wireReserveBytes;
-  }
-  private batchCovered(batch: ContextRequiredTextBatch, additions: readonly { target_id: string; start: number; end_exclusive: number }[] = []): boolean {
-    return batch.ranges.every(range => this.coverage.contains(range.target_id, range.start, range.end_exclusive,
-      additions.find(addition => addition.target_id === range.target_id)));
-  }
-  private recoveryAvailable(): ContextReservedCost {
-    if (this.firstWorkReturns) return { tokens: 0, wire_bytes: 0 };
-    const claims = [...this.pending.values()].reduce((sum, entry) => ({
-      tokens: sum.tokens + (entry.recoveryClaim?.tokens ?? 0),
-      wire_bytes: sum.wire_bytes + (entry.recoveryClaim?.wire_bytes ?? 0),
-    }), { tokens: 0, wire_bytes: 0 });
-    return { tokens: Math.max(0, this.retryReserve.tokens - this.recoverySpent.tokens - claims.tokens),
-      wire_bytes: Math.max(0, this.retryReserve.wire_bytes - this.recoverySpent.wire_bytes - claims.wire_bytes) };
-  }
-  private controlCredits(result?: BrokerToolResult): string[] {
-    const body = result?.structuredContent as { startup_protocol?: string; read_state?: string } | undefined;
-    if (!this.controlReserve || !result || result.isError || body?.startup_protocol !== "context-bootstrap-v1"
-      || body.read_state !== "readable" || this.firstWorkReturns) return [];
-    if (!this.generatedControls.has("initial")) return ["initial"];
-    const keys = this.requiredTargets().filter(target => this.delivered.has(target.target_id)
-      && this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp")
-      .map(target => `image:${target.target_id}`).filter(key => !this.generatedControls.has(key));
-    if (this.status().context_ready && !this.generatedControls.has("final")) keys.push("final");
-    return keys;
-  }
-  private remainingControlCost(credits: readonly string[] = []): ContextReservedCost {
-    if (!this.controlReserve || this.firstWorkReturns) return { tokens: 0, wire_bytes: 0 };
-    const { start, overview } = this.controlReserve;
-    const units = [{ key: "initial", tokens: Math.max(start.tokens, overview.tokens), wire_bytes: Math.max(start.wire_bytes, overview.wire_bytes) },
-      { key: "final", ...overview }, ...this.requiredTargets().filter(target => this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp")
-        .map(target => ({ key: `image:${target.target_id}`, ...overview }))];
-    return units.filter(unit => !this.generatedControls.has(unit.key) && !credits.includes(unit.key))
-      .reduce((sum, unit) => ({ tokens: sum.tokens + unit.tokens, wire_bytes: sum.wire_bytes + unit.wire_bytes }), { tokens: 0, wire_bytes: 0 });
+  private batchCovered(batch: ContextRequiredTextBatch): boolean {
+    return batch.ranges.every(range => this.coverage.contains(range.target_id, range.start, range.end_exclusive));
   }
   private remainingBudget(targets: readonly ContextTarget[] = [], result?: BrokerToolResult): ContextRemainingBudget {
-    const limits = contextLimits(this.registration.limits), used = this.navigator?.usage(), budget = this.effectiveBudget;
-    const metadata = result && !result.isError && (result.structuredContent as { format?: string } | undefined)?.format === "context-text-batch-v1"
-      ? parseContextTextReadResult(result).metadata : undefined;
-    const step = metadata?.required_step;
-    const canonical = step && step.plan_id === this.registration.planId ? this.textBatches[step.index] : undefined;
-    const additions = canonical ? metadata!.items.map(item => ({ target_id: String(item.source.target_id), ...item.range })) : [];
-    const text = this.textBatches.filter(batch => !this.batchCovered(batch, additions))
-      .reduce((sum, batch) => ({ tokens: sum.tokens + batch.tokens, wire_bytes: sum.wire_bytes + batch.wire_bytes }), { tokens: 0, wire_bytes: 0 });
+    const limits = contextLimits(this.registration.limits), used = this.navigator?.usage();
     const readingImage = result && !result.isError && targets.length === 1 && targets[0]!.kind === "image" ? targets[0] : undefined;
     const images = this.requiredTargets().filter(target => !this.delivered.has(target.target_id)
       && target.target_id !== readingImage?.target_id && this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp"
       && (this.registration.startupProtocol || !this.hasPendingTarget(target.target_id)));
-    const retry = this.recoveryAvailable();
-    // A canonical replay can use only the remaining shared recovery allowance.
-    // New canonical delivery credits its whole unit temporarily; its pending entry
-    // then protects every undelivered range until the atomic transport settlement.
-    if (canonical && this.batchCovered(canonical) && result) {
-      const cost = measureContextResponse(result, limits);
-      retry.tokens = Math.max(0, retry.tokens - cost.total_tokens);
-      retry.wire_bytes = Math.max(0, retry.wire_bytes - cost.wire_bytes);
-    }
-    const controls = this.remainingControlCost(this.controlCredits(result));
-    const spentTokens = (used?.text_tokens ?? 0) + (used?.visual_token_reserve ?? 0), spentWire = used?.wire_bytes ?? 0;
-    return { tokens: Math.max(0, budget.tokens - spentTokens),
-      reserved_tokens: (budget.reserved_tokens ?? 0) + text.tokens + retry.tokens + controls.tokens + images.reduce((sum, target) =>
-        sum + (this.registration.requiredImageTokenReserves?.[target.target_id] ?? (target.visual_token_reserve ?? 0) + limits.imageMetadataTokens), 0),
-      wire_bytes: Math.max(0, budget.wire_bytes - spentWire),
-      reserved_wire_bytes: (budget.reserved_wire_bytes ?? 0) + text.wire_bytes + retry.wire_bytes + controls.wire_bytes
-        + images.reduce((sum, target) => sum + this.imageWireReserve(target), 0),
+    return { tokens: UNLIMITED_CONTEXT_ALLOWANCE, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE,
       image_reads: Math.max(0, limits.maxImageReads - (used?.image_reads ?? 0)), reserved_image_reads: images.length,
       image_bytes: Math.max(0, limits.maxTotalImageBytes - (used?.image_bytes ?? 0)),
       reserved_image_bytes: images.reduce((sum, target) => sum + (target.image_bytes ?? 0), 0) };
-  }
-  private consumeControl(result: BrokerToolResult): void {
-    for (const key of this.controlCredits(result)) this.generatedControls.add(key);
   }
 
   assertPending(receiptId: string, textRead?: ContextTextReadReceipt): void {
@@ -416,7 +337,7 @@ export class ContextScope {
     const reuseReady = this.reuseValid();
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
       ...(this.registration.reuse ? { reuse_ready: reuseReady, ...(!reuseReady ? { reuse_failure: "baseline_invalid" } : {}) } : {}),
-      context_ready: !this.permanentFailure && !this.budgetStopped && remaining.length === 0 && missingTexts.length === 0 && reuseReady && (!this.registration.reuse || this.deliveredEntry), images_ready: remaining.length === 0, text_ready: missingTexts.length === 0 && (!this.registration.reuse || this.deliveredEntry),
+      context_ready: !this.permanentFailure && !this.returnRecoveryExhausted && remaining.length === 0 && missingTexts.length === 0 && reuseReady && (!this.registration.reuse || this.deliveredEntry), images_ready: remaining.length === 0, text_ready: missingTexts.length === 0 && (!this.registration.reuse || this.deliveredEntry),
       required_texts: texts.length, delivered_texts: texts.length - missingTexts.length, remaining_texts: missingTexts.length,
       required_text_bytes: texts.reduce((sum, target) => sum + target.utf8_bytes!, 0),
       delivered_text_bytes: texts.reduce((sum, target) => sum + this.coverage.bytes(target.target_id), 0), next_required_read: nextRequiredRead,
@@ -429,7 +350,6 @@ export class ContextScope {
     const args = { context_id: this.registration.snapshot.context_id, view: "overview" as const };
     if (control.read_state && control.read_state !== "readable") return this.navigator.preflightList(args, this.status(), control);
     const result = this.navigator.list(args, this.status(), control);
-    this.consumeControl(result);
     return result;
   }
   markEntryDelivered(): void { this.assertLive(); this.deliveredEntry = true; this.reuseDiagnostics.markEntryDelivered(); }
@@ -467,7 +387,7 @@ export class ContextScope {
   }
   private prepareReply(method: ContextMethod, args: ContextArgs, overviewControl?: ContextBootstrapControl): ContextPreparedReply {
     this.openReads();
-    if (this.budgetStopped || this.navigator.usage().navigation_stopped) throw contextError("CONTEXT_NAVIGATION_STOPPED", "This scope's navigation capability is retired. Use its original completion path");
+    if (this.returnRecoveryExhausted || this.navigator.usage().navigation_stopped) throw contextError("CONTEXT_NAVIGATION_STOPPED", "This scope's navigation capability is retired. Use its original completion path");
     if (this.pending.size >= 8) throw contextError("CONTEXT_BUSY", "Wait for the in-flight context returns");
     if (args.context_id !== this.registration.snapshot.context_id) throw contextError("CONTEXT_INVALID", "Context access is invalid or no longer active");
     const inputReads = method === "read" && Array.isArray((args as ContextReadArgs).reads) ? (args as ContextReadArgs).reads : [];
@@ -476,25 +396,10 @@ export class ContextScope {
       return target ? [target] : [];
     });
     const target = targets.length === 1 ? targets[0] : undefined;
-    // One return buffer protects an undelivered required page if its transport fails.
-    // Parallel on-demand navigation still has to leave this buffer and all holes intact.
-    const requiredPending = this.registration.startupProtocol
-      && [...this.pending.values()].some(pending => pending.targetIds.some(id => this.registration.deliveryByTarget[id]?.required));
-    if (requiredPending) {
-      const remaining = this.remainingBudget(), limits = contextLimits(this.registration.limits);
-      // Generation has paid for this return, but its full unit stays protected until
-      // settlement. If recovery is exhausted, even an error may temporarily not fit.
-      // Use the existing transient gate; successful settlement can restore capacity.
-      if (targets.some(target => this.registration.deliveryByTarget[target.target_id]?.required)
-        || remaining.tokens - (remaining.reserved_tokens ?? 0) < limits.errorResponseTokens
-        || remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0) < limits.errorResponseBytes) {
-        throw contextError("CONTEXT_BUSY", "Wait for the in-flight required context return");
-      }
-    }
-    // The first return has already paid its budgets, but only its successful receipt
-    // contributes coverage. A parallel duplicate must not spend its delivery reserve.
+    // Coverage changes only after a successful transport receipt. Required sources
+    // and images cannot have a duplicate return in flight.
     if (targets.some(target => (target.kind === "image" || this.registration.deliveryByTarget[target.target_id]?.required)
-      && this.hasPendingTarget(target.target_id))) throw contextError("CONTEXT_BUSY", "Wait for this source's in-flight return before reading it again");
+      && this.hasPendingTarget(target.target_id))) throw contextError("CONTEXT_BUSY", "Wait for the in-flight required source return before reading it again");
     const status = method === "list" ? this.status() : undefined;
     let result: BrokerToolResult;
     try {
@@ -562,36 +467,24 @@ export class ContextScope {
       const cost = measureContextResponse(result, contextLimits(this.registration.limits));
       this.reservedTokensUsed += Math.min(this.textBatches[batchIndex]!.tokens, cost.total_tokens);
     }
-    this.consumeControl(result);
     if (result.isError) {
       const body = result.structuredContent as { code?: unknown; error?: { code?: unknown } } | undefined;
       const code = body?.error?.code ?? body?.code ?? (result.content[0] as { text?: unknown } | undefined)?.text;
-      // Parameter/cursor and remaining-budget errors remain correctable. Immutable source loss is permanent.
-      if (this.purpose === "normal" && target && !this.delivered.has(target.target_id) && this.registration.deliveryByTarget[target.target_id]?.required && this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp" && ["IMAGE_UNAVAILABLE", "BUDGET_EXCEEDED", "PROCESSING_BUDGET_EXCEEDED"].includes(String(code))) this.fail(contextError("CONTEXT_IMAGE_UNAVAILABLE", "A required image cannot be delivered within the remaining budget"));
+      // Parameter and cursor errors remain correctable. Immutable source loss is permanent.
+      if (this.purpose === "normal" && target && !this.delivered.has(target.target_id) && this.registration.deliveryByTarget[target.target_id]?.required && this.registration.deliveryByTarget[target.target_id]?.media_route === "mcp" && ["IMAGE_UNAVAILABLE", "BUDGET_EXCEEDED", "PROCESSING_BUDGET_EXCEEDED"].includes(String(code))) this.fail(contextError("CONTEXT_IMAGE_UNAVAILABLE", "A required image cannot be delivered within the resource limits"));
       if (code === "PROCESSING_BUDGET_EXCEEDED") this.permanentFailure = true;
       if (["IMAGE_UNAVAILABLE", "CONTEXT_IMAGE_UNAVAILABLE", "CONTEXT_SOURCE_UNAVAILABLE", "CONTEXT_RETIRED", "CONTEXT_EXPIRED"].includes(String(code))) this.permanentFailure = true;
     }
     const receiptId = `context_return_${randomBytes(24).toString("base64url")}`;
     const stopTimer = this.returnTimer(() => this.finish(receiptId, false));
-    const canonicalBatch = batchIndex === undefined ? undefined : this.textBatches[batchIndex];
-    const replay = canonicalBatch !== undefined && this.batchCovered(canonicalBatch);
-    const requiredImage = validImage && this.purpose === "normal" && this.registration.deliveryByTarget[target!.target_id]?.required
-      && !this.delivered.has(target!.target_id);
-    const cost = !result.isError && (canonicalBatch || requiredImage) ? measureContextResponse(result, {
-      ...contextLimits(this.registration.limits), visualTokens: target?.visual_token_reserve ?? 0 }) : undefined;
-    const recovery = this.recoveryAvailable();
-    const claim = cost ? { tokens: Math.min(cost.total_tokens, recovery.tokens), wire_bytes: Math.min(cost.wire_bytes, recovery.wire_bytes) } : undefined;
-    if (replay && claim) {
-      // Generation spends the replay allowance once, even if this return later fails.
-      this.recoverySpent.tokens += claim.tokens;
-      this.recoverySpent.wire_bytes += claim.wire_bytes;
-    }
+    const requiredReturn = batchIndex !== undefined || this.purpose === "normal"
+      && (validImage && this.registration.deliveryByTarget[target!.target_id]?.required
+        || textRead?.items.some(item => this.registration.deliveryByTarget[item.target_id]?.required) === true);
     this.pending.set(receiptId, { targetIds: textRead ? textRead.items.map(item => item.target_id) : validImage ? [target!.target_id] : [], method,
       manifestOrder: !result.isError && method === "list" && (args as ContextListArgs).view === "overview" ? this.manifestSequence++ : undefined,
       successful: !result.isError, observedCost: measureContextResponse(result, { wireReserveBytes: 0, tokenReserve: 0 }), textRead,
       requestedItems: method === "read" ? inputReads.length : undefined,
-      ...(cost ? { requiredCost: { tokens: cost.total_tokens, wire_bytes: cost.wire_bytes },
-        ...(replay ? { replayCharged: true } : { recoveryClaim: claim }) } : {}), stopTimer });
+      ...(requiredReturn ? { requiredReturn: true } : {}), stopTimer });
     this.changed();
     return { result, receiptId };
   }
@@ -616,15 +509,10 @@ export class ContextScope {
       } else for (const targetId of pending.targetIds) if (!this.delivered.has(targetId)) {
         this.delivered.add(targetId); this.lastProgress = Date.now();
       }
-    } else if (pending.requiredCost && !pending.replayCharged) {
-      this.recoverySpent.tokens += pending.requiredCost.tokens;
-      this.recoverySpent.wire_bytes += pending.requiredCost.wire_bytes;
     }
-    if (!successful && pending.requiredCost && this.isLive) {
-      const remaining = this.remainingBudget();
-      if (remaining.tokens < (remaining.reserved_tokens ?? 0) || remaining.wire_bytes < (remaining.reserved_wire_bytes ?? 0)) {
-        this.budgetStopped = true;
-      }
+    if (!successful && pending.requiredReturn && this.isLive) {
+      this.requiredReturnFailures++;
+      this.returnRecoveryExhausted = this.requiredReturnFailures >= contextLimits(this.registration.limits).maxErrorResponses;
     }
     if (sent && this.isLive) this.reuseDiagnostics.sent({ wireBytes: pending.observedCost.wire_bytes,
       tokens: pending.observedCost.total_tokens, successful: successful, method: pending.method, manifestOrder: pending.manifestOrder,
@@ -639,10 +527,6 @@ export class ContextScope {
     if (!this.deliveredEntry) throw contextError("CONTEXT_NOT_READY", "The compaction source entry has not been delivered");
     if (this.permanentFailure) throw contextError("CONTEXT_SOURCE_UNAVAILABLE", "The compaction source has a permanent read failure");
     if (this.pending.size) throw contextError("CONTEXT_BUSY", "Wait for in-flight context reads before submitting");
-    const budget = this.effectiveBudget;
-    const used = this.navigator.usage();
-    if (budget.tokens - used.text_tokens - used.visual_token_reserve < (budget.reserved_tokens ?? 0)
-      || budget.wire_bytes! - used.wire_bytes < (budget.reserved_wire_bytes ?? 0)) throw contextError("BUDGET_EXCEEDED", "The summary and submission reserve is exhausted");
   }
   retire(): void {
     this.live = false; this.navigator.retire();

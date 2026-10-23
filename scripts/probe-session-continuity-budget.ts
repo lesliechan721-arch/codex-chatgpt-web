@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { requireChatGptWebModelRoute, resolveChatGptWebHistoryLimits } from "../src/chatgpt-web-models";
 
 // P0 only: real Codex, a private catalog, and short requests to a loopback model stub.
-// Reported usage is synthetic. This does not measure million-token memory or browser capacity.
+// Reported usage is synthetic. This checks the client contract, not browser memory or capacity.
 const args = process.argv.slice(2);
 const option = (name: string) => args.find(value => value.startsWith(`${name}=`))?.slice(name.length + 1);
 const codex = realpathSync(resolve(option("--codex") ?? Bun.which("codex")!));
@@ -26,7 +26,7 @@ assert.ok(template, "The target binary must contain the Sol model template");
 const model = "chatgpt-web/gpt-5.6-sol";
 const capabilities = { mode: "full" as const, browserHost: "launcher" as const, solAvailable: true, proAvailable: false };
 const publicLimits = resolveChatGptWebHistoryLimits(requireChatGptWebModelRoute(model, capabilities), capabilities);
-assert.deepEqual(publicLimits, { contextWindow: 1_000_000, autoCompactTokenLimit: 900_000, effectiveContextWindowPercent: 90 });
+assert.deepEqual(publicLimits, { contextWindow: 500_000, autoCompactTokenLimit: 450_000, effectiveContextWindowPercent: 90 });
 const checkpoint = "P0_CHECKPOINT: Prior synthetic work is complete. Continue the short validation task.";
 
 interface Scenario {
@@ -35,8 +35,15 @@ interface Scenario {
   limit: number;
   windowOverride?: number;
   limitOverride?: number;
+  reportedUsage?: number;
 }
 const scenarios: Scenario[] = [
+  ...[200_000, 300_000, 500_000, 600_000].flatMap(window => [
+    ...[-1, 0, 1].map(offset => ({ name: `history-${window}-C${offset < 0 ? "minus1" : offset > 0 ? "plus1" : "exact"}`,
+      window, limit: window * 0.9, reportedUsage: window * 0.9 + offset })),
+    ...[-1, 0, 1].map(offset => ({ name: `history-${window}-H${offset < 0 ? "minus1" : offset > 0 ? "plus1" : "exact"}`,
+      window, limit: window * 0.9, reportedUsage: window + offset })),
+  ]),
   { name: "short", window: 20_000, limit: 12_000 },
   { name: "target-default", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit },
   { name: "lower-window", window: publicLimits.contextWindow, limit: publicLimits.autoCompactTokenLimit, windowOverride: 100_000 },
@@ -168,22 +175,36 @@ async function run(scenario: Scenario, scope: "default" | "total" | "body_after_
       assert.equal(completions.at(-1).status, "completed", JSON.stringify(completions.at(-1).error));
     }
     await turn(baseUsage);
-    await turn(expectedTrigger - 2_000);
-    await turn(expectedTrigger + 1_000);
-    assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 0, "No compaction below the measured threshold");
-    await turn(baseUsage);
-    assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 1, "One automatic compaction after high usage");
-    await turn(baseUsage);
-    assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 1, "Low post-compaction usage must not compact again");
-    assert.ok(evidence.requests.at(-1).hasCheckpoint, "Replacement history must contain the accepted checkpoint");
+    if (scenario.reportedUsage !== undefined) {
+      await turn(scenario.reportedUsage);
+      const expectedCompactions = scenario.reportedUsage >= expectedTrigger ? 1 : 0;
+      await turn(baseUsage);
+      evidence.reportedBoundaryUsage = scenario.reportedUsage;
+      evidence.expectedCompactions = expectedCompactions;
+      assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, expectedCompactions,
+        "Client compaction must follow the configured threshold at the reported boundary");
+      if (expectedCompactions) assert.ok(evidence.requests.at(-1).hasCheckpoint,
+        "Replacement history must contain the accepted checkpoint");
+    } else {
+      await turn(expectedTrigger - 2_000);
+      await turn(expectedTrigger + 1_000);
+      assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 0, "No compaction below the measured threshold");
+      await turn(baseUsage);
+      assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 1, "One automatic compaction after high usage");
+      await turn(baseUsage);
+      assert.equal(evidence.requests.filter((entry: any) => entry.compact).length, 1, "Low post-compaction usage must not compact again");
+      assert.ok(evidence.requests.at(-1).hasCheckpoint, "Replacement history must contain the accepted checkpoint");
+    }
     assert.ok(evidence.tokenEvents.some((event: any) => event.modelContextWindow === fullWindow), "Native effective window must match the bounded catalog window");
     const recount = evidence.tokenEvents.find((event: any, index: number, events: any[]) => index > 0
       && events[index - 1].last.totalTokens === 500
       && event.last.totalTokens !== 500 && event.last.totalTokens < expectedTrigger
       && event.total.totalTokens === events[index - 1].total.totalTokens);
-    assert.ok(recount, "Codex must recount the replaced history independently of the next stub response");
-    evidence.historyRecountTokens = recount.last.totalTokens;
-    evidence.triggerBracket = { noCompactionAfterReportedUsage: expectedTrigger - 2_000,
+    if (scenario.reportedUsage === undefined || scenario.reportedUsage >= expectedTrigger) {
+      assert.ok(recount, "Codex must recount the replaced history independently of the next stub response");
+      evidence.historyRecountTokens = recount.last.totalTokens;
+    }
+    if (scenario.reportedUsage === undefined) evidence.triggerBracket = { noCompactionAfterReportedUsage: expectedTrigger - 2_000,
       compactionAfterReportedUsage: expectedTrigger + 1_000 };
     evidence.lastNativeUsage = evidence.tokenEvents.at(-1);
     evidence.status = "passed";
@@ -202,7 +223,7 @@ async function run(scenario: Scenario, scope: "default" | "total" | "body_after_
 }
 
 for (const scenario of scenarios) {
-  for (const scope of scenario.name === "target-default"
+  for (const scope of scenario.reportedUsage !== undefined ? ["total"] as const : scenario.name === "target-default"
     ? ["default", "total", "body_after_prefix"] as const
     : ["total", "body_after_prefix"] as const) {
     if (option("--case") && !`${scenario.name}-${scope}`.includes(option("--case")!)) continue;

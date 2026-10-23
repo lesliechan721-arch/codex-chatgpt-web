@@ -31,7 +31,6 @@ const config = loadConfig();
 assert.equal(config.purpose, "dev-harness");
 assert.equal(config.mode, "full");
 assert.equal(config.browserInteractionMode, "automatic");
-assert.equal(config.experimentalBiggerContext, false);
 assert.notEqual(config.experimentalFreshConversationPerTurn, true);
 const descriptorPath = config.browserHostDescriptorPath!;
 assert.equal(readLauncherBrowserHostDescriptor(descriptorPath).profile, "development");

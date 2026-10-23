@@ -16,6 +16,14 @@ function takeOption(args: string[], name: string): string | undefined {
   return value;
 }
 
+function consumeRetiredContextFlags(args: string[]): void {
+  const biggerContext = takeFlag(args, "--bigger-context");
+  const standardContext = takeFlag(args, "--standard-context");
+  if (biggerContext || standardContext) {
+    process.stderr.write("Bigger Context has been removed. Legacy context flags are ignored; on-demand reading and account/model history limits now apply by default.\n");
+  }
+}
+
 // Keep each command's consumption order and error text. DEV accepts fewer options.
 export function parseProductionSetupArgs(arguments_: readonly string[]): {
   options: SetupOptions;
@@ -86,12 +94,7 @@ export function parseProductionSetupArgs(arguments_: readonly string[]): {
     throw new Error("Choose --fresh-conversation or --retained-conversation");
   }
   if (freshConversation || retainedConversation) options.experimentalFreshConversationPerTurn = freshConversation;
-  const biggerContext = takeFlag(args, "--bigger-context");
-  const standardContext = takeFlag(args, "--standard-context");
-  if (biggerContext && standardContext) {
-    throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
-  }
-  if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+  consumeRetiredContextFlags(args);
   if (predictions || noPredictions) options.composerPredictionsEnabled = predictions;
   if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
   const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
@@ -156,12 +159,8 @@ export function parseDevSetupArgs(
   if (freshConversation && retainedConversation) {
     throw new Error("Choose --fresh-conversation or --retained-conversation");
   }
-  const biggerContext = takeFlag(args, "--bigger-context");
-  const standardContext = takeFlag(args, "--standard-context");
+  consumeRetiredContextFlags(args);
   const nativeToolLongWaitProbe = takeFlag(args, "--native-tool-long-wait-probe");
-  if (biggerContext && standardContext) {
-    throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
-  }
   if (args.length > 0) throw new Error(`Unknown DEV setup arguments: ${args.join(" ")}`);
   return {
     mode: full ? "full" : "browser-only",
@@ -174,7 +173,6 @@ export function parseDevSetupArgs(
       ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
       : {}),
     ...(toolAuthorityMode ? { toolAuthorityMode } : {}),
-    ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
     ...(predictions || noPredictions ? { composerPredictionsEnabled: predictions } : {}),
     ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
     ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),

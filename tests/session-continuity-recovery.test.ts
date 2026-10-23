@@ -1047,7 +1047,7 @@ for (const manual of [false, true]) test(`unified recovery: Fresh chooses a cold
   expect(f.submissions).toHaveLength(2);
 });
 
-for (const manual of [false, true]) for (const reason of ["Fresh", "budget"] as const)
+for (const manual of [false, true]) for (const reason of ["Fresh", "single-input-limit"] as const)
 for (const wait of ["source-sync", "capacity"] as const) test(`ordinary cold preflight: stale ${reason} ${wait} preserves the newer writer (${manual})`, async () => {
   const f = fixture(manual);
   f.provider.chatgptWeb!.experimentalFreshConversationPerTurn = reason === "Fresh";
@@ -1058,9 +1058,9 @@ for (const wait of ["source-sync", "capacity"] as const) test(`ordinary cold pre
   const source = chatGptTurnSessions.find(binding.executionKey!)!;
   const sync = source.runtime.syncContextUsage;
   const preflightInput = continuityInput.preflightContinuityInput;
-  const budgetCheck = reason === "budget" ? spyOn(continuityInput, "preflightContinuityInput").mockImplementation((...args) => {
+  const budgetCheck = reason === "single-input-limit" ? spyOn(continuityInput, "preflightContinuityInput").mockImplementation((...args) => {
     if (args[3] && args[4]?.retainedTokens !== undefined) {
-      throw Object.assign(new Error("The fixture retained page has no remaining context budget."), { code: "CONTEXT_BUDGET_EXCEEDED" });
+      throw Object.assign(new Error("The fixture retained input exceeds its single-message limit."), { code: "continuity_input_limit" });
     }
     return preflightInput(...args);
   }) : undefined;
@@ -1159,15 +1159,17 @@ for (const checkpoint of [false, true]) test(`unified recovery: an oversized rea
     turn.onContinuityLease!(lease);
     const compiled = await turn.prepare();
     expect(compiled.text).not.toContain(tail);
-    expect(compiled.text).toContain("Continue this accepted task after reading the stored log tail.");
     await turn.onContextPlanSelected!(compiled.contextPlan!.planId);
     f.submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: false });
     await turn.onSendActivated!(); await turn.onSubmitted!();
-    const entry = JSON.parse(compiled.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+    const required = await f.readStartup(compiled.text);
+    expect(JSON.stringify(required)).toContain("Continue this accepted task after reading the stored log tail.");
+    const entry = JSON.parse(compiled.text.match(/<codex_bootstrap_json>\n([^\n]+)\n/)![1]!);
     const credential = entry.first_call.arguments;
     const query = async (method: "search" | "read", args: Record<string, unknown>) => {
       const reply = await callTurnBroker<{ result: BrokerToolResult; receiptId: string }>(f.provider.chatgptWeb!.brokerSocketPath!, {
         method: "context_query", token: credential.turn_token, contract: "native", credentialKind: "ordinary", contextProtocol: CONTEXT_PROTOCOL_VERSION,
+        contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1",
         contextMethod: method, contextArgs: { context_id: credential.context_id, ...args } as import("../src/adapters/chatgpt-web/context-runtime").ContextArgs,
       });
       expect(reply.result.isError).not.toBe(true);
@@ -1200,7 +1202,7 @@ for (const checkpoint of [false, true]) test(`unified recovery: an oversized rea
   expect(f.submissions).toHaveLength(checkpoint ? 4 : 2);
 }, 30_000);
 
-test("unified recovery: non-externalized assistant text still fails before a replacement send", async () => {
+test("unified recovery: long assistant history is optional on a replacement page", async () => {
   const f = fixture();
   f.controls.invokeSourceTools = true; f.controls.singleSourceTool = true; f.controls.failAfterToolsOnce = true;
   const original = f.request();
@@ -1211,9 +1213,11 @@ test("unified recovery: non-externalized assistant text still fails before a rep
   await f.run(f.request("", "turn-first", input));
   f.controls.invokeSourceTools = false;
   const oversized = f.request("", "turn-first", [...input,
-    { type: "message", role: "assistant", content: "Required assistant source text. ".repeat(60_000) }]);
-  await expect(f.run(oversized)).rejects.toMatchObject({ code: "CONTEXT_BUDGET_EXCEEDED", retryable: false });
-  expect(f.submissions).toHaveLength(1);
+    { type: "message", role: "assistant", content: "Optional assistant source text. ".repeat(60_000) }]);
+  expect((await f.run(oversized)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions.at(-1)!.prompt).not.toContain("Optional assistant source text.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("Optional assistant source text.");
 }, 30_000);
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) test(`review repair1: persistent inspection failure isolates the old writer and admits one cold successor (${manual}, checkpoint=${checkpoint})`, async () => {

@@ -16,11 +16,11 @@ import { measureRuntimeOperation, measureRuntimeAsync, runtimePerformanceContext
 import { retainedFixtureCleanup } from "./retained-fixture-cleanup";
 
 /** Public route + actual Adapter/Broker; only the browser transport is simulated. */
-export function retainedTaskFixture(experimentalBiggerContext = false) {
-  return withRuntimePerformanceContext({ ...runtimePerformanceContext(), fixtureMode: experimentalBiggerContext ? "retained-bigger-context" : "retained" },
-    () => measureRuntimeOperation("fixture.prepare", () => createRetainedTaskFixture(experimentalBiggerContext)));
+export function retainedTaskFixture() {
+  return withRuntimePerformanceContext({ ...runtimePerformanceContext(), fixtureMode: "retained" },
+    () => measureRuntimeOperation("fixture.prepare", () => createRetainedTaskFixture()));
 }
-function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
+function createRetainedTaskFixture() {
   // These fixtures exercise the existing inline/on-demand contract. Short startup
   // and its default composer limit have separate production MCP integration tests.
   const profileContext = runtimePerformanceContext();
@@ -72,7 +72,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
     browserHost: "launcher", browserHostDescriptorPath: descriptorPath, browserInteractionMode: "automatic",
     appName: CHATGPT_CONNECTOR_NAME, continuityStateDirectory: statePath, brokerSocketPath: defaultBrokerEndpoint(root),
     localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false,
-    toolAuthorityMode: "delegated", experimentalBiggerContext,
+    toolAuthorityMode: "delegated",
   } };
   const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
   const reuseSupport = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
@@ -115,7 +115,7 @@ function createRetainedTaskFixture(experimentalBiggerContext: boolean) {
     }
   });
   const config = { ...defaultConfig("full"), browserHost: "launcher" as const,
-    browserInteractionMode: "automatic" as const, solAvailable: true, experimentalBiggerContext };
+    browserInteractionMode: "automatic" as const, solAvailable: true };
   const threadId = `thread-${root}`;
   const body = { model: "chatgpt-web/gpt-5.6-sol", stream: false, reasoning: { effort: "medium" },
     input: [{ type: "message", role: "user", id: "source-item", content: "Continue the original task.",

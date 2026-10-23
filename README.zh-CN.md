@@ -86,18 +86,14 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
 
 > **限制**
 >
-> 有关 **GPT-5.6 Sol Pro** 和 **GPT-6 Astra** 当前的 ChatGPT 消息额度，请参阅
-> [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)。Token 上下文上限取决于
-> 账户类型、模型和所选 effort。Plus 的 Medium/High 使用实测的 90,000-token 窗口。
-> GPT-5.6 启用实验性的 **3× context** 后最高为 270,000 tokens，并支持原生 Codex compaction。
->
-> GPT-6 Sol 在 Medium、High 和可用的 Extra High 下支持 Bigger Context：Plus 窗口为
-> **120,000 tokens**，在 **110,000 tokens** 时压缩；Pro 窗口为 **240,000 tokens**，
-> 在 **220,000 tokens** 时压缩。GPT-6 Instant 使用标准容量。
-> GPT-5.6 和 GPT-6 Pro 保留原有 Bigger Context 容量。
-
-> Luna/Think 可启用实验性分段大上下文。Free 长会话可能丢失较早细节。关闭大上下文时，
-> Luna 保留滚动 checkpoint。适用 Full Native + Launcher 路由使用统一历史预算，网页投递仍遵守原有传输能力。
+> ChatGPT 消息额度见 [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)。
+> 账户和模型决定历史窗口与客户端压缩阈值：**200,000 / 180,000**、**300,000 / 270,000**、
+> **500,000 / 450,000** 或 **600,000 / 540,000** tokens。这些是历史策略，不是网页容量实测。
+> Full/MCP 默认选择按需读取；短输入可直接内联。Bigger Context 及其分段发送已移除。
+> 单条消息、单次读取、图片、附件、存储和处理时间限制仍有效。
+> Full/MCP Luna/Think 按 canonical 历史计量，并在 180,000 tokens 支持独立压缩。
+> Browser-only Luna 保留滚动 checkpoint 和投影用量。完整映射见
+> [账户和模型表](docs/context-navigation.md#history-window-and-client-compaction)。
 
 1. 完成启动器中的必需设置。
 2. 在启动器中打开 **MCP**。请在将使用 ChatGPT 连接器的同一个 OpenAI 账户中创建 Tunnel
@@ -123,9 +119,9 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
 `operation_id` 合同保持不变；请同时更新运行时和浏览器 helper。新的逻辑 Native 调用使用新的
 正整数 ID，重试和等待在重连后仍复用该 ID。pending 收据不表示任务完成，也不能使原操作再次执行。
 
-[上下文导航](docs/context-navigation.md) 保留普通任务文字，允许按需读取所选工具历史。图片优先
+[上下文导航](docs/context-navigation.md) 完整保留当前请求与规则，允许按需读取普通助手历史、所选工具历史和详细来源映射。图片优先
 通过 MCP 投递；只有必需的附件回退才需要额外的 Zero Risk 确认。压缩可以查看独立的只读来源目录，
-不要求读取全部来源。现有上下文限额保持不变。完整发布验收仍未完成；High 模式下有限的多图成功
+不要求读取全部来源。页面累计交付估算不再限制发送、读取、完成或决定换页。完整发布验收仍未完成；High 模式下有限的多图成功
 不能证明容量增加、数字识别可靠或所有模型稳定。请参阅
 [验收范围](docs/release-validation.md#context-navigation-validation)。
 
@@ -209,7 +205,7 @@ bun run app:package
 
 `dev:launcher` 在 `~/.codex-chatgpt-web-dev` 下使用独立配置和账户。`dev:chat` 使用真实浏览器与压缩流程，并提供明确的模拟工具结果，不改变正常 Codex 路由。设置和命令请参阅 [DEV chat harness](docs/dev-chat.md)。
 
-[会话连续性](docs/session-continuity.md)在受支持的 Full Native + Launcher 路由中使用统一任务机制和常规 `chatgpt-web/` 模型名。健康且兼容的页面优先复用；普通未完成工作、checkpoint 续接和未提交压缩可在项目权限隔离、真实工具结算、合法来源与实际计划核对后换页恢复。未知 Send、未知结果和停止事实仍有效。Fresh Conversation Per Turn 只改变页面选择；Bigger Context 保留既有能力与 Zero Risk 限制。1,000,000 / 900,000-token Codex 历史预算不扩大网页窗口。物理页面上限仍为五个，清理次数有限。旧前缀配置需改为对应常规模型名，迁移保留 work、stop、checkpoint 和 retry 事实。真实平台验证状态见文档。
+[会话连续性](docs/session-continuity.md)在受支持的 Full Native + Launcher 路由中使用统一任务机制和常规 `chatgpt-web/` 模型名。健康且兼容的页面优先复用；普通未完成工作、checkpoint 续接和未提交压缩可在项目权限隔离、真实工具结算、合法来源与实际计划核对后换页恢复。未知 Send、未知结果和停止事实仍有效。Fresh Conversation Per Turn 只改变页面选择；Zero Risk 保留手动发送限制。Codex 历史窗口使用上述账户/模型四档，不扩大单条传输限制。物理页面上限仍为五个，清理次数有限。旧前缀配置需改为对应常规模型名，迁移保留 work、stop、checkpoint 和 retry 事实。真实平台验证状态见文档。
 
 </details>
 

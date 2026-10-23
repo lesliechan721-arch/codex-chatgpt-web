@@ -23,7 +23,6 @@ function provider(): CodexProviderConfig {
     browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
     continuityStateDirectory: join(root, "task-state"), localToolsEnabled: true,
     solAvailable: true, toolAuthorityMode: "delegated", experimentalFreshConversationPerTurn: false,
-    experimentalBiggerContext: false,
   } };
 }
 function request(turn = "turn") {
@@ -72,7 +71,7 @@ test("an ordinary live owner without durable dispatch evidence cannot be adopted
   sessions.clear();
 });
 
-test("all six Automatic and both Zero Risk public routes share finite history limits", () => {
+test("all public routes use the account and model history tier", () => {
   const capabilities = { ...defaultConfig("full"), browserHost: "launcher" as const, proAvailable: true, extraHighAvailable: true };
   expect(availableChatGptWebModelRoutes(capabilities)).toHaveLength(6);
   for (const slug of [...availableChatGptWebModelRoutes(capabilities).map(route => route.slug), "chatgpt-web/zero-risk", "chatgpt-web/zero-risk-pro"]) {
@@ -80,15 +79,18 @@ test("all six Automatic and both Zero Risk public routes share finite history li
     const config = { ...capabilities, browserInteractionMode: manual ? "manual" as const : "automatic" as const,
       zeroRiskProEnabled: slug.endsWith("zero-risk-pro") };
     const route = requireChatGptWebModelRoute(slug, config);
-    expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({ contextWindow: 1_000_000, autoCompactTokenLimit: 900_000 });
-    expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config, route.interactionMode === "automatic" ? route.modelFamily : undefined).contextWindow).toBeLessThan(1_000_000);
+    const window = slug === "chatgpt-web/zero-risk" || slug === "chatgpt-web/gpt-6-sol-instant" ? 300_000
+      : slug === "chatgpt-web/gpt-6-sol" ? 500_000 : 600_000;
+    expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({ contextWindow: window, autoCompactTokenLimit: window * 0.9 });
+    expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config,
+      route.interactionMode === "automatic" ? route.modelFamily : undefined).contextWindow).toBe(window);
   }
 });
 
-test("Fresh, Bigger, timeout, and presentation changes do not alter execution identity", () => {
+test("Fresh, timeout, and presentation changes do not alter execution identity", () => {
   const config = provider(); const namespace = chatGptWebExecutionNamespace(config);
   const changed = structuredClone(config);
-  Object.assign(changed.chatgptWeb!, { experimentalFreshConversationPerTurn: true, experimentalBiggerContext: true,
+  Object.assign(changed.chatgptWeb!, { experimentalFreshConversationPerTurn: true,
     experimentalSkillAttachments: true, headed: false, useSavedChats: true, turnTimeoutMs: 1000, proAvailable: true });
   expect(chatGptWebExecutionNamespace(changed)).toBe(namespace);
   const reordered = { ...config, chatgptWeb: Object.fromEntries(Object.entries(config.chatgptWeb!).reverse()) };
@@ -112,7 +114,7 @@ for (const fresh of [false, true]) test(`unknown legacy page clears its stop bef
     createPage: true, dispatchProtocolComplete: true });
   store.stopWork(thread, { scope }, work, "user-stop");
   expect(store.get(thread)!.works[work]!.stopReason).toBe("user-stop");
-  Object.assign(config.chatgptWeb!, { experimentalFreshConversationPerTurn: fresh, experimentalBiggerContext: true });
+  Object.assign(config.chatgptWeb!, { experimentalFreshConversationPerTurn: fresh });
   expect(chatGptWebLegacyExecutionScopes(config, parsed)).toContain(scope);
   // This routing fixture has no Launcher descriptor. The old stop must not hide
   // that current configuration error or survive as a future recovery gate.

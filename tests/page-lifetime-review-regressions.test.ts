@@ -45,6 +45,7 @@ import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../src/types";
 import { actualCheckpoint, observeCheckpointResponse, checkpointContinuationBody, compactionBody, observeCompactionHandoff } from "../scripts/validate-unified-task-continuity-transitions";
 import { createLiveRequestBody } from "../scripts/validate-context-rendering";
+import { readContinuityStartup } from "./helpers/session-continuity-fixture";
 
 // These fixtures exercise the existing inline/on-demand contract. Short startup
 // and its default composer limit have separate production MCP integration tests.
@@ -335,7 +336,7 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
     turn.onContinuityLease!(lease);
     const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
     if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
-    expect(compiled.multipart).toBeUndefined();
+    expect(compiled).not.toHaveProperty("multipart");
     submissions.push({ prompt: compiled.text, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
     await turn.onSendActivated?.();
     if (turn.nativeConnector) {
@@ -433,7 +434,9 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
       const prompt = activity.requireRetainedConversation ? activity.resumePrompt! : activity.prompt;
       if (activity.continuity!.expected || !hadPage) {
         submissions.push({ prompt, claim: activity.continuity!, key: activity.conversationKey!, reused: Boolean(activity.requireRetainedConversation) });
-        controls.safeToken = JSON.parse(prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id;
+        const bootstrap = prompt.match(/<codex_bootstrap_json>\n([^\n]+)\n/);
+        controls.safeToken = bootstrap ? JSON.parse(bootstrap[1]!).first_call.arguments.request_id
+          : JSON.parse(prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id;
       }
       if (controls.loseStartAcknowledgementOnce && !hadPage && !activity.continuity!.expected) {
         controls.loseStartAcknowledgementOnce = false;
@@ -448,6 +451,9 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
     async markStarted() {
       controls.started = true;
       controls.onStarted?.();
+      if (submissions.at(-1)!.prompt.includes("<codex_bootstrap_json>")) {
+        await readContinuityStartup(submissions.at(-1)!.prompt, await manualMcp());
+      }
       if (controls.invokeSourceTools) {
         const token = controls.safeToken;
         controls.modelTask = sourceTools(token).then(async () => {
@@ -456,7 +462,13 @@ function createFixture(manual = false, options: { codexHome?: string; threadId?:
           expect(result.isError).not.toBe(true);
         });
         void controls.modelTask.catch(() => {});
-      } else if (!controls.deferCompletion) broker.completeSafeTurn(controls.safeToken, `Completed response ${submissions.length}.`);
+      } else if (!controls.deferCompletion) {
+        if (submissions.at(-1)!.prompt.includes("<codex_bootstrap_json>")) {
+          const result = await (await manualMcp()).callTool({ name: "codex_turn_complete", arguments: {
+            request_id: controls.safeToken, task_revision: 0, final_answer: `Completed response ${submissions.length}.` } });
+          expect(result.isError).not.toBe(true);
+        } else broker.completeSafeTurn(controls.safeToken, `Completed response ${submissions.length}.`);
+      }
     },
     async end(_path, activity) {
       for (const page of pages.values()) if (page.continuity.traceId === activity.traceId) page.state = "ready";

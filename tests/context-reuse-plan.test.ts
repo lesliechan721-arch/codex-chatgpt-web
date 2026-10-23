@@ -164,10 +164,10 @@ test("a source scope change retains its identity and reports scope_changed", () 
   expect(restore(next, bodies(first))).toEqual(next.compiled.bootstrapContent!.payload);
 });
 
-test("capability absence preserves the full v1 value tree and retained cost is never deducted", () => {
+test("capability absence preserves the full v3 value tree and retained cost is never deducted", () => {
   const first = plan();
   const legacy = plan(request(), baseline(first), false, 8000, { contextReuseAvailable: false });
-  expect(payload(legacy).format).toBe("context-bootstrap-payload-v1");
+  expect(payload(legacy).format).toBe("context-bootstrap-payload-v3");
   expect(payload(legacy).payload.system[0]).toBe(rule);
   expect(legacy.registration!.reuse).toBeUndefined();
   const retained = plan(request(), baseline(first), false, 8000, { budget: { retainedTokens: 25_000 } });
@@ -192,7 +192,7 @@ test("a changed protocol fingerprint redelivers only that complete protocol unit
   old.units = old.units.map(unit => unit.scope === "common" ? { ...unit, fingerprint: "0".repeat(64) } : unit);
   const next = plan(request(), old);
   expect(next.registration!.reuse!.units.filter(unit => unit.delivery !== "reuse").map(unit => unit.scope)).toEqual(["common"]);
-  expect(requiredText(next)).toContain("context-bootstrap-payload-v2");
+  expect(requiredText(next)).toContain("context-bootstrap-payload-v3");
   expect(restore(next, bodies(first))).toEqual(next.compiled.bootstrapContent!.payload);
 });
 
@@ -243,8 +243,9 @@ test("the current payload source map does not copy omitted canonical history", (
   };
   const small = make(1), large = make(100);
   expect(large.snapshot.targets.length).toBeGreaterThan(small.snapshot.targets.length);
-  expect(payload(large).source_map.sources).toHaveLength(2);
-  expect(payload(large).source_map.targets).toHaveLength(2);
+  const sourceMap = JSON.parse(large.snapshot.getText(payload(large).source_map.read_ref)!);
+  expect(sourceMap.sources).toHaveLength(2);
+  expect(sourceMap.targets).toHaveLength(2);
   expect(JSON.stringify(payload(large))).not.toContain("omitted old history");
   expect(JSON.stringify(payload(large)).length - JSON.stringify(payload(small)).length).toBeLessThan(100);
   expect(restore(large, bodies(first))).toEqual(large.compiled.bootstrapContent!.payload);

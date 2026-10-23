@@ -37,9 +37,14 @@ for (const manual of [true, false]) test(`continuity: ${manual ? "Zero Risk" : "
     expect(f.submissions).toHaveLength(turn);
     const submission = f.submissions.at(-1)!;
     expect(submission.reused).toBe(turn > 1);
-    expect(submission.prompt).toContain('"protocol":"task-updates-v1","task_revision":0');
+    const bootstrapJson = submission.prompt.match(/<codex_bootstrap_json>\n([^\n]+)\n/);
+    const bootstrap = bootstrapJson ? JSON.parse(bootstrapJson[1]!) : undefined;
+    if (bootstrap) expect(bootstrap).toMatchObject({ startup_protocol: "context-bootstrap-v1",
+      task_update_protocol: "task-updates-v1", task_revision: 0 });
+    else expect(submission.prompt).toContain('"protocol":"task-updates-v1","task_revision":0');
     const token = manual
-      ? JSON.parse(submission.prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id
+      ? bootstrap?.first_call.arguments.request_id
+        ?? JSON.parse(submission.prompt.match(/<codex_zero_risk_request_json>\n([^\n]+)\n/)![1]!).request_id
       : submission.turnToken!;
     expect(tokens.has(token)).toBe(false);
     tokens.add(token);
@@ -308,7 +313,7 @@ for (const [kind, layout] of [
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   const next = f.next(first);
   expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
-  const prompt = f.submissions.at(-1)!.prompt;
+  const prompt = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
   for (const part of parts) expect(prompt).toContain(part.text);
   expect(prompt.indexOf(parts[0]!.text)).toBeLessThan(prompt.indexOf(parts[1]!.text));
   const raw = structuredClone(next._rawBody) as { input: Array<Record<string, unknown>> };
@@ -541,7 +546,7 @@ for (const layout of ["rebuilt environment", "native retained preamble"] as cons
   expect(f.submissions).toHaveLength(3);
   expect(f.submissions[2]).toMatchObject({ key: physicalKey, reused: true });
   expect(binding.lease!.leaseId).toBe(leaseId);
-  const prompt = f.submissions[2]!.prompt;
+  const prompt = JSON.stringify(taskEnvelope(f.submissions[2]!.prompt));
   for (const marker of ["SYSTEM_MARKER", "DEVELOPER_MARKER", "CONTINUE_MARKER"]) expect(prompt).toContain(marker);
   for (const marker of ["ORDINARY_MARKER", "NEW_TURN_MARKER", "AGENTS_MARKER"]) expect(prompt).not.toContain(marker);
   expect(await f.run(structuredClone(continued))).toEqual(accepted);
@@ -607,9 +612,9 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(f.submissions).toHaveLength(2);
   expect(f.submissions[0]!.key).toBe(f.submissions[1]!.key);
   expect(f.submissions[1]!.reused).toBe(true);
-  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("First continuity instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("Completed response 1.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Next continuity instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("First continuity instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Completed response 1.");
   const repeated = await f.run(second);
   expect(repeated.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
@@ -617,9 +622,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   if (manual) { expect(f.automatic).not.toHaveBeenCalled(); expect(f.compatible).not.toHaveBeenCalled(); }
 });
 
-test("automatic continuity keeps the same page with Bigger Context enabled and sends each input without staging", async () => {
+test("automatic continuity keeps the same page and sends each input once", async () => {
   const f = fixture();
-  f.provider.chatgptWeb!.experimentalBiggerContext = true;
   const first = f.request();
   first.options.reasoning = "medium";
   expect((await f.run(first)).at(-1)).toMatchObject({ type: "done", endTurn: true });
@@ -630,19 +634,40 @@ test("automatic continuity keeps the same page with Bigger Context enabled and s
   expect(f.pages.size).toBe(1);
   expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
   expect(f.submissions[1]!.reused).toBe(true);
-  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("Completed response 1.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Next continuity instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Completed response 1.");
 });
 
-for (const biggerContext of [false, true]) test(`first input preflight rejects over-limit prompts with Bigger Context ${biggerContext}`, async () => {
+test("first input preflight rejects a prompt that cannot fit the configured single-message limit", async () => {
   const f = fixture();
-  f.provider.chatgptWeb!.experimentalBiggerContext = biggerContext;
-  await expect(f.run(f.request("oversized ".repeat(100_000)))).rejects.toMatchObject({
-    code: biggerContext ? "context_length_exceeded" : "CONTEXT_BUDGET_EXCEEDED", retryable: false,
-  });
+  f.provider.chatgptWeb!.maxComposerCodePoints = 1;
+  await expect(f.run(f.request())).rejects.toMatchObject({ code: "CONTEXT_BUDGET_EXCEEDED", retryable: false });
   expect(f.registrations.get(continuityDigest(f.threadId))).toBeUndefined();
   expect(f.submissions).toHaveLength(0);
   expect(f.pages.size).toBe(0);
+});
+
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} retains a proven page regardless of cumulative delivery estimates`, async () => {
+  const f = fixture(manual);
+  let request = f.request();
+  expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  const bindings = continuityBindingsFor(f.statePath);
+  const binding = bindings.observed(continuityDigest(f.threadId))!;
+  const key = f.submissions[0]!.key;
+  for (const retained of [89_999, 90_001, 599_999, 600_001, undefined]) {
+    binding.retainedPageTokens = retained;
+    const source = binding.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
+    const originalCoverage = source?.runtime.compactionSourceCoverage;
+    if (retained === undefined && source) source.runtime.compactionSourceCoverage = undefined;
+    try {
+      request = f.next(request, `turn-estimate-${retained ?? "missing"}`);
+      expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+      expect(f.submissions.at(-1)!.key).toBe(key);
+      expect(f.submissions.at(-1)!.reused).toBe(true);
+    } finally { if (source) source.runtime.compactionSourceCoverage = originalCoverage; }
+  }
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(6);
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} capacity rejection preserves the unused first-creation right`, async () => {
@@ -706,7 +731,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect((await payload.run(payload.request("Changed current instruction.", "turn-first"))).at(-1))
     .toMatchObject({ type: "done", endTurn: true });
   expect(payload.submissions).toHaveLength(1);
-  expect(payload.submissions[0]!.prompt).toContain("Changed current instruction.");
+  expect(JSON.stringify(taskEnvelope(payload.submissions[0]!.prompt))).toContain("Changed current instruction.");
   await expect(payload.run(first)).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(payload.submissions).toHaveLength(1);
 
@@ -725,8 +750,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   changedInput[0]!.content = "Changed initial history.";
   expect((await history.run(history.request("", "turn-first", changedInput))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(history.submissions).toHaveLength(1);
-  expect(history.submissions[0]!.prompt).toContain("Changed initial history.");
-  expect(history.submissions[0]!.prompt).not.toContain("Original initial history.");
+  expect(JSON.stringify(taskEnvelope(history.submissions[0]!.prompt))).toContain("Changed initial history.");
+  expect(JSON.stringify(taskEnvelope(history.submissions[0]!.prompt))).not.toContain("Original initial history.");
 });
 
 for (const manual of [false, true]) for (const retryable of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ${retryable ? "ended creation uses current" : "live completed replay preserves accepted"} ID-only history after removed turn metadata`, async () => {
@@ -751,8 +776,8 @@ for (const manual of [false, true]) for (const retryable of [false, true]) test(
   if (!retryable) expect(replay).toEqual(accepted);
   expect(f.submissions).toHaveLength(1);
   expect(f.pages.size).toBe(1);
-  expect(f.submissions[0]!.prompt).toContain(retryable ? "Changed ID-only history." : "Original ID-only history.");
-  expect(f.submissions[0]!.prompt).not.toContain(retryable ? "Original ID-only history." : "Changed ID-only history.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain(retryable ? "Changed ID-only history." : "Original ID-only history.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).not.toContain(retryable ? "Original ID-only history." : "Changed ID-only history.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ordinary resume rejects an unowned completed instruction before submitting`, async () => {
@@ -786,8 +811,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       internal_chat_message_metadata_passthrough: { turn_id: "turn-next" } },
   ]);
   const accepted = await f.run(next);
-  expect(f.submissions[1]!.prompt).toContain("Keep this current constraint.");
-  expect(f.submissions[1]!.prompt).toContain("Current next instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Keep this current constraint.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Current next instruction.");
   expect(await f.run(structuredClone(next))).toEqual(accepted);
   const changed = structuredClone(next);
   (changed._rawBody as { input: Array<Record<string, unknown>> }).input.find(item => item.id === "current-constraint")!.content = "Changed current constraint.";
@@ -870,7 +895,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
   ]);
   const accepted = await f.run(next);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
-  const prompt = f.submissions.at(-1)!.prompt;
+  const prompt = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
   expect(prompt).toContain("CURRENT_SYSTEM_CONSTRAINT.");
   expect(prompt).toContain("CURRENT_DEVELOPER_CONSTRAINT.");
   expect(prompt).not.toContain("OLD_SYSTEM_CONTEXT.");
@@ -901,8 +926,8 @@ for (const manual of [false, true]) for (const role of ["system", "developer"] a
   const changed = f.request("", "turn-first", changedInput);
   const accepted = await f.run(changed);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.submissions[0]!.prompt).toContain("Conflicting current constraint.");
-  expect(f.submissions[0]!.prompt).not.toContain("Accepted current constraint.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain("Conflicting current constraint.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).not.toContain("Accepted current constraint.");
   expect(await f.run(changed)).toEqual(accepted);
   await expect(f.run(first)).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(f.submissions).toHaveLength(1);
@@ -933,8 +958,8 @@ for (const manual of [false, true]) for (const retainSource of [false, true]) fo
   ]);
   const accepted = await f.run(continuation);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.submissions.at(-1)!.prompt).toContain("CURRENT_CHECKPOINT_SYSTEM.");
-  expect(f.submissions.at(-1)!.prompt).toContain("CURRENT_CHECKPOINT_DEVELOPER.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("CURRENT_CHECKPOINT_SYSTEM.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("CURRENT_CHECKPOINT_DEVELOPER.");
   const submissions = f.submissions.length;
   expect(await f.run(structuredClone(continuation))).toEqual(accepted);
   for (const role of ["system", "developer"] as const) {
@@ -979,8 +1004,8 @@ for (const manual of [false, true]) for (const entry of ["initial", "ordinary", 
   const accepted = await f.run(request);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(submissions + 1);
-  expect(f.submissions.at(-1)!.prompt).toContain("Current valid task.");
-  if (entry !== "initial") expect(f.submissions.at(-1)!.prompt).not.toContain("previous turn was interrupted");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("Current valid task.");
+  if (entry !== "initial") expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("previous turn was interrupted");
   expect(await f.run(structuredClone(request))).toEqual(accepted);
   expect(f.submissions).toHaveLength(submissions + 1);
   expect(f.pages.size).toBe(1);
@@ -991,7 +1016,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   const literal = "<turn_aborted>Explain this tag.</turn_aborted>";
   const first = f.request(literal);
   const accepted = await f.run(first);
-  expect(f.submissions[0]!.prompt).toContain(literal);
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain(literal);
   const anonymous = f.next(first);
   ((anonymous._rawBody as { input: unknown[] }).input).push({
     type: "message", role: "user", content: "<turn_aborted>Unknown ownership.</turn_aborted>",
@@ -1096,8 +1121,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(await f.run(changed)).toEqual(accepted);
   expect((await f.run(f.next(changed))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.prompt).not.toContain("anonymous completed task");
-  expect(f.submissions[1]!.prompt).not.toContain("Changed completed history");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("anonymous completed task");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Changed completed history");
 });
 
 test("Automatic reclaimed result replay rejects without retiring the current owner", async () => {
@@ -1192,8 +1217,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       internal_chat_message_metadata_passthrough: { turn_id: "turn-first" } },
   ]);
   expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.submissions[1]!.prompt).toContain("Current steering instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("OLD_FOREIGN_");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Current steering instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("OLD_FOREIGN_");
   expect(f.submissions).toHaveLength(2);
 });
 
@@ -1219,7 +1244,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect((await f.run(structuredClone(accepted))).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(1);
   expect(f.pages.size).toBe(1);
-  expect(f.submissions[0]!.prompt).toContain(accepted.context.messages[0]!.content as string);
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain(accepted.context.messages[0]!.content as string);
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} concurrent initial preflights with changed history share the first captured prompt`, async () => {
@@ -1242,8 +1267,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   await adapters[laterIndex]!.runTurn!(requests[laterIndex]!, { headers: new Headers() }, event => events.push(event));
   expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(1);
-  expect(f.submissions[0]!.prompt).toContain(requests[accepted[0]!]!.context.messages[0]!.content as string);
-  expect(f.submissions[0]!.prompt).not.toContain(requests[laterIndex]!.context.messages[0]!.content as string);
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain(requests[accepted[0]!]!.context.messages[0]!.content as string);
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).not.toContain(requests[laterIndex]!.context.messages[0]!.content as string);
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} pre-page creation failure can be abandoned by leaving continuity`, async () => {
@@ -1324,7 +1349,7 @@ test("a missing physical page starts one replacement epoch and exact retries rep
   expect(f.submissions).toHaveLength(2);
   expect(f.submissions[1]!.key).not.toBe(sourceKey);
   expect(f.submissions[1]!.reused).toBe(false);
-  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Next continuity instruction.");
   expect(f.pages.size).toBe(1);
   expect(f.registrations.get(continuityDigest(f.threadId))).toMatchObject({ state: "entered" });
   expect(continuityBindingsFor(f.statePath).recoveryStore.get(continuityDigest(f.threadId))!.epoch).not.toBe(sourceEpoch);
@@ -1375,8 +1400,8 @@ test("changed completed assistant history does not block a clear new native inst
   const changed = f.next(first, "turn-next", "Invented final answer");
   expect((await f.run(changed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("Invented final answer");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Next continuity instruction.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Invented final answer");
 });
 
 test("an invented checkpoint cannot advance revision even when a clear current instruction follows", async () => {
@@ -1404,9 +1429,10 @@ test("ordinary resume ignores completed foreign history before a clear new instr
   ]);
   expect((await f.run(repeated)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.prompt).toContain("Next continuity instruction.");
-  expect(f.submissions[1]!.prompt).not.toContain("Foreign execution record.");
-  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Foreign tool result.");
+  const delivered = JSON.stringify(taskEnvelope(f.submissions[1]!.prompt));
+  expect(delivered).toContain("Next continuity instruction.");
+  expect(delivered).not.toContain("Foreign execution record.");
+  expect(delivered).not.toContain("Foreign tool result.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ordinary resume keeps every new current-turn instruction item`, async () => {
@@ -1423,8 +1449,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   ]);
   expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.prompt).toContain("Constraint: keep both new items.");
-  expect(f.submissions[1]!.prompt).toContain("Execute the next task.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Constraint: keep both new items.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Execute the next task.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} cross-turn resume excludes an old item-ID-only instruction before explicit current work`, async () => {
@@ -1441,8 +1467,8 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   ]);
   expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.prompt).toContain("Current instruction B.");
-  expect(f.submissions[1]!.prompt).not.toContain("Historical instruction A.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).toContain("Current instruction B.");
+  expect(JSON.stringify(taskEnvelope(f.submissions[1]!.prompt))).not.toContain("Historical instruction A.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} replay binds every instruction item in the accepted current work set`, async () => {
@@ -1969,7 +1995,7 @@ for (const manual of [false, true]) for (const reclamation of ["retained", "capa
   ((valid._rawBody as { input: unknown[] }).input).push(maskedInput.at(-1));
   expect((await f.run(valid)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(3);
-  expect(f.submissions.at(-1)!.prompt).not.toContain("Completed foreign work.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("Completed foreign work.");
 });
 
 for (const manual of [false, true]) for (const reclamation of ["retained", "tombstone"] as const) test(`${manual ? "Zero Risk" : "Automatic"} checkpoint resume rejects a ${reclamation} consumed item-ID-only instruction`, async () => {
@@ -2034,7 +2060,7 @@ for (const manual of [false, true]) for (const reclamation of ["retained", "tomb
   ]);
   expect((await f.run(valid)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(submissions + 1);
-  expect(f.submissions.at(-1)!.prompt).not.toContain("Completed foreign work.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("Completed foreign work.");
 });
 
 for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} ordinary replay rejects changed top-level instructions`, async () => {
@@ -2137,9 +2163,9 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       internal_chat_message_metadata_passthrough: { turn_id: "turn-next" } },
   ]);
   await f.run(next);
-  expect(f.submissions.at(-1)!.prompt).toContain("New instruction C.");
-  expect(f.submissions.at(-1)!.prompt).not.toContain("Historical instruction A.");
-  expect(f.submissions.at(-1)!.prompt).not.toContain("Source instruction B.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("New instruction C.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("Historical instruction A.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).not.toContain("Source instruction B.");
   const replayRaw = structuredClone(next._rawBody) as { input: Array<Record<string, unknown>> };
   replayRaw.input[0]!.content = "Changed old instruction.";
   const replay = parseRequest(replayRaw);
@@ -2269,7 +2295,7 @@ for (const manual of [false, true]) for (const content of ["New task B.", "Sourc
   expect(f.submissions).toHaveLength(count + 1);
   expect(result).toMatchObject({ accepted: true, events: controlResult });
   expect(chatGptCurrentInstructionRevision(request)?.itemId).toBe("msg-new-same-turn");
-  expect(f.submissions.at(-1)?.prompt).toContain(content);
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain(content);
 });
 
 for (const manual of [false, true]) for (const checkpoint of [false, true]) for (const grouped of [false, true]) test(`Round 9: current ${grouped ? "grouped preamble" : "prefix constraints"} survives ${checkpoint ? "checkpoint" : "ordinary"} boundary ${manual}`, async () => {
@@ -2302,7 +2328,7 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
   const next = f.request("", "turn-next", input);
   const accepted = await f.run(next);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
-  const prompt = f.submissions.at(-1)!.prompt;
+  const prompt = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
   if (grouped) {
     expect(prompt).toContain("CURRENT_GROUP_CONSTRAINT.");
     expect(prompt).toContain("<recommended_plugins>");

@@ -6,7 +6,7 @@ import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-ren
 import { ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { assertContinuityCompiledInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
-import { resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
+import { resolveChatGptWebMessageTokenBudget } from "../src/chatgpt-web-models";
 import {
   activeCompactionToolResultInstruction,
   zeroRiskActiveCompactionToolResultInstruction,
@@ -37,7 +37,7 @@ test("Zero Risk prompt carries only a neutral request id while MCP metadata owns
   const compiled = compileChatGptWebPrompt(request(), capabilities, requestId, {
     manualControl: true,
   });
-  expect(compiled.multipart).toBeUndefined();
+  expect(compiled).not.toHaveProperty("multipart");
   expect(compiled.text).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(ZERO_RISK_CHATGPT_CONNECTOR_NAME)}.`);
   expect(compiled.text).toContain("<codex_zero_risk_request_json>");
   expect(compiled.text).toContain(`\"request_id\":\"${requestId}\"`);
@@ -96,8 +96,8 @@ test("Zero Risk prompt fails closed without Full harness or an exact manual bind
   })).toThrow("requires a broker request id");
   expect(() => compileChatGptWebPrompt(request(), capabilities, requestId, {
     manualControl: true,
-    experimentalMultipartParts: 2,
-  })).toThrow("does not support rolling or multipart browser transport");
+    captureLunaCheckpoint: true,
+  })).toThrow("does not support rolling browser checkpoints");
 });
 
 test("active Zero Risk compaction returns its checkpoint through the bound completion control", () => {
@@ -121,7 +121,7 @@ test("Zero Risk uses the same rendering selection while preserving its manual li
   expect(compiled.contextFormat).toBe("codex-context-text-v1");
   expect(decodeWebContextPayload(compiled.contextPayload!).context!.messages[0]!.content).toBe(text);
   expect(compiled.text).toContain(`"request_id":"${requestId}"`);
-  expect(compiled.multipart).toBeUndefined();
+  expect(compiled).not.toHaveProperty("multipart");
   expect(compiled.text).not.toContain("turn_token");
   const whitespace = compileChatGptWebPrompt({ ...input, context: { ...input.context, messages: [
     { role: "user", content: text + "\n\t  ", timestamp: 1 },
@@ -143,17 +143,17 @@ test.each([
   const legacy = compileChatGptWebPrompt(input, caps, requestId, { manualControl: true, contextRendering: "legacy-json" });
   const mixed = compileChatGptWebPrompt(input, caps, requestId, { manualControl: true, contextRendering: "codex-context-text-v1" });
   const auto = compileChatGptWebPrompt(input, caps, requestId, { manualControl: true });
-  const { contextWindow } = resolveChatGptWebContextLimits(modelId, "low", caps);
+  const inputLimit = resolveChatGptWebMessageTokenBudget(modelId, "low", caps) + 8_192 + 1;
   const legacyTokens = estimateCompiledChatGptWebInputTokens(legacy, modelId);
   const mixedTokens = estimateCompiledChatGptWebInputTokens(mixed, modelId);
   expect(mixedTokens).toBeLessThan(legacyTokens);
-  expect(mixedTokens).toBeLessThan(contextWindow);
+  expect(mixedTokens).toBeLessThan(inputLimit);
   expect(chatGptPromptJsonBytes(mixed.text)).toBeLessThanOrEqual(chatGptPromptJsonBytes(legacy.text));
   if (legacyFits) {
-    expect(legacyTokens).toBeLessThan(contextWindow);
+    expect(legacyTokens).toBeLessThan(inputLimit);
     expect(() => assertContinuityCompiledInput(legacy, input, caps)).not.toThrow();
   } else {
-    expect(legacyTokens).toBeGreaterThanOrEqual(contextWindow);
+    expect(legacyTokens).toBeGreaterThanOrEqual(inputLimit);
     expect(() => assertContinuityCompiledInput(legacy, input, caps)).toThrow();
   }
   expect(() => assertContinuityCompiledInput(mixed, input, caps)).not.toThrow();
@@ -162,7 +162,7 @@ test.each([
   expect(() => assertContinuityCompiledInput(auto, input, caps)).not.toThrow();
   expect(decodeWebContextPayload(auto.contextPayload!).context)
     .toEqual(decodeWebContextPayload(legacy.contextPayload!).context);
-  expect(auto.multipart).toBeUndefined();
+  expect(auto).not.toHaveProperty("multipart");
   expect(auto.trimmedCompactionMessages).toBeUndefined();
   expect(auto.text).toContain(`"request_id":"${requestId}"`);
   expect(input).toEqual(original);
@@ -208,7 +208,7 @@ describe("Zero Risk Pro original character boundary", () => {
     try { assertContinuityCompiledInput(mixed, input, caps); }
     catch (error) { rejection = error; }
     expect(rejection).toMatchObject({ code: "continuity_input_limit", retryable: false });
-    expect(auto.multipart).toBeUndefined();
+    expect(auto).not.toHaveProperty("multipart");
     expect(auto.trimmedCompactionMessages).toBeUndefined();
     expect(input).toEqual(original);
   }, 60_000);
@@ -234,11 +234,11 @@ test.each([
   const caps = { ...capabilities, proAvailable };
   const mixed = compileChatGptWebPrompt(input, caps, requestId, { manualControl: true, contextRendering: "codex-context-text-v1" });
   const auto = compileChatGptWebPrompt(input, caps, requestId, { manualControl: true });
-  const { contextWindow } = resolveChatGptWebContextLimits(modelId, "low", caps);
-  expect(estimateCompiledChatGptWebInputTokens(mixed, modelId)).toBeGreaterThanOrEqual(contextWindow);
+  const inputLimit = resolveChatGptWebMessageTokenBudget(modelId, "low", caps) + 8_192 + 1;
+  expect(estimateCompiledChatGptWebInputTokens(mixed, modelId)).toBeGreaterThanOrEqual(inputLimit);
   expect(mixed.images).toHaveLength(1);
   expect(auto.contextFormat).toBe("legacy-json");
   expect(() => assertContinuityCompiledInput(mixed, input, caps)).toThrow();
   expect(() => assertContinuityCompiledInput(auto, input, caps)).toThrow();
-  expect(auto.multipart).toBeUndefined();
+  expect(auto).not.toHaveProperty("multipart");
 }, 30_000);

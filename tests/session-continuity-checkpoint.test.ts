@@ -13,6 +13,7 @@ import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continui
 import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
 import { createChatGptWebAdapter as createVerifiedChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { runContextCapabilityVerification } from "../src/adapters/chatgpt-web/context-capability-verification";
+import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { extractChatGptTurnIdentity, continuityCheckpointSiblingGroup, CONTINUITY_CHECKPOINT_SIBLING_PROOF } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
@@ -26,7 +27,7 @@ import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { actualCheckpoint, observeCheckpointResponse, checkpointContinuationBody, compactionBody, observeCompactionHandoff } from "../scripts/validate-unified-task-continuity-transitions";
 import { createLiveRequestBody } from "../scripts/validate-context-rendering";
 import { performanceTest } from "./helpers/performance-test";
-import { createSessionContinuityFixtures, recordedCall, taskEnvelope, reverseJsonObjectKeys, codexRoundtrippedOutput } from "./helpers/session-continuity-fixture";
+import { createSessionContinuityFixtures, readContinuityStartup, recordedCall, taskEnvelope, reverseJsonObjectKeys, codexRoundtrippedOutput } from "./helpers/session-continuity-fixture";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
@@ -384,9 +385,10 @@ test("real Codex captured active and completed checkpoint-only requests reuse pr
   const activeResult = await f.run(continued);
   expect(activeResult.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(await f.run(load(activeContinuation))).toEqual(activeResult);
-  expect(f.submissions.at(-1)!.prompt).toContain("SYSTEM_MARKER");
-  expect(f.submissions.at(-1)!.prompt).toContain("DEVELOPER_MARKER");
-  expect(f.submissions.at(-1)!.prompt).toContain("# AGENTS.md instructions");
+  const delivered = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
+  expect(delivered).toContain("SYSTEM_MARKER");
+  expect(delivered).toContain("DEVELOPER_MARKER");
+  expect(delivered).toContain("# AGENTS.md instructions");
   expect(f.submissions.at(-1)!.prompt).not.toContain("ORDINARY_MARKER");
   const next = load(captured.captured.find(record => record.label === "new-turn")!);
   const nextResult = await f.run(next);
@@ -411,7 +413,52 @@ test("real Codex captured active and completed checkpoint-only requests reuse pr
 });
 
 for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automatic repeated-summary continuation replays the old result round for the same native instruction${reclamation ? ` before ${reclamation} reclamation` : ""}`, async () => {
-  const f = fixture();
+  let client!: Client;
+  const f = fixture(false, { contextModel: async input => {
+    client = input.client;
+    await readContinuityStartup(input.prompt, input.client);
+  } });
+  let expectedCompactionResult: string | undefined;
+  const readResults: string[] = [];
+  const run = f.automatic.getMockImplementation()!;
+  f.automatic.mockImplementation(async turn => {
+    if (turn.nativeConnector && expectedCompactionResult) {
+      const submitted = turn.onSubmitted;
+      turn.onSubmitted = async () => {
+        await submitted?.();
+        const entry = JSON.parse(f.submissions.at(-1)!.prompt.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+        const { compaction_token, context_id } = entry.first_call.arguments;
+        expect((await client.callTool(entry.first_call)).isError).not.toBe(true);
+        const found = await client.callTool({ name: "codex_context_search", arguments: {
+          compaction_token, context_id, query: "Next continuation result." } });
+        expect(found.isError).not.toBe(true);
+        const hits = (found.structuredContent as { hits: Array<{ read_ref: string }> }).hits;
+        expect(hits.length).toBeGreaterThan(0);
+        let reads: Array<{ read_ref: string; cursor?: string }> = [{ read_ref: hits[0]!.read_ref }];
+        let body = "";
+        for (let page = 0; reads.length; page++) {
+          if (page >= 100) throw new Error("The optional compaction source did not end");
+          const returned = await client.callTool({ name: "codex_context_read", arguments: { compaction_token, context_id, reads } });
+          expect(returned.isError).not.toBe(true);
+          const parsed = parseContextTextReadResult(returned);
+          expect(parsed.metadata.items[0]).toMatchObject({ kind: "tool_result", required: false, range: { start: Buffer.byteLength(body) } });
+          body += parsed.bodies[0]!;
+          reads = parsed.metadata.remaining_reads;
+        }
+        expect(body).toBe(expectedCompactionResult!);
+        readResults.push(body);
+        // The fixture submits directly to the Broker after the real MCP receipt settles.
+        for (let attempt = 0; ; attempt++) {
+          try { await f.broker.guardCompactionContextCommit(compaction_token); break; }
+          catch (error) {
+            if ((error as { code?: string }).code !== "CONTEXT_BUSY" || attempt >= 100) throw error;
+            await Bun.sleep(1);
+          }
+        }
+      };
+    }
+    return run(turn);
+  });
   f.controls.invokeSourceTools = true;
   const first = f.request();
   await f.run(first);
@@ -448,11 +495,14 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
   await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
   const accepted = await next;
   const unacceptedCall = source.outstanding()[0]!;
-  // Reclamation exercises a cold handoff with actual delivered content. The short
-  // variant exercises same-page retirement without accumulating unused reserves.
+  // The longer result stays on the same page. Actual reclamation below must still
+  // retire the old owner and reject its replay independently of delivery estimates.
   const nextOutput = "Next continuation result.\n".repeat(reclamation ? 2_000 : 1);
+  expectedCompactionResult = nextOutput;
   expect(await compactCurrent(result, nextOutput)).toBe(summary);
-  expect(f.submissions.at(-1)!.reused).toBe(!reclamation);
+  expectedCompactionResult = undefined;
+  expect(readResults).toEqual([nextOutput]);
+  expect(f.submissions.at(-1)!.reused).toBe(true);
   const submissions = f.submissions.length;
   const results = f.controls.toolResults.length;
   const retry = structuredClone(result);
@@ -473,6 +523,16 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
   expect(f.controls.toolResults).toHaveLength(results);
   if (reclamation) {
     const sourceKey = `${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(result)}`;
+    // A real successor keeps the page and makes this source a historical owner.
+    f.controls.invokeSourceTools = false;
+    const current = f.request("", "turn-after-second-checkpoint", [
+      { type: "compaction", encrypted_content: encodeCompactionSummary(summary) },
+      { type: "message", role: "user", id: "msg-after-second-checkpoint", content: "New work after the second checkpoint.",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-after-second-checkpoint" } },
+    ]);
+    expect((await f.run(current)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect(f.submissions.at(-1)!.reused).toBe(true);
+    expect(f.pages.size).toBe(1);
     if (reclamation === "ttl") {
       const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 60_000);
       try { chatGptTurnSessions.activeCount(); }
@@ -480,13 +540,13 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
     } else {
       const capacity = chatGptTurnSessions as unknown as { maxEntries: number };
       const originalMaxEntries = capacity.maxEntries;
-      capacity.maxEntries = 1;
+      capacity.maxEntries = 2;
       try { chatGptTurnSessions.assertContinuityThreadAvailable(f.threadId, "cold-source-reclamation-probe"); }
       finally { capacity.maxEntries = originalMaxEntries; }
     }
     expect(chatGptTurnSessions.find(sourceKey)).toBeUndefined();
     await expect(f.run(structuredClone(result))).rejects.toMatchObject({ code: "continuity_source_unproven" });
-    expect(f.submissions).toHaveLength(submissions);
+    expect(f.submissions).toHaveLength(submissions + 1);
     expect(f.controls.toolResults).toHaveLength(results);
   }
 });
@@ -613,7 +673,7 @@ for (const manual of [false, true]) for (const retainSource of [false, true]) te
   const input = [group, ...(retainSource ? sourceInput : []), marker];
   const accepted = await f.run(f.request("", "turn-first", input));
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.submissions.at(-1)!.prompt.match(/Current checkpoint constraint\./g)).toHaveLength(1);
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt)).match(/Current checkpoint constraint\./g)).toHaveLength(1);
   const submissions = f.submissions.length;
   const environmentChanged = structuredClone(group);
   environmentChanged.content[1]!.text = "<environment_context><cwd>/tmp/changed</cwd><shell>zsh</shell></environment_context>";
@@ -683,7 +743,7 @@ for (const manual of [false, true]) for (const retained of [false, true]) for (c
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(submissions + 1);
   expect(f.submissions.at(-1)!.reused).toBe(true);
-  expect(f.submissions.at(-1)!.prompt).toContain("Keep this current constraint.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("Keep this current constraint.");
   expect(f.submissions.at(-1)!.prompt).not.toContain("Completed historical request.");
   expect(await f.run(structuredClone(continuation))).toEqual(accepted);
   const changedHistory = f.request("", "turn-first", [constraint, { ...oldUser, content: "Changed old history." },

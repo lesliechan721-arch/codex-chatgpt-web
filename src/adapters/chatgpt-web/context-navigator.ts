@@ -31,7 +31,7 @@ export interface ContextNavigatorOptions {
   deliveryByTarget?: Readonly<Record<string, ContextDelivery>>;
   limits?: ContextLimitOverrides;
   bootstrap?: { planId: string; manifestDigest: string; reuse?: ContextReusePlan; requiredTextBatches?: readonly ContextRequiredTextBatch[] };
-  /** Runtime credits only complete fixed units covered by this result. */
+  /** Runtime protects undelivered required image counts and bytes. */
   remainingBudget?: (targets?: readonly ContextTarget[], result?: BrokerToolResult) => ContextRemainingBudget;
 }
 
@@ -100,18 +100,23 @@ export class ContextNavigator {
       if (input.view === "overview") {
         if (input.cursor !== undefined) throw new NavigationError("INVALID_ARGUMENT");
         const unfiltered = !requiredOnly && filterKeys.every(k => input[k] === undefined);
+        const sourceIds = new Set(matches.map(target => target.source_id));
+        const sources = this.#snapshot.sources.filter(source => unfiltered || sourceIds.has(source.source_id));
+        const categories: Record<string, number> = {};
+        for (const source of sources) categories[source.source_kind] = (categories[source.source_kind] ?? 0) + 1;
         const body: Record<string, unknown> = { context_id: this.#snapshot.context_id, purpose: this.#purpose,
           counts: { sources: unfiltered ? this.#snapshot.sources.length : new Set(matches.map(t => t.source_id)).size,
             targets: matches.length, calls: matches.filter(t => t.kind === "tool_arguments").length,
             results: new Set(matches.filter(t => t.original_role === "toolResult").map(t => t.source_id)).size,
             images: matches.filter(t => t.kind === "image").length },
-          source_cutoff: this.#snapshot.sources.length };
+          source_cutoff: this.#snapshot.sources.length,
+          source_range: { start: sources[0]?.source_index ?? 0,
+            end_exclusive: sources.length ? sources[sources.length - 1]!.source_index + 1 : 0 },
+          source_categories: categories };
         if (liveOverview) body.live = this.#live(liveOverview);
         if (this.#bootstrap) {
           delete body.counts; delete body.source_cutoff;
           if (body.live) {
-            delete (body.live as ContextLiveOverview).remaining_tokens;
-            delete (body.live as ContextLiveOverview).remaining_wire_bytes;
             delete (body.live as ContextLiveOverview).required_text_bytes;
             delete (body.live as ContextLiveOverview).delivered_text_bytes;
           }
@@ -151,7 +156,6 @@ export class ContextNavigator {
           const result = response(body);
           return { result, meteredResult: this.#bootstrapEnvelope(result) };
         }
-        if (this.#purpose === "compaction") body.remaining_budget = this.#budgetHint();
         return { result: response(body) };
       }
       const q = hash(deterministicContextJson({ ...filter, ...(requiredOnly ? { required_only: true } : {}) }));
@@ -288,15 +292,12 @@ export class ContextNavigator {
   #packText(reads: ValidatedRead[], step?: ContextTextReadMetadata["required_step"],
     allowance = { tokens: 0, wire_bytes: 0 }, fixedRanges?: ContextRequiredTextBatch["ranges"]): BrokerToolResult {
     const items: ContextTextReadItem[] = [], bodies: string[] = [];
-    const hint = this.#purpose === "compaction" ? this.#budgetHint() : undefined;
-    const make = (candidateItems: ContextTextReadItem[], candidateBodies: string[], conservative: boolean): BrokerToolResult => {
+    const make = (candidateItems: ContextTextReadItem[], candidateBodies: string[]): BrokerToolResult => {
       const last = candidateItems[candidateItems.length - 1]!;
       const remaining = [ ...(last.has_more ? [{ read_ref: last.read_ref, cursor: last.next_cursor! }] : []),
         ...reads.slice(candidateItems.length).map(read => ({ ...read.input })) ];
       return createContextTextReadResult({ context_id: this.#snapshot.context_id, purpose: this.#purpose, items: candidateItems,
-        remaining_reads: remaining, ...(step ? { required_step: step } : {}), ...(hint ? { remaining_budget: conservative
-          ? { tokens: Number.MAX_SAFE_INTEGER, wire_bytes: Number.MAX_SAFE_INTEGER, reserved_tokens: Number.MAX_SAFE_INTEGER,
-            reserved_wire_bytes: Number.MAX_SAFE_INTEGER, stop_hint: "Stop reading before consuming the summary and submission reserve" } : hint } : {}) }, candidateBodies);
+        remaining_reads: remaining, ...(step ? { required_step: step } : {}) }, candidateBodies);
     };
     const fits = (result: BrokerToolResult): boolean => {
       const cost = this.#costBound(result, this.#limits.readTokens - allowance.tokens);
@@ -311,7 +312,7 @@ export class ContextNavigator {
         encoding: target.encoding!, source_completeness: target.source_completeness, utf8_bytes: bytes.length, range: { start, end_exclusive: end },
         body_content_index: index + 1, has_more: end < bytes.length,
         next_cursor: end < bytes.length ? this.#encode("read", this.#readQuery(target.read_ref!), target.target_id, end) : null });
-      const candidate = (end: number) => make([...items, item(end)], [...bodies, bytes.subarray(start, end).toString("utf8")], true);
+      const candidate = (end: number) => make([...items, item(end)], [...bodies, bytes.subarray(start, end).toString("utf8")]);
       if (fixedRanges) {
         const range = fixedRanges[index];
         if (!range) break;
@@ -336,9 +337,9 @@ export class ContextNavigator {
       break;
     }
     if (!items.length) throw new NavigationError("BUDGET_EXCEEDED");
-    const conservative = make(items, bodies, true);
-    if (!fits(conservative)) throw new NavigationError("BUDGET_EXCEEDED");
-    return make(items, bodies, false);
+    const result = make(items, bodies);
+    if (!fits(result)) throw new NavigationError("BUDGET_EXCEEDED");
+    return result;
   }
 
   #read(args: ContextReadArgs | unknown, preflight = false): BrokerToolResult {
@@ -352,8 +353,7 @@ export class ContextNavigator {
         if (image.bytes.length > this.#limits.maxImageBytes) throw new NavigationError("BUDGET_EXCEEDED");
         const body = { context_id: this.#snapshot.context_id, purpose: this.#purpose, read_ref: target.read_ref,
           source: this.#source(target), mime_type: image.mime_type, image_bytes: image.bytes.length, content_digest: target.content_digest,
-          visual_token_reserve: image.visual_token_reserve,
-          ...(this.#purpose === "compaction" ? { remaining_budget: this.#budgetHint([target]) } : {}) };
+          visual_token_reserve: image.visual_token_reserve };
         return { result: response(body, { type: "image", mimeType: image.mime_type, data: Buffer.from(image.bytes).toString("base64") }),
           targets: [target], requestedItems: reads.length, returnedItems: 1, visual: image.visual_token_reserve, imageBytes: image.bytes.length };
       }
@@ -458,16 +458,9 @@ export class ContextNavigator {
         if (this.#processingNow() - started > this.#limits.callProcessingMs) throw new NavigationError("PROCESSING_BUDGET_EXCEEDED");
         return result;
       }
-      const cost = this.#cost(meteredResult ?? result, visual);
       const remaining = this.#remaining?.(value.targets, result);
       if (remaining) this.#validateRemaining(remaining);
-      const errors = this.#errorReserve();
-      const exceedsWireBudget = remaining && cost.wire_bytes + errors.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0);
-      const exceedsTokenBudget = remaining && cost.total_tokens + errors.tokens > remaining.tokens - (remaining.reserved_tokens ?? 0);
-      if (exceedsWireBudget) this.#hit("total_wire");
-      if (exceedsTokenBudget) this.#hit("total_tokens");
-      if (exceedsWireBudget || exceedsTokenBudget
-        || image && (this.#usage.image_reads >= this.#limits.maxImageReads || this.#usage.image_bytes + imageBytes > this.#limits.maxTotalImageBytes)
+      if (image && (this.#usage.image_reads >= this.#limits.maxImageReads || this.#usage.image_bytes + imageBytes > this.#limits.maxTotalImageBytes)
         || image && remaining && (remaining.image_reads !== undefined && remaining.image_reads - (remaining.reserved_image_reads ?? 0) < 1
           || remaining.image_bytes !== undefined && imageBytes > remaining.image_bytes - (remaining.reserved_image_bytes ?? 0))) throw new NavigationError("BUDGET_EXCEEDED");
       if (this.#retired) throw new NavigationError("CONTEXT_EXPIRED");
@@ -482,11 +475,7 @@ export class ContextNavigator {
       meteredResult = undefined;
       const cost = this.#cost(result);
       if (preflight) return result;
-      const remaining = this.#remaining?.() ?? this.#localRemaining();
-      try { this.#validateRemaining(remaining); } catch { this.#usage.navigation_stopped = true; throw new ContextNavigationStoppedError(); }
-      if (cost.text_tokens > this.#limits.errorResponseTokens || cost.wire_bytes > this.#limits.errorResponseBytes
-        || cost.total_tokens > remaining.tokens - (remaining.reserved_tokens ?? 0)
-        || cost.wire_bytes > remaining.wire_bytes - (remaining.reserved_wire_bytes ?? 0)) {
+      if (cost.text_tokens > this.#limits.errorResponseTokens || cost.wire_bytes > this.#limits.errorResponseBytes) {
         this.#usage.navigation_stopped = true; throw new ContextNavigationStoppedError();
       }
       this.#usage.error_responses++;
@@ -598,23 +587,16 @@ export class ContextNavigator {
     return cursor as unknown as Cursor;
   }
   #validateRemaining(budget: ContextRemainingBudget): void {
-    if ([budget.tokens, budget.wire_bytes, budget.reserved_tokens ?? 0, budget.reserved_wire_bytes ?? 0, budget.image_reads ?? 0, budget.reserved_image_reads ?? 0, budget.image_bytes ?? 0, budget.reserved_image_bytes ?? 0].some(n => !Number.isSafeInteger(n) || n < 0)
+    if ([budget.image_reads ?? 0, budget.reserved_image_reads ?? 0, budget.image_bytes ?? 0, budget.reserved_image_bytes ?? 0].some(n => !Number.isSafeInteger(n) || n < 0)
       || budget.reserved_image_reads !== undefined && budget.image_reads === undefined || budget.reserved_image_bytes !== undefined && budget.image_bytes === undefined) throw new NavigationError("BUDGET_EXCEEDED");
   }
-  #errorReserve() { const count = this.#limits.maxErrorResponses - this.#usage.error_responses;
-    return { tokens: count * this.#limits.errorResponseTokens, wire_bytes: count * this.#limits.errorResponseBytes }; }
   #localRemaining(): ContextRemainingBudget { return { tokens: UNLIMITED_CONTEXT_ALLOWANCE, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE }; }
-  #budgetHint(targets?: readonly ContextTarget[]) {
-    const budget = this.#remaining?.(targets) ?? this.#localRemaining();
-    this.#validateRemaining(budget);
-    return { tokens: budget.tokens, wire_bytes: budget.wire_bytes, reserved_tokens: budget.reserved_tokens ?? 0, reserved_wire_bytes: budget.reserved_wire_bytes ?? 0, stop_hint: "Stop reading before consuming the summary and submission reserve" };
-  }
   #live(value: ContextLiveOverview): ContextLiveOverview {
     const result: ContextLiveOverview = {};
     for (const key of ["context_ready", "reuse_ready", "text_ready", "images_ready"] as const) if (value[key] !== undefined) {
       if (typeof value[key] !== "boolean") throw new NavigationError("INVALID_ARGUMENT"); result[key] = value[key];
     }
-    for (const key of ["required_images", "delivered_images", "required_texts", "delivered_texts", "required_text_bytes", "delivered_text_bytes", "remaining_tokens", "remaining_wire_bytes"] as const) if (value[key] !== undefined) {
+    for (const key of ["required_images", "delivered_images", "required_texts", "delivered_texts", "required_text_bytes", "delivered_text_bytes"] as const) if (value[key] !== undefined) {
       if (!Number.isSafeInteger(value[key]) || value[key]! < 0) throw new NavigationError("INVALID_ARGUMENT"); result[key] = value[key];
     }
     if (value.stop_hint !== undefined) { if (typeof value.stop_hint !== "string") throw new NavigationError("INVALID_ARGUMENT"); result.stop_hint = Array.from(value.stop_hint).slice(0, 160).join(""); }

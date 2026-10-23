@@ -12,7 +12,7 @@ function registration(delivery: "inline" | "required" | "reuse", text = "规则�
   const target = snapshot.targets.at(-1)!;
   return { snapshot, planId: "reuse-runtime-plan", manifestDigest: "reuse-runtime-manifest", startupProtocol: "context-bootstrap-v1",
     deliveryByTarget: { [target.target_id]: { delivery: delivery === "required" ? "source_required" : "source_on_demand", required: delivery === "required" } },
-    reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v2", mode: delivery === "reuse" ? "incremental" : "full",
+    reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v3", mode: delivery === "reuse" ? "incremental" : "full",
       ...(delivery === "reuse" ? { dependency: { baseline_id: "baseline", page_identity: "page", predecessor: "previous",
         units: [{ unit_id: "rule", fingerprint: "fingerprint" }] } } : {}),
       units: [{ unit_id: "rule", fingerprint: "fingerprint", kind: "rule", role: "system", scope: "request", utf8_bytes: Buffer.byteLength(text), delivery, target_id: target.target_id }], snapshots: [] } };

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
+import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS, CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, resolveChatGptWebMessageTokenBudget } from "../src/chatgpt-web-models";
 import { parseRequest } from "../src/responses/parser";
 import { assertContinuityCompiledInput, preflightContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
 import * as tokens from "../src/adapters/chatgpt-web/input-tokens";
@@ -15,8 +15,8 @@ for (const manual of [false, true]) {
   });
   test(`${manual ? "manual" : "automatic"} initial input leaves capacity for the unknown real capability`, () => {
     const parsed = request();
-    const { contextWindow } = resolveChatGptWebContextLimits(modelId, "low", capabilities);
-    const inputEstimate = spyOn(tokens, "estimateCompiledChatGptWebInputTokens").mockReturnValue(contextWindow - 1);
+    const inputLimit = resolveChatGptWebMessageTokenBudget(modelId, "low", capabilities) + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS;
+    const inputEstimate = spyOn(tokens, "estimateCompiledChatGptWebInputTokens").mockReturnValue(inputLimit);
     const messageEstimate = spyOn(tokens, "estimateCompiledChatGptWebMessageTokens").mockReturnValue(1);
     try {
       // A real compiled prompt at this exact count is legal. A preflight placeholder cannot

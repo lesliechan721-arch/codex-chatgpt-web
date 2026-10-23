@@ -189,22 +189,18 @@ test("DEV persistence uses standard model names and rejects removed models", () 
     .toThrow("Change it to chatgpt-web/gpt-5.6-sol");
 });
 
-test("GPT-6 DEV status uses the canonical task history budget", () => {
+test("GPT-6 DEV status uses the account/model history budget", () => {
   const root = scratch("cgw-dev-six-task-context");
-  for (const experimentalBiggerContext of [false, true]) {
-    const driver = new DevChatDriver(
-      { ...defaultConfig("full"), browserHost: "launcher", experimentalBiggerContext },
-      new DevChatStore(join(root, "chats")),
-      (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
-      root,
-    );
-    for (const suffix of ["sol-instant", "sol"] as const) {
-      const model = `chatgpt-web/gpt-6-${suffix}` as const;
-      const { state } = driver.open(suffix, model);
-      expect(driver.status(state)).toMatchObject({
-        model, contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
-      });
-    }
+  const driver = new DevChatDriver(
+    { ...defaultConfig("full"), browserHost: "launcher" },
+    new DevChatStore(join(root, "chats")),
+    (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
+    root,
+  );
+  for (const [suffix, contextWindow, autoCompactTokenLimit] of [["sol-instant", 200_000, 180_000], ["sol", 300_000, 270_000]] as const) {
+    const model = `chatgpt-web/gpt-6-${suffix}` as const;
+    const { state } = driver.open(suffix, model);
+    expect(driver.status(state)).toMatchObject({ model, contextWindow, autoCompactTokenLimit });
   }
 });
 
@@ -274,8 +270,8 @@ test("an existing DEV chat changes route only when the user explicitly requests 
   });
 });
 
-test("Bigger Context exposes bounded full-history windows for Sol and Luna", async () => {
-  const root = scratch("cgw-dev-bigger-context");
+test("DEV status exposes the default history windows for Sol and Luna", async () => {
+  const root = scratch("cgw-dev-history-context");
   const config = {
     ...defaultConfig("browser-only"),
     purpose: "dev-harness" as const,
@@ -283,7 +279,7 @@ test("Bigger Context exposes bounded full-history windows for Sol and Luna", asy
     extraHighAvailable: true, proAvailable: true,
   };
   const factory = (): ProviderAdapter => ({
-    name: "dev-bigger-context-test",
+    name: "dev-history-test",
     async runTurn(_parsed, _incoming, emit) {
       emit({ type: "text_delta", text: "unused", phase: "final_answer" });
       emit({
@@ -293,38 +289,33 @@ test("Bigger Context exposes bounded full-history windows for Sol and Luna", asy
     },
   });
   const store = new DevChatStore(join(root, "chats"));
-  const normal = new DevChatDriver(config, store, factory, root);
-  const normalState = normal.open("normal-window", "chatgpt-web/high").state;
-  expect(normal.status(normalState).autoCompactTokenLimit).toBe(95_000);
-
-  const biggerConfig = { ...config, experimentalBiggerContext: true };
-  const bigger = new DevChatDriver(biggerConfig, store, factory, root, { biggerContext: true });
-  const biggerState = bigger.open("bigger-window", "chatgpt-web/high").state;
-  const biggerStatus = bigger.status(biggerState);
-  expect(biggerStatus).toMatchObject({
-    autoCompactTokenLimit: 285_000,
-    contextWindow: 333_579,
+  const driver = new DevChatDriver(config, store, factory, root);
+  const state = driver.open("paid-window", "chatgpt-web/high").state;
+  const status = driver.status(state);
+  expect(status).toMatchObject({
+    autoCompactTokenLimit: 540_000,
+    contextWindow: 600_000,
   });
-  expect(biggerStatus.percent).toBe(Math.round((biggerStatus.inputTokens / 285_000) * 1_000) / 10);
+  expect(status.percent).toBe(Math.round((status.inputTokens / 540_000) * 1_000) / 10);
   for (const [model, contextWindow, autoCompactTokenLimit] of [
-    ["chatgpt-web/gpt-6-sol", 240_000, 220_000],
-    ["chatgpt-web/gpt-6-sol-instant", 111_193, 95_000],
+    ["chatgpt-web/gpt-6-sol", 500_000, 450_000],
+    ["chatgpt-web/gpt-6-sol-instant", 300_000, 270_000],
   ] as const) {
-    const state = bigger.open(model.split("/")[1]!, model).state;
-    expect(bigger.status(state)).toMatchObject({ contextWindow, autoCompactTokenLimit });
+    const state = driver.open(model.split("/")[1]!, model).state;
+    expect(driver.status(state)).toMatchObject({ contextWindow, autoCompactTokenLimit });
   }
-  const proState = bigger.open("six-pro", "chatgpt-web/gpt-6-pro").state;
-  expect(bigger.status(proState)).toMatchObject({ contextWindow: 336_579, autoCompactTokenLimit: 285_000 });
+  const proState = driver.open("six-pro", "chatgpt-web/gpt-6-pro").state;
+  expect(driver.status(proState)).toMatchObject({ contextWindow: 600_000, autoCompactTokenLimit: 540_000 });
   const luna = new DevChatDriver({
-    ...biggerConfig,
+    ...config,
     solAvailable: false,
     extraHighAvailable: false, proAvailable: false,
-  }, store, factory, root, { biggerContext: true });
+  }, store, factory, root);
   for (const model of ["chatgpt-web/luna", "chatgpt-web/think"] as const) {
     const state = luna.open(model.split("/")[1]!, model).state;
-    expect(luna.status(state)).toMatchObject({ contextWindow: 84_000, autoCompactTokenLimit: 59_424 });
+    expect(luna.status(state)).toMatchObject({ contextWindow: 200_000, autoCompactTokenLimit: 180_000 });
   }
-  await Promise.all([normal.close(), bigger.close(), luna.close()]);
+  await Promise.all([driver.close(), luna.close()]);
 });
 
 test("browser-only DEV driver runs real turns without advertising simulated tools", async () => {
@@ -563,8 +554,8 @@ test("synthetic fill crosses the production threshold and triggers the real comp
   const store = new DevChatStore(join(root, "chats"));
   const driver = new DevChatDriver(config, store, factory, root);
   const state = driver.open("auto-compact", "chatgpt-web/light").state;
-  driver.fill(state, 30_000);
-  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(32_000);
+  driver.fill(state, 270_000);
+  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(270_000);
   const events: string[] = [];
   const result = await driver.send(state, "Continue after compacting the synthetic history.", event => events.push(event.type));
   expect(result).toMatchObject({ text: "DEV turn completed after compaction.", compactions: 1 });

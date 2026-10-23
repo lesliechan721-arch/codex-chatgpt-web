@@ -24,7 +24,7 @@ import { routeChatGptWebRequest } from "../src/server";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { performanceTest } from "./helpers/performance-test";
-import { createSessionContinuityFixtures, recordedCall } from "./helpers/session-continuity-fixture";
+import { createSessionContinuityFixtures, deliveredStartupSources, recordedCall, taskEnvelope } from "./helpers/session-continuity-fixture";
 import { withContinuitySourceDiagnostics } from "./helpers/continuity-source-diagnostics";
 import * as launcherHost from "../src/launcher-browser-host";
 
@@ -391,7 +391,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(prompt).not.toContain("Verified checkpoint.");
   expect(prompt).not.toContain("Actual completed tool result: 42.");
   expect(prompt).not.toContain(token);
-  expect(prompt).toContain("continue only unfinished authorized work");
+  expect(deliveredStartupSources(prompt)).toContain("continue only unfinished authorized work");
   expect(new Set(f.submissions.map(submission => submission.key)).size).toBe(1);
   expect(f.pages.size).toBe(1);
   await expect(callTurnBroker(f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) }))
@@ -888,7 +888,7 @@ for (const manual of [false, true]) for (const sameTurn of [false, true]) for (c
       internal_chat_message_metadata_passthrough: { turn_id: turnId } },
   ]);
   expect((await f.run(proved)).at(-1)).toMatchObject({ type: "done", endTurn: true });
-  expect(f.submissions.at(-1)!.prompt).toContain("Proved new work.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("Proved new work.");
   expect(f.submissions.at(-1)!.prompt).not.toContain("Old instruction A.");
 });
 
@@ -1012,6 +1012,7 @@ for (const manual of [false,true]) test(`Round 7: completed foreign tool search 
   f.controls.started = false;
   const pending = f.run(next);
   while (!f.controls.started) await Bun.sleep(1);
+  await f.readStartup(f.submissions.at(-1)!.prompt);
   const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.turnToken!;
   const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
     f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
@@ -1115,7 +1116,7 @@ for (const manual of [false, true]) test(`Round 7: current native cross-task ins
   const before = f.submissions.length;
   expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(before + 1);
-  expect(f.submissions.at(-1)?.prompt).toContain("Perform the checkpoint delegated task.");
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("Perform the checkpoint delegated task.");
   await f.run(next);
   expect(f.submissions).toHaveLength(before + 1);
 });
@@ -1268,6 +1269,7 @@ for (const manual of [false, true]) test(`Round 8: older accepted discovery cann
   f.controls.started = false;
   const pending = f.run(next);
   while (!f.controls.started) await Bun.sleep(1);
+  await f.readStartup(f.submissions.at(-1)!.prompt);
   const token = manual ? f.controls.safeToken : f.submissions.at(-1)!.turnToken!;
   const claim = await callTurnBroker<{ bindingId: string; activityId?: string; environment: { registryGeneration: number } }>(
     f.provider.chatgptWeb!.brokerSocketPath!, { method: "claim", token, ...(manual ? { contract: "safe" } : {}) });
@@ -1699,8 +1701,9 @@ for (const manual of [false, true]) for (const checkpoint of [false, true]) for 
   const accepted = await f.run(next);
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions.at(-1)!.reused).toBe(true);
-  expect(f.submissions.at(-1)!.prompt).toContain("Next continuity instruction.");
-  expect(f.submissions.at(-1)!.prompt.match(/KEEP_NEW_AGENTS_RULE\./g)).toHaveLength(1);
+  const delivered = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
+  expect(delivered).toContain("Next continuity instruction.");
+  expect(delivered.match(/KEEP_NEW_AGENTS_RULE\./g)).toHaveLength(1);
   const submissions = f.submissions.length;
   expect(await f.run(structuredClone(next))).toEqual(accepted);
   await expect(f.run(changedRequest)).rejects.toMatchObject({ code: "continuity_source_unproven" });
@@ -1773,9 +1776,10 @@ for (const format of ["v1", "v2"] as const) for (const ownership of ["item", "tu
   expect(accepted.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(sends + 1);
   expect(f.submissions.at(-1)!.reused).toBe(true);
-  expect(f.submissions.at(-1)!.prompt).toContain(newUser.content[0]!.text);
-  expect(f.submissions.at(-1)!.prompt.match(/KEEP_RECOVERED_TASK_RULE\./g)).toHaveLength(1);
-  expect(f.submissions.at(-1)!.prompt).toContain("/tmp/recovered-workspace");
+  const delivered = JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt));
+  expect(delivered).toContain(newUser.content[0]!.text);
+  expect(delivered.match(/KEEP_RECOVERED_TASK_RULE\./g)).toHaveLength(1);
+  expect(delivered).toContain("/tmp/recovered-workspace");
   const after = bindings.recoveryStore.get(binding.thread)!;
   expect(after.owner.id).toBe(bindings.owner);
   expect(after.epoch).toBe(before.epoch);

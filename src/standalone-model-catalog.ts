@@ -6,7 +6,7 @@ import metadata from "../launcher/electron/codex-model-metadata.cjs";
 /**
  * Project-owned metadata, not a cached/authenticated OpenAI model. Keep required fields compatible
  * with Codex ModelInfo. Per-route identity, effort and compaction limits remain owned by the
- * existing buildChatGptWebModel/resolveChatGptWebContextLimits implementation.
+ * shared buildChatGptWebModel/resolveChatGptWebHistoryLimits implementation.
  */
 export function buildStandaloneModelCatalog(config: AppConfig): {
   models: Record<string, unknown>[];

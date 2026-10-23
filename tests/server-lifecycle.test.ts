@@ -32,17 +32,17 @@ test("DEV harness configuration cannot bind a Responses listener", () => {
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
 });
 
-test("Luna Bigger Context reaches the adapter for every Free route and response mode", async () => {
+test("Luna reaches the adapter for every Free route and response mode", async () => {
   for (const mode of ["browser-only", "full"] as const) for (const stream of [false, true]) {
     for (const model of ["chatgpt-web/gpt-5.6-luna", "chatgpt-web/luna", "chatgpt-web/think"]) {
-      const config = { ...defaultConfig(mode), solAvailable: false, experimentalBiggerContext: true };
+      const config = { ...defaultConfig(mode), solAvailable: false };
       let adapterStarted = false;
       const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ model, input: "hello", stream }),
       }), config, () => ({
-        name: "luna-bigger-context-test",
+        name: "luna-route-test",
         async runTurn(parsed, _incoming, emit) {
           adapterStarted = true;
           expect(parsed.modelId).toBe("gpt-5.6-luna");

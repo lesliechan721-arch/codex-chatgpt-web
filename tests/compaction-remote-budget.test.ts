@@ -9,7 +9,6 @@ import { registerCompactionSource } from "../src/adapters/chatgpt-web/compaction
 import { createContextSnapshot, serializeContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { ChatGptSuspensionClock, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/suspension-clock";
 import { RemoteTurnBroker, TurnBroker, callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
-import { estimateTokens } from "../src/lib/token-estimate";
 
 function virtualTime() {
   let wall = Date.now(), elapsed = 0;
@@ -48,11 +47,11 @@ for (const mode of ["native", "safe", "manual"] as const) {
       const source = await registerCompactionSource(f.remote, { snapshot: snapshot(),
         ...(transaction ? { contract: "native" as const, transactionToken: transaction.token, handoffId: transaction.handoffId }
           : { contract: "safe" as const, turnToken, handoffId: "safe:remote-source", ...(mode === "manual" ? { explicitManual: true as const } : {}) }),
-        historyRevision: 0, ownerGeneration: "page", availableTokens: 160_000,
+        historyRevision: 0, ownerGeneration: "page",
         expiresAt: () => { const deadline = budget.deadlineAt; if (++reads === 1 && pause) queueMicrotask(() => f.time.sleep(601_000)); return deadline; },
       }, "Summarize the original source");
       const entry = JSON.parse(source.instruction.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
-      expect(entry.overview.remaining_tokens).toBe(160_000 - estimateTokens("Summarize the original source") - 4_096);
+      expect(entry.overview.remaining_tokens).toBeUndefined();
       expect(budget.remainingMs()).toBe(pause ? 59_000 : 60_000);
       if (mode === "safe") await f.remote.requestCompaction(turnToken!, { content: [{ type: "text", text: source.instruction }] });
       if (mode === "manual") f.broker.startSafeTurn(turnToken!);
@@ -97,7 +96,7 @@ for (const mode of ["native", "safe", "manual"] as const) {
       const input = await registration(f, mode, mode === "native" ? 60_000 : 3_600_000);
       const budget = new CompactionDeadline(input.expiresAt);
       let reads = 0;
-      const pending = registerCompactionSource(f.remote, { ...input, availableTokens: 96_000, expiresAt: () => {
+      const pending = registerCompactionSource(f.remote, { ...input, expiresAt: () => {
         const value = budget.deadlineAt;
         if (++reads === 2) queueMicrotask(() => {
           if (outcome === "expired") f.time.awake(60_000);
@@ -187,7 +186,7 @@ test("a caller expired before prepare arrives cannot renew its budget on retry",
     const input = await registration(f, "safe", 3_600_000);
     const budget = new CompactionDeadline(input.expiresAt);
     let first = true;
-    await expect(registerCompactionSource(f.remote, { ...input, availableTokens: 96_000, expiresAt: () => {
+    await expect(registerCompactionSource(f.remote, { ...input, expiresAt: () => {
       const value = budget.deadlineAt;
       if (first) { first = false; queueMicrotask(() => f.time.awake(60_000)); }
       return value;
@@ -201,7 +200,7 @@ test("source validation failure retires its pending budget without consuming sou
   try {
     const input = await registration(f, "native");
     const prepared = await prepare(f, input);
-    await expect(commit(f, { ...input, remainingBudget: { ...input.remainingBudget!, tokens: -1 } }, prepared.budgetToken)).rejects.toBeDefined();
+    await expect(commit(f, { ...input, limits: { readBytes: 1 } }, prepared.budgetToken)).rejects.toBeDefined();
     await expect(prepare(f, input)).rejects.toBeDefined();
     await expect(commit(f, input, prepared.budgetToken)).rejects.toBeDefined();
     const fresh = await registration(f, "native");

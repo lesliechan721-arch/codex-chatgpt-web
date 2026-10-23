@@ -158,6 +158,66 @@ Before treating the feature as release-ready, exercise both Automatic and Zero R
    image check through the final new-ABI path; measure actual attachment limits and a higher count
    before making any capacity claim.
 
+## Default selective reading validation
+
+**Real acceptance remains pending:** no complete Automatic/Zero Risk task acceptance is recorded
+here for protocol 6, `context-bootstrap-payload-v3`, default selective reading, the four history
+tiers, Full/MCP Luna independent compaction or Bigger Context retirement. The controlled results
+below cover specific local/client boundaries. Historical observations retain their original
+versions, dates and limits; they do not prove the new contract.
+
+### Recorded implementation evidence (2026-10-23)
+
+| Observation | Actual result | Evidence limit |
+| --- | --- | --- |
+| Isolated client/catalog boundary probe | Codex CLI 0.163.0 completed **41 of 41 controlled cases** through a loopback response stub and an isolated model catalog. Cases covered C−1/C/C+1 and H−1/H/H+1 for all four H/C tiers, plus lower and higher user window/compaction settings. The public resolver row used 500,000 / 450,000 with a 90% ratio. | Usage was synthetic and requests were short. This checks actual Codex catalog loading, user-setting bounds and compaction triggers. It does not measure ChatGPT capacity, remote schema adoption, model recall or complete real tasks. |
+| Fixed eight-Scope comparison | Actual Scope read-chain samples included a long-assistant case whose required body bytes changed from **237,011 to 15,331**, and required text batches from **9 to 1**. | These are required-body and batch observations from actual Scope reading. They are not full-task cost, model latency, Send-to-ready timing or answer-quality measurements. Optional reads and other complete-task costs remain separate. |
+
+The client probe uses [scripts/probe-session-continuity-budget.ts](../scripts/probe-session-continuity-budget.ts).
+Run it with the target Codex binary and retain its controlled output separately:
+
+```sh
+bun run scripts/probe-session-continuity-budget.ts --codex=/path/to/codex --output=/tmp/client-boundaries.json
+```
+
+Three attempts used the same no-tool DEV smoke task on 2026-10-23:
+
+| Attempt | Observed boundary | Send/result state |
+| --- | --- | --- |
+| First | Session inspection timed out after 30 seconds. | Failed before Send. |
+| Second | A temporary continuity lock conflict blocked preparation. | No Send. The lock later released without intervention. |
+| Third | The attempt reached the current helper, which reported that the ChatGPT composer was unavailable. | `submission=prepared`, `returned_calls=0`. The original attempt still required confirmation; no replacement Send was issued for an unknown result. |
+
+These blocked attempts do not establish successful browser delivery, `context_ready`, model body
+use or task completion. Real Automatic and Zero Risk retrieval of an implicitly referenced old
+answer, startup timing and complete-task reading cost remain unaccepted. No speedup is established.
+The full test suite is still being updated for migration; no final suite total is recorded here.
+
+### Remaining acceptance checks
+
+| Check | Required current evidence |
+| --- | --- |
+| Startup and fidelity | Short input, long assistant bodies, many small records, long rules, long current requests, duplicate user events and mixed skills/images. Required requests/rules/delegation/checkpoints remain exact; unknown scope remains conservative. Optional bodies and source_map do not enter required delivery. Restore exact fields from current sources; forged markers and same-name user fields grant no authority. |
+| Relative history use | A real model resolves “the second option in your last answer” by order/search and reads that answer before the dependent action. Server coverage alone is insufficient. |
+| Delivery and reuse | Fixed required chain reaches ready without source_map or optional reads. No empty required read or mandatory directory traversal. Same-page exact rules reuse; new page, restart and known compaction redeliver. Old/cross-scope receipts cannot advance coverage. |
+| No cumulative gate | Compare identical single-operation inputs below/above the old page threshold and 600k. Send/read/completion/page choice are unchanged except diagnostics. Missing cost records alone do not force recovery. Ordinary and compaction reads can exceed 96k, old page limits and 600k, including a required chain larger than the old page pool. Storage, time, images and single-response limits still apply. |
+| History mapping | Check all available account/model/effort/mode/host/task-policy combinations against the maintained table. Check old-tier boundaries 99,999/100,000/199,999/200,000/299,999/300,000, aliases and unavailable routes. Full + Launcher has no tier override. Native catalogs are unchanged. |
+| Client thresholds | Integrate C−1/C/C+1 for 180k, 270k, 450k and 540k, including 539,999/540,000/540,001, plus H−1/H/H+1 and lower user settings. H/C are not server cumulative rejection gates. |
+| Luna routes | Full/MCP Luna/Think reports canonical usage and can compact independently at 180k using complete legal read-only sources. Browser-only Luna retains rolling projection and its original compaction trigger. A short startup cannot be reported as full history usage. |
+| Retirement and migration | All UI/languages/recommendations/config/status/capability/API/IPC surfaces stop offering Bigger Context. Old true/false/absent settings normalize alike, old flags warn without changing behavior. New ordinary/compaction plans create no stage/commit sends. Old staged bodies/checkpoints survive as sources; old scopes finish or invalidate and upgrades revoke credentials. |
+| Independent limits and authority | H/C and page accounting do not change single-message/read-response/image/attachment/storage/time boundaries. Browser-only gains no MCP or multipart delivery. Source/owner/permissions/ACK/settlement remain gates. Zero Risk stays manual. Unknown Send cannot trigger resend. Compaction retains read-only authority, in-flight settlement, source failures and its finite deadline. |
+| Compatibility and real errors | Driver/Broker/Helper agree on protocol 6 and payload v3. Before Send, only legal complete inline fallback or explicit capability/single-limit failure; no version-5 shared quota fallback. After Send, no replan/resend. Actual platform refusal follows original finite recovery. |
+
+For fixed samples record required bytes/tokens, batch count, source_map bytes, startup and full-task
+read calls, category counts, retain/optional reasons and page-change reasons. Long optional assistant
+body growth must not cause equal required-body growth; position metadata still has a cost. Compare
+complete costs and retain inline when selective delivery gives no benefit. Do not output bodies or
+credentials in diagnostics.
+
+Actual Automatic and Zero Risk runs must measure Send/confirmed Send to `context_ready`, total
+reading cost, waits and completion separately. No speedup percentage or answer-quality claim is
+accepted from smaller startup token estimates alone. Record results here only after execution.
+
 ## Short-start context validation
 
 `context-bootstrap-v1` implementation and local tests are separate from release acceptance.
@@ -169,7 +229,7 @@ thresholds for every account or model.
 
 Validate ordinary Automatic and Zero Risk Full/MCP against the
 [short-start contract](context-navigation.md#short-startup-and-required-text). Keep Browser-only,
-upstream API forwarding, legacy inline, compaction and existing multipart regressions separate.
+upstream API forwarding, legal inline, compaction and historical multipart-source regressions separate.
 
 | Gate | Required evidence |
 | --- | --- |
@@ -178,7 +238,7 @@ upstream API forwarding, legacy inline, compaction and existing multipart regres
 | Delivery | Missing/overlapping/repeated/out-of-order pages, empty sources, multibyte boundaries, malformed batch-v1 metadata, failed transport, wrong digest/index/range, cross-source/scope, revocation and late receipts. Only valid range unions reach ready. |
 | Execution | Early business calls, inventory and no-tool direct success fail in both modes; existing wait/replay/ACK/control remains usable. Rejected IDs stay rejected; new decisions use new IDs. Verify atomic generation/revision checks and exact output-schema values. |
 | Independent controls | MCP and fallback images, configured Sent on/off, duplicate start, pending Sent without read spending, and image-first guidance. Text does not advance image progress or extend deadlines. Updates and ACK remain independent of initial coverage. |
-| Capacity | All fixed required batches, initial/final overview, image recovery controls, startup/result wrappers, cursors, required images, corrective replies, one maximum-return recovery allowance and working reserves count. No mandatory entries traversal is reserved. On-demand reads cannot exhaust protected required capacity. A shorter composer can cost more total tokens. Impossible complete plans fail before Send. |
+| Capacity | Each fixed required batch and actual startup fits its independent single-return/single-message limit. Snapshot storage, images, processing time and correction counts remain bounded. The total required chain, page estimates and cumulative wire/token counts cannot reject planning or reads. No mandatory entries traversal is required. A shorter startup can cost more total tokens. |
 | Lifecycle | Same-scope retry, retained suffix, new-page/cold recovery, restart, unknown Send, active updates before/during/after reading, final lock, cancellation and compaction. Fresh scopes start with zero coverage; compaction keeps optional reads. |
 | Compatibility | Missing/old/failed diagnosis does not select a plan. Current missing capabilities and remote old schema fail explicitly; valid custom identities remain supported. Only a complete pre-send candidate independent of the incompatible context interface can fall back; old read parameters cannot. No post-send automatic reroute. |
 | Protocol migration | Account for P01–P13: role/trust, execution, wait, updates, navigation, batch-v1 read, images, attachments/skills, real errors and safety recovery, retained/recovered context, output schema, final output and mode-specific completion. Verify all unique conditions and exceptions remain reachable. Server instructions/tool descriptions must not repeat full protocols. Current errors alone select recovery; the three-attempt rule applies only to unexplained platform safety-check rejection. |
@@ -286,7 +346,8 @@ configuration does not prove that an installed Launcher uses that runtime.
 
 ## Context batch and short-start validation
 
-Protocol 4, manifest 3 and `context-text-batch-v1` require fresh acceptance. Historical single-read,
+Batch-v1 originally used protocol 4. Current protocol 6 with manifest 3 and `context-text-batch-v1`
+requires fresh acceptance together with selective payload v3. Historical single-read,
 image and renderer results above do not prove this contract or its larger response limits.
 Real Automatic, Zero Risk and applicable installed Codex validation is pending. Local parser,
 DEV simulation and offline replay do not establish remote schema adoption or model body use.
@@ -303,10 +364,11 @@ images retain their separate receipt/confirmation and Send/Sent/ACK remain indep
 Local acceptance must cover strict 0/1/8/9 arrays, duplicate targets, invalid suffixes, old schemas,
 complete UTF-8 reconstruction, all-block validation, packaging/argument limits, deterministic
 partial pages, whole-batch receipts, cancellation, late scope callbacks and canonical replay.
-Prove that partial coverage does not release proportional reservation credit, generated response
-costs remain charged after failed transport, one finite maximum-return allowance serves both retry and replay, and the
-final overview retains it until first business/success admission. Impossible complete plans fail
-before Send; running out of recovery cannot waive coverage or consume protected workspace funds.
+Prove that only actual supported transport receipts advance required range coverage, while failed
+transmissions and repeats remain diagnostic costs. Keep each complete response within its fixed
+limits. Cumulative page/token/wire accounting and summary/work reserves must not become reading
+or completion gates. Correction exhaustion cannot waive required coverage.
+
 Compaction may still read partially or not at all and waits for in-flight reads before submission.
 
 Real validation must record remote acceptance of the array schema, intact maximum candidate
@@ -372,8 +434,8 @@ Record the following before claiming page-lifecycle recovery validated:
     non-externalizable instructions, image/attachment, input/output, snapshot, and navigation
     limits. Report actual source/read/plan budgets and preserve required bodies. A missing
     `previous_response_id` cache keeps its API-context 409. Corrected requests retain recovery
-    eligibility. Load the public 1,000,000 / 900,000 history settings with the target Codex binary
-    and lower client limits; this is not proof of million-token browser capacity.
+    eligibility. Load each current account/model H/C tier with the target Codex binary and lower
+    client limits; these checks do not measure browser capacity.
 11. Exercise five physical pages, safe idle reclamation, and cleanup that never destroys a page.
     Closing/fault documents still occupy slots, with at most three automatic closes per fixed
     cleanup transaction. Logical revocation cannot permit a sixth page. Retain only minimum
@@ -382,7 +444,8 @@ Record the following before claiming page-lifecycle recovery validated:
 12. Cover Automatic, Zero Risk, local Web API Key access, and excluded Browser-only, non-Launcher,
     Luna, Think, and upstream API paths. Fresh affects logical sends rather than tool round trips,
     retries, or updates, and cannot bypass live-page conflicts. Preserve Zero Risk Send, Sent,
-    attachment and ended-response handoff boundaries and Bigger Context prohibition. Confirm one
+    attachment and ended-response handoff boundaries. Verify removal of Bigger Context controls and
+    new stage/commit planning; historical staged sources stay readable without replay. Confirm one
     accurate recovery notice and bounded logs without prompt bodies, tool results, or credentials.
 
 Real Launcher pages must cover items 1, 3, 5, and 6 in Automatic and Zero Risk, in addition to
@@ -395,7 +458,10 @@ and remaining navigation/platform combinations. Update this list only when new e
 The maintained contract is [session continuity](session-continuity.md).
 Keep raw controlled output and acceptance records in the local ignored task workspace.
 
-### Current unified-budget evidence
+### Historical unified-budget evidence (2026-10-12)
+
+This record tested the former 1,000,000 / 900,000 policy. It is not acceptance of the current four
+history tiers, protocol 6, selective payload v3, or removal of cumulative gates.
 
 The 2026-10-12 target-Codex loopback probe used synthetic usage without ChatGPT sending. Three
 usage scopes passed with the public 1,000,000 / 900,000 resolver settings; six lower-window,
