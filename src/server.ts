@@ -1270,7 +1270,7 @@ export async function responseRequest(
 
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
-  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {
+  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && config.mode !== "full") {
     return formatErrorResponse(
       409,
       "invalid_request_error",
@@ -1575,7 +1575,7 @@ export async function compactRequest(
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
-  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {
+  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && config.mode !== "full") {
     return formatErrorResponse(
       409,
       "invalid_request_error",

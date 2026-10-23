@@ -416,7 +416,7 @@ export function restoreContextSnapshot(wire: unknown, options: { maxStorageBytes
 export interface FixedContextRecord {
   text: string;
   encoding: "utf-8" | "deterministic-json";
-  origin: "context_bootstrap_protocol" | "context_bootstrap_payload" | "context_reuse_unit";
+  origin: "context_bootstrap_protocol" | "context_bootstrap_payload" | "context_reuse_unit" | "context_source_map";
   originalRole?: string;
 }
 export function appendFixedContextRecords(snapshot: ContextSnapshot, records: readonly FixedContextRecord[],
@@ -433,6 +433,7 @@ export function appendFixedContextRecords(snapshot: ContextSnapshot, records: re
       encoding: record.encoding, utf8_bytes: Buffer.byteLength(record.text), content_digest: digest(record.text),
       mime_type: null, image_bytes: null, visual_token_reserve: null,
       label: record.origin === "context_bootstrap_protocol" ? "Required execution protocol"
+        : record.origin === "context_source_map" ? "Detailed source mapping"
         : record.origin === "context_reuse_unit" ? "Exact current context unit" : "Required exact task context value tree",
       label_source: "excerpt", unavailable_reason: null, error_status: "not_error",
       relation: { state: "not_applicable", call_count: 0, result_count: 0, related_target_ids: [] } };

@@ -13,7 +13,7 @@
     "tests/browser-turn-binding.test.ts": "bdd86c7bfc5eeb502543445aa2121f3ef90d044c4d950cfc3f364fd4ac885b64",
     "tests/chatgpt-effort-browser.test.ts": "4d2f62c37a28cfd2d77a4fa3a6e7d7255bb4e31c75a74c5341a0321571598261",
     "tests/chatgpt-limits-browser.test.ts": "7c586f0a5ab8581fcfaa99dafee84e4d933832ea2eabe04374bbf1400ce67721",
-    "tests/chatgpt-markdown-parser.test.ts": "a33e69d8d33fa50a7435dee4361c61d11bc4af03deb7c3a3dabf002e9d0d1f72",
+    "tests/chatgpt-markdown-parser.test.ts": "027e58292c1aae46966005859fac96cedf6af926dff1592d9008f3fee6c08102",
     "tests/chatgpt-model-family-browser.test.ts": "9f7e1193d77898775cfba5710e76d3df86e8ac6c00a363345ba367f721bc2eac",
     "tests/composer-insert.test.ts": "a7978cbddb18bec51e4d272cd3bdf84e879ddd102d88a1cf3f7a875935e3d484",
     "tests/continuity-lock-windows.test.ts": "78b1cdfc76cb5e8853f8148d3898424bd9b436d509fe782bd2318437f83b3afb",
@@ -21,11 +21,10 @@
     "tests/launcher-navigation-viewport.test.ts": "59ade91f7f1e0a32d24232a3830a4eefab40545b2586c439f847d91760e93607",
     "tests/launcher-system-theme.test.ts": "f47587d58ad00d56b22abe97170e7ab35d18f41d28fcdee5d9372e2ad00ae20d",
     "tests/launcher-viewport-browser.test.ts": "e6a19ee56653f4064adf52370f30da41bc564d3adab695a43031664ec0732799",
-    "tests/multipart-history.test.ts": "bf7e7386489bafac7f26fbf5f4ba4bcdfcc89ad5654a37ed3ad1c1562af0931b",
     "tests/server-deploy.test.ts": "da2f8241519ff407bef78b562efe41b4d8d1fbf44905442408d43ac4380ee101",
-    "tests/session-continuity-checkpoint.test.ts": "e52491040233bb502ebd98aaa185862a2b7aa365b152888a6c7e2863d199aa0b",
-    "tests/session-continuity-compaction.test.ts": "71da4831399f2f67330dbe2deddc8d5bd38233454d07ec09b5c8b24840950fc0",
-    "tests/session-continuity-recovery.test.ts": "43baf0e23ea329c0d9d64c2b9672eca9b9409fb3c26e36671b7faa2d2e5d0d56",
+    "tests/session-continuity-checkpoint.test.ts": "fdf465a9da2c93fca364f53d9a05637b0c3a1c84db522f144c80111284d8bd7c",
+    "tests/session-continuity-compaction.test.ts": "bcfe859d1e1dea417dc39d093a8b37c0227e8b14c32f0a0514e6af524791221c",
+    "tests/session-continuity-recovery.test.ts": "e64546a032edcb67ae55890e3fcc0b3a7ac8073f568c3e7d8521685347b8307c",
     "tests/submission-error-alert.test.ts": "d6ac5074e3e32bcc44ac71d09152a67bf51b4c290719d1bd039ced2cf158395a",
     "tests/tool-approval-dom.test.ts": "7a06750046002a550d39231cdff851c29c0f0a33f54d190bb8fa91d64c50fde6",
     "tests/validate-context-rendering.test.ts": "27cbe3e193b2e5a51faa0c7ef71dc263a357fb592fb4471fabafddaf394bf126"
@@ -495,36 +494,6 @@
       "file": "tests/launcher-viewport-browser.test.ts",
       "name": "finishing another Electron tab preserves the open model picker and viewport",
       "reason": "!process.env.LAUNCHER_TEST_ELECTRON：未提供非空的可选 Electron 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "a new multipart user message is accepted before ChatGPT mounts its assistant area",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "a previously acknowledged but unmounted stage cannot acknowledge the next Send when it returns",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "acknowledged multipart history can rekey without becoming a new submission",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "multipart history does not admit mismatched, unfinished, duplicated or unrelated exchanges",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "pending multipart submissions do not expand their transient user bubble while earlier stages remain accounted for",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
-    },
-    {
-      "file": "tests/multipart-history.test.ts",
-      "name": "rekeyed multipart stages verify the full message behind a collapsed middle preview",
-      "reason": "!process.env.CHATGPT_DOM_TEST_BROWSER：未提供非空的可选 Chromium 路径；未区分未设置和空值。"
     },
     {
       "file": "tests/server-deploy.test.ts",

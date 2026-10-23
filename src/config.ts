@@ -140,7 +140,6 @@ export interface AppConfig {
   solAvailable: boolean;
   extraHighAvailable?: boolean;
   proAvailable: boolean;
-  experimentalBiggerContext: boolean;
   composerPredictionsEnabled: boolean;
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
@@ -285,7 +284,6 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     solAvailable: true,
     extraHighAvailable: false,
     proAvailable: false,
-    experimentalBiggerContext: false,
     composerPredictionsEnabled: false,
     experimentalSkillAttachments: false,
     experimentalFreshConversationPerTurn: false,
@@ -456,7 +454,7 @@ export function loadConfigForSetup(): AppConfig {
 
 function parseConfig(value: unknown, path: string): AppConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid configuration object in ${path}`);
-  const parsed = value as Partial<AppConfig>;
+  const parsed = value as Partial<AppConfig> & { experimentalBiggerContext?: unknown };
   if (parsed.version !== 3) throw new Error(`Unsupported configuration version in ${path}; rerun setup to migrate it`);
   if (parsed.purpose !== undefined && parsed.purpose !== "dev-harness") {
     throw new Error(`Invalid configuration purpose in ${path}`);
@@ -595,6 +593,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && typeof parsed.experimentalBiggerContext !== "boolean") {
     throw new Error(`Invalid experimentalBiggerContext in ${path}`);
   }
+  delete parsed.experimentalBiggerContext;
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
@@ -628,16 +627,12 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (browserInteractionMode === "manual" && experimentalSkillAttachments) {
     throw new Error(`Zero Risk does not support Skills as files in ${path}`);
   }
-  const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   const zeroRiskRequireSentConfirmation = parsed.zeroRiskRequireSentConfirmation !== false;
   for (const key of ["maxComposerCodePoints", "automaticMaxComposerCodePoints", "zeroRiskMaxComposerCodePoints"] as const) {
     if (parsed[key] !== undefined && (!Number.isSafeInteger(parsed[key]) || Number(parsed[key]) < 1)) {
       throw new Error(`Invalid ${key} in ${path}: expected a positive safe integer`);
     }
-  }
-  if (browserInteractionMode === "manual" && experimentalBiggerContext) {
-    throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
   }
   if (parsed.extraHighAvailable === true && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Extra High requires Sol`);
@@ -654,7 +649,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
     subagentProtocol,
     solAvailable,
     proAvailable,
-    experimentalBiggerContext,
     composerPredictionsEnabled,
     experimentalSkillAttachments,
     experimentalFreshConversationPerTurn,
@@ -667,7 +661,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
 export function saveConfig(config: AppConfig): void {
   const path = getConfigPath();
   const original = existsSync(path) ? readFileSync(path, "utf8") : "";
-  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(config, null, 2)}\n`, original));
+  const persisted: AppConfig & { experimentalBiggerContext?: unknown } = { ...config };
+  delete persisted.experimentalBiggerContext;
+  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(persisted, null, 2)}\n`, original));
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {
@@ -715,7 +711,6 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       solAvailable: manual ? false : config.solAvailable,
       extraHighAvailable: !manual && config.extraHighAvailable === true,
       proAvailable: manual ? false : config.proAvailable,
-      experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       experimentalSkillAttachments: manual ? false : config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: !manual && config.experimentalFreshConversationPerTurn === true,
       useSavedChats: config.useSavedChats === true,

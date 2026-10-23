@@ -18,7 +18,6 @@ const DEFAULT_STATE = Object.freeze({
   autoApproveToolCalls: false,
   browserInteractionMode: "automatic",
   toolAuthorityMode: "verified-environment",
-  experimentalBiggerContext: false,
   composerPredictionsEnabled: false,
   experimentalSkillAttachments: false,
   experimentalFreshConversationPerTurn: false,
@@ -45,6 +44,8 @@ function readState(filePath) {
     if (!parsed || parsed.version !== 1) return { ...DEFAULT_STATE };
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
+    delete state.experimentalBiggerContext;
+    delete state.biggerContextAvailable;
     if (state.language !== null && (typeof state.language !== "string" || !Object.hasOwn(languages, state.language))) {
       state.language = DEFAULT_STATE.language;
     }
@@ -56,7 +57,6 @@ function readState(filePath) {
       "keepRunningOnClose",
       "showBrowserDuringTurns",
       "autoApproveToolCalls",
-      "experimentalBiggerContext",
       "composerPredictionsEnabled",
       "experimentalSkillAttachments",
       "experimentalFreshConversationPerTurn",
@@ -137,6 +137,8 @@ function createStateStore(filePath) {
     },
     update(patch) {
       const next = { ...state, ...patch, version: 1 };
+      delete next.experimentalBiggerContext;
+      delete next.biggerContextAvailable;
       writeState(filePath, next);
       state = next;
       return structuredClone(next);

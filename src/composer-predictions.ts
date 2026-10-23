@@ -23,7 +23,6 @@ export function configureComposerPrediction(parsed: CodexParsedRequest, config: 
   return {
     ...config,
     mode: "browser-only",
-    experimentalBiggerContext: false,
     experimentalSkillAttachments: false,
     experimentalFreshConversationPerTurn: true,
     useSavedChats: false,

@@ -8,6 +8,10 @@ import { bindContextFullCandidate, bindContextInstructionInputSource, contextCan
 import { continuityCurrentEnvironmentInput, continuityCurrentInstructionInput } from "../src/adapters/chatgpt-web/environment";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { preflightContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
+import { planContextDelivery } from "../src/adapters/chatgpt-web/context-planner";
+import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
+import { measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
+import { contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { defaultConfig } from "../src/config";
 import { routeChatGptWebRequest } from "../src/server";
@@ -391,18 +395,63 @@ describe("continuity candidate source mapping", () => {
     expect(selected).toEqual(original);
   });
 
-  test("cold recovery capacity includes required task text restored from the retained page", () => {
+  test("cold recovery delivers exact restored task text beyond cumulative page estimates", () => {
     const current = instruction("current", "current", "Current task.");
     const parsed = request([current]);
     parsed.modelId = CHATGPT_WEB_MODEL_ID;
+    const original = structuredClone(parsed);
+    const text = "Original active task. ".repeat(60_000);
     const selected = continuityRecoveredContextCandidate(parsed, recovered(parsed), undefined,
-      [instruction("previous", "prior", "Original active task. ".repeat(60_000)), current]);
+      [instruction("previous", "prior", text), current]);
     expect(selected.context.messages).toHaveLength(2);
-    expect(() => preflightContinuityInput(selected, {
-      localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false,
-    })).toThrow();
+    const canonical = contextCandidateCanonicalSource(parsed, selected)!;
+    expect(contextCandidateMessageIndices(canonical, selected)).toEqual([0, 1]);
+    expect(contextCandidateRawInputIndices(canonical, selected)).toEqual([0, 1]);
+    expect(contextCandidateRestoredMessageIndices(canonical, selected)).toEqual([0]);
+    const provenance = contextCandidateSourceProvenance(canonical, selected)!;
+    expect(provenance.get(0)).toEqual({ restored: true });
+    const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
+    expect(() => preflightContinuityInput(selected, capabilities, false, false, { retainedTokens: 1_000_000 })).not.toThrow();
+    const plan = planContextDelivery({ canonical, candidate: selected,
+      snapshot: createContextSnapshot(canonical, { provenanceByMessage: provenance }),
+      messageIndices: contextCandidateMessageIndices(canonical, selected),
+      rawInputIndices: contextCandidateRawInputIndices(canonical, selected),
+      capabilities, contextToolsAvailable: true, turnToken: `turn_${"a".repeat(32)}`,
+      budget: { contextWindowTokens: 1, retainedTokens: 1_000_000 } });
+    expect(plan.registration!.startupProtocol).toBe("context-bootstrap-v1");
+    expect(Array.from(plan.compiled.text).length).toBeLessThanOrEqual(8000);
+    expect(plan.costs.requiredMcpTokens).toBeGreaterThan(90_000);
+    const restoredTarget = plan.snapshot.targets.find(target => target.locator.message_index === 0)!;
+    expect(restoredTarget).toMatchObject({ provenance: "verified_restoration", original_role: "user" });
+    expect(plan.registration!.deliveryByTarget[restoredTarget.target_id]).toMatchObject({ delivery: "source_required_record" });
+    const scope = new ContextScope("cold-recovery-restored-task", plan.registration!, "normal", () => {}, error => { throw error; });
+    const bodies = new Map<string, string>();
+    try {
+      scope.markEntryDelivered();
+      for (let count = 0; !scope.status().text_ready && count < 200; count++) {
+        const reply = scope.prepare("read", scope.status().next_required_read!.arguments);
+        expect(reply.result.isError).not.toBe(true);
+        const cost = measureContextResponse(reply.result);
+        expect(cost.text_tokens).toBeLessThanOrEqual(plan.limits.readTokens);
+        expect(cost.wire_bytes).toBeLessThanOrEqual(plan.limits.readBytes);
+        const page = parseContextTextReadResult(reply.result);
+        for (const [index, item] of page.metadata.items.entries()) {
+          const previousText = bodies.get(item.read_ref) ?? "";
+          expect(item.range.start).toBe(Buffer.byteLength(previousText));
+          bodies.set(item.read_ref, previousText + page.bodies[index]!);
+        }
+        scope.finish(reply.receiptId, true, contextTextReadReceipt(reply.result));
+      }
+      expect(scope.status().context_ready).toBe(true);
+      const payloadTarget = plan.snapshot.targets.find(target => target.origin === "context_bootstrap_payload")!;
+      const payload = JSON.parse(bodies.get(payloadTarget.read_ref!)!);
+      expect(payload.format).toBe("context-bootstrap-payload-v3");
+      expect(payload.payload.messages.map((message: { content: unknown }) => message.content)).toEqual([text, "Current task."]);
+      expect(payload.external_positions).toEqual([]);
+    } finally { scope.retire(); }
     expect((parsed._rawBody as { input: unknown[] }).input).toHaveLength(1);
-  });
+    expect(parsed).toEqual(original);
+  }, 30_000);
 
   test("recovery binding rejects changed original source, fabricated instructions and ambiguous call returns", () => {
     const result = { type: "function_call_output", call_id: "actual", output: "Real return." };

@@ -56,7 +56,7 @@ export function measureContextRendering() {
           inline_visible_bytes: inline.costs.promptBytes, inline_json_bytes: inline.costs.promptJsonBytes,
           inline_tokens: inline.costs.promptTokens, selected_visible_bytes: plan.costs.promptBytes,
           selected_editor_characters: plan.costs.promptCharacters, selected_json_bytes: plan.costs.promptJsonBytes,
-          selected_tokens: plan.costs.promptTokens, acknowledgement_tokens: plan.costs.acknowledgementTokens,
+          selected_tokens: plan.costs.promptTokens,
           navigation_entry_bytes: plan.costs.navigationPromptBytes, attachment_bytes: plan.costs.attachmentBytes,
           image_visual_reserve: plan.costs.attachmentVisualTokens + plan.costs.requiredMcpTokens,
           ...replay, total_estimated_tokens: plan.costs.promptTokens + replay.mcp_conservative_tokens,

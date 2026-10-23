@@ -11,16 +11,16 @@ import { ContextNavigator } from "../src/adapters/chatgpt-web/context-navigator"
 import { contextErrorReserve, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
 import { planContextDelivery, type ContextDeliveryPlan, type ContextDeliveryPlanInput } from "../src/adapters/chatgpt-web/context-planner";
-import { ContextDeliveryPlanningError, contextAttachmentImage } from "../src/adapters/chatgpt-web/context-media-plan";
+import { contextAttachmentImage } from "../src/adapters/chatgpt-web/context-media-plan";
 import { assertContinuityCompiledInput, preflightContinuityInput } from "../src/adapters/chatgpt-web/continuity-input";
 import { CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
-import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
+import { contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { estimateWebContextFieldCost } from "../src/adapters/chatgpt-web/context-renderer";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
 import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 
-// These cases exercise the retained inline/on-demand contract. Bootstrap admission
-// and its independent default composer limit have dedicated tests.
+// A large composer limit lets these cases compare complete inline and selective
+// delivery costs. The production composer boundary has separate bootstrap tests.
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false, maxComposerCodePoints: 2_000_000 };
 const token = `turn_${"a".repeat(32)}`;
 const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4nGP4z8DwHwwZGP6DAQBJyAn3FGMynQAAAABJRU5ErkJggg==";
@@ -52,13 +52,13 @@ function plan(canonical: CodexParsedRequest, overrides: Partial<ContextDeliveryP
     turnToken: token, contextToolsAvailable: true, ...overrides });
 }
 function entry(result: ContextDeliveryPlan): Record<string, any> {
-  const match = /<codex_context_navigation_json>\n([^\n]+)\n<\/codex_context_navigation_json>/.exec(result.compiled.text);
+  const match = /<codex_bootstrap_json>\n([^\n]+)\n<\/codex_bootstrap_json>/.exec(result.compiled.text);
   expect(match).not.toBeNull();
   return JSON.parse(match![1]!);
 }
 function navigator(result: ContextDeliveryPlan): ContextNavigator {
   const published = entry(result);
-  expect(published.first_call.arguments.context_id).toBe(result.registration!.snapshot.context_id);
+  expect(published.context_id).toBe(result.registration!.snapshot.context_id);
   return new ContextNavigator({ scopeId: token, snapshot: result.registration!.snapshot, purpose: "normal",
     deliveryByTarget: result.registration!.deliveryByTarget, limits: result.registration!.limits });
 }
@@ -66,7 +66,7 @@ function entries(result: ContextDeliveryPlan): Array<Record<string, any>> {
   const nav = navigator(result), published = entry(result), all: Array<Record<string, any>> = [];
   let cursor: string | undefined;
   do {
-    const response = nav.list({ context_id: published.first_call.arguments.context_id, view: "entries", ...(cursor ? { cursor } : {}) });
+    const response = nav.list({ context_id: published.context_id, view: "entries", ...(cursor ? { cursor } : {}) });
     expect(response.isError).not.toBe(true);
     const body = response.structuredContent as Record<string, any>;
     all.push(...body.entries); cursor = body.next_cursor ?? undefined;
@@ -74,15 +74,59 @@ function entries(result: ContextDeliveryPlan): Array<Record<string, any>> {
   return all;
 }
 
-test("large history fields use the real compiler and exact pagination without changing canonical sources", () => {
+function readText(result: ContextDeliveryPlan, readRef: string): string {
+  const nav = navigator(result);
+  let text = "", cursor: string | undefined;
+  do {
+    const response = nav.read({ context_id: result.snapshot.context_id, reads: [{ read_ref: readRef, ...(cursor ? { cursor } : {}) }] });
+    expect(response.isError).not.toBe(true);
+    const page = parseContextTextReadResult(response);
+    text += page.bodies[0]!;
+    cursor = page.metadata.items[0]!.next_cursor ?? undefined;
+  } while (cursor);
+  return text;
+}
+
+function payload(result: ContextDeliveryPlan): Record<string, any> {
+  const target = result.snapshot.targets.find(value => value.origin === "context_bootstrap_payload")!;
+  expect(result.registration!.deliveryByTarget[target.target_id]!.required).toBe(true);
+  const value = JSON.parse(readText(result, target.read_ref!));
+  expect(value.format).toBe("context-bootstrap-payload-v3");
+  return value;
+}
+
+function externalizedSources(result: ContextDeliveryPlan): string[] {
+  return result.snapshot.targets.filter(target => target.origin !== "context_bootstrap_payload"
+    && target.origin !== "context_bootstrap_protocol" && result.externalizedTargetIds.includes(target.target_id))
+    .map(target => target.target_id);
+}
+
+function requiredImages(result: ContextDeliveryPlan): number {
+  const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
+  try { return scope.status().required_images; } finally { scope.retire(); }
+}
+
+function deliverRequired(scope: ContextScope): void {
+  for (let count = 0; !scope.status().context_ready && count < 500; count++) {
+    const next = scope.status().next_required_read;
+    expect(next).not.toBeNull();
+    const reply = scope.prepare("read", next!.arguments);
+    expect(reply.result.isError).not.toBe(true);
+    scope.finish(reply.receiptId, true, reply.result.content.some((value: any) => value.type === "image")
+      ? undefined : contextTextReadReceipt(reply.result));
+  }
+  expect(scope.status().context_ready).toBe(true);
+}
+
+test("large history fields use v3 placements and exact pagination without changing canonical sources", () => {
   const text = "日志🙂 line with \\\"quoted\\\" path\\n".repeat(1500);
   const canonical = logRequest(text), snapshot = createContextSnapshot(canonical);
   const before = structuredClone(canonical), sourceBefore = snapshot.toWire();
   const result = plan(canonical, { snapshot });
   expect(result.navigationEnabled).toBe(true);
-  expect(result.externalizedTargetIds).toHaveLength(1);
+  expect(externalizedSources(result).length).toBeGreaterThan(0);
+  expect(result.registration!.startupProtocol).toBe("context-bootstrap-v1");
   expect(result.costs.netSavedPromptBytes).toBeGreaterThan(0);
-  expect(result.compiled.text).toContain("codex_context_ref");
   expect(entry(result).first_call.arguments.turn_token).toBe(token);
   expect(result.compiled.turnToken).toBe(token);
   expect(result.compiled.text.split(token)).toHaveLength(2);
@@ -105,10 +149,22 @@ test("large history fields use the real compiler and exact pagination without ch
   } while (cursor);
   expect(read).toBe(text);
   expect(end).toBe(Buffer.byteLength(text));
-  const recompilation = compileChatGptWebPrompt(result.projected, capabilities, token, {
-    contextNavigation: { plan: result.compiled.contextPlan!, overview: entry(result).overview, requiredImages: 0 },
-  });
-  expect(result.compiled).toEqual(recompilation);
+  const source = payload(result), position = source.external_positions.find((value: any) => value.target_id === field.target_id);
+  expect(position).toMatchObject({ path: ["messages", 2, "content"], original_role: "toolResult", source_index: field.source_index,
+    read_ref: field.read_ref, content_digest: field.content_digest, utf8_bytes: Buffer.byteLength(text) });
+  expect(source.payload.messages[2].content).toBeNull();
+  source.payload.messages[2].content = read;
+  expect(source.payload.system).toEqual(["Keep system instruction."]);
+  expect(source.payload.messages[0].content).toBe("Run the test and check the recorded result.");
+  expect(source.payload.messages[3].content).toBe("Use the existing result.");
+  const mapTarget = result.snapshot.targets.find(value => value.origin === "context_source_map")!;
+  expect(source.source_map).toMatchObject({ context_id: result.snapshot.context_id, target_id: mapTarget.target_id,
+    read_ref: mapTarget.read_ref, content_digest: mapTarget.content_digest });
+  expect(result.registration!.deliveryByTarget[mapTarget.target_id]).toMatchObject({ required: false, delivery: "source_on_demand" });
+  expect(source.sources).toBeUndefined();
+  expect(source.targets).toBeUndefined();
+  const mapping = JSON.parse(readText(result, mapTarget.read_ref!));
+  expect(mapping.targets.some((value: any) => value.target_id === mapTarget.target_id)).toBe(false);
 });
 
 test("short fields and a negative full-prompt benefit keep the original fast path", () => {
@@ -127,7 +183,7 @@ for (const manual of [false, true]) for (const length of [6000, 10000]) {
     const inline = plan(canonical, { snapshot, compileOptions, contextToolsAvailable: false });
     const result = plan(canonical, { snapshot, compileOptions });
     expect(result.navigationEnabled).toBe(false);
-    expect(result.externalizedTargetIds).toHaveLength(0);
+    expect(externalizedSources(result)).toHaveLength(0);
     expect(result.compiled).toEqual(inline.compiled);
     expect(result.costs.requiredTotalTokens).toBe(inline.costs.requiredTotalTokens);
     expect(result.costs.discoveryReserveTokens).toBe(0);
@@ -135,68 +191,60 @@ for (const manual of [false, true]) for (const length of [6000, 10000]) {
   });
 }
 
-test("retained history keeps the inline candidate that fits the default window", async () => {
+test("page estimates do not reject inline delivery or force a new send plan", async () => {
   const canonical = logRequest("A".repeat(6000)), snapshot = createContextSnapshot(canonical);
   const baseline = plan(canonical, { snapshot, contextToolsAvailable: false });
-  const maxRetainedTokens = baseline.costs.contextWindowTokens - baseline.costs.requiredTotalTokens;
-  const retainedTokens = maxRetainedTokens - 20;
-  const inline = plan(canonical, { snapshot, contextToolsAvailable: false, budget: { retainedTokens } });
-  expect(inline.costs.contextWindowTokens).toBe(90_000);
-  expect(inline.costs.requiredTotalTokens).toBe(89_980);
-  const result = plan(canonical, { snapshot, budget: { retainedTokens } });
-  expect(result.navigationEnabled).toBe(false);
-  expect(result.compiled).toEqual(inline.compiled);
-  expect(plan(canonical, { snapshot, budget: { retainedTokens: maxRetainedTokens } }).costs.requiredTotalTokens).toBe(90_000);
-  expect(() => plan(canonical, { snapshot, budget: { retainedTokens: maxRetainedTokens + 1 } })).toThrow("exceed the context budget");
-  const limits = { listTokens: 128 };
-  expect(plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens } }).costs.requiredTotalTokens).toBe(90_000);
-  expect(() => plan(canonical, { snapshot, limits, budget: { retainedTokens: maxRetainedTokens + 1 } })).toThrow("exceed the context budget");
+  for (const retainedTokens of [89_999, 90_001, 599_999, 600_001, 1_000_000]) {
+    const inline = plan(canonical, { snapshot, contextToolsAvailable: false, budget: { retainedTokens, contextWindowTokens: 1 } });
+    const result = plan(canonical, { snapshot, budget: { retainedTokens, contextWindowTokens: 1 } });
+    expect(result.navigationEnabled).toBe(false);
+    expect(result.compiled).toEqual(baseline.compiled);
+    expect(result.costs.requiredTotalTokens).toBe(baseline.costs.requiredTotalTokens + retainedTokens);
+    expect(result.costs.requiredTotalTokens).toBe(inline.costs.requiredTotalTokens);
+  }
   const broker = TurnBroker.forSocket(join(tmpdir(), `context-cost-${randomUUID()}.sock`));
   const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   const send = new ContextSend(canonical, broker, capabilities, "cost-boundary", undefined, undefined, snapshot);
   try {
-    const prepared = await send.prepare(canonical, token, {}, retainedTokens);
+    const prepared = await send.prepare(canonical, token, {}, 1_000_000);
     expect(prepared.navigationEnabled).toBe(false);
-    expect(prepared.compiled).toEqual(inline.compiled);
+    expect(prepared.compiled).toEqual(baseline.compiled);
     await send.select(token, prepared);
     await send.sent();
     expect(send.coverage.latest()?.delivered).toBe(true);
   } finally { send.retire(); reuseCapability.mockRestore(); await broker.close(); }
 });
 
-test("a complete externalized candidate can fit when the inline candidate exceeds capacity", () => {
-  const canonical = logRequest("recorded result line\n".repeat(3000)), snapshot = createContextSnapshot(canonical);
+test("selective delivery is available below input capacity and beyond page estimates", () => {
+  const text = "recorded result line\n".repeat(3000);
+  const canonical = logRequest(text), snapshot = createContextSnapshot(canonical);
   const inline = plan(canonical, { snapshot, contextToolsAvailable: false });
-  const budget = { contextWindowTokens: inline.costs.requiredTotalTokens - 1 };
-  const result = plan(canonical, { snapshot, budget });
-  expect(result.navigationEnabled).toBe(true);
-  expect(result.externalizedTargetIds).toHaveLength(1);
-  expect(result.costs.requiredTotalTokens).toBeLessThanOrEqual(budget.contextWindowTokens);
-  // The same admission rule applies when omitted history makes navigation mandatory.
-  canonical.context.messages.unshift({ role: "toolResult", toolCallId: "older", toolName: "exec_command",
-    content: "omitted result", isError: false, timestamp: 0 });
-  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(1) } };
-  const mandatory = plan(canonical, { candidate, budget });
-  expect(mandatory.navigationEnabled).toBe(true);
-  expect(mandatory.externalizedTargetIds).toHaveLength(1);
-  expect(mandatory.costs.requiredTotalTokens).toBeLessThanOrEqual(budget.contextWindowTokens);
+  for (const budget of [{ contextWindowTokens: 1 }, { contextWindowTokens: 1, retainedTokens: 1_000_000 }]) {
+    const result = plan(canonical, { snapshot, budget });
+    expect(result.navigationEnabled).toBe(true);
+    expect(externalizedSources(result).length).toBeGreaterThan(0);
+    expect(result.costs.requiredTotalTokens - (budget.retainedTokens ?? 0)).toBeLessThan(inline.costs.requiredTotalTokens);
+    expect(readText(result, entries(result).find(value => value.kind === "tool_result")!.read_ref)).toBe(text);
+  }
 });
 
-test("mandatory history navigation keeps low-token selected logs inline and still enforces capacity", () => {
+test("omitted history requires a current directory while selected fields keep exact values", () => {
   const canonical = logRequest(" ".repeat(6000));
   canonical.context.messages.unshift({ role: "toolResult", toolCallId: "older-call", toolName: "exec_command",
     content: "omitted readable result", isError: false, timestamp: 0 });
   const snapshot = createContextSnapshot(canonical);
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(1) } };
-  const result = plan(canonical, { snapshot, candidate });
+  const result = plan(canonical, { snapshot, candidate, budget: { retainedTokens: 1_000_000, contextWindowTokens: 1 } });
   expect(result.navigationEnabled).toBe(true);
-  expect(result.externalizedTargetIds).toHaveLength(0);
-  expect(result.projected.context.messages[2]!.content).toBe(" ".repeat(6000));
   expect(result.costs.discoveryReserveTokens).toBeGreaterThan(0);
   expect(result.costs.errorReserveTokens).toBeGreaterThan(0);
-  expect(entries(result).find(value => value.call_id === "older-call")!.delivery).toBe("source_on_demand");
-  const retainedTokens = result.costs.contextWindowTokens - result.costs.requiredTotalTokens + 256;
-  expect(() => plan(canonical, { snapshot, candidate, budget: { retainedTokens } })).toThrow("exceed the context budget");
+  const older = entries(result).find(value => value.call_id === "older-call")!;
+  expect(older.delivery).toBe("source_on_demand");
+  expect(readText(result, older.read_ref)).toBe("omitted readable result");
+  const selected = entries(result).find(value => value.call_id === "log-call" && value.kind === "tool_result")!;
+  expect(readText(result, selected.read_ref)).toBe(" ".repeat(6000));
+  const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
+  try { scope.markEntryDelivered(); deliverRequired(scope); } finally { scope.retire(); }
 });
 
 test("an incompatible current context contract cannot silently drop omitted history", () => {
@@ -236,7 +284,7 @@ test("externalization threshold uses mixed field cost instead of escaped JSON sa
   canonical.context.systemPrompt = [JSON.stringify(Array.from({ length: 500 }, (_, i) => ({ id: i, value: '"quoted"' })))];
   const result = plan(canonical);
   expect(result.compiled.contextFormat).toBe("codex-context-text-v1");
-  expect(result.externalizedTargetIds).toHaveLength(0);
+  expect(externalizedSources(result)).toHaveLength(0);
   expect(result.navigationEnabled).toBe(false);
 });
 
@@ -244,7 +292,7 @@ test("multiple medium fields can jointly repay the complete entry cost", () => {
   // Leave room for token-count variation in random navigation IDs and read references.
   // Each field alone must still cost less inline than with a complete navigation entry.
   const canonical = request(Array.from({ length: 6 }, (_, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
-    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(360)}`, isError: false, timestamp: index })));
+    toolName: "exec_command", content: `result ${index}: ${"result line\n".repeat(1200)}`, isError: false, timestamp: index })));
   for (const message of canonical.context.messages) {
     expect(plan(request([message])).navigationEnabled).toBe(false);
   }
@@ -252,22 +300,24 @@ test("multiple medium fields can jointly repay the complete entry cost", () => {
   const inline = plan(canonical, { snapshot, contextToolsAvailable: false });
   const result = plan(canonical, { snapshot });
   expect(result.navigationEnabled).toBe(true);
-  expect(result.externalizedTargetIds).toHaveLength(6);
+  expect(externalizedSources(result)).toHaveLength(6);
   expect(result.costs.netSavedPromptBytes).toBeGreaterThan(0);
   expect(result.costs.requiredTotalTokens).toBeLessThan(inline.costs.requiredTotalTokens);
 });
 
 test("resume and short second-round inputs publish a new visible entry for omitted readable history", () => {
-  const canonical = logRequest("unique unread suffix\n".repeat(2000)), snapshot = createContextSnapshot(canonical);
+  const text = "unique unread suffix\n".repeat(2000);
+  const canonical = logRequest(text), snapshot = createContextSnapshot(canonical);
   const full = plan(canonical, { snapshot });
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
   const resume = plan(canonical, { snapshot, candidate, compileOptions: { retainedContinuity: true } });
   expect(resume.navigationEnabled).toBe(true);
-  expect(resume.externalizedTargetIds).toHaveLength(0);
+  expect(externalizedSources(resume)).toHaveLength(0);
   expect(resume.planId).not.toBe(full.planId);
-  expect(resume.registration!.snapshot).toBe(snapshot);
+  expect(resume.registration!.snapshot.context_id).not.toBe(snapshot.context_id);
+  expect(snapshot.getText(snapshot.targets.find(value => value.kind === "tool_result")!.read_ref!)).toBe(text);
   expect(resume.compiled.text).not.toContain("unique unread suffix\\n".repeat(10));
-  expect(resume.costs.netSavedPromptBytes).toBeLessThan(0);
+  expect(resume.costs.promptBytes).toBe(Buffer.byteLength(resume.compiled.text));
   expect(entry(resume).first_call.arguments.turn_token).toBe(token);
   const field = entries(resume).find(value => value.kind === "tool_result")!;
   expect(field.delivery).toBe("source_on_demand");
@@ -288,25 +338,46 @@ test("re-parsed candidates require an explicit map and do not infer repeated cal
   expect(() => plan(canonical, { candidate: synthetic, messageIndices: [0] })).toThrow("no exact canonical mapping");
 });
 
-test("system, developer, user, skill, delegation, summary and ordinary assistant text stay inline", () => {
-  const marker = "protected evidence " .repeat(1000);
-  const canonical = logRequest("tool log\n".repeat(3000));
+test("rules, user history, skills, delegation and trusted summaries remain required while ordinary assistant history is optional", () => {
+  const marker = "protected evidence ".repeat(1000);
+  const canonical = request([
+    { role: "developer", content: marker, timestamp: 0 },
+    { role: "user", origin: "codex_skill", content: marker, timestamp: 1 },
+    { role: "agentMessage", author: "parent", recipient: "worker", content: marker, timestamp: 2 },
+    { role: "assistant", content: [{ type: "text", text: marker }], timestamp: 3 },
+    { role: "assistant", content: [{ type: "text", text: "ordinary explanation\n".repeat(5000) }], timestamp: 4 },
+    { role: "user", content: marker, timestamp: 5 },
+    { role: "user", content: "Apply the second option in your previous answer.", timestamp: 6 },
+  ]);
   canonical.context.systemPrompt = [marker];
-  canonical.context.messages.unshift({ role: "developer", content: marker, timestamp: 0 },
-    { role: "user", origin: "codex_skill", content: marker, timestamp: 0 },
-    { role: "agentMessage", author: "parent", recipient: "worker", content: marker, timestamp: 0 },
-    { role: "assistant", content: [{ type: "text", text: marker }], timestamp: 0 },
-    { role: "user", content: marker, timestamp: 0 });
-  const snapshot = createContextSnapshot(canonical, { provenanceByMessage: new Map([[4, { source_kind: "summary" }]]) });
-  const result = plan(canonical, { snapshot });
-  expect(result.externalizedTargetIds).toHaveLength(1);
-  expect(result.projected.context.systemPrompt).toEqual(canonical.context.systemPrompt);
-  expect(result.projected.context.messages.slice(0, 5)).toEqual(canonical.context.messages.slice(0, 5));
-  expect(entries(result).filter(value => value.kind === "message_text").every(value => value.delivery === "inline")).toBe(true);
+  const snapshot = createContextSnapshot(canonical, { provenanceByMessage: new Map([[3, { source_kind: "summary" }]]) });
+  const result = plan(canonical, { snapshot, capabilities: { ...capabilities, maxComposerCodePoints: 8000 } });
+  const source = payload(result);
+  expect(source.payload.system).toEqual([marker]);
+  expect(source.payload.messages.slice(0, 4).map((value: any) => value.content)).toEqual([
+    marker, marker, marker, [{ type: "text", text: marker }],
+  ]);
+  expect(source.payload.messages[5].content).toBe(marker);
+  expect(source.payload.messages[6].content).toBe("Apply the second option in your previous answer.");
+  expect(source.payload.messages[4].content[0].text).toBeNull();
+  const ordinary = entries(result).find(value => value.source_kind === "assistant" && value.kind === "message_text")!;
+  expect(ordinary).toMatchObject({ required: false, delivery: "source_on_demand", original_role: "assistant" });
+  expect(readText(result, ordinary.read_ref)).toBe("ordinary explanation\n".repeat(5000));
+  for (const value of entries(result).filter(value => snapshot.targets.some(target => target.target_id === value.target_id)
+    && ["system", "developer", "skill", "agent_message", "delegation", "summary", "user"].includes(value.source_kind))) {
+    expect(value.delivery).toBe("source_required_record");
+  }
+  const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
+  try {
+    scope.markEntryDelivered();
+    deliverRequired(scope);
+    expect(scope.status().context_ready).toBe(true);
+    expect(scope.navigator.usage().text_tokens).toBeLessThan(result.costs.requiredTotalTokens);
+  } finally { scope.retire(); }
 });
 
-test("raw invalid JSON, freeform input and multi-block outputs remain exact and position-specific", () => {
-  const invalid = "not JSON 🙂 " .repeat(1000), freeform = "*** patch 原文\n".repeat(1000);
+test("raw invalid JSON, freeform input and multi-block outputs remain exact when field mapping is unproven", () => {
+  const invalid = "not JSON 🙂 ".repeat(1000), freeform = "*** patch 原文\n".repeat(1000);
   const first = "前段🙂\n".repeat(1200), second = "后段\\\"\n".repeat(1200);
   const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, reasoning: { effort: "high" }, input: [
     { type: "function_call", call_id: "bad-json", name: "exec_command", arguments: invalid },
@@ -314,26 +385,34 @@ test("raw invalid JSON, freeform input and multi-block outputs remain exact and 
     { type: "custom_tool_call", call_id: "freeform", name: "apply_patch", input: freeform },
     { role: "user", content: "Check the recorded data." },
   ] });
-  const result = plan(canonical);
-  const snapshot = result.registration!.snapshot;
+  const result = plan(canonical, { capabilities: { ...capabilities, maxComposerCodePoints: 8000 } });
+  const snapshot = result.snapshot;
   const callFields = snapshot.targets.filter(value => value.kind === "tool_arguments");
-  expect(snapshot.getText(callFields[0]!.read_ref!)).toBe(invalid);
-  expect(snapshot.getText(callFields[1]!.read_ref!)).toBe(freeform);
+  expect(readText(result, callFields[0]!.read_ref!)).toBe(invalid);
+  expect(readText(result, callFields[1]!.read_ref!)).toBe(freeform);
   const outputs = snapshot.targets.filter(value => value.kind === "tool_result");
-  expect(outputs.map(value => snapshot.getText(value.read_ref!))).toEqual([first, second]);
-  const projectedOutput = result.projected.context.messages.find(message => message.role === "toolResult")!;
-  expect(typeof projectedOutput.content).toBe("string");
-  expect(projectedOutput.content).toContain(outputs[0]!.read_ref!);
-  expect(projectedOutput.content).toContain(outputs[1]!.read_ref!);
-  expect((canonical.context.messages.find(message => message.role === "toolResult")!.content)).toBe(`${first}${second}`);
+  expect(outputs.map(value => readText(result, value.read_ref!))).toEqual([first, second]);
+  const source = payload(result);
+  const output = source.payload.messages.find((value: any) => value.role === "tool_result");
+  expect(output.content).toBe(`${first}${second}`);
+  expect(source.external_positions.some((value: any) => outputs.some(target => value.target_id === target.target_id))).toBe(false);
+  expect(source.external_positions.some((value: any) => value.target_id === callFields[0]!.target_id)).toBe(false);
+  expect(canonical.context.messages.find(value => value.role === "toolResult")!.content).toBe(`${first}${second}`);
 });
 
-test("externalization processes serialized savings in descending order and source order for ties", () => {
+test("each optional field keeps its original source position even when lengths and values repeat", () => {
   const canonical = request([3000, 9000, 3000].map((length, index) => ({ role: "toolResult" as const, toolCallId: `c${index}`,
     toolName: "exec_command", content: "log line\n".repeat(length / 10), isError: false, timestamp: index })));
-  const snapshot = createContextSnapshot(canonical), result = plan(canonical, { snapshot });
-  const fields = snapshot.targets.filter(value => value.kind === "tool_result");
-  expect(result.externalizedTargetIds).toEqual([fields[1]!.target_id, fields[0]!.target_id, fields[2]!.target_id]);
+  const result = plan(canonical, { capabilities: { ...capabilities, maxComposerCodePoints: 8000 } });
+  const source = payload(result);
+  expect(source.external_positions).toHaveLength(3);
+  for (const [index, message] of canonical.context.messages.entries()) {
+    if (typeof message.content !== "string") throw new Error("This fixture must contain text messages");
+    const placement = source.external_positions.find((value: any) => value.path[1] === index);
+    expect(placement.path).toEqual(["messages", index, "content"]);
+    expect(readText(result, placement.read_ref)).toBe(message.content);
+  }
+  expect(new Set(source.external_positions.map((value: any) => value.target_id)).size).toBe(3);
 });
 
 test("partial and full log replays count complete MCP response overhead and repeated reads", () => {
@@ -373,7 +452,7 @@ test("short inputs with more than ten required MCP images do not enter composer 
   const result = plan(canonical);
   expect(result.navigationEnabled).toBe(true);
   expect(result.compiled.images).toHaveLength(0);
-  expect(entry(result).required_images).toBe(12);
+  expect(requiredImages(result)).toBe(12);
   expect(entries(result).filter(value => value.kind === "image").every(value => value.media_route === "mcp" && value.required && value.read_ref)).toBe(true);
   expect(result.costs.requiredMcpTokens).toBeGreaterThan(12 * 4096);
   const first = result.registration!.snapshot.targets.find(value => value.kind === "image")!;
@@ -411,7 +490,7 @@ test("omitted fixed historical images are discoverable and remain optional", () 
     { role: "user", content: "Continue.", timestamp: 3 }]);
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
   const result = plan(canonical, { candidate });
-  expect(entry(result).required_images).toBe(0);
+  expect(requiredImages(result)).toBe(0);
   expect(entries(result).filter(value => value.kind === "image").every(value => !value.required && value.media_route === "mcp" && value.read_ref)).toBe(true);
   expect(result.compiled.images).toHaveLength(0);
 });
@@ -434,7 +513,7 @@ test("bounded optional image history preserves the current required image in pla
   const result = plan(canonical, { snapshot, candidate });
   expect(result.registration!.deliveryByTarget[current.target_id]).toMatchObject({ required: true, media_route: "mcp" });
   expect(result.compiled.images).toHaveLength(0);
-  const returned = navigator(result).read({ context_id: snapshot.context_id, reads: [{ read_ref: current.read_ref! }] });
+  const returned = navigator(result).read({ context_id: result.snapshot.context_id, reads: [{ read_ref: current.read_ref! }] });
   expect(returned.isError).not.toBe(true);
   expect(returned.content.some((block: any) => block.type === "image")).toBe(true);
   expect(() => preflightContinuityInput(canonical, capabilities)).not.toThrow();
@@ -471,24 +550,30 @@ test("invalid encoded images cannot bypass source validation through attachment 
   }
 });
 
-test("required attachment overflow and image token exhaustion fail without dropping oldest images", () => {
+test("required attachment overflow remains independent of page estimates", () => {
   const canonical = request([{ role: "user", content: Array.from({ length: 12 }, () => ({ type: "image" as const, imageUrl: png })), timestamp: 1 }]);
   expect(() => plan(canonical, { limits: { maxImageReads: 1 } })).toThrow("cannot be delivered");
-  expect(() => plan(canonical, { budget: { contextWindowTokens: 12_000 } })).toThrow("cannot be delivered");
+  const admitted = plan(canonical, { budget: { contextWindowTokens: 1, retainedTokens: 1_000_000 } });
+  expect(requiredImages(admitted)).toBe(12);
   expect(contextAttachmentImage("https://example.invalid/a.png")).toBeUndefined();
-  expect(contextAttachmentImage("data:image/svg+xml;base64,PHN2Zz4=" )).toBeUndefined();
-  expect(contextAttachmentImage("data:image/png;base64," )).toBeUndefined();
+  expect(contextAttachmentImage("data:image/svg+xml;base64,PHN2Zz4=")).toBeUndefined();
+  expect(contextAttachmentImage("data:image/png;base64,")).toBeUndefined();
   expect(contextAttachmentImage(png)?.bytes).toBeGreaterThan(0);
 });
 
-test("required history entry capacity failures remain independent between full and resume plans", () => {
+test("long required rules remain exact in full and retained plans without a cumulative window gate", () => {
   const canonical = logRequest("log\n".repeat(2000));
-  canonical.context.messages.unshift({ role: "developer", content: "instruction\n".repeat(15000), timestamp: 0 });
+  const rule = "instruction\n".repeat(15000);
+  canonical.context.messages.unshift({ role: "developer", content: rule, timestamp: 0 });
   const snapshot = createContextSnapshot(canonical), candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
-  expect(() => plan(canonical, { snapshot, budget: { contextWindowTokens: 20_000 } })).toThrow();
-  expect(plan(canonical, { snapshot, candidate, budget: { contextWindowTokens: 20_000 } }).navigationEnabled).toBe(true);
-  try { plan(canonical, { snapshot, candidate, budget: { contextWindowTokens: 14_000 } }); throw new Error("unexpected fit"); }
-  catch (error) { expect(error).toBeInstanceOf(ContextDeliveryPlanningError); }
+  const full = plan(canonical, { snapshot, capabilities: { ...capabilities, maxComposerCodePoints: 8000 },
+    budget: { contextWindowTokens: 1, retainedTokens: 1_000_000 } });
+  expect(payload(full).payload.messages[0].content).toBe(rule);
+  expect(full.costs.requiredMcpTokens).toBeGreaterThan(20_000);
+  const retained = plan(canonical, { snapshot, candidate, budget: { contextWindowTokens: 1, retainedTokens: 1_000_000 } });
+  expect(payload(retained).payload.messages.map((value: any) => value.content)).toEqual(["Use the existing result."]);
+  const historicalRule = entries(retained).find(value => value.source_kind === "developer")!;
+  expect(readText(retained, historicalRule.read_ref)).toBe(rule);
 });
 
 test("unverified ABI and non-MCP paths retain the real original compilation", () => {
@@ -544,21 +629,21 @@ test("raw system images keep their source role for MCP, attachments and retained
   ] });
   const before = structuredClone(canonical), snapshot = createContextSnapshot(canonical);
   const result = plan(canonical, { snapshot });
-  expect(entry(result).required_images).toBe(2);
+  expect(requiredImages(result)).toBe(2);
   expect(result.compiled.images).toHaveLength(0);
   expect(result.projected.context.systemPrompt?.join("\n")).toContain("System image rule.");
-  expect(result.projected.context.systemPrompt?.join("\n")).toContain("codex_context_ref");
+  expect(payload(result).payload.system.join("\n")).toContain("codex_context_ref");
   expect(entries(result).filter(value => value.kind === "image").every(value => value.original_role === "system" && value.required)).toBe(true);
   const mixed = plan(canonical, { snapshot, limits: { maxImageReads: 1 } });
   expect(mixed.compiled.images).toHaveLength(1);
-  const envelope = JSON.parse(/<codex_context_json>\n([^\n]+)/.exec(mixed.compiled.text)![1]!);
+  const envelope = payload(mixed).payload;
   expect(envelope.system.some((value: any) => Array.isArray(value) && value[0]?.type === "image_attachment")).toBe(true);
   expect(envelope.messages.every((value: any) => !Array.isArray(value.content))).toBe(true);
   const retained = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
-  expect(entry(plan(canonical, { snapshot, candidate: retained })).required_images).toBe(2);
+  expect(requiredImages(plan(canonical, { snapshot, candidate: retained }))).toBe(2);
   const excluded = { ...canonical, context: { ...canonical.context, systemPrompt: undefined, messages: canonical.context.messages.slice(-1) } };
   const optional = plan(canonical, { snapshot, candidate: excluded, rawInputIndices: [2] });
-  expect(entry(optional).required_images).toBe(0);
+  expect(requiredImages(optional)).toBe(0);
   expect(entries(optional).filter(value => value.kind === "image").every(value => !value.required && value.read_ref)).toBe(true);
   expect(canonical).toEqual(before);
 });
@@ -575,7 +660,7 @@ test("file-id-only required sources and raw system mapping gaps fail explicitly"
   ] });
   const candidate = structuredClone(canonical);
   expect(() => plan(canonical, { candidate, messageIndices: [0] })).toThrow("Raw system sources require");
-  expect(entry(plan(canonical, { candidate, messageIndices: [0], rawInputIndices: [0, 1] })).required_images).toBe(1);
+  expect(requiredImages(plan(canonical, { candidate, messageIndices: [0], rawInputIndices: [0, 1] }))).toBe(1);
 });
 
 test("Zero Risk uses its manual mode and visible request-id entry for full and resume candidates", () => {
@@ -583,34 +668,26 @@ test("Zero Risk uses its manual mode and visible request-id entry for full and r
   canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
   const snapshot = createContextSnapshot(canonical), requestId = `request_${"b".repeat(32)}`;
   for (const candidate of [canonical, { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } }]) {
-    const result = plan(canonical, { snapshot, candidate, turnToken: requestId, compileOptions: { manualControl: true } });
+    const result = plan(canonical, { snapshot, candidate, turnToken: requestId, compileOptions: { manualControl: true },
+      capabilities: { ...capabilities, maxComposerCodePoints: 8000 } });
     expect(result.navigationEnabled).toBe(true);
     expect(entry(result).first_call.arguments.request_id).toBe(requestId);
     expect(entry(result).first_call.arguments.turn_token).toBeUndefined();
   }
 });
 
-test("Bigger Context compares actual stage wrappers and preserves the selected transport", () => {
-  const canonical = logRequest("long multipart evidence\n".repeat(9000));
-  const result = plan(canonical, { compileOptions: { experimentalMultipartParts: 2 } });
-  expect(result.compiled.multipart?.parts).toHaveLength(2);
-  expect(result.externalizedTargetIds).toHaveLength(1);
+test("ordinary history and required images use one bootstrap message without multipart staging", () => {
+  const canonical = logRequest("long recorded evidence\n".repeat(9000));
+  canonical.context.messages.push({ role: "user", content: Array.from({ length: 12 }, () => ({ type: "image" as const, imageUrl: png, detail: "original" as const })), timestamp: 5 });
+  const result = plan(canonical);
+  expect("multipart" in result.compiled).toBe(false);
+  expect(result.registration!.startupProtocol).toBe("context-bootstrap-v1");
+  expect(externalizedSources(result).length).toBeGreaterThan(0);
   expect(result.costs.netSavedPromptBytes).toBeGreaterThan(0);
-  expect(result.costs.promptBytes).toBeGreaterThan(Buffer.byteLength(result.compiled.text));
+  expect(result.costs.promptBytes).toBe(Buffer.byteLength(result.compiled.text));
+  expect(requiredImages(result)).toBe(12);
+  expect(Object.keys(result.registration!.requiredImageTokenReserves!)).toHaveLength(12);
   expect(entry(result).context_id).toBe(result.registration!.snapshot.context_id);
-});
-
-test("Bigger Context can route required images when the old attachment reserve prevents compilation", () => {
-  const canonical = request([{ role: "user", content: Array.from({ length: 12 }, () => ({ type: "image" as const, imageUrl: png, detail: "original" })), timestamp: 1 }]);
-  expect(() => compileChatGptWebPrompt(canonical, capabilities, token, { experimentalMultipartParts: 2 })).toThrow("final part's instructions and attachments");
-  const result = plan(canonical, { compileOptions: { experimentalMultipartParts: 2 } });
-  expect(result.compiled.multipart?.parts).toHaveLength(2);
-  expect(result.compiled.images.length).toBeLessThan(12);
-  expect(Object.keys(result.registration!.requiredImageTokenReserves!)).toHaveLength(12 - result.compiled.images.length);
-  expect(entry(result).required_images).toBe(12);
-  expect(result.costs.originalPromptTransport).toBe("ordinary_capacity_baseline");
-  expect(result.costs.requiredMcpTokens).toBeGreaterThan(0);
-  expect(result.costs.requiredTotalTokens).toBeLessThanOrEqual(result.costs.contextWindowTokens);
 });
 
 test("trusted delegation and summary tool-shaped sources keep their original instruction contract", () => {
@@ -620,8 +697,8 @@ test("trusted delegation and summary tool-shaped sources keep their original ins
   const snapshot = createContextSnapshot(canonical, { provenanceByMessage: new Map([
     [0, { source_kind: "delegation" }], [1, { source_kind: "summary" }],
   ]) });
-  const result = plan(canonical, { snapshot });
-  expect(result.externalizedTargetIds).toHaveLength(1);
+  const result = plan(canonical, { snapshot, capabilities: { ...capabilities, maxComposerCodePoints: 8000 } });
+  expect(externalizedSources(result)).toHaveLength(1);
   expect(result.projected.context.messages.slice(0, 2)).toEqual(canonical.context.messages.slice(0, 2));
   const source = entries(result).find(value => value.source_kind === "tool")!;
   expect(source.delivery).toBe("source_on_demand");
@@ -638,35 +715,38 @@ test("attachment checks keep the existing single-image and aggregate byte ceilin
   expect(() => plan(canonical)).toThrow("cannot be delivered");
 }, 30_000);
 
-test("required-media reserve includes the exact complete MCP response and retained/work usage", () => {
+test("required-media and text costs count complete responses and retain diagnostic work usage", () => {
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: png }], timestamp: 1 }]);
   const result = plan(canonical, { budget: { retainedTokens: 12_000, workReserveTokens: 5000 } });
   const target = result.registration!.snapshot.targets.find(value => value.kind === "image")!;
   const actual = navigator(result).read({ context_id: entry(result).context_id, reads: [{ read_ref: target.read_ref! }] });
   const measured = measureContextResponse(actual, { visualTokens: target.visual_token_reserve! });
   expect(result.registration!.requiredImageTokenReserves![target.target_id]).toBe(measured.total_tokens);
-  expect(result.costs.requiredMcpWireBytes).toBe(measured.wire_bytes);
+  expect(result.costs.requiredMcpWireBytes).toBe(measured.wire_bytes + result.costs.requiredTextWireBytes!);
   expect(result.registration!.requiredImageWireReserves![target.target_id]).toBe(measured.wire_bytes);
   expect(result.registration!.remainingBudget!.reserved_tokens).toBe(5000);
   expect(result.costs.requiredTotalTokens).toBe(result.costs.promptTokens + result.costs.platformReserveTokens + 12_000 + 5000
-    + measured.total_tokens + result.costs.discoveryReserveTokens + result.costs.errorReserveTokens);
+    + measured.total_tokens + result.costs.requiredTextTokens! + result.costs.requiredRetryTokens!
+    + result.costs.discoveryReserveTokens + result.costs.errorReserveTokens);
 });
 
 test("image routes reserve directory and errors and respect per-image response limits", () => {
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: paddedPng(5000) }], timestamp: 1 }]);
   const snapshot = createContextSnapshot(canonical), normal = plan(canonical, { snapshot });
-  const required = normal.costs.requiredMcpWireBytes;
+  const imageTarget = normal.snapshot.targets.find(value => value.kind === "image")!;
+  const required = measureContextResponse(navigator(normal).read({ context_id: normal.snapshot.context_id, reads: [{ read_ref: imageTarget.read_ref! }] })).wire_bytes;
   const directory = normal.costs.discoveryReserveWireBytes;
   const errors = contextErrorReserve();
   expect(directory).toBeGreaterThan(0);
   expect(normal.costs.errorReserveWireBytes).toBe(errors.wire_bytes);
-  expect(normal.costs.requiredNavigationWireBytes).toBe(required + directory + errors.wire_bytes);
+  expect(normal.costs.requiredNavigationWireBytes).toBe(required + normal.costs.requiredTextWireBytes!
+    + normal.costs.requiredRetryWireBytes! + directory + errors.wire_bytes);
   const byWire = plan(canonical, { snapshot, limits: { imageWireBytes: required - 1 } });
   const byTokens = plan(canonical, { snapshot, limits: { imageMetadataTokens: 128 } });
   for (const result of [byWire, byTokens]) {
     expect(result.compiled.images).toHaveLength(1);
-    expect(result.costs.requiredMcpTokens).toBe(0);
-    expect(result.costs.requiredMcpWireBytes).toBe(0);
+    expect(result.costs.requiredMcpTokens).toBe(result.costs.requiredTextTokens!);
+    expect(result.costs.requiredMcpWireBytes).toBe(result.costs.requiredTextWireBytes!);
     const image = entries(result).find(value => value.kind === "image")!;
     expect(image.media_route).toBe("attachment");
     expect(image.read_ref).toBeNull();
@@ -676,60 +756,44 @@ test("image routes reserve directory and errors and respect per-image response l
   }
 });
 
-test("directory and required-image reserves survive a corrective reply and keep model work separate", () => {
+test("a corrective reply preserves required image and text delivery without a cumulative token gate", () => {
   const canonical = request([{ role: "user", content: [{ type: "image", imageUrl: png, detail: "original" }], timestamp: 1 }]);
-  const snapshot = createContextSnapshot(canonical);
-  const result = plan(canonical, { snapshot, budget: { workReserveTokens: 6000 } });
+  const result = plan(canonical, { budget: { retainedTokens: 1_000_000, contextWindowTokens: 1, workReserveTokens: 6000 } });
   expect(result.compiled.images).toHaveLength(0);
   const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const corrective = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref: "unknown" }] });
+    const corrective = scope.prepare("read", { context_id: result.snapshot.context_id, reads: [{ read_ref: "unknown" }] });
     expect(corrective.result.isError).toBe(true);
     scope.finish(corrective.receiptId, true);
-    const directory = scope.prepare("list", { context_id: snapshot.context_id, view: "overview" });
+    const directory = scope.prepare("list", { context_id: result.snapshot.context_id, view: "overview" });
     expect(directory.result.isError).not.toBe(true);
     scope.finish(directory.receiptId, true);
-    const image = snapshot.targets.find(value => value.kind === "image")!;
-    const returned = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref: image.read_ref! }] });
-    expect(returned.result.isError).not.toBe(true);
-    scope.finish(returned.receiptId, true);
-    expect(scope.status().context_ready).toBe(true);
-    const used = scope.navigator.usage();
-    expect(used.wire_bytes).toBeLessThanOrEqual(result.costs.requiredNavigationWireBytes);
-    expect(result.registration!.remainingBudget!.tokens - used.text_tokens - used.visual_token_reserve).toBeGreaterThanOrEqual(6000);
+    deliverRequired(scope);
+    expect(scope.navigator.usage().wire_bytes).toBeLessThanOrEqual(result.costs.requiredNavigationWireBytes);
+    expect(result.registration!.remainingBudget!.reserved_tokens).toBe(6000);
   } finally { scope.retire(); }
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} required image discovery reserves every filtered page`, () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} required images and text reach ready without an entries traversal`, () => {
   const canonical = request([{ role: "user", content: Array.from({ length: 6 }, () => ({ type: "image" as const, imageUrl: png })), timestamp: 1 }]);
-  const compileOptions = manual ? { manualControl: true as const } : {};
-  const discoveryCapabilities = { ...capabilities, proAvailable: true };
-  const snapshot = createContextSnapshot(canonical);
-  const result = plan(canonical, { snapshot, compileOptions, capabilities: discoveryCapabilities, limits: { listEntries: 1 } });
+  const result = plan(canonical, { compileOptions: manual ? { manualControl: true } : {},
+    capabilities: { ...capabilities, proAvailable: true }, limits: { listEntries: 1 },
+    budget: { retainedTokens: 1_000_000, contextWindowTokens: 1 } });
   expect(result.compiled.images).toHaveLength(0);
   const scope = new ContextScope(token, result.registration!, "normal", () => {}, error => { throw error; });
   try {
     scope.markEntryDelivered();
-    const overview = scope.prepare("list", { context_id: snapshot.context_id, view: "overview" });
-    expect(overview.result.isError).not.toBe(true); scope.finish(overview.receiptId, true);
-    const refs: string[] = [];
-    let cursor: string | undefined, pages = 0;
-    do {
-      const returned = scope.prepare("list", { context_id: snapshot.context_id, view: "entries", kind: "image", ...(cursor ? { cursor } : {}) });
-      expect(returned.result.isError).not.toBe(true);
-      const page = returned.result.structuredContent as any;
-      refs.push(...page.entries.filter((value: any) => value.required && value.read_ref).map((value: any) => value.read_ref));
-      pages++; cursor = page.next_cursor ?? undefined; scope.finish(returned.receiptId, true);
-    } while (cursor);
-    expect(pages).toBe(6); expect(new Set(refs).size).toBe(6);
-    expect(scope.navigator.usage().wire_bytes).toBeLessThanOrEqual(result.costs.discoveryReserveWireBytes);
-    for (const read_ref of refs) {
-      const returned = scope.prepare("read", { context_id: snapshot.context_id, reads: [{ read_ref }] });
-      expect(returned.result.isError).not.toBe(true); scope.finish(returned.receiptId, true);
-    }
-    expect(scope.status().context_ready).toBe(true);
+    expect(scope.status().required_images).toBe(6);
+    const overview = scope.prepare("list", { context_id: result.snapshot.context_id, view: "overview" });
+    expect(overview.result.isError).not.toBe(true);
+    scope.finish(overview.receiptId, true);
+    deliverRequired(scope);
     expect(scope.navigator.usage().wire_bytes + result.costs.errorReserveWireBytes).toBeLessThanOrEqual(result.costs.requiredNavigationWireBytes);
+    for (const value of entries(result).filter(value => value.kind === "image")) {
+      expect(value).toMatchObject({ required: true, media_route: "mcp" });
+      expect(value.read_ref).toBeTruthy();
+    }
   } finally { scope.retire(); }
 });
 
@@ -737,7 +801,7 @@ test("an undeliverable directory fails required navigation while an optional opt
   const canonical = logRequest("old readable history"), snapshot = createContextSnapshot(canonical);
   const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
   const limits = { listBytes: 512, listTokens: 128 };
-  expect(() => plan(canonical, { snapshot, candidate, limits })).toThrow("directory overview");
+  expect(() => plan(canonical, { snapshot, candidate, limits })).toThrow("bounded directory page");
   const small = logRequest("x".repeat(1800));
   const unchanged = plan(small, { limits });
   expect(unchanged.navigationEnabled).toBe(false);
@@ -793,38 +857,36 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(result.compiled).toEqual(compileChatGptWebPrompt(canonical, capabilities, token, compileOptions));
 });
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} bounds future directory cursor tokens at admission`, () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} bounds directory cursor tokens for the published source identity`, () => {
   const canonical = parseRequest({ model: "gpt-5.6-sol", input: [
     ...Array.from({ length: 8 }, (_, index) => ({ role: "user", content: `Source ${index}` })),
     { type: "function_call", call_id: "c".repeat(236), name: "t".repeat(236), namespace: "n".repeat(236), arguments: "{}" },
     { role: "user", content: "Continue" },
   ] });
-  const snapshot = createContextSnapshot(canonical);
+  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
+  const admitted = plan(canonical, { candidate, compileOptions: manual ? { manualControl: true } : {} });
+  const snapshot = admitted.snapshot;
   const probe = new ContextNavigator({ scopeId: "preflight-cursor", snapshot, purpose: "normal", limits: { listTokens: 10_000 } });
   const minimal = probe.preflightListEntry(8);
   expect(minimal.isError).not.toBe(true);
   const bound = measureContextResponse(minimal, { boundCursorTokens: true }).text_tokens;
   expect(bound).toBeGreaterThan(measureContextResponse(minimal).text_tokens);
-  const candidate = { ...canonical, context: { ...canonical.context, messages: canonical.context.messages.slice(-1) } };
-  const compileOptions = manual ? { manualControl: true as const } : {};
-  expect(() => plan(canonical, { snapshot, candidate, compileOptions, limits: { listTokens: bound - 1 } }))
-    .toThrow("bounded directory page");
-  const admitted = plan(canonical, { snapshot, candidate, compileOptions, limits: { listTokens: bound } });
+  const tooSmall = new ContextNavigator({ scopeId: "preflight-cursor", snapshot, purpose: "normal", limits: { listTokens: bound - 1 } });
+  expect(tooSmall.preflightListEntry(8).structuredContent).toMatchObject({ error: { code: "BUDGET_EXCEEDED" } });
   for (const scopeId of ["runtime-a", "runtime-b", "runtime-c"]) {
-    const scope = new ContextScope(scopeId, admitted.registration!, "normal", () => {}, error => { throw error; });
-    try {
-      scope.markEntryDelivered();
-      const discovered: string[] = [];
-      let cursor: string | undefined;
-      do {
-        const reply = scope.prepare("list", { context_id: snapshot.context_id, view: "entries", ...(cursor ? { cursor } : {}) });
-        expect(reply.result.isError).not.toBe(true);
-        const body = reply.result.structuredContent as { entries: Array<{ target_id: string }>; next_cursor: string | null };
-        discovered.push(...body.entries.map(value => value.target_id));
-        cursor = body.next_cursor ?? undefined;
-        scope.finish(reply.receiptId, true);
-      } while (cursor);
-      expect(discovered).toEqual(snapshot.targets.map(target => target.target_id));
-    } finally { scope.retire(); }
+    const nav = new ContextNavigator({ scopeId, snapshot, purpose: "normal", limits: { listTokens: bound },
+      deliveryByTarget: admitted.registration!.deliveryByTarget });
+    expect(nav.preflightListEntry(8).isError).not.toBe(true);
+    const discovered: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const reply = nav.list({ context_id: snapshot.context_id, view: "entries", ...(cursor ? { cursor } : {}) });
+      expect(reply.isError).not.toBe(true);
+      expect(measureContextResponse(reply).text_tokens).toBeLessThanOrEqual(bound);
+      const body = reply.structuredContent as { entries: Array<{ target_id: string }>; next_cursor: string | null };
+      discovered.push(...body.entries.map(value => value.target_id));
+      cursor = body.next_cursor ?? undefined;
+    } while (cursor);
+    expect(discovered).toEqual(snapshot.targets.map(target => target.target_id));
   }
 });

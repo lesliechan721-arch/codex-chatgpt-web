@@ -1,4 +1,6 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { createContinuityMcpClient } from "./helpers/continuity-mcp-client";
+import { readContinuityStartup } from "./helpers/session-continuity-fixture";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
@@ -19,7 +21,7 @@ import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import {
   CODEX_ACTIVE_COMPACTION_REQUEST_MARKER,
 } from "../src/adapters/chatgpt-web/native-compaction-control";
-import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
+import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSession, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptDelegatedCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, RemoteTurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
@@ -541,7 +543,7 @@ describe("ChatGPT outer-native harness v4", () => {
 
   test.each([
     [false, false], [true, false], [false, true], [true, true],
-  ])("sequential native messages honor fresh conversation=%s and Luna Bigger Context=%s", async (freshConversation, luna) => {
+  ])("sequential native messages honor fresh conversation=%s and Luna Full=%s", async (freshConversation, luna) => {
     const socketPath = brokerTestEndpoint(`cgw-retained-messages-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -554,13 +556,13 @@ describe("ChatGPT outer-native harness v4", () => {
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         solAvailable: !luna,
-        experimentalBiggerContext: luna,
         extraHighAvailable: true, proAvailable: true,
       },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
-    const preparedPrompts: string[] = [];
+    const deliveredContexts: string[] = [];
+    let contextClient: Awaited<ReturnType<typeof createContinuityMcpClient>> | undefined;
     const conversationKeys: (string | undefined)[] = [];
     const tokens: string[] = [];
     let browserMessages = 0;
@@ -571,12 +573,25 @@ describe("ChatGPT outer-native harness v4", () => {
       }
       expect(turn.captureLunaCheckpoint).toBeUndefined();
       const prepared = browserMessages === 0 || freshConversation ? await turn.prepare() : await turn.prepareResume!();
-      expect(prepared.text).toContain('The selected local Codex plugin for this turn is "Codex app".');
-      preparedPrompts.push(prepared.text);
+      const bootstrap = prepared.text.includes("<codex_bootstrap_json>");
+      if (bootstrap) {
+        expect(prepared.text).toContain('Call only plugin "Codex app" for first_call and local tools.');
+        expect(prepared.text.match(/Call only plugin /g)).toHaveLength(1);
+      } else {
+        expect(prepared.text).toContain('The selected local Codex plugin for this turn is "Codex app".');
+        expect(prepared.text.match(/The selected local Codex plugin for this turn is /g)).toHaveLength(1);
+      }
       conversationKeys.push(turn.conversationKey!);
-      const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+      const token = prepared.turnToken ?? prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
       if (!token) throw new Error("retained message prompt has no current turn token");
       tokens.push(token);
+      if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
+      if (bootstrap) {
+        contextClient ??= await createContinuityMcpClient({ brokerSocketPath: socketPath, contract: "native", transport: "in-process" });
+        deliveredContexts.push(JSON.stringify(await readContinuityStartup(prepared.text, contextClient.client)));
+      } else deliveredContexts.push(prepared.text);
       prepared.release();
       browserMessages += 1;
       const answer = browserMessages === 1 ? "First retained answer" : "Second retained answer";
@@ -630,18 +645,20 @@ describe("ChatGPT outer-native harness v4", () => {
         ? undefined : chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
       expect(conversationKeys[1]).toBe(conversationKeys[0]);
       expect(tokens[1]).not.toBe(tokens[0]);
-      expect(preparedPrompts[0]).toContain("Inspect the project");
-      expect(preparedPrompts[1]).toContain("Continue in the same repository");
+      expect(deliveredContexts[0]).toContain("Inspect the project");
+      expect(deliveredContexts[1]).toContain("Continue in the same repository");
       if (freshConversation) {
-        expect(preparedPrompts[1]).toContain("First retained answer");
-        expect(preparedPrompts[1]).toContain("Inspect the project");
+        expect(deliveredContexts[1]).toContain("First retained answer");
+        expect(deliveredContexts[1]).toContain("Inspect the project");
       } else {
-        expect(preparedPrompts[1]).not.toContain("First retained answer");
+        expect(deliveredContexts[1]).not.toContain("First retained answer");
       }
-      expect(preparedPrompts[1]).not.toContain(environmentXml);
+      expect(deliveredContexts[1]).not.toContain(environmentXml);
+      expect(deliveredContexts[1]).not.toContain(JSON.stringify(environmentXml).slice(1, -1));
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       chatGptTurnSessions.clear();
+      await contextClient?.close();
       await TurnBroker.forSocket(socketPath).close();
     }
   });
@@ -1664,7 +1681,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {
+  test("prompt preparation preserves a single-message error when navigation is unavailable", async () => {
     const socketPath = brokerTestEndpoint(`cgw-prepare-error-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1672,12 +1689,13 @@ describe("ChatGPT outer-native harness v4", () => {
       chatgptWeb: { maxComposerCodePoints: 2_000_000,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
-        experimentalBiggerContext: true,
         solAvailable: false,
         threadEnvironmentStatePath: join(tempRoot, "prepare-error-environment.json"),
         lunaCheckpointStatePath: join(tempRoot, "prepare-error-checkpoint.json"),
       },
     };
+    const broker = TurnBroker.forSocket(socketPath);
+    const contextTools = spyOn(broker, "contextToolsAvailable").mockReturnValue(false);
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
@@ -1694,10 +1712,11 @@ describe("ChatGPT outer-native harness v4", () => {
       await createChatGptWebAdapter(provider).runTurn!(
         request, { headers: new Headers() }, event => events.push(event),
       );
-      expect(events.at(-1)).toMatchObject({ type: "error", code: "context_length_exceeded", retryable: false });
-      expect((events.at(-1) as { message: string }).message).toContain("exceed the available message budget");
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "CONTEXT_BUDGET_EXCEEDED", retryable: false });
+      expect((events.at(-1) as { message: string }).message).toContain("single browser message budget");
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
     } finally {
+      contextTools.mockRestore();
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();
     }
@@ -1882,7 +1901,7 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(files[0]?.buffer.length).toBeGreaterThan(0);
   });
 
-  test("keeps only the newest complete Codex model-switch contract", () => {
+  test("keeps all model-switch and skill rules without proven replacement", () => {
     const history = [
       { role: "developer" as const, content: "<model_switch>old contract</model_switch>", timestamp: 1 },
       { role: "developer" as const, content: "<skills_instructions>old catalog</skills_instructions>", timestamp: 2 },
@@ -1894,10 +1913,13 @@ describe("ChatGPT outer-native harness v4", () => {
       { role: "user" as const, content: "current request", timestamp: 8 },
     ];
 
-    const normalized = withoutSupersededModelSwitchContracts(history);
-    const serialized = JSON.stringify(normalized);
-    expect(serialized).not.toContain("old contract");
-    expect(serialized).not.toContain("old catalog");
+    const input = parsed();
+    input.context.messages = history;
+    const compiled = compileChatGptWebPrompt(input, toolCapabilities, "turn_123456789012345678901234", { bootstrapPreparation: true });
+    const serialized = JSON.stringify(compiled.bootstrapContent!.payload.messages);
+    expect(compiled.bootstrapContent!.messageSourceIndices).toEqual(history.map((_, index) => index));
+    expect(serialized).toContain("old contract");
+    expect(serialized).toContain("old catalog");
     expect(serialized).toContain("historical user message");
     expect(serialized).toContain("historical answer");
     expect(serialized).toContain("unrelated developer instruction");
@@ -1941,7 +1963,6 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(context.messages).toHaveLength(1);
       expect(context.messages[0].content).toBe(content);
       expect(compiled.images).toEqual([]);
-      expect(compiled.multipart).toBeUndefined();
     }
   });
 

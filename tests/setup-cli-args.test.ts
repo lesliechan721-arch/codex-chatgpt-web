@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,6 @@ for (const { name, parse } of parsers) {
     { flags: ["--composer-predictions", "--no-composer-predictions"], message: "Choose --composer-predictions or --no-composer-predictions" },
     { flags: ["--skill-attachments", "--inline-skills"], message: "Choose --skill-attachments or --inline-skills" },
     { flags: ["--saved-chats", "--temporary-chats"], message: "Choose --saved-chats or --temporary-chats" },
-    { flags: ["--bigger-context", "--standard-context"], message: "Choose at most one context mode: --bigger-context or --standard-context" },
     { flags: ["--tool-authority-mode", "unsafe"], message: "--tool-authority-mode must be verified-environment or delegated" },
     { flags: ["--tool-authority-mode", "--acknowledge-unofficial"], message: "--tool-authority-mode requires a value" },
     { flags: ["--browser-only"], message: `Unknown ${name === "DEV" ? "DEV setup " : ""}arguments: --browser-only` },
@@ -49,7 +48,6 @@ for (const { name, parse } of parsers) {
       { enabled: "--composer-predictions", disabled: "--no-composer-predictions", property: "composerPredictionsEnabled" },
       { enabled: "--skill-attachments", disabled: "--inline-skills", property: "experimentalSkillAttachments" },
       { enabled: "--saved-chats", disabled: "--temporary-chats", property: "useSavedChats" },
-      { enabled: "--bigger-context", disabled: "--standard-context", property: "experimentalBiggerContext" },
     ] as const) {
       expect(parse(["--browser-only", enabled])[property]).toBe(true);
       expect(parse(["--browser-only", disabled])[property]).toBe(false);
@@ -89,7 +87,7 @@ test("production setup preserves parsed options and leaves argv unchanged", () =
       connectorNameSuffix: "Local", subagentProtocol: "native", tunnelId: "tunnel", runtimeKeyFile: "key",
       chromeExecutablePath: "chrome", browserHostDescriptorPath: "descriptor", refreshAccountCapabilities: true,
       forceLogin: true, autoApproveToolCalls: true, experimentalSkillAttachments: true, useSavedChats: true,
-      experimentalFreshConversationPerTurn: true, experimentalBiggerContext: true, zeroRiskProEnabled: true,
+      experimentalFreshConversationPerTurn: true, zeroRiskProEnabled: true,
       zeroRiskRequireSentConfirmation: false, replaceCodexRoute: true, preserveDisconnectedRoute: true,
       restartService: true,
     },
@@ -132,7 +130,7 @@ test("DEV setup preserves its defaults, accepted options, and argv", () => {
     connectorNameSuffix: "Local", acknowledgedUnofficial: true, refreshAccountCapabilities: true,
     autoApproveToolCalls: true, browserInteractionMode: "automatic", toolAuthorityMode: "delegated",
     experimentalSkillAttachments: true, useSavedChats: true, experimentalFreshConversationPerTurn: true,
-    experimentalBiggerContext: true, devNativeToolLongWaitProbe: true,
+    devNativeToolLongWaitProbe: true,
   });
   expect(args).toEqual(original);
 });
@@ -187,12 +185,12 @@ test("setup preflight validates the port before browser runtime work", () => {
   });
 });
 
-test("manual setup preflight rejects refresh and Bigger Context before requiring full mode", () => {
+test("manual setup preflight preserves its restrictions while ignoring retired context flags", () => {
   withIsolatedPreflight(() => {
     for (const { flags, message } of [
       { flags: ["--refresh-account-capabilities"], message: "Zero Risk cannot refresh account capabilities" },
       { flags: ["--refresh-account-capabilities", "--bigger-context"], message: "Zero Risk cannot refresh account capabilities" },
-      { flags: ["--bigger-context"], message: "Zero Risk does not support Bigger Context" },
+      { flags: ["--bigger-context"], message: "Zero Risk requires --full so Codex Zero Risk3 can signal start, tools, and completion" },
       { flags: [], message: "Zero Risk requires --full so Codex Zero Risk3 can signal start, tools, and completion" },
     ]) {
       const options: SetupOptions = parseProductionSetupArgs([
@@ -201,4 +199,20 @@ test("manual setup preflight rejects refresh and Bigger Context before requiring
       expect(() => preflightSetup({ ...options, acknowledgedUnofficial: true })).toThrow(new Error(message));
     }
   });
+});
+
+for (const { name, parse } of parsers) test(`${name} accepts legacy context flags as ignored compatibility options`, () => {
+  const warnings = spyOn(process.stderr, "write").mockImplementation(() => true);
+  try {
+    const expected = parse(["--full", "--zero-risk-browser-interaction"]);
+    for (const flags of [["--bigger-context"], ["--standard-context"], ["--bigger-context", "--standard-context"]]) {
+      expect(parse(["--full", "--zero-risk-browser-interaction", ...flags])).toEqual(expected);
+    }
+    expect(warnings).toHaveBeenCalledTimes(3);
+    for (const [warning] of warnings.mock.calls) {
+      expect(String(warning)).toContain("removed");
+      expect(String(warning)).toContain("ignored");
+      expect(String(warning)).toContain("account/model history limits");
+    }
+  } finally { warnings.mockRestore(); }
 });

@@ -9,7 +9,7 @@ import { createProcessLineWriter } from "./process-line-writer";
 import { createBrowserHelperPromptSelection, validateBrowserHelperContextPlan } from "./browser-helper-prompt-selection";
 import { CONTINUITY_EXECUTION_FENCING_FEATURE, getLauncherKnownUnsentReceipt, LAUNCHER_CONTEXT_DELIVERY_FEATURE, notifyLauncherTurn } from "../../launcher-browser-host";
 import { CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, isContinuityClaim, sameContinuityRecoveryIdentity, type ContinuityClaim, type ContinuityRecoveryIdentity } from "./continuity-contract";
-import { isChatGptWebMultipartPartCount, type CompiledChatGptWebPrompt } from "./prompt";
+import type { CompiledChatGptWebPrompt } from "./prompt";
 import { ChatGptMirroredTurnProgress } from "./turn-progress";
 import type { ChatGptExternalTurnProgressSnapshot } from "./turn-progress";
 import { CONTEXT_PROTOCOL_VERSION } from "./context-runtime";
@@ -476,12 +476,6 @@ async function run(message: RunMessage): Promise<void> {
       }
       return promise;
     },
-    onMultipartStageAcknowledged: stageIndex => {
-      assertActiveOutput();
-      if (!writeTurnProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
-        throw new Error("Browser helper could not persist multipart acknowledgement evidence");
-      }
-    },
     onReasoningSummary: (text, continuation) => {
       assertActiveOutput();
       writeTurnProtocol({ type: "event", id: message.id, event: "reasoning", text, ...(continuation ? { continuation: true } : {}) });
@@ -647,6 +641,13 @@ input.on("line", line => {
       abortRun(message.id, new Error("Browser helper prompt selection is invalid"));
       return;
     }
+    // Old runtimes must not submit a retired staged commit as a complete inline prompt.
+    if (Object.hasOwn(prepared, "multipart")) {
+      abortRun(message.id, new ChatGptWebAdapterError("Staged context transport is retired; update the runtime and browser helper before sending this prompt", {
+        status: 503, errorType: "server_error", code: "codex_context_upgrade_required", retryable: false,
+      }));
+      return;
+    }
     try {
       validateSkillFiles(prepared.skillFiles);
       validateBrowserHelperContextPlan(prepared.contextPlan);
@@ -654,16 +655,6 @@ input.on("line", line => {
     catch (error) {
       abortRun(message.id, error instanceof Error ? error : new Error(String(error)));
       return;
-    }
-    if (prepared.multipart !== undefined) {
-      const multipart = prepared.multipart;
-      if (!multipart || !Array.isArray(multipart.parts)
-        || !isChatGptWebMultipartPartCount(multipart.parts.length)
-        || multipart.parts.some(part => typeof part !== "string")
-        || typeof multipart.commit !== "string") {
-        abortRun(message.id, new Error("Browser helper multipart prompt is invalid"));
-        return;
-      }
     }
     const selection = preparedSelections.get(message.id);
     if (!selection) {
@@ -805,4 +796,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", ...contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "multipart-stage-ack", "skill-attachments", "submission-receipt-ack-v1", "preparation-termination-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });
+writeProtocol({ type: "ready", ...contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), features: ["progress", "tool-boundary-ack", "completion-fence", "native-tool-wait-v1", "task-updates-v1", "task-output-ack-v3", "skill-attachments", "submission-receipt-ack-v1", "preparation-termination-v1", CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_CONTEXT_DELIVERY_FEATURE] });

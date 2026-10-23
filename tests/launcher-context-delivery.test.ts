@@ -152,7 +152,8 @@ test("the real helper protocol returns the selected plan before Send and preserv
 });
 
 test("old helpers and mismatched plan receipts never receive a Send acknowledgement", async () => {
-  for (const old of [true, false]) {
+  for (const compatibility of ["missing", "previous", "current"] as const) {
+    const old = compatibility !== "current";
     const { config } = descriptor("http://127.0.0.1:39001");
     const client = new LauncherBrowserHelperClient(config);
     const internal = client as unknown as { child: unknown; helperFeatures: Set<string>; ensureChild(): Promise<void>;
@@ -161,7 +162,8 @@ test("old helpers and mismatched plan receipts never receive a Send acknowledgem
     internal.child = child;
     internal.ensureChild = async () => {};
     internal.handleLine(child, JSON.stringify({ type: "ready", features: [LAUNCHER_CONTEXT_DELIVERY_FEATURE],
-      ...(old ? {} : contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION)) }));
+      ...(compatibility === "missing" ? {} : contextProtocolCapabilities(
+        compatibility === "previous" ? CONTEXT_PROTOCOL_VERSION - 1 : CONTEXT_PROTOCOL_VERSION)) }));
     const sent: Record<string, unknown>[] = [];
     internal.send = async message => {
       sent.push(message);
@@ -171,10 +173,16 @@ test("old helpers and mismatched plan receipts never receive a Send acknowledgem
       if (frame) queueMicrotask(() => internal.handleLine(child, JSON.stringify(frame)));
     };
     let released = false;
+    let sendActivations = 0;
     const turn: BrowserTurn = { traceId: "reject-context-plan", modelId: "gpt-6-sol", capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
-      prepare: async () => ({ text: "reduced", images: [], contextPlan: full, release() { released = true; } }), onTextDelta() {} };
-    await expect(client.run(turn)).rejects.toThrow(old ? "does not support context delivery plans" : "unknown or mismatched context plan");
+      prepare: async () => ({ text: "reduced", images: [], contextPlan: full, release() { released = true; } }),
+      onSendActivated() { sendActivations++; }, onTextDelta() {} };
+    if (old) await expect(client.run(turn)).rejects.toMatchObject({
+      status: 503, code: "codex_context_upgrade_required", retryable: false,
+    });
+    else await expect(client.run(turn)).rejects.toThrow("unknown or mismatched context plan");
     expect(sent.map(item => item.type)).toEqual(old ? ["run", "abort"] : ["run", "prepared_selected_ack", "abort"]);
+    expect(sendActivations).toBe(0);
     expect(released).toBe(true);
   }
 });

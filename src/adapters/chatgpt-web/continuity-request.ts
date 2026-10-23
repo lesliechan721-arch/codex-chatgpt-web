@@ -633,7 +633,7 @@ function bindRequestCheckpointInstruction(parsed: CodexParsedRequest): void {
 }
 
 async function prepareFreshPage(parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
-  bindings: ContinuityBindings, descriptor: string, attachments: boolean | undefined, experimentalBiggerContext: boolean | undefined,
+  bindings: ContinuityBindings, descriptor: string, attachments: boolean | undefined,
   compatible: () => Promise<void>, abortSignal?: AbortSignal): Promise<PreparedContinuityRequest> {
   const identity = extractChatGptTurnIdentity(parsed);
   if (!parsed.context.messages.length) throw continuityError("continuity_context_missing", "The current request has no readable task context.");
@@ -646,7 +646,7 @@ async function prepareFreshPage(parsed: CodexParsedRequest, namespace: string, c
       `Explicit user retry: process only the retried user message IDs ${JSON.stringify(retry.messageIds)} using the current request's permissions. Historical tool calls and real returned results are context only. Do not replay old tool calls or assume a returned command session ID means that the command exited.`];
     continuityRecoveredContextCandidate(parsed, input);
   }
-  preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
+  preflightContinuityInput(input, capabilities, attachments, false);
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
   const epoch = Number.parseInt(randomBytes(6).toString("hex"), 16);
@@ -752,7 +752,7 @@ async function prepareContinuityRequestUnlocked(
     const retry = explicitTaskInputRetry(parsed, durable);
     if (retry) {
       const prepared = await prepareExplicitTaskInputRetry(parsed, namespace, capabilities, config.experimentalSkillAttachments,
-        bindings, durable, retry, descriptor, assertExecutionCompatible, abortSignal, config.experimentalBiggerContext);
+        bindings, durable, retry, descriptor, assertExecutionCompatible, abortSignal);
       if (prepared) return prepared;
     }
   }
@@ -763,7 +763,7 @@ async function prepareContinuityRequestUnlocked(
         abortSignal, assertExecutionCompatible);
     }
     return prepareFreshPage(parsed, namespace, capabilities, bindings, descriptor, config.experimentalSkillAttachments,
-      config.experimentalBiggerContext, assertExecutionCompatible, abortSignal);
+      assertExecutionCompatible, abortSignal);
   }
   livePageSelected?.();
   parsed._continuityPageGeneration = durable ? Math.min(...Object.values(durable.works)
@@ -827,9 +827,9 @@ async function prepareContinuityRequestUnlocked(
   const initialLocalOwner = binding?.executionKey ? chatGptTurnSessions.find(binding.executionKey) : undefined;
   if (!parsed._compactionRequest && initialLocalOwner?.nativeTurnId === identity.turnId) initialLocalOwner.bindContinuityResultSource(parsed);
   if (!parsed._compactionRequest && durable) {
-    const checkpointPrepared = await prepareDurableContinuation(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, Boolean(config.experimentalFreshConversationPerTurn), config.experimentalBiggerContext);
+    const checkpointPrepared = await prepareDurableContinuation(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, Boolean(config.experimentalFreshConversationPerTurn));
     if (checkpointPrepared) return checkpointPrepared;
-    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible, config.experimentalBiggerContext);
+    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, config.experimentalSkillAttachments, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
     if (recovered) return recovered;
     binding = bindings.lookup(thread, scope);
   }
@@ -1061,26 +1061,26 @@ async function prepareContinuityRequestUnlocked(
       const retainedTokens = coverage || binding?.retainedPageTokens !== undefined
         ? Math.max(binding?.retainedPageTokens ?? 0, (coverage?.pageTokenReserve() ?? 0)
           + (previousFinal?.type === "final" ? estimateTokens(previousFinal.answer) : 0)) : undefined;
-      let retainedFailure = false;
-      if (!config.experimentalFreshConversationPerTurn && retainedTokens !== undefined) {
+      let inputLimitFailure = false;
+      if (!config.experimentalFreshConversationPerTurn) {
         try { preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, true,
-          { canonical: parsed, retainedTokens, experimentalBiggerContext: config.experimentalBiggerContext, contextReuseAvailable, reuseBaseline, ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) }); }
+          { canonical: parsed, retainedTokens, contextReuseAvailable, reuseBaseline, ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) }); }
         catch (error) {
           if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
           const costs = (error as { details?: { costs?: { retainedTokens?: number; requiredTotalTokens?: number; contextWindowTokens?: number; reuse?: unknown } } }).details?.costs;
-          console.info(`[chatgpt-web] context_preflight_limit ${JSON.stringify({ retained_tokens: retainedTokens, reuse_baseline: !!reuseBaseline, total_tokens: costs?.requiredTotalTokens, window_tokens: costs?.contextWindowTokens, reuse: costs?.reuse, code: (error as { code?: string }).code })}`);
-          retainedFailure = true;
+          console.info(`[chatgpt-web] context_preflight_limit ${JSON.stringify({ cumulative_delivery_estimate_tokens: retainedTokens, reuse_baseline: !!reuseBaseline, planned_delivery_estimate_tokens: costs?.requiredTotalTokens, reuse: costs?.reuse, code: (error as { code?: string }).code })}`);
+          inputLimitFailure = true;
         }
       }
-      if (config.experimentalFreshConversationPerTurn || retainedTokens === undefined || retainedFailure) {
+      if (config.experimentalFreshConversationPerTurn || inputLimitFailure) {
         input = parsed;
         expected = undefined;
         coldPage = true;
-        console.info(`[chatgpt-web] context_candidate_fallback ${JSON.stringify({ selected: "full", reason: config.experimentalFreshConversationPerTurn ? "fresh_page" : retainedTokens === undefined ? "unproven_page_cost" : "retained_budget" })}`);
+        console.info(`[chatgpt-web] context_candidate_fallback ${JSON.stringify({ selected: "full", reason: config.experimentalFreshConversationPerTurn ? "fresh_page" : "single_input_limit" })}`);
       }
     }
     if (!finalReplaySource) preflightContinuityInput(input, capabilities, config.experimentalSkillAttachments, Boolean(expected),
-      { canonical: parsed, experimentalBiggerContext: config.experimentalBiggerContext, contextReuseAvailable, ...(expected && reuseBaseline ? { reuseBaseline } : {}), ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) });
+      { canonical: parsed, contextReuseAvailable, ...(expected && reuseBaseline ? { reuseBaseline } : {}), ...(toolSource?.taskUpdatesEnabled() ? { taskUpdateProtocol: 1 as const } : {}) });
   } else if (binding?.state === "compacting" && !parsed._compactionRequest
     && !existing?.roundCompleted(existing.continuityRoundKey(parsed))) {
     throw continuityError("continuity_source_unproven");
@@ -1215,7 +1215,7 @@ export async function finishContinuityResponse(prepared: PreparedContinuityReque
 async function prepareExplicitTaskInputRetry(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities, attachments: boolean | undefined,
   bindings: ContinuityBindings, observed: RecoveryThreadRecord, retry: RecoveryTaskInputRetry, descriptor: string,
-  compatible: () => Promise<void>, abortSignal?: AbortSignal, experimentalBiggerContext = false,
+  compatible: () => Promise<void>, abortSignal?: AbortSignal,
 ): Promise<PreparedContinuityRequest> {
   const native = extractChatGptTurnIdentity(parsed), store = bindings.recoveryStore;
   const metadata = { identity: { thread: observed.thread, scope: observed.scope, taskId: retry.taskId },
@@ -1237,7 +1237,7 @@ async function prepareExplicitTaskInputRetry(
       conversationKey: binding.conversation!.key, executionKey, nativeThreadId: native.threadId!,
       revision: observed.historyRevision, taskInputRetry: metadata };
     const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, attachments, bindings, observed,
-      descriptor, abortSignal, compatible, experimentalBiggerContext);
+      descriptor, abortSignal, compatible);
     if (!recovered) throw continuityError("continuity_unverified");
     return { ...recovered, taskInputRetry: metadata };
   }
@@ -1256,7 +1256,7 @@ async function prepareExplicitTaskInputRetry(
     logicalWorkId: source.logicalWorkId, attempt: source.attempts.at(-1)!.attempt });
   continuityRecoveredContextCandidate(parsed, input);
   assertRecoveredSource(parsed, input, store.get(observed.thread)!, source, source.attempts.at(-1)!.historyRevision);
-  preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
+  preflightContinuityInput(input, capabilities, attachments, false);
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
   const current = store.get(observed.thread)!;
@@ -1290,7 +1290,6 @@ async function prepareDurableOrdinary(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
   attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
   descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>,
-  experimentalBiggerContext = false,
 ): Promise<PreparedContinuityRequest | undefined> {
   const identity = extractChatGptTurnIdentity(parsed);
   const liveBinding = bindings.observed(observed.thread);
@@ -1367,7 +1366,7 @@ async function prepareDurableOrdinary(
       recoverySource?.compactionObjectArgumentCallIds());
   }
   if (work) assertRecoveredSource(parsed, input, store.get(record.thread)!, work, work.attempts.at(-1)!.historyRevision);
-  preflightContinuityInput(input, capabilities, attachments, false, { experimentalBiggerContext });
+  preflightContinuityInput(input, capabilities, attachments, false);
   await assertLauncherContinuityCapacity(descriptor);
   abortSignal?.throwIfAborted();
   const current = store.get(record.thread)!;
@@ -1512,7 +1511,6 @@ async function prepareDurableContinuation(
   parsed: CodexParsedRequest, namespace: string, capabilities: ChatGptWebCapabilities,
   attachments: boolean | undefined, bindings: ContinuityBindings, observed: RecoveryThreadRecord,
   descriptor: string, abortSignal?: AbortSignal, assertExecutionCompatible?: () => Promise<void>, freshConversationPerTurn = false,
-  experimentalBiggerContext = false,
 ): Promise<PreparedContinuityRequest | undefined> {
   const proof = continuityCheckpoint(parsed);
   if (proof.index < 0) return undefined;
@@ -1602,7 +1600,7 @@ async function prepareDurableContinuation(
   }
   const beforeRecovery = store.get(record.thread)!;
   if (beforeRecovery.version !== record.version) {
-    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, beforeRecovery, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, beforeRecovery, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn);
   }
   let input = recoveryContext(parsed, { directory: bindings.registrations.directory, thread: record.thread,
     logicalWorkId: work.logicalWorkId, attempt: work.attempts.at(-1)!.attempt }, checkpoint.commitId);
@@ -1628,21 +1626,18 @@ async function prepareDurableContinuation(
   // inspection is in flight. Reconcile that receipt before retiring any writer.
   const afterInspection = store.get(record.thread)!;
   if (afterInspection.version !== record.version) {
-    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, afterInspection, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
+    return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, afterInspection, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn);
   }
   if (expected && binding && localCheckpoint) input = checkpointResumeInput(parsed, binding, localCheckpoint, proof, { suffix,
     instructionPrevious: { instructionIdentity: work.instructionIdentity, nativeTurnId: work.nativeTurnId } }).input;
   const retainedTokens = binding?.retainedPageTokens;
   if (expected) {
-    let retainedFailure = retainedTokens === undefined;
-    if (!retainedFailure) {
-      try { preflightContinuityInput(input, capabilities, attachments, true, { experimentalBiggerContext, retainedTokens }); }
-      catch (error) {
-        if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
-        retainedFailure = true;
-      }
+    try { preflightContinuityInput(input, capabilities, attachments, true, { retainedTokens }); }
+    catch (error) {
+      if (!["CONTEXT_BUDGET_EXCEEDED", "context_length_exceeded", "continuity_input_limit"].includes(String((error as { code?: string }).code))) throw error;
+      expected = undefined;
+      input = recoveredInput;
     }
-    if (retainedFailure) { expected = undefined; input = recoveredInput; }
   }
   parsed.context.tools = continuityToolRegistry(parsed, binding, existing).tools;
   input.context.tools = parsed.context.tools;
@@ -1652,7 +1647,7 @@ async function prepareDurableContinuation(
       recoverySource?.compactionObjectArgumentCallIds());
   }
   if (!expected) assertRecoveredSource(parsed, input, store.get(record.thread)!, work, parsed._continuityHistoryRevision!);
-  preflightContinuityInput(input, capabilities, attachments, Boolean(expected), { experimentalBiggerContext });
+  preflightContinuityInput(input, capabilities, attachments, Boolean(expected), { retainedTokens });
   if (!expected) {
     await assertLauncherContinuityCapacity(descriptor);
     record = await retireRecoveryWriter(bindings, record, descriptor, taskInputRequestIdentity(parsed));
@@ -1664,7 +1659,7 @@ async function prepareDurableContinuation(
       const currentCheckpoint = current.checkpoints[checkpoint.commitId];
       if (currentCheckpoint?.continuation.state === "consumed"
         && currentCheckpoint.continuation.consumerLogicalWorkId === consumerLogicalWorkId) {
-        return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, current, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn, experimentalBiggerContext);
+        return prepareDurableContinuation(parsed, namespace, capabilities, attachments, bindings, current, descriptor, abortSignal, assertExecutionCompatible, freshConversationPerTurn);
       }
     }
     record = store.consumeContinuation(record.thread, { scope: record.scope, expectedVersion: record.version }, checkpoint.commitId, {

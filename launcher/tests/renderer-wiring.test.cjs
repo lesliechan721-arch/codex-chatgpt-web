@@ -14,7 +14,7 @@ const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src"
 const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("../electron/connector-identity.cjs");
 const apiAccessSettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "ApiAccessSettings.tsx"), "utf8");
 
-test("Bigger Context waits for startup and route recovery without invalidating healthy setup", async () => {
+test("browser preferences waits for startup and route recovery without invalidating healthy setup", async () => {
   const vm = require("node:vm");
   for (const fails of [false, true]) {
     const startupAuthenticationRefresh = new Promise(() => {});
@@ -25,7 +25,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
     let startupSettled = false;
     const calls = [];
     const handlers = new Map();
-    const config = { mode: "full", experimentalBiggerContext: false };
+    const config = { mode: "full", composerPredictionsEnabled: false };
     const state = { coreSetupComplete: true, codexCatalogVerified: true };
     const stateStore = { read: () => state, update: patch => Object.assign(state, patch) };
     const logger = { info() {}, error() {} };
@@ -47,7 +47,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
           return { status: "ready" };
         },
       },
-      CORE_HOME: "/tmp/codex-home", browserHost: { turnTabs: new Map() }, clipboard: {}, path,
+      CORE_HOME: "/tmp/codex-home", browserHost: { turnTabs: new Map(), currentOperation: () => null }, clipboard: {}, path,
       readPolicyFile: () => ({ policy: { mode: "openai" } }),
       createApiAccessSettings: () => ({ daemonEnvironment: () => ({}) }),
       registerApiAccessIpc: () => () => {}, rendererNavigationAllowed: () => true,
@@ -58,10 +58,10 @@ test("Bigger Context waits for startup and route recovery without invalidating h
         upgradeManagedRuntime: async () => ({ updated: false }),
         runtimeConfigSnapshot: () => ({ configured: true, config }),
         connectBridgeRoute: async () => { calls.push("route"); return { changed: false }; },
-        setBiggerContext: async enabled => {
+        setComposerPredictions: async enabled => {
           assert.equal(startupSettled, true, "settings must wait through startup recovery too");
           calls.push("setting");
-          config.experimentalBiggerContext = enabled;
+          config.composerPredictionsEnabled = enabled;
           return { enabled };
         },
       },
@@ -70,7 +70,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
       + "\nregisterIpc({ logger, stateStore });", context);
     const start = electronMain.indexOf("} else void (async () => {");
     vm.runInContext(electronMain.slice(start + "} else ".length, electronMain.indexOf('  app.on("before-quit"', start)), context);
-    const setting = handlers.get("launcher:bigger-context")({}, true);
+    const setting = handlers.get("launcher:composer-predictions")({}, true);
     // Runtime startup proceeds even if the browser session check never completes.
     // Settings still wait for runtime readiness, and read-only UI stays usable.
     assert.equal((await handlers.get("launcher:limits")()).enabled, false);
@@ -78,7 +78,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
     completeRuntime();
     await setting;
     assert.deepEqual(calls, fails ? ["startup", "recovery", "setting"] : ["startup", "route", "setting"]);
-    assert.equal(state.experimentalBiggerContext, true);
+    assert.equal(state.composerPredictionsEnabled, true);
     assert.equal(state.coreSetupComplete, !fails, "only a real startup failure may invalidate setup");
   }
 });
@@ -540,9 +540,6 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(electronMain, /onboardingComplete:\s*true,[\s\S]*?autoStart:\s*false/);
   assert.match(appSource, /snapshot\.profile === "development"/);
   assert.match(appSource, /data-profile=\{snapshot\.profile\}/);
-  assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
-  assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
-  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
   assert.match(appSource, /api!\.setToolAuthorityMode\(mode\)/);
   assert.match(preloadSource, /setToolAuthorityMode:[\s\S]*?launcher:tool-authority-mode/);
   assert.match(electronMain, /runtimeHost\.setToolAuthorityMode\(mode\)/);
@@ -684,20 +681,11 @@ test("passkey buttons show launch progress, wait for Chrome, and preserve import
   }
 });
 
-test("Bigger Context startup recommendation reuses the persisted setting and setup transaction", () => {
-  assert.match(
-    appSource,
-    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?snapshot\.state\.biggerContextAvailable === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
-  );
-  assert.match(appSource, /&& !biggerContextRecommendationOpen\s*&& !networkProxyOpen;/);
-  assert.match(appSource, /updateState\(await api!\.setBiggerContext\(enabled\)\)/);
-  assert.match(
-    appSource,
-    /<BiggerContextRecommendation[\s\S]*?checked=\{snapshot\.state\.experimentalBiggerContext\}[\s\S]*?onClose=\{\(\) => setBiggerContextRecommendationOpen\(false\)\}/,
-  );
-  assert.match(appSource, /<Switch checked=\{checked\} disabled=\{busy\} onChange=\{onChange\} \/>/);
-  assert.match(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*position:\s*fixed;/s);
-  assert.doesNotMatch(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*backdrop-filter:/s);
+test("Bigger Context has no settings, recommendation, translation, or IPC entry", () => {
+  for (const source of [appSource, preloadSource, electronMain, stylesSource,
+    fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8")]) {
+    assert.doesNotMatch(source, /bigger.?context/i);
+  }
 });
 
 test("Zero Risk setup commits state after the runtime transaction and preserves manual inspection boundaries", () => {
@@ -1300,18 +1288,18 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   }
   config = {};
   assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, false);
-  assert.equal((await snapshot()).state.biggerContextAvailable, false);
+  assert.equal((await snapshot()).state.biggerContextAvailable, undefined);
   config.solAvailable = true;
-  assert.equal((await snapshot()).state.biggerContextAvailable, true);
+  assert.equal((await snapshot()).state.biggerContextAvailable, undefined);
   config.solAvailable = false;
-  assert.equal((await snapshot()).state.biggerContextAvailable, true);
+  assert.equal((await snapshot()).state.biggerContextAvailable, undefined);
 });
 
-test("changing Bigger Context retires ordinary chats and preserves the continuity page and lease", () => {
+test("retired Bigger Context configuration does not retire chats or alter continuity", () => {
   const vm = require("node:vm");
   const { continuityLease } = require("../electron/continuity-lease.cjs");
-  const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
-    useSavedChats: true, autoApproveToolCalls: false, biggerContextAvailable: true };
+  const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
+    useSavedChats: true, autoApproveToolCalls: false };
   const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
     traceId: "continuity-trace", continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32),
     continuityLastSuccessAt: Date.now(), view: { webContents: { isDestroyed: () => false } } };
@@ -1340,8 +1328,8 @@ test("changing Bigger Context retires ordinary chats and preserves the continuit
     if (!enabled) tabs.set("old", { id: "old", status: "ready", conversationKey: "old-luna", interactionMode: "automatic" });
     const config = { solAvailable: false, experimentalBiggerContext: enabled };
     assert.doesNotThrow(() => context.syncBrowserPreferences(store, config));
-    assert.equal(state.experimentalBiggerContext, enabled);
-    assert.equal(tabs.has("old"), false);
+    assert.equal(state.experimentalBiggerContext, undefined);
+    assert.equal(tabs.has("old"), true);
     assert.equal(tabs.get("continuity"), continuity);
     assert.deepEqual(continuityLease(continuity), lease);
     assert.equal(continuity.continuityInvalidated, undefined);
@@ -1349,8 +1337,8 @@ test("changing Bigger Context retires ordinary chats and preserves the continuit
     assert.equal(tabs.has("manual"), true);
     assert.doesNotThrow(() => context.syncBrowserPreferences(store, config));
   }
-  assert.deepEqual(released, ["old-luna", "old-luna"]);
-  assert.equal(events.length, 2, "repeated synchronization must settle without another update");
+  assert.deepEqual(released, []);
+  assert.equal(events.length, 0, "repeated synchronization must settle without another update");
 });
 
 test("broader persistence changes still require the continuity lease before releasing its page", () => {
@@ -1394,7 +1382,6 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
     api: {
       setFreshConversationPerTurn: async enabled => { invocation = enabled; return { experimentalFreshConversationPerTurn: enabled }; },
       setAutoApproveToolCalls: async enabled => { invocation = enabled; return { autoApproveToolCalls: enabled }; },
-      setBiggerContext: async enabled => { invocation = enabled; return { experimentalBiggerContext: enabled }; },
     },
     messageOf: String, platformLabel: String, requiresCodexCatalog: () => false,
   };
@@ -1408,16 +1395,14 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
     for (const [property, label, body, unavailable] of [
       ["experimentalFreshConversationPerTurn", "freshConversation", "freshConversationBody", "manualFreshConversationUnavailable"],
       ["autoApproveToolCalls", "autoApproveTools", "autoApproveToolsBody", "manualAutoApproveUnavailable"],
-      ["experimentalBiggerContext", "biggerContext", "biggerContextBody", "manualBiggerContextUnavailable"],
     ]) {
       for (const key of [label, body, unavailable, "toolApprovalNeeded", "toolApprovalPendingBody"]) {
         assert.equal(typeof copy[key], "string");
         assert.ok(copy[key].length > 5);
       }
-      for (const available of property === "experimentalBiggerContext" ? [true, false] : [true])
       for (const [mode, configured, enabled] of [["automatic", true, false], ["automatic", true, true], ["manual", true, true], ["automatic", false, false]]) {
         const tree = render({ copy, devProfile: false, language, configureInteractionMode() {}, setError() {},
-          snapshot: { toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null }, connectorNames: { automatic: "Codex Native4", manual: "Codex Zero Risk3" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, biggerContextAvailable: available, [property]: enabled } },
+          snapshot: { toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null }, connectorNames: { automatic: "Codex Native4", manual: "Codex Zero Risk3" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, [property]: enabled } },
           updateState: value => { saved = value; },
         });
         const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy[label]);
@@ -1425,8 +1410,7 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
         assert.equal(row.props.body, mode === "manual" ? copy[unavailable] : copy[body]);
         const control = visit(row).find(node => node.type === "Switch");
         assert.equal(control.props.checked, property === "autoApproveToolCalls" && mode === "manual" ? false : enabled);
-        assert.equal(control.props.disabled, mode === "manual" || !configured
-          || (property === "experimentalBiggerContext" && !available && !enabled));
+        assert.equal(control.props.disabled, mode === "manual" || !configured);
         if (!control.props.disabled) {
           control.props.onChange(!enabled);
           await new Promise(resolve => setImmediate(resolve));

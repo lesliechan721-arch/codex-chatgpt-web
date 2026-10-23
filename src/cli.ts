@@ -94,7 +94,6 @@ Setup options:
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
-  --bigger-context             Enable experimental adaptive 1/2/6-message context
   --fresh-conversation         Start each automatic turn in a fresh browser chat
   --retained-conversation      Reuse the browser chat between turns (default)
   --saved-chats                Keep task conversations in ChatGPT history (default)
@@ -103,7 +102,6 @@ Setup options:
   --no-composer-predictions    Disable next-message suggestions for Web models (default)
   --skill-attachments         Experimental selected skills as text attachments
   --inline-skills             Keep selected skills inline (default)
-  --standard-context           Disable experimental multi-message context
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
 API key mode:

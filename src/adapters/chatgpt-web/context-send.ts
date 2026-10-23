@@ -31,8 +31,7 @@ export class ContextSend {
   constructor(private readonly canonical: CodexParsedRequest, private readonly broker: TurnBrokerOwner,
     private readonly capabilities: ChatGptWebCapabilities, private readonly pageGeneration: string,
     coverage?: CompactionSourceCoverage, private readonly ownerContext?: TaskUpdateOwnerContext,
-    sourceSnapshot?: ContextSnapshot, private readonly reuseBaseline?: ContextReuseBaseline,
-    private readonly experimentalBiggerContext?: boolean) {
+    sourceSnapshot?: ContextSnapshot, private readonly reuseBaseline?: ContextReuseBaseline) {
     this.source = sourceSnapshot ?? createContextSnapshot(canonical, { imageStoragePolicy: "bounded" });
     this.initialSource = this.source;
     this.coverage = coverage?.fork() ?? new CompactionSourceCoverage();
@@ -50,7 +49,6 @@ export class ContextSend {
       messageIndices: contextCandidateMessageIndices(this.canonical, candidate), capabilities: this.capabilities,
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
       turnToken: token, compileOptions: options, contextToolsAvailable, budgetProfile,
-      experimentalBiggerContext: this.experimentalBiggerContext,
       contextBootstrapAvailable: bootstrapAvailable, contextReuseAvailable: reuseAvailable,
       ...(baseline ? { reuseBaseline: baseline } : {}), budget: { retainedTokens } };
     let plan = planContextDelivery(planInput);
@@ -73,7 +71,8 @@ export class ContextSend {
     const costs = plan.costs;
     console.info(`[chatgpt-web] context_prepared ${JSON.stringify({ prepare_ms: performance.now() - startedAt,
       prompt_code_points: costs.promptCodePoints, retained_tokens: costs.retainedTokens, total_tokens: costs.requiredTotalTokens,
-      prompt_serialized_bytes: costs.promptJsonBytes, reuse: costs.reuse,
+      prompt_serialized_bytes: costs.promptJsonBytes, reuse: costs.reuse, selection: costs.selection,
+      page_accounting: "cumulative_delivery_estimate",
       context_budget_profile: budgetProfile, context_limits: plan.limits,
       budget: { context_window_tokens: costs.contextWindowTokens, retained_tokens: costs.retainedTokens,
         current_plan_tokens: costs.requiredTotalTokens - costs.retainedTokens - costs.platformReserveTokens,

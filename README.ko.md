@@ -89,21 +89,14 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 > [!NOTE]
 > **Limits**
 >
-> GPT-5.6 Sol Pro 및 GPT-6 Astra의 현재 ChatGPT 메시지 허용량은
-> [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)를 참고하세요.
-> 컨텍스트 한도는 계정 유형과 선택한 effort에 따라 달라집니다. Plus의 Medium/High는 실측
-> 90,000-token 창을 사용합니다. GPT-5.6은 실험적 3× context를 활성화하면 최대 270,000 tokens까지
-> 확장되며, 네이티브 Codex compaction을 지원합니다.
->
-> GPT-6 Sol의 Bigger Context는 Medium, High 및 사용 가능한 Extra High에서 지원합니다.
-> Plus 컨텍스트 창은 **120,000 tokens**이며 **110,000 tokens**에서 압축합니다.
-> Pro 컨텍스트 창은 **240,000 tokens**이며 **220,000 tokens**에서 압축합니다.
-> GPT-6 Instant는 표준 용량을 사용합니다.
-> GPT-5.6과 GPT-6 Pro는 기존 Bigger Context 한도를 유지합니다.
-
-> Luna/Think는 실험적인 분할 Bigger Context를 사용할 수 있습니다. Free의 긴 대화에서는 이전 세부
-> 정보가 손실될 수 있습니다. 끄면 Luna의 롤링 checkpoint를 유지합니다. 지원되는 Full Native + Launcher
-> 경로는 공통 기록 예산을 사용하며 웹 전송은 기존 전송 제한을 따릅니다.
+> ChatGPT 메시지 허용량은 [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)를 참고하세요.
+> 계정과 모델에 따라 기록 창과 클라이언트 압축 기준은 **200,000 / 180,000**, **300,000 / 270,000**,
+> **500,000 / 450,000**, 또는 **600,000 / 540,000** tokens입니다. 이는 기록 관리 정책이며 웹 용량 실측값이 아닙니다.
+> Full/MCP는 기본으로 필요한 본문을 읽습니다. 짧은 입력은 인라인으로 유지할 수 있습니다.
+> Bigger Context와 분할 전송은 제거되었습니다. 단일 메시지, 읽기 응답, 이미지, 첨부, 저장 및 처리 시간 제한은 유지됩니다.
+> Full/MCP Luna/Think는 canonical 기록을 계산하고 180,000 tokens에서 독립 압축을 지원합니다.
+> Browser-only Luna는 롤링 checkpoint와 투영 usage를 유지합니다.
+> [계정 및 모델 표](docs/context-navigation.md#history-window-and-client-compaction)를 참고하세요.
 
 1. 필수 설정을 완료하고 **MCP**를 연 다음 Tunnel과 일반 API 키를 생성하고
    **하네스 연결**을 누릅니다.
@@ -127,10 +120,9 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 호출은 새 양의 정수 ID를 사용하며 재시도와 대기는 재연결 후에도 같은 ID를 사용합니다. pending
 수신 확인은 작업 완료가 아니며 원래 작업을 다시 실행해서는 안 됩니다.
 
-[컨텍스트 탐색](docs/context-navigation.md)은 일반 작업 본문을 유지하면서 선택한 도구 이력을 필요할 때
+[컨텍스트 탐색](docs/context-navigation.md)은 현재 요청과 규칙을 유지하면서 일반 도우미 기록, 상세 소스 매핑과 선택한 도구 이력을 필요할 때
 읽게 합니다. 이미지는 MCP를 우선 사용하고 필수 첨부 대체 경로만 Zero Risk의 추가 확인을 요구합니다.
-압축은 별도의 읽기 전용 소스 목록을 사용할 수 있으며 모든 소스를 읽을 필요는 없습니다. 기존 컨텍스트
-한도는 유지됩니다. 전체 릴리스 검증은 아직 끝나지 않았습니다. High 모드의 제한된 다중 이미지 성공은
+압축은 별도의 읽기 전용 소스 목록을 사용할 수 있으며 모든 소스를 읽을 필요는 없습니다. 페이지 누적 전달 추정값은 전송, 읽기, 완료 또는 페이지 교체를 제한하지 않습니다. 전체 릴리스 검증은 아직 끝나지 않았습니다. High 모드의 제한된 다중 이미지 성공은
 용량 증가, 정확한 숫자 인식, 모든 모델의 안정성을 증명하지 않습니다.
 [검증 범위](docs/release-validation.md#context-navigation-validation)를 참고하세요.
 
@@ -220,7 +212,7 @@ bun run app:package
 
 `dev:launcher`는 `~/.codex-chatgpt-web-dev`의 별도 프로필과 계정을 사용합니다. `dev:chat`은 실제 브라우저와 compaction 경로를 사용하며, 도구 결과는 명시적인 시뮬레이션입니다. 일반 Codex 경로는 변경하지 않습니다. 설정과 명령은 [DEV chat harness](docs/dev-chat.md)를 참고하세요.
 
-[세션 연속성](docs/session-continuity.md)은 지원되는 Full Native + Launcher 경로에서 일반 `chatgpt-web/` 모델 이름과 공통 작업 처리를 사용합니다. 정상이며 호환되는 페이지를 재사용합니다. 프로젝트 실행 권한 격리, 실제 도구 결과, 유효한 소스와 전송 계획을 확인한 뒤 미완료 작업, checkpoint 후 계속 작업, 미확정 압축을 새 페이지에서 복구할 수 있습니다. 알 수 없는 Send, 결과, 중지 기록은 계속 유효합니다. Fresh Conversation Per Turn은 페이지 선택만 변경합니다. Bigger Context는 기존 기능과 Zero Risk 제한을 유지합니다. 1,000,000 / 900,000-token Codex 기록 예산은 웹페이지 용량을 늘리지 않습니다. 실제 페이지는 최대 다섯 개이며 정리 시도 횟수는 제한됩니다. 이전 접두사 설정은 해당 일반 이름으로 변경해야 합니다. 이전 작업의 work, stop, checkpoint, retry 기록은 유지됩니다. 실제 환경 검증 상태는 문서에서 확인할 수 있습니다.
+[세션 연속성](docs/session-continuity.md)은 지원되는 Full Native + Launcher 경로에서 일반 `chatgpt-web/` 모델 이름과 공통 작업 처리를 사용합니다. 정상이며 호환되는 페이지를 재사용합니다. 프로젝트 실행 권한 격리, 실제 도구 결과, 유효한 소스와 전송 계획을 확인한 뒤 미완료 작업, checkpoint 후 계속 작업, 미확정 압축을 새 페이지에서 복구할 수 있습니다. 알 수 없는 Send, 결과, 중지 기록은 계속 유효합니다. Fresh Conversation Per Turn은 페이지 선택만 변경합니다. Zero Risk의 수동 전송 제한은 유지됩니다. Codex 기록 창은 위의 네 단계를 사용하며 단일 메시지 전송 제한을 늘리지 않습니다. 실제 페이지는 최대 다섯 개이며 정리 시도 횟수는 제한됩니다. 이전 접두사 설정은 해당 일반 이름으로 변경해야 합니다. 이전 작업의 work, stop, checkpoint, retry 기록은 유지됩니다. 실제 환경 검증 상태는 문서에서 확인할 수 있습니다.
 
 </details>
 

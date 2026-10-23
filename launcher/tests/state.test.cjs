@@ -10,6 +10,23 @@ const {
   validateSidebarState,
 } = require("../electron/state.cjs");
 
+test("retired context state is removed on read and the next normal save", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-retired-context-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    for (const experimentalBiggerContext of [undefined, false, true]) {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, experimentalBiggerContext, biggerContextAvailable: true }));
+      const store = createStateStore(file);
+      assert.equal(Object.hasOwn(store.read(), "experimentalBiggerContext"), false);
+      assert.equal(Object.hasOwn(store.read(), "biggerContextAvailable"), false);
+      store.update({ sidebarOpen: false });
+      const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+      assert.equal(Object.hasOwn(saved, "experimentalBiggerContext"), false);
+      assert.equal(Object.hasOwn(saved, "biggerContextAvailable"), false);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("prediction setting defaults off for new, old, and invalid state and persists explicit choices", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prediction-state-"));
   const file = path.join(root, "state.json");
@@ -57,7 +74,6 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
-      experimentalBiggerContext: false,
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
@@ -93,7 +109,6 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "delegated",
-      experimentalBiggerContext: false,
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
@@ -180,7 +195,6 @@ test("persisted sidebar and proxy corruption are repaired without changing the r
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
-      experimentalBiggerContext: false,
       composerPredictionsEnabled: false,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,

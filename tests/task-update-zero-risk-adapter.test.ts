@@ -97,7 +97,7 @@ async function fixture(options: { remote?: boolean; awaitingSent?: boolean } = {
       appName: ZERO_RISK_CHATGPT_CONNECTOR_NAME, browserInteractionMode: "manual", browserHost: "launcher",
       browserHostDescriptorPath: join(root, `${scope}-launcher.json`), brokerSocketPath: socket,
       localToolsEnabled: true, toolAuthorityMode: "delegated", solAvailable: false,
-      extraHighAvailable: false, proAvailable: false, experimentalBiggerContext: false,
+      extraHighAvailable: false, proAvailable: false,
     },
   };
   const broker = TurnBroker.forSocket(socket);

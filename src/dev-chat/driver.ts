@@ -59,12 +59,6 @@ export interface DevChatTurnResult {
   status: DevContextStatus;
 }
 
-export interface DevChatFeatures {
-  biggerContext: boolean;
-}
-
-const DEFAULT_DEV_CHAT_FEATURES: DevChatFeatures = { biggerContext: false };
-
 interface ResponsesEnvelope {
   id?: string;
   status?: string;
@@ -414,9 +408,6 @@ export function createLauncherDevAdapter(
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
       useSavedChats: config.useSavedChats,
-      ...(config.experimentalBiggerContext
-        ? { experimentalBiggerContext: true }
-        : {}),
     },
   }, { broker });
   return { broker, adapterFactory };
@@ -428,7 +419,6 @@ export class DevChatDriver {
     readonly store: DevChatStore,
     readonly adapterFactory: AdapterFactory,
     readonly cwd = process.cwd(),
-    readonly features: DevChatFeatures = DEFAULT_DEV_CHAT_FEATURES,
   ) {}
 
   open(name: string, requestedModel?: DevChatModel): { state: DevChatState; created: boolean } {
@@ -612,7 +602,7 @@ export class DevChatDriver {
   }
 
   private shouldAutoCompact(state: DevChatState, context: DevContextStatus): boolean {
-    return (!isLunaDevChatModel(state.model) || this.config.experimentalBiggerContext === true)
+    return (!isLunaDevChatModel(state.model) || this.config.mode === "full")
       && context.inputTokens >= context.autoCompactTokenLimit;
   }
 
@@ -632,7 +622,7 @@ export class DevChatDriver {
       solAvailable: this.config.solAvailable,
       extraHighAvailable: this.config.extraHighAvailable === true,
       proAvailable: this.config.proAvailable,
-    }, this.config.experimentalBiggerContext ? { captureLunaCheckpoint: false } : {});
+    }, { captureLunaCheckpoint: this.config.mode !== "full" && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL });
     const limits = resolveChatGptWebHistoryLimits(route, this.config);
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;
@@ -655,7 +645,7 @@ export class DevChatDriver {
     reason: "automatic" | "manual",
     emit: (event: DevChatEvent) => void,
   ): Promise<unknown[]> {
-    if (isLunaDevChatModel(state.model) && !this.config.experimentalBiggerContext) {
+    if (isLunaDevChatModel(state.model) && this.config.mode !== "full") {
       throw new Error("ChatGPT Web Luna uses its production rolling checkpoint and does not support a separate compact command");
     }
     const compactTurnId = id("dev_compact_turn");

@@ -332,7 +332,6 @@ test("manual provider configuration preserves a distinct backend without guessin
     browserInteractionMode: "manual",
     solAvailable: false,
     extraHighAvailable: false, proAvailable: false,
-    experimentalBiggerContext: false,
   });
 
   config.zeroRiskProEnabled = true;

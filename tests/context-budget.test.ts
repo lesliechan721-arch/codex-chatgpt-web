@@ -112,7 +112,7 @@ describe("complete context response budgets", () => {
     expect(() => new ContextNavigator({ scopeId: "compaction", snapshot, purpose: "compaction" })).toThrow("fully readable");
   });
 
-  test("cumulative image and shared remaining budgets reject before charging image delivery", () => {
+  test("image limits remain independent from diagnostic token and wire estimates", () => {
     const snapshot = snapshotOf([{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] }]);
     const target = snapshot.targets[0]!;
     const limited = new ContextNavigator({ scopeId: "limited", snapshot, purpose: "normal", limits: { maxImageReads: 1 } });
@@ -124,18 +124,18 @@ describe("complete context response budgets", () => {
     const reserved = new ContextNavigator({ scopeId: "reserve", snapshot, purpose: "normal", remainingBudget: image => {
       if (image) seen.push(image[0]!.target_id); return { tokens: 5384, wire_bytes: 10000, reserved_tokens: image ? 0 : 5000 };
     } });
-    expect(reserved.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
+    expect(reserved.list({ context_id: snapshot.context_id, view: "overview" }).isError).not.toBe(true);
     expect(reserved.read(args).isError).not.toBe(true); expect(seen).toEqual([target.target_id]);
   });
 
   test("compaction has no required-media gate and idle time does not expire snapshots", async () => {
     const snapshot = snapshotOf([{ role: "user", content: "summary source" }]);
     const navigator = new ContextNavigator({ scopeId: "compaction", snapshot, purpose: "compaction", remainingBudget: () => ({ tokens: 4000, wire_bytes: 10000, reserved_tokens: 500 }) });
-    const overview = navigator.list({ context_id: snapshot.context_id, view: "overview" }); expect((overview.structuredContent as any).remaining_budget.reserved_tokens).toBe(500);
+    const overview = navigator.list({ context_id: snapshot.context_id, view: "overview" }); expect((overview.structuredContent as any).remaining_budget).toBeUndefined();
     const elapsed = navigator.usage().processing_ms;
     await new Promise(resolve => setTimeout(resolve, 15)); expect(navigator.usage().processing_ms).toBe(elapsed);
     const read = navigator.read({ context_id: snapshot.context_id, reads: [{ read_ref: snapshot.targets[0]!.read_ref! }] }); expect(read.isError).not.toBe(true);
-    expect((read.structuredContent as any).remaining_budget.stop_hint).toBeString();
+    expect((read.structuredContent as any).remaining_budget).toBeUndefined();
     const entries = (navigator.list({ context_id: snapshot.context_id, view: "entries" }).structuredContent as any).entries;
     expect(entries[0]).toMatchObject({ delivery: "source_on_demand", required: false });
   });
@@ -167,7 +167,7 @@ describe("complete context response budgets", () => {
     }) });
     let chargedTokens = 0, chargedBytes = 0;
     for (let index = 0; index < 3; index++) {
-      const result = navigator.list({ context_id: snapshot.context_id, view: "overview" });
+      const result = navigator.list({ context_id: snapshot.context_id, view: "invalid" });
       expect(result.isError).toBe(true);
       const cost = measureContextResponse(result); chargedTokens += cost.text_tokens; chargedBytes += cost.wire_bytes;
       expect(cost.text_tokens).toBeLessThanOrEqual(128); expect(cost.wire_bytes).toBeLessThanOrEqual(512);
@@ -181,7 +181,7 @@ describe("complete context response budgets", () => {
     expect(snapshot.getText(snapshot.targets[0]!.read_ref!)).toBe("summary source");
   });
 
-  test("an overview rejection protects required image tokens and wire while its read credits only its own reserve", () => {
+  test("legacy token and wire reserves do not block overview or image delivery", () => {
     const snapshot = snapshotOf([{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] }]);
     const target = snapshot.targets[0]!, args = { context_id: snapshot.context_id, reads: [{ read_ref: target.read_ref! }] };
     const image = new ContextNavigator({ scopeId: "measure", snapshot, purpose: "normal" }).read(args);
@@ -193,31 +193,31 @@ describe("complete context response budgets", () => {
       reserved_tokens: source?.[0]?.target_id === target.target_id ? 0 : imageCost.total_tokens,
       reserved_wire_bytes: source?.[0]?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
     }) });
-    expect(navigator.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
+    expect(navigator.list({ context_id: snapshot.context_id, view: "overview" }).isError).not.toBe(true);
     expect(navigator.usage().text_tokens).toBeGreaterThan(0); expect(navigator.usage().wire_bytes).toBeGreaterThan(0);
     expect(navigator.read(args)).toEqual(image); expect(navigator.usage().image_reads).toBe(1);
-    // Tight wire protection independently rejects a page even with ample model tokens.
+    // A small diagnostic wire value does not create a cumulative limit.
     let wireOnly: ContextNavigator;
     wireOnly = new ContextNavigator({ scopeId: "wire", snapshot, purpose: "normal", remainingBudget: source => ({
       tokens: 100000 - wireOnly.usage().text_tokens - wireOnly.usage().visual_token_reserve,
       wire_bytes: imageCost.wire_bytes + reserve.wire_bytes + 1 - wireOnly.usage().wire_bytes,
       reserved_wire_bytes: source?.[0]?.target_id === target.target_id ? 0 : imageCost.wire_bytes,
     }) });
-    expect(wireOnly.list({ context_id: snapshot.context_id, view: "overview" }).isError).toBe(true);
+    expect(wireOnly.list({ context_id: snapshot.context_id, view: "overview" }).isError).not.toBe(true);
     expect(wireOnly.read(args).isError).not.toBe(true);
   });
 
-  test("publication rejects budgets without the finite error pool and malformed wire allowances", () => {
+  test("publication ignores diagnostic totals and preserves bounded corrective-response configuration", () => {
     const reserve = contextErrorReserve();
-    expect(() => assertContextNavigationBudget({ tokens: 4462, reserved_tokens: 4461, wire_bytes: 10000 })).toThrow();
-    expect(() => assertContextNavigationBudget({ tokens: 10000, wire_bytes: reserve.wire_bytes - 1 })).toThrow();
-    expect(() => assertContextNavigationBudget({ tokens: 10000, wire_bytes: -1 })).toThrow();
+    expect(() => assertContextNavigationBudget({ tokens: 4462, reserved_tokens: 4461, wire_bytes: 10000 })).not.toThrow();
+    expect(() => assertContextNavigationBudget({ tokens: 10000, wire_bytes: reserve.wire_bytes - 1 })).not.toThrow();
+    expect(() => assertContextNavigationBudget({ tokens: 10000, wire_bytes: -1 })).not.toThrow();
     expect(() => contextLimits({ errorResponseBytes: 256 })).toThrow("corrective reply");
     expect(() => contextLimits({ listBytes: 256 })).toThrow("corrective reply");
     const snapshot = snapshotOf([{ role: "user", content: "source" }]);
     const navigator = new ContextNavigator({ scopeId: "unpublished", snapshot, purpose: "normal", remainingBudget: () => ({ tokens: 501, reserved_tokens: 500, wire_bytes: 10000 }) });
-    expect(() => navigator.list({ context_id: snapshot.context_id, view: "overview" })).toThrow(ContextNavigationStoppedError);
-    expect(navigator.usage()).toMatchObject({ text_tokens: 0, wire_bytes: 0, navigation_stopped: true });
+    expect(navigator.list({ context_id: snapshot.context_id, view: "overview" }).isError).not.toBe(true);
+    expect(navigator.usage().navigation_stopped).toBe(false);
   });
 
   test("verified attachment delivery remains visible when its snapshot has no MCP image reference", () => {

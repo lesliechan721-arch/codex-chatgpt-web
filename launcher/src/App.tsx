@@ -391,17 +391,9 @@ function LauncherShell({
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
   const [networkProxyOpen, setNetworkProxyOpen] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
-  const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
-    snapshot.state.browserInteractionMode === "automatic"
-      && snapshot.state.coreSetupComplete === true
-      && snapshot.state.biggerContextAvailable === true
-      && !snapshot.state.experimentalBiggerContext,
-  );
-  const [biggerContextRecommendationBusy, setBiggerContextRecommendationBusy] = useState(false);
   const browserSlotRef = useCallback((node: HTMLDivElement | null) => setBrowserSlot(node), []);
   const browserSurfaceActive = surface === "browser"
     && !(compactSidebar && sidebarOpen)
-    && !biggerContextRecommendationOpen
     && !networkProxyOpen;
   const needsBrowser = snapshot.state.browserInteractionMode === "automatic"
     && browser?.authenticated !== true;
@@ -419,16 +411,9 @@ function LauncherShell({
   const limitsCopy = limitsCopyFor(language);
 
   useEffect(() => {
-    if (snapshot.state.browserInteractionMode === "manual" || snapshot.state.biggerContextAvailable !== true) {
-      setBiggerContextRecommendationOpen(false);
-    }
-  }, [snapshot.state.browserInteractionMode, snapshot.state.biggerContextAvailable]);
-
-  useEffect(() => {
     if (!selectedManualTab) return;
     setSurface("browser");
     setSidebarOpen(false);
-    setBiggerContextRecommendationOpen(false);
     void api!.setBrowserSurfaceActive(true).catch((cause) => setError(messageOf(cause)));
   }, [selectedManualTab?.id, selectedManualTab?.manualState, setError]);
 
@@ -552,19 +537,6 @@ function LauncherShell({
       setError(messageOf(cause));
     } finally {
       setSessionReminderBusy(false);
-    }
-  };
-
-  const setRecommendedBiggerContext = async (enabled: boolean) => {
-    if (biggerContextRecommendationBusy) return;
-    setBiggerContextRecommendationBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setBiggerContext(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBiggerContextRecommendationBusy(false);
     }
   };
 
@@ -707,7 +679,6 @@ function LauncherShell({
             </div>
             <SecondaryButton onClick={() => {
               navigateSurface("browser");
-              setBiggerContextRecommendationOpen(false);
               void api!.selectBrowserTab(tab.id).then(() => activateBrowser(true))
                 .catch(cause => setError(messageOf(cause)));
             }}>{copy.openChatgpt}</SecondaryButton>
@@ -770,7 +741,6 @@ function LauncherShell({
                 openTab={async id => {
                   await api!.selectBrowserTab(id);
                   navigateSurface("browser");
-                  setBiggerContextRecommendationOpen(false);
                   await activateBrowser(true);
                 }} />
             ) : null}
@@ -807,19 +777,7 @@ function LauncherShell({
       </section>
 
       <AnimatePresence>
-        {biggerContextRecommendationOpen ? (
-          <BiggerContextRecommendation
-            busy={biggerContextRecommendationBusy || operation?.status === "running"}
-            checked={snapshot.state.experimentalBiggerContext}
-            copy={copy}
-            onChange={(enabled) => void setRecommendedBiggerContext(enabled)}
-            onClose={() => setBiggerContextRecommendationOpen(false)}
-          />
-        ) : null}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {sessionReminderDue && !biggerContextRecommendationOpen ? (
+        {sessionReminderDue ? (
           <SessionRefreshReminder
             busy={sessionReminderBusy}
             copy={copy}
@@ -1924,17 +1882,6 @@ function SettingsSurface({
       setBusy(false);
     }
   };
-  const setBiggerContext = async (enabled: boolean) => {
-    setBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setBiggerContext(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
   const setComposerPredictions = async (enabled: boolean) => {
     setBusy(true);
     setError(null);
@@ -2118,21 +2065,6 @@ function SettingsSurface({
             onChange={(checked) => void api!.setPreference("showBrowserDuringTurns", checked)
               .then(updateState)
               .catch((cause) => setError(messageOf(cause)))}
-          />
-        </SettingRow>
-        <SettingRow
-          body={snapshot.state.browserInteractionMode === "manual"
-            ? copy.manualBiggerContextUnavailable
-            : copy.biggerContextBody}
-          label={copy.biggerContext}
-        >
-          <Switch
-            checked={snapshot.state.experimentalBiggerContext}
-            disabled={busy
-              || snapshot.state.browserInteractionMode === "manual"
-              || (snapshot.state.biggerContextAvailable !== true && !snapshot.state.experimentalBiggerContext)
-              || snapshot.state.coreSetupComplete !== true}
-            onChange={(checked) => void setBiggerContext(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.composerPredictionsBody} label={copy.composerPredictions}>
@@ -2919,59 +2851,6 @@ function SessionRefreshReminder({
         </button>
       </div>
     </motion.aside>
-  );
-}
-
-function BiggerContextRecommendation({
-  busy,
-  checked,
-  copy,
-  onChange,
-  onClose,
-}: {
-  busy: boolean;
-  checked: boolean;
-  copy: Copy;
-  onChange: (checked: boolean) => void;
-  onClose: () => void;
-}) {
-  return (
-    <motion.div
-      animate={{ opacity: 1 }}
-      aria-describedby="bigger-context-recommendation-body"
-      aria-labelledby="bigger-context-recommendation-title"
-      aria-modal="true"
-      className="bigger-context-recommendation-backdrop"
-      exit={{ opacity: 0 }}
-      initial={{ opacity: 0 }}
-      role="dialog"
-      transition={{ duration: 0.18 }}
-    >
-      <motion.section
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        className="bigger-context-recommendation"
-        exit={{ opacity: 0, scale: 0.98, y: 6 }}
-        initial={{ opacity: 0, scale: 0.98, y: 8 }}
-        transition={PANEL_TRANSITION}
-      >
-        <header className="bigger-context-recommendation-header">
-          <small>{copy.biggerContext}</small>
-          <h2 id="bigger-context-recommendation-title">{copy.biggerContextRecommendationTitle}</h2>
-        </header>
-        <p className="bigger-context-recommendation-body" id="bigger-context-recommendation-body">{copy.biggerContextRecommendationBody}</p>
-        <div className="bigger-context-recommendation-toggle">
-          <div>
-            <strong>{copy.biggerContext}</strong>
-            <p>{copy.biggerContextRecommendationToggleBody}</p>
-          </div>
-          <Switch checked={checked} disabled={busy} onChange={onChange} />
-        </div>
-        {checked ? <p className="bigger-context-recommendation-restart">{copy.restartCodex}</p> : null}
-        <footer>
-          <SecondaryButton disabled={busy} onClick={onClose}>{copy.close}</SecondaryButton>
-        </footer>
-      </motion.section>
-    </motion.div>
   );
 }
 

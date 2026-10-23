@@ -8,20 +8,20 @@ import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker
 import { createChatGptWebAdapter, type ChatGptZeroRiskManualControl } from "./helpers/chatgpt-web-adapter";
 import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { ContextSend } from "../src/adapters/chatgpt-web/context-send";
-import { compactionAvailableTokens } from "../src/adapters/chatgpt-web/compaction-context";
+import { assertCompactionReadable } from "../src/adapters/chatgpt-web/compaction-context";
 import type { ContextDeliveryPlan } from "../src/adapters/chatgpt-web/context-planner";
 import type { ContextUsageEvidence } from "../src/adapters/chatgpt-web/context-runtime";
 import * as contextSnapshot from "../src/adapters/chatgpt-web/context-snapshot";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
-import { CHATGPT_WEB_BACKEND_MODEL, CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL, CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
+import { CHATGPT_WEB_BACKEND_MODEL, CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL } from "../src/chatgpt-web-models";
 import { CHATGPT_CONNECTOR_NAME, ZERO_RISK_CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
 import { estimateTokens } from "../src/lib/token-estimate";
 import type { AdapterEvent, CodexProviderConfig } from "../src/types";
 import { CONTEXT_TEXT_READ_FORMAT, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 
-// These fixtures exercise the existing inline/on-demand contract. Short startup
-// and its default composer limit have separate production MCP integration tests.
+// The simulated model follows the public startup chain and reads optional evidence
+// through the real MCP transport before completing each task.
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
 const tailMarker = "unread-tail-evidence-七三九";
 const log = `${"recorded test line\n".repeat(3_000)}${tailMarker}\n`;
@@ -31,12 +31,15 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-type Entry = { context_id: string; plan_id: string; required_images: number;
+type Entry = { context_id: string; plan_id: string;
   first_call: { name: string; arguments: Record<string, unknown> } };
 function navigation(prompt: string): Entry {
-  const match = /<codex_context_navigation_json>\n([^\n]+)\n<\/codex_context_navigation_json>/.exec(prompt);
+  const match = /<codex_(?:context_navigation|bootstrap)_json>\n([^\n]+)\n<\/codex_(?:context_navigation|bootstrap)_json>/.exec(prompt);
   if (!match) throw new Error("The actual submitted prompt has no context entry");
-  return JSON.parse(match[1]!);
+  const entry = JSON.parse(match[1]!) as Entry;
+  if (entry.first_call.name === "codex_turn_start") entry.first_call = { name: "codex_context_list",
+    arguments: { ...entry.first_call.arguments, context_id: entry.context_id, view: "overview" } };
+  return entry;
 }
 function data(result: any): any {
   if (result.structuredContent?.format !== CONTEXT_TEXT_READ_FORMAT) return result.structuredContent;
@@ -63,7 +66,7 @@ async function fixture(manual: boolean, sent: boolean) {
   const root = mkdtempSync(join(tmpdir(), "context-adapter-"));
   const socket = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socket);
-  // This fixture represents a connector with the original inline/on-demand ABI.
+  // Reuse support is absent; payload-v3 startup and its delivery chain remain available.
   const reuseCapability = spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
   await broker.listen();
   const provider: CodexProviderConfig = { adapter: "chatgpt-web", baseUrl: `context://${root}`, chatgptWeb: { maxComposerCodePoints: 2_000_000,
@@ -82,6 +85,17 @@ async function fixture(manual: boolean, sent: boolean) {
     const { view, ...reference } = entry.first_call.arguments;
     return client.callTool({ name, arguments: { ...reference,
       ...(name === "codex_context_list" ? { view } : {}), ...args } });
+  };
+  const ready = async (entry: Entry) => {
+    let overview = await call(entry);
+    for (let count = 0; data(overview).next_required_read; count++) {
+      expect(count).toBeLessThan(1000);
+      const next = data(overview).next_required_read;
+      const returned = await call(entry, next.tool, next.arguments);
+      expect(returned.isError).not.toBe(true);
+      overview = await call(entry);
+    }
+    return overview;
   };
   const credential = (entry: Entry) => manual
     ? { request_id: entry.first_call.arguments.request_id }
@@ -102,7 +116,7 @@ async function fixture(manual: boolean, sent: boolean) {
     client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: root, turn_id: turnId }) },
   });
   cleanups.push(async () => { reuseCapability.mockRestore(); await client.close(); await broker.close(); rmSync(root, { recursive: true, force: true }); });
-  return { broker, provider, client, call, credential, input, request };
+  return { broker, provider, client, call, ready, credential, input, request };
 }
 
 for (const manual of [false, true]) for (const secondBranch of ["full", "resume"] as const)
@@ -143,7 +157,7 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
         } else {
           if (secondBranch === "resume") {
             expect(prompt).not.toContain("Read only the first page");
-            expect(entry.required_images).toBe(0);
+            expect(data(await f.call(entry)).live.required_images).toBe(0);
           }
           const search = await f.call(entry, "codex_context_search", { query: tailMarker, kind: "tool_result" });
           expect(search.isError).not.toBe(true);
@@ -169,7 +183,7 @@ for (const manual of [false, true]) for (const secondBranch of ["full", "resume"
         expect(image.isError).not.toBe(true);
         expect(image.content).toContainEqual(expect.objectContaining({ type: "image", data: png, mimeType: "image/png" }));
         expect(JSON.stringify(image.structuredContent)).not.toContain(png);
-        const overview = await f.call(entry);
+        const overview = await f.ready(entry);
         expect(data(overview).live.context_ready).toBe(true);
         oldEntry = entry;
         if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
@@ -267,7 +281,6 @@ for (const sent of [true, false]) test(`Zero Risk mixed image routes, Sent=${sen
       entry = navigation(activity.prompt);
       plan = activity.contextPlans!.full!;
       expect(plan.requiredAttachments).toHaveLength(1);
-      expect(entry.required_images).toBe(2);
       if (!sent) await f.client.callTool({ name: "codex_turn_start", arguments: f.credential(entry) });
       return { selectedPlanId: plan.planId };
     },
@@ -292,7 +305,7 @@ for (const sent of [true, false]) test(`Zero Risk mixed image routes, Sent=${sen
         expect(plan.requiredAttachments.map(value => value.id)).not.toContain(mcp.target_id);
         const image = await f.call(entry, "codex_context_read", { reads: [{ read_ref: mcp.read_ref }] });
         expect(image.content).toContainEqual(expect.objectContaining({ type: "image", data: png }));
-        const overview = await f.call(entry);
+        const overview = await f.ready(entry);
         expect(data(overview).live).toMatchObject({ context_ready: false, required_images: 2, delivered_images: 1 });
         const blocked = await f.client.callTool({ name: "codex_exec", arguments: { ...f.credential(entry),
           task_revision: 0, operation_id: 1, cmd: "must not execute before fallback confirmation" } });
@@ -331,14 +344,14 @@ for (const sent of [true, false]) test(`Zero Risk mixed image routes, Sent=${sen
   expect(events.some(event => event.type === "text_delta" && event.text === "MCP image and attested fallback delivered")).toBe(true);
 }, 30_000);
 
-for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} carries actual navigation costs into the retained page and compaction reserve`, async () => {
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} keeps cumulative navigation estimates while allowing independent compaction reads`, async () => {
   const f = await fixture(manual, true);
   // Observe the actual selected plan. This evidence is never given to the simulated model.
-  const prepared = new Map<string, { send: ContextSend; costs: ContextDeliveryPlan["costs"] }>();
+  const prepared = new Map<string, { send: ContextSend; snapshot: ContextDeliveryPlan["snapshot"]; costs: ContextDeliveryPlan["costs"] }>();
   const originalPrepare = ContextSend.prototype.prepare;
   const planning = spyOn(ContextSend.prototype, "prepare").mockImplementation(async function(this: ContextSend, ...args) {
     const plan = await originalPrepare.apply(this, args);
-    if (plan.planId) prepared.set(plan.planId, { send: this, costs: structuredClone(plan.costs) });
+    if (plan.planId) prepared.set(plan.planId, { send: this, snapshot: plan.snapshot, costs: structuredClone(plan.costs) });
     return plan;
   });
   const worker = ChatGptBrowserWorker.forProvider(f.provider);
@@ -412,12 +425,14 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
       expect(JSON.stringify(invalidCursor.structuredContent)).toContain("INVALID_CURSOR");
       expect(usage.usage.error_responses).toBe(errors + 1);
       expect(usage.usage.navigation_stopped).toBe(false);
-      finalUsage = usage;
+
     } else {
       secondPlanId = entry.plan_id;
-      expect(entry.required_images).toBe(0);
+      expect(data(await f.call(entry)).live.required_images).toBe(0);
       expect((await f.call(entry)).isError).not.toBe(true);
     }
+    await f.ready(entry);
+    if (round === 1) finalUsage = f.broker.contextUsage(String(entry.first_call.arguments.request_id ?? entry.first_call.arguments.turn_token))!;
     if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
       ...f.credential(entry), task_revision: 0, final_answer: answer(round) } })).isError).not.toBe(true);
   };
@@ -479,10 +494,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   expect(second.send.coverage.pageTokenReserve()).toBe(second.send.coverage.latest()!.pageTokens);
   expect(second.send.coverage.pageTokenReserve()).toBeGreaterThan(second.costs.retainedTokens);
   for (const selected of [first, second]) {
-    expect(compactionAvailableTokens(f.request("budget-check", f.input), {
-      localToolsEnabled: true, solAvailable: !manual, extraHighAvailable: false, proAvailable: false,
-    }, selected.send.coverage.pageTokenReserve()))
-      .toBe(Math.max(0, selected.costs.contextWindowTokens - selected.send.coverage.pageTokenReserve() - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS));
+    await expect(assertCompactionReadable(selected.snapshot)).resolves.toBeUndefined();
   }
 }, 30_000);
 
@@ -518,7 +530,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
   let entry: Entry;
   let modelTask: Promise<void> | undefined;
   const inspect = async () => {
-    expect(entry.required_images).toBe(0);
+    expect(data(await f.call(entry)).live.required_images).toBe(0);
     const pictures = await f.call(entry, "codex_context_list", { view: "entries", kind: "image" });
     expect(pictures.isError).not.toBe(true);
     expect(data(pictures).entries).toContainEqual(expect.objectContaining({ required: false,
@@ -529,6 +541,7 @@ for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} 
     const source = await f.call(entry, "codex_context_read", { reads: [{ read_ref: hit.read_ref, cursor: hit.read_cursor }] });
     expect(source.isError).not.toBe(true);
     expect(data(source).content).toContain(tailMarker);
+    await f.ready(entry);
     if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
       ...f.credential(entry), task_revision: 0, final_answer: "Valid resume despite invalid full candidate" } })).isError).not.toBe(true);
   };
@@ -590,8 +603,7 @@ for (const branch of ["full", "resume"] as const) test(`Zero Risk selects ${bran
     async start(_path, activity) {
       expect(activity.prompt).not.toContain("<codex_context_navigation_json>");
       expect(activity.prompt).toContain(shortResult);
-      const resumeContext = JSON.parse(/<codex_context_json>\n([^\n]+)/.exec(activity.resumePrompt!)![1]!);
-      expect(resumeContext.messages).not.toContainEqual(expect.objectContaining({ content: shortResult }));
+      expect(activity.resumePrompt).not.toContain(shortResult);
       resumeEntry = navigation(activity.resumePrompt!);
       const plans = activity.contextPlans!;
       expect(plans.full).toBeDefined();
@@ -599,7 +611,9 @@ for (const branch of ["full", "resume"] as const) test(`Zero Risk selects ${bran
       expect(plans.full!.planId).not.toBe(plans.resume!.planId);
       expect(plans.full!.requiredAttachments).toHaveLength(0);
       const submittedPrompt = branch === "full" ? activity.prompt : activity.resumePrompt!;
-      request = JSON.parse(/<codex_zero_risk_request_json>\n([^\n]+)/.exec(submittedPrompt)![1]!);
+      const legacyRequest = /<codex_zero_risk_request_json>\n([^\n]+)/.exec(submittedPrompt);
+      request = legacyRequest ? JSON.parse(legacyRequest[1]!)
+        : { request_id: String(navigation(submittedPrompt).first_call.arguments.request_id) };
       selectedPlanId = plans[branch]!.planId;
       expect((await f.call(resumeEntry)).isError).toBe(true);
       return { selectedPlanId, reused: branch === "resume" };
@@ -617,7 +631,7 @@ for (const branch of ["full", "resume"] as const) test(`Zero Risk selects ${bran
           expect(overview.isError).toBe(true);
         } else {
           expect(overview.isError).not.toBe(true);
-          expect(data(overview).live.context_ready).toBe(true);
+          expect(data(await f.ready(resumeEntry)).live.context_ready).toBe(true);
           expect(resumeEntry.plan_id).toBe(selectedPlanId);
           const listing = await f.call(resumeEntry, "codex_context_list", { view: "entries", kind: "tool_result" });
           expect(listing.isError).not.toBe(true);
@@ -684,7 +698,6 @@ for (const manual of [false, true]) for (const source of ["system", "delegation"
     let attachmentConfirmations = 0;
     const answer = `Required ${source} image delivered through MCP`;
     const inspect = async () => {
-      expect(resumeEntry.required_images).toBe(1);
       expect(resumeEntry.plan_id).not.toBe(fullEntry.plan_id);
       const before = await f.call(resumeEntry);
       expect(before.isError).not.toBe(true);
@@ -714,7 +727,7 @@ for (const manual of [false, true]) for (const source of ["system", "delegation"
       expect(typeof image.data).toBe("string");
       expect(Buffer.from(image.data!, "base64").byteLength).toBe(400 * 1024);
       expect(image.data === requiredImage).toBe(true);
-      expect(data(await f.call(resumeEntry)).live).toMatchObject({ context_ready: true, delivered_images: 1 });
+      expect(data(await f.ready(resumeEntry)).live).toMatchObject({ context_ready: true, delivered_images: 1 });
       if (manual) expect((await f.client.callTool({ name: "codex_turn_complete", arguments: {
         ...f.credential(resumeEntry), task_revision: 0, final_answer: answer } })).isError).not.toBe(true);
     };

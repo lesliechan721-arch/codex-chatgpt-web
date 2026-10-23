@@ -53,11 +53,10 @@ for (const manual of [false, true]) test(`long rules and no history or images se
   expect(result.costs.fixedBootstrapCodePoints).toBeLessThanOrEqual(3000);
   expect(Array.from(result.compiled.text).length).toBeLessThanOrEqual(8000);
   expect(result.costs.originalPromptCodePoints).toBeGreaterThan(30_000);
-  expect(result.compiled.multipart).toBeUndefined();
+  expect("multipart" in result.compiled).toBeFalse();
   expect(inline(result)).toEqual(result.compiled.bootstrapContent!.payload.messages);
   const source = payload(result);
-  source.payload.messages = source.payload.messages.map((message: any, index: number) => message.codex_inline_request_message
-    ? inline(result)![source.inline_request_message_indices.indexOf(index)] : message);
+  for (const position of source.inline_request_positions) source.payload.messages[position.path[1]] = inline(result)![position.inline_index];
   expect(source.payload).toEqual(result.compiled.bootstrapContent!.payload);
   expect(result.costs.requiredTextTokens).toBeGreaterThan(0);
   expect(result.costs.requiredRetryTokens).toBeGreaterThan(0);
@@ -92,20 +91,20 @@ test("long and unproven user text is exact required source data without role or 
   }
 });
 
-test("short bootstrap admission protects shared context capacity and source storage", () => {
+test("short bootstrap admission ignores page estimates and protects source storage", () => {
   const canonical = fixture();
   const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical), capabilities,
     turnToken: credential, contextToolsAvailable: true };
-  expect(() => planContextDelivery({ ...input, budget: { contextWindowTokens: 1000 } })).toThrow("context budget");
+  expect(planContextDelivery({ ...input, budget: { contextWindowTokens: 1, retainedTokens: 1_000_000 } }).navigationEnabled).toBeTrue();
   expect(() => planContextDelivery({ ...input, limits: { maxStorageBytes: 2000 } })).toThrow("storage budget");
   expect(() => planContextDelivery({ ...input, contextBootstrapAvailable: false })).toThrow("does not support context-bootstrap-v1");
   expect(() => planContextDelivery({ ...input, capabilities: { ...capabilities, maxComposerCodePoints: 0 } })).toThrow("configuration");
 });
 
-test("required reads can exceed 96000 tokens when the complete plan fits the shared context", () => {
+test("required reads exceed the former page window and reach readiness", () => {
   const canonical = fixture(undefined, true, 30_000);
   const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical), capabilities,
-    turnToken: credential, contextToolsAvailable: true, budget: { contextWindowTokens: 350_000 } };
+    turnToken: credential, contextToolsAvailable: true, budget: { contextWindowTokens: 1000, retainedTokens: 1_000_000 } };
   const result = planContextDelivery(input);
   expect(result.costs.requiredMcpTokens).toBeGreaterThan(96_000);
   const scope = new ContextScope("large-required-plan", result.registration!, "normal", () => {}, () => {});
@@ -132,7 +131,7 @@ test("the independent composer limit can select a short plan with a larger compl
   expect(inline.registration).toBeUndefined();
   expect(short.costs.promptCodePoints).toBeLessThan(inline.costs.promptCodePoints);
   expect(short.costs.requiredTotalTokens).toBeGreaterThan(inline.costs.requiredTotalTokens);
-  const mapped = payload(short).source_map;
+  const mapped = JSON.parse(short.snapshot.getText(payload(short).source_map.read_ref)!);
   expect(mapped.candidate_message_sources).toEqual([0]);
   expect(mapped.prepared_message_sources).toEqual([0]);
   expect(mapped.sources.map((source: any) => source.original_role)).toEqual(["system", "user"]);

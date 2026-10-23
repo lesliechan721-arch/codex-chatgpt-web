@@ -72,20 +72,18 @@ test("retained turns reuse prior attachments; fresh chats rebuild them and new s
   expect(compiled.skillFiles![0]!.name).toStartWith("next--");
 });
 
-test("skill content counts toward input and final-message budgets, including multipart", () => {
+test("skill content counts toward single-message input and file budgets", () => {
   const parsed = parse([input(text("testing", "check this carefully\n".repeat(1000))), input("Do it", ["user.text"])]);
-  for (const parts of [undefined, 6] as const) {
-    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { experimentalSkillAttachments: true, experimentalMultipartParts: parts });
+  {
+    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { experimentalSkillAttachments: true });
     const withoutFiles = { ...compiled, skillFiles: undefined };
     const fileTokens = skillFileTokens(compiled.skillFiles, parsed.modelId);
     expect(fileTokens).toBeGreaterThan(1000);
     expect(estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId)
       - estimateCompiledChatGptWebInputTokens(withoutFiles, parsed.modelId)).toBe(fileTokens);
     expect(estimateCompiledChatGptWebMessageTokens(compiled, parsed.modelId)).toBeGreaterThan(fileTokens);
-    if (parts) {
-      expect(compiled.multipart!.parts.join(" ")).not.toContain("check this carefully");
-      expect(compiled.multipart!.commit).toContain("skill_attachment");
-    }
+    expect(compiled.text).not.toContain("check this carefully");
+    expect(compiled.text).toContain("skill_attachment");
   }
 });
 
@@ -104,7 +102,7 @@ test("over-limit, malformed and manual requests fail explicitly without silently
 
 test("usage accounts for skills accumulated over many turns without applying a per-message upload cap", () => {
   const parsed = parse(Array.from({ length: 11 }, (_, i) => input(text(`skill-${i}`))));
-  const usage = estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, false, true);
+  const usage = estimateChatGptWebUsage(parsed, { answer: "done" }, capabilities, true);
   expect(usage.inputTokens).toBeGreaterThan(0);
   expect(usage.estimated).toBe(true);
 });

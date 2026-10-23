@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 import { parseRequest } from "../src/responses/parser";
 
 const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
@@ -61,16 +62,14 @@ test("inline Web context emits a distinct agent_message envelope", () => {
   expect(compiled.text).toContain("Exclude agent_message inputs");
 });
 
-test("multipart Web context emits the same agent_message envelope", () => {
+test("mixed Web context emits the same agent_message envelope", () => {
   const compiled = compileChatGptWebPrompt(
     request(),
     capabilities,
     turnToken,
-    { experimentalMultipartParts: 2 },
+    { contextRendering: "codex-context-text-v1" },
   );
-  const records = compiled.multipart!.parts.flatMap(part => (
-    (JSON.parse(part) as { records: Array<Record<string, unknown>> }).records
-  ));
+  const records = decodeWebContextPayload(compiled.contextPayload!).records;
   const messages = records
     .filter(record => record.kind === "message")
     .map(record => record.message as Record<string, unknown>);

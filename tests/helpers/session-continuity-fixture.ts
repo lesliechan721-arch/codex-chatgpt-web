@@ -23,10 +23,14 @@ import { CONTINUITY_EXECUTION_FENCING_FEATURE, LAUNCHER_BROWSER_HOST_KIND, LAUNC
 import { compactRequest, responseRequest } from "../../src/server";
 import { parseRequest } from "../../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig } from "../../src/types";
+import { parseContextTextReadResult } from "../../src/adapters/chatgpt-web/context-text-result";
 
-// These fixtures exercise the existing inline/on-demand contract. Short startup
-// and its default composer limit have separate production MCP integration tests.
+// The fixture model completes the published required chain before business work.
+// Tests can supply contextModel to inspect or delay that delivery themselves.
 const require = createRequire(import.meta.url);
+const deliveredEnvelopes = new Map<string, unknown>();
+const deliveredStartupText = new Map<string, string>();
+const startupReads = new Map<string, Promise<unknown>>();
 
 export const launcherRecovery = require("../../launcher/electron/continuity-recovery.cjs");
 
@@ -54,7 +58,80 @@ export function currentRecordedCall(provider: CodexProviderConfig, request: Code
 }
 
 export function taskEnvelope(prompt: string): unknown {
+  if (deliveredEnvelopes.has(prompt)) return structuredClone(deliveredEnvelopes.get(prompt));
   return JSON.parse(/<codex_context_json>\n([^\n]+)/.exec(prompt)![1]!);
+}
+
+/** The visible entry and exact bodies returned by its completed public required chain. */
+export function deliveredStartupSources(prompt: string): string {
+  return deliveredStartupText.get(prompt) ?? prompt;
+}
+
+/** Uses the public MCP response and complete delivery receipts, never the planner's private payload. */
+export async function readContinuityStartup(prompt: string, client: ContinuityContextModelInput["client"]): Promise<unknown> {
+  const running = startupReads.get(prompt);
+  if (running) return running;
+  const read = readContinuityStartupOnce(prompt, client);
+  startupReads.set(prompt, read);
+  try { return await read; }
+  finally { if (startupReads.get(prompt) === read) startupReads.delete(prompt); }
+}
+
+async function readContinuityStartupOnce(prompt: string, client: ContinuityContextModelInput["client"]): Promise<unknown> {
+  const match = /<codex_bootstrap_json>\n([^\n]+)/.exec(prompt);
+  if (!match) return taskEnvelope(prompt);
+  const entry = JSON.parse(match[1]!);
+  const credential = entry.first_call.arguments;
+  const auth = credential.request_id ? { request_id: credential.request_id } : { turn_token: credential.turn_token };
+  const first = await client.callTool(entry.first_call);
+  expect(first.isError).not.toBe(true);
+  const overviewCall = { name: "codex_context_list", arguments: {
+    ...auth, context_id: credential.context_id ?? entry.context_id, view: "overview" } };
+  const overview = (first.structuredContent as any).context_bootstrap ?? first.structuredContent;
+  if (overview.live?.context_ready && deliveredEnvelopes.has(prompt)) return structuredClone(deliveredEnvelopes.get(prompt));
+  let next = overview.next_required_read;
+  const bodies = new Map<string, string>();
+  let payloadRef: string | undefined;
+  for (let count = 0; next; count++) {
+    if (count > 2_000) throw new Error("The fixture required context chain did not end");
+    const result = await client.callTool({ name: next.tool, arguments: { ...next.arguments, ...auth } });
+    expect(result.isError).not.toBe(true);
+    const parsed = parseContextTextReadResult(result);
+    for (const [index, item] of parsed.metadata.items.entries()) {
+      const previous = bodies.get(item.read_ref) ?? "";
+      expect(item.range.start).toBe(Buffer.byteLength(previous));
+      bodies.set(item.read_ref, previous + parsed.bodies[index]!);
+      if (item.source.origin === "context_bootstrap_payload") payloadRef = item.read_ref;
+    }
+    expect(parsed.metadata.required_step).toBeDefined();
+    next = parsed.metadata.required_step!.next_required_read;
+  }
+  const ready = await client.callTool(overviewCall);
+  expect(ready.isError).not.toBe(true);
+  expect(ready.structuredContent).toMatchObject({ live: { context_ready: true } });
+  const inline = /<codex_inline_context_json>\n```json\n([\s\S]*?)\n```\n<\/codex_inline_context_json>/.exec(prompt)?.[1];
+  const payload = JSON.parse(inline ?? bodies.get(payloadRef!)!);
+  expect(payload.format).toBe("context-bootstrap-payload-v3");
+  const value = structuredClone(payload.payload);
+  const inlineRequestText = /<codex_inline_request_json>\n```json\n([\s\S]*?)\n```\n<\/codex_inline_request_json>/.exec(prompt)?.[1];
+  const inlineRequest = inlineRequestText ? JSON.parse(inlineRequestText) : undefined;
+  for (const position of payload.inline_request_positions ?? []) {
+    expect(inlineRequest?.[position.inline_index]).toBeDefined();
+    value[position.path[0]][position.path[1]] = inlineRequest[position.inline_index];
+  }
+  for (const position of payload.positions ?? []) {
+    const reference = payload.references.find((unit: any) => unit.unit_id === position.unit_id);
+    expect(reference.delivery).not.toBe("reuse");
+    const body = payload.inline_units?.find((unit: any) => unit.unit_id === position.unit_id)?.body
+      ?? bodies.get(reference.read_ref);
+    expect(body).toBeDefined();
+    let parent = value;
+    for (const segment of position.path.slice(0, -1)) parent = parent[segment];
+    parent[position.path.at(-1)] = JSON.parse(body);
+  }
+  deliveredEnvelopes.set(prompt, value);
+  deliveredStartupText.set(prompt, [prompt, ...bodies.values()].join("\n"));
+  return value;
 }
 
 export function reverseJsonObjectKeys(value: unknown): unknown {
@@ -86,6 +163,9 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       try { await exit(); } catch (error) { errors.push(error); }
     }
     chatGptTurnSessions.clear();
+    deliveredEnvelopes.clear();
+    deliveredStartupText.clear();
+    startupReads.clear();
     for (const cleanup of cleanups.splice(0).reverse()) {
       try { await cleanup(); } catch (error) { errors.push(error); }
     }
@@ -216,8 +296,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       },
     };
     const broker = measureRuntimeOperation("fixture.broker", () => TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!));
-    // Existing cases exercise the compatible inline path. Reuse cases opt into
-    // a model that consumes the real versioned startup and text receipts.
+    // Ordinary lifecycle cases consume the public startup chain without reuse.
+    // Reuse cases supply a model that verifies their versioned reuse receipts.
     const reuseSupport = options.contextModel ? undefined : spyOn(broker, "contextReuseAvailable").mockReturnValue(false);
     let modelMcp: Awaited<ReturnType<typeof createContinuityMcpClient>> | undefined;
     let modelMcpConnection: Promise<Awaited<ReturnType<typeof createContinuityMcpClient>>> | undefined;
@@ -368,7 +448,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       turn.onContinuityLease!(lease);
       const compiled = await (turn.requireRetainedConversation ? turn.prepareResume!() : turn.prepare());
       if (compiled.contextPlan) await turn.onContextPlanSelected!(compiled.contextPlan.planId);
-      expect(compiled.multipart).toBeUndefined();
+      expect("multipart" in compiled).toBeFalse();
       submissions.push({ prompt: compiled.text, turnToken: compiled.turnToken, claim: turn.continuity!, key: turn.conversationKey!, reused: Boolean(turn.requireRetainedConversation) });
       await turn.onSendActivated?.();
       if (turn.nativeConnector) {
@@ -403,6 +483,7 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       }
       if (options.contextModel) await options.contextModel({ prompt: compiled.text, token: compiled.turnToken!,
         manual, client: await manualMcp(), broker });
+      else if (compiled.contextPlan) await readContinuityStartup(compiled.text, await manualMcp());
       if (controls.invokeSourceTools) {
         const token = compiled.turnToken;
         expect(token).toBeDefined();
@@ -438,6 +519,19 @@ export function createSessionContinuityFixtures(testFilePath: string) {
           contract: "native", taskUpdateProtocol: 1, deliveryId: reply.taskUpdate.deliveryId, throughRevision: 1 });
         expect(broker.taskUpdateState(token)).toMatchObject({ acceptedRevision: 1, acknowledgedRevision: 1 });
         completionCandidate = { expectedDriverGeneration: 1, taskRevision: 1, acknowledgedRevision: 1 };
+      }
+      if (options.taskUpdates && compiled.contextPlan) {
+        // The fixture can produce its answer before the child MCP transport has
+        // settled its final overview receipt. Wait on the actual output guard;
+        // do not manufacture delivery evidence or bypass another guard failure.
+        const deadline = Date.now() + 2_000;
+        for (;;) {
+          try { broker.checkFinalOutputCandidate(compiled.turnToken!, completionCandidate); break; }
+          catch (error) {
+            if ((error as { code?: string }).code !== "CONTEXT_BUSY" || Date.now() >= deadline) throw error;
+            await Bun.sleep(5);
+          }
+        }
       }
       turn.onTextDelta(answer, options.taskUpdates ? completionCandidate : undefined);
       if (options.taskUpdates && turn.completionFence) {
@@ -487,6 +581,9 @@ export function createSessionContinuityFixtures(testFilePath: string) {
         controls.onStarted?.();
         if (options.contextModel) await options.contextModel({ prompt: submissions.at(-1)!.prompt,
           token: controls.safeToken, manual, client: await manualMcp(), broker });
+        else if (submissions.at(-1)!.prompt.includes("<codex_bootstrap_json>")) {
+          await readContinuityStartup(submissions.at(-1)!.prompt, await manualMcp());
+        }
         if (controls.invokeSourceTools) {
           const token = controls.safeToken;
           controls.modelTask = sourceTools(token).then(async () => {
@@ -495,7 +592,14 @@ export function createSessionContinuityFixtures(testFilePath: string) {
             expect(result.isError).not.toBe(true);
           });
           void controls.modelTask.catch(() => {});
-        } else if (!controls.deferCompletion) broker.completeSafeTurn(controls.safeToken, `Completed response ${submissions.length}.`);
+        } else if (!controls.deferCompletion) {
+          const answer = `Completed response ${submissions.length}.`;
+          if (submissions.at(-1)!.prompt.includes("<codex_bootstrap_json>")) {
+            const result = await (await manualMcp()).callTool({ name: "codex_turn_complete", arguments: {
+              request_id: controls.safeToken, task_revision: 0, final_answer: answer } });
+            expect(result.isError).not.toBe(true);
+          } else broker.completeSafeTurn(controls.safeToken, answer);
+        }
       },
       async end(_path, activity) {
         for (const page of pages.values()) if (page.continuity.traceId === activity.traceId) page.state = "ready";
@@ -567,7 +671,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       if (firstRequest) { firstRequest = false; return measureRuntimeAsync("fixture.firstRequest", request); }
       return request();
     });
-    return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost, root, manualControl };
+    return { provider, request, next, adapter, run, registrations, statePath, threadId, pages, submissions, compatible, automatic, descriptor, descriptorPath, controls, broker, recoveryHost, root, manualControl,
+      readStartup: async (prompt: string) => readContinuityStartup(prompt, await manualMcp()) };
   }
 
   function httpFixture(manual = false, taskUpdates = false, options: { root?: string; threadId?: string; mcpTransport?: ContinuityMcpTransport } = {}) {

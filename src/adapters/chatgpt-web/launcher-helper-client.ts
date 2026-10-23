@@ -30,7 +30,6 @@ interface PendingTurn {
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
   localFailure?: Error;
   progressForwarding?: AbortController;
-  acknowledgedMultipartStage?: number;
   selectedContextPlanId?: string;
   preparing?: boolean;
   submissionReceipt?: Promise<void>;
@@ -54,7 +53,6 @@ type HelperMessage = { recovery?: ContinuityRecoveryIdentity } & (
   | { type: "ready"; features?: string[]; contextCompatible: boolean }
   | { type: "event"; id: string; event: "heartbeat" | "generation_progress" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
-  | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number; candidate?: TaskUpdateOwnerContext }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
@@ -114,12 +112,6 @@ function parseHelperPayload(message: Record<string, unknown>): HelperMessage {
     if (event === "continuity_lease") {
       if (!isContinuityLease(message.lease)) throw new Error("Launcher browser helper returned an invalid continuity lease");
       return { type: "event", id: message.id, event, lease: message.lease };
-    }
-    if (event === "multipart_stage_acknowledged") {
-      if (!Number.isSafeInteger(message.stageIndex) || (message.stageIndex as number) <= 0) {
-        throw new Error("Launcher browser helper multipart stage index is invalid");
-      }
-      return { type: "event", id: message.id, event, stageIndex: message.stageIndex as number };
     }
     if (event === "tool_batch_observed") {
       if (!Number.isSafeInteger(message.revision) || (message.revision as number) <= 0) {
@@ -285,11 +277,6 @@ export class LauncherBrowserHelperClient {
       throw continuityError("continuity_configuration_conflict", "Recovery requires the authenticated durable state directory in the browser helper.");
     }
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
-      throw new Error(
-        "Launcher browser helper does not support multipart acknowledgement forwarding; update or restart the launcher",
-      );
-    }
     if (turn.externalProgress && !this.helperFeatures.has("tool-boundary-ack")) {
       throw new Error(
         "Launcher browser helper does not support causal Codex tool-boundary acknowledgement; update or restart the launcher",
@@ -440,7 +427,7 @@ export class LauncherBrowserHelperClient {
     await this.ensureChild();
     assertLauncherContextDeliveryFeature(readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!));
     if (!this.helperFeatures.has(LAUNCHER_CONTEXT_DELIVERY_FEATURE) || !this.helperContextCompatible) {
-      throw new ChatGptWebAdapterError("Launcher browser helper does not support context delivery plans with the current reads-array, context-text-batch-v1 and manifest 3 contract; update the runtime and helper before using context navigation", {
+      throw new ChatGptWebAdapterError(`Launcher browser helper does not support context protocol ${CONTEXT_PROTOCOL_VERSION}, context-bootstrap-payload-v3, context-text-batch-v1 and manifest 3; update the runtime and helper before using context navigation`, {
         status: 503, errorType: "server_error", code: "codex_context_upgrade_required", retryable: false,
       });
     }
@@ -696,26 +683,6 @@ export class LauncherBrowserHelperClient {
             message.id, error instanceof Error ? error : new Error(String(error)), pending,
           ));
       }
-      else if (message.event === "multipart_stage_acknowledged") {
-        const multipart = pending.prepared?.multipart;
-        if (!multipart
-          || message.stageIndex >= multipart.parts.length
-          || message.stageIndex !== (pending.acknowledgedMultipartStage ?? 0) + 1) {
-          this.abortWithLocalFailure(
-            message.id,
-            new Error("Launcher browser helper acknowledged an unexpected multipart stage"),
-            pending,
-          );
-          return;
-        }
-        pending.acknowledgedMultipartStage = message.stageIndex;
-        void Promise.resolve().then(() => pending.turn.onMultipartStageAcknowledged?.(message.stageIndex))
-          .catch(error => this.abortWithLocalFailure(
-            message.id,
-            error instanceof Error ? error : new Error(String(error)),
-            pending,
-          ));
-      }
       else if (message.event === "continuity_lease") {
         try {
           const claim = pending.turn.continuity;
@@ -744,6 +711,11 @@ export class LauncherBrowserHelperClient {
             return;
           }
           pending.prepared = prepared;
+          if (Object.hasOwn(prepared, "multipart")) {
+            throw new ChatGptWebAdapterError("Staged context transport is retired; update the runtime and browser helper before sending this prompt", {
+              status: 503, errorType: "server_error", code: "codex_context_upgrade_required", retryable: false,
+            });
+          }
           validateBrowserHelperContextPlan(prepared.contextPlan);
           if (prepared.skillFiles?.length && !this.helperFeatures.has("skill-attachments")) {
             throw new Error("Launcher browser helper does not support skill attachments; update or restart the launcher");
@@ -760,7 +732,6 @@ export class LauncherBrowserHelperClient {
                 ...(prepared.contextPlan ? { contextPlan: prepared.contextPlan } : {}),
                 ...(prepared.turnToken ? { turnToken: prepared.turnToken } : {}),
                 ...(prepared.skillFiles ? { skillFiles: prepared.skillFiles } : {}),
-                ...(prepared.multipart ? { multipart: prepared.multipart } : {}),
                 ...(prepared.trimmedCompactionMessages !== undefined
                   ? { trimmedCompactionMessages: prepared.trimmedCompactionMessages }
                   : {}),

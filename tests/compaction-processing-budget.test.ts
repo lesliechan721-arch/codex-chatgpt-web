@@ -42,7 +42,7 @@ for (const outcome of ["resume", "expired", "revoked"] as const) test(`source re
     });
     const pending = registerCompactionSource(broker, {
       snapshot: snapshot(), contract: "native", transactionToken: transaction.token, handoffId: transaction.handoffId,
-      historyRevision: 0, ownerGeneration: "page", expiresAt: () => budget.deadlineAt, availableTokens: 96_000,
+      historyRevision: 0, ownerGeneration: "page", expiresAt: () => budget.deadlineAt,
     }, "Summarize the original source");
     if (outcome !== "resume") {
       await expect(pending).rejects.toMatchObject({ code: "CONTEXT_INVALID" });
@@ -110,7 +110,7 @@ for (const awake of [false, true]) test(`source preflight excludes suspension ac
   let yielded = false;
   const tick = setImmediate(() => { yielded = true; if (awake) time.awake(25_000); else time.sleep(601_000); });
   try {
-    const preflight = assertCompactionReadable(source, 96_000);
+    const preflight = assertCompactionReadable(source);
     if (awake) await expect(preflight).rejects.toMatchObject({ code: "continuity_resource_capacity" });
     else await expect(preflight).resolves.toBeUndefined();
     expect(yielded).toBeTrue();

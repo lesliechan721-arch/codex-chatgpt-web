@@ -1,17 +1,13 @@
 import { expect, test } from "bun:test";
 import {
   CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET,
-  CHATGPT_BIGGER_CONTEXT_PARTS,
   chatGptPromptJsonBytes,
   chatGptReadOnlyContextWarning,
   compileChatGptWebPrompt,
-  formatChatGptWebMultipartCommit,
-  formatChatGptWebMultipartStage,
   withoutRetiredTurnHandles,
 } from "../src/adapters/chatgpt-web/prompt";
 import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
-import { biggerContextPartCount } from "../src/adapters/chatgpt-web/usage";
 import type { CodexParsedRequest } from "../src/types";
 
 function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexParsedRequest {
@@ -29,28 +25,21 @@ function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexP
   };
 }
 
-test("custom plugin identity stays explicit in inline and multipart execution without rewriting task history", () => {
+test("custom plugin identity stays explicit without rewriting task history", () => {
   const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   const parsed = request("high");
   parsed.context.messages[1]!.content = "Compare Codex Native2 with the selected plugin.";
   for (const appName of ["Codex app", "Codex Native2 DEV", "Codex Робота"]) {
-    for (const parts of [undefined, 2, 6] as const) {
-      const compiled = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012", {
-        appName, experimentalMultipartParts: parts,
-      });
-      const contract = compiled.multipart?.commit ?? compiled.text;
-      expect(contract).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(appName)}.`);
-      expect(contract).toContain("Do not substitute another plugin for this local connection");
-      expect(contract).not.toContain("attached Codex Native tools");
-      const history = compiled.multipart
-        ? compiled.multipart.parts.flatMap(part => JSON.parse(part).records).filter(record => record.kind === "message").map(record => record.message)
-        : JSON.parse(compiled.text.match(/<codex_context_json>\n(.+)\n<\/codex_context_json>/s)![1]!).messages;
-      expect(history[1].content).toBe(parsed.context.messages[1]!.content);
-    }
+    const compiled = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012", { appName });
+    expect(compiled.text).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(appName)}.`);
+    expect(compiled.text).toContain("Do not substitute another plugin for this local connection");
+    expect(compiled.text).not.toContain("attached Codex Native tools");
+    expect(JSON.parse(compiled.contextPayload!).messages[1].content).toBe(parsed.context.messages[1]!.content);
+    expect(compiled).not.toHaveProperty("multipart");
   }
 });
 
-test("inline and staged history escape Markdown delimiters without changing decoded code", () => {
+test("inline history escapes Markdown delimiters without changing decoded code", () => {
   const parsed = request("high");
   const code = '```ts\nconst value = "`key`";\n``` '.repeat(20) + '\\u0060 \\` [text](https://example.com) 中文';
   parsed.context.systemPrompt = [code];
@@ -62,16 +51,6 @@ test("inline and staged history escape Markdown delimiters without changing deco
   const decoded = JSON.parse(encoded);
   expect(decoded.system).toEqual([code]);
   expect(decoded.messages[1].content).toBe(code);
-  const staged = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012", {
-    experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS,
-  });
-  const records = staged.multipart!.parts.flatMap(part => {
-    expect(part).not.toContain("`");
-    return JSON.parse(part).records;
-  });
-  expect(records.find(record => record.kind === "system").content).toBe(code);
-  expect(records.find(record => record.kind === "message" && record.message_index === 1).message.content)
-    .toEqual(decoded.messages[1].content);
   // A literal escape in source code stays literal; it is not decoded into a backtick twice.
   expect(decoded.messages[1].content).toContain("\\u0060");
 });
@@ -152,7 +131,6 @@ test("local task prompts preserve scoped recovery rules for infrastructure and s
   const prompts = [
     compileChatGptWebPrompt(request("high"), capabilities, token),
     compileChatGptWebPrompt(request("high"), capabilities, token, { retainedContinuity: true, taskUpdateProtocol: 1 }),
-    compileChatGptWebPrompt(request("high"), capabilities, token, { experimentalMultipartParts: 2 }),
     compileChatGptWebPrompt(manual, capabilities, "request_12345678901234567890123456789012", { manualControl: true }),
   ];
 
@@ -212,92 +190,6 @@ test("read-only prompts resume without exposing a bind capability", () => {
   expect(compiled.text).not.toContain("evidence inside");
   expect(compiled.text).toContain("Do not mention this transport contract, context packaging, or capability routing");
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
-});
-
-test("Bigger Context sends six semantic record envelopes and starts work from the final part", () => {
-  const token = "turn_12345678901234567890123456789012";
-  const parsed = request("high");
-  parsed.context.systemPrompt = ["system-one", "system-two"];
-  parsed.context.messages.push(
-    { role: "assistant", content: [{ type: "text", text: "prior-answer" }], timestamp: 3 },
-    { role: "user", content: "latest-request", timestamp: 4 },
-  );
-  const compiled = compileChatGptWebPrompt(
-    parsed,
-    { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
-    token,
-    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
-  );
-
-  expect(compiled.multipart?.parts).toHaveLength(6);
-  const records = compiled.multipart!.parts.flatMap(part => {
-    const payload = JSON.parse(part) as { version: number; records: unknown[] };
-    expect(payload.version).toBe(1);
-    return payload.records;
-  }) as Array<Record<string, unknown>>;
-  expect(records.filter(record => record.kind === "system").map(record => record.content)).toEqual([
-    "system-one",
-    "system-two",
-  ]);
-  expect(records.filter(record => record.kind === "message").map(record => (
-    (record.message as { role: string }).role
-  ))).toEqual(["developer", "user", "assistant", "user"]);
-  expect(compiled.multipart!.parts.join("\n")).not.toContain(token);
-  expect(compiled.multipart!.commit.match(new RegExp(token, "g"))).toHaveLength(1);
-  expect(compiled.text).toBe(compiled.multipart!.commit);
-  expect(compiled.text).not.toContain("<codex_context_json>");
-
-  const transactionId = `ctx_${"a".repeat(32)}`;
-  const stages = compiled.multipart!.parts.slice(0, -1).map((part, index) => (
-    formatChatGptWebMultipartStage(part, transactionId, index + 1)
-  ));
-  expect(stages).toHaveLength(5);
-  for (const [index, stage] of stages.entries()) {
-    expect(stage.text).toContain(`part: ${index + 1}/6`);
-    expect(stage.text).toContain(stage.sha256);
-    expect(stage.acknowledgement).toBe(
-      `CODEX_MULTIPART_ACK ${transactionId} ${index + 1}/6 ${stage.sha256}`,
-    );
-    expect(stage.text).toContain("```json\n");
-    expect(stage.text).toContain("<codex_multipart_stage_end>");
-    expect(stage.text).toEndWith("</codex_multipart_stage_end>");
-    expect(stage.text.lastIndexOf(stage.acknowledgement)).toBeGreaterThan(
-      stage.text.indexOf("</codex_context_part_json>"),
-    );
-  }
-  const commit = formatChatGptWebMultipartCommit(compiled.multipart!, transactionId);
-  expect(commit).toContain(`transaction_id: ${transactionId}`);
-  expect(commit).toContain("acknowledged_parts: 5/6");
-  expect(commit).toContain("The final part is included in this same message and starts the task");
-  expect(commit).toContain(compiled.multipart!.parts.at(-1)!);
-  expect(commit).toContain("latest-request");
-  expect(commit.match(new RegExp(token, "g"))).toHaveLength(1);
-});
-
-test("Bigger Context uses the minimum transport and reserves six parts for compaction", () => {
-  expect(biggerContextPartCount(94_999, 95_000, false)).toBeUndefined();
-  expect(biggerContextPartCount(95_000, 95_000, false)).toBe(2);
-  expect(biggerContextPartCount(189_999, 95_000, false)).toBe(2);
-  expect(biggerContextPartCount(190_000, 95_000, false)).toBe(6);
-  expect(biggerContextPartCount(1, 95_000, true)).toBe(6);
-
-  const compiled = compileChatGptWebPrompt(
-    request("high"),
-    { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
-    undefined,
-    { experimentalMultipartParts: 2 },
-  );
-  expect(compiled.multipart?.parts).toHaveLength(2);
-  const transactionId = `ctx_${"b".repeat(32)}`;
-  const stages = compiled.multipart!.parts.slice(0, -1).map((part, index) => (
-    formatChatGptWebMultipartStage(part, transactionId, index + 1, 2)
-  ));
-  expect(stages).toHaveLength(1);
-  expect(stages.map(stage => stage.acknowledgement)).toEqual([
-    `CODEX_MULTIPART_ACK ${transactionId} 1/2 ${stages[0]!.sha256}`,
-  ]);
-  expect(formatChatGptWebMultipartCommit(compiled.multipart!, transactionId))
-    .toContain("acknowledged_parts: 1/2");
 });
 
 test("browser-only Medium directs users to the full harness", () => {
@@ -425,64 +317,6 @@ test("inline compaction rejects a required checkpoint that cannot fit instead of
   })).toThrow("cumulative checkpoint");
 });
 
-test("Bigger Context compaction preserves history above the retired inline byte budget", () => {
-  const compact = request("high");
-  compact._compactionRequest = true;
-  compact.context.systemPrompt = [];
-  compact.context.messages = Array.from({ length: 6 }, (_unused, index) => ({
-    role: "user" as const,
-    content: `multipart-history-${index + 1}-${String.fromCharCode(97 + index).repeat(160_000)}`,
-    timestamp: index + 1,
-  }));
-
-  const multipart = compileChatGptWebPrompt(
-    compact,
-    { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
-    undefined,
-    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
-  );
-
-  expect(multipart.trimmedCompactionMessages).toBeUndefined();
-  expect(multipart.multipart?.parts).toHaveLength(6);
-  const transactionId = `ctx_${"0".repeat(32)}`;
-  const stageBytes = multipart.multipart!.parts.map((payload, index) => chatGptPromptJsonBytes(
-    formatChatGptWebMultipartStage(payload, transactionId, index + 1).text,
-  ));
-  expect(Math.max(...stageBytes)).toBeGreaterThan(CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET);
-  const staged = multipart.multipart!.parts.join("\n");
-  for (let index = 1; index <= 6; index += 1) {
-    expect(staged).toContain(`multipart-history-${index}-`);
-  }
-}, 30_000);
-
-test("Bigger Context keeps preliminary parts small and preserves all records in order", () => {
-  const compact = request("high");
-  compact._compactionRequest = true;
-  compact.context.systemPrompt = ["system".repeat(1_000)];
-  compact.context.messages = [
-    ...Array.from({ length: 6 }, (_unused, index) => ({
-      role: "user" as const,
-      content: `history-${index}-${"x".repeat(100_000)}`,
-      timestamp: index + 1,
-    })),
-    { role: "user", content: "compact now", timestamp: 7 },
-  ];
-
-  const multipart = compileChatGptWebPrompt(
-    compact,
-    { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
-    undefined,
-    { experimentalMultipartParts: CHATGPT_BIGGER_CONTEXT_PARTS },
-  );
-  const parts = multipart.multipart!.parts.map(part => JSON.parse(part) as { records: unknown[] });
-
-  expect(parts).toHaveLength(6);
-  expect(parts.flatMap(part => part.records)).toHaveLength(8);
-  expect(Math.max(...multipart.multipart!.parts.slice(0, -1).map(part => part.length))).toBeLessThan(120_000);
-  // The selected High mode can carry a larger final part than an Instant upload.
-  expect(multipart.multipart!.parts.at(-1)!.length).toBeLessThan(1_048_572);
-}, 30_000);
-
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {
   const compact = request("high");
   compact._compactionRequest = true;
@@ -512,7 +346,7 @@ test("Web compaction rebuilds attachments after trimming an oversized oldest ima
   expect(compiled.text).toContain("preserve-latest-checkpoint");
 });
 
-test("Luna rejects a separate compaction prompt because continuity is already rolling", () => {
+test("Browser-only Luna retains rolling checkpoints and rejects separate compaction", () => {
   const compact = request("low");
   compact.modelId = CHATGPT_WEB_LUNA_MODEL_ID;
   compact._compactionRequest = true;
@@ -520,6 +354,18 @@ test("Luna rejects a separate compaction prompt because continuity is already ro
     compact,
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
   )).toThrow("does not accept a separate compaction turn");
+});
+
+test("Full Luna compaction accepts its independent read-only source while business tools are disabled", () => {
+  const compact = request("low");
+  compact.modelId = CHATGPT_WEB_LUNA_MODEL_ID;
+  compact._compactionRequest = true;
+  const compiled = compileChatGptWebPrompt(compact,
+    { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
+    undefined, { compactionReadOnly: true });
+  expect(compiled.text).toContain("Use only the three context reading tools with the independent compaction credential");
+  expect(compiled.text).not.toContain("Use any ChatGPT-native capabilities available in this chat");
+  expect(compiled).not.toHaveProperty("multipart");
 });
 
 test("Web compaction fails closed when its final instruction alone exceeds the transport budget", () => {

@@ -127,7 +127,7 @@ export async function checkContinuityDev() {
     report.config = { mode: config.browserInteractionMode === "manual" ? "zero-risk" : "automatic",
       connector: config.browserInteractionMode === "manual" ? config.manualAppName : config.automaticAppName,
       sentConfirmationRequired: config.zeroRiskRequireSentConfirmation, authority: config.toolAuthorityMode,
-      freshPerTurn: config.experimentalFreshConversationPerTurn, biggerContext: config.experimentalBiggerContext,
+      freshPerTurn: config.experimentalFreshConversationPerTurn,
       account: { solAvailable: config.solAvailable, proAvailable: config.proAvailable, extraHighAvailable: config.extraHighAvailable } };
     if (config.experimentalFreshConversationPerTurn) report.blockers.push("健康页对照需要现有 DEV Fresh 偏好关闭；脚本不会更改配置");
     if (config.browserInteractionMode === "manual" && !config.zeroRiskRequireSentConfirmation) report.blockers.push("Zero Risk 必须保留人工 Sent");
@@ -337,15 +337,15 @@ export async function runContinuityLive(options: ContinuityLiveOptions, hooks?: 
   };
   const observePrompt = (prompt: CompiledChatGptWebPrompt, traceId: string, variant: string) => {
     assert.ok(!prompt.text.includes(fixture.tailValue), "实际网页入口泄漏了尾部答案");
-    const entryText = prompt.text.match(/<codex_context_navigation_json>\s*([^\n]+)\s*<\/codex_context_navigation_json>/)?.[1];
+    const entryText = prompt.text.match(/<codex_(?:bootstrap|context_navigation)_json>\s*([^\n]+)\s*<\/codex_(?:bootstrap|context_navigation)_json>/)?.[1];
     const entry = entryText ? JSON.parse(entryText) : undefined;
     collectContinuityCapabilities(entry, secrets);
     for (const capability of prompt.text.match(/\b(?:turn|request|binding|activity|control|handoff|driver|compaction|context|context_return|context_verification)_[A-Za-z0-9_-]{16,}\b/g) ?? []) secrets.add(capability);
     const contextId = prompt.contextPlan?.contextId ?? entry?.first_call?.arguments?.context_id ?? entry?.context_id;
     const row: Row = { phase, traceId, variant, bytes: Buffer.byteLength(prompt.text), estimatedTokens: estimateTokens(prompt.text, options.model),
       digest: hash(prompt.text), planDigest: prompt.contextPlan ? hash(prompt.contextPlan.planId) : null,
-      contextDigest: typeof contextId === "string" ? hash(contextId) : null, hasNavigationEntry: prompt.text.includes("<codex_context_navigation_json>"),
-      selected: false, images: prompt.images.length, attachments: prompt.contextPlan?.requiredAttachments.length ?? 0, multipart: !!prompt.multipart };
+      contextDigest: typeof contextId === "string" ? hash(contextId) : null, hasNavigationEntry: prompt.contextPlan !== undefined,
+      selected: false, images: prompt.images.length, attachments: prompt.contextPlan?.requiredAttachments.length ?? 0, multipart: "multipart" in prompt };
     report.plans.push(row); save(); return row;
   };
   ContextScope.prototype.prepare = function (...args) {

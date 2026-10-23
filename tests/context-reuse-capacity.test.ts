@@ -23,8 +23,8 @@ function plan(manual: boolean, inline: boolean, baseline?: ContextReuseBaseline,
     capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: manual,
       maxComposerCodePoints: inline ? 500_000 : 8000 }, turnToken: `turn_${"7".repeat(32)}`,
     contextToolsAvailable: true, contextBootstrapAvailable: true, contextReuseAvailable: true, reuseBaseline: baseline,
-    compileOptions: manual ? { manualControl: true } : {}, experimentalBiggerContext: true,
-    // The paged cases isolate reuse metadata capacity from shared context capacity.
+    compileOptions: manual ? { manualControl: true } : {},
+    // Historical page estimates do not limit delivery of these bounded units.
     budget: { retainedTokens, ...(!inline ? { contextWindowTokens: 1_000_000 } : {}) },
   });
 }
@@ -82,7 +82,7 @@ function reconstruct(delivered: ReturnType<typeof deliver>, previous = new Map<s
 }
 
 // Paged cases plan and deliver three complete scopes; allow headroom on Intel CI.
-for (const [manual, inline] of [[false, false], [true, false], [false, true]] as const) {
+for (const [manual, inline] of [[false, false], [true, false]] as const) {
   test(`capacity fallback preserves real delivery, bounded evidence and the next scope: manual=${manual} inline=${inline}`, () => {
     const first = plan(manual, inline);
     const delivered = deliver(first);
@@ -107,3 +107,12 @@ for (const [manual, inline] of [[false, false], [true, false], [false, true]] as
     expect(reconstruct(removal, delivered.units)).toEqual(removed.compiled.bootstrapContent!.payload);
   }, inline ? 30_000 : 60_000);
 }
+
+// A reusable candidate is optional: its complete metadata can cost more than short rules.
+test("many short rules remain inline when reuse metadata has no full-cost benefit", () => {
+  const result = plan(false, true);
+  expect(result.navigationEnabled).toBeFalse();
+  expect(result.registration).toBeUndefined();
+  expect(result.projected.context.messages).toHaveLength(131);
+  expect(result.compiled.text).toContain("Exact rule 129");
+});

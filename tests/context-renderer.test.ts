@@ -132,10 +132,16 @@ test("raw paths cannot reinterpret array indices or create object properties", (
 });
 
 test("multipart decoder rejects mixed versions, missing records and wrong global indices", () => {
-  const first = encodeWebContextPayload(records.slice(0, 1), "codex-context-text-v1", { partIndex: 1, totalParts: 2 });
-  const second = encodeWebContextPayload(records.slice(1), "codex-context-text-v1", { partIndex: 2, totalParts: 2 });
+  // Persisted stage bytes remain readable. No new multipart encoder is available.
+  const first = JSON.stringify({ format: "codex-context-text-v1", context_version: 3, record_count: 1, part_index: 1, total_parts: 2 })
+    + "\n" + JSON.stringify({ record: records[0] }) + "\n";
+  const second = JSON.stringify({ format: "codex-context-text-v1", context_version: 3, record_count: 2, part_index: 2, total_parts: 2 })
+    + "\n" + records.slice(1).map(record => JSON.stringify({ record }) + "\n").join("");
   expect(decodeWebContextTransaction([first, second])).toEqual(records);
-  expect(() => decodeWebContextTransaction([first, encodeWebContextPayload(records.slice(1), "legacy-json", { partIndex: 2, totalParts: 2 })])).toThrow();
+  const oldJsonPart = JSON.stringify({ version: 1, part_index: 2, total_parts: 2, records: records.slice(1) });
+  expect(() => decodeWebContextTransaction([first, oldJsonPart])).toThrow();
+  const firstJsonPart = JSON.stringify({ version: 1, part_index: 1, total_parts: 2, records: records.slice(0, 1) });
+  expect(decodeWebContextTransaction([firstJsonPart, oldJsonPart])).toEqual(records);
   expect(() => decodeWebContextTransaction([first, second.replace('"message_index":0', '"message_index":4')])).toThrow();
   expect(() => decodeWebContextTransaction([first, first])).toThrow();
   expect(() => decodeWebContextTransaction([first])).toThrow();

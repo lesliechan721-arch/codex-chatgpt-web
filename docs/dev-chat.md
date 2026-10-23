@@ -129,8 +129,8 @@ Interactive commands:
 `/fill N` appends deterministic inert text measured by the production tokenizer. It does not open
 ChatGPT. The next message checks the real model-specific auto-compaction threshold and calls the
 same `compactRequest` handler when the threshold is crossed. `/compact` forces that handler
-immediately. Luna keeps its production rolling-checkpoint contract and therefore rejects the
-separate compact command.
+immediately. Full/MCP Luna supports independent compaction; Browser-only Luna keeps its
+rolling-checkpoint contract and rejects the separate compact command.
 
 `/send-fill N` sends deterministic inert text as the current message through the live browser. Use
 it to exercise the one-message composer budget and multi-chunk prompt insertion independently of
@@ -153,72 +153,42 @@ An unsupported browser helper or rejected upload produces an error instead of si
 instructions. This remains experimental: moving instructions into attachments does not guarantee
 that ChatGPT will follow them more reliably.
 
-## Bigger Context experiment
+## Default reading and history policy
 
-Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by
-default. The switch updates the profile's canonical runtime configuration through the normal setup
-transaction; it is not a launcher-only preference. Production setup also rewrites the managed
-Codex model catalog and asks you to restart Codex. Applicable unified routes advertise a
-1,000,000-token history window and 900,000-token compaction threshold independently of browser
-delivery capacity. GPT-5.6 and GPT-6 Pro keep their three-times budgets. GPT-6 Sol uses
-240,000 context tokens and a 220,000-token compaction threshold only on Pro accounts at Medium,
-High, or Extra High. GPT-6 Instant and GPT-6 Sol on other account plans keep standard budgets.
-The DEV CLI reads the same setting from its isolated runtime configuration on each command.
+Full/MCP compares inline and on-demand candidates by default, including Luna/Think and GPT-6
+Instant. Short inputs can stay inline. Current requests, effective rules and recovery state stay
+required; trusted ordinary assistant history and detailed source maps can be read when needed.
+Context protocol 6 uses payload v3, manifest 3 and batch-v1. See
+[context navigation](context-navigation.md) for classification, identity, readiness and source limits.
 
-When enabled, a normal turn stays on the original single-message path while its estimated input
-is below the selected mode's existing auto-compaction threshold. At the first threshold it uses two
-messages; at twice that threshold it uses six messages. The final context part also commits the
-transaction and starts the task, so there is no extra request. The named DEV driver keeps its own compaction trigger; it does not demonstrate the public
-Codex history threshold. Delivery still obeys the selected model and account limits.
+History H/C tiers are 200,000/180,000, 300,000/270,000, 500,000/450,000 and 600,000/540,000 tokens,
+selected by account/model, with C = 90% of H. Full + Launcher has no highest-tier override.
+Full/MCP Luna/Think reports canonical history and supports independent read-only compaction at
+180,000. Browser-only Luna retains rolling checkpoints and projected usage. The client owns the
+compaction trigger. Neither H nor C is a server cumulative reading or sending limit.
 
-Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
-must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.
-Actual fallback image attachments, the MCP connector, and the private `turn_token` belong only to
-the final part. MCP-routed images are read through the selected navigation entry after submission.
-In Full/MCP mode, compaction does not replay the expanded history into an unrelated summarizer. If
-the source Web response is still waiting on a tool boundary, its canonical tool results finish that
-response first without a compaction suffix. If those results are enough for an ordinary final
-answer, that committed answer remains owned by the logical Responses turn even if the page is
-later replaced. If the Web model instead requests another tool, the broker blocks that new execution
-and tells the response to stop; the compacted continuation then resumes the unfinished work. The
-exact retained chat receives one strict checkpoint message with the one-shot MCP submission
-capability and, when needed, an independent `compaction_token` for read-only sources. It grants no
-ordinary work capability. The model chooses which sources to read; no full-reading threshold is
-required. Source failures, remaining summary reserve, and in-flight reads still gate submission.
-The checkpoint never rides in the tail of a potentially
-huge tool result, and its wait is capped at five minutes independently of the normal turn timeout.
-For supported Full Native + Launcher tasks, accepting a structured handoff does not require
-closing the page. The checkpoint commits once after its bound execution, source and real-result
-checks; a healthy compatible page remains available for continuation. If a page replacement is
-needed, old project authority must be durably isolated before the successor is activated. Physical
-cleanup runs separately and still consumes its slot until exact destruction. Neither ending the
-one-purpose response nor clicking close proves dispatched operations settled.
+Bigger Context settings, capability flags, API/IPC setters and new stage/commit sends are removed.
+Old configuration true/false/absent values normalize to default behavior; the next normal save
+removes the old field. Old CLI switches are compatibility no-ops with a removal notice, and are
+not emitted by help or generated commands. No new multipart retry or ACK path is created. Old
+staged text remains source data; it does not authorize replaying its instructions or Send.
 
-Non-applicable paths keep their existing compaction lifecycle: the one-purpose response ends,
-physical Launcher settlement is awaited where required, and the old surface closes before a fresh
-chat. This control-only completion does not depend on assistant prose or a Copy action.
-If an applicable task's retained chat was lost without user stop, its uncommitted compaction uses
-legal rebuilt sources and an actual read-only on-demand plan, with the same logical target,
-deadline and retry budget. An existing stop is never cleared. Non-applicable fallback paths retain
-their original source and transport checks. Browser-only has no retained MCP boundary and uses
-the six-message compaction path with its complete expanded history.
+Browser-only gains no MCP tools. Every browser input must fit its existing single-message limits,
+or fail with a specific capacity/capability error when no complete legal representation fits.
+Luna's ordinary input remains 28,000 tokens with its existing deductions. Image, attachment,
+snapshot, processing-time, correction and source-lifetime limits stay independent.
 
-Any missing or malformed acknowledgement fails the whole transaction. No later part or final
-commit is sent, and a retry starts again from part one in a fresh chat. The model context
-and auto-compaction ceilings follow the model and account rules above. Every individual stage
-must still fit the selected ChatGPT mode's measured one-message boundary. Bigger Context uses only the existing supported model/account and staged-send paths. Unified
-task continuity does not exclude it by mode; Zero Risk retains its prohibition. The applicable
-1,000,000 / 900,000-token history budget does not increase the browser input boundary.
+Cumulative delivered tokens and wire bytes are diagnostic estimates only. They do not block
+Send, reads, completion, compaction or page reuse, and missing cost records alone do not force a
+new page. Ordinary and compaction reads have no total token pool derived from page history.
+Readiness still requires the fixed required set, images and applicable rule reuse. Compaction
+keeps independent sources, read-only credentials, in-flight settlement, original submission checks
+and its finite control deadline, with no minimum source-reading rate. Business tools remain closed
+in compaction. Zero Risk keeps its manual Send, configured Sent and separate attachment confirmation.
 
-Small turns use one request. Two-part turns use one inert staging request and one final request;
-six-part turns use five staging requests and one final request. Browser-only compaction also uses
-six parts. Inert stages use the fastest available mode that fits their complete messages; the final
-part uses the selected execution effort. Plus Instant uploads keep the same input headroom as
-ordinary Instant turns; the selected final mode can receive a larger share of the context.
-Large turns may increase the probability of
-rate limits or a temporary account cooldown. The experiment is intentionally unavailable for Luna:
-Luna's later requests still include the accumulated transcript inside the same measured
-28,000-token browser transport budget.
+Use the [release checklist](release-validation.md#default-selective-reading-validation) to record
+new real runs. Historical measurements do not validate this contract or guarantee faster tasks
+or better model answers.
 
 Browser-only chats do not advertise outer tools and never claim simulated effects. Full setup keeps
 the launcher-owned DEV tunnel ready so ChatGPT can create and validate `Codex Native5 DEV` before a

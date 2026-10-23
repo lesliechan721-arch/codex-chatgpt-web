@@ -32,12 +32,11 @@ routing and metadata are defined in the [upstream provider guide](upstream-provi
   limits; catalog generation rejects a mismatch rather than reducing a budget. Pro rows use the
   native `max` effort; `ultra` is not used for new rows because Codex transforms it before transport.
 - Named Sol/Pro routes select the exact browser family and verify it again before every Send.
-  Latest must identify version 6 for a GPT-6 Pro response. Its existing lower-effort multipart
-  acknowledgements identify 5.6, then the final part returns to verified 6 Pro. No version fallback.
+  Latest must identify version 6 for a GPT-6 Pro response. No version fallback is allowed.
 - Pre-6.0 slugs remain hidden catalog entries with their original fixed bindings, including the
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
-  picker. Native models and existing context/compaction budgets are preserved.
+  picker. Native model budgets are preserved; Web routes use the account/model history table below.
 - Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (saved in ChatGPT history by default).
 - Never starts the broker, tunnel, or MCP server.
 - Emits a nonfatal Codex commentary warning that local tools are unavailable for the selected model.
@@ -184,7 +183,7 @@ and costs. It does not change source choice, permissions, or retry policy. MCP t
 `context-text-batch-v1` result with two metadata representations and one independent body block per
 returned item. A whole batch has one transaction and one validated successful-transport receipt;
 any invalid item prevents all new coverage. Single images retain their original result and
-confirmation through one-item arrays. Protocol 4 and manifest 3 publish a fixed required batch
+confirmation through one-item arrays. Protocol 6 and manifest 3 publish a fixed required batch
 chain, so normal pure-text startup needs no required directory traversal. A final overview
 establishes settled readiness. The expanded profile caps a complete text response at 64 KiB and
 8,000 estimated tokens; it is a local budget, not proof of real platform acceptance.
@@ -244,33 +243,40 @@ connector attachment. Tool rounds, HTTP replays and task updates do not create p
 this preference. It changes page choice, not work identity, stop, checkpoint or retry facts. The
 existing Zero Risk send capability and manual boundaries still apply.
 
-Bigger Context partitions complete ordered records against each message's available token and
-composer budgets. Inert stages carry text; the final message also carries actual fallback attachments,
-the execution contract and any output schema. Their reserves are deducted before partitioning,
-then preflight checks the actual compiled messages and total transaction. The selected execution
-effort and attachment references remain unchanged. Large transactions use up to six messages;
-the actual delivery window and multipart thresholds depend on the model and account. These are
-separate from the public unified-task history window and automatic-compaction threshold. GPT-5.6 and
-GPT-6 Pro retain three-times budgets. GPT-6 Sol on Pro accounts at Medium, High, or Extra High
-uses a 240,000-token context window and a 220,000-token compaction threshold. Plus supports
-Medium, High, and available Extra High with a 120,000-token window and a 110,000-token compaction
-threshold. GPT-6 Instant uses standard budgets. Luna/Think can opt into experimental multipart
-transport with an 84,000-token ceiling derived from its 28,000-token per-message transport budget;
-this is not a verified Free recall window. Multipart Luna sends complete canonical history without
-the rolling checkpoint; disabling Bigger Context restores ordinary checkpoint transport.
-More parts reduce message size without increasing these delivery limits. Bigger Context uses
-existing supported model/account and transport capabilities. Applicable unified routes use the
-separate 1,000,000 / 900,000-token history budget; it does not increase browser input capacity.
+Default Full/MCP planning compares inline and selective delivery for Automatic and Zero Risk,
+including GPT-6 Instant and Luna/Think. Payload v3 uses an external position table for optional
+fields and an optional detailed source_map; manifest 3 and text-batch-v1 use protocol 6. Requests,
+effective rules, current delegation and recovery checkpoints remain required. Only trusted ordinary
+assistant history is optional by default; unknown mixed records and unproved skill/image scope
+remain required. See [context navigation](context-navigation.md) for exact source and reuse rules.
+
+Bigger Context, its configuration/capability/API/IPC surfaces and new two-/six-stage transactions
+are removed. Saved old values normalize to default behavior. Legacy command switches have no
+effect and report removal. Historical staged bodies remain readable data, not executable sends.
+Browser-only has no new MCP capability and must use a complete legal single-message input or fail.
+
+The account/model catalog selects H/C of 200k/180k, 300k/270k, 500k/450k or 600k/540k, with C = 90%
+of H; Full + Launcher has no override. These are history policies. Single-message transport remains
+independent, including Luna's ordinary 28,000-token input and existing Pro text limits. H/C cannot
+raise read-response, composer, image, attachment, storage or time limits. Full/MCP Luna/Think
+estimates canonical history and uses independent client compaction at 180k; Browser-only Luna
+retains rolling checkpoints and projected usage.
+
+Cumulative delivered tokens/wire bytes are diagnostics. They cannot reject Send, read, completion,
+compaction registration/submission or page reuse. Missing cost records alone cannot force a page.
+No ordinary or compaction total reading ceiling is derived from page history or summary reserves.
+Required delivery, source identity, permissions, settlement, ACK and independent resource limits
+remain gates.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
 environment. When required, the same control message also supplies an independent
 `compaction_token` and a bounded entry into complete legal sources. The model chooses its reads;
 submission does not require full reading or image coverage. Reading grants no submission or business
-authority. Source availability, remaining summary allowance, in-flight reads, and original ownership
+authority. Source availability, in-flight reads, and original ownership
 and settlement checks still gate acceptance. A permanent source failure prevents a checkpoint.
-Zero Risk retains its Bigger Context multipart prohibition. Applicable unified routes advertise
-1,000,000 / 900,000 history values separately from actual delivery limits. Active compaction receives
+Zero Risk retains its manual-send boundary. Account/model history tiers remain separate from actual
+delivery limits. Active compaction receives
 the checkpoint instruction as an MCP result and submits through its bound completion control.
 A healthy compatible page can remain after the checkpoint; replacing it is a separate decision.
 Every actual new manual input still requires its selected plan, Sent and attachment confirmation.
@@ -329,13 +335,13 @@ Ordinary `chatgpt-web/` routes use one task mechanism for supported Full Native 
 Automatic and Zero Risk paths. Task/work, execution attempt/generation, source/plan and physical
 page are separate. Healthy compatible pages receive increments and remain usable across accepted
 compaction. Fresh selects pages for actual new logical sends without changing task identity.
-Bigger Context retains existing model/account, staged ACK/final-commit and Send-retry limits;
-Zero Risk retains its existing prohibition and manual-send boundary.
+Zero Risk retains its manual-send boundary. Ordinary tool ACK, task-update ACK and compaction
+submission retain their separate contracts.
 
-The public history window is 1,000,000 estimated tokens with a 900,000 automatic-compaction
-threshold, including equivalent ordinary aliases. Lower client limits still apply. Canonical
-history usage remains distinct from actual browser/attachment, source storage, navigation and
-answer-cache budgets. No million-token browser input is implied.
+The public history tiers and 90% compaction thresholds follow the
+[account/model table](context-navigation.md#history-window-and-client-compaction), including aliases.
+Lower client limits still apply. Canonical Full/MCP usage remains distinct from actual browser,
+attachment, storage, per-response and result-cache limits. Cumulative page accounting is diagnostic.
 
 Ordinary unfinished recovery, checkpoint continuation, and uncommitted compaction select the
 page-lifecycle branch before historical admission. A current authenticated Launcher must confirm
@@ -392,7 +398,7 @@ The launcher Limits page is an opt-in estimate of its own accepted browser submi
 reads the current personal ChatGPT account and the Billing panel's Pro tier; a model-picker Pro
 badge alone cannot distinguish Pro $100 from Pro $200. The private store keeps account hashes,
 submission receipt IDs, timestamps, and model families, never prompts or authentication tokens.
-Every physical Send is counted once after semantic acceptance, including Bigger Context stages;
+Every physical Send is counted once after semantic acceptance, including historical staged sends;
 native tool rounds and stream reconnects do not create receipts. The selected slider's accessibility
 announcement identifies GPT-6 Pro versus GPT-5.6 Pro. Unidentified Pro sends are visibly uncertain.
 

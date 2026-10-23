@@ -21,7 +21,6 @@ import {
   withCompactionAbort,
 } from "../src/adapters/chatgpt-web/compaction-handoff";
 import { CompactionSourceCoverage } from "../src/adapters/chatgpt-web/compaction-context";
-import { CHATGPT_WEB_PLATFORM_RESERVE_TOKENS } from "../src/chatgpt-web-models";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
 import { CompactionTransactionStore } from "../src/adapters/chatgpt-web/compaction-transaction";
 import { rememberCompactionContinuation, recoverCompactionInstruction } from "../src/adapters/chatgpt-web/compaction-continuation";
@@ -673,7 +672,7 @@ test("a rejected exact compaction run is evicted while a successful run remains 
   expect(starts).toBe(2);
 });
 
-test("an exact oversized compaction replays its size error instead of uploading the same parts again", async () => {
+test("an exact oversized compaction replays its size error without sending the browser entry again", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-size-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -685,7 +684,6 @@ test("an exact oversized compaction replays its size error instead of uploading 
       localToolsEnabled: true,
       solAvailable: true,
       proAvailable: true,
-      experimentalBiggerContext: true,
       experimentalFreshConversationPerTurn: true,
     },
   };
@@ -1519,7 +1517,7 @@ test("retained compaction can close its browser epoch while preserving an ordina
   sessions.clear();
 });
 
-test.each([false, true])("adapter retained checkpoint preserves the ordinary final (Bigger Context=%s)", async experimentalBiggerContext => {
+test.each([false, true])("adapter retained checkpoint preserves the ordinary final with high delivery estimate=%s", async highDeliveryEstimate => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-adapter-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1532,7 +1530,6 @@ test.each([false, true])("adapter retained checkpoint preserves the ordinary fin
       localToolsEnabled: true,
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
-      experimentalBiggerContext,
     },
   };
   const broker = TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!);
@@ -1541,11 +1538,11 @@ test.each([false, true])("adapter retained checkpoint preserves the ordinary fin
   const sourceRequest = request(false);
   sourceRequest._chatgptModelFamily = "6";
   const sourceCoverage = deliveredCoverage(sourceRequest);
-  if (experimentalBiggerContext) {
+  if (highDeliveryEstimate) {
     sourceCoverage.prepare(createContextSnapshot(sourceRequest), { historyRevision: 0,
-      pageGeneration: "bigger-page", planId: "bigger-selected", bodyDigest: "bigger-body", manifestDigest: "bigger-images",
-      pageTokens: 150_000, externalizedTargetIds: [] });
-    sourceCoverage.markDelivered("bigger-selected");
+      pageGeneration: "high-delivery-page", planId: "high-delivery-selected", bodyDigest: "high-delivery-body", manifestDigest: "high-delivery-images",
+      pageTokens: 650_000, externalizedTargetIds: [] });
+    sourceCoverage.markDelivered("high-delivery-selected");
   }
   const namespace = chatGptWebExecutionNamespace(provider);
   const sourceKey = `${namespace}:${chatGptTurnExecutionKey(sourceRequest)}`;
@@ -1567,11 +1564,8 @@ test.each([false, true])("adapter retained checkpoint preserves the ordinary fin
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
-    if (experimentalBiggerContext) {
-      const entry = JSON.parse(prepared.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
-      expect(entry.overview.remaining_tokens).toBeGreaterThan(80_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-      expect(entry.overview.remaining_tokens).toBeLessThan(90_000 - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-    }
+    const entry = JSON.parse(prepared.text.match(/<codex_context_navigation_json>\n([^\n]+)\n/)![1]!);
+    expect(entry.overview.remaining_tokens).toBeUndefined();
     turn.onSubmitted?.();
     expect(turn.nativeConnector).toBeTrue();
     expect(turn.capabilities.localToolsEnabled).toBeFalse();
@@ -1853,13 +1847,12 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
   }
 });
 
-test.each([false, true])("structured compact rejects missing source coverage before sending (Bigger Context=%s)", async experimentalBiggerContext => {
+test.each([false, true])("structured compact rejects missing source coverage before sending (long source=%s)", async longSource => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-missing-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://missing-retained-${Date.now()}`,
     chatgptWeb: {
-      experimentalBiggerContext,
       browserHost: "launcher",
       browserHostDescriptorPath: join(root, "launcher.json"),
       brokerSocketPath: defaultBrokerEndpoint(root),
@@ -1877,21 +1870,13 @@ test.each([false, true])("structured compact rejects missing source coverage bef
     expect(turn.conversationKey).toBeUndefined();
     expect(turn.compaction).toBeTrue();
     const prepared = await turn.prepare();
-    const contextText = prepared.multipart?.parts.join("\n") ?? prepared.text;
-    expect(contextText).toContain("Original task");
-    expect(contextText).toContain("Continue with the next step");
-    if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(6);
-      expect(prepared.trimmedCompactionMessages).toBeUndefined();
-      const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
-      expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);
-    }
+    expect(prepared.text).toContain("codex_context_navigation_json");
     prepared.release();
     return "Fallback checkpoint from canonical Codex context";
   };
   const compact = request(true);
   const events: AdapterEvent[] = [];
-  if (experimentalBiggerContext) compact.context.messages.at(-1)!.content += "x".repeat(160_000);
+  if (longSource) compact.context.messages.at(-1)!.content += "x".repeat(160_000);
   try {
     await createChatGptWebAdapter(provider).runTurn!(
       compact,
@@ -1980,7 +1965,6 @@ test.each([false, true])("fresh compaction sends one bounded entry within the or
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     expect(turn.traceId.endsWith(freshConversation ? "_fresh" : "_fallback")).toBeTrue();
     const prepared = await turn.prepare();
-    expect(prepared.multipart).toBeUndefined();
     expect(prepared.text).toContain("codex_context_navigation_json");
     turn.onSubmitted!();
     mock.timers.tick(250);
@@ -2176,7 +2160,6 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     fallbackTrace = turn.traceId;
-    await turn.onMultipartStageAcknowledged?.(1);
     turn.onGenerationProgress?.();
     started();
     turn.abortSignal!.addEventListener("abort", () => { cancelled = true; }, { once: true });
@@ -2206,7 +2189,6 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
       phase: "fresh_compaction",
       timeoutMs: 40,
       lastActivity: "generation",
-      acknowledgedParts: 1,
       elapsedMs: expect.any(Number),
       idleMs: expect.any(Number),
     });
@@ -2535,8 +2517,8 @@ test.each([false, true])("compaction source progress renews waiting, but silent 
   }
 });
 
-test.each([false, true])("public Full Launcher task commits a retained checkpoint once and preserves its final (Bigger Context=%s)", async experimentalBiggerContext => {
-  const f = retainedTaskFixture(experimentalBiggerContext);
+test("public Full Launcher task commits a retained checkpoint once and preserves its final", async () => {
+  const f = retainedTaskFixture();
   try {
     const source = await f.send(f.body);
     expect(source.status).toBe(200);

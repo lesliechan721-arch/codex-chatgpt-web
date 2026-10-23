@@ -264,6 +264,7 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  delete config.experimentalBiggerContext;
   if (config.toolAuthorityMode !== undefined
     && config.toolAuthorityMode !== "verified-environment"
     && config.toolAuthorityMode !== "delegated") {
@@ -414,6 +415,10 @@ class RuntimeSupervisor {
     if (!config || typeof config !== "object" || Array.isArray(config)) {
       throw new Error("Runtime configuration is not an object");
     }
+    if (config.experimentalBiggerContext !== undefined && typeof config.experimentalBiggerContext !== "boolean") {
+      throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
+    }
+    delete config.experimentalBiggerContext;
     if (this.launcherProfile === "development") {
       if (config.purpose !== "dev-harness") {
         throw new Error("DEV launcher refuses a configuration that is not marked dev-harness");

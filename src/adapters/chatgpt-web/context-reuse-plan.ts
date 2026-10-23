@@ -73,7 +73,7 @@ export function prepareContextReuse(input: {
   let targets = snapshot.targets.slice(input.snapshot.targets.length);
   const makePlan = (inline: boolean): ContextReusePlan => {
     const reused = drafts.filter(unit => unit.reused);
-    return { protocol: CONTEXT_REUSE_PROTOCOL, payload_format: "context-bootstrap-payload-v2", mode: reused.length ? "incremental" : "full",
+    return { protocol: CONTEXT_REUSE_PROTOCOL, payload_format: "context-bootstrap-payload-v3", mode: reused.length ? "incremental" : "full",
       ...(reused.length ? { dependency: { baseline_id: input.baseline!.baseline_id, page_identity: input.baseline!.page_identity,
         predecessor: input.baseline!.predecessor, units: reused.map(({ unit_id, fingerprint }) => ({ unit_id, fingerprint })) } } : {}),
       units: drafts.map(({ text: _text, encoding: _encoding, path: _path, reused: reuse, ...unit }, index) => ({ ...unit,
@@ -121,7 +121,7 @@ export function prepareContextReuse(input: {
     return !previous || deterministicContextJson(previous) !== deterministicContextJson(snapshot) || changedVersion
       ? [{ ...snapshot, replaces: previous?.unit_ids ?? [] }] : [];
   });
-  const makePayload = (inline: boolean, sourceMap: unknown) => ({ format: "context-bootstrap-payload-v2", mode,
+  const makePayload = (inline: boolean, sourceMap: unknown) => ({ format: "context-bootstrap-payload-v3", mode,
     ...(reusedUnits.length ? { baseline: { baseline_id: input.baseline!.baseline_id,
       page_identity: input.baseline!.page_identity, predecessor: input.baseline!.predecessor } } : {}),
     payload, positions: drafts.flatMap(unit => unit.path ? [{ path: unit.path, unit_id: unit.unit_id }] : []),

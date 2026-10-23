@@ -56,7 +56,7 @@ test("predictions stay disabled by default before constructing an adapter", asyn
 });
 
 test("prediction policy uses Sol 6 Medium, keeps history/schema, and never exposes tools or alters saved preferences", async () => {
-  const config = { ...defaultConfig("full"), composerPredictionsEnabled: true, proAvailable: true, experimentalBiggerContext: true,
+  const config = { ...defaultConfig("full"), composerPredictionsEnabled: true, proAvailable: true,
     experimentalSkillAttachments: true, useSavedChats: true };
   const before = structuredClone(config);
   for (const model of ["chatgpt-web/gpt-6-pro", "chatgpt-web/gpt-5.6-sol"]) {
@@ -69,7 +69,7 @@ test("prediction policy uses Sol 6 Medium, keeps history/schema, and never expos
       options: { reasoning: "medium", outputFormat: { schema: base.text.format.schema } } });
     expect(observed!.parsed.context.messages).toHaveLength(2);
     expect(observed!.parsed.context.tools).toBeUndefined();
-    expect(observed!.provider.chatgptWeb).toMatchObject({ localToolsEnabled: false, experimentalBiggerContext: false,
+    expect(observed!.provider.chatgptWeb).toMatchObject({ localToolsEnabled: false,
       experimentalSkillAttachments: false, experimentalFreshConversationPerTurn: true, useSavedChats: false });
     expect(config).toEqual(before);
   }
@@ -110,7 +110,7 @@ test("oversized predictions skip rather than opening a tab, staging, or silently
   for (const proAvailable of [false, true]) {
     const result = await send({ ...base, input: [{ type: "message", role: "user", content: [{
       type: "input_text", text: "preserve this entire history ".repeat(60_000),
-    }] }] }, { ...defaultConfig("full"), composerPredictionsEnabled: true, proAvailable, experimentalBiggerContext: true });
+    }] }] }, { ...defaultConfig("full"), composerPredictionsEnabled: true, proAvailable });
     expect(result.response.status).toBe(400);
     expect(result.constructions).toBe(0);
     expect(result.text).toContain("Next-message prediction skipped");

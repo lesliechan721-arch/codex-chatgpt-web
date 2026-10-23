@@ -75,6 +75,18 @@ function launcherConfig(descriptorPath, overrides = {}) {
   };
 }
 
+test("runtime configuration accepts retired booleans but exposes no retired context setting", () => {
+  const descriptor = path.join(os.tmpdir(), "retired-context-launcher.json");
+  const expected = validateConfig(launcherConfig(descriptor), descriptor);
+  for (const experimentalBiggerContext of [undefined, false, true]) {
+    const loaded = validateConfig(launcherConfig(descriptor, { experimentalBiggerContext }), descriptor);
+    assert.deepEqual(loaded, expected);
+    assert.equal(Object.hasOwn(loaded, "experimentalBiggerContext"), false);
+  }
+  assert.throws(() => validateConfig(launcherConfig(descriptor, { experimentalBiggerContext: "true" }), descriptor),
+    /invalid experimentalBiggerContext/);
+});
+
 test("degraded broker health preserves daemon identity without declaring the runtime ready", async () => {
   const body = {
     service: "codex-chatgpt-web", status: "degraded", mode: "full", version: "5.0.9-14",

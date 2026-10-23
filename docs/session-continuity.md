@@ -78,24 +78,24 @@ results or handles are context; they do not authorize redispatch of old tools. V
 calls use current permissions. One recovery notice and bounded logs describe this limitation;
 the bridge does not promise exactly-once business effects across page loss.
 
-Cold start includes all current effective system, developer, AGENTS, skill, delegation and user
-instructions, request-carried summaries, history, real results, and required images. It is not an
-old resume suffix or just the last user message and a directory. The request need not become a new
-turn or prove equality with the closed page's history; it may contain rolled-back history.
-Eligible tool history remains on demand. Ordinary Full/MCP short-start plans can deliver other
-required text through `context-bootstrap-v1`; it must be fully delivered before business work or
-successful completion. Required text cannot be silently summarized, trimmed, or made optional.
+Cold start delivers current effective system, developer, AGENTS, applicable skill, delegation and
+user instructions, trusted recovery checkpoints and required images. It preserves canonical
+history and real results as legal sources; trusted ordinary assistant text, selected tool fields
+and detailed source maps can be optional. Unknown mixed/control content remains required.
+This is not an old resume suffix or just the last user message and a directory. The request need
+not prove equality with the closed page's history; it may contain rolled-back history.
+Required bodies use inline delivery or `context-bootstrap-v1` and must be fully delivered before
+work or successful completion. Classification is fixed before publication; it cannot silently
+summarize or trim required text.
 
-Complete sources need not fit as one browser prompt. The actual plan must fit its model and account
-window, composer/attachment limits, existing page cost, directory discovery, complete read replies,
-required images, error allowance, and work/summary reserve. HTTP, parsing, source readability,
-32 MiB snapshot storage, and durable-evidence limits remain separate. Navigation uses the remaining
-shared page context, with no separate cumulative token or wire ceiling. Single-response,
-image-resource and processing limits still apply. A small legal inline request remains valid.
-Navigation requires the configured Native5 / Native5 DEV / Zero Risk4 or supported custom connector
-and its current protocol, credentials, readable sources, and delivery checks. Historical
-**Verify runtime** results do not control admission or recovery. Full + Launcher and a past
-successful diagnosis do not establish that the current operation can succeed.
+Complete sources need not fit one browser prompt or one page token pool. The actual startup and
+each complete read response fit their independent limits. HTTP/parsing, readable sources,
+32 MiB snapshot storage, durable evidence, image resources and processing limits remain separate.
+Cumulative page tokens/wire bytes and work/summary reserves cannot block planning or reads.
+A small legal inline request remains valid. Navigation requires the configured Native5 / Native5
+DEV / Zero Risk4 or supported custom connector and current protocol 6, credentials, readable
+sources and delivery checks. Historical **Verify runtime** results do not control admission or
+recovery. Full + Launcher and past diagnosis do not establish current operation success.
 
 All three recovery entrances use this branch: unfinished ordinary work, checkpoint continuation,
 and uncommitted compaction after page loss. A new page can use the request's readable summary
@@ -106,20 +106,27 @@ share one creation and execution with fresh generation-bound credentials. Rechec
 generation after asynchronous inspection and before creation or mutation. A late old receipt
 cannot replace a newer page.
 
-The catalog publishes a finite 1,000,000-token Codex history window and 900,000-token automatic
-compaction threshold for applicable routes and equivalent ordinary aliases. Lower client limits
-still apply. Usage estimates the canonical history, not just a small retained-page increment.
-These values do not enlarge the actual ChatGPT window, per-message transport, source storage,
-single-response limits, or result cache, and do not claim platform billing or complete visual-token counts.
-The client initiates compaction. A server capacity refusal does not replace the normal response
-with a checkpoint or automatically compact the client's history.
+The catalog uses the account/model H/C tiers **200,000/180,000**, **300,000/270,000**,
+**500,000/450,000** and **600,000/540,000** tokens. Full + Launcher has no tier override.
+See the [complete table](context-navigation.md#history-window-and-client-compaction).
+C = 90% of H and lower client settings remain effective. Full/MCP usage estimates canonical
+history, including Luna/Think, rather than startup size or cumulative page deliveries. Full/MCP
+Luna uses independent client compaction at 180,000; Browser-only Luna retains rolling checkpoints
+and projected usage. These reading/history policies do not extend the continuity route eligibility
+listed above. H and C are not server cumulative reading or history rejection lines.
+
+Single-message, single-response, image, attachment, snapshot, processing-time and source-lifetime
+limits remain independent. Page delivery estimates are diagnostic only; even missing old cost
+records cannot alone force replacement. Identity, owner, source, required delivery, permissions,
+settlement and ACK checks remain. Compaction keeps independent read-only sources and original
+submission checks without a total token allowance derived from page history or summary reserve.
 
 Fresh Conversation Per Turn selects a new page for each logical send that needs new browser input.
-It does not create a page for tool round trips, HTTP replay, or task updates, and cannot bypass
-conflict checks on a confirmed live page. Bigger Context keeps existing model/account/send capabilities
-and single-message limits; supported fixed-part, final-commit, ACK and Send-retry contracts still
-apply. Zero Risk's existing Bigger Context prohibition remains. Mode unification adds no new manual
-multipart permission.
+It does not create a page for tool round trips, HTTP replay or task updates, and cannot bypass
+conflict checks on a confirmed live page. Bigger Context and new multipart stage/commit sends are
+removed. Browser-only gains no navigation capability and must fit legal single-message delivery
+or report the specific capacity/capability error. Historical staged bodies remain legal data;
+they cannot replay control instructions or authorize a new Send.
 
 Zero Risk still requires user sending, Sent confirmation, and required-attachment confirmation.
 An already-ended response uses the existing explicit manual checkpoint handoff; recovery never
@@ -159,8 +166,8 @@ or trigger automatic Send.
 Compaction sources remain optional summary evidence under their independent credential and
 submission protections. Compaction does not acquire an all-history coverage gate. A subsequent
 ordinary task delivers its current required instructions under its own new plan. Browser-only,
-upstream API forwarding, legacy inline delivery and existing multipart semantics retain their
-contracts; each actual composer message still obeys the effective code-point limit. See
+upstream API forwarding and legal inline delivery retain their separate contracts. New multipart
+stage/commit plans are removed; each actual composer message obeys the effective code-point limit. See
 [short-start delivery and budgets](context-navigation.md#short-startup-and-required-text).
 
 ## Current work and committed relationships

@@ -1,13 +1,21 @@
 # Context navigation
 
-Full/MCP tasks can provide a source directory instead of repeating large source text in
-each browser input. Ordinary Automatic and Zero Risk tasks can use `context-bootstrap-v1`
-when the complete input exceeds the composer text budget. Images use MCP first and use the existing
-attachment path only when necessary.
-This applies to Automatic and Zero Risk. Browser-only and upstream API forwarding keep their
-existing paths. Local API Key authentication does not exclude a request that uses Web Full/MCP.
-The feature's complete release validation is still pending; the
-[validation record](release-validation.md#context-navigation-validation) defines the tested scope.
+Automatic and Zero Risk Full/MCP tasks compare inline and on-demand candidates by default,
+including GPT-6 Instant and Luna/Think. Short inputs can stay inline when reading gives no complete
+cost benefit. This does not require a setting. Browser-only adds no MCP tools; upstream API
+forwarding is unchanged. Images prefer MCP and use the existing attachment fallback when needed.
+Local API Key authentication does not exclude Web Full/MCP requests.
+
+Bigger Context, its switches and new two-/six-part stage/commit plans are removed. Legacy saved
+true, false and absent settings use the same default policy; the next normal save removes the old
+field. Legacy CLI flags are accepted only for migration and have no effect. Old staged bodies
+remain legal source data, never instructions to replay sends. Published scopes retain their fixed
+plan until completion or invalidation; an upgrade revokes old process credentials.
+
+The new contract uses context protocol **6**, `context-bootstrap-payload-v3`, manifest **3**, and
+`context-text-batch-v1`. Driver, Broker, Helper and startup must agree. Connector names stay unchanged.
+This change has no complete release acceptance record yet; see
+[validation](release-validation.md#default-selective-reading-validation).
 
 ## Connector setup
 
@@ -79,27 +87,34 @@ roles, order, original representations, and known completeness. Tool calls and r
 only by a unique call ID. A recorded result is evidence that a result exists, not evidence of
 business success. Labels, snippets, digests, and references are not complete sources.
 
-The unified task mechanism selects a legal full or retained-suffix input first. Within that
-candidate, the legacy navigation path replaces only eligible tool-history arguments and results
-with references. A field
-must offer at least 1 KiB of potential encoded-byte savings in its selected presentation. The planner
-then compares complete inline and externalized candidates in their best available presentation.
-Each candidate must fit the context window, browser message limits, and required navigation limits.
-For legacy candidates within the composer text budget, when a valid inline candidate is available, externalization must reduce the total required token estimate, including protocol instructions,
-references, directory discovery, required media, and error reserves. If it has no benefit or cannot
-fit, the planner keeps that inline candidate. If inline cannot fit, a valid externalized candidate
-can be used. Required history navigation remains present in
-both candidates. System, developer, user, skill, delegation,
-summary, and assistant prose retain their existing delivery contract. The canonical request and
-the real tool results used for settlement remain intact. This feature generates no intermediate
-summary and does not silently trim an oversized request.
+The task mechanism first selects a legal full or retained-suffix candidate and fixes its real
+source snapshot. It then compares complete inline and on-demand representations, even when the
+input fits the composer. Eligible tool fields retain their existing mapping and savings checks.
+Canonical requests and real settlement results remain intact. There is no generated historical
+summary, silent truncation, or automatic replay of a historical tool.
 
-A new navigation entry is also required when the legal snapshot contains readable tool history or
-fixed images that the selected retained input omits. The current credential,
-`context_id`, and first list call then appear in the actual input, even if that entry adds bytes.
-The directory can expose those legal historical sources without sending the full history again.
-It cannot recover sources that the current request and existing authorized restoration do not hold.
-Small inputs with no navigation need keep the original path.
+Current requests and accepted updates are required in full, in event order, including duplicates.
+Effective system/developer/AGENTS rules, current environment, output format, delegation, applicable
+skills and the trusted checkpoint needed for recovery are required. Exact same-page rule reuse
+can satisfy delivery under its existing identity checks. Historical user text stays required unless
+a legal candidate boundary or an accepted, bound checkpoint covers it.
+
+Only trusted ordinary assistant text and thinking summaries become optional by default. Unknown
+mixed content, checkpoints and current agent messages remain required. Skills and user images
+become optional only with trusted evidence that their scope ended. File names, body markers,
+equal text and a claim of completion cannot establish that evidence. Existing legal candidate and
+checkpoint boundaries are used; there is no general expired-skill classifier. Missing proof keeps
+the body required, with a diagnostic reason. Required images retain actual delivery evidence.
+
+When the request depends on an old answer, plan or result, first locate it by source order,
+directory or search, then read the exact body before acting. For “the second option in your last
+answer”, start with the nearest relevant sources. An unread source is not an absent source;
+rerunning its tool is not a substitute for historical evidence. The server proves classification
+and delivery, not model understanding or selection of every relevant optional source.
+
+The entry provides legal source range, category counts, credentials and directory access without
+copying every optional body or its full metadata. Historical order remains queryable. Sources
+outside the legal snapshot cannot be recovered by inventing references.
 
 ### Browser context presentation
 
@@ -123,14 +138,14 @@ local encoder/decoder test alone does not enable them. MCP strings do not have t
 
 When both complete candidates fit, auto selection uses the mixed format only with strictly fewer
 estimated input tokens and no increase in JSON-encoded transport bytes. Protocol instructions,
-dynamic fences, navigation, attachments, multipart stages, the final commit, and ACKs count in the
-comparison. No-benefit inputs keep JSON. Preparation verifies exact decoding; retries keep the
+dynamic fences, navigation, attachments and applicable ACKs count in the comparison. No-benefit inputs keep JSON. Preparation verifies exact decoding; retries keep the
 selected format, boundaries, bytes, hash, and plan. Unknown Send or post-send corruption never
 triggers an automatic format switch or resend.
 
-Two- and six-part inputs partition complete records in one format. A raw field never spans parts.
-Manifests and ACKs refer to the actual fixed payload bytes. The coverage journal records the selected
-`contextFormat` with the body digest and costs; older records without it mean `legacy-json`.
+New plans use one browser startup message followed by legal read batches. Browser-only must fit
+its legal single-message representation or report a specific capacity/capability error. It does
+not gain tools or multipart sending. Historical multipart bytes remain source data. The coverage
+journal records the selected `contextFormat` with digest and costs; missing format means `legacy-json`.
 
 ## Same-page rule reuse
 
@@ -138,15 +153,29 @@ Manifests and ACKs refer to the actual fixed payload bytes. The coverage journal
 ordinary continuation on the same physical page can reuse exact rule and protocol units from
 the preceding successfully completed task. Each new user event is delivered in full, including
 identical consecutive requests. Current environment, output schema and verbosity remain current
-task data. Reuse does not select a different history candidate or remove retained page cost.
+task data. Reuse does not select a different history candidate. Prior delivery remains in diagnostic totals.
 
-The new `context-bootstrap-payload-v2` explicitly identifies `full` or `incremental` delivery.
-Its structure and separate position table reconstruct the same selected candidate value tree.
-References contain unit identity, fingerprint, source role and scope, and a current source
-reference for exact rereading. A user value named like a reference is still user data. Reused
-bodies are absent from the required payload and startup metadata. The complete legal historical
-directory remains available on demand. A short complete increment is inline; a long increment
-uses required batch-v1 text responses. An inline increment needs no artificial protocol or payload read.
+`context-bootstrap-payload-v3` identifies full or incremental delivery. It preserves current input
+structure, original required values and verified reuse positions, including null, false, empty
+strings, unknown fields and order. Its external position table binds every substituted field to
+its original path, source identity, role/order, current target/read reference, encoding and
+integrity. User fields that happen to have the same names remain user data. Exact original values
+remain recoverable from current real sources; optional bodies need not be restored before work.
+
+The payload names the position array `external_positions`. The detailed `source_map` is an
+independent optional record in the fixed snapshot. The required
+payload carries its `context_id`, `target_id`, `read_ref`, `encoding`, `content_digest` and
+`utf8_bytes` binding, without copying complete
+source/target arrays. Required reconstruction and the fixed read chain do not depend on reading
+that map. A failed map read cannot be called verified. The map has no self-reference and does not
+copy its body into required sources. It counts toward snapshot storage. Position metadata can still
+grow with source count; startup cost is not independent of history size.
+
+Reused units retain identity, fingerprint, role/scope and a current exact reread reference.
+Reused and optional bodies are absent from required startup content. A short complete increment
+can stay inline; a longer one uses required batch-v1 returns. Inline delivery needs no empty
+protocol or payload read. Unknown field mappings retain the original value or fail with a real
+source/capacity error; they cannot silently drop data.
 
 Source identity is checked against the real parsed request and its verified candidate mapping.
 The top-level Responses `instructions` field is a current rule field with replacement semantics.
@@ -169,10 +198,11 @@ New pages, cold recovery, restart and known compaction require full delivery and
 A proved unsent preparation failure can preserve the last healthy baseline. Late callbacks cannot
 commit to a successor. Baselines are limited to 128 units and 64 KiB of metadata per page; capacity
 loss causes complete redelivery. Exact rereads use current source data and credentials and count
-against navigation and retained-page costs. Neither a baseline nor a receipt proves model memory.
-The page budget uses the configured model and account limits. An enabled Bigger Context setting
-also applies when a short increment uses one message; the ordinary per-message limits remain
-unchanged. A small page window can still require a fresh page during a long sequence of turns.
+toward cumulative delivery estimates. Neither a baseline nor a receipt proves model memory.
+Cumulative page estimates cannot force a fresh page or block a read, Send or completion. Missing
+old cost records alone cannot force replacement; page identity, owner and source evidence still matter.
+
+
 Content-free diagnostics record the lifecycle reason before dropping a baseline, the selected
 candidate, serialized prompt size and budget components. Transport observations separate the
 first startup manifest, later overview returns and directory pages. They count actual successful
@@ -190,8 +220,8 @@ Sent confirmation and separate image confirmation, with no new reuse confirmatio
 
 ## Short startup and required text
 
-The complete short-start plan captures the selected task and generated execution protocol as required
-sources. Reuse-enabled plans apply the rules above. Both preserve the selected value tree, source identity, roles, order, empty values, unknown
+The short-start plan fixes the required source set and generated execution protocol before publication.
+Optional assistant bodies and detailed source maps are outside that set. Reuse-enabled plans apply the rules above. Both preserve the selected value tree, source identity, roles, order, empty values, unknown
 structure, and known completeness. It does not infer authority from body markers such as
 `role:developer` or `AGENTS.md`. The guarantee starts after existing normalization, attachment
 projection, and retired-handle cleanup. It does not restore data that those steps already removed.
@@ -235,7 +265,7 @@ UTF-8 range union counts; every required source must cover `[0, utf8_bytes)`. Em
 an actual empty-body receipt. Duplicate or overlapping pages add only new coverage, but each return
 consumes budget. Failed, malformed, cross-source, expired, revoked or cross-scope receipts add no
 coverage. Preparing a reply, a search hit, a digest or a claim of reading does not count.
-`images_ready` stays independent; `context_ready` requires both. Text returns do not extend image
+`images_ready` and `reuse_ready` stay independent; `context_ready` requires all applicable gates. Text returns do not extend image
 deadlines. Readiness proves delivery to the supported transport, not model understanding.
 
 New business calls, business inventory and successful completion are checked atomically against
@@ -254,15 +284,13 @@ The provider's `chatgptWeb` options receive only the effective valid `maxCompose
 The complete final text is measured after rendering and escaping; UTF-16 length is recorded
 separately. The default is an engineering limit, not a measured platform attachment threshold.
 
-Plans reserve complete canonical text batches, initial startup and final overview, image recovery
-controls, wrappers, cursors, required images, corrective replies, retained context and working
-capacity, plus one maximum required-return retry allowance. They do not reserve a mandatory
-required-directory traversal. On-demand reads cannot
-spend the protected remaining required-source allowance. Repeats count again. A plan that exceeds
-the composer limit cannot win because it uses fewer tokens; a valid short plan can cost more total
-tokens. If no complete plan fits, preparation fails before Send with the limiting budget or missing
-capability. It does not summarize, truncate, switch model, attach text or automatically resend.
-Each actual composer message in existing multipart delivery also has this text limit.
+Each fixed batch must fit its complete single-response byte/token limits; the startup must fit
+the independent single-message limits. Required sources must exist and fit snapshot storage.
+The complete required chain need not fit a page token pool. Optional reads have no minimum coverage
+rate and cannot replace required delivery. Repeats and failed retransmissions remain diagnostic
+costs. No required sources means no artificial empty read or mandatory directory traversal.
+If a legal plan cannot fit a single-message or resource limit, preparation reports that limit
+before Send. It cannot truncate requests, weaken rules, change model or automatically resend.
 
 The short entry gives the first call, batch body selection, trust boundary and pre-work gate. Detailed
 role, execution, wait, error, output and applicable update/image/attachment/continuity rules are in
@@ -274,15 +302,15 @@ step; uncertain writes must first be checked. Permission denials retain the orig
 Strict output values and the result/ACK/final-output order remain unchanged. Rich cards also need
 ordinary Markdown results that Codex can receive; their DOM markup is not final-answer content
 unless requested. Ordinary tasks recognize trusted compaction handoff, whose full control rules
-are supplied only on that path. Multipart stage/commit/ACK rules remain inline while stage sources
-are unavailable; they bind fixed bytes and do not execute task work before final commit. A resume
+are supplied only on that path. Ordinary tool ACK, task-update ACK, compaction submission and Zero Risk confirmation retain their
+separate contracts. A resume
 entry states the remaining startup and ACK conditions rather than claiming the context is complete.
 
 Local checks require the current bootstrap and batch-v1 contracts, not historical diagnostic success.
 They cannot prove adoption of the new schema in ChatGPT's remote cache. Refresh or reconnect the
-current compatible connector when needed. A known pre-send incompatibility allows only an
-existing complete candidate that fits every budget and does not depend on the incompatible
-context interface; post-send incompatibility stops the request without a new Send.
+current compatible connector when needed. A known pre-send incompatibility allows only a
+complete inline candidate that preserves the new metering contract and single-message limits
+and does not depend on the incompatible context interface; post-send incompatibility stops the request without a new Send.
 The real editor, remote schema and model tail-page acceptance remain pending; see
 [short-start validation](release-validation.md#short-start-context-validation).
 
@@ -330,20 +358,20 @@ images/text, multiple images and image cursors are rejected as a whole. A search
 
 Complete-result sizing includes every body, both metadata copies, remaining reads, cursors and
 fixed successor. The same snapshot, scope, budget, ordered arguments and cursors produce the same
-bodies/ranges and successor. Dynamic compaction budget hints cannot change them. Insufficient
-cumulative balance produces an error instead of silently shrinking the page. Images, list, search
+bodies/ranges and successor. Dynamic compaction hints and cumulative delivery estimates cannot
+shrink a page or reject a read. Each fixed response still fits its single-return limit. Images, list, search
 and errors keep their original forms. New scopes reject `context-text-read-v2`; no old-schema adapter
 or dual text-output selection is provided.
 
 Each batch has one pending transaction and one receipt. Any missing/corrupt item, mismatched
 metadata or invalid receipt prevents coverage for the entire batch. Only successful full transport
 and matching fixed source bytes atomically commit all returned ranges. Unreturned suffix items do
-not count. Generation costs are charged once for the complete response and remain charged after
-failure, cancellation or replay. A canonical unit releases its full reservation only when every
-planned range is covered; partial or overlapping coverage releases no proportional credit.
-One finite maximum-return recovery allowance protects failed delivery and identical canonical
-replay through the first business/success admission, including after final overview. It is not an
-unlimited retry guarantee; exhausted recovery does not waive coverage or spend workspace reserves.
+not count. Generation costs, failed transport and repeated returns remain diagnostic observations.
+Partial coverage cannot satisfy complete required delivery. Retries remain bounded by the original
+error-recovery, processing-time and lifecycle rules; exhaustion cannot waive readiness. There is
+no cumulative token/wire recovery pool or workspace reserve that can stop otherwise legal reads.
+
+
 ## Images and confirmation
 
 Each image target uses fixed PNG, JPEG, GIF, or WebP bytes from the request or an existing authorized
@@ -400,8 +428,8 @@ Historical instructions are summary evidence, not new work to execute.
 
 The control entry must actually be delivered before reads open. Current-page owner, generation,
 revision, ACK, Send, real-result settlement, and checkpoint checks still apply. A healthy retained
-source does not need to fit all source bytes into a new browser input or all reads into the cumulative
-allowance. Fresh-page recovery checks complete legal sources independently from the actual selected plan;
+source does not need to fit all source bytes into a new browser input. Reads have no cumulative
+token or wire allowance. Fresh-page recovery checks complete legal sources independently from the actual selected plan;
 unsent full-source compilation is not a browser-window admission gate. Ordinary recovery, committed
 checkpoint continuation, and uncommitted compaction all use this separation. The new plan includes
 current effective instructions and rechecks required images from zero page coverage. An ended
@@ -410,9 +438,52 @@ automatic prompt.
 
 Sources must remain real and individually readable. Missing source bytes fail before control
 delivery. A permanent read failure, cancellation, expiry, or revoked source prevents successful
-checkpoint submission. Correctable argument, cursor, and remaining-budget errors allow the model
+checkpoint submission. Correctable argument, cursor, and single-response-limit errors allow the model
 to stop reading and submit a supported summary. In-flight reads must settle before submission.
 Neither source failure nor missing evidence permits rerunning business tools to reconstruct history.
+
+## History window and client compaction
+
+H is the catalog history window; C is its 90% client automatic-compaction threshold. K means 1,000
+tokens. These are history policies, not measurements of ChatGPT capacity. Available routes use:
+
+| Account/model or explicit mode | H / C tokens |
+| --- | --- |
+| Luna / Luna Think | 200,000 / 180,000 |
+| Plus GPT-5.6 Instant (low) | 300,000 / 270,000 |
+| Plus GPT-6 Instant (low) | 200,000 / 180,000 |
+| Plus GPT-5.6 Sol Medium/High/available Extra High | 500,000 / 450,000 |
+| Plus GPT-6 Sol Medium/High/available Extra High | 300,000 / 270,000 |
+| Pro account GPT-5.6 Instant or Sol Medium/High/Extra High | 600,000 / 540,000 |
+| Pro account GPT-6 Instant (low) | 300,000 / 270,000 |
+| Pro account GPT-6 Sol Medium/High/Extra High | 500,000 / 450,000 |
+| Pro account GPT-5.6 Pro or GPT-6 Pro model (max) | 600,000 / 540,000 |
+| Zero Risk explicit ordinary mode | 300,000 / 270,000 |
+| Zero Risk explicit Pro mode | 600,000 / 540,000 |
+
+The migration basis is the old effective account/model tier: below 100k maps to 200k/180k,
+100k–below 200k to 300k/270k, 200k–below 300k to 500k/450k, and 300k or above to 600k/540k.
+Match from the highest tier down. Do not multiply these results again. This basis excludes the
+former unified Launcher override and Luna's former non-Bigger catalog value. Zero Risk uses its
+explicit ordinary/Pro tier, not a guessed browser model.
+
+Capability validation comes first; unavailable combinations still fail. Aliases resolve to the
+same route. Unknown combinations do not inherit the largest tier. Full + Launcher does not override
+the account/model tier. Runtime, generated catalog, setup and refresh share this policy. Catalog
+`context_window`, `max_context_window`, `auto_compact_token_limit` and the 90% ratio agree.
+Lower client settings remain effective; native models and global settings are unchanged.
+
+Full/MCP, including Luna/Think, estimates canonical history. Startup size or cumulative page delivery
+is not history usage. Luna/Think uses client compaction at 180,000 and independent read-only sources,
+without per-turn rolling projection. Trusted old checkpoints retain only their proved coverage.
+Browser-only uses the same history tiers without MCP or multipart delivery. Browser-only Luna
+retains rolling checkpoints and projected usage, so canonical totals do not directly trigger its
+compaction. Other Browser-only compaction follows its existing capability.
+
+H is not a server history rejection line, and C does not block reads or Send. A tool result can
+cross C before the client compacts. No silent history trimming, fabricated compaction or automatic
+replay is allowed. Actual platform refusal uses its existing finite recovery and unknown-Send
+rules. Zero Risk retains manual Send, configured Sent and required-image confirmation.
 
 ## Effective local budgets
 
@@ -422,9 +493,11 @@ Set `CODEX_CONTEXT_BUDGET_PROFILE=expanded` or `conservative` in the runtime env
 preparing a new plan. The selected profile and effective limits are frozen in that plan and scope.
 Both use arrays and batch-v1; neither can change a published plan. These are runtime ceilings,
 not measured ChatGPT limits or a promise of more image capacity.
-The selected model's existing context and composer budgets can impose smaller effective allowances.
-Context protocol 5 identifies the shared-capacity contract. The driver, Launcher runtime and helper
-must support that version; an older owner cannot authorize a new navigation plan.
+Single-message transport and composer limits can impose smaller independent allowances. They are
+not derived from the history window. Protocol 6 declares selective payload v3 and diagnostic-only
+cumulative page accounting. Version 5 shared-page navigation is not a valid fallback. Before Send,
+use legal complete inline delivery or report a capability/single-message error; after Send, keep
+the plan fixed and do not resend.
 
 | Return | Maximum items | Complete response bytes | Estimated text tokens |
 | --- | --- | --- | --- |
@@ -436,7 +509,7 @@ must support that version; an older owner cannot authorize a new navigation plan
 | Shared limit | Effective value |
 | --- | --- |
 | Snapshot source storage | 32 MiB |
-| Cumulative navigation tokens | Use the remaining shared page context; no separate reading ceiling |
+| Cumulative navigation tokens / wire bytes | No cumulative allowance; diagnostic accounting only |
 | Image returns / cumulative raw image bytes | 64 / 32 MiB |
 | Search query / complete serialized MCP arguments including credential | 512 UTF-8 bytes / 8 KiB |
 | Navigation entry JSON / label / search snippet | 8 KiB / 120 characters / 160 characters |
@@ -448,23 +521,27 @@ The fallback attachment planner retains limits of 10 attachment slots, 20,000,00
 and 50,000,000 bytes total, including reserved skill attachments. These are local checks, not a
 measurement of the account's current composer allowance. Only actual attachments consume slots.
 
-Ordinary planning includes the selected prompt, retained-page estimate, required images, return
-wrappers, an 8,192-token platform reserve, and a 4,096-token work reserve. Navigation reserves the
-fixed required batch chain, initial startup, image-progress recovery,
-final overview, the protected error reserve and one maximum required-return retry. Optional
-list/search/read cannot spend remaining required or workspace reserves. Each image uses a conservative
-visual reserve of 4,096 tokens,
-or 8,192 for original detail. These reserves are estimates, not observed vision usage or billing.
-The work reserve protects current execution capacity. It is not added to the retained-page ledger
-on every send; completed answer text is accounted separately. Navigation returns still contribute
-to the retained-page estimate, with prepaid required returns credited once. There is no separate
-cumulative navigation token or wire ceiling. Wire bytes remain measured for diagnostics and
-per-response transport checks.
-Compaction deducts its instruction and a 4,096-token entry reserve from available page capacity,
-and reserves 8,192 of the remaining shared allowance for summary and
-submission. Unread sources need not all fit within the remaining reading allowance.
-The client owns automatic compaction admission. A normal server response does not substitute a
-checkpoint or start an unsolicited compaction when a local capacity check fails.
+The page ledger reports **cumulative delivery estimates**, not current model memory or remaining
+capacity. Unsent optional text is not charged. Prior delivered text is not subtracted when it later
+becomes optional. Prepaid required returns are credited once; rereads and retransmissions count
+again. These numbers cannot gate planning, Send, reads, completion, compaction registration or
+submission, or page selection. There is no replacement 96k, 540k or 600k total reading ceiling,
+and no cumulative wire allowance. Any compatibility balance fields have no cumulative quota meaning.
+
+The 8,192-token platform reserve and image estimates retain their single-input/usage roles.
+A 4,096-token work reserve, required returns, error/retry costs and the 8,192-token summary reserve
+can describe cost or the original operation constraint; they do not create a remaining-page
+reading pool. Each image uses a conservative visual estimate of 4,096 tokens, or 8,192 for original
+detail. These estimates are not observed vision usage or billing. History H/C changes cannot change
+a single-message or single-return limit. Luna's ordinary browser total input remains 28,000 tokens
+with its original deductions; existing Pro single-text limits such as 103,000/104,000 remain separate.
+
+Compaction uses its independent snapshot, read-only credential and original submission path.
+It may read the complete legal source range even when ordinary startup omitted some bodies, with
+no minimum reading rate. Cumulative page estimates and summary reserves cannot reject registration,
+reads or submission. Source failure, ownership, in-flight read settlement, original submission
+permissions and control deadlines still apply. The client initiates automatic compaction; a normal
+server response does not invent a checkpoint or silently compact canonical history.
 
 Wire measurement includes the complete result's content, structured content, JSON escaping,
 cursors, base64, and framing reserve. Text batches are charged once, not once per item. The
@@ -477,13 +554,11 @@ reserve, including the directory-preflight cursor bound. A diagnostic estimate o
 text and structured metadata is separate and cannot reduce this hard allowance. Reports distinguish
 visible prompt bytes, editor length, JSON-encoded bytes, conservative tokens, and actual model input
 counts; actual model counts remain unknown unless observed.
-Successful pages cannot consume the protected corrective-reply pool. Errors cannot borrow required
-image or compaction summary reserves. After the third corrective reply, or when no budgeted reply
-can be returned, the scope stops authorizing source queries. Further queries receive a JSON-RPC
-rejection. This does not close
-the shared MCP transport, ordinary business authority, or the original compaction submission path.
-Existing readiness and permanent-failure checks still apply; losing read permission cannot waive
-undelivered required text or images, or authorize a checkpoint after permanent source failure.
+Correctable errors remain limited to three bounded replies. After exhaustion, source queries stop
+under the original recovery rules and further queries receive JSON-RPC rejection. This does not
+close the shared MCP transport or grant ordinary work or compaction submission authority.
+Read failure cannot waive required delivery or a permanent source failure. Error/retry reserves
+are not a cumulative reading quota.
 
 Required MCP images have a 120-second readiness deadline and a 45-second no-progress deadline,
 starting when the selected entry is delivered and the original start/Sent conditions allow reading.

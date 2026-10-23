@@ -61,6 +61,8 @@ test("production and DEV setup reject the removed connector-name option before c
     expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
     const help = await runCli(["--help"], env);
     expect(help.stdout).not.toContain("--app-name");
+    expect(help.stdout).not.toContain("--bigger-context");
+    expect(help.stdout).not.toContain("--standard-context");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

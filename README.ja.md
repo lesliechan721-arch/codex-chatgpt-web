@@ -85,21 +85,15 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 
 > **Limits**
 >
-> **GPT-5.6 Sol Pro** と **GPT-6 Astra** の現在の ChatGPT メッセージ上限については、
-> [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) を参照してください。
-> Token コンテキスト上限は、アカウント種別と選択した effort によって異なります。Plus の
-> Medium/High は実測 90,000-token ウィンドウを使用します。GPT-5.6 では実験的な **3× context**
-> を有効にすると最大 270,000 tokens まで拡張され、ネイティブ Codex compaction に対応します。
->
-> GPT-6 Sol の Bigger Context は Medium、High、および利用可能な Extra High に対応します。
-> Plus は **120,000 tokens** のウィンドウと **110,000 tokens** の圧縮閾値、
-> Pro は **240,000 tokens** のウィンドウと **220,000 tokens** の圧縮閾値を使用します。
-> GPT-6 Instant は標準容量を使用します。
-> GPT-5.6 と GPT-6 Pro の既存の Bigger Context 上限は変わりません。
-
-> Luna/Think は試験的な分割 Bigger Context を利用できます。Free の長いチャットでは古い詳細が
-> 失われる場合があります。無効時は Luna のローリング checkpoint を維持します。対応する Full Native + Launcher
-> 経路は共通の履歴予算を使います。ブラウザー送信には既存の伝送制限が適用されます。
+> ChatGPT のメッセージ上限は [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) を参照してください。
+> アカウントとモデルにより、履歴ウィンドウとクライアント圧縮閾値は **200,000 / 180,000**、
+> **300,000 / 270,000**、**500,000 / 450,000**、または **600,000 / 540,000** tokens になります。
+> これは履歴管理の設定であり、ブラウザー容量の実測値ではありません。Full/MCP は既定で必要な本文を
+> オンデマンドで読み取ります。短い入力はインラインのままにできます。Bigger Context と分割送信は廃止されました。
+> 単一メッセージ、読み取り応答、画像、添付、保存容量、処理時間の制限は引き続き適用されます。
+> Full/MCP Luna/Think は canonical 履歴を計量し、180,000 tokens で独立した圧縮を利用できます。
+> Browser-only Luna はローリング checkpoint と投影 usage を維持します。
+> [アカウントとモデルの表](docs/context-navigation.md#history-window-and-client-compaction) を参照してください。
 
 1. ランチャーの必須セットアップを完了します。
 2. ランチャーで **MCP** を開きます。ChatGPT コネクタを使用するものと同じ OpenAI アカウントで
@@ -129,10 +123,10 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 一緒に更新してください。新しい論理 Native 呼び出しには新しい正整数 ID を使い、再試行と待機では
 再接続後も同じ ID を使います。pending の受領通知はタスク完了ではなく、元の操作を再実行してはいけません。
 
-[コンテキストナビゲーション](docs/context-navigation.md) は通常のタスク本文を保持し、選択した
-ツール履歴を必要に応じて読み取れるようにします。画像は MCP を優先し、必須の添付への代替経路だけが
+[コンテキストナビゲーション](docs/context-navigation.md) は現在の要求とルールを保持し、通常の助手履歴、選択した
+ツール履歴と詳細なソース対応表を必要に応じて読み取れるようにします。画像は MCP を優先し、必須の添付への代替経路だけが
 Zero Risk の追加確認を必要とします。圧縮では独立した読み取り専用のソース一覧を使えますが、
-全ソースを読む必要はありません。既存のコンテキスト上限は変わりません。完全なリリース検証は
+全ソースを読む必要はありません。ページへの累積配信推定値は送信、読み取り、完了、ページ交換を制限しません。完全なリリース検証は
 未完了です。High モードでの限定的な複数画像の成功は、容量増加、正確な数字認識、全モデルでの
 安定性を証明しません。[検証範囲](docs/release-validation.md#context-navigation-validation)を参照してください。
 
@@ -218,7 +212,7 @@ bun run app:package
 
 `dev:launcher` は `~/.codex-chatgpt-web-dev` 内の独立したプロファイルとアカウントを使います。`dev:chat` は実際のブラウザーとコンパクション処理を使い、ツールの結果は明示的にシミュレーションします。通常の Codex のルートは変更しません。設定とコマンドは [DEV chat ハーネス](docs/dev-chat.md)を参照してください。
 
-[セッション継続性](docs/session-continuity.md)は、対応する Full Native + Launcher 経路で通常の `chatgpt-web/` モデル名と共通のタスク処理を使います。正常で互換性のあるページを再利用し、プロジェクトの実行権限の隔離、実際のツール結果、合法なソースと送信計画を確認した後、未完了作業、checkpoint 後の継続、未確定の圧縮を新しいページで復旧できます。不明な Send、結果、停止の記録は引き続き有効です。Fresh Conversation Per Turn はページ選択だけを変更します。Bigger Context は既存の対応能力と Zero Risk の制限を維持します。1,000,000 / 900,000-token の Codex 履歴予算はブラウザーの容量を増やしません。物理ページは最大五つで、終了処理の試行回数も有限です。旧プレフィックスの設定は対応する通常名に変更してください。移行は work、stop、checkpoint、retry の記録を維持します。実環境の検証状況は文書に記載します。
+[セッション継続性](docs/session-continuity.md)は、対応する Full Native + Launcher 経路で通常の `chatgpt-web/` モデル名と共通のタスク処理を使います。正常で互換性のあるページを再利用し、プロジェクトの実行権限の隔離、実際のツール結果、合法なソースと送信計画を確認した後、未完了作業、checkpoint 後の継続、未確定の圧縮を新しいページで復旧できます。不明な Send、結果、停止の記録は引き続き有効です。Fresh Conversation Per Turn はページ選択だけを変更します。Zero Risk の手動送信制限は維持されます。Codex の履歴ウィンドウは上記の四段階を使用し、単一メッセージの伝送制限は拡大しません。物理ページは最大五つで、終了処理の試行回数も有限です。旧プレフィックスの設定は対応する通常名に変更してください。移行は work、stop、checkpoint、retry の記録を維持します。実環境の検証状況は文書に記載します。
 
 </details>
 

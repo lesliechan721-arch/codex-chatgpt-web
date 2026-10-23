@@ -189,7 +189,7 @@ test("bootstrap selects image, skill and recovery rules from the actual prepared
   expect(manual).toContain("After successful completion, stop tool calls");
 });
 
-test("prepared source positions follow superseded-contract removal and do not invent a user request", () => {
+test("prepared source positions preserve unrevoked rules and do not invent a user request", () => {
   const input = request();
   input.context.messages = [
     { role: "developer", content: "<model_switch>old</model_switch>", timestamp: 1 },
@@ -198,9 +198,10 @@ test("prepared source positions follow superseded-contract removal and do not in
     { role: "developer", content: "<model_switch>current</model_switch>", timestamp: 4 },
   ];
   const compiled = compileChatGptWebPrompt(input, capabilities, token, { bootstrapPreparation: true });
-  expect(compiled.bootstrapContent!.messageSourceIndices).toEqual([2, 3]);
-  expect(compiled.bootstrapContent!.payload.messages.map(message => message.role)).toEqual(["developer", "developer"]);
+  expect(compiled.bootstrapContent!.messageSourceIndices).toEqual([0, 1, 2, 3]);
+  expect(compiled.bootstrapContent!.payload.messages.map(message => message.role)).toEqual(["developer", "developer", "developer", "developer"]);
   expect(compiled.bootstrapContent!.payload.messages.map(message => message.content)).toEqual([
+    "<model_switch>old</model_switch>", "<skills_instructions>old catalog</skills_instructions>",
     "keep project rules", "<model_switch>current</model_switch>",
   ]);
   const short = shortContextBootstrapPrompt({ appName: "Codex Work", plan, credential: { turn_token: token } });
@@ -215,9 +216,9 @@ test.each(["automatic", "zero-risk"] as const)("%s fixed startup and reuse entri
     credential, requiredMcpImages: 1, taskUpdateInitialState: {
       acceptedRevision: Number.MAX_SAFE_INTEGER, acknowledgedRevision: Number.MAX_SAFE_INTEGER } };
   for (const entry of [shortContextBootstrapPrompt(input), shortContextReuseBootstrapPrompt({ ...input,
-    reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v2", mode: "incremental" } }),
+    reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v3", mode: "incremental" } }),
     shortContextReuseBootstrapPrompt({ ...input, inlinePayload: {},
-      reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v2", mode: "full" } })]) {
+      reuse: { protocol: "context-reuse-v1", payload_format: "context-bootstrap-payload-v3", mode: "full" } })]) {
     expect(entry.fixedCodePoints).toBeLessThanOrEqual(3_000);
     expect(entry.text).toContain("required_step.next_required_read");
     expect(entry.text).toContain("overview once");

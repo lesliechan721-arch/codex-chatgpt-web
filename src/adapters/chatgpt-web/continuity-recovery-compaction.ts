@@ -28,7 +28,7 @@ import { chatGptCurrentInstructionIndex, extractChatGptCompactionSourceRevision,
   extractChatGptTurnIdentity, continuityCheckpointSiblings, continuityCheckpointSiblingGroup, continuityCheckpointSiblingProof, CONTINUITY_CHECKPOINT_SIBLING_PROOF, type ChatGptTurnUserRevision } from "./environment";
 import type { ChatGptWebCapabilities } from "./model";
 import { structuredCompactionHandoffInstruction } from "./native-compaction-control";
-import { CompactionSourceCoverage, assertCompactionReadable, compactionAvailableTokens, compactionSourceInstruction, compactionSourcePageCost, previewRetainedCompactionSource, registerCompactionSource } from "./compaction-context";
+import { CompactionSourceCoverage, assertCompactionReadable, compactionSourceInstruction, compactionSourcePageCost, previewRetainedCompactionSource, registerCompactionSource } from "./compaction-context";
 import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type TurnBrokerOwner } from "./turn-broker";
@@ -330,7 +330,7 @@ function compactionPayloadDigest(parsed: CodexParsedRequest, target: RecoveryCom
 export function compileRecoveryCompactionInput(parsed: CodexParsedRequest, capabilities: ChatGptWebCapabilities,
   transaction: { token: string; handoffId: string }, snapshot = createContextSnapshot(parsed), appName = "Codex app"): CompiledChatGptWebPrompt {
   const instruction = structuredCompactionHandoffInstruction(transaction, { appName, compactPrompt: compactPrompt(parsed) });
-  const compiled = { text: compactionSourceInstruction(snapshot, instruction, compactionAvailableTokens(parsed, capabilities, 0)), images: [] };
+  const compiled = { text: compactionSourceInstruction(snapshot, instruction), images: [] };
   assertContinuityCompiledInput(compiled, { ...parsed, context: { ...parsed.context, messages: [] } }, capabilities,
     (transaction.token.length + transaction.handoffId.length + 42) * 2);
   return compiled;
@@ -509,18 +509,16 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
         && afterUsage.works[selection.source.logicalWorkId]?.state === "completed") return undefined;
       const preview = previewRetainedCompactionSource(parsed, source);
       const snapshot = preview.snapshot;
-      const pageTokens = Math.max(observed.retainedPageTokens ?? 0, preview.coverage.pageTokenReserve());
-      const available = compactionAvailableTokens(parsed, capabilities, pageTokens);
       try {
         const control = structuredCompactionHandoffInstruction({ token: `turn_${"0".repeat(32)}`,
           handoffId: `handoff_${"0".repeat(32)}` }, { appName: worker.appName, compactPrompt: compactPrompt(parsed) });
-        const instruction = compactionSourceInstruction(snapshot, control, available);
-        await assertCompactionReadable(snapshot, available - Math.max(8_192, estimateTokens(instruction)));
+        compactionSourceInstruction(snapshot, control);
+        await assertCompactionReadable(snapshot);
         return undefined;
       } catch (error) {
         if ((error as { code?: string }).code !== "continuity_input_limit") throw error;
-        // An otherwise healthy page may fit ordinary work but lack the independent
-        // checkpoint reading and summary allowance. Admit the actual cold plan below.
+        // A retained page entry may exceed its single-input limit.
+        // Admit the actual cold plan below through its original send checks.
         compactionReplaySource = { executionKey: observed.executionKey!, historyRevision: selection.target.sourceHistoryRevision };
       }
     }
@@ -587,10 +585,9 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
   // Check the selected entry and individual source reads without charging unread
   // task history as browser input. No credentials or page are created here.
   if (!acceptedHandoff) {
-    const compiled = compileRecoveryCompactionInput(input, capabilities,
+    compileRecoveryCompactionInput(input, capabilities,
       { token: `turn_${"0".repeat(32)}`, handoffId: `handoff_${"0".repeat(32)}` }, sourceSnapshot, worker.appName);
-    await assertCompactionReadable(sourceSnapshot!, compactionAvailableTokens(input, capabilities, 0)
-      - estimateTokens(compiled.text));
+    await assertCompactionReadable(sourceSnapshot!);
   }
   abortSignal?.throwIfAborted();
   const afterSourcePreparation = store.get(record.thread)!;
@@ -1066,7 +1063,6 @@ export async function runRecoveryCompaction(parsed: CodexParsedRequest, prepared
             logicalWorkId, attempt: attempt.attempt, ownerId: record.owner.id },
           ownerGeneration: `${prepared.bindings.owner}:${attempt.epoch}:${attempt.attempt}`,
           expiresAt: () => budgetDeadline.deadlineAt,
-          availableTokens: compactionAvailableTokens(parsed, capabilities, 0),
         }, structuredCompactionHandoffInstruction(transaction, { appName: worker.appName, compactPrompt: compactPrompt(parsed) }));
         sourceToken = registered.token;
         compiled = { text: registered.instruction, images: [] };

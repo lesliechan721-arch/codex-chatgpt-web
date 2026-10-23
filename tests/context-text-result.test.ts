@@ -104,8 +104,8 @@ describe("context-text-batch-v1 public result", () => {
       expect(page.metadata.items[0]!.range.start).toBe(position);
       expect(page.bodies[0]).not.toContain("�"); expect(page.bodies[0]!.length).toBeGreaterThan(0);
       if (purpose === "compaction") {
-        expect(page.metadata.remaining_budget?.reserved_tokens).toBe(700);
-        expect(retry.metadata.remaining_budget?.tokens).toBeLessThan(page.metadata.remaining_budget!.tokens as number);
+        expect(page.metadata.remaining_budget).toBeUndefined();
+        expect(retry.metadata.remaining_budget).toBeUndefined();
       }
       restored += page.bodies[0]!; position = page.metadata.items[0]!.range.end_exclusive; cursor = page.metadata.items[0]!.next_cursor ?? undefined;
       expect(++pages).toBeLessThan(100);

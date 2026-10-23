@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
+import { parseRequest } from "../src/responses/parser";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
-import { decodeWebContextPayload, decodeWebContextTransaction } from "../src/adapters/chatgpt-web/context-renderer";
+import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-renderer";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import type { CodexParsedRequest } from "../src/types";
 
@@ -70,27 +71,7 @@ test("inline Web context preserves assistant phase and MCP namespace metadata", 
   expect(envelope.messages[3]).not.toHaveProperty("phase");
 });
 
-test("multipart Web context preserves the same history metadata", () => {
-  const compiled = compileChatGptWebPrompt(
-    parsed(),
-    capabilities,
-    turnToken,
-    { experimentalMultipartParts: 2 },
-  );
-  const records = compiled.multipart!.parts.flatMap(part => {
-    const decoded = JSON.parse(part) as { records: Array<Record<string, unknown>> };
-    return decoded.records;
-  });
-  const messages = records
-    .filter(record => record.kind === "message")
-    .map(record => record.message as Record<string, unknown>);
-  expect(messages[0]?.phase).toBe("commentary");
-  expect((messages[0]?.content as Array<Record<string, unknown>>)[1]?.namespace).toBe("mcp__inventory");
-  expect(messages[1]?.tool_namespace).toBe("mcp__inventory");
-  expect(messages[2]?.phase).toBe("final_answer");
-});
-
-test("mixed inline and multipart context preserve metadata, false, absent fields and content-block order", () => {
+test("mixed inline context preserves metadata, false, absent fields and content-block order", () => {
   const input = parsed();
   const source = '"long\\code";'.repeat(400);
   const assistant = input.context.messages[0]!;
@@ -99,12 +80,11 @@ test("mixed inline and multipart context preserve metadata, false, absent fields
   input.context.messages.push({ role: "agentMessage", author: "writer", recipient: "coordinator", content: source, timestamp: 5 });
   const legacy = compileChatGptWebPrompt(input, capabilities, turnToken, { contextRendering: "legacy-json" });
   const expected = decodeWebContextPayload(legacy.contextPayload!).records;
-  for (const parts of [undefined, 2, 6] as const) {
+  {
     const compiled = compileChatGptWebPrompt(input, capabilities, turnToken, {
-      contextRendering: "codex-context-text-v1", experimentalMultipartParts: parts,
+      contextRendering: "codex-context-text-v1",
     });
-    const actual = compiled.multipart ? decodeWebContextTransaction(compiled.multipart.parts)
-      : decodeWebContextPayload(compiled.contextPayload!).records;
+    const actual = decodeWebContextPayload(compiled.contextPayload!).records;
     expect(actual).toEqual(expected);
     const messages = actual.filter(record => record.kind === "message").map(record => record.message);
     expect(messages[0]!.phase).toBe("commentary");
@@ -116,4 +96,20 @@ test("mixed inline and multipart context preserve metadata, false, absent fields
       "text", "tool_call", "text", "thinking_summary",
     ]);
   }
+});
+
+
+test("content-kind metadata does not prove replacement of earlier developer rules", () => {
+  const rules = [
+    ["model_switch.instructions", "<model_switch>Keep the earlier file protection.</model_switch>"],
+    ["skills.catalog", "<skills_instructions>Keep the required skill validation.</skills_instructions>"],
+    ["model_switch.instructions", "<model_switch>Add concise output.</model_switch>"],
+  ];
+  const input = parseRequest({ model: CHATGPT_WEB_MODEL_ID, input: rules.map(([kind, content], index) => ({
+    id: `rule-${index}`, type: "message", role: "developer", content,
+    internal_chat_message_metadata_passthrough: { content_item_kinds: [kind] },
+  })) });
+  const compiled = compileChatGptWebPrompt(input, capabilities, turnToken, { bootstrapPreparation: true });
+  expect(compiled.bootstrapContent!.payload.messages.map(message => message.content)).toEqual(rules.map(([, content]) => content));
+  expect(compiled.bootstrapContent!.messageSourceIndices).toEqual([0, 1, 2]);
 });

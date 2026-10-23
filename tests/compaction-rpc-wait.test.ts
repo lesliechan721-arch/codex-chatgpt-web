@@ -45,7 +45,7 @@ for (const mode of ["native", "safe", "manual"] as const) for (const phase of ["
       const source = await registerCompactionSource(f.remote, { snapshot: snapshot(),
         ...(transaction ? { contract: "native" as const, transactionToken: transaction.token, handoffId: transaction.handoffId }
           : { contract: "safe" as const, turnToken, handoffId: "safe:rpc-wait", ...(mode === "manual" ? { explicitManual: true as const } : {}) }),
-        historyRevision: 0, ownerGeneration: "page", availableTokens: 96_000,
+        historyRevision: 0, ownerGeneration: "page",
         expiresAt: () => { const value = budget.deadlineAt; if (++reads === (phase === "prepare" ? 1 : 2)) queueMicrotask(f.pause); return value; },
       }, "Summarize the original source");
       expect(chatGptSuspensionClock.suspendedMs() - before).toBeGreaterThan(5_000);

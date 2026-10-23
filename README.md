@@ -91,20 +91,15 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 
 > **Limits**
 >
-> See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for the current
-> ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Astra**. Context limits depend on
-> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window.
-> GPT-5.6 supports up to 270,000 tokens with experimental **3× context** enabled, with native
-> Codex compaction supported throughout.
->
-> GPT-6 Sol supports Bigger Context at Medium, High and available Extra High: **120,000 tokens
-> on Plus**, with compaction at **110,000**, and **240,000 on Pro**, with compaction at **220,000**.
-> GPT-6 Instant uses standard context.
-> GPT-5.6 and GPT-6 Pro keep their existing Bigger Context limits.
-
-> Luna/Think can opt into experimental multipart Bigger Context. Long Free chats may lose older
-> details. With Bigger Context off, Luna keeps its rolling checkpoint. Applicable Full Native + Launcher
-> routes use the unified history budget; browser delivery still follows each supported transport.
+> See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for ChatGPT message allowances.
+> The account and model determine the history window and client compaction threshold:
+> **200,000 / 180,000**, **300,000 / 270,000**, **500,000 / 450,000**, or **600,000 / 540,000** tokens.
+> These are history policies, not measured browser capacity. Full/MCP selects on-demand reading by
+> default; short inputs can stay inline. Bigger Context and its multipart sending are removed.
+> Single-message, read-response, image, attachment, storage and processing-time limits still apply.
+> Full/MCP Luna/Think measures canonical history and supports independent compaction at 180,000 tokens.
+> Browser-only Luna keeps its rolling checkpoint and projected usage. See the
+> [account/model table](docs/context-navigation.md#history-window-and-client-compaction).
 
 1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
    **Connect harness**.
@@ -130,10 +125,10 @@ helper together. A new logical Native call uses a new positive integer ID; retri
 that ID across reconnects. A pending receipt is not task completion and must not execute the
 original operation again.
 
-[Context navigation](docs/context-navigation.md) keeps ordinary task text intact while selected
-tool history is read on demand. Images prefer MCP; only required attachment fallbacks need the
+[Context navigation](docs/context-navigation.md) preserves current requests and rules while ordinary assistant
+history, selected tool history and detailed source maps can be read on demand. Images prefer MCP; only required attachment fallbacks need the
 extra Zero Risk confirmation. Compaction can inspect a separate read-only source directory without
-reading every source. These paths retain existing context limits. Complete release validation is
+reading every source. Cumulative page delivery estimates do not gate sending, reading, completion, or page replacement. Complete release validation is
 still pending: limited High-mode multi-image evidence does not establish higher capacity, reliable
 number recognition, or stability across all models. See the
 [validation scope](docs/release-validation.md#context-navigation-validation).
@@ -224,7 +219,7 @@ bun run app:package
 
 `dev:launcher` uses a separate profile and account under `~/.codex-chatgpt-web-dev`. `dev:chat` exercises the real browser and compaction paths with explicit simulated tool results, without changing your normal Codex route. See the [DEV chat harness](docs/dev-chat.md) for setup and commands.
 
-[Session continuity](docs/session-continuity.md) uses one task mechanism on supported Full Native + Launcher routes with ordinary `chatgpt-web/` models. Confirmed live pages retain current-request conflict checks. Closed or unknown pages recover from the current request after best-effort old-execution revocation; old stops, unknown Send/results, checkpoints, and retry budgets cannot block a new page. External work may execute again or continue on an unreachable old page. Closed-page task records are removed, while the independent one-hour `previous_response_id` cache remains. Fresh Conversation Per Turn affects logical sends; Bigger Context and Zero Risk keep existing capabilities and manual-send restrictions. The 1,000,000 / 900,000-token history budget does not enlarge the ChatGPT window. Five physical pages and bounded cleanup still apply. Old-prefix configuration must use the corresponding ordinary name. The guide records outstanding real-platform validation.
+[Session continuity](docs/session-continuity.md) uses one task mechanism on supported Full Native + Launcher routes with ordinary `chatgpt-web/` models. Confirmed live pages retain current-request conflict checks. Closed or unknown pages recover from the current request after best-effort old-execution revocation; old stops, unknown Send/results, checkpoints, and retry budgets cannot block a new page. External work may execute again or continue on an unreachable old page. Closed-page task records are removed, while the independent one-hour `previous_response_id` cache remains. Fresh Conversation Per Turn affects logical sends; Zero Risk keeps its manual-send restrictions. Account/model history windows use the four tiers above; they do not enlarge single-message transport limits. Five physical pages and bounded cleanup still apply. Old-prefix configuration must use the corresponding ordinary name. The guide records outstanding real-platform validation.
 
 </details>
 

@@ -10,7 +10,7 @@ import { ChatGptWebAdapterError } from "./adapter-error";
 /** These are the existing browser-worker file checks, in a module with no browser side effects. */
 export const CONTEXT_ATTACHMENT_LIMITS = Object.freeze({ count: 10, imageBytes: 20_000_000, totalBytes: 50_000_000 });
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const REQUIRED_SOURCES = new Set(["system", "developer", "user", "skill", "delegation", "agent_message"]);
+const REQUIRED_SOURCES = new Set(["system", "developer", "user", "skill", "delegation", "agent_message", "summary"]);
 
 export class ContextDeliveryPlanningError extends ChatGptWebAdapterError {
   constructor(readonly code: "CONTEXT_MAPPING_UNPROVEN" | "CONTEXT_IMAGE_UNAVAILABLE" | "CONTEXT_BUDGET_EXCEEDED",
@@ -53,7 +53,6 @@ export interface ContextMediaPlanInput {
   selectedTargetIds: ReadonlySet<string>;
   selectedImageParts: ReadonlyMap<string, CodexImageContent>;
   limits?: ContextLimitOverrides;
-  availableTokens: number;
   attachmentSlotsReserved?: number;
   attachmentBytesReserved?: number;
 }
@@ -70,29 +69,25 @@ export function planContextMedia(input: ContextMediaPlanInput): ContextMediaPlan
   const vision = (target: ContextTarget) => target.visual_token_reserve ?? chatGptWebImageTokenReserve(input.selectedImageParts.get(target.target_id)?.detail);
   const ordered = [...images.filter(required), ...images.filter(t => !required(t) && input.selectedTargetIds.has(t.target_id)),
     ...images.filter(t => !input.selectedTargetIds.has(t.target_id))];
-  let pendingRequiredVision = images.filter(required).reduce((sum, target) => sum + vision(target), 0);
   let attachmentSlots = input.attachmentSlotsReserved ?? 0;
   let attachmentBytes = input.attachmentBytesReserved ?? 0;
   for (const target of ordered) {
     const isRequired = required(target);
-    if (isRequired) { result.requiredImages++; pendingRequiredVision -= vision(target); }
+    if (isRequired) result.requiredImages++;
     const selected = input.selectedTargetIds.has(target.target_id);
     const fixed = target.read_ref ? input.snapshot.getImage(target.read_ref) : undefined;
-    const requiredCost = result.requiredMcpTokens + result.attachmentVisualTokens + pendingRequiredVision;
     let mcpCost: ContextResponseCost | undefined;
     if (fixed && target.image_bytes !== null && target.image_bytes <= limits.maxImageBytes
-      && result.mcpImages < limits.maxImageReads && result.mcpImageBytes + fixed.bytes.length <= limits.maxTotalImageBytes
-      && requiredCost + fixed.visual_token_reserve <= input.availableTokens) {
+      && result.mcpImages < limits.maxImageReads && result.mcpImageBytes + fixed.bytes.length <= limits.maxTotalImageBytes) {
       const navigator = new ContextNavigator({ scopeId: "context-media-preflight", snapshot: input.snapshot, purpose: "normal", limits,
         deliveryByTarget: { [target.target_id]: { delivery: "source_on_demand", media_route: "mcp", required: isRequired } } });
       const response = navigator.read({ context_id: input.snapshot.context_id, reads: [{ read_ref: target.read_ref! }] });
       if (!response.isError) mcpCost = measureContextResponse(response, { visualTokens: fixed.visual_token_reserve,
         wireReserveBytes: limits.wireReserveBytes, tokenReserve: limits.tokenReserve });
     }
-    // Optional images need room for one complete return, without taking undelivered required reserves.
+    // Every image return must fit the fixed single-response limits.
     if (mcpCost && result.mcpImages < limits.maxImageReads
-      && result.mcpImageBytes + fixed!.bytes.length <= limits.maxTotalImageBytes
-      && requiredCost + mcpCost.total_tokens <= input.availableTokens) {
+      && result.mcpImageBytes + fixed!.bytes.length <= limits.maxTotalImageBytes) {
       result.deliveryByTarget[target.target_id] = { delivery: "source_on_demand", media_route: "mcp", required: isRequired };
       result.imageResponseCosts[target.target_id] = mcpCost;
       result.mcpImages++; result.mcpImageBytes += fixed!.bytes.length; result.mcpWireBytes += mcpCost.wire_bytes;
@@ -104,8 +99,7 @@ export function planContextMedia(input: ContextMediaPlanInput): ContextMediaPlan
     const attachmentUrl = fixed ? `data:${fixed.mime_type};base64,${Buffer.from(fixed.bytes).toString("base64")}` : originalUrl;
     const attachment = selected && attachmentUrl ? contextAttachmentImage(attachmentUrl) : undefined;
     if (attachment && attachmentSlots < CONTEXT_ATTACHMENT_LIMITS.count
-      && attachmentBytes + attachment.bytes <= CONTEXT_ATTACHMENT_LIMITS.totalBytes
-      && requiredCost + vision(target) <= input.availableTokens) {
+      && attachmentBytes + attachment.bytes <= CONTEXT_ATTACHMENT_LIMITS.totalBytes) {
       result.deliveryByTarget[target.target_id] = { delivery: "attachment", media_route: "attachment", required: isRequired,
         reason: "The fixed MCP image does not fit the selected image budget; the supported attachment route is used" };
       attachmentUrls.set(target.target_id, attachmentUrl!);
