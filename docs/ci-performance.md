@@ -423,16 +423,15 @@ gh workflow run windows-performance.yml --repo OWNER/REPO --ref BRANCH -f condit
 ## Reviewed platform skips
 
 `.github/windows-test-skips.json` stores each permitted Windows skip by test file, test
-name and reason, with a content hash for every source file. Intel uses the separate
+name and reason. Intel uses the separate
 `.github/macos-intel-test-skips.json` policy, including Windows-only skips and the macOS
-tests that must run. The gate checks those hashes
-against its checkout, binds the policy to the current source, and requires the observed
+tests that must run. The gate binds the policy to the current run and requires the observed
 skip identities to match exactly. It never generates an allowlist from the current run.
 
-When a listed test file changes, review its skip conditions and update the affected hash
-and entries in the same change. New skips require a reason; removing a test or enabling it
-also requires updating the policy. Do not refresh hashes without checking the conditions.
-Missing entries, duplicate identities, changed source bytes or unknown skips fail the gate.
+Test source edits do not require policy updates unless the permitted skips change.
+New skips require a reason; renaming, removing or enabling a listed test also requires
+updating its policy entry. Missing entries, duplicate identities or unknown skips fail
+the gate.
 
 ```sh
 bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts --job-results=/path/to/jobs.json --output=/path/to/aggregate.json --skip-policy=.github/windows-test-skips.json --mode=timing

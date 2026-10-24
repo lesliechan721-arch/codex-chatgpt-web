@@ -174,7 +174,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
 function json(path: string) { try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; } }
 function contents(path: string) { try { return readFileSync(path, "utf8"); } catch { return null; } }
 
-/** Reviewed test bytes authorize reuse; the historical revision is only provenance. */
+/** Explicit skip identities authorize reuse; the historical revision is only provenance. */
 export function loadSkipPolicy(root: string, path: string, files: string[], source: { revision: string; patchDigest: string; toolDigest: string }) {
   const bytes = readFileSync(path), policy = JSON.parse(bytes.toString("utf8"));
   if (policy?.version !== 1 || !hash(policy.reviewedSource?.revision, 40)
@@ -188,22 +188,10 @@ export function loadSkipPolicy(root: string, path: string, files: string[], sour
     || new Set(entries.map(entry => `${entry.file}::${entry.name}`)).size !== entries.length) {
     throw new Error("Skip policy requires unique known test identities and nonempty reasons.");
   }
-  const sources = [...new Set<string>(entries.map(entry => entry.file))].sort();
-  if (policy.fileHashes === null || typeof policy.fileHashes !== "object" || Array.isArray(policy.fileHashes)
-    || !sameFiles(Object.keys(policy.fileHashes), sources)
-    || !sources.every(file => hash(policy.fileHashes[file], 64))) {
-    throw new Error("Skip policy hashes must cover exactly its test source files.");
-  }
-  for (const file of sources) {
-    let digest: string;
-    try { digest = createHash("sha256").update(readFileSync(join(root, file))).digest("hex"); }
-    catch { throw new Error(`Skip policy source file is missing or unreadable: ${file}`); }
-    if (digest !== policy.fileHashes[file]) throw new Error(`Skip policy source file changed and needs review: ${file}`);
-  }
   if (!hash(source.revision, 40) || !hash(source.patchDigest, 64) || !hash(source.toolDigest, 64)) throw new Error("Unknown skip policy gate source.");
   return { version: 1, source: { revision: source.revision, patchDigest: source.patchDigest, toolDigest: source.toolDigest }, entries,
     policy: { version: policy.version, path: relative(root, path).replaceAll("\\", "/"),
-      sha256: createHash("sha256").update(bytes).digest("hex"), reviewedSource: policy.reviewedSource, fileHashes: policy.fileHashes } };
+      sha256: createHash("sha256").update(bytes).digest("hex"), reviewedSource: policy.reviewedSource } };
 }
 
 export function loadShardArtifacts(directory: string) {

@@ -27,7 +27,7 @@ import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { actualCheckpoint, observeCheckpointResponse, checkpointContinuationBody, compactionBody, observeCompactionHandoff } from "../scripts/validate-unified-task-continuity-transitions";
 import { createLiveRequestBody } from "../scripts/validate-context-rendering";
 import { performanceTest } from "./helpers/performance-test";
-import { createSessionContinuityFixtures, readContinuityStartup, recordedCall, taskEnvelope, reverseJsonObjectKeys, codexRoundtrippedOutput } from "./helpers/session-continuity-fixture";
+import { createSessionContinuityFixtures, recordedCall, taskEnvelope, reverseJsonObjectKeys, codexRoundtrippedOutput } from "./helpers/session-continuity-fixture";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
@@ -416,7 +416,8 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
   let client!: Client;
   const f = fixture(false, { contextModel: async input => {
     client = input.client;
-    await readContinuityStartup(input.prompt, input.client);
+    // Wait for the Broker receipt before the fixture submits tools directly.
+    await f.readStartup(input.prompt);
   } });
   let expectedCompactionResult: string | undefined;
   const readResults: string[] = [];
@@ -478,7 +479,7 @@ for (const reclamation of [undefined, "ttl", "capacity"] as const) test(`Automat
   };
   const summary = await compactCurrent(first, "Original source result.");
   const continuation = f.request("", "turn-first", [{ type: "compaction", encrypted_content: encodeCompactionSummary(summary) }]);
-  await f.run(continuation);
+  expect((await f.run(continuation)).at(-1)).toMatchObject({ type: "done", endTurn: false });
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(continuation)}`)!;
   const call = source.outstanding()[0]!;
   const result = f.request("", "turn-first", [

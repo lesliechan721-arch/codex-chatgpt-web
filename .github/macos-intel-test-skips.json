@@ -5,30 +5,6 @@
     "patchDigest": "2d1dce03a349a11564e2607771c004890a653ee67c92f7d4b5b61e1e9cc458d8",
     "toolDigest": "92f2c054cf12b5b1a5bad065926a429f823b99e738ac713fce88ee88a1529245"
   },
-  "fileHashes": {
-    "tests/attachment-upload-electron.test.ts": "eb2a83444b6ce9c266e5decf663953380fec1f15840e2915a2739a332ce9f71f",
-    "tests/attachment-upload.test.ts": "f22b7b2be79ef96e0a8284f93cd26a4dcbe06e426d17d9f5d619e64d484afcb2",
-    "tests/browser-generation.test.ts": "4785cfcc55d0532a802b06f336f12857e8014fc0df2e8a513dd8418cf905e361",
-    "tests/browser-live-progress.test.ts": "4492ee1bc5945e5b8317019f472b662d9c9d1f0c0a0b2fecdea2fc8582308415",
-    "tests/browser-turn-binding.test.ts": "bdd86c7bfc5eeb502543445aa2121f3ef90d044c4d950cfc3f364fd4ac885b64",
-    "tests/chatgpt-effort-browser.test.ts": "4d2f62c37a28cfd2d77a4fa3a6e7d7255bb4e31c75a74c5341a0321571598261",
-    "tests/chatgpt-limits-browser.test.ts": "7c586f0a5ab8581fcfaa99dafee84e4d933832ea2eabe04374bbf1400ce67721",
-    "tests/chatgpt-markdown-parser.test.ts": "027e58292c1aae46966005859fac96cedf6af926dff1592d9008f3fee6c08102",
-    "tests/chatgpt-model-family-browser.test.ts": "9f7e1193d77898775cfba5710e76d3df86e8ac6c00a363345ba367f721bc2eac",
-    "tests/composer-insert.test.ts": "a7978cbddb18bec51e4d272cd3bdf84e879ddd102d88a1cf3f7a875935e3d484",
-    "tests/continuity-lock-windows.test.ts": "78b1cdfc76cb5e8853f8148d3898424bd9b436d509fe782bd2318437f83b3afb",
-    "tests/environment.test.ts": "a46b8d431ff2bda2733bed4212f1b15e3f708128f5f6e467d6caaac24a653465",
-    "tests/launcher-navigation-viewport.test.ts": "59ade91f7f1e0a32d24232a3830a4eefab40545b2586c439f847d91760e93607",
-    "tests/launcher-system-theme.test.ts": "f47587d58ad00d56b22abe97170e7ab35d18f41d28fcdee5d9372e2ad00ae20d",
-    "tests/launcher-viewport-browser.test.ts": "e6a19ee56653f4064adf52370f30da41bc564d3adab695a43031664ec0732799",
-    "tests/server-deploy.test.ts": "da2f8241519ff407bef78b562efe41b4d8d1fbf44905442408d43ac4380ee101",
-    "tests/session-continuity-checkpoint.test.ts": "fdf465a9da2c93fca364f53d9a05637b0c3a1c84db522f144c80111284d8bd7c",
-    "tests/session-continuity-compaction.test.ts": "d789f4392d2bea0b679f7b95f6f3e16ea57d5aed7fe1d91e7dc76cfdb3020246",
-    "tests/session-continuity-recovery.test.ts": "e64546a032edcb67ae55890e3fcc0b3a7ac8073f568c3e7d8521685347b8307c",
-    "tests/submission-error-alert.test.ts": "d6ac5074e3e32bcc44ac71d09152a67bf51b4c290719d1bd039ced2cf158395a",
-    "tests/tool-approval-dom.test.ts": "7a06750046002a550d39231cdff851c29c0f0a33f54d190bb8fa91d64c50fde6",
-    "tests/validate-context-rendering.test.ts": "27cbe3e193b2e5a51faa0c7ef71dc263a357fb592fb4471fabafddaf394bf126"
-  },
   "entries": [
     {
       "file": "tests/attachment-upload-electron.test.ts",

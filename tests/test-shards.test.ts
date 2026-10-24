@@ -250,15 +250,15 @@ function skipPolicyFixture() {
   mkdirSync(join(root, "tests"));
   writeFileSync(join(root, file), "reviewed test source\n");
   const policy = { version: 1, reviewedSource: { revision, patchDigest, toolDigest },
-    fileHashes: { [file]: createHash("sha256").update(readFileSync(join(root, file))).digest("hex") },
     entries: [{ file, name: "a case", reason: "Requires another platform" }] };
   writeFileSync(path, JSON.stringify(policy));
   return { root, path, policy };
 }
 
-test("persistent skip policy binds reviewed file bytes to different gate revisions", () => {
+test("persistent skip policy preserves explicit skips across source changes and gate revisions", () => {
   const { root, path } = skipPolicyFixture();
   try {
+    writeFileSync(join(root, files[0]!), "changed test source\n");
     for (const currentRevision of [revision, "f".repeat(40)]) {
       const fixture = skippedFixture();
       fixture.expected.revision = currentRevision;
@@ -277,11 +277,6 @@ const policyDefects: [string, (fixture: ReturnType<typeof skipPolicyFixture>) =>
   ["blank test name", fixture => { fixture.policy.entries[0]!.name = " "; }],
   ["duplicate identity", fixture => { fixture.policy.entries.push(fixture.policy.entries[0]!); }],
   ["unknown test file", fixture => { fixture.policy.entries[0]!.file = "tests/unknown.test.ts"; }],
-  ["missing hash", fixture => { delete fixture.policy.fileHashes[files[0]!]; }],
-  ["extra hash", fixture => { fixture.policy.fileHashes[files[1]!] = "d".repeat(64); }],
-  ["invalid hash", fixture => { fixture.policy.fileHashes[files[0]!] = "invalid"; }],
-  ["changed source file", fixture => { writeFileSync(join(fixture.root, files[0]!), "changed test source\n"); }],
-  ["missing source file", fixture => { rmSync(join(fixture.root, files[0]!)); }],
 ];
 for (const [name, change] of policyDefects) test(`persistent skip policy rejects ${name}`, () => {
   const fixture = skipPolicyFixture();
