@@ -13,7 +13,7 @@ import { contextTextReadReceipt, contextTextReadReceiptsEqual, parseContextTextR
 import { ContextTextCoverage } from "./context-text-coverage";
 export { CONTEXT_PROTOCOL_VERSION } from "./context-protocol";
 
-import { CONTEXT_REUSE_PROTOCOL, type ContextReusePlan, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
+import { CONTEXT_REUSE_PROTOCOL, type ContextReusePlan, type ContextReuseDeliveryEvidence, type ContextReuseValidation, type ContextReuseFailure } from "./context-reuse-types";
 import { boundedContextReuse } from "./context-reuse-lifecycle";
 
 export const CONTEXT_READY_TIMEOUT_MS = 120_000;
@@ -46,7 +46,7 @@ export interface ContextStatus {
   context_ready: boolean;
   text_ready: boolean;
   reuse_ready?: boolean;
-  reuse_failure?: string;
+  reuse_failure?: ContextReuseFailure;
   images_ready: boolean;
   required_texts: number;
   delivered_texts: number;
@@ -162,7 +162,8 @@ export class ContextScope {
     private readonly changed: () => void,
     private readonly fail: (error: Error) => void,
     readonly expiresAt?: number,
-    private readonly reuseValid: () => boolean = () => !registration.reuse?.dependency,
+    private readonly validateReuse: () => ContextReuseValidation = () => registration.reuse?.dependency
+      ? { ready: false, failure: "baseline_invalid" } : { ready: true },
   ) {
     if (purpose === "compaction" && expiresAt !== undefined) this.compactionDeadline = new CompactionDeadline(expiresAt);
     // A plan and its effective limits do not change after this scope is published.
@@ -334,9 +335,10 @@ export class ContextScope {
     const nextRequiredRead: ContextRequiredRead | null = image ? { tool: "codex_context_read", arguments: {
       context_id: this.registration.snapshot.context_id, reads: [{ read_ref: image.read_ref! }] } } : batchIndex >= 0 ? {
       tool: "codex_context_read", arguments: this.navigator.requiredReadArgs(batchIndex) } : null;
-    const reuseReady = this.reuseValid();
+    const reuse = this.validateReuse();
+    const reuseReady = reuse.ready;
     return { context_id: this.registration.snapshot.context_id, plan_id: this.registration.planId,
-      ...(this.registration.reuse ? { reuse_ready: reuseReady, ...(!reuseReady ? { reuse_failure: "baseline_invalid" } : {}) } : {}),
+      ...(this.registration.reuse ? { reuse_ready: reuseReady, ...(!reuse.ready ? { reuse_failure: reuse.failure } : {}) } : {}),
       context_ready: !this.permanentFailure && !this.returnRecoveryExhausted && remaining.length === 0 && missingTexts.length === 0 && reuseReady && (!this.registration.reuse || this.deliveredEntry), images_ready: remaining.length === 0, text_ready: missingTexts.length === 0 && (!this.registration.reuse || this.deliveredEntry),
       required_texts: texts.length, delivered_texts: texts.length - missingTexts.length, remaining_texts: missingTexts.length,
       required_text_bytes: texts.reduce((sum, target) => sum + target.utf8_bytes!, 0),
@@ -374,6 +376,10 @@ export class ContextScope {
   notReady(): BrokerToolResult | undefined {
     this.assertLive();
     const status = this.status();
+    if (status.reuse_failure === "verification_unavailable" || status.reuse_failure === "lifecycle_not_ready") {
+      return contextFailure("CONTEXT_NOT_READY", "Context reuse cannot be verified yet. Pause new work and recheck the original task after its recovery state or storage is available. Use a new operation_id after readiness; do not resend the plan.",
+        { ...status, recovery_action: status.reuse_failure === "verification_unavailable" ? "retry_verification" : "resume_original_lifecycle" });
+    }
     return status.context_ready ? undefined : status.reuse_ready === false
       ? contextFailure("CONTEXT_NOT_READY", "The fixed reuse baseline is no longer valid. Stop new work and recover a new complete plan through the original lifecycle; do not resend this plan.", { ...status, recovery_action: "recover_full_plan" })
       : contextFailure("CONTEXT_NOT_READY", "Deliver the required context and confirm required attachments. Use a new operation_id for new work after readiness.", { ...status });

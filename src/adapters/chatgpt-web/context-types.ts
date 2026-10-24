@@ -128,6 +128,7 @@ export interface ContextSearchArgs extends ContextFilter {
 export interface ContextLiveOverview {
   context_ready?: boolean;
   reuse_ready?: boolean;
+  reuse_failure?: import("./context-reuse-types").ContextReuseFailure;
   text_ready?: boolean;
   images_ready?: boolean;
   required_texts?: number;

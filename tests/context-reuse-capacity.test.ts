@@ -31,7 +31,8 @@ function plan(manual: boolean, inline: boolean, baseline?: ContextReuseBaseline,
 
 function deliver(result: ContextDeliveryPlan, baseline?: ContextReuseBaseline) {
   const scope = new ContextScope("capacity-scope", result.registration!, "normal", () => {}, () => {}, undefined,
-    () => !result.registration!.reuse!.dependency || contextReuseMatches(baseline, result.registration!.reuse!.dependency!));
+    () => !result.registration!.reuse!.dependency || contextReuseMatches(baseline, result.registration!.reuse!.dependency!)
+      ? { ready: true } : { ready: false, failure: "baseline_invalid" });
   const current = new Map<string, string>();
   try {
     expect(scope.usageEvidence().reuse_delivery).toBeUndefined();

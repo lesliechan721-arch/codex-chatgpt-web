@@ -3,6 +3,10 @@ export const CONTEXT_REUSE_PROTOCOL = "context-reuse-v1" as const;
 export const CONTEXT_REUSE_MAX_UNITS = 128;
 export const CONTEXT_REUSE_MAX_BYTES = 64 * 1024;
 
+export type ContextReuseFailure = "baseline_invalid" | "baseline_missing" | "lineage_mismatch"
+  | "authority_changed" | "page_changed" | "lifecycle_not_ready" | "verification_unavailable";
+export type ContextReuseValidation = { ready: true } | { ready: false; failure: ContextReuseFailure };
+
 export interface ContextReuseUnit {
   unit_id: string;
   fingerprint: string;
