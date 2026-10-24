@@ -191,8 +191,21 @@ committed only after the current required text and images, original completion c
 final response and physical termination all succeed. Page identity and the completed predecessor
 are checked again at commit. New scopes start with empty text coverage. `reuse_ready` checks
 the fixed baseline dependency separately from `text_ready` and `images_ready`, at preparation,
-Send admission, new business admission and successful completion. A baseline failure stops new
-work and success under that plan; it does not alter a sent plan or authorize another Send.
+Send admission, new business admission and successful completion. Registered plans retain their
+verified baseline metadata until discarded or retired, within the active context storage budget;
+cache eviction cannot revoke an active dependency. Accepted appends preserve the original completed
+predecessor through the durable same-lineage chain. Each crossed append requires the previous writer
+to be retired, consecutive task revisions, and unchanged page epoch and history revision. Owner,
+current execution authority, page identity and exact content checks remain live.
+A baseline failure stops new work and success under that plan; it does not alter a sent plan or
+authorize another Send. Failure details distinguish missing or mismatched baseline evidence,
+lineage mismatch, changed authority or page, lifecycle readiness, and unavailable verification.
+Unavailable verification and pending lifecycle recovery pause admission and permit another check
+through the original task; neither event alone proves that the baseline has changed. Rejected
+operations retain their result, so new work after readiness uses a new operation ID.
+Registration, selection and Send admission report temporary verification or lifecycle failures as
+`CONTEXT_BUSY`, retaining the failure reason and recovery action. These failures do not trigger
+preparation's automatic full-plan fallback; only a definite reuse miss permits that unsent fallback.
 
 New pages, cold recovery, restart and known compaction require full delivery and a new baseline.
 A proved unsent preparation failure can preserve the last healthy baseline. Late callbacks cannot

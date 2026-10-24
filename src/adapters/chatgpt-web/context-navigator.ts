@@ -593,6 +593,7 @@ export class ContextNavigator {
   #localRemaining(): ContextRemainingBudget { return { tokens: UNLIMITED_CONTEXT_ALLOWANCE, wire_bytes: UNLIMITED_CONTEXT_ALLOWANCE }; }
   #live(value: ContextLiveOverview): ContextLiveOverview {
     const result: ContextLiveOverview = {};
+    if (value.reuse_failure !== undefined) result.reuse_failure = value.reuse_failure;
     for (const key of ["context_ready", "reuse_ready", "text_ready", "images_ready"] as const) if (value[key] !== undefined) {
       if (typeof value[key] !== "boolean") throw new NavigationError("INVALID_ARGUMENT"); result[key] = value[key];
     }

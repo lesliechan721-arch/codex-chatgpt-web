@@ -8,6 +8,7 @@ import type { CodexParsedRequest } from "../src/types";
 import { isChatGptWebZeroRiskBackendModel } from "../src/chatgpt-web-models";
 import { continuityDigest, existingContinuityBindings } from "../src/adapters/chatgpt-web/continuity-binding";
 import { createSessionContinuityFixtures, type ContinuityContextModelInput } from "./helpers/session-continuity-fixture";
+import { ContinuityRecoveryStore } from "../src/adapters/chatgpt-web/continuity-recovery-store";
 
 const { fixture, disposeTestFixtures } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
@@ -75,6 +76,39 @@ async function readCurrentContext(input: ContinuityContextModelInput,
   expect(observed.actual_model_input_tokens).toBeNull();
   return { bootstrap, bodies, readRefs, calls, wireBytes, manifest };
 }
+
+test("temporary recovery during preparation preserves incremental delivery without a full fallback or another Send", async () => {
+  const observations: Awaited<ReturnType<typeof readCurrentContext>>[] = [];
+  const f = fixture(false, { taskUpdates: true, mcpTransport: "in-process", contextModel: async input => {
+    observations.push(await readCurrentContext(input));
+  } });
+  f.provider.chatgptWeb!.maxComposerCodePoints = 8_000;
+  const stable = "STABLE_RECOVERY_RULE " + "x".repeat(30_000);
+  const request = rules(f.request("first"), stable);
+  const original = ContextSend.prototype.prepare;
+  let paused = false;
+  const prepare = spyOn(ContextSend.prototype, "prepare").mockImplementation(async function(this: ContextSend, ...args) {
+    if (!paused && args[2].retainedContinuity) {
+      paused = true;
+      const store = new ContinuityRecoveryStore(f.statePath), thread = continuityDigest(f.threadId);
+      const record = store.get(thread)!;
+      store.transact(thread, { scope: record.scope }, draft => { draft.state = "recovering"; });
+      try { await expect(original.apply(this, args)).rejects.toMatchObject({ code: "CONTEXT_BUSY" }); }
+      finally { store.transact(thread, { scope: record.scope }, draft => { draft.state = "running"; }); }
+    }
+    return original.apply(this, args);
+  });
+  try {
+    expect((await f.run(request)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+    expect((await f.run(rules(f.next(request), stable))).at(-1))
+      .toMatchObject({ type: "done", endTurn: true });
+    expect(paused).toBeTrue();
+    expect(observations).toHaveLength(2);
+    expect(observations[1]!.bodies.join("\n")).not.toContain("STABLE_RECOVERY_RULE");
+    expect(f.submissions).toHaveLength(2);
+    expect(f.submissions[1]!.reused).toBeTrue();
+  } finally { prepare.mockRestore(); }
+});
 
 for (const manual of [false, true]) test(`reuse ${manual ? "Zero Risk" : "Automatic"}: 20 healthy physical turns deliver stable originals once`, async () => {
   const stable = "STABLE_RULE_BODY_7f14: preserve every exact rule.\n".repeat(700);

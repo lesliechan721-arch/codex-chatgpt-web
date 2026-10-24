@@ -21,12 +21,25 @@ export function contextReuseBaseline(evidence: ContextReuseDeliveryEvidence, pag
   return boundedContextReuse(value) ? value : undefined;
 }
 
-/** Ordinary tasks retain the previous instruction selection, while appended work has a direct predecessor. */
+/** Appended work preserves the original completed predecessor through its durable lineage. */
 export function contextReusePredecessor(record: RecoveryThreadRecord, workId: string, predecessor: string): boolean {
-  const work = record.works[workId], previous = record.works[predecessor];
+  let work = record.works[workId];
+  const previous = record.works[predecessor];
   if (!work || !previous || previous.state !== "completed" || previous.purpose !== "ordinary"
     || previous.attempts.at(-1)?.epoch !== record.epoch) return false;
-  return work.predecessorLogicalWorkId === predecessor || !!work.instructionPrevious
-    && work.instructionPrevious.instructionIdentity === previous.instructionIdentity
-    && (work.instructionPrevious.nativeTurnId === undefined || work.instructionPrevious.nativeTurnId === previous.nativeTurnId);
+  const visited = new Set<string>();
+  while (work && !visited.has(work.logicalWorkId)) {
+    visited.add(work.logicalWorkId);
+    const attempt = work.attempts.at(-1);
+    if (work.purpose !== "ordinary" || work.state === "stopped" || attempt?.epoch !== record.epoch) return false;
+    if (work.predecessorLogicalWorkId === predecessor || !!work.instructionPrevious
+      && work.instructionPrevious.instructionIdentity === previous.instructionIdentity
+      && (work.instructionPrevious.nativeTurnId === undefined || work.instructionPrevious.nativeTurnId === previous.nativeTurnId)) return true;
+    const parent = work.predecessorLogicalWorkId ? record.works[work.predecessorLogicalWorkId] : undefined;
+    if (!parent || parent.workLineageId !== work.workLineageId || !parent.attempts.at(-1)?.writerRetired
+      || parent.acceptedTaskRevision + 1 !== work.acceptedTaskRevision
+      || parent.attempts.at(-1)?.historyRevision !== attempt.historyRevision) return false;
+    work = parent;
+  }
+  return false;
 }

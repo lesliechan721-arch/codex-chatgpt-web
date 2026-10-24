@@ -1,5 +1,5 @@
 import { CompactionDeadline } from "./compaction-deadline";
-import { CONTEXT_REUSE_PROTOCOL, type ContextReuseBaseline, type ContextReuseDeliveryEvidence } from "./context-reuse-types";
+import { CONTEXT_REUSE_PROTOCOL, type ContextReuseBaseline, type ContextReuseDeliveryEvidence, type ContextReuseValidation } from "./context-reuse-types";
 import { contextReusePageIdentity, contextReuseMatches, contextReuseBaseline, contextReusePredecessor } from "./context-reuse-lifecycle";
 import { recoveryStore } from "./continuity-recovery-runtime";
 import { taskUpdateDigest } from "./task-update-source";
@@ -208,6 +208,8 @@ interface TurnChannel {
   taskInputAckBoundary?: boolean;
   verificationPair?: string;
   contextPlans?: Map<string, ContextPlanRegistration>;
+  /** Verified evidence belongs to the bounded registered plan, independent of cache eviction. */
+  contextReuseBaselines?: Map<string, ContextReuseBaseline>;
   contextScope?: ContextScope;
   contextSent?: boolean;
   recovery?: RuntimeRecoveryReference;
@@ -898,6 +900,7 @@ export class TurnBroker implements TurnBrokerOwner {
     for (const current of this.channels.values()) {
       for (const plan of current.contextPlans?.values() ?? []) bytes += plan.snapshot.storage_bytes;
       if (current.contextScope) bytes += current.contextScope.registration.snapshot.storage_bytes;
+      for (const baseline of current.contextReuseBaselines?.values() ?? []) bytes += Buffer.byteLength(JSON.stringify(baseline));
     }
     for (const record of this.compactionContexts.values()) bytes += record.registration.snapshot.storage_bytes;
     for (const record of this.verificationPairs.values()) bytes += record.scope.registration.snapshot.storage_bytes;
@@ -908,23 +911,41 @@ export class TurnBroker implements TurnBrokerOwner {
   contextBootstrapAvailable(): boolean { return hasContextBootstrapCapabilities(contextProtocolCapabilities(CONTEXT_PROTOCOL_VERSION), CONTEXT_PROTOCOL_VERSION); }
   contextReuseAvailable(): boolean { return true; }
 
-  private reuseDependencyValid(channel: TurnChannel, registration: ContextPlanRegistration): boolean {
+  private validateReuseDependency(channel: TurnChannel, registration: ContextPlanRegistration): ContextReuseValidation {
     const dependency = registration.reuse?.dependency;
-    if (!dependency) return true;
+    if (!dependency) return { ready: true };
     const ref = channel.recovery;
-    if (!ref) return false;
+    if (!ref) return { ready: false, failure: "authority_changed" };
     try {
       const record = recoveryRecord(ref);
       const work = record.works[ref.logicalWorkId]!;
-      return record.currentWorkId === ref.logicalWorkId && record.owner.id === ref.ownerId
-        && !["lost", "unverified", "recovering", "stopped", "compacting"].includes(record.state)
-        && work.purpose === "ordinary" && work.attempts.at(-1)?.attempt === ref.attempt
-        && work.attempts.at(-1)?.epoch === record.epoch
-        && contextReusePredecessor(record, ref.logicalWorkId, dependency.predecessor)
-        && record.works[dependency.predecessor]?.state === "completed"
-        && contextReusePageIdentity(ref, record) === dependency.page_identity
-        && contextReuseMatches(this.reuseBaselines.get(dependency.page_identity), dependency);
-    } catch { return false; }
+      const attempt = work.attempts.at(-1);
+      if (record.currentWorkId !== ref.logicalWorkId || record.owner.id !== ref.ownerId || attempt?.writerRetired
+        || work.purpose !== "ordinary" || work.state === "stopped" || work.state === "completed"
+        || attempt?.attempt !== ref.attempt || attempt.epoch !== record.epoch) return { ready: false, failure: "authority_changed" };
+      if (record.pendingPreparation || ["lost", "unverified", "recovering", "stopped", "compacting"].includes(record.state)) {
+        return { ready: false, failure: "lifecycle_not_ready" };
+      }
+      if (contextReusePageIdentity(ref, record) !== dependency.page_identity) return { ready: false, failure: "page_changed" };
+      if (!contextReusePredecessor(record, ref.logicalWorkId, dependency.predecessor)) return { ready: false, failure: "lineage_mismatch" };
+      const baseline = channel.contextReuseBaselines?.get(registration.planId) ?? this.reuseBaselines.get(dependency.page_identity);
+      if (!baseline) return { ready: false, failure: "baseline_missing" };
+      return contextReuseMatches(baseline, dependency) ? { ready: true } : { ready: false, failure: "baseline_invalid" };
+    } catch { return { ready: false, failure: "verification_unavailable" }; }
+  }
+  private assertReuseDependency(channel: TurnChannel, registration: ContextPlanRegistration): void {
+    const validation = this.validateReuseDependency(channel, registration);
+    if (validation.ready) return;
+    const temporary = validation.failure === "verification_unavailable" || validation.failure === "lifecycle_not_ready";
+    // Preparation may replace an unsent plan only after a definite reuse miss.
+    // CONTEXT_BUSY preserves temporary failures across the Remote owner boundary.
+    throw contextError(temporary ? "CONTEXT_BUSY" : "CONTEXT_NOT_READY", JSON.stringify({
+      reuse_failure: validation.failure,
+      recovery_action: validation.failure === "verification_unavailable" ? "retry_verification"
+        : validation.failure === "lifecycle_not_ready" ? "resume_original_lifecycle" : "recover_full_plan",
+      message: temporary ? "Pause new work and recheck the original task when verification is available; do not resend the plan."
+        : "The context reuse dependency is invalid. Recover complete context through the original lifecycle; do not resend this plan.",
+    }));
   }
   commitContextReuse(token: string): ContextReuseBaseline | undefined {
     const completed = this.completedReuse.get(token);
@@ -945,20 +966,24 @@ export class TurnBroker implements TurnBrokerOwner {
   registerContextPlan(token: string, registration: ContextPlanRegistration, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope) throw contextError("CONTEXT_INVALID", "The context plan is already selected");
-    if (!this.reuseDependencyValid(channel, registration)) throw contextError("CONTEXT_NOT_READY", "The reuse baseline changed before preparation; recover a complete plan");
+    this.assertReuseDependency(channel, registration);
     const plans = channel.contextPlans ??= new Map();
-    this.assertContextStorage(registration.snapshot.storage_bytes);
+    const dependency = registration.reuse?.dependency;
+    const baseline = dependency ? this.reuseBaselines.get(dependency.page_identity)! : undefined;
+    this.assertContextStorage(registration.snapshot.storage_bytes + (baseline ? Buffer.byteLength(JSON.stringify(baseline)) : 0));
     if (plans.has(registration.planId)) throw contextError("CONTEXT_INVALID", "The context plan identity is already registered");
     if (plans.size >= 4) throw contextError("CONTEXT_BUDGET_EXCEEDED", "The bounded candidate plan limit was reached");
     // The wire round-trip validates a Remote owner's data and prevents later owner mutation.
     const snapshot = restoreContextSnapshot(serializeContextSnapshot(registration.snapshot));
     plans.set(registration.planId, { ...structuredClone({ ...registration, snapshot: undefined }), snapshot });
+    if (baseline) (channel.contextReuseBaselines ??= new Map()).set(registration.planId, structuredClone(baseline));
   }
 
   discardUnselectedContextPlans(token: string, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope || channel.contextSent || channel.safe?.launcherSent) throw contextError("CONTEXT_INVALID", "Selected or sent context plans cannot be discarded");
     channel.contextPlans?.clear();
+    channel.contextReuseBaselines?.clear();
     channel.activityRevision += 1;
   }
 
@@ -970,9 +995,10 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     const registration = channel.contextPlans?.get(planId);
     if (!registration) throw contextError("CONTEXT_INVALID", "Select a registered context plan");
-    if (!this.reuseDependencyValid(channel, registration)) throw contextError("CONTEXT_NOT_READY", "The reuse baseline changed before Send; recover a complete plan");
-    channel.contextScope = new ContextScope(token, registration, "normal", () => { channel.activityRevision += 1; }, error => this.revokeTrusted(token, error), undefined, () => this.reuseDependencyValid(channel, registration));
+    this.assertReuseDependency(channel, registration);
+    channel.contextScope = new ContextScope(token, registration, "normal", () => { channel.activityRevision += 1; }, error => this.revokeTrusted(token, error), undefined, () => this.validateReuseDependency(channel, registration));
     channel.contextPlans!.clear();
+    for (const id of channel.contextReuseBaselines?.keys() ?? []) if (id !== planId) channel.contextReuseBaselines!.delete(id);
     channel.contextScope.presentAttachments();
     this.activateContextReads(channel);
   }
@@ -980,7 +1006,7 @@ export class TurnBroker implements TurnBrokerOwner {
   markContextPlanSent(token: string, planId: string, context?: TaskUpdateOwnerContext): void {
     const channel = this.contextOwner(token, context);
     if (channel.contextScope?.registration.planId !== planId) throw contextError("CONTEXT_INVALID", "Send evidence must match the selected context plan");
-    if (!this.reuseDependencyValid(channel, channel.contextScope.registration)) throw contextError("CONTEXT_NOT_READY", "The fixed reuse baseline is no longer valid");
+    this.assertReuseDependency(channel, channel.contextScope.registration);
     channel.contextSent = true;
     this.activateContextReads(channel);
   }
@@ -1095,6 +1121,7 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (channel.contextScope) { this.retainContextUsage(token, channel.contextScope); channel.contextScope.retire(); }
     channel.contextScope = undefined; channel.contextPlans?.clear();
+    channel.contextReuseBaselines?.clear();
   }
 
   private activateContextReads(channel: TurnChannel): void {

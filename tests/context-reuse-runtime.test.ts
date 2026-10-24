@@ -4,7 +4,7 @@ import { appendFixedContextRecords, createContextSnapshot } from "../src/adapter
 import { CONTEXT_PROTOCOL_VERSION, ContextScope, type ContextPlanRegistration } from "../src/adapters/chatgpt-web/context-runtime";
 import { contextTextReadReceipt } from "../src/adapters/chatgpt-web/context-text-result";
 import { measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
-import { boundedContextReuse, contextReuseBaseline, contextReuseMatches } from "../src/adapters/chatgpt-web/context-reuse-lifecycle";
+import { boundedContextReuse, contextReuseBaseline, contextReuseMatches, contextReusePredecessor } from "../src/adapters/chatgpt-web/context-reuse-lifecycle";
 
 function registration(delivery: "inline" | "required" | "reuse", text = "规则🙂\n".repeat(1800)): ContextPlanRegistration {
   const snapshot = appendFixedContextRecords(createContextSnapshot(parseRequest({ model: "gpt-6", input: "new request" })),
@@ -75,7 +75,8 @@ test("reuse evidence requires actual inline entry delivery or complete successfu
 
 test("fixed reuse dependencies are checked again after reads and before successful completion", () => {
   let valid = true;
-  const scope = new ContextScope("current", registration("reuse"), "normal", () => {}, () => {}, undefined, () => valid);
+  const scope = new ContextScope("current", registration("reuse"), "normal", () => {}, () => {}, undefined,
+    () => valid ? { ready: true } : { ready: false, failure: "baseline_invalid" });
   try {
     scope.markEntryDelivered();
     expect(scope.status()).toMatchObject({ context_ready: true, reuse_ready: true, required_texts: 0 });
@@ -88,6 +89,26 @@ test("fixed reuse dependencies are checked again after reads and before successf
     expect(scope.notReady()?.structuredContent).toMatchObject({ code: "CONTEXT_NOT_READY", reuse_failure: "baseline_invalid", recovery_action: "recover_full_plan" });
     expect(() => scope.assertReady()).toThrow();
     expect(scope.usageEvidence().reuse_delivery).toBeUndefined();
+  } finally { scope.retire(); }
+});
+
+for (const failure of ["verification_unavailable", "lifecycle_not_ready"] as const)
+test(`temporary reuse verification reports ${failure} and permits a later readiness check`, () => {
+  let available = false;
+  const scope = new ContextScope("temporary-verification", registration("reuse"), "normal", () => {}, () => {}, undefined,
+    () => available ? { ready: true } : { ready: false, failure });
+  try {
+    scope.markEntryDelivered();
+    const blocked = scope.notReady();
+    expect(blocked?.structuredContent).toMatchObject({ context_ready: false, reuse_failure: failure,
+      recovery_action: failure === "verification_unavailable" ? "retry_verification" : "resume_original_lifecycle" });
+    expect(() => scope.assertReady()).toThrow();
+    const overview = scope.prepare("list", { context_id: scope.registration.snapshot.context_id, view: "overview" });
+    expect(overview.result.structuredContent).toMatchObject({ live: { reuse_failure: failure, reuse_ready: false } });
+    scope.finish(overview.receiptId, true);
+    available = true;
+    expect(scope.notReady()).toBeUndefined();
+    expect(scope.status()).not.toHaveProperty("reuse_failure");
   } finally { scope.retire(); }
 });
 
@@ -115,6 +136,152 @@ import { ContinuityRecoveryStore, continuityProcessInstance } from "../src/adapt
 import { TurnBroker, RemoteTurnBroker, callTurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptTurnSession, ChatGptTraceFeed, ChatGptTextFeed } from "../src/adapters/chatgpt-web/turn-execution";
 import type { ContextPreparedReply } from "../src/adapters/chatgpt-web/context-runtime";
+import { recoveryDigest } from "../src/adapters/chatgpt-web/continuity-recovery-runtime";
+import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
+import type { TaskUpdateTransfer, UpdateDelivery } from "../src/adapters/chatgpt-web/task-update-protocol";
+
+async function continuationFixture(manual: boolean) {
+  const directory = mkdtempSync(join(tmpdir(), "reuse-continuation-"));
+  new ContinuityRegistrationStore(directory).initialize();
+  const store = new ContinuityRecoveryStore(directory);
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory)); await broker.listen();
+  const owner = new RemoteTurnBroker(broker.socketPath);
+  const scope = "2".repeat(64), digest = "3".repeat(64), processOwner = continuityProcessInstance("4".repeat(64));
+  const environment = { authorityMode: "delegated" as const, threadId: "native-thread", turnId: "native-turn",
+    tools: [{ name: "exec_command", description: "Simulated command", parameters: {
+      type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }] };
+  const completedBaseline = async (thread: string) => {
+    store.admitWork({ thread, scope, owner: processOwner, logicalWorkId: "A", instructionIdentity: "instruction-A",
+      nativeTurnId: "turn-A", workPayloadDigest: digest, snapshotDigest: digest, createPage: true, dispatchProtocolComplete: true });
+    const token = await owner.register(environment, undefined, "reuse-source", {
+      recovery: { directory, thread, logicalWorkId: "A", attempt: 0, ownerId: processOwner.id } });
+    const plan = registration("inline", "exact stable rule");
+    await owner.registerContextPlan(token, plan); await owner.selectContextPlan(token, plan.planId);
+    await owner.markContextPlanSent(token, plan.planId);
+    const fence = await owner.beginCompletionFence(token);
+    expect(await owner.commitCompletionFence(token, fence!)).toBeTrue();
+    store.completeWork(thread, { scope }, "A", { receiptId: "final-A", digest });
+    return (await owner.commitContextReuse(token))!;
+  };
+  const thread = "1".repeat(64);
+  const baseline = await completedBaseline(thread);
+  store.admitWork({ thread, scope, owner: processOwner, logicalWorkId: "B", instructionIdentity: "instruction-B",
+    nativeTurnId: "turn-B", workPayloadDigest: digest, snapshotDigest: digest, dispatchProtocolComplete: true,
+    instructionPrevious: { instructionIdentity: "instruction-A", nativeTurnId: "turn-A" } });
+  const options = { recovery: { directory, thread, logicalWorkId: "B", attempt: 0, ownerId: processOwner.id }, taskUpdateProtocol: 1 as const };
+  const token = manual ? await owner.registerSafe(environment, "surface-continuation-123456789", undefined, "reuse-continuation", { ...options, requireSentConfirmation: false })
+    : await owner.register(environment, undefined, "reuse-continuation", options);
+  const request = { token, contract: manual ? "safe" as const : "native" as const, credentialKind: "ordinary" as const,
+    contextProtocol: CONTEXT_PROTOCOL_VERSION, contextBootstrapProtocol: "context-bootstrap-v1", contextReuseProtocol: "context-reuse-v1" };
+  const plan = registration("reuse", "exact stable rule");
+  plan.reuse!.dependency = { baseline_id: baseline.baseline_id, page_identity: baseline.page_identity, predecessor: "A",
+    units: baseline.units.map(({ unit_id, fingerprint }) => ({ unit_id, fingerprint })) };
+  const context = { expectedDriverGeneration: 0, taskRevision: 0 };
+  await owner.registerContextPlan(token, plan, context);
+  return { directory, store, broker, owner, thread, scope, digest, environment, token, request, plan, context,
+    completedBaseline,
+    async start() {
+      await owner.selectContextPlan(token, plan.planId, context);
+      if (manual) {
+        const started = await callTurnBroker<{ contextBootstrapReceipt: string }>(broker.socketPath, { ...request, method: "safe_start" });
+        await callTurnBroker(broker.socketPath, { ...request, method: "context_return", receiptId: started.contextBootstrapReceipt, sent: true });
+      } else await owner.markContextPlanSent(token, plan.planId, context);
+    },
+    async close() { await broker.close(); rmSync(directory, { recursive: true, force: true }); } };
+}
+
+for (const manual of [false, true]) test(`active reuse survives repeated accepted appends (${manual ? "safe" : "native"})`, async () => {
+  const f = await continuationFixture(manual);
+  try {
+    await f.start();
+    for (let revision = 1; revision <= 3; revision++) {
+      const operationId = revision * 2 - 1;
+      const pending = await callTurnBroker<NativeOperationReply>(f.broker.socketPath, { ...f.request,
+        method: "native_operation_start", nativeWaitProtocol: 1, taskUpdateProtocol: 1, taskRevision: revision - 1,
+        operationId, entry: "codex_exec", nativeInput: { cmd: "must not execute" }, waitMs: 1 });
+      expect(pending.kind).toBe("pending");
+      const content = `Append instruction ${revision}`;
+      const transfer: TaskUpdateTransfer = { transferId: `append-transfer-${revision}`, payloadDigest: `append-payload-${revision}`,
+        expectedDriverGeneration: revision - 1, expectedRevision: revision - 1, environment: f.environment,
+        mode: "continuity", batchFingerprint: `append-batch-${revision}`, results: [],
+        updates: [{ revision, sourceMessageId: `append-${revision}`, payloadDigest: recoveryDigest(content), content }],
+        recovery: { logicalWorkId: `append-${revision}`, instructionIdentity: `append-${revision}`, nativeTurnId: "turn-B",
+          workPayloadDigest: f.digest, snapshotDigest: f.digest, localSessionId: "session-B", localTaskRevision: revision, results: [] } };
+      const context = { expectedDriverGeneration: revision - 1, taskRevision: revision - 1 };
+      await f.owner.reserveTaskUpdate(f.token, transfer.transferId, transfer.payloadDigest, context, true);
+      expect(await f.owner.acceptTaskUpdate(f.token, transfer)).toMatchObject({ status: "committed" });
+      const reply = await callTurnBroker<NativeOperationReply & { taskUpdate: UpdateDelivery }>(f.broker.socketPath, {
+        ...f.request, method: "native_operation_wait", nativeWaitProtocol: 1, operationId, waitMs: 1 });
+      expect(reply.taskUpdate.updates.map(update => update.content)).toEqual([content]);
+      await callTurnBroker(f.broker.socketPath, { ...f.request, method: "task_update_ack", taskUpdateProtocol: 1,
+        deliveryId: reply.taskUpdate.deliveryId, throughRevision: revision });
+      expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: true, reuse_ready: true });
+      const inventory = await callTurnBroker<NativeOperationReply>(f.broker.socketPath, { ...f.request,
+        method: "native_operation_start", nativeWaitProtocol: 1, taskUpdateProtocol: 1, taskRevision: revision,
+        operationId: revision * 2, entry: "codex_tool_inventory", nativeInput: {} });
+      expect(inventory.kind).toBe("result");
+      expect(inventory.kind === "result" && inventory.result.isError).not.toBe(true);
+    }
+    const record = f.store.get(f.thread)!;
+    expect(contextReusePredecessor(record, "append-3", "A")).toBeTrue();
+    // A valid append chain must not bridge another lineage, page epoch, history,
+    // stopped ancestor, or a predecessor that still has execution authority.
+    for (const change of [
+      (copy: typeof record) => { copy.works["append-2"]!.workLineageId = "another-lineage"; },
+      (copy: typeof record) => { copy.works["append-2"]!.attempts[0]!.epoch++; },
+      (copy: typeof record) => { copy.works["append-2"]!.attempts[0]!.historyRevision++; },
+      (copy: typeof record) => { copy.works["append-2"]!.state = "stopped"; },
+      (copy: typeof record) => { copy.works["append-2"]!.attempts[0]!.writerRetired = false; },
+      (copy: typeof record) => { copy.works["append-2"]!.acceptedTaskRevision++; },
+      (copy: typeof record) => { copy.works["append-2"]!.predecessorLogicalWorkId = "append-3"; },
+    ]) {
+      const copy = structuredClone(record); change(copy);
+      expect(contextReusePredecessor(copy, "append-3", "A")).toBeFalse();
+    }
+    const context = { expectedDriverGeneration: 3, taskRevision: 3, acknowledgedRevision: 3 };
+    if (manual) await callTurnBroker(f.broker.socketPath, { ...f.request, method: "safe_complete", taskUpdateProtocol: 1,
+      taskRevision: 3, finalAnswer: "Completed appended work" });
+    else {
+      const fence = await f.owner.beginCompletionFence(f.token, context);
+      expect(await f.owner.commitCompletionFence(f.token, fence!, context)).toBeTrue();
+    }
+    expect(f.store.get(f.thread)!.works["append-3"]!.taskUpdateJournal).toMatchObject({ acceptedRevision: 3, acknowledgedRevision: 3 });
+  } finally { await f.close(); }
+});
+
+test("registered and active reuse retain their evidence when other pages evict the baseline cache", async () => {
+  const f = await continuationFixture(false);
+  try {
+    for (let index = 0; index < 129; index++) await f.completedBaseline(recoveryDigest(`other-page-${index}`));
+    await f.start();
+    expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: true, reuse_ready: true });
+    for (let index = 0; index < 129; index++) await f.completedBaseline(recoveryDigest(`active-other-page-${index}`));
+    expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: true, reuse_ready: true });
+    f.store.stopWork(f.thread, { scope: f.scope }, "B", "user-stop");
+    expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: false, reuse_ready: false });
+    await expect(f.owner.beginCompletionFence(f.token, f.context)).rejects.toBeDefined();
+  } finally { await f.close(); }
+}, 30_000);
+
+for (const manual of [false, true]) for (const stage of ["register", "select", "sent"] as const)
+test(`reuse admission pauses during recovery and resumes the same plan (${manual ? "safe" : "native"}, ${stage})`, async () => {
+  const f = await continuationFixture(manual);
+  try {
+    if (stage === "register") await f.owner.discardUnselectedContextPlans(f.token, f.context);
+    if (stage === "sent") await f.owner.selectContextPlan(f.token, f.plan.planId, f.context);
+    const admit = () => stage === "register" ? f.owner.registerContextPlan(f.token, f.plan, f.context)
+      : stage === "select" ? f.owner.selectContextPlan(f.token, f.plan.planId, f.context)
+      : f.owner.markContextPlanSent(f.token, f.plan.planId, f.context);
+    f.store.transact(f.thread, { scope: f.scope }, record => { record.state = "recovering"; });
+    const error = await admit().then(() => undefined, error => error);
+    expect(error).toMatchObject({ code: "CONTEXT_BUSY" });
+    expect(JSON.parse(error.message)).toMatchObject({ reuse_failure: "lifecycle_not_ready", recovery_action: "resume_original_lifecycle" });
+    f.store.transact(f.thread, { scope: f.scope }, record => { record.state = "running"; });
+    await admit();
+    await f.start();
+    expect(await f.owner.contextStatus(f.token)).toMatchObject({ plan_id: f.plan.planId, context_ready: true, reuse_ready: true });
+  } finally { await f.close(); }
+});
 
 for (const manual of [false, true]) for (const followup of ["directory-after", "overview-after", "overview-before"] as const)
 test(`late startup receipts retain startup identity and the original business boundary (${manual ? "safe" : "native"}, ${followup})`, async () => {
