@@ -249,13 +249,26 @@ for (const manual of [false, true]) test(`active reuse survives repeated accepte
   } finally { await f.close(); }
 });
 
-test("registered and active reuse retain their evidence when other pages evict the baseline cache", async () => {
+for (const stage of ["registered", "active"] as const)
+test(`${stage} reuse retains its evidence when other pages evict the baseline cache`, async () => {
   const f = await continuationFixture(false);
   try {
-    for (let index = 0; index < 129; index++) await f.completedBaseline(recoveryDigest(`other-page-${index}`));
-    await f.start();
-    expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: true, reuse_ready: true });
-    for (let index = 0; index < 129; index++) await f.completedBaseline(recoveryDigest(`active-other-page-${index}`));
+    if (stage === "active") await f.start();
+    for (let index = 0; index < 129; index++) {
+      const thread = recoveryDigest(`other-page-${index}`);
+      await f.completedBaseline(thread);
+      // Completed pages still occupy the broker cache. Retire their disk records
+      // so each fixture write stays bounded instead of rewriting every prior page.
+      expect(f.store.removePage(thread, f.store.get(thread)!)).toBeTrue();
+    }
+    // A new registration has no pinned evidence and must observe the real miss.
+    const probe = await f.owner.register(f.environment, undefined, "reuse-eviction-probe", {
+      recovery: { directory: f.directory, thread: f.thread, logicalWorkId: "B", attempt: 0,
+        ownerId: f.store.get(f.thread)!.owner.id }, taskUpdateProtocol: 1 });
+    const miss = await f.owner.registerContextPlan(probe, f.plan, f.context).then(() => undefined, error => error);
+    expect(miss).toMatchObject({ code: "CONTEXT_NOT_READY" });
+    expect(JSON.parse(miss.message)).toMatchObject({ reuse_failure: "baseline_missing" });
+    if (stage === "registered") await f.start();
     expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: true, reuse_ready: true });
     f.store.stopWork(f.thread, { scope: f.scope }, "B", "user-stop");
     expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: false, reuse_ready: false });
