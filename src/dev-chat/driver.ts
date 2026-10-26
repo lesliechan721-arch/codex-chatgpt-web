@@ -407,7 +407,6 @@ export function createLauncherDevAdapter(
       turnTimeoutMs: 60 * 60_000,
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
-      useSavedChats: config.useSavedChats,
     },
   }, { broker });
   return { broker, adapterFactory };

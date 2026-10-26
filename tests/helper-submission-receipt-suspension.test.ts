@@ -44,7 +44,7 @@ function helperFixture(body: string, compaction = true) {
   const client = new LauncherBrowserHelperClient({ appName: "Codex Native5", browserHost: "launcher",
     browserHostDescriptorPath: descriptor, browserHelperScriptPath: script,
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false });
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false });
   const sent: string[] = [];
   const internal = client as unknown as { send(frame: { type: string; id?: string }): Promise<void> };
   const send = internal.send.bind(client);

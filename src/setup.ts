@@ -63,7 +63,6 @@ export interface SetupOptions {
   composerPredictionsEnabled?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalFreshConversationPerTurn?: boolean;
-  useSavedChats?: boolean;
   zeroRiskProEnabled?: boolean;
   zeroRiskRequireSentConfirmation?: boolean;
   replaceCodexRoute?: boolean;
@@ -161,7 +160,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     composerPredictionsEnabled: before.composerPredictionsEnabled,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
-    useSavedChats: before.useSavedChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     zeroRiskRequireSentConfirmation: before.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: before.autoApproveToolCalls,
@@ -194,7 +192,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     composerPredictionsEnabled: after.composerPredictionsEnabled,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
-    useSavedChats: after.useSavedChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     zeroRiskRequireSentConfirmation: after.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: after.autoApproveToolCalls,
@@ -316,7 +313,6 @@ function baseConfig(
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }
-  if (options.useSavedChats !== undefined) config.useSavedChats = options.useSavedChats;
   if (options.experimentalFreshConversationPerTurn !== undefined) {
     config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
   }

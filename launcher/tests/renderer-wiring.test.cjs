@@ -774,14 +774,10 @@ test("external model catalog export-required state directs the user to export in
   assert.doesNotMatch(retryCondition, /export-required/);
 });
 
-test("API-key and remote forwarding bypass catalog validation while invalid policy fails closed", () => {
+test("API-key and remote forwarding bypass local catalog diagnostics", () => {
   assert.match(
     appSource,
     /function requiresCodexCatalog[\s\S]*?snapshot\.apiAccessMode !== "api-key"[\s\S]*?snapshot\.toolAuthority\.source !== "remote-bind"/,
-  );
-  assert.match(
-    appSource,
-    /function codexCatalogReady[\s\S]*?snapshot\.apiAccessMode !== "invalid"[\s\S]*?!requiresCodexCatalog\(snapshot\)[\s\S]*?snapshot\.state\.codexCatalogVerified === true/,
   );
   assert.match(
     electronMain,
@@ -793,9 +789,9 @@ test("API-key and remote forwarding bypass catalog validation while invalid poli
   );
   assert.match(
     appSource,
-    /manualInteraction[\s\S]*?\|\| configuringInactiveMode[\s\S]*?\|\| catalogReady[\s\S]*?copy\.mcpStepTwoHint/,
+    /manualInteraction \|\| configuringInactiveMode \|\| snapshot\.state\.coreSetupComplete[\s\S]*?copy\.mcpStepTwoHint/,
   );
-  assert.match(appSource, /snapshot\.state\.coreSetupComplete !== true[\s\S]*?\|\| !catalogReady/);
+  assert.doesNotMatch(appSource, /\|\| !catalogReady/);
 });
 
 test("API access mode changes refresh the catalog requirement", () => {
@@ -882,6 +878,52 @@ test("API access settle retries catalog state reset after the committed notifica
   assert.equal(state.codexRestartRequired, true);
   assert.equal(started, 1);
   assert.equal(warnings.length, 1);
+});
+
+test("installed integration can connect MCP while the native catalog refresh is pending", async () => {
+  const ts = require("typescript");
+  const vm = require("node:vm");
+  const surfaces = appSource.slice(appSource.indexOf("function SetupSurface("), appSource.indexOf("function SettingsSurface("));
+  const transpile = (source, fileName) => ts.transpileModule(source, { fileName,
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "element" } }).outputText;
+  const translated = { exports: {} };
+  vm.runInNewContext(transpile(fs.readFileSync(path.join(launcherRoot, "src", "i18n.ts"), "utf8"), "i18n.ts"), translated);
+  let connected = 0;
+  const sandbox = {
+    element: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState: value => [value, () => {}], useMemo: callback => callback(), useEffect() {},
+    React: { Fragment: "Fragment" },
+    AnimatePresence: "AnimatePresence", motion: { section: "section" }, PANEL_TRANSITION: {},
+    MCP_GUIDE_MEDIA: ["fixture", "fixture", "fixture"], messageOf: String,
+    requiresCodexCatalog: () => true,
+    api: { setupMcp: async () => { connected++; }, snapshot: async () => ({ state: {} }), setMcpStep: async () => ({}) },
+  };
+  for (const name of ["ContentSurface", "SectionHeading", "SetupRow", "PrimaryButton", "SecondaryButton", "NoticeRow", "Icon", "DoctorSummary", "FieldRow", "ZeroRiskModelMenu", "McpMark", "TutorialVideo"]) sandbox[name] = name;
+  vm.runInNewContext(transpile(surfaces, "surfaces.tsx") + "\nrenderSetup = SetupSurface; renderMcp = McpSurface;", sandbox);
+  const visit = tree => Array.isArray(tree) ? tree.flatMap(visit) : tree && typeof tree === "object"
+    ? [tree, ...visit(tree.children ?? [])] : [];
+  for (const language of ["en", "zh-CN", "ja", "ko", "zh-TW"]) {
+    const copy = translated.exports.copyFor(language);
+    for (const installed of [false, true]) {
+      const snapshot = { state: { browserInteractionMode: "automatic", coreSetupComplete: installed,
+        codexCatalogVerified: false, codexRestartRequired: true, mcpGuideStep: 1 },
+        smokePassed: true, mcpCredentialsConfigured: true };
+      const base = { snapshot, copy, devProfile: false, operation: null, updateState() {}, setError(error) { if (error) throw new Error(error); } };
+      const setup = visit(sandbox.renderSetup({ ...base, activateBrowser: async () => {}, browser: { authenticated: true }, showMcp() {} }));
+      assert.equal(setup.find(node => node.type === "SetupRow" && node.props.index === 3).props.complete, installed);
+      assert.equal(setup.find(node => node.props.className === "next-surface-row").props.disabled, !installed);
+      assert.ok(setup.some(node => node.type === "NoticeRow" && node.children.includes(copy.restartCodex)));
+      const mcp = visit(sandbox.renderMcp({ ...base, language, interactionMode: "automatic", onDone() {} }));
+      const connect = mcp.find(node => node.type === "PrimaryButton" && node.children.includes(copy.reconnect));
+      assert.ok(connect);
+      assert.equal(connect.props.disabled, !installed);
+      assert.equal(mcp.some(node => node.type === "NoticeRow" && node.children.includes(copy.mcpCoreSetupRequired)), !installed);
+      if (installed) await connect.props.onClick();
+      assert.equal(snapshot.state.codexCatalogVerified, false, "connecting must not fabricate native catalog verification");
+    }
+  }
+  assert.equal(connected, 5);
 });
 
 test("MCP navigation remains locked while an operation is active", () => {
@@ -1162,16 +1204,15 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
   const vm = require("node:vm");
   for (const [property, method, channel, nextChannel] of [
     ["composerPredictionsEnabled", "setComposerPredictions", "launcher:composer-predictions", "launcher:skill-attachments"],
-    ["experimentalFreshConversationPerTurn", "setFreshConversationPerTurn", "launcher:fresh-conversation-per-turn", "launcher:use-saved-chats"],
-    ["useSavedChats", "setUseSavedChats", "launcher:use-saved-chats", "launcher:auto-approve-tool-calls"],
+    ["experimentalFreshConversationPerTurn", "setFreshConversationPerTurn", "launcher:fresh-conversation-per-turn", "launcher:auto-approve-tool-calls"],
     ["autoApproveToolCalls", "setAutoApproveToolCalls", "launcher:auto-approve-tool-calls", "launcher:zero-risk-pro"],
   ]) {
     const source = electronMain.slice(
       electronMain.indexOf(`handle("${channel}",`),
       electronMain.indexOf(`handle("${nextChannel}",`),
     );
-    const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
-    const config = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useSavedChats: false, autoApproveToolCalls: false };
+    const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, autoApproveToolCalls: false };
+    const config = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, autoApproveToolCalls: false };
     const events = [];
     let handler, finishSetup, setupFailure, calls = 0;
     const browserHost = { activeTraceId: "running-turn", currentOperation: () => null, turnTabs: new Map() };
@@ -1220,7 +1261,7 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
 test("old runtime configuration keeps predictions off until explicitly enabled", () => {
   const vm = require("node:vm");
   const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
-    useSavedChats: false, autoApproveToolCalls: false, experimentalBiggerContext: false, biggerContextAvailable: false };
+    autoApproveToolCalls: false, experimentalBiggerContext: false, biggerContextAvailable: false };
   const events = [];
   const context = vm.createContext({
     stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
@@ -1299,7 +1340,7 @@ test("retired Bigger Context configuration does not retire chats or alter contin
   const vm = require("node:vm");
   const { continuityLease } = require("../electron/continuity-lease.cjs");
   const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
-    useSavedChats: true, autoApproveToolCalls: false };
+    autoApproveToolCalls: false };
   const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
     traceId: "continuity-trace", continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32),
     continuityLastSuccessAt: Date.now(), view: { webContents: { isDestroyed: () => false } } };
@@ -1343,9 +1384,9 @@ test("retired Bigger Context configuration does not retire chats or alter contin
 
 test("broader persistence changes still require the continuity lease before releasing its page", () => {
   const vm = require("node:vm");
-  for (const property of ["useSavedChats", "experimentalFreshConversationPerTurn"]) {
+  for (const property of ["experimentalFreshConversationPerTurn"]) {
     const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
-      useSavedChats: false, autoApproveToolCalls: false, biggerContextAvailable: true };
+      autoApproveToolCalls: false, biggerContextAvailable: true };
     const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
       continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32), view: { webContents: { isDestroyed: () => false } } };
     const tabs = new Map([[continuity.id, continuity]]);

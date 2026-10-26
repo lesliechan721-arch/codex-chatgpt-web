@@ -1661,16 +1661,6 @@ test("fresh-conversation preference uses production and DEV setup without forcin
       await assert.rejects(() => fixture.host.setFreshConversationPerTurn(false), /Initialize|Zero Risk/);
       assert.equal(fixture.invocation(), undefined);
     }
-    for (const interaction of ["automatic", "manual"]) {
-      const saved = makeHost({ mode: "full", browserInteractionMode: interaction }, interaction);
-      for (const enabled of [true, false]) {
-        await saved.host.setUseSavedChats(enabled);
-        assert.equal(saved.invocation().args.includes(enabled ? "--saved-chats" : "--temporary-chats"), true);
-        assert.equal(saved.invocation().args.includes("--full"), true);
-        assert.equal(saved.invocation().args.includes("--fresh-conversation"), false);
-      }
-      await assert.rejects(() => saved.host.setUseSavedChats("true"), /boolean/);
-    }
     const fixture = makeHost({ mode: "browser-only", browserInteractionMode: "automatic" });
     await assert.rejects(() => fixture.host.setFreshConversationPerTurn("true"), /boolean/);
     assert.equal(fixture.invocation(), undefined);

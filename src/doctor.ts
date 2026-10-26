@@ -63,56 +63,75 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
   return undefined;
 }
 
-async function proxyCheck(config: AppConfig, accessPolicy: ApiAccessPolicy): Promise<DoctorCheck> {
+function modelCatalogCheck(health: Record<string, unknown>): DoctorCheck {
+  const result = health.last_model_catalog_result as { status?: unknown; failure?: { stage?: unknown; code?: unknown } } | null | undefined;
+  if (!result || !Number.isInteger(result.status)) {
+    return { id: "model-catalog", status: "warning", message: "This runtime has not observed a completed Codex model-list request yet" };
+  }
+  const status = result.status as number;
+  if (status >= 200 && status < 300) {
+    return { id: "model-catalog", status: "ok", message: "Codex's latest model-list request succeeded" };
+  }
+  const stage = ["config", "request", "transport", "upstream", "catalog"].includes(String(result.failure?.stage))
+    ? String(result.failure!.stage) : undefined;
+  const code = typeof result.failure?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(result.failure.code)
+    ? result.failure.code : undefined;
+  return {
+    id: "model-catalog", status: "error", message: "Codex's latest model-list request failed; the local runtime is reachable",
+    detail: [`HTTP ${status}`, stage, code].filter(Boolean).join("; "),
+  };
+}
+
+async function proxyChecks(config: AppConfig, accessPolicy: ApiAccessPolicy): Promise<DoctorCheck[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2_000);
   try {
     const response = await fetch(`http://${config.host}:${config.port}/healthz`, { signal: controller.signal });
-    if (!response.ok) return { id: "proxy", status: "error", message: `Responses proxy returned HTTP ${response.status}` };
+    if (!response.ok) return [{ id: "proxy", status: "error", message: `Responses proxy returned HTTP ${response.status}` }];
     const body = await response.json() as Record<string, unknown>;
     if (body.service !== "codex-chatgpt-web" || body.status !== "ok") {
-      return { id: "proxy", status: "error", message: "The configured port belongs to another service" };
+      return [{ id: "proxy", status: "error", message: "The configured port belongs to another service" }];
     }
     if (body.mode !== config.mode) {
-      return { id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` };
+      return [{ id: "proxy", status: "error", message: `Daemon is running in ${String(body.mode)} mode; config requires ${config.mode}` }];
     }
     if (body.version !== config.releaseVersion) {
-      return { id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` };
+      return [{ id: "proxy", status: "error", message: `Daemon version is ${String(body.version)}; config requires ${config.releaseVersion}` }];
     }
     if (body.api_access_revision !== apiAccessRevision(accessPolicy, config.controlToken)) {
-      return {
+      return [{
         id: "proxy",
         status: "error",
         message: "Responses proxy has not loaded the current API access configuration",
         detail: `Daemon access mode is ${String(body.access_mode)}; config requires ${accessPolicy.mode}`,
-      };
+      }];
     }
     if (body.accepting_turns !== true) {
-      return {
+      return [{
         id: "proxy",
         status: "error",
         message: "Responses proxy is still drained and is not accepting Codex turns",
-      };
+      }];
     }
     const ownershipError = launcherOwnershipError(config, body);
     if (ownershipError) {
-      return { id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError };
+      return [{ id: "proxy", status: "error", message: "Responses proxy ownership could not be verified", detail: ownershipError }];
     }
     const metadataRepairCount = body.upstream_metadata_repair_count;
     if (Number.isInteger(metadataRepairCount) && (metadataRepairCount as number) > 0) {
       const repairMessage = metadataRepairCount === 1
         ? "1 upstream model metadata configuration requires repair"
         : `${String(metadataRepairCount)} upstream model metadata configurations require repair`;
-      return {
+      return [{
         id: "proxy",
         status: "warning",
         message: `Responses proxy is healthy but ${repairMessage}`,
-      };
+      }, modelCatalogCheck(body)];
     }
-    return { id: "proxy", status: "ok", message: `Responses proxy is healthy on 127.0.0.1:${config.port}` };
+    return [{ id: "proxy", status: "ok", message: `Responses proxy is healthy on 127.0.0.1:${config.port}` }, modelCatalogCheck(body)];
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    return { id: "proxy", status: "error", message: "Responses proxy is not reachable", detail };
+    return [{ id: "proxy", status: "error", message: "Responses proxy is not reachable", detail }];
   } finally {
     clearTimeout(timeout);
   }
@@ -190,8 +209,8 @@ export async function runDoctor(): Promise<DoctorReport> {
     }
   }
 
-  const proxy = await proxyCheck(config, accessPolicy);
-  const apiKeyMode = accessPolicy.mode === "api-key" && proxy.status !== "error";
+  const proxy = await proxyChecks(config, accessPolicy);
+  const apiKeyMode = accessPolicy.mode === "api-key" && proxy[0]?.status !== "error";
   const codex = inspectCodexIntegration();
   if (apiKeyMode && !codex.installed) {
     checks.push({
@@ -231,7 +250,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "service", status: "ok", message: "macOS background service is loaded" });
   }
-  checks.push(proxy);
+  checks.push(...proxy);
 
   if (config.mode === "full") {
     const settings = config.tunnel!;

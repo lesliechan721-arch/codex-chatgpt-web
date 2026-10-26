@@ -21,7 +21,6 @@ const DEFAULT_STATE = Object.freeze({
   composerPredictionsEnabled: false,
   experimentalSkillAttachments: false,
   experimentalFreshConversationPerTurn: false,
-  useSavedChats: true,
   zeroRiskProEnabled: false,
   zeroRiskRequireSentConfirmation: true,
   networkProxyUrl: null,
@@ -46,6 +45,7 @@ function readState(filePath) {
     delete state.bridgeEnabled;
     delete state.experimentalBiggerContext;
     delete state.biggerContextAvailable;
+    delete state.useSavedChats;
     if (state.language !== null && (typeof state.language !== "string" || !Object.hasOwn(languages, state.language))) {
       state.language = DEFAULT_STATE.language;
     }
@@ -60,7 +60,6 @@ function readState(filePath) {
       "composerPredictionsEnabled",
       "experimentalSkillAttachments",
       "experimentalFreshConversationPerTurn",
-      "useSavedChats",
       "zeroRiskProEnabled",
       "zeroRiskRequireSentConfirmation",
       "browserSmokePassed",
@@ -139,6 +138,7 @@ function createStateStore(filePath) {
       const next = { ...state, ...patch, version: 1 };
       delete next.experimentalBiggerContext;
       delete next.biggerContextAvailable;
+      delete next.useSavedChats;
       writeState(filePath, next);
       state = next;
       return structuredClone(next);

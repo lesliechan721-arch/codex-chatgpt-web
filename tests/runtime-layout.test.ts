@@ -15,6 +15,7 @@ import {
   loadConfig,
   loadConfigForSetup,
   legacyChatGptConnectorMigrationMessage,
+  saveConfig,
   providerConfig,
   resolveBrokerEndpoint,
   resolveInteractionConnectorIdentities,
@@ -191,7 +192,7 @@ test.each([
   expect(loaded.automaticAppName).toBe("Codex Native2");
   expect(loaded.manualAppName).toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
   expect(loaded.contextWindow).toBe(123_456);
-  expect(loaded.useSavedChats).toBe(true);
+  expect(loaded).not.toHaveProperty("useSavedChats");
   if (mode === "full") {
     expect(loaded.automaticTunnel).toEqual(automaticTunnel);
     expect(loaded.manualTunnel).toEqual(manualTunnel);
@@ -343,41 +344,31 @@ test("manual provider configuration preserves a distinct backend without guessin
   });
 });
 
-test("conversation preferences survive reload; saved chats also apply to Zero Risk", () => {
+test("retired chat preferences are removed without changing current configuration", () => {
   const root = join(tmpdir(), `codex-web-fresh-config-${process.pid}-${Date.now()}`);
   roots.push(root);
   process.env.CODEX_CHATGPT_WEB_HOME = root;
   mkdirSync(root, { recursive: true });
-  const config: Record<string, unknown> = { ...defaultConfig("browser-only") };
-  const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
-  expect(config.experimentalFreshConversationPerTurn).toBe(false);
-  expect(config.useSavedChats).toBe(true);
-  delete config.useSavedChats;
-  delete config.experimentalFreshConversationPerTurn;
-  persist();
-  expect(loadConfig()!.experimentalFreshConversationPerTurn).toBe(false);
-  expect(loadConfig()!.useSavedChats).toBe(true);
-  config.useSavedChats = false;
-  persist();
-  expect(loadConfigForSetup().useSavedChats).toBe(false);
-  expect(providerConfig(loadConfig()!).chatgptWeb!.useSavedChats).toBe(false);
-  config.useSavedChats = true;
-  config.experimentalFreshConversationPerTurn = true;
-  persist();
-  const loaded = loadConfig()!;
-  expect(providerConfig(loaded).chatgptWeb!.useSavedChats).toBe(true);
-  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" }).chatgptWeb!.useSavedChats).toBe(true);
-  expect(providerConfig(loaded).chatgptWeb!.experimentalFreshConversationPerTurn).toBe(true);
-  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" })
-    .chatgptWeb!.experimentalFreshConversationPerTurn).toBe(false);
-  expect(loaded.experimentalFreshConversationPerTurn).toBe(true);
-  config.experimentalFreshConversationPerTurn = "true";
-  persist();
+  const original = { ...defaultConfig("browser-only"), experimentalFreshConversationPerTurn: true,
+    composerPredictionsEnabled: false, autoApproveToolCalls: true, toolAuthorityMode: "delegated" as const,
+    zeroRiskRequireSentConfirmation: false };
+  expect(original).not.toHaveProperty("useSavedChats");
+  for (const useSavedChats of [undefined, false, true, "retired-value"]) {
+    writeFileSync(join(root, "config.json"), JSON.stringify({ ...original, useSavedChats }));
+    for (const loaded of [loadConfig(), loadConfigForSetup()]) {
+      expect(loaded).toEqual(original);
+      expect(providerConfig(loaded).chatgptWeb).not.toHaveProperty("useSavedChats");
+      expect(providerConfig(loaded).chatgptWeb!.experimentalFreshConversationPerTurn).toBe(true);
+      expect(providerConfig({ ...loaded, browserInteractionMode: "manual" }).chatgptWeb)
+        .not.toHaveProperty("useSavedChats");
+      expect(providerConfig({ ...loaded, browserInteractionMode: "manual" })
+        .chatgptWeb!.experimentalFreshConversationPerTurn).toBe(false);
+      saveConfig(loaded);
+      expect(JSON.parse(readFileSync(join(root, "config.json"), "utf8"))).toEqual(original);
+    }
+  }
+  writeFileSync(join(root, "config.json"), JSON.stringify({ ...original, experimentalFreshConversationPerTurn: "true" }));
   expect(() => loadConfig()).toThrow("experimentalFreshConversationPerTurn");
-  config.experimentalFreshConversationPerTurn = false;
-  config.useSavedChats = "true";
-  persist();
-  expect(() => loadConfig()).toThrow("useSavedChats");
 });
 
 test("composer predictions default off for existing configurations and persist an explicit opt-in", () => {

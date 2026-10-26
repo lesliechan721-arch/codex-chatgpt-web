@@ -30,16 +30,22 @@ The safe-log export is separate and does not include these browser checkpoint fi
 
 ## Models do not appear, or setup remains on step 3
 
-**Install models** updates the Codex route, but a running Codex process keeps its old model catalog.
-Fully quit every Codex Desktop window and Codex CLI process, then reopen Codex while the launcher is
-still running. The launcher should move from **Restart Codex** to a verified catalog state.
+**Install models** updates the Codex route. Once installation finishes, step 3 is complete and you
+can connect MCP. The launcher checks model loading separately; waiting for that check does not
+prevent MCP setup.
+
+A running Codex process can keep its old model catalog. If **(Web)** models are missing, fully quit
+every Codex Desktop window and Codex CLI process, then reopen Codex while the launcher is still
+running. If a **(Web)** model already answers successfully, you do not need to reinstall just because
+the launcher has not observed a new model-list request.
 
 If the models still do not appear:
 
 - confirm that **Codex itself** uses ChatGPT sign-in; signing into the launcher's browser is separate.
   An API-key or signed-out Codex session can show only its built-in catalog without contacting the bridge;
 - open **Setup → Install into Codex** and click **Reinstall** once;
-- check **Settings → Run doctor**;
+- check **Settings → Run doctor**; a healthy local proxy does not mean the upstream model-list
+  request succeeded. Doctor reports its latest result separately;
 - make sure another Codex wrapper is not replacing the route; and
 - export a safe log after the failed catalog check.
 
@@ -165,7 +171,7 @@ or strip encrypted history; this can lose task context. External-router composit
 The launcher must own the ChatGPT session used for model turns. Signing in to an unrelated browser
 window does not automatically transfer that session.
 
-- Complete ordinary sign-in inside the launcher-owned flow and wait until a Temporary Chat composer
+- Complete ordinary sign-in inside the launcher-owned flow and wait until a new chat composer
   is visible.
 - Do not navigate or close the launcher browser while authentication or session verification is
   running.
@@ -177,17 +183,17 @@ window does not automatically transfer that session.
   session. Your usual Chrome profile is not used. Google Chrome must be installed.
 
 If an ordinary login still fails, export a safe log immediately after one attempt. Include the OS,
-launcher version, account tier, sign-in provider, and whether the Temporary Chat composer ever
+launcher version, account tier, sign-in provider, and whether the new chat composer ever
 appeared. Never upload cookies, browser storage, authentication headers, or raw profile files.
 
 ## The browser smoke test fails
 
 The smoke test and real turns use the same current ChatGPT controls. Errors mentioning the effort
-control, composer, send button, Temporary Chat, personalization, or an operational viewport usually
+control, composer, send button, new chat, or an operational viewport usually
 mean that the ChatGPT UI did not expose a structure the bridge can safely prove.
 
 1. Update to the latest release.
-2. Confirm that a normal Temporary Chat can be opened in the launcher and that the account is not
+2. Confirm that a new ordinary chat can be opened in the launcher and that the account is not
    showing a login, onboarding, capacity, or rate-limit dialog.
 3. Run the smoke test one more time with the launcher visible.
 4. If the same structural error remains, do not keep retrying. Export a safe log and open a focused
@@ -204,14 +210,10 @@ read its legal source or report the gap. See [context navigation](docs/context-n
 
 ## Personalization or connector controls are not found
 
-If the connector is missing in Temporary Chat but available in a regular ChatGPT chat, enable
-**Launcher → Settings → Save chats in ChatGPT**. Finish active tasks, restart the launcher and
-Codex, then try a new task. This keeps task conversations in your ChatGPT history; ChatGPT
-memory and custom instructions may apply. Saved chats are the default for new setups, but
-updating preserves an existing explicit off setting.
-
-In **6.1.10**, **Verify runtime** still checks Temporary Chat even with saved chats enabled;
-test an actual task on that version. **6.1.11 and later** verify the selected chat mode.
+Current builds always use ordinary ChatGPT chats, including connector verification. If an older
+build fails in Temporary Chat, update, finish active tasks, and restart the launcher and Codex.
+The old chat-mode setting is no longer used. Task conversations remain in ChatGPT history;
+ChatGPT memory and custom instructions may apply.
 
 In ChatGPT, open **Settings → General → Language** and choose **English** explicitly, then reload
 ChatGPT inside the launcher and retry once. Some browser controls depend on English labels;
@@ -343,6 +345,20 @@ approval review**, disable that optional Codex review setting and restart Codex.
 sandbox and explicit approvals still apply; this only prevents an unavailable native model from
 being inserted as an extra reviewer after the Web tool call already completed.
 
+## Long-running commands and MCP deadlines
+
+Each MCP invocation has a 90-second deadline. Command polling through `codex_write_stdin`,
+`codex_tool_call`, or the native `exec` gateway accepts `yield_time_ms` up to 60,000 ms.
+Longer waits are rejected before dispatch without retiring the task. Return after each poll;
+if the result still has a `session_id`, use a separate call to collect more output.
+The command continues running between polls. Changing `stallTimeoutSec` does not change the
+MCP invocation deadline.
+
+After updating, if ChatGPT still advertises a five-minute maximum for `codex_write_stdin`,
+recreate the current mode's connector with the same Tunnel and permissions to load its updated
+tool schema. Existing connectors receive an explicit validation error for an excessive wait;
+the bridge does not silently shorten the requested duration.
+
 ## `Reconnecting`, `stream disconnected`, or `ChatGPT failed`
 
 These are result boundaries, not one diagnosis. The bridge uses them when it cannot prove a complete
@@ -361,6 +377,16 @@ its bounded MCP deadline.
 Do not assume that a generic 502 means the Tunnel is broken. Since v4.0.7, a native tool that
 outlives its turn binding is reported explicitly as `codex_tool_timeout` and retired rather than
 being presented as an ambiguous proxy success.
+
+If Stop disappears before the final answer, the bridge allows up to ten minutes without new
+observable response activity. A visible error or a completed empty answer has its own check.
+An idle timeout does not establish why ChatGPT stopped responding. Keep the original ChatGPT tab
+when reporting this case, and mention whether its final answer appeared after the error.
+
+For repeated compaction, the safe log includes `context_token_breakdown`: character and token
+counts grouped by instruction/message role, without their contents. These counts distinguish a
+large fixed instruction load from growing conversation history. They cover individual submitted
+records; the full input estimate also includes transport framing, attachments and platform reserve.
 
 ## Saved task environment cannot be read
 

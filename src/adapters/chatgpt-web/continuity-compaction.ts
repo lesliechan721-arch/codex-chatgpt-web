@@ -14,7 +14,7 @@ import {
 } from "./compaction-handoff";
 import { continuitySourceRepresentationDigest, type ContinuityClaim, type ContinuityToolResultReplayEvidence } from "./continuity-binding";
 import { continuityError } from "./continuity-errors";
-import { compactionSourceWasDelegation, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isDurableCompactionSourceIdentity } from "./compaction-continuation";
+import { compactionSourceWasDelegation, compactionSourceWasGoal, CONTINUITY_GOAL_SOURCE, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isDurableCompactionSourceIdentity } from "./compaction-continuation";
 import { taskUpdateSourceError } from "./task-update-source";
 import { assertCompactionReadable, captureRetainedCompactionSource, compactionSourcePageCost } from "./compaction-context";
 import {
@@ -326,6 +326,7 @@ export function runContinuityCompaction(
           ...[sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]
             .map(revision => continuitySourceRepresentationDigest(parsed, revision)),
           ...(sourceWasDelegation ? [CONTINUITY_DELEGATION_SOURCE] : []),
+          ...(compactionSourceWasGoal(parsed, sourceRevision) ? [CONTINUITY_GOAL_SOURCE] : []),
           ...(sourceIdentityOnly ? [CONTINUITY_IDENTITY_ONLY_SOURCE] : []),
         ])],
         identity.turnId,

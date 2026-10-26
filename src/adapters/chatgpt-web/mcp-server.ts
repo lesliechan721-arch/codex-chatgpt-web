@@ -14,10 +14,10 @@ import { VERSION } from "../../version";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 import { observeMcpToolCalls } from "./mcp-observation";
-import { BRIDGE_TOOL_NAMES, nativePublicResult, nativeToolInputSchemas, type ChatGptMcpContract, type NativeToolEntry } from "./native-tool-contract";
+import { BRIDGE_TOOL_NAMES, COMMAND_POLL_TRANSPORT_RULE, nativePublicResult, nativeToolInputSchemas, type ChatGptMcpContract, type NativeToolEntry } from "./native-tool-contract";
 import { NativeOperationError, nativeOperationFailure, nativePendingResult, NATIVE_WAIT_PROTOCOL_VERSION, type NativeOperationReply } from "./native-tool-operations";
 import type { TaskUpdateAckResult, UpdateDelivery } from "./task-update-protocol";
-export { CHATGPT_WEB_AGENT_WAIT_POLL_MS } from "./native-tool-contract";
+export { CHATGPT_WEB_AGENT_WAIT_POLL_MS, CHATGPT_WEB_COMMAND_POLL_MAX_MS } from "./native-tool-contract";
 export type { ChatGptMcpContract } from "./native-tool-contract";
 
 const turnTokenSchema = z.string().min(20).max(256);
@@ -270,7 +270,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string; cont
 
   const descriptions: Record<NativeToolEntry, { title: string; description: string; readOnly: boolean }> = {
     codex_exec: { title: "Run a native Codex command", description: "Invoke the command tool advertised by the current outer Codex harness. A long-running command returns its native session_id.", readOnly: false },
-    codex_write_stdin: { title: "Continue a native Codex command session", description: "Write characters to, or poll, a session_id returned by codex_exec.", readOnly: false },
+    codex_write_stdin: { title: "Continue a native Codex command session", description: `Write characters to, or poll, a session_id returned by codex_exec. ${COMMAND_POLL_TRANSPORT_RULE}`, readOnly: false },
     codex_apply_patch: { title: "Apply a native Codex patch", description: "Invoke the outer Codex apply_patch tool, producing a native file-change item in the Codex task.", readOnly: false },
     codex_view_image: { title: "View an image through native Codex", description: "Invoke the outer Codex view_image tool and return its multimodal result to this same ChatGPT response.", readOnly: true },
     codex_tool_inventory: { title: "Discover tools from the current Codex harness", description: "List tools available to the current Codex turn, including configured MCP and app tools.", readOnly: true },

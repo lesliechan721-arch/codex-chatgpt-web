@@ -91,7 +91,7 @@ test("Fresh, timeout, and presentation changes do not alter execution identity",
   const config = provider(); const namespace = chatGptWebExecutionNamespace(config);
   const changed = structuredClone(config);
   Object.assign(changed.chatgptWeb!, { experimentalFreshConversationPerTurn: true,
-    experimentalSkillAttachments: true, headed: false, useSavedChats: true, turnTimeoutMs: 1000, proAvailable: true });
+    experimentalSkillAttachments: true, headed: false, turnTimeoutMs: 1000, proAvailable: true });
   expect(chatGptWebExecutionNamespace(changed)).toBe(namespace);
   const reordered = { ...config, chatgptWeb: Object.fromEntries(Object.entries(config.chatgptWeb!).reverse()) };
   expect(chatGptWebExecutionNamespace(reordered)).toBe(namespace);

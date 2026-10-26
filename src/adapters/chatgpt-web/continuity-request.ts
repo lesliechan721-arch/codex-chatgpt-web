@@ -35,7 +35,7 @@ import { continuityError } from "./continuity-errors";
 import { captureTaskUpdateSource, taskUpdateDigest, taskUpdateSourceError } from "./task-update-source";
 import { ContinuityTaskInputStore, type TaskInputIdentity } from "./continuity-task-input-store";
 import { continuityToolRegistry } from "./continuity-tools";
-import { isAcceptedCompactionContinuation } from "./compaction-continuation";
+import { compactionSourceWasGoal, isAcceptedCompactionContinuation } from "./compaction-continuation";
 import { existingStructuredCompactionRun, hasActiveStructuredCompactionRun, registerStructuredCompactionPage } from "./compaction-handoff";
 import { preflightContinuityInput } from "./continuity-input";
 import { chatGptConversationKey } from "./conversation-key";
@@ -770,7 +770,7 @@ async function prepareContinuityRequestUnlocked(
     .flatMap(work => work.attempts.map(attempt => attempt.epoch))) : 0;
   parsed._continuityEpoch = durable?.epoch ?? 0;
   assertContinuityStoppedReceipt(parsed);
-  let continuedDelegationSource: RecoveryWorkRecord | undefined;
+  let continuedSyntheticSource: RecoveryWorkRecord | undefined;
   if (parsed._compactionRequest) {
     const retained = binding && durable ? {
       executionKey: binding.executionKey, owner: binding.owner, epoch: binding.epoch,
@@ -782,8 +782,9 @@ async function prepareContinuityRequestUnlocked(
     const prepared = await prepareRecoveryCompaction(parsed, provider, namespace, capabilities, worker, bindings, durable, descriptor, abortSignal, assertExecutionCompatible);
     if (prepared) return prepared;
     const target = recoveryCompactionTarget(parsed);
-    if (target?.source.allowRetainedSourceFallback && target.sourceRevision.instructionEnvelope?.role === "tool_result") {
-      continuedDelegationSource = target.source;
+    if (target?.source.allowRetainedSourceFallback && (target.sourceRevision.instructionEnvelope?.role === "tool_result"
+      || compactionSourceWasGoal(parsed, target.sourceRevision))) {
+      continuedSyntheticSource = target.source;
     }
     // Retained-source preview yields while reading page usage and source bounds.
     // Its old healthy decision cannot survive a loss callback or a new writer.
@@ -941,14 +942,14 @@ async function prepareContinuityRequestUnlocked(
         : chatGptCompactionSourceExecutionKey(parsed);
     } catch { /* A missing or malformed source is not a retained-page creation authority. */ }
     const source = sourceExecutionKey ? chatGptTurnSessions.find(sourceExecutionKey) : undefined;
-    // A consumed delegation checkpoint binds the original source instruction to a new
+    // A consumed native task checkpoint binds the original source instruction to a new
     // native consumer turn. Its proven work relation identifies the current execution.
-    const matchesContinuedDelegation = continuedDelegationSource
-      && binding.recovery?.logicalWorkId === continuedDelegationSource.logicalWorkId
-      && source?.nativeTurnId === continuedDelegationSource.nativeTurnId
-      && source?.acceptedContinuityInstructionIdentity() === continuedDelegationSource.instructionIdentity;
+    const matchesContinuedSyntheticSource = continuedSyntheticSource
+      && binding.recovery?.logicalWorkId === continuedSyntheticSource.logicalWorkId
+      && source?.nativeTurnId === continuedSyntheticSource.nativeTurnId
+      && source?.acceptedContinuityInstructionIdentity() === continuedSyntheticSource.instructionIdentity;
     if (((!candidate || `${namespace}:${candidate}` !== (binding.logicalExecutionKey ?? sourceExecutionKey))
-      && !matchesContinuedDelegation) || !source
+      && !matchesContinuedSyntheticSource) || !source
       || source !== chatGptTurnSessions.findConversationHead(conversationKey)
       || source.supersededError || (binding.state === "compacting" && binding.compactionKey !== executionKey)) {
       if (config.toolAuthorityMode === "delegated" && source && source.taskRevision() === 0) {

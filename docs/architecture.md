@@ -159,7 +159,7 @@ logical identities fail explicitly; accepted messages are never resent to repair
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
 redirected to another browser. After the provider returns to ChatGPT, the launcher requires both a
-server-authenticated session and the Temporary Chat composer in the primary owned view, then closes
+server-authenticated session and a new ordinary chat composer in the primary owned view, then closes
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
@@ -226,15 +226,13 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
-**Save chats in ChatGPT** (`setup --saved-chats`, enabled by default; `--temporary-chats` opts out)
-uses ordinary saved conversations for task turns in Automatic and Zero Risk modes. This is
-independent of conversation reuse. Changing it releases idle retained tabs, and its provider
-configuration participates in conversation identity. Saved history does not authorize reopening
-an arbitrary ChatGPT conversation. Applicable unified tasks prefer page reuse across compaction.
-Connector verification uses the same saved/temporary mode as task turns, while account inspection
-continues to use an empty Temporary Chat. Existing explicit choices are preserved on upgrade.
-ChatGPT memory and custom instructions
-may apply to saved conversations.
+Automatic and Zero Risk task turns always use ordinary saved conversations. Sign-in, account
+inspection, connector verification and smoke tests use the same new-chat surface. The retired
+`useSavedChats` preference is discarded when loading configuration. Legacy `--saved-chats` and
+`--temporary-chats` flags report removal and do not select a chat mode.
+This is independent of conversation reuse. Saved history does not authorize reopening an arbitrary
+ChatGPT conversation. Applicable unified tasks retain verified page reuse across compaction.
+ChatGPT memory and custom instructions may apply to these conversations.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
 default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each logical send

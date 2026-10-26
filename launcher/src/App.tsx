@@ -50,11 +50,6 @@ function requiresCodexCatalog(snapshot: LauncherSnapshot): boolean {
     && snapshot.toolAuthority.source !== "remote-bind";
 }
 
-function codexCatalogReady(snapshot: LauncherSnapshot): boolean {
-  return snapshot.apiAccessMode !== "invalid"
-    && (!requiresCodexCatalog(snapshot) || snapshot.state.codexCatalogVerified === true);
-}
-
 export function App() {
   const [snapshot, setSnapshot] = useState<LauncherSnapshot | null>(null);
   const [browser, setBrowser] = useState<BrowserState | null>(null);
@@ -373,10 +368,7 @@ function LauncherShell({
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
-  const catalogReady = codexCatalogReady(snapshot);
-  const interactionSetupComplete = snapshot.state.coreSetupComplete === true
-    && (snapshot.state.browserInteractionMode === "manual"
-      || catalogReady);
+  const interactionSetupComplete = snapshot.state.coreSetupComplete === true;
   const firstRunZeroRiskSetup = snapshot.state.browserInteractionMode === "manual"
     && snapshot.state.coreSetupComplete !== true;
   const [surface, setSurface] = useState<Surface>(
@@ -400,7 +392,6 @@ function LauncherShell({
   const needsSetup = !needsBrowser && !interactionSetupComplete;
   const mcpOptional = snapshot.state.browserInteractionMode === "automatic"
     && snapshot.state.coreSetupComplete === true
-    && catalogReady
     && snapshot.state.mcpSetupComplete !== true;
   const updateVisible = ["available", "downloading", "installing"].includes(snapshot.update.status);
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
@@ -1250,7 +1241,6 @@ function SetupSurface({
   const [localBusy, setLocalBusy] = useState(false);
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
   const codexCatalogRequired = requiresCodexCatalog(snapshot);
-  const catalogReady = codexCatalogReady(snapshot);
   const busy = localBusy
     || operation?.status === "running"
     || (!manualInteraction && (
@@ -1324,8 +1314,7 @@ function SetupSurface({
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall
             : devProfile ? copy.devInstall : copy.install}
-          complete={snapshot.state.coreSetupComplete === true
-            && catalogReady}
+          complete={snapshot.state.coreSetupComplete === true}
           description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody}
           disabled={busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
           index={manualInteraction ? 1 : 3}
@@ -1352,10 +1341,7 @@ function SetupSurface({
       <SectionHeading label="MCP" meta={manualInteraction ? copy.required : copy.optional} spaced />
       <button
         className="next-surface-row"
-        disabled={!manualInteraction && (
-          snapshot.state.coreSetupComplete !== true
-          || !catalogReady
-        )}
+        disabled={!manualInteraction && !snapshot.state.coreSetupComplete}
         onClick={showMcp}
         type="button"
       >
@@ -1393,7 +1379,6 @@ function McpSurface({
   updateState: (state: LauncherState) => void;
 }) {
   const configuringInactiveMode = interactionMode !== snapshot.state.browserInteractionMode;
-  const catalogReady = codexCatalogReady(snapshot);
   const [step, setStep] = useState(
     configuringInactiveMode ? 1 : Math.min(2, Math.max(0, snapshot.state.mcpGuideStep || 0)),
   );
@@ -1500,10 +1485,8 @@ function McpSurface({
       subtitle={devProfile ? copy.devMcpSubtitle : copy.mcpSubtitle}
       title={devProfile ? copy.devMcpTitle : "MCP"}
     >
-      {!manualInteraction
-        && !configuringInactiveMode
-        && !catalogReady ? (
-        <NoticeRow icon="setup" tone="warning">{copy.mcpCatalogRequired}</NoticeRow>
+      {!manualInteraction && !configuringInactiveMode && !snapshot.state.coreSetupComplete ? (
+        <NoticeRow icon="setup" tone="warning">{copy.mcpCoreSetupRequired}</NoticeRow>
       ) : null}
 
       <div className="wizard-stepper" aria-label={`${step + 1} / 3`}>
@@ -1617,11 +1600,9 @@ function McpSurface({
             ) : null}
             {step === 1 ? (
               <p className="mcp-step-two-hint">
-                {manualInteraction
-                  || configuringInactiveMode
-                  || catalogReady
+                {manualInteraction || configuringInactiveMode || snapshot.state.coreSetupComplete
                   ? copy.mcpStepTwoHint
-                  : copy.mcpCatalogRequired}
+                  : copy.mcpCoreSetupRequired}
               </p>
             ) : null}
             {step === 2 ? (
@@ -1677,10 +1658,7 @@ function McpSurface({
           <PrimaryButton
             disabled={
               busy
-              || (!manualInteraction && !configuringInactiveMode && (
-                snapshot.state.coreSetupComplete !== true
-                || !catalogReady
-              ))
+              || (!manualInteraction && !configuringInactiveMode && !snapshot.state.coreSetupComplete)
               || ((!credentialsConfigured || replacingCredentials) && (!tunnelId || !runtimeKey))
             }
             onClick={() => void install()}
@@ -1926,17 +1904,6 @@ function SettingsSurface({
       setBusy(false);
     }
   };
-  const setUseSavedChats = async (enabled: boolean) => {
-    setBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.setUseSavedChats(enabled));
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
   const setZeroRiskRequireSentConfirmation = async (enabled: boolean) => {
     setBusy(true);
     setError(null);
@@ -2096,13 +2063,6 @@ function SettingsSurface({
             checked={snapshot.state.browserInteractionMode !== "manual" && snapshot.state.autoApproveToolCalls}
             disabled={busy || snapshot.state.browserInteractionMode === "manual" || !snapshot.state.coreSetupComplete}
             onChange={(checked) => void setAutoApproveToolCalls(checked)}
-          />
-        </SettingRow>
-        <SettingRow body={copy.savedChatsBody} label={copy.savedChats}>
-          <Switch
-            checked={snapshot.state.useSavedChats}
-            disabled={busy || snapshot.state.coreSetupComplete !== true}
-            onChange={(checked) => void setUseSavedChats(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
@@ -2879,8 +2839,8 @@ function FatalMessage({ message }: { message: string }) {
 
 function browserTabTitleFromTitle(value: string | undefined, copy: Copy): string {
   const title = value?.trim();
-  if (!title || title === "about:blank" || title.includes("codex-web-gpt-browser-host")) return copy.temporaryChat;
-  return title.replace(/\s*[|–-]\s*ChatGPT\s*$/i, "") || copy.temporaryChat;
+  if (!title || title === "about:blank" || title.includes("codex-web-gpt-browser-host")) return copy.newChat;
+  return title.replace(/\s*[|–-]\s*ChatGPT\s*$/i, "") || copy.newChat;
 }
 
 function browserTabTone(status: BrowserState["tabs"][number]["status"]): "idle" | "ready" | "busy" | "error" {
@@ -2894,9 +2854,6 @@ function formatBrowserAddress(url: string | undefined, copy: Copy): string {
   if (!url || url.startsWith("about:blank")) return copy.browserAddress;
   try {
     const parsed = new URL(url);
-    if (parsed.hostname === "chatgpt.com" && parsed.searchParams.get("temporary-chat") === "true") {
-      return `chatgpt.com  /  ${copy.temporaryChat}`;
-    }
     return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`;
   } catch {
     return copy.browserAddress;

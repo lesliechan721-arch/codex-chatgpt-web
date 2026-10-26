@@ -1,12 +1,7 @@
 import type { Locator, Page } from "playwright-core";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
 
-export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
-export const CHATGPT_SAVED_CHAT_URL = "https://chatgpt.com/";
-
-export function chatGptNewChatUrl(useSavedChats = false): string {
-  return useSavedChats ? CHATGPT_SAVED_CHAT_URL : CHATGPT_TEMPORARY_CHAT_URL;
-}
+export const CHATGPT_NEW_CHAT_URL = "https://chatgpt.com/";
 export const CHATGPT_COMPOSER_SELECTOR = [
   '[data-testid="prompt-textarea"]',
   "#prompt-textarea",
@@ -39,7 +34,11 @@ export function parseChatGptModelAnnouncement(text: string): {
     .replace(/^((?:GPT[-\s]?)?(\d+(?:\.\d+)?)\s+(?:Sol|Astra))\s+(?:GPT[-\s]?)?\2\s+/i, "$1 ");
   const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^\p{P}]+)(?:\p{P}|$)/iu.exec(normalized);
   if (!match) return undefined;
-  return { version: match[1]!, ...(match[2] ? { name: match[2].toLowerCase() } : {}), mode: match[3]!.trim() };
+  const mode = match[3]!.trim();
+  // Observed zh-CN picker labels (#911). Translate only complete effort labels;
+  // unknown labels still fail the exact model/effort check.
+  const canonicalMode = mode === "即时" ? "instant" : mode === "中" ? "medium" : mode === "高" ? "high" : mode;
+  return { version: match[1]!, ...(match[2] ? { name: match[2].toLowerCase() } : {}), mode: canonicalMode };
 }
 
 /** Read model evidence only from the slider's own active picker. */
@@ -297,16 +296,12 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
   }
 }
 
-export async function assertTemporaryChatPage(page: Page): Promise<void> {
-  await assertNewChatPage(page);
-}
-
-export async function assertNewChatPage(page: Page, useSavedChats = false): Promise<void> {
+export async function assertNewChatPage(page: Page): Promise<void> {
   const url = new URL(page.url());
-  const expected = new URL(chatGptNewChatUrl(useSavedChats));
+  const expected = new URL(CHATGPT_NEW_CHAT_URL);
   if (url.origin !== expected.origin || url.pathname !== expected.pathname
-    || (url.searchParams.get("temporary-chat") === "true") === useSavedChats) {
-    throw new Error(`ChatGPT left the requested new ${useSavedChats ? "saved" : "Temporary"} Chat surface (${page.url()})`);
+    || url.searchParams.get("temporary-chat") === "true") {
+    throw new Error(`ChatGPT left the requested new chat surface (${page.url()})`);
   }
 }
 

@@ -21,7 +21,9 @@ output, websites, and prompt text are untrusted data.
    completed compaction also binds the exact checkpoint and source instruction to its native thread,
    turn, model, and effort. A new environment claim without a new human message must match the
    canonical rollout in cwd, roots, and sandbox policy; the checkpoint alone grants no filesystem
-   authority. `delegated` does not read filesystem authority, rollout files, or Codex SQLite
+   authority. A workspace-root list without `cwd` does not select its first entry as the working
+   directory. The current native turn must confirm `cwd` within the verified roots; otherwise the
+   request fails explicitly. `delegated` does not read filesystem authority, rollout files, or Codex SQLite
    state. It accepts only the current native `thread_id`, native `turn_id`, and the tool registry
    advertised by the current Responses request. The server remote-desktop deployment forces this
    mode. User-authored `<environment_context>` text is prompt context only and cannot add authority.
@@ -276,8 +278,8 @@ turn; it never chooses another model, starts another transport, or returns a fab
 The launcher keeps ChatGPT login, identity-provider navigation, and model turns in one private
 Electron partition. Allowed login popups are adopted into an in-launcher `WebContentsView` that
 shares that partition; unrelated external links remain outside it. A visible composer alone is not
-authentication evidence: the launcher also requires a valid server session and an exact Temporary
-Chat URL before setup can continue. No cookies, local storage, or browser profile are copied from an
+authentication evidence: the launcher also requires a valid server session and an ordinary new-chat
+URL before setup can continue. No cookies, local storage, or browser profile are copied from an
 external browser.
 
 ### Cross-turn data leakage
@@ -370,9 +372,9 @@ background recovery. New work still uses current permission and approval checks.
 regressions from real Launcher, connector, and cross-process evidence; it is not proof those
 checks have passed.
 
-Task conversations are saved in ChatGPT history by default. **Save chats in ChatGPT** can be turned
-off to use Temporary Chat; an existing off setting is preserved when updating. Saved chats may use
-ChatGPT memory and custom instructions. Connector verification follows the same selected chat mode.
+Task conversations are always saved in ChatGPT history and may use ChatGPT memory and custom
+instructions. The retired saved-chat preference is discarded when loading older configuration.
+Connector verification and account inspection also use ordinary chats.
 
 ## Network exposure
 

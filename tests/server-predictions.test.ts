@@ -57,7 +57,7 @@ test("predictions stay disabled by default before constructing an adapter", asyn
 
 test("prediction policy uses Sol 6 Medium, keeps history/schema, and never exposes tools or alters saved preferences", async () => {
   const config = { ...defaultConfig("full"), composerPredictionsEnabled: true, proAvailable: true,
-    experimentalSkillAttachments: true, useSavedChats: true };
+    experimentalSkillAttachments: true };
   const before = structuredClone(config);
   for (const model of ["chatgpt-web/gpt-6-pro", "chatgpt-web/gpt-5.6-sol"]) {
     const body = { ...base, model, tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
@@ -70,7 +70,7 @@ test("prediction policy uses Sol 6 Medium, keeps history/schema, and never expos
     expect(observed!.parsed.context.messages).toHaveLength(2);
     expect(observed!.parsed.context.tools).toBeUndefined();
     expect(observed!.provider.chatgptWeb).toMatchObject({ localToolsEnabled: false,
-      experimentalSkillAttachments: false, experimentalFreshConversationPerTurn: true, useSavedChats: false });
+      experimentalSkillAttachments: false, experimentalFreshConversationPerTurn: true });
     expect(config).toEqual(before);
   }
 });

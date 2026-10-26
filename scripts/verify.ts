@@ -23,7 +23,9 @@ export function verifyOptions(args: string[]) {
 
 export function verificationCommands(testMode: "full" | "timing", scratch: string, testShard?: TestShard) {
   return [
-    ["run", "check-version"], ["run", "audit"], ["run", "launcher:audit"], ["run", "typecheck"],
+    ["run", "check-version"], ["run", "audit"], ["run", "launcher:audit"],
+    // Prepare Electron before timed tests; its executable is downloaded on first use.
+    ["run", "launcher/node_modules/electron/install.js"], ["run", "typecheck"],
     ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : [])], ["run", "launcher:build"],
     ["run", "scripts/build-runtime-bundle.ts", join(scratch, "runtime")],
     ["run", "scripts/generate-third-party-notices.ts", join(scratch, "THIRD_PARTY_NOTICES.txt"), "--include-launcher"],

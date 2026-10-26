@@ -1576,7 +1576,7 @@ function realHelperClient(browserFixture: string): LauncherBrowserHelperClient {
     appName: CHATGPT_CONNECTOR_NAME, browserHost: "launcher", browserHostDescriptorPath: descriptor,
     browserHelperScriptPath: helper, browserDiagnosticsPath: root,
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useSavedChats: false,
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false,
   });
 }
 

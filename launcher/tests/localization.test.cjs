@@ -74,6 +74,13 @@ for (const language of Object.keys(languages).filter(language => language !== "e
     localizeRuntimeMessage(copy, "Responses proxy is healthy on 127.0.0.1:17841", "proxy", language),
     copy.doctorProxyHealthy.replace("{endpoint}", () => "127.0.0.1:17841"),
   );
+  for (const [message, translated] of [
+    ["This runtime has not observed a completed Codex model-list request yet", copy.doctorCatalogPending],
+    ["Codex's latest model-list request succeeded", copy.doctorCatalogReady],
+    ["Codex's latest model-list request failed; the local runtime is reachable", copy.doctorCatalogFailed],
+  ]) {
+    assert.equal(localizeRuntimeMessage(copy, message, "model-catalog", language), translated);
+  }
 });
 
 test("runtime message localization preserves other languages and unknown backend messages", () => {

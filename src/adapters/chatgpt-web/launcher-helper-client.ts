@@ -363,7 +363,6 @@ export class LauncherBrowserHelperClient {
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
-            useSavedChats: this.config.useSavedChats,
           },
           turn: {
             traceId: turn.traceId,
@@ -732,6 +731,7 @@ export class LauncherBrowserHelperClient {
                 ...(prepared.contextPlan ? { contextPlan: prepared.contextPlan } : {}),
                 ...(prepared.turnToken ? { turnToken: prepared.turnToken } : {}),
                 ...(prepared.skillFiles ? { skillFiles: prepared.skillFiles } : {}),
+                ...(prepared.contextTokenBreakdown ? { contextTokenBreakdown: prepared.contextTokenBreakdown } : {}),
                 ...(prepared.trimmedCompactionMessages !== undefined
                   ? { trimmedCompactionMessages: prepared.trimmedCompactionMessages }
                   : {}),

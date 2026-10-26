@@ -1,6 +1,6 @@
 import type { CodexParsedRequest } from "../../types";
 import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
-import { isNativeAgentsMdContext } from "../../responses/native-context";
+import { isNativeAgentsMdContext, readNativeThreadDelegation } from "../../responses/native-context";
 
 export interface ChatGptTurnUserRevision {
   content: unknown;
@@ -82,14 +82,7 @@ export function isNativeOpenPageContext(item: Record<string, unknown> | undefine
 
 /** The desktop injects cross-task messages as synthetic tool outputs without a call_id. */
 export function isDelegatedInstruction(item: Record<string, unknown> | undefined): boolean {
-  if (item?.type !== "function_call_output" || item.name !== "send_message_to_thread"
-    || item.namespace !== "codex_app" || item.call_id !== undefined
-    || typeof item.id !== "string" || !item.id || !itemTurnId(item)?.trim()
-    || typeof item.output !== "string") return false;
-  // The native producer escapes &, < and > in both fields. Reject extra/nested tags and
-  // malformed entities; keep the original text as task content, never environment authority.
-  const fields = /^<codex_delegation>\s*<source_thread_id>([^<>]+)<\/source_thread_id>\s*<input>([^<>]+)<\/input>\s*<\/codex_delegation>$/.exec(item.output.trim());
-  return fields !== null && fields.slice(1).every(text => text.trim() && !/&(?!amp;|lt;|gt;)/.test(text));
+  return item !== undefined && readNativeThreadDelegation(item) !== undefined;
 }
 
 /** V2 agent_message instructions must still come from this child's direct parent. */

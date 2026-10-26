@@ -104,6 +104,19 @@ references; reading them again consumes budget. Startup remains overview in Auto
 successful completion with bounded recovery information. Existing operation settlement,
 wait/replay, ACK, cancellation and error termination retain their own rules.
 
+## Command polling limits
+
+A Native command poll through `codex_write_stdin`, generic tool dispatch, or a nested `exec`
+gateway accepts `yield_time_ms` up to 60,000 ms. A larger value is rejected before dispatch;
+the bridge does not silently shorten it. Each MCP invocation has its own 90-second deadline.
+Commands can keep running between polls: use the same Native `session_id` in a later operation
+with a new `operation_id` to collect more output. Repeating a pending bridge query uses the
+original operation ID and does not start another command poll.
+
+This command-argument limit is separate from the 30-second bridge result-query window below.
+A pending result, its renewable lease, or an accepted old schema does not extend the command
+poll limit. Old connectors that still advertise five-minute polls need their tool schema refreshed.
+
 ## Waiting and public results
 
 The first call and each `codex_tool_wait` have a 30,000 ms semantic waiting window. A still-running

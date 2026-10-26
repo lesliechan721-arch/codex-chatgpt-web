@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { crc32, inflateSync } from "node:zlib";
 import { chatGptWebImageTokenReserve } from "../../chatgpt-web-models";
 import { parseRequest } from "../../responses/parser";
+import { readNativeThreadDelegation } from "../../responses/native-context";
 import { contextSourceParserModel } from "./context-source-parser";
 import type { CodexMessage, CodexParsedRequest, CodexToolCall } from "../../types";
 import { CONTEXT_LIMITS } from "./context-budget";
@@ -516,7 +517,8 @@ function rawFields(parsed: CodexParsedRequest): {
     }
   }
   const parsedResults = parsed.context.messages.filter(m => m.role === "toolResult");
-  const rawResults = raw.filter(({ item }) => ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(String(item.type)));
+  const rawResults = raw.filter(({ item }) => ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(String(item.type))
+    && !readNativeThreadDelegation(item));
   if (same && parsedResults.length === rawResults.length) parsedResults.forEach((m, i) => results.set(m, rawResults[i]!));
   else if (rawParsed) for (const m of parsedResults) {
     const candidates = rawResults.filter(({ item }) => item.call_id === m.toolCallId);
@@ -536,7 +538,8 @@ function rawFields(parsed: CodexParsedRequest): {
   const rawMessages = new Map<string, Array<{ item: Record<string, unknown>; index: number }>>();
   // Message metadata cannot be inferred from XML/text. Check the actual parser projection.
   for (const entry of raw) {
-    if (!(entry.item.type === "agent_message" || ["compaction", "compaction_summary", "context_compaction"].includes(String(entry.item.type))
+    if (!(entry.item.type === "agent_message" || readNativeThreadDelegation(entry.item)
+      || ["compaction", "compaction_summary", "context_compaction"].includes(String(entry.item.type))
       || entry.item.type === "message" || (!entry.item.type && entry.item.role))) continue;
     let single: CodexParsedRequest;
     try { single = parseRequest({ model: contextSourceParserModel(parsed), input: [entry.item] }); } catch { continue; }
@@ -648,7 +651,8 @@ export function createContextSnapshot(parsed: CodexParsedRequest, options: Conte
       ...(message.role === "agentMessage" ? { author: message.author ?? null, recipient: message.recipient ?? null } : {}),
       provenance: evidence?.restored ? "verified_restoration" : rawMessage ? "verified_raw" : "parsed",
       source_completeness: evidence?.source_completeness ?? "unknown", locator: { message_index: messageIndex,
-        ...(rawMessage ? { raw_input_index: rawMessage.index } : {}), field: message.role === "toolResult" ? "output" : "content" } });
+        ...(rawMessage ? { raw_input_index: rawMessage.index } : {}),
+        field: message.role === "toolResult" || rawMessage?.item.type === "function_call_output" ? "output" : "content" } });
     const relationFields = message.role === "toolResult" ? { call_id: message.toolCallId || null,
       error_status: (typeof rawMessage?.item.is_error === "boolean" ? rawMessage.item.is_error ? "error" : "not_error" : "unknown") as ContextTarget["error_status"] } : {};
     const resultItem = raw.results.get(message);

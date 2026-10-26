@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.13-4/codex-web-gpt-6.1.13-4-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.13-4/codex-web-gpt-6.1.13-4-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.13-4/codex-web-gpt-6.1.13-4-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.14-1/codex-web-gpt-6.1.14-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.14-1/codex-web-gpt-6.1.14-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.14-1/codex-web-gpt-6.1.14-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.13-4/codex-web-gpt-6.1.13-4-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.14-1/codex-web-gpt-6.1.14-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
 </p>
 
 <p align="center">
@@ -177,7 +177,7 @@ codex-chatgpt-web subagents native
 Full モードを有効にする前に、完全な[アーキテクチャ](docs/architecture.md)と
 [セキュリティモデル](docs/security-model.md)をお読みください。脆弱性は [SECURITY.md](SECURITY.md) から報告してください。
 
-一時チャットは [ChatGPT のプライバシーモード](https://help.openai.com/en/articles/8914046-temporary-chat-faq)です。プロンプトは引き続き OpenAI によって処理されます。
+タスクには常に通常のチャットを使い、会話は ChatGPT の履歴に残ります。プロンプトは OpenAI によって処理されます。
 
 検証範囲：[リリース検証](docs/release-validation.md)。
 

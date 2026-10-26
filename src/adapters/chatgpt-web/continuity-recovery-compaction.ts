@@ -17,7 +17,7 @@ import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationD
 import { sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityLease } from "./continuity-contract";
 import { chatGptConversationKey } from "./conversation-key";
 import { continuityError } from "./continuity-errors";
-import { compactionSourceWasDelegation, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity } from "./compaction-continuation";
+import { compactionSourceWasDelegation, compactionSourceWasGoal, CONTINUITY_GOAL_SOURCE, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity } from "./compaction-continuation";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import type { PreparedContinuityRequest } from "./continuity-request";
@@ -173,7 +173,7 @@ function assertSourcePayload(parsed: CodexParsedRequest, source: RecoveryWorkRec
   const payload = sourcePayloadDigest(parsed, source);
   if (payload !== source.workPayloadDigest && !target?.representationDigests.includes(sourcePayloadRepresentation(payload))) {
     const revision = extractChatGptCompactionSourceRevision(parsed);
-    const continuation = continuedDelegation(parsed, record, revision);
+    const continuation = continuedSyntheticInstruction(parsed, record, revision);
     if (isDurableCompactionSourceIdentity(parsed, revision) && continuation?.work.logicalWorkId === source.logicalWorkId
       && continuation.checkpoint.representationDigests.includes(sourcePayloadRepresentation(payload))) return;
     throw continuityError("continuity_source_unproven", "The source instruction group conflicts with its first accepted payload.");
@@ -273,9 +273,9 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
   return { target, source, sourceRevision, ...(checkpoint ? { checkpoint } : {}) };
 }
 
-function continuedDelegation(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: ChatGptTurnUserRevision) {
+function continuedSyntheticInstruction(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: ChatGptTurnUserRevision) {
   const identity = sourceIdentity(parsed, source);
-  if (compactionSourceWasDelegation(parsed, source)) {
+  if (compactionSourceWasDelegation(parsed, source) || compactionSourceWasGoal(parsed, source)) {
     const continuation = selectRecoveryContinuation(parsed, record, extractChatGptTurnIdentity(parsed));
     // The exact checkpoint selects its source, or its recorded consumer once consumed.
     // That execution can keep the original delegated source's different native turn.
@@ -290,7 +290,7 @@ function continuedDelegation(parsed: CodexParsedRequest, record: RecoveryThreadR
 function selectSource(parsed: CodexParsedRequest, record: RecoveryThreadRecord): RecoveryWorkRecord {
   const source = extractChatGptCompactionSourceRevision(parsed);
   const identity = sourceIdentity(parsed, source);
-  const continuation = continuedDelegation(parsed, record, source);
+  const continuation = continuedSyntheticInstruction(parsed, record, source);
   if (continuation) return continuation.work;
   let matching = Object.values(record.works).filter(work => work.purpose === "ordinary"
     && work.instructionIdentity === identity && (!source.turnId || work.nativeTurnId === source.turnId));
@@ -495,7 +495,7 @@ export async function prepareRecoveryCompaction(parsed: CodexParsedRequest, prov
     // Only its exact identity-only delegation relation can use recovery again here.
     const retiredDelegation = !observed.executionKey
       && isDurableCompactionSourceIdentity(parsed, selection.sourceRevision)
-      && continuedDelegation(parsed, record, selection.sourceRevision)?.work.logicalWorkId === selection.source.logicalWorkId;
+      && continuedSyntheticInstruction(parsed, record, selection.sourceRevision)?.work.logicalWorkId === selection.source.logicalWorkId;
     if ((!source || !coverage) && !retiredDelegation) return undefined;
     if (source && coverage) {
       await source.runtime.syncContextUsage?.({ compaction: true });
@@ -680,6 +680,7 @@ function representations(parsed: CodexParsedRequest, selection: CompactionSelect
       .map(source => continuitySourceRepresentationDigest(parsed, source)),
     ...payloads,
     ...(compactionSourceWasDelegation(parsed, selection.sourceRevision) ? [CONTINUITY_DELEGATION_SOURCE] : []),
+    ...(compactionSourceWasGoal(parsed, selection.sourceRevision) ? [CONTINUITY_GOAL_SOURCE] : []),
     ...(isDurableCompactionSourceIdentity(parsed, selection.sourceRevision) ? [CONTINUITY_IDENTITY_ONLY_SOURCE] : []),
   ])];
 }

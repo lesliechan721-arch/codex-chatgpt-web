@@ -355,7 +355,8 @@ function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatG
   const nativeRoots = new Set(right.roots.map(pathIdentity));
   const nativeGrants = new Set([...right.roots, ...right.writableRoots].map(pathIdentity));
   const fields: string[] = [];
-  if (pathIdentity(left.cwd) !== pathIdentity(right.cwd)) fields.push("cwd");
+  if ((left.cwd !== undefined && pathIdentity(left.cwd) !== pathIdentity(right.cwd))
+    || !left.roots.some(root => contains(root, right.cwd))) fields.push("cwd");
   // Codex 0.163 omits workspace_roots in some rollouts while its envelope still
   // lists output directories. Every extra claimed root must be an exact native
   // grant, and no native workspace may disappear. Return only native authority.
@@ -385,7 +386,8 @@ function currentWorkspaceContext(
   if (!workspaceRootsDeclared
     && environment.sandboxPolicy.type === "dangerFullAccess"
     && claim?.environment.sandboxPolicy.type === "dangerFullAccess"
-    && pathIdentity(claim.environment.cwd) === pathIdentity(environment.cwd)) {
+    && (claim.environment.cwd === undefined || pathIdentity(claim.environment.cwd) === pathIdentity(environment.cwd))
+    && claim.environment.roots.some(root => contains(root, environment.cwd))) {
     return {
       ...environment,
       roots: [...claim.environment.roots],
@@ -503,18 +505,21 @@ export class ChatGptThreadEnvironmentStore {
     try {
       const claim = extractChatGptTurnEnvironmentClaim(parsed);
       const environment = claim.environment;
-      if (this.codexHomes.length > 1
+      if (environment.cwd === undefined || this.codexHomes.length > 1
         || (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess)) {
         // A shared bridge must prove the current native owner even for complete envelopes.
         // Modern envelopes state filesystem access only. Resolve the current native policy on
         // the first round too: absence of a network statement is not a disabled-network grant.
+        // Likewise, workspace roots do not identify cwd; only this turn's native record can.
         initialClaim = claim;
         throw new MissingTrustedCodexEnvironmentError(
-          this.codexHomes.length > 1 ? "current native task ownership" : "network access",
+          environment.cwd === undefined ? "cwd"
+            : this.codexHomes.length > 1 ? "current native task ownership" : "network access",
         );
       }
-      if (identity.threadId) this.set(identity.threadId, environment, parsed);
-      return environment;
+      const completeEnvironment = { ...environment, cwd: environment.cwd };
+      if (identity.threadId) this.set(identity.threadId, completeEnvironment, parsed);
+      return completeEnvironment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
       const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
@@ -541,6 +546,7 @@ export class ChatGptThreadEnvironmentStore {
       if (currentCompaction || nativeCompaction) diagnostics.recovery_stage = "compaction_claim";
       const currentClaim = initialClaim ?? (currentCompaction
         ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim ?? nativeCompaction?.claim);
+      const resolvedCalendarDelta = calendarDelta ?? currentClaim?.calendarDelta;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       diagnostics.rollout_lookup = "identity_unavailable";
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -586,10 +592,10 @@ export class ChatGptThreadEnvironmentStore {
         diagnostics.rollout_lookup = rollout ? "hit" : "miss";
         if (rollout) {
           const rolloutEnvironment = currentWorkspaceContext(rollout.environment, rollout.workspaceRootsDeclared, currentClaim);
-          if (calendarDelta) {
+          if (resolvedCalendarDelta) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
-            if (calendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
-              || calendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
+            if (resolvedCalendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
+              || resolvedCalendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
                 || roots.some(root => !nativeRoots.has(root)))) {
               throw new TrustedCodexEnvironmentValidationError("Calendar environment delta conflicts with its current Codex rollout");
             }

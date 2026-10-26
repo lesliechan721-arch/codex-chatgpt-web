@@ -372,7 +372,8 @@ test("Linux aggregation checks Windows verify paths and independent requested co
     command: ["C:\\bun\\bun.exe", ...command.map(argument => argument.replaceAll("/", "\\"))], exitCode: 0, error: null, elapsedMs: 1,
   }));
   // The slash in i/n is a CLI value, not a Windows path separator.
-  fixture.verify.stages[6].command = ["C:\\bun\\bun.exe", "run", "test", "--mode=full", "--shard=1/2"];
+  const serverStage = fixture.verify.stages.find((stage: { command: string[] }) => stage.command[2] === "test")!;
+  serverStage.command = ["C:\\bun\\bun.exe", "run", "test", "--mode=full", "--shard=1/2"];
   fixture.expected = { ...fixture.expected, platform: "win32", workers: 2, mode: "full", isolation: "default" };
   expect(aggregateShardEvidence(fixture).success).toBe(true);
   for (const [key, value] of [["platform", "linux"], ["workers", 4], ["mode", "timing"], ["isolation", "isolate"]]) {

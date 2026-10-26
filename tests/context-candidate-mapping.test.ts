@@ -211,7 +211,7 @@ describe("continuity candidate source mapping", () => {
     const selected = candidate(parsed, undefined);
     expect(contextCandidateMessageIndices(parsed, selected)).toEqual([0]);
     expect(contextCandidateRawInputIndices(parsed, selected)).toEqual([0]);
-    expect(selected.context.messages[0]!.role).toBe("toolResult");
+    expect(selected.context.messages[0]!.role).toBe("agentMessage");
     const ordinary = request([{ type: "function_call_output", call_id: "call", output: "Ordinary tool result." }]);
     const item = structuredClone((ordinary._rawBody as { input: unknown[] }).input[0]);
     bindContextInstructionInputSource(ordinary, item, 0);

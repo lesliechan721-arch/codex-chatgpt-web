@@ -6,7 +6,9 @@ import { parseRequest } from "../../responses/parser";
 import { contextErrorReserve, contextLimits, contextBudgetProfileLimits, measureContextResponse, UNLIMITED_CONTEXT_ALLOWANCE, type ContextBudgetProfile, type ContextLimitOverrides, type ContextLimits, type ContextResponseCost } from "./context-budget";
 import { ContextDeliveryPlanningError, planContextMedia, type ContextMediaPlan } from "./context-media-plan";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
-import { compileChatGptWebPrompt,
+import { restoreCompactionTaskMessages } from "./compaction-continuation";
+import { chatGptTurnUserRevisionHistory, extractChatGptTurnIdentity } from "./environment";
+import { compileChatGptWebPrompt, contextTokenBreakdown,
   type CompiledChatGptWebPrompt, type CompileChatGptWebPromptOptions } from "./prompt";
 import type { ContextPlanRegistration } from "./context-runtime";
 import { appendFixedContextRecords, deterministicContextJson, type ContextSnapshot } from "./context-snapshot";
@@ -354,11 +356,26 @@ export function planContextDelivery(input: ContextDeliveryPlanInput): ContextDel
 }
 
 function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
+  if (input.messageIndices && input.messageIndices.length !== input.candidate.context.messages.length) {
+    throw new ContextDeliveryPlanningError("CONTEXT_MAPPING_UNPROVEN", "The candidate index map has the wrong number of messages");
+  }
+  const candidate = input.candidate;
+  const restored = restoreCompactionTaskMessages(candidate, extractChatGptTurnIdentity(candidate), chatGptTurnUserRevisionHistory(candidate));
+  if (restored !== candidate.context.messages) {
+    input = { ...input, candidate: { ...candidate, context: { ...candidate.context, messages: restored } },
+      messageIndices: restored.map(message => {
+        const index = candidate.context.messages.indexOf(message);
+        return index < 0 ? null : input.messageIndices?.[index] ?? (input.messageIndices ? null : input.canonical.context.messages.indexOf(message));
+      }) };
+  }
   const started = performance.now();
   const budgetProfile = input.budgetProfile ?? "expanded";
   const limits = contextLimits({ ...contextBudgetProfileLimits(budgetProfile), ...input.limits });
   const reuseAvailable = input.contextReuseAvailable === true;
-  const compile = (parsed: CodexParsedRequest, options = input.compileOptions) => compileChatGptWebPrompt(parsed, input.capabilities, input.turnToken, options);
+  // The candidate above already contains its authenticated task restoration. A media
+  // projection clones these messages; compile that view without inserting the task again.
+  const compile = (parsed: CodexParsedRequest, options = input.compileOptions) => compileChatGptWebPrompt(parsed, input.capabilities,
+    input.turnToken, { ...options, contextTaskRestoration: false });
   if (input.compileOptions?.contextNavigation) throw new Error("The context planner owns its navigation entry");
   let original: CompiledChatGptWebPrompt;
   let originalCompileFailure: unknown;
@@ -643,7 +660,25 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
       if (entry.fixedCodePoints > CONTEXT_MAX_FIXED_BOOTSTRAP_CODE_POINTS) throw new ContextDeliveryPlanningError(
         "CONTEXT_BUDGET_EXCEEDED", "The fixed bootstrap exceeds its 3000 Unicode code point engineering limit",
         { limit: "fixed_bootstrap", fixed_code_points: entry.fixedCodePoints });
-      const compiled: CompiledChatGptWebPrompt = { ...prepared, text: entry.text, contextPlan: descriptor };
+      let diagnostics: CompiledChatGptWebPrompt["contextTokenBreakdown"];
+      if (ordinaryOptions.includeContextTokenBreakdown) {
+        let delivered = selection.prepared.payload;
+        if (reuse && reusePrepared) {
+          // Reused rule bodies remain on the page. Count only current records delivered again.
+          const current = reusePrepared.makePayload(false, sourceMapRef);
+          delivered = structuredClone(current.payload);
+          for (const position of current.positions) {
+            const reference = current.references.find(reference => reference.unit_id === position.unit_id)!;
+            if (reference.delivery === "current") {
+              delivered[position.path[0]][position.path[1]] = JSON.parse(snapshot.getText(reference.read_ref!)!) as never;
+            }
+          }
+        }
+        diagnostics = contextTokenBreakdown(delivered.system.filter(content => content !== null),
+          delivered.messages.filter(message => message !== null));
+      }
+      const compiled: CompiledChatGptWebPrompt = { ...prepared, text: entry.text, contextPlan: descriptor,
+        ...(diagnostics ? { contextTokenBreakdown: diagnostics } : {}) };
       for (const [id, cost] of Object.entries(media.imageResponseCosts)) if (deliveryByTarget[id]?.required) {
         required.retry.tokens = Math.max(required.retry.tokens, cost.total_tokens);
         required.retry.wire_bytes = Math.max(required.retry.wire_bytes, cost.wire_bytes);

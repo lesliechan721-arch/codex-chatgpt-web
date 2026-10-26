@@ -75,6 +75,9 @@ jobs:
           if-no-files-found: warn
       - run: bun run app:package
         if: runner.os != 'Windows'
+        env:
+          # PR packaging has no signing credentials; retain the verified ad-hoc signature.
+          CSC_FOR_PULL_REQUEST: ${{ runner.os == 'macOS' && 'true' || 'false' }}
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux'
         run: |

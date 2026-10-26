@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
@@ -33,6 +33,8 @@ test.each([
   const recoveryCallbacks: unknown[] = [];
   const actions: string[] = [];
   const sendBudgets: number[] = [];
+  const logs: string[] = [];
+  const log = spyOn(console, "info").mockImplementation(message => { logs.push(String(message)); });
   let released = false;
   let activated = 0;
   let freshChatPreparations = 0;
@@ -131,7 +133,11 @@ test.each([
     });
   }
   const prepare = async () => ({ text: preflightRejected ? "word ".repeat(120_000) : "Summarize the context",
+    contextTokenBreakdown: { user: { records: 1, chars: 21, tokens: 5 } },
     images: [], release: () => { released = true; } });
+  const prepareResume = async () => ({ text: "Continue context", images: [],
+    contextTokenBreakdown: { user: { records: 1, chars: 16, tokens: 2 } },
+    release: () => { released = true; } });
   try {
     const run = worker.runBrowserTurn({
       traceId: "compaction_recovery_fixture",
@@ -147,7 +153,7 @@ test.each([
         commit: async () => { throw new Error("fixture must stop before completion"); },
       } : undefined,
       prepare,
-      prepareResume: prepare,
+      prepareResume,
     }, owned ? "owned-surface" : undefined, page, retained);
     if (preflightRejected) {
       await expect(run).rejects.toMatchObject({ code: "context_length_exceeded", retryable: false });
@@ -170,6 +176,13 @@ test.each([
       ]);
       expect(sendBudgets).toEqual([180_000]);
       expect(activated).toBe(1);
+      const breakdowns = logs.filter(message => message.startsWith("[chatgpt-web] context_token_breakdown "))
+        .map(message => JSON.parse(message.slice(message.indexOf("{"))));
+      expect(breakdowns).toEqual([{
+        traceId: "compaction_recovery_fixture", scope: "submitted", retainedConversation: retained,
+        estimatedInputTokens: retained ? 8194 : 8197,
+        byRole: { user: retained ? { records: 1, chars: 16, tokens: 2 } : { records: 1, chars: 21, tokens: 5 } },
+      }]);
     }
     expect(released).toBe(true);
     expect(page.listenerCount("request")).toBe(0);
@@ -177,6 +190,7 @@ test.each([
     expect(page.listenerCount("requestfinished")).toBe(0);
     expect(page.listenerCount("requestfailed")).toBe(0);
   } finally {
+    log.mockRestore();
     rmSync(diagnostics, { recursive: true, force: true });
   }
 });

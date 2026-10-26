@@ -41,6 +41,44 @@ async function unusedPort(): Promise<number> {
   return address.port;
 }
 
+test("doctor distinguishes a healthy local proxy from failed, pending and recovered model loading", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-doctor-catalog-"));
+  const appHome = join(root, "app");
+  const config = { ...defaultConfig("browser-only"), browserHost: "managed-chrome" as const };
+  let result: Record<string, unknown> | null = {
+    request: 2, at: "2026-10-22T07:53:53.739Z", status: 502,
+    failure: { stage: "transport", code: "ConnectionRefused", message: "PRIVATE_PROXY_URL" },
+  };
+  const paths: string[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+    paths.push(new URL(req.url).pathname);
+    return Response.json({
+      status: "ok", service: "codex-chatgpt-web", version: config.releaseVersion,
+      mode: config.mode, accepting_turns: true, pid: process.pid,
+      api_access_revision: apiAccessRevision({ version: 1, mode: "openai" }, config.controlToken),
+      successful_model_catalog_requests: result ? 1 : 0,
+      last_model_catalog_result: result,
+    });
+  } });
+  config.port = server.port!;
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), JSON.stringify(config));
+  const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: join(root, "codex") };
+  try {
+    const check = async () => {
+      const report = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+      expect(report.checks.find((c: any) => c.id === "proxy").status).toBe("ok");
+      return report.checks.find((c: any) => c.id === "model-catalog");
+    };
+    expect(await check()).toMatchObject({ status: "error", detail: "HTTP 502; transport; ConnectionRefused" });
+    result = null;
+    expect(await check()).toMatchObject({ status: "warning" });
+    result = { request: 3, at: "2026-10-22T07:54:00Z", status: 200 };
+    expect(await check()).toMatchObject({ status: "ok" });
+    expect(paths).toEqual(["/healthz", "/healthz", "/healthz"]);
+  } finally { server.stop(true); rmSync(root, { recursive: true, force: true }); }
+});
+
 test("production and DEV setup reject the removed connector-name option before configuration", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-fixed-connector-"));
   try {
@@ -51,11 +89,14 @@ test("production and DEV setup reject the removed connector-name option before c
       CODEX_WEB_GPT_DEV_HOME: join(root, "dev"),
     };
     for (const command of [["setup"], ["dev", "setup"]]) {
-      const result = await runCli([
-        ...command, "--browser-only", "--app-name", "Other Connector", "--acknowledge-unofficial",
-      ], env);
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toMatch(/Unknown.*arguments: --app-name Other Connector/);
+      for (const option of [["--app-name", "Other Connector"]]) {
+        const result = await runCli([
+          ...command, "--browser-only", ...option, "--acknowledge-unofficial",
+        ], env);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toMatch(/Unknown.*arguments:/);
+        expect(result.stderr).toContain(option.join(" "));
+      }
     }
     expect(existsSync(join(root, "app", "config.json"))).toBeFalse();
     expect(existsSync(join(root, "dev", "config.json"))).toBeFalse();
@@ -63,6 +104,8 @@ test("production and DEV setup reject the removed connector-name option before c
     expect(help.stdout).not.toContain("--app-name");
     expect(help.stdout).not.toContain("--bigger-context");
     expect(help.stdout).not.toContain("--standard-context");
+    expect(help.stdout).not.toContain("--saved-chats");
+    expect(help.stdout).not.toContain("--temporary-chats");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -208,11 +251,11 @@ test("production setup saves and reloads delegated tool authority", async () => 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       authenticated: true,
-      temporary: true,
+      newChat: true,
       solAvailable: true,
       extraHighAvailable: false,
       proAvailable: false,
-      url: "https://chatgpt.com/?temporary-chat=true",
+      url: "https://chatgpt.com/",
     }));
   });
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -595,10 +638,10 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       authenticated: true,
-      temporary: true,
+      newChat: true,
       solAvailable: true,
       extraHighAvailable: false, proAvailable: false,
-      url: "https://chatgpt.com/?temporary-chat=true",
+      url: "https://chatgpt.com/",
     }));
   });
   await new Promise<void>((resolveListen, rejectListen) => {

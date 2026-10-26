@@ -30,7 +30,7 @@ function fixture(mode = "automatic", ready = 5) {
     snapshot: () => ({}), writeDescriptor() {}, presentTurnView() {}, bindShellZoomShortcuts() {},
     bindTurnContents() {}, bindManualTurnContents() {}, initializeTurnTab: async () => {}, initializeManualTurnTab: async () => {},
     manualCompletionSignals: new Map(), manualTerminalSignals: new Map(), showWindow() {}, show() {},
-    getUseSavedChats: () => false, writeManualPrompt() { copies++; }, bindManualContextPlan() {}, armManualTurnDeadline() {},
+    writeManualPrompt() { copies++; }, bindManualContextPlan() {}, armManualTurnDeadline() {},
   });
   for (let index = 1; index <= 5; index++) {
     let destroyed = false, closes = 0;

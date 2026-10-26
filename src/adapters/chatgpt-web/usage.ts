@@ -50,6 +50,7 @@ function inputTokens(
     mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
     {
       ...options,
+      contextTaskRestoration: false,
       ...(manual ? { manualControl: true as const } : {}),
       captureLunaCheckpoint: options.captureLunaCheckpoint ?? (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
         && !mode.localTools

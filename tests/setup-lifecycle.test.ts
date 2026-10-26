@@ -75,7 +75,7 @@ for (const development of [false, true]) for (const interaction of ["automatic",
       expect(committed.appName).toBe(interaction === "manual" ? "Codex Zero Risk4" : committed.automaticAppName);
       expect(committed.automaticTunnel.tunnelId).toBe(automaticTunnel.tunnelId);
       expect(committed.manualTunnel.tunnelId).toBe(manualTunnel.tunnelId);
-      expect(committed.useSavedChats).toBe(true);
+      expect(committed).not.toHaveProperty("useSavedChats");
       expect(committed.zeroRiskRequireSentConfirmation).toBe(false);
       expect(inspect).not.toHaveBeenCalled();
       writeFileSync(configPath, original);
@@ -330,7 +330,6 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       const result = await (development ? setupDevProfile : setup)({ ...options, port,
         ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
         ...(development && interaction === "automatic" ? { devNativeToolLongWaitProbe: true } : {}),
-        useSavedChats: true,
         connectorNameSuffix: "Work",
       });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
@@ -338,7 +337,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       expect(result.tunnelReady).not.toBe(true);
       expect(result.connectorSetupRequired).toBe(true);
       expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
-      expect(saved?.useSavedChats).toBe(true);
+      expect(saved).not.toHaveProperty("useSavedChats");
       const continuityPath = join(root, "runtime", "session-continuity");
       const continuity = new ContinuityRegistrationStore(continuityPath);
       const thread = "1".repeat(64);

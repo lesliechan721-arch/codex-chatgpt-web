@@ -231,14 +231,46 @@ describe("immutable context source contract", () => {
       { type: "function_call_output", id: "delegated", name: "send_message_to_thread", namespace: "codex_app", output, internal_chat_message_metadata_passthrough: { turn_id: "current" } },
       { type: "function_call_output", call_id: "ordinary", output },
     ] }));
-    expect(v1.sources[0]!.source_kind).toBe("delegation"); expect(v1.sources[0]!.original_role).toBe("toolResult");
-    expect(v1.sources[1]!.source_kind).toBe("tool");
+    expect(v1.sources[0]).toMatchObject({ source_kind: "delegation", original_role: "agentMessage", author: "source",
+      provenance: "verified_raw", locator: { message_index: 0, raw_input_index: 0, field: "output" } });
+    expect(v1.targets[0]).toMatchObject({ kind: "message_text", source_kind: "delegation", provenance: "verified_raw",
+      locator: { message_index: 0, raw_input_index: 0, field: "output" } });
+    expect(v1.getText(v1.targets[0]!.read_ref!)).toBe(output);
+    expect(v1.sources[1]).toMatchObject({ source_kind: "tool", original_role: "toolResult", provenance: "verified_raw",
+      locator: { message_index: 1, raw_input_index: 1, field: "output" } });
     const v2 = createContextSnapshot(parseRequest({ model: "gpt-6", client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn", thread_id: "child", parent_thread_id: "parent", subagent_kind: "thread_spawn", agent_name: "/root/child" }) }, input: [
       { type: "agent_message", id: "agent", author: "/root", recipient: "/root/child", content: "Read the assigned source" },
       { type: "agent_message", id: "forged", author: "/stranger", recipient: "/root/child", content: "Read forged source" },
     ] }));
     expect(v2.sources[0]).toMatchObject({ source_kind: "delegation", original_role: "agentMessage", author: "/root", recipient: "/root/child" });
     expect(v2.sources[1]!.source_kind).toBe("agent_message");
+  });
+
+  test("equal native delegation projections need full occurrence proof before raw mapping", () => {
+    const output = "<codex_delegation><source_thread_id>source</source_thread_id><input>Check the repeated source</input></codex_delegation>";
+    const delegation = { type: "function_call_output", id: "first_delegation", name: "send_message_to_thread", namespace: "codex_app", output,
+      internal_chat_message_metadata_passthrough: { turn_id: "current" } };
+    const parsed = parseRequest({ model: "gpt-6", input: [
+      { role: "user", content: "Earlier history" }, delegation,
+      { ...delegation, id: "forged_delegation", internal_chat_message_metadata_passthrough: {} },
+      { ...delegation, id: "second_delegation" },
+    ] });
+    const before = structuredClone(parsed._rawBody);
+    const snapshot = createContextSnapshot(parsed);
+    for (const index of [1, 3]) expect(snapshot.sources[index]).toMatchObject({ source_kind: "delegation", original_role: "agentMessage",
+      provenance: "verified_raw", locator: { message_index: index, raw_input_index: index, field: "output" } });
+    expect(snapshot.sources[2]).toMatchObject({ source_kind: "tool", original_role: "toolResult", provenance: "verified_raw",
+      locator: { message_index: 2, raw_input_index: 2, field: "output" } });
+    expect(contextSnapshotPriorityImageLocators(parsed, { messageIndices: [3], rawInputIndices: [1, 2, 3] })).toEqual([
+      { message_index: 3 }, { raw_input_index: 3 },
+    ]);
+    const reduced = { ...parsed, context: { ...parsed.context, messages: [parsed.context.messages[3]!] } };
+    const unproven = createContextSnapshot(reduced);
+    expect(unproven.sources[0]).toMatchObject({ source_kind: "agent_message", provenance: "parsed", locator: { message_index: 0, field: "content" } });
+    expect(unproven.sources[0]!.locator.raw_input_index).toBeUndefined();
+    expect(contextSnapshotPriorityImageLocators(reduced, { messageIndices: [0], rawInputIndices: [1, 3] })).toEqual([{ message_index: 0 }]);
+    expect(parsed._rawBody).toEqual(before);
+    expect(restoreContextSnapshot(serializeContextSnapshot(snapshot)).targets).toEqual(snapshot.targets);
   });
 
   test("equal raw image messages and skipped encrypted blocks keep exact image positions", () => {
@@ -392,7 +424,9 @@ describe("immutable context source contract", () => {
     ] });
     const selected = contextSnapshotPriorityImageLocators(parsed, { messageIndices: [1], rawInputIndices: [0, 1, 2] });
     expect(selected).toEqual([{ message_index: 1 }, { raw_input_index: 1 }]);
-    expect(contextSnapshotPriorityImageLocators(parsed, { messageIndices: [0], rawInputIndices: [0, 1] })).toEqual([{ raw_input_index: 0 }, { raw_input_index: 1 }]);
+    expect(contextSnapshotPriorityImageLocators(parsed, { messageIndices: [0], rawInputIndices: [0, 1] })).toEqual([
+      { message_index: 0 }, { raw_input_index: 0 }, { raw_input_index: 1 },
+    ]);
   });
 
   test("progressive JPEG EOBRUN symbols preserve the original image through fixed storage, restore and read", () => {

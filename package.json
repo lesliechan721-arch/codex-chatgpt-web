@@ -1,6 +1,6 @@
 {
   "name": "codex-chatgpt-web",
-  "version": "6.1.13-4",
+  "version": "6.1.14-1",
   "private": true,
   "description": "A focused local Responses bridge that runs Codex tasks through a user-authenticated ChatGPT web session.",
   "repository": {
@@ -91,8 +91,9 @@
     "ip-address": "10.7.4",
     "proxy-addr": "2.0.8",
     "hono": "4.13.12",
-    "qs": "6.16.0",
-    "zod-to-json-schema": "3.25.1"
+    "qs": "6.16.1",
+    "zod-to-json-schema": "3.25.1",
+    "body-parser": "2.4.0"
   },
   "keywords": [
     "codex",

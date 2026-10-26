@@ -25,7 +25,6 @@ export function configureComposerPrediction(parsed: CodexParsedRequest, config: 
     mode: "browser-only",
     experimentalSkillAttachments: false,
     experimentalFreshConversationPerTurn: true,
-    useSavedChats: false,
   };
 }
 

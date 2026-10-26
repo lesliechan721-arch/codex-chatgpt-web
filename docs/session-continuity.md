@@ -274,11 +274,15 @@ The specifically committed checkpoint relation selects continuation on a confirm
 a summary cache alone grants no authority over that page. Exact
 delegated proof still includes request-carried source thread/turn, item ID, content, model, and
 reasoning identity. Neither the current compaction turn nor a matching summary replaces the source.
-Native v1 compaction can retain an older human message while dropping a synthetic delegated
-instruction. Recover that delegated source only through its exact committed checkpoint and
+Native compaction can retain an older human message while dropping a producer-marked goal or
+synthetic delegated instruction. Recover that source only through its exact committed checkpoint and
 accepted producer representation. Repeated compaction preserves this provenance; a new steering
 instruction keeps its own identity. Native AGENTS refreshes remain context and do not become a new
-task. Durable source-type evidence does not reconstruct missing instruction text after restart.
+task. A matching completed checkpoint can restore an accepted goal or delegation to model-visible
+context only when no newer steering follows it. This does not change the raw request or tool
+authority. Restored context retains its actual source identity in on-demand delivery; it must not
+reuse another raw message's position. Durable source-type evidence does not reconstruct missing
+instruction text after restart.
 Verified mode retains only its existing legitimate mappings. Retained-page continuation selects
 a unique source; a matching summary or the latest head cannot replace missing source proof.
 

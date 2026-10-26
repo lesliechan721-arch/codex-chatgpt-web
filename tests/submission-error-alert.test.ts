@@ -47,7 +47,8 @@ for (const freshAlert of [false, true]) {
       }, undefined, undefined, undefined, observer);
       if (freshAlert) {
         // The rejection can remove every turn before any acceptance evidence appears.
-        await expect(result).rejects.toMatchObject({ code: "context_length_exceeded", retryable: false });
+        const failure = await result.then(() => undefined, (error: unknown) => error);
+        expect(failure).toMatchObject({ code: "context_length_exceeded", retryable: false });
         expect(performance.now() - dispatchedAt).toBeLessThan(10_000);
         expect(receipts).toBe(0);
       } else {
@@ -117,7 +118,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("size alerts require a curren
     expect(await observer.failure()).toMatchObject({ status: 400, code: "context_length_exceeded", retryable: false });
     await observer.failure();
     expect(failures).toHaveLength(1);
-    // The next multipart Send records the existing alert as stale and resets the failure.
+    // The next Send records the existing alert as stale and resets the failure.
     observer.begin(page, undefined, [], await observer.captureAlertBaseline(page));
     await page.evaluate(async () => { await fetch("/backend-api/f/conversation", { method: "POST" }); });
     expect(await observer.failure()).toBeUndefined();

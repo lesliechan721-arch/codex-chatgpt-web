@@ -31,12 +31,13 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.12-3` integrates upstream `6.1.12` with this fork's continuity, durable input queue,
-short-start context, API access, provider, proxy, and remote-runtime contracts. New configurations
-and configurations without `useSavedChats` save chats by default; explicit choices are preserved.
-Connector verification uses the selected saved or temporary chat mode. The service, Launcher, installer, and download
-metadata use the same version. Next-message suggestions are available as an explicit opt-in;
-new installations and existing configurations without this setting leave them disabled.
+Version `6.1.14-1` integrates upstream `6.1.14` with this fork's continuity, durable input queue,
+short-start context, on-demand reading, API access, provider, proxy, and remote-runtime contracts.
+Task turns, sign-in, account inspection and connector verification use ordinary ChatGPT chats.
+The retired `useSavedChats` preference is ignored on upgrade, including a previous explicit false
+value; other settings are preserved. ChatGPT memory and custom instructions may apply.
+The service, Launcher, installer, and download metadata use the same version. Next-message
+suggestions remain an explicit opt-in and are disabled when the setting is absent.
 The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an
 existing release's pre-release flag when rerun. Other preview builds must have that flag set
 explicitly before publication. Named version suffixes retain preview ordering below the base release.
@@ -686,7 +687,7 @@ recreation. A Secret Service substrate probe does not by itself validate Electro
 Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account:
 
 1. Install the packaged launcher on a clean profile and prove that the embedded Bun runtime starts.
-2. Sign in inside the embedded browser and prove that Temporary Chat reaches a usable composer.
+2. Sign in inside the embedded browser and prove that a new ordinary chat reaches a usable composer.
 3. Install the Codex model route, restart Codex, and prove that every account-available ChatGPT Web
    effort appears exactly once without removing native models.
 4. Complete one Browser-only turn and verify streamed commentary plus the final answer.

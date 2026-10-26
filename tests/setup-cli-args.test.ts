@@ -17,7 +17,6 @@ for (const { name, parse } of parsers) {
     { flags: ["--fresh-conversation", "--retained-conversation"], message: "Choose --fresh-conversation or --retained-conversation" },
     { flags: ["--composer-predictions", "--no-composer-predictions"], message: "Choose --composer-predictions or --no-composer-predictions" },
     { flags: ["--skill-attachments", "--inline-skills"], message: "Choose --skill-attachments or --inline-skills" },
-    { flags: ["--saved-chats", "--temporary-chats"], message: "Choose --saved-chats or --temporary-chats" },
     { flags: ["--tool-authority-mode", "unsafe"], message: "--tool-authority-mode must be verified-environment or delegated" },
     { flags: ["--tool-authority-mode", "--acknowledge-unofficial"], message: "--tool-authority-mode requires a value" },
     { flags: ["--browser-only"], message: `Unknown ${name === "DEV" ? "DEV setup " : ""}arguments: --browser-only` },
@@ -47,7 +46,6 @@ for (const { name, parse } of parsers) {
       { enabled: "--fresh-conversation", disabled: "--retained-conversation", property: "experimentalFreshConversationPerTurn" },
       { enabled: "--composer-predictions", disabled: "--no-composer-predictions", property: "composerPredictionsEnabled" },
       { enabled: "--skill-attachments", disabled: "--inline-skills", property: "experimentalSkillAttachments" },
-      { enabled: "--saved-chats", disabled: "--temporary-chats", property: "useSavedChats" },
     ] as const) {
       expect(parse(["--browser-only", enabled])[property]).toBe(true);
       expect(parse(["--browser-only", disabled])[property]).toBe(false);
@@ -86,7 +84,7 @@ test("production setup preserves parsed options and leaves argv unchanged", () =
       mode: "full", port: 16, browserInteractionMode: "manual", toolAuthorityMode: "delegated",
       connectorNameSuffix: "Local", subagentProtocol: "native", tunnelId: "tunnel", runtimeKeyFile: "key",
       chromeExecutablePath: "chrome", browserHostDescriptorPath: "descriptor", refreshAccountCapabilities: true,
-      forceLogin: true, autoApproveToolCalls: true, experimentalSkillAttachments: true, useSavedChats: true,
+      forceLogin: true, autoApproveToolCalls: true, experimentalSkillAttachments: true,
       experimentalFreshConversationPerTurn: true, zeroRiskProEnabled: true,
       zeroRiskRequireSentConfirmation: false, replaceCodexRoute: true, preserveDisconnectedRoute: true,
       restartService: true,
@@ -129,7 +127,7 @@ test("DEV setup preserves its defaults, accepted options, and argv", () => {
     mode: "full", tunnelId: "tunnel", runtimeKeyFile: "key", browserHostDescriptorPath: "explicit-descriptor",
     connectorNameSuffix: "Local", acknowledgedUnofficial: true, refreshAccountCapabilities: true,
     autoApproveToolCalls: true, browserInteractionMode: "automatic", toolAuthorityMode: "delegated",
-    experimentalSkillAttachments: true, useSavedChats: true, experimentalFreshConversationPerTurn: true,
+    experimentalSkillAttachments: true, experimentalFreshConversationPerTurn: true,
     devNativeToolLongWaitProbe: true,
   });
   expect(args).toEqual(original);
@@ -213,6 +211,24 @@ for (const { name, parse } of parsers) test(`${name} accepts legacy context flag
       expect(String(warning)).toContain("removed");
       expect(String(warning)).toContain("ignored");
       expect(String(warning)).toContain("account/model history limits");
+    }
+  } finally { warnings.mockRestore(); }
+});
+
+for (const { name, parse } of parsers) test(`${name} ignores retired chat flags and explains ordinary history`, () => {
+  const warnings = spyOn(process.stderr, "write").mockImplementation(() => true);
+  try {
+    const expected = parse(["--full", "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated"]);
+    for (const flags of [["--saved-chats"], ["--temporary-chats"], ["--saved-chats", "--temporary-chats"]]) {
+      const options = parse(["--full", "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated", ...flags]);
+      expect(options).toEqual(expected);
+      expect(options).not.toHaveProperty("useSavedChats");
+    }
+    expect(warnings).toHaveBeenCalledTimes(3);
+    for (const [warning] of warnings.mock.calls) {
+      expect(String(warning)).toContain("Temporary Chat has been removed");
+      expect(String(warning)).toContain("ignored");
+      expect(String(warning)).toContain("ordinary ChatGPT history");
     }
   } finally { warnings.mockRestore(); }
 });

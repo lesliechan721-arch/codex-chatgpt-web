@@ -912,6 +912,7 @@ export function createChatGptWebAdapter(
       return {
         ...contextPresentation,
         appName: worker.appName,
+        includeContextTokenBreakdown: true,
         captureLunaCheckpoint,
         experimentalSkillAttachments,
         ...(taskUpdates ? { taskUpdateProtocol: 1 as const, ...taskUpdateRecoveryOptions(input) } : {}),

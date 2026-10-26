@@ -1408,14 +1408,17 @@ for (const manual of [false, true]) test(`Round 10: cached compact codecs do not
   expect(JSON.stringify(v1Output)).toContain("Older human text 1.");
 }, 30_000);
 
-for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint preserves the delegated source when native history retains an older human instruction`, async () => {
+for (const format of ["v1", "v2"] as const) for (const kind of ["delegation", "goal"] as const) test(`${format} task checkpoint preserves the ${kind} source when native history retains an older human instruction`, async () => {
   const f = fixture();
   f.controls.invokeSourceTools = true;
   const previous = { type: "message", role: "user", id: "msg-older-human", content: [{ type: "input_text", text: "Earlier human task." }],
     internal_chat_message_metadata_passthrough: { turn_id: "turn-older-human" } };
-  const delegation = { type: "function_call_output", id: "fco-current-delegation", name: "send_message_to_thread", namespace: "codex_app",
-    output: "<codex_delegation><source_thread_id>parent-thread</source_thread_id><input>Finish the delegated audit.</input></codex_delegation>",
-    internal_chat_message_metadata_passthrough: { turn_id: "turn-delegation" } };
+  const taskText = kind === "goal" ? '<codex_internal_context source="goal">Finish the delegated audit.</codex_internal_context>'
+    : "<codex_delegation><source_thread_id>parent-thread</source_thread_id><input>Finish the delegated audit.</input></codex_delegation>";
+  const delegation = kind === "goal" ? { type: "message", role: "user", id: "goal-current", content: taskText,
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-delegation", content_item_kinds: ["goal.internal_context"] } }
+    : { type: "function_call_output", id: "fco-current-delegation", name: "send_message_to_thread", namespace: "codex_app",
+      output: taskText, internal_chat_message_metadata_passthrough: { turn_id: "turn-delegation" } };
   const source = f.request("", "turn-delegation", [previous, delegation]);
   await f.run(source);
   const active = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(source)}`)!;
@@ -1432,9 +1435,9 @@ for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint pres
   f.controls.invokeSourceTools = false;
   const resumed = f.request("", "turn-checkpoint", installed);
   bindContinuityRequestScope(resumed, chatGptWebExecutionNamespace(f.provider));
-  expect(extractChatGptTurnUserRevision(resumed)).toBe(delegation.output);
+  expect(extractChatGptTurnUserRevision(resumed)).toBe(taskText);
   expect(chatGptCurrentInstructionRevision(resumed)?.itemId).toBe(delegation.id);
-  expect(recoverCompactionInstruction(resumed, extractChatGptTurnIdentity(resumed))?.sourceWasDelegation).toBe(true);
+  expect(recoverCompactionInstruction(resumed, extractChatGptTurnIdentity(resumed))?.sourceWasSyntheticInstruction).toBe(true);
   expect((await f.run(resumed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(f.submissions).toHaveLength(3);
 
@@ -1456,13 +1459,16 @@ for (const format of ["v1", "v2"] as const) test(`${format} task checkpoint pres
   expect(f.submissions.at(-1)?.prompt).toContain("Use the new scope.");
 });
 
-async function seedDelegationCheckpoint(f: ReturnType<typeof fixture>, format: "v1" | "v2") {
+async function seedDelegationCheckpoint(f: ReturnType<typeof fixture>, format: "v1" | "v2", kind: "delegation" | "goal" = "delegation") {
   f.controls.invokeSourceTools = true;
   const human = { type: "message", role: "user", id: "older-human", content: [{ type: "input_text", text: "Earlier human task." }],
     internal_chat_message_metadata_passthrough: { turn_id: "older-human-turn" } };
-  const delegation = { type: "function_call_output", id: "delegated-task", name: "send_message_to_thread", namespace: "codex_app",
-    output: "<codex_delegation><source_thread_id>parent</source_thread_id><input>Complete delegated work.</input></codex_delegation>",
-    internal_chat_message_metadata_passthrough: { turn_id: "delegated-turn" } };
+  const delegation = kind === "goal" ? { type: "message", role: "user", id: "delegated-task",
+    content: '<codex_internal_context source="goal">Complete delegated work.</codex_internal_context>',
+    internal_chat_message_metadata_passthrough: { turn_id: "delegated-turn", content_item_kinds: ["goal.internal_context"] } }
+    : { type: "function_call_output", id: "delegated-task", name: "send_message_to_thread", namespace: "codex_app",
+      output: "<codex_delegation><source_thread_id>parent</source_thread_id><input>Complete delegated work.</input></codex_delegation>",
+      internal_chat_message_metadata_passthrough: { turn_id: "delegated-turn" } };
   const original = f.request("", "delegated-turn", [human, delegation]);
   await f.run(original);
   const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
@@ -1483,7 +1489,7 @@ async function seedDelegationCheckpoint(f: ReturnType<typeof fixture>, format: "
   expect(Object.values(record.checkpoints).some(checkpoint => checkpoint.summaryDigest === continuityDigest(summary.text)
     && checkpoint.sourceIdentity === delegation.id && checkpoint.continuation.state === "consumed"
     && checkpoint.continuation.consumerLogicalWorkId === record.currentWorkId)).toBe(true);
-  return { installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
+  return { kind, installed, summary: summary.text, owner: record.owner, epoch: record.epoch,
     consumerId: record.currentWorkId, sourceId: Object.values(record.checkpoints)[0]!.sourceLogicalWorkId, pages: [...f.pages] };
 }
 
@@ -1549,7 +1555,8 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child seed
   const root = process.env.DELEGATION_RESTART_ROOT!;
   const launcherInstance = JSON.parse(process.env.DELEGATION_RESTART_LAUNCHER!);
   const f = fixture(false, { root, threadId: "delegation-backend-restart", launcherInstance, cleanupMode: "backend-exit" });
-  const seed = await seedDelegationCheckpoint(f, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2");
+  const seed = await seedDelegationCheckpoint(f, process.env.DELEGATION_RESTART_FORMAT as "v1" | "v2",
+    process.env.COMPACTION_RESTART_KIND === "goal" ? "goal" : "delegation");
   writeFileSync(join(root, "delegation-seed.json"), JSON.stringify(seed));
 }, 30000);
 
@@ -1592,7 +1599,8 @@ async function repeatDelegationCheckpoint(f: ReturnType<typeof fixture>, seed: a
   repeated._continuityStateDirectory = f.statePath;
   bindContinuityRequestScope(repeated, chatGptWebExecutionNamespace(f.provider));
   const recovered = recoverCompactionInstruction(repeated, extractChatGptTurnIdentity(repeated))!;
-  expect(recovered.sourceWasDelegation).toBe(true);
+  expect(recovered.sourceWasDelegation).toBe(seed.kind !== "goal");
+  expect(recovered.sourceWasGoal).toBe(seed.kind === "goal");
   expect(recovered.source).toMatchObject({ itemId: "delegated-task", turnId: "delegated-turn", content: [] });
   expect(isDurableCompactionSourceIdentity(repeated, recovered.source)).toBe(true);
   expect(isDurableCompactionSourceIdentity(repeated, { ...recovered.source })).toBe(false);
@@ -1637,7 +1645,7 @@ test.skipIf(!process.env.DELEGATION_RESTART_ROOT)("delegation restart child repe
   writeFileSync(join(root, "delegation-next.json"), JSON.stringify(next));
 }, 30000);
 
-for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, true]) test(`${format} delegated continuation can compact again after the backend process exits; second exit=${restartAgain}`, async () => {
+for (const format of ["v1", "v2"] as const) for (const kind of ["delegation", "goal"] as const) for (const restartAgain of [false, true]) test(`${format} ${kind} continuation can compact again after the backend process exits; second exit=${restartAgain}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "delegation-restart-"));
   cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
   const launcher = continuityProcessInstance();
@@ -1645,7 +1653,7 @@ for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, t
     ? "darwin:Sat Oct 10 00:00:00 2026" : launcher.startIdentity, instanceId: "a".repeat(64) };
   const log = Bun.file(join(root, "child.log"));
   const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^delegation restart child seed$"], {
-    env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format,
+    env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format, COMPACTION_RESTART_KIND: kind,
       DELEGATION_RESTART_LAUNCHER: JSON.stringify(launcherInstance) }, stdout: log, stderr: log,
   });
   expect(await child.exited, await log.text()).toBe(0);
@@ -1654,7 +1662,7 @@ for (const format of ["v1", "v2"] as const) for (const restartAgain of [false, t
   if (restartAgain) {
     const nextLog = Bun.file(join(root, "repeat-child.log"));
     const nextChild = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "^delegation restart child repeat$"], {
-      env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format,
+      env: { ...process.env, DELEGATION_RESTART_ROOT: root, DELEGATION_RESTART_FORMAT: format, COMPACTION_RESTART_KIND: kind,
         DELEGATION_RESTART_LAUNCHER: JSON.stringify(launcherInstance) }, stdout: nextLog, stderr: nextLog,
     });
     expect(await nextChild.exited, await nextLog.text()).toBe(0);

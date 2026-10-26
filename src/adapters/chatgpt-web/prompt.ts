@@ -18,6 +18,8 @@ import {
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
+import { restoreCompactionTaskMessages } from "./compaction-continuation";
+import { chatGptTurnUserRevisionHistory, extractChatGptTurnIdentity } from "./environment";
 import { estimateTokens, withTokenEstimateCache } from "../../lib/token-estimate";
 import type { CodexAssistantContentPart, CodexContentPart, CodexImageContent, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
@@ -56,7 +58,14 @@ export interface CompiledChatGptWebPrompt {
   skillFiles?: ChatGptSkillFile[];
   /** Oldest history items removed by native-style compaction fit recovery; absent on normal turns. */
   trimmedCompactionMessages?: number;
+  /** Numeric counts of the submitted context records, never their contents or identifiers. */
+  contextTokenBreakdown?: ChatGptContextTokenBreakdown;
 }
+
+export type ChatGptContextTokenBreakdown = Partial<Record<
+  "system" | "developer" | "user" | "assistant" | "tool_result" | "agent_message",
+  { records: number; chars: number; tokens: number }
+>>;
 
 export interface CompileChatGptWebPromptOptions {
   /** Internal comparison/acceptance control; does not change delivery selection or send limits. */
@@ -75,6 +84,10 @@ export interface CompileChatGptWebPromptOptions {
   appName?: string;
   captureLunaCheckpoint?: boolean;
   experimentalSkillAttachments?: boolean;
+  /** Capture numeric context diagnostics only for the selected browser submission. */
+  includeContextTokenBreakdown?: boolean;
+  /** Canonical usage probes measure request history without acquiring checkpoint recovery evidence. */
+  contextTaskRestoration?: false;
   /**
    * Manual Zero Risk transport keeps ChatGPT model/effort selection and prompt submission under the
    * user's control. The browser bridge may open the owned tab and copy this prompt, but it never
@@ -146,7 +159,7 @@ const DROPPED_IMAGE_NOTE =
 /**
  * A fresh compaction epoch receives the complete canonical context, so every still-relevant image
  * must be attached on that first message. Retained continuation messages send only their new
- * canonical suffix because prior images remain in the same Temporary Chat. The per-message image
+ * canonical suffix because prior images remain in the same ChatGPT conversation. The per-message image
  * limit still drops overflow from the oldest end so the images the task is actively working on
  * survive.
  */
@@ -242,6 +255,24 @@ function messageEnvelope(
     };
   }
   return { role: message.role, content: inputContent(message.content, images, budget) };
+}
+
+/** Count the prepared records actually included in the selected delivery. */
+export function contextTokenBreakdown(
+  system: readonly unknown[],
+  messages: readonly Record<string, unknown>[],
+): ChatGptContextTokenBreakdown {
+  const counts: ChatGptContextTokenBreakdown = {};
+  const add = (role: keyof ChatGptContextTokenBreakdown, value: unknown): void => {
+    const text = withoutRetiredTurnHandles(JSON.stringify(value));
+    const group = counts[role] ??= { records: 0, chars: 0, tokens: 0 };
+    group.records += 1;
+    group.chars += text.length;
+    group.tokens += estimateTokens(text);
+  };
+  system.forEach(content => add("system", content));
+  messages.forEach(message => add(message.role as keyof ChatGptContextTokenBreakdown, message));
+  return counts;
 }
 
 export function chatGptReadOnlyContextWarning(
@@ -464,6 +495,9 @@ function compileChatGptWebPromptCandidate(
     const attachments = {
       ...(skillFiles.length ? { skillFiles } : {}),
       ...(mode.localTools && !manualControl && !parsed._compactionRequest ? { turnToken } : {}),
+      ...(options?.includeContextTokenBreakdown
+        ? { contextTokenBreakdown: contextTokenBreakdown(deliveredSystem, messages) }
+        : {}),
     };
     const answerContract = captureLunaCheckpoint
       ? "Return the complete answer that the outer Codex task should receive, then the required private checkpoint tail."
@@ -523,8 +557,10 @@ function compileChatGptWebPromptCandidate(
 
   // The caller owns the proven candidate boundary. Body tags and content-kind
   // metadata do not prove that a later input message revokes an earlier rule.
-  const sourceMessageIndices = parsed.context.messages.map((_, index) => index);
-  let sourceMessages = sourceMessageIndices.map(index => parsed.context.messages[index]!);
+  let sourceMessages = [...(options?.contextTaskRestoration === false ? parsed.context.messages
+    : restoreCompactionTaskMessages(parsed, extractChatGptTurnIdentity(parsed), chatGptTurnUserRevisionHistory(parsed)))];
+  // Restored checkpoint context has no raw input position. Keep later records' exact positions.
+  const sourceMessageIndices = sourceMessages.map(message => parsed.context.messages.indexOf(message));
   const initialMessageCount = sourceMessages.length;
   let compiled = build(sourceMessages);
   if (!parsed._compactionRequest || !trimCompaction) return compiled;
@@ -542,6 +578,7 @@ function compileChatGptWebPromptCandidate(
     const discardIndex = checkpointIndex === 0 ? 1 : 0;
     if (discardIndex === sourceMessages.length - 1) break;
     sourceMessages.splice(discardIndex, 1);
+    sourceMessageIndices.splice(discardIndex, 1);
     if (checkpointIndex > discardIndex) checkpointIndex -= 1;
     // Rebuild image references and count the omission notice inside the same byte budget.
     compiled = build(sourceMessages, initialMessageCount - sourceMessages.length);

@@ -9,6 +9,10 @@ export type NativeToolEntry = "codex_exec" | "codex_write_stdin" | "codex_apply_
 
 export class NativeToolAdmissionError extends Error {}
 
+export const CHATGPT_WEB_COMMAND_POLL_MAX_MS = 60_000;
+export const COMMAND_POLL_TRANSPORT_RULE = `ChatGPT Web transport rule: write_stdin yield_time_ms must be at most ${CHATGPT_WEB_COMMAND_POLL_MAX_MS}. A running command returns partial output and its session_id; return after each poll and use a separate MCP call to poll again if needed. Longer waits are rejected before execution because they can exceed the MCP deadline.`;
+const COMMAND_POLL_TOOL_NAME_PATTERN = /(^|__)(codex_)?write_stdin$/;
+
 export const nativeToolInputSchemas = {
   codex_exec: {
     cmd: z.string().min(1).max(100_000),
@@ -24,7 +28,7 @@ export const nativeToolInputSchemas = {
   codex_write_stdin: {
     session_id: z.number().int().nonnegative(),
     chars: z.string().max(1_000_000).optional(),
-    yield_time_ms: z.number().int().min(250).max(300_000).optional(),
+    yield_time_ms: z.number().int().min(250).max(CHATGPT_WEB_COMMAND_POLL_MAX_MS).optional(),
     max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
   },
   codex_apply_patch: { patch: z.string().min(1).max(5_000_000) },
@@ -165,6 +169,9 @@ export function planNativeTool(
         if (wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME || /(^|__)(codex_tool_wait|codex_task_update_ack|codex_context_list|codex_context_read|codex_context_search)$/.test(wire_name)) {
           throw new NativeToolAdmissionError("Bridge control tools cannot be called through the Native gateway");
         }
+        if (COMMAND_POLL_TOOL_NAME_PATTERN.test(wire_name) && freeformInput !== undefined) {
+          throw new NativeToolAdmissionError("ChatGPT Web write_stdin requires structured arguments. " + COMMAND_POLL_TRANSPORT_RULE);
+        }
         const tool = safeVisibleTools(bound, contract).find(candidate => wireName(candidate) === wire_name);
         if (!tool) {
           const gateway = execGateway(bound);
@@ -284,13 +291,25 @@ function isGatewayAgentWaitTool(name: string): boolean {
 
 function browserToolDescription(tool: CodexTool): string {
   if (isAgentWaitTool(tool)) return `${tool.description}\n\n${AGENT_WAIT_TRANSPORT_RULE}`;
+  if (COMMAND_POLL_TOOL_NAME_PATTERN.test(wireName(tool))) return `${tool.description}\n\n${COMMAND_POLL_TRANSPORT_RULE}`;
   if (!tool.namespace && tool.name === "exec") {
-    return `${tool.description}\n\n${AGENT_WAIT_TRANSPORT_RULE} This rule is enforced for wait_agent calls made inside exec; recursive raw exec is unavailable.`;
+    return `${tool.description}\n\n${AGENT_WAIT_TRANSPORT_RULE} This rule is enforced for wait_agent calls made inside exec; recursive raw exec is unavailable. ${COMMAND_POLL_TRANSPORT_RULE}`;
   }
   return tool.description;
 }
 
 function browserToolParameters(tool: CodexTool): Record<string, unknown> {
+  if (COMMAND_POLL_TOOL_NAME_PATTERN.test(wireName(tool))) {
+    const parameters = structuredClone(tool.parameters);
+    const properties = parameters.properties as Record<string, Record<string, unknown>> | undefined;
+    if (properties?.yield_time_ms) {
+      const yieldTime = properties.yield_time_ms;
+      yieldTime.maximum = Math.min(typeof yieldTime.maximum === "number" ? yieldTime.maximum : Infinity, CHATGPT_WEB_COMMAND_POLL_MAX_MS);
+      if (typeof yieldTime.default === "number" && yieldTime.default > Number(yieldTime.maximum)) delete yieldTime.default;
+      yieldTime.description = COMMAND_POLL_TRANSPORT_RULE;
+    }
+    return parameters;
+  }
   if (!isAgentWaitTool(tool)) return tool.parameters;
   const parameters = structuredClone(tool.parameters);
   const properties = parameters.properties && typeof parameters.properties === "object" && !Array.isArray(parameters.properties)
@@ -322,6 +341,7 @@ function browserToolParameters(tool: CodexTool): Record<string, unknown> {
 }
 
 function assertBrowserToolArguments(tool: CodexTool, args: Record<string, unknown>): void {
+  if (COMMAND_POLL_TOOL_NAME_PATTERN.test(wireName(tool))) assertCommandPollArguments(args);
   if (!isAgentWaitTool(tool)) return;
   if (args.timeout_ms !== CHATGPT_WEB_AGENT_WAIT_POLL_MS) {
     throw new Error(
@@ -332,12 +352,21 @@ function assertBrowserToolArguments(tool: CodexTool, args: Record<string, unknow
 }
 
 function assertGatewayToolArguments(name: string, args: Record<string, unknown>): void {
+  if (COMMAND_POLL_TOOL_NAME_PATTERN.test(name)) assertCommandPollArguments(args);
   if (!isGatewayAgentWaitTool(name)) return;
   if (args.timeout_ms !== CHATGPT_WEB_AGENT_WAIT_POLL_MS) {
     throw new Error(
       `ChatGPT Web wait_agent requires timeout_ms=${CHATGPT_WEB_AGENT_WAIT_POLL_MS}`
       + " so the shared MCP channel remains available to spawned Web agents",
     );
+  }
+}
+
+function assertCommandPollArguments(args: Record<string, unknown>): void {
+  const value = args.yield_time_ms;
+  if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value)
+    || value < 250 || value > CHATGPT_WEB_COMMAND_POLL_MAX_MS)) {
+    throw new Error(COMMAND_POLL_TRANSPORT_RULE);
   }
 }
 
@@ -361,6 +390,7 @@ interface GatewayToolCatalogPage {
 }
 
 function gatewayToolDescription(tool: GatewayToolDescriptor): string {
+  if (COMMAND_POLL_TOOL_NAME_PATTERN.test(tool.name)) return `${tool.description}\n\n${COMMAND_POLL_TRANSPORT_RULE}`;
   if (!isGatewayAgentWaitTool(tool.name)) return tool.description;
   return `${tool.description}\n\n${AGENT_WAIT_TRANSPORT_RULE}`;
 }
@@ -485,51 +515,70 @@ function execGatewayProgram(
 }
 
 /**
- * Preserve the native freeform exec surface while applying the same wait_agent deadline contract
- * as direct calls. The model still owns its JavaScript; only the tool registry it receives is a
- * transparent proxy whose native wait functions validate their transport-bound argument before dispatch.
+ * Preserve native freeform exec while applying the same command-poll and wait_agent limits
+ * as direct calls. Compile model code separately from the closure holding the original tools,
+ * and replace the fresh isolate's global registry so dynamic functions also use the proxy.
  */
 function transportBoundRawExecProgram(input: string, blockedExecName: string): string {
+  const modelProgram = ["await (async (tools) => {", input, "})(tools);"].join("\n");
   return [
-    "await (async (tools) => {",
-    input,
-    "})((() => {",
+    "await (async () => {",
+    "const guardedTools = (() => {",
     "  const source = tools;",
+    "  const get = Reflect.get, apply = Reflect.apply;",
     `  const waitNames = new Set(${JSON.stringify([...GATEWAY_AGENT_WAIT_TOOL_NAMES])});`,
+    "  const isAgentWait = waitNames.has.bind(waitNames);",
+    "  const isBridgeQuery = RegExp.prototype.exec.bind(/(^|__)(codex_tool_wait|codex_task_update_ack|codex_context_list|codex_context_read|codex_context_search)$/);",
     `  const blockedExecName = ${JSON.stringify(blockedExecName)};`,
     `  const pollMs = ${CHATGPT_WEB_AGENT_WAIT_POLL_MS};`,
+    `  const commandPollNames = ${COMMAND_POLL_TOOL_NAME_PATTERN};`,
+    "  const isCommandPoll = RegExp.prototype.exec.bind(commandPollNames);",
+    `  const commandPollMaxMs = ${CHATGPT_WEB_COMMAND_POLL_MAX_MS};`,
+    `  const commandPollRule = ${JSON.stringify(COMMAND_POLL_TRANSPORT_RULE)};`,
     "  const registryNames = new Set(Reflect.ownKeys(source));",
     "  if (typeof ALL_TOOLS !== \"undefined\" && Array.isArray(ALL_TOOLS)) {",
     "    for (const tool of ALL_TOOLS) if (typeof tool?.name === \"string\") registryNames.add(tool.name);",
     "  }",
+    "  const isRegistered = registryNames.has.bind(registryNames);",
+    "  const registeredKeys = [...registryNames];",
     "  const wrappers = new Map();",
+    "  const hasWrapper = wrappers.has.bind(wrappers), getWrapper = wrappers.get.bind(wrappers), setWrapper = wrappers.set.bind(wrappers);",
     "  const expose = name => {",
-    "    if (wrappers.has(name)) return wrappers.get(name);",
-    "    const value = Reflect.get(source, name, source);",
+    "    if (!isRegistered(name)) return undefined;",
+    "    if (hasWrapper(name)) return getWrapper(name);",
+    "    const value = get(source, name, source);",
     "    let exposed = value;",
-    "    if (typeof name === \"string\" && /(^|__)(codex_tool_wait|codex_task_update_ack|codex_context_list|codex_context_read|codex_context_search)$/.test(name)) {",
+    "    if (typeof name === \"string\" && isBridgeQuery(name)) {",
     "      exposed = () => { throw new Error(String(name) + \" is a bridge query, not a Native gateway tool\"); };",
     "    } else if (typeof value === \"function\" && name === blockedExecName) {",
     "      exposed = () => { throw new Error(\"Nested raw exec is unavailable inside ChatGPT Web exec\"); };",
-    "    } else if (typeof value === \"function\" && typeof name === \"string\" && waitNames.has(name)) {",
+    "    } else if (typeof value === \"function\" && typeof name === \"string\" && isAgentWait(name)) {",
     "      exposed = args => {",
     "        if (!args || typeof args !== \"object\" || Array.isArray(args) || args.timeout_ms !== pollMs) {",
     "          throw new Error(\"ChatGPT Web wait_agent requires timeout_ms=\" + pollMs + \" so the shared MCP channel remains available to spawned Web agents\");",
     "        }",
-    "        return Reflect.apply(value, source, [args]);",
+    "        return apply(value, source, [args]);",
+    "      };",
+    "    } else if (typeof value === \"function\" && typeof name === \"string\" && isCommandPoll(name)) {",
+    "      exposed = args => {",
+    "        if (!args || typeof args !== \"object\" || Array.isArray(args)) throw new Error(commandPollRule);",
+    "        const pollArgs = { __proto__: null, ...args };",
+    "        const wait = pollArgs.yield_time_ms;",
+    "        if (wait !== undefined && (typeof wait !== \"number\" || !Number.isInteger(wait) || wait < 250 || wait > commandPollMaxMs)) throw new Error(commandPollRule);",
+    "        return apply(value, source, [pollArgs]);",
     "      };",
     "    } else if (typeof value === \"function\") {",
-    "      exposed = (...args) => Reflect.apply(value, source, args);",
+    "      exposed = (...args) => apply(value, source, args);",
     "    }",
-    "    wrappers.set(name, exposed);",
+    "    setWrapper(name, exposed);",
     "    return exposed;",
     "  };",
     "  return new Proxy(Object.create(null), {",
     "    get: (_target, name) => expose(name),",
-    "    has: (_target, name) => registryNames.has(name) || Reflect.has(source, name),",
-    "    ownKeys: () => [...registryNames],",
+    "    has: (_target, name) => isRegistered(name),",
+    "    ownKeys: () => registeredKeys,",
     "    getOwnPropertyDescriptor: (_target, name) =>",
-    "      registryNames.has(name) || Reflect.has(source, name)",
+    "      isRegistered(name)",
     "        ? { configurable: true, enumerable: true, writable: false, value: expose(name) }",
     "        : undefined,",
     "    set: () => false,",
@@ -539,7 +588,19 @@ function transportBoundRawExecProgram(input: string, blockedExecName: string): s
     "    getPrototypeOf: () => null,",
     "    preventExtensions: () => false,",
     "  });",
-    "})());",
+    "})();",
+    // Native exec has a fresh isolate for each call. Lexical-only hosts have no global tool
+    // registry to replace, so do not create one that outlives this execution.
+    "const globalToolsDescriptor = Object.getOwnPropertyDescriptor(globalThis, \"tools\");",
+    "if (globalToolsDescriptor) {",
+    "  if (globalThis.tools !== tools) throw new Error(\"Native global tool registry does not match the current exec registry\");",
+    "  Object.defineProperty(globalThis, \"tools\", { value: guardedTools, writable: false, configurable: false, enumerable: globalToolsDescriptor.enumerable });",
+    "}",
+    `const execute = new (Object.getPrototypeOf(async () => {}).constructor)("tools", "ALL_TOOLS", "text", "image", "audio", "generatedImage", ${JSON.stringify(modelProgram)});`,
+    "await execute(guardedTools, typeof ALL_TOOLS === \"undefined\" ? undefined : ALL_TOOLS,",
+    "  typeof text === \"undefined\" ? undefined : text, typeof image === \"undefined\" ? undefined : image,",
+    "  typeof audio === \"undefined\" ? undefined : audio, typeof generatedImage === \"undefined\" ? undefined : generatedImage);",
+    "})();",
   ].join("\n");
 }
 

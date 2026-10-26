@@ -59,7 +59,6 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   setComposerPredictions: (enabled) => ipcRenderer.invoke("launcher:composer-predictions", enabled),
   setSkillAttachments: (enabled) => ipcRenderer.invoke("launcher:skill-attachments", enabled),
   setFreshConversationPerTurn: (enabled) => ipcRenderer.invoke("launcher:fresh-conversation-per-turn", enabled),
-  setUseSavedChats: (enabled) => ipcRenderer.invoke("launcher:use-saved-chats", enabled),
   setAutoApproveToolCalls: (enabled) => ipcRenderer.invoke("launcher:auto-approve-tool-calls", enabled),
   setZeroRiskPro: (enabled) => ipcRenderer.invoke("launcher:zero-risk-pro", enabled),
   setZeroRiskRequireSentConfirmation: (enabled) => ipcRenderer.invoke("launcher:zero-risk-sent-confirmation", enabled),
