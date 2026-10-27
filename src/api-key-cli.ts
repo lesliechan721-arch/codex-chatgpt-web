@@ -1,7 +1,7 @@
 import { stdin, stdout, stderr } from "node:process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
+import { atomicWriteFile, currentRuntimeCommand, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
 import {
   API_KEY_ENV,
   MODEL_CATALOG_STATUS_HEADER,
@@ -25,6 +25,7 @@ import modelCatalogCommandLock from "../launcher/electron/model-catalog-command-
 import { installCodexIntegration } from "./codex-integration";
 import { cleanupApiKeyCodexIntegration } from "./api-key-integration";
 import { codexProxyEnvironment, renderApiKeyCodexConfig } from "./api-key-codex-config";
+import { installCodexInterruptHookLauncher } from "./codex-interrupt-hook";
 import { loadUpstreamProviderConfig } from "./upstream-provider-config";
 import {
   clientBaseUrl,
@@ -255,6 +256,7 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
       stdout.write(`${JSON.stringify({ catalogPath })}\n`);
       return;
     }
+    if (!externalClient) installCodexInterruptHookLauncher({ runtimeCommand: currentRuntimeCommand() });
     const rendered = renderApiKeyCodexConfig({
       port: config.port,
       baseUrl: clientRoute.baseUrl,

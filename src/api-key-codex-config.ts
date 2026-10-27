@@ -58,7 +58,7 @@ export function renderApiKeyCodexConfig(options: {
   // Exported settings belong to the user, not to the automatic injection journal.
   text = text.trimEnd() + "\n\n" + defaults + "\n";
   if (options.runtimeCommand?.length) {
-    const command = codexInterruptHookCommand({ runtimeCommand: options.runtimeCommand });
+    const command = codexInterruptHookCommand();
     text = text.trimEnd() + "\n\n" + [
       '# Interrupt lifecycle hook, shared with the forwarding integration.',
       '# No automatic trust hash: the destination file and hook index are chosen by you.',

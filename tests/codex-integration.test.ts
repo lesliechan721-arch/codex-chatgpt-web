@@ -912,32 +912,43 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toBe('model = "gpt-5.6-sol"\n');
   });
 
-  test("upgrades the released v9 route by adding the trusted Interrupt lifecycle hook", () => {
-    const { codexHome } = fixture();
-    const configPath = join(codexHome, "config.toml");
-    const original = 'model = "gpt-5.6-sol"\n';
-    writeFileSync(configPath, original);
-    installCodexIntegration(nativeConfig("browser-only"));
+  for (const action of ["setup", "connect"] as const) {
+    test(`upgrades the released v9 route with a working Interrupt launcher via ${action}`, () => {
+      const { codexHome, appHome } = fixture();
+      const configPath = join(codexHome, "config.toml");
+      const original = 'model = "gpt-5.6-sol"\n';
+      writeFileSync(configPath, original);
+      const config = nativeConfig("browser-only");
+      saveConfig(config);
+      installCodexIntegration(config);
 
-    const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
-    const interruptFragment = legacy.interruptHook.fragment as string;
-    const legacyConfig = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), legacy.previousAutoRecap);
-    legacy.version = 9;
-    delete legacy.interruptHook;
-    delete legacy.previousAutoRecap;
-    const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
-    writeFileSync(configPath, legacyConfig);
-    writeFileSync(getCodexJournalPath(), legacyJournal);
-    writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
+      const legacy = JSON.parse(readFileSync(getCodexJournalPath(), "utf8"));
+      const interruptFragment = legacy.interruptHook.fragment as string;
+      const legacyConfig = restoreAutoRecap(readFileSync(configPath, "utf8").replace(interruptFragment, ""), legacy.previousAutoRecap);
+      legacy.version = 9;
+      delete legacy.interruptHook;
+      delete legacy.previousAutoRecap;
+      const legacyJournal = `${JSON.stringify(legacy, null, 2)}\n`;
+      writeFileSync(configPath, legacyConfig);
+      writeFileSync(getCodexJournalPath(), legacyJournal);
+      writeFileSync(getCodexJournalRecoveryPath(), legacyJournal);
 
-    preflightCodexIntegration(nativeConfig("browser-only"));
-    expect(readFileSync(configPath, "utf8")).toBe(legacyConfig);
-    const upgraded = installCodexIntegration(nativeConfig("browser-only"));
-    expect(upgraded.version).toBe(10);
-    expect(readFileSync(configPath, "utf8")).toContain(upgraded.interruptHook.fragment);
-    expect(uninstallCodexIntegration()).toEqual({ changed: true });
-    expect(readFileSync(configPath, "utf8")).toBe(original);
-  });
+      const script = join(appHome, "hooks", process.platform === "win32" ? "interrupt.cmd" : "interrupt.sh");
+      rmSync(join(appHome, "hooks"), { recursive: true, force: true });
+      preflightCodexIntegration(config);
+      expect(existsSync(script)).toBe(false);
+      expect(readFileSync(configPath, "utf8")).toBe(legacyConfig);
+      if (action === "setup") installCodexIntegration(config);
+      else expect(activateCodexIntegration()).toEqual({ changed: true, active: true });
+      const upgraded = inspectCodexIntegration().journal!;
+      if (upgraded.version !== 10) throw new Error("Expected upgraded integration journal");
+      expect(existsSync(script)).toBe(true);
+      expect(upgraded.version).toBe(10);
+      expect(readFileSync(configPath, "utf8")).toContain(upgraded.interruptHook.fragment);
+      expect(uninstallCodexIntegration()).toEqual({ changed: true });
+      expect(readFileSync(configPath, "utf8")).toBe(original);
+    });
+  }
 
   test("disconnects and reconnects the bridge without losing the prior route or journal", () => {
     const { codexHome } = fixture();

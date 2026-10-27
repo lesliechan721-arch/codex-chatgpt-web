@@ -141,7 +141,7 @@ Compatible settings from the original forwarding integration are generated throu
 | `[features] multi_agent = true` | Export in Compatibility V1 mode, matching automatic integration |
 | `[features] multi_agent_v2 = false` | Export in Compatibility V1 mode; native mode does not force a downgrade |
 | `[agents] max_depth` | Reuse the V1 default, currently 2; the user can retain a larger existing value |
-| `[[hooks.Interrupt]]` | Normal local API mode exports the same runtime command, application home, and `timeout=3`; server remote-desktop deployment does not export a container-local command hook |
+| `[[hooks.Interrupt]]` | Normal local API mode exports a stable script in the application home's `hooks` directory with `timeout=3`; server remote-desktop deployment does not export a container-local command hook |
 | `openai_base_url` | Exclude; API mode uses the custom provider's `base_url` |
 | `experimental_realtime_webrtc_call_base_url` | Exclude; it depends on native OpenAI identity and conflicts with standalone API access |
 | `[hooks.state] trusted_hash` | Exclude; the target file and hook index are user-selected, so export does not fabricate pre-approval state |
@@ -161,6 +161,14 @@ bridge does not support instant interruption of an active model response. Merge
 `features.instant_interrupt = false` into existing client settings and restart Codex.
 
 On a normal local installation, the exported Interrupt hook is a declaration, not automatic authorization. After merging it, the user approves the command through Codex as required. Server remote-desktop deployment does not depend on a client command hook for correctness. It continues to use HTTP disconnect cancellation and additionally enables a no-progress timeout for native turns. When `[features]`, `[agents]`, or hooks already exist, merge by field instead of appending duplicate TOML tables or importing the same hook twice.
+
+The local command points to `<application home>/hooks/interrupt.sh` (`interrupt.cmd` on Windows).
+Each local service start updates this script to use the running installation. The command and
+its Codex trust hash stay the same across service upgrades. The script forwards the Interrupt
+payload to the existing handler, which reads the current service address and control token
+from the bound application home. Existing manual configurations that reference a versioned
+runtime path need one hook-command replacement from a new export and Codex approval. Later
+upgrades do not require another hook-command change.
 
 ## 7. Usage examples
 

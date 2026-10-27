@@ -7,7 +7,8 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, providerConfig, saveConfig } from "./config";
+import { currentRuntimeCommand, defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, providerConfig, saveConfig } from "./config";
+import { installCodexInterruptHookLauncher } from "./codex-interrupt-hook";
 import { readTaskInputControl, taskInputControl } from "./task-input-control";
 import {
   inspectLauncherBrowserHost,
@@ -630,6 +631,9 @@ async function main(): Promise<void> {
   } else if (command === "serve") {
     assertNoArgs(args);
     const config = loadConfig();
+    if (!manualCodexConfigurationOnly()) {
+      installCodexInterruptHookLauncher({ runtimeCommand: currentRuntimeCommand() });
+    }
     if (loadApiAccessPolicy().mode === "api-key" && !manualCodexConfigurationOnly()) {
       try { cleanupApiKeyCodexIntegration(); }
       catch { process.stderr.write("API mode: recorded Codex injection could not be cleaned; inspect conflicts or run api-key cleanup.\n"); }
