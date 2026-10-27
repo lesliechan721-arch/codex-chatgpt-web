@@ -174,7 +174,8 @@ test("successful CLI reconnect clears the persisted OpenAI routing warning", () 
 test("CLI Codex export requires the current local key and emits sensitive TOML plus separate proxy environment", () => withHome("local Codex export", home => {
   const localKey = "cgw_" + "q".repeat(43);
   writeFileSync(join(home, "api-access.json"), `${JSON.stringify(apiKeyPolicy(localKey))}\n`);
-  writeFileSync(join(home, "config.json"), `${JSON.stringify(defaultConfig("browser-only"))}\n`);
+  const config = { ...defaultConfig("browser-only"), runtimeCommand: [process.execPath, "retired-release-entry.js"] };
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(config)}\n`);
   const missing = rejectedCli(home, ["codex-config", "--json"], undefined, { CODEX_CHATGPT_WEB_API_KEY: undefined });
   assert.equal(missing.code, 1);
   assert.match(missing.err, /must contain the current local API key before export/);
@@ -196,6 +197,12 @@ test("CLI Codex export requires the current local key and emits sensitive TOML p
   assert.ok(payload.config.includes(`experimental_bearer_token = "${localKey}"`));
   assert.equal((Bun.TOML.parse(payload.config) as { features: { instant_interrupt: boolean } }).features.instant_interrupt, false);
   assert.ok(!payload.config.includes("env_key ="));
+  const hook = (Bun.TOML.parse(payload.config) as any).hooks.Interrupt[0].hooks[0];
+  const script = join(home, "hooks", process.platform === "win32" ? "interrupt.cmd" : "interrupt.sh");
+  assert.ok(hook.command.includes(script));
+  assert.ok(existsSync(script));
+  assert.ok(!readFileSync(script, "utf8").includes("retired-release-entry.js"));
+  assert.ok(readFileSync(script, "utf8").includes("cli.ts"));
   assert.equal(payload.catalogPath, join(home, "api-key-models.json"));
   assert.deepEqual(JSON.parse(payload.catalog), JSON.parse(readFileSync(payload.catalogPath, "utf8")));
   assert.equal(payload.environment.HTTP_PROXY, "http://proxy.example:8080");

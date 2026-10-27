@@ -1,8 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type { AppConfig } from "./config";
-import { getConfigPath, loadConfig, saveConfig } from "./config";
-import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
+import { currentRuntimeCommand, getConfigPath, loadConfig, saveConfig } from "./config";
+import { codexInterruptHookCommand, installCodexInterruptHook, installCodexInterruptHookCommand, installCodexInterruptHookLauncher } from "./codex-interrupt-hook";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
   getCodexConfigPath,
@@ -93,7 +93,7 @@ function installConfiguredRoute(
   const tui = installAutoRecap(configured.text);
   const hook = "interruptHookCommand" in config
     ? installCodexInterruptHookCommand(tui.text, getCodexConfigPath(), config.interruptHookCommand)
-    : installCodexInterruptHook(tui.text, getCodexConfigPath(), config);
+    : installCodexInterruptHook(tui.text, getCodexConfigPath());
   return { ...configured, text: hook.text, previousAutoRecap: tui.previousAutoRecap, interruptHook: hook.installed };
 }
 
@@ -237,6 +237,7 @@ export function installCodexIntegration(
   config: AppConfig,
   options: InstallCodexIntegrationOptions = {},
 ): CodexIntegrationJournal {
+  installCodexInterruptHookLauncher(config);
   const configPath = getCodexConfigPath();
   mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
   const configExists = existsSync(configPath);
@@ -457,6 +458,9 @@ export function activateCodexIntegration(options: { recoveryOnly?: boolean } = {
     } : {}),
     ...(existing.format ? { format: existing.format } : {}),
   };
+  if (route.interruptHook.command === codexInterruptHookCommand()) {
+    installCodexInterruptHookLauncher({ runtimeCommand: currentRuntimeCommand() });
+  }
   writeIntegrationState(connected, { path: existing.configPath, data: route.text }, [getCodexModelsCachePath()]);
   return { changed: true, active: true };
 }

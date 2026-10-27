@@ -235,7 +235,7 @@ test("export shares V1 feature defaults and Interrupt command but omits conflict
   expect(parsed.features).toEqual({ ...defaults.features, instant_interrupt: false });
   expect(parsed.agents).toEqual(defaults.agents);
   expect(parsed.tui.auto_recap).toBe(false);
-  expect(parsed.hooks.Interrupt[0].hooks[0].command).toBe(codexInterruptHookCommand(config));
+  expect(parsed.hooks.Interrupt[0].hooks[0].command).toBe(codexInterruptHookCommand());
   expect(parsed.hooks.state).toBeUndefined(); expect(parsed.openai_base_url).toBeUndefined();
   expect(parsed.experimental_realtime_webrtc_call_base_url).toBeUndefined();
   expect(parsed.model_providers.chatgpt_web.requires_openai_auth).toBe(false);

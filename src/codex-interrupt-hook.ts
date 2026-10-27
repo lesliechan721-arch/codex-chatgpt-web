@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { getStaticTOMLValue, parseTOML, type AST } from "toml-eslint-parser";
 import type { AppConfig } from "./config";
-import { getConfigDir } from "./config";
+import { atomicWriteFile, getConfigDir } from "./config";
 import type { InstalledCodexInterruptHook } from "./codex-integration-shared";
 
 export const MANAGED_INTERRUPT_HOOK_START =
@@ -50,13 +50,31 @@ function cmdShellArgument(value: string): string {
 }
 
 export function codexInterruptHookCommand(
-  config: Pick<AppConfig, "runtimeCommand">,
   home = getConfigDir(),
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const absoluteHome = platform === "win32" ? win32.resolve(home) : posix.resolve(home);
+  const path = platform === "win32" ? win32 : posix;
+  const script = path.join(path.resolve(home), "hooks", platform === "win32" ? "interrupt.cmd" : "interrupt.sh");
+  return (platform === "win32" ? cmdShellArgument : posixShellArgument)(script);
+}
+
+/** Refresh the dispatch target without changing Codex's command or its trust hash. */
+export function installCodexInterruptHookLauncher(
+  config: Pick<AppConfig, "runtimeCommand">,
+  home = getConfigDir(),
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const path = platform === "win32" ? win32 : posix;
+  const absoluteHome = path.resolve(home);
+  const script = path.join(absoluteHome, "hooks", platform === "win32" ? "interrupt.cmd" : "interrupt.sh");
   const args = [...config.runtimeCommand, "--home", absoluteHome, "hook", "interrupt"];
-  return args.map(platform === "win32" ? cmdShellArgument : posixShellArgument).join(" ");
+  const command = args.map(platform === "win32"
+    ? value => cmdShellArgument(value).replaceAll("%", "%%")
+    : posixShellArgument).join(" ");
+  const text = platform === "win32"
+    ? `@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n${command}\r\nexit /b %errorlevel%\r\n`
+    : `#!/bin/sh\nexec ${command}\n`;
+  atomicWriteFile(script, text, { mode: 0o700 });
 }
 
 function lineEnding(text: string): "\n" | "\r\n" | "\r" {
@@ -83,9 +101,8 @@ function canonicalConfigPath(configPath: string): string {
 export function installCodexInterruptHook(
   text: string,
   configPath: string,
-  config: Pick<AppConfig, "runtimeCommand">,
 ): { text: string; installed: InstalledCodexInterruptHook } {
-  return installCodexInterruptHookCommand(text, configPath, codexInterruptHookCommand(config));
+  return installCodexInterruptHookCommand(text, configPath, codexInterruptHookCommand());
 }
 
 export function installCodexInterruptHookCommand(

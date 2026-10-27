@@ -134,8 +134,7 @@ test("installs one narrowly trusted Interrupt hook and restores the exact Codex 
     'command = "existing-hook"',
     "",
   ].join("\n");
-  const config = { runtimeCommand: ["/opt/Codex Web/runtime/bun", "/opt/Codex Web/app/cli.js"] };
-  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", config);
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml");
 
   expect(installed.installed.groupIndex).toBe(1);
   expect(installed.installed.stateKey).toBe(`${resolve("/Users/test/.codex/config.toml")}:interrupt:1:0`);
@@ -151,7 +150,7 @@ test("trusts the canonical Codex config path before a new config file exists", (
   const directory = mkdtempSync(join(tmpdir(), "codex-interrupt-hook-"));
   try {
     const configPath = join(directory, "config.toml");
-    const installed = installCodexInterruptHook("", configPath, { runtimeCommand: ["/opt/runtime"] });
+    const installed = installCodexInterruptHook("", configPath);
     expect(installed.installed.stateKey).toBe(
       `${join(realpathSync.native(directory), "config.toml")}:interrupt:0:0`,
     );
@@ -160,23 +159,13 @@ test("trusts the canonical Codex config path before a new config file exists", (
   }
 });
 
-test("Interrupt hook command is absolute, quoted, and bound to the exact application home", () => {
+test("Interrupt hook command is bound to a stable script in the exact application home", () => {
   expect(codexInterruptHookCommand(
-    { runtimeCommand: ["/Applications/Codex Web GPT.app/runtime/bun", "/Applications/Codex Web GPT.app/app/cli.js"] },
-    "/Users/test/Application Support/Codex Web GPT",
-    "darwin",
-  )).toBe(
-    "'/Applications/Codex Web GPT.app/runtime/bun' '/Applications/Codex Web GPT.app/app/cli.js'"
-      + " '--home' '/Users/test/Application Support/Codex Web GPT' 'hook' 'interrupt'",
-  );
+    "/Users/test/Application Support/Codex Web GPT", "darwin",
+  )).toBe("'/Users/test/Application Support/Codex Web GPT/hooks/interrupt.sh'");
   expect(codexInterruptHookCommand(
-    { runtimeCommand: ["C:\\Program Files\\Codex Web GPT\\bun.exe", "C:\\Program Files\\Codex Web GPT\\cli.js"] },
-    "C:\\Users\\test\\Codex Web GPT",
-    "win32",
-  )).toBe(
-    '"C:\\Program Files\\Codex Web GPT\\bun.exe" "C:\\Program Files\\Codex Web GPT\\cli.js"'
-      + ' "--home" "C:\\Users\\test\\Codex Web GPT" "hook" "interrupt"',
-  );
+    "C:\\Users\\test\\Codex Web GPT", "win32",
+  )).toBe('"C:\\Users\\test\\Codex Web GPT\\hooks\\interrupt.cmd"');
 });
 
 test("Interrupt hook trust hash is deterministic and changes with its exact command", () => {
@@ -191,7 +180,6 @@ test("refuses to remove a modified or duplicated managed hook", () => {
   const installed = installCodexInterruptHook(
     original,
     "/Users/test/.codex/config.toml",
-    { runtimeCommand: ["/opt/runtime"] },
   );
   const modified = installed.text.replace("timeout = 3", "timeout = 2");
   expect(() => restoreCodexInterruptHook(modified, installed.installed)).toThrow("changed after setup");
@@ -217,16 +205,14 @@ test("refuses to remove a modified or duplicated managed hook", () => {
     installed.text,
   ].join("\n");
   expect(() => restoreCodexInterruptHook(reordered, installed.installed)).toThrow("order changed after setup");
-  expect(() => installCodexInterruptHook(installed.text, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] }))
+  expect(() => installCodexInterruptHook(installed.text, "/Users/test/.codex/config.toml"))
     .toThrow("already contains");
 });
 
 test("preserves native TOML editor tables inserted before the trailing hook comment", () => {
   for (const ending of ["\n", "\r\n"]) {
     const original = 'model = "gpt-5.6-sol"\n';
-    const installed = installCodexInterruptHook(original.replaceAll("\n", ending), "/Users/test/.codex/config.toml", {
-      runtimeCommand: ["/opt/runtime"],
-    });
+    const installed = installCodexInterruptHook(original.replaceAll("\n", ending), "/Users/test/.codex/config.toml");
     // Native config writes normalize line endings and insert tables before the trailing comment.
     const appended = "\n[features]\ngoals = true\n";
     const edited = installed.text.replaceAll("\r\n", "\n")
@@ -244,9 +230,7 @@ test("preserves native TOML editor tables inserted before the trailing hook comm
 test("restores a hook whose end comment moved before unchanged definitions without losing MCP settings", () => {
   for (const ending of ["\n", "\r\n"]) {
     const original = 'model = "gpt-5.6-sol"\n';
-    const installed = installCodexInterruptHook(original.replaceAll("\n", ending), "/Users/test/.codex/config.toml", {
-      runtimeCommand: ["/opt/runtime"],
-    });
+    const installed = installCodexInterruptHook(original.replaceAll("\n", ending), "/Users/test/.codex/config.toml");
     const mcp = '\n[mcp_servers.node_repl]\ncommand = "my-mcp"\n\n[mcp_servers.node_repl.env]\nMODE = "user-setting"\n';
     const definitions = installed.installed.fragment.replaceAll("\r\n", "\n")
       .replace(`${MANAGED_INTERRUPT_HOOK_END}\n`, "");
@@ -277,7 +261,7 @@ test("restores a hook whose end comment moved before unchanged definitions witho
 test("keeps foreign TOML tables inserted between the managed hook and its trust state", () => {
   for (const ending of ["\n", "\r\n", "\r"]) {
     const original = 'model = "example"\n\n[[hooks.Interrupt]]\n[[hooks.Interrupt.hooks]]\ntype = "command"\ncommand = "prior-hook"\n'.replaceAll("\n", ending);
-    const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] });
+    const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml");
     const foreign = '\n[marketplaces.claude-plugins-official]\nsource = "unchanged-user-setting"\n\n[mcp_servers.notes]\ncommand = "notes-server"\n\n'.replaceAll("\n", ending);
     const stateHeader = `[hooks.state.${JSON.stringify(installed.installed.stateKey)}]`;
     const edited = installed.text.replace(stateHeader, foreign + stateHeader);
@@ -286,7 +270,7 @@ test("keeps foreign TOML tables inserted between the managed hook and its trust 
     verifyCodexInterruptHook(edited, installed.installed);
     const restored = restoreCodexInterruptHook(edited, installed.installed);
     expect(restored).toBe(original + foreign);
-    const next = installCodexInterruptHook(restored, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/new-runtime"] });
+    const next = installCodexInterruptHook(restored, "/Users/test/.codex/config.toml");
     verifyCodexInterruptHook(next.text, next.installed);
     expect(restoreCodexInterruptHook(next.text, next.installed)).toBe(restored);
     for (const changed of [
@@ -303,9 +287,7 @@ test("keeps foreign TOML tables inserted between the managed hook and its trust 
 test("preserves ownership when Codex moves trust state before the hook and normalizes boundary newlines", () => {
   for (const ending of ["\n", "\r\n", "\r"]) {
     const original = 'model = "example"\n'.replaceAll("\n", ending);
-    const { text, installed } = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
-      runtimeCommand: ["/opt/runtime"],
-    });
+    const { text, installed } = installCodexInterruptHook(original, "/Users/test/.codex/config.toml");
     const state = `[hooks.state.${JSON.stringify(installed.stateKey)}]${ending}trusted_hash = ${JSON.stringify(installed.trustedHash)}${ending}`;
     const rewritten = text.replace(state, "").replace("# Managed by codex-chatgpt-web:", state + "# Managed by codex-chatgpt-web:")
       .replace(`timeout = 3${ending}${ending}`, `timeout = 3${ending}`);
@@ -330,7 +312,7 @@ test("preserves ownership when Codex moves trust state before the hook and norma
 
 test("accepts a literal-quoted trust-state key while preserving another config path's trust entry", () => {
   const original = 'model = "example"\n';
-  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] });
+  const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml");
   // Use the Windows key from #443 without depending on this test host's path resolver.
   const stateKey = String.raw`D:\AppData\Codex\UserData\config.toml:interrupt:0:0`;
   const beforeHeader = `[hooks.state.${JSON.stringify(installed.installed.stateKey)}]`;
