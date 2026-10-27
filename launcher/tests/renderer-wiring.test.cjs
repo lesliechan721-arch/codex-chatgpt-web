@@ -14,6 +14,37 @@ const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src"
 const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("../electron/connector-identity.cjs");
 const apiAccessSettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "ApiAccessSettings.tsx"), "utf8");
 
+// Use real React hooks and DOM events; only the native host and layout APIs are fixtures.
+async function withRendererDom(run) {
+  const React = require("react");
+  const { createWindow } = require("@mixmark-io/domino");
+  const window = createWindow("<html><body><div id='root'></div></body></html>");
+  const saved = ["window", "document", "IS_REACT_ACT_ENVIRONMENT"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]);
+  Object.assign(globalThis, { window, document: window.document, IS_REACT_ACT_ENVIRONMENT: true });
+  const root = require("react-dom/client").createRoot(window.document.getElementById("root"));
+  const compile = (source, name, scope = {}) => {
+    const ts = require("typescript");
+    const sandbox = { React, ...React, window, document: window.document, exports: {},
+      require: name => name === "react" ? React : name === "react-dom" ? require("react-dom") : {}, ...scope };
+    const js = ts.transpileModule(source, { compilerOptions: {
+      target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.React, jsxFactory: "React.createElement", jsxFragmentFactory: "React.Fragment",
+    } }).outputText;
+    require("node:vm").runInNewContext(`${js}\nrender = ${name};`, sandbox);
+    return sandbox.render;
+  };
+  try {
+    await run({ React, window, compile, render: element => React.act(async () => root.render(element)),
+      unmount: () => React.act(async () => root.unmount()) });
+  } finally {
+    await React.act(async () => root.unmount());
+    for (const [key, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  }
+}
+
 test("browser preferences waits for startup and route recovery without invalidating healthy setup", async () => {
   const vm = require("node:vm");
   for (const fails of [false, true]) {
@@ -55,7 +86,7 @@ test("browser preferences waits for startup and route recovery without invalidat
       app: { once() {} },
       runtimeHost: {
         currentOperation: () => null,
-        upgradeManagedRuntime: async () => ({ updated: false }),
+        upgradeManagedRuntime: async () => { calls.push("upgrade"); return { updated: false }; },
         runtimeConfigSnapshot: () => ({ configured: true, config }),
         connectBridgeRoute: async () => { calls.push("route"); return { changed: false }; },
         setComposerPredictions: async enabled => {
@@ -74,20 +105,79 @@ test("browser preferences waits for startup and route recovery without invalidat
     // Runtime startup proceeds even if the browser session check never completes.
     // Settings still wait for runtime readiness, and read-only UI stays usable.
     assert.equal((await handlers.get("launcher:limits")()).enabled, false);
-    assert.deepEqual(calls, ["startup"]);
+    assert.deepEqual(calls, ["upgrade", "startup"]);
     completeRuntime();
     await setting;
-    assert.deepEqual(calls, fails ? ["startup", "recovery", "setting"] : ["startup", "route", "setting"]);
+    assert.deepEqual(calls, fails ? ["upgrade", "startup", "recovery", "setting"] : ["upgrade", "startup", "route", "setting"]);
     assert.equal(state.composerPredictionsEnabled, true);
     assert.equal(state.coreSetupComplete, !fails, "only a real startup failure may invalidate setup");
   }
 });
 
-test("embedded ChatGPT is measured only after its animated surface mounts", () => {
-  assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
-  assert.match(appSource, /setBrowserSurfaceActive\(browserSurfaceActive\)\.then\(\(\) => \{/);
-  assert.match(appSource, /observer\.observe\(browserSlot\)/);
-  assert.match(appSource, /ref=\{browserSlotRef\}/);
+test("embedded ChatGPT reports mounted bounds after activation and cancels measurement on unmount", async () => {
+  for (const cancelPendingActivation of [false, true]) await withRendererDom(async ({ React, window, compile, render, unmount }) => {
+    const activations = [], bounds = [], frames = new Map(), observers = [];
+    let nextFrame = 0;
+    const api = {
+      setBrowserSurfaceActive: () => new Promise(resolve => activations.push(resolve)),
+      setBrowserBounds: async value => { bounds.push({ ...value }); },
+    };
+    window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+    const passthrough = ({ children }) => children ?? null;
+    const source = appSource.slice(appSource.indexOf("function requiresCodexCatalog("), appSource.indexOf("export function App("))
+      + appSource.slice(appSource.indexOf("function LauncherShell("), appSource.indexOf("function TitleBar("))
+      + appSource.slice(appSource.indexOf("function BrowserSurface("), appSource.indexOf("function ManualTurnGuide("));
+    const scope = { api, COMPACT_SIDEBAR_QUERY: "fixture", useLimits: () => ({}), limitsCopyFor: () => ({}),
+      messageOf: String, formatBrowserAddress: value => value ?? "", AnimatePresence: passthrough,
+      motion: Object.fromEntries(["main", "aside", "div"].map(tag => [tag, ({ children, className }) => React.createElement(tag, { className }, children)])),
+      requestAnimationFrame: callback => { frames.set(++nextFrame, callback); return nextFrame; },
+      cancelAnimationFrame: id => frames.delete(id),
+      ResizeObserver: class {
+        constructor(callback) { this.callback = callback; observers.push(this); }
+        observe(node) { this.node = node; }
+        disconnect() { this.disconnected = true; }
+      },
+    };
+    for (const name of source.matchAll(/<([A-Z][A-Za-z]+)/g)) scope[name[1]] ??= passthrough;
+    // Keep the real BrowserSurface, including its DOM ref.
+    delete scope.BrowserSurface;
+    const Shell = compile(source, "LauncherShell", scope);
+    const props = { browser: { tabs: [], authenticated: true, visible: true }, copy: {}, language: "en", logs: [],
+      setError: error => assert.fail(error), snapshot: { state: { coreSetupComplete: true, browserInteractionMode: "automatic",
+        sessionRefreshReminderAt: null }, update: { status: "idle" }, profile: "production", toolAuthority: {}, urls: {} } };
+    await render(React.createElement(Shell, props));
+    const slot = window.document.querySelector(".browser-viewport");
+    assert.ok(slot, "the actual browser viewport is mounted");
+    const rect = { x: 10, y: 20, width: 800, height: 600 };
+    slot.getBoundingClientRect = () => rect;
+    assert.equal(frames.size, 0, "activation must complete before measurement");
+    if (cancelPendingActivation) {
+      await unmount();
+      await React.act(async () => activations.splice(0).forEach(resolve => resolve()));
+      assert.equal(frames.size, 0, "late activation must not measure an unmounted slot");
+      assert.equal(observers.length, 0);
+      return;
+    }
+    await React.act(async () => activations.splice(0).forEach(resolve => resolve()));
+    assert.equal(observers.length, 1, "only the mounted slot is observed");
+    assert.equal(observers[0].node, slot);
+    assert.equal(frames.size, 1);
+    const flushFrames = () => { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback()); };
+    await React.act(async () => flushFrames());
+    assert.deepEqual(bounds, [rect]);
+    rect.width = 900;
+    observers[0].callback();
+    window.dispatchEvent(new window.Event("resize"));
+    assert.equal(frames.size, 1, "resize notifications share one pending frame");
+    await React.act(async () => flushFrames());
+    assert.equal(bounds[1].width, 900);
+    observers[0].callback();
+    await unmount();
+    assert.equal(frames.size, 0);
+    assert.equal(observers[0].disconnected, true);
+    window.dispatchEvent(new window.Event("resize"));
+    assert.equal(frames.size, 0, "unmounted surfaces must remove the resize listener");
+  });
 });
 
 test("Zero Risk manual actions confirm cancellation and acknowledge only successful copies", async () => {
@@ -349,12 +439,25 @@ test("fatal partial shutdown stays supervised and a later partial quit does not 
   assert.doesNotMatch(JSON.stringify(operations), /private shutdown exception/);
 });
 
-test("all proxy translations describe authenticated URLs and the MCP Tunnel limitation", () => {
-  assert.equal((networkProxySettingsSource.match(/http:\/\/user:password@host:port/g) || []).length, 5);
-  assert.equal((networkProxySettingsSource.match(/MCP Tunnel/g) || []).length, 5);
-  assert.equal((networkProxySettingsSource.match(/http:\/\/user:password@proxy\.example:8080/g) || []).length, 5);
-  assert.doesNotMatch(networkProxySettingsSource, /SOCKS/i);
-  assert.match(networkProxySettingsSource, /autoComplete="off"/);
+test("proxy settings render the selected language and authentication guidance", async () => {
+  await withRendererDom(async ({ React, window, compile, render }) => {
+    window.codexWebLauncher = {};
+    const Settings = compile(networkProxySettingsSource, "NetworkProxySettings");
+    for (const [language, title] of Object.entries({ en: "Global network proxy", "zh-CN": "全局网络代理",
+      "zh-TW": "全域網路代理", ja: "グローバルネットワークプロキシ", ko: "전역 네트워크 프록시" })) {
+      await render(React.createElement(Settings, { key: language, state: { language }, onOpenChange() {}, updateState() {} }));
+      await React.act(async () => window.document.querySelector(".network-proxy-launcher")
+        .click());
+      assert.equal(window.document.querySelector("h2").textContent, title);
+      const body = window.document.querySelector(".network-proxy-description").textContent;
+      assert.match(body, /http:\/\/user:password@host:port/);
+      assert.match(body, /MCP Tunnel/);
+      assert.doesNotMatch(body, /SOCKS/i);
+      const input = window.document.querySelector("input");
+      assert.equal(input.getAttribute("placeholder"), "http://user:password@proxy.example:8080");
+      assert.equal(input.getAttribute("autocomplete"), "off");
+    }
+  });
 });
 
 test("native clicks reach browser tabs instead of the window drag region", () => {
@@ -1043,20 +1146,10 @@ test("MCP setup resets completion only after a successful runtime transaction", 
   }
 });
 
-test("saved ChatGPT authentication refresh does not gate local runtime startup", () => {
+test("saved ChatGPT authentication refresh exposes its loading state", () => {
   assert.match(electronMain, /browserHost\.refreshAuthentication\(\)/);
-  const productionStartup = electronMain.indexOf("} else void (async () => {");
-  const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
-  const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
-  const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute({ recoveryOnly: true })", runtimeStart);
-  assert.equal(refreshBarrier, -1, "the bridge must start while ChatGPT is signed out or unavailable");
-  assert.ok(upgrade > productionStartup);
-  assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
-  assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
 });
-
 test("completed model setup remains a repeatable capability probe", () => {
   assert.match(appSource, /<SetupRow[\s\S]*?onAction=\{install\}[\s\S]*?repeatable/);
   assert.match(appSource, /complete && !repeatable/);

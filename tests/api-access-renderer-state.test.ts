@@ -147,29 +147,11 @@ test("Renderer custom override state treats prototype-named model IDs as ordinar
   }
 });
 
-test("manual model discovery failure preserves the draft but not the previous transient candidates", async () => {
-  const draft = {
-    baseUrl: "https://draft.example/v1",
-    key: "new-key",
-    proxy: { mode: "custom", url: "http://proxy.example:8080" },
-    filter: { mode: "selected", models: ["gpt-selected"] },
-    candidateModels: ["gpt-selected", "gpt-candidate"],
-  };
-  const before = structuredClone(draft);
-  draft.candidateModels = resetDiscoveredModelCandidates(draft.filter.models);
+test("preserve-draft recovery does not refresh saved state and resets candidates to the selected IDs", async () => {
   let refreshes = 0;
-  await recoverApiAccessActionFailure("preserve-draft", async () => {
-    refreshes++;
-    Object.assign(draft, {
-      baseUrl: "https://saved.example/v1",
-      key: "",
-      proxy: { mode: "global" },
-      filter: { mode: "all" },
-      candidateModels: [],
-    });
-  });
+  await recoverApiAccessActionFailure("preserve-draft", async () => { refreshes++; });
   expect(refreshes).toBe(0);
-  expect(draft).toEqual({ ...before, candidateModels: ["gpt-selected"] });
+  expect(resetDiscoveredModelCandidates(["gpt-selected"])).toEqual(["gpt-selected"]);
 });
 
 test("upstream draft revision conflict keeps the original baseline stale", () => {

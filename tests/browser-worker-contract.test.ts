@@ -1,9 +1,12 @@
-import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
+import * as launcherBrowserHost from "../src/launcher-browser-host";
+import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptTurnBindingDiagnostic, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
@@ -620,16 +623,74 @@ test("compaction retry submission evidence cannot make prompt-stage settlement u
   expect(evaluateStarted).toBeTrue();
 });
 
-test("launcher page acquisition proves a nonzero operational viewport before DOM interaction", () => {
-  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  const connect = workerSource.indexOf("const connection = await connectLauncherBrowserHost(");
-  const viewport = workerSource.indexOf("await waitForOperationalChatGptViewport(connection.page, abortSignal);", connect);
-  const acquired = workerSource.indexOf('await diagnostics.capture(page, "browser-page-acquired")', viewport);
+async function withBrowserTurnFixture(run: (worker: any, turn: BrowserTurn, page: any) => Promise<void>) {
+  const directory = mkdtempSync(join(tmpdir(), "browser-turn-contract-"));
+  const page = Object.assign(new EventEmitter(), { isClosed: () => false, url: () => "https://chatgpt.com/",
+    evaluate: async () => { throw new Error("Fixture has no renderer"); } });
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { appName: "Codex Native5", browserDiagnosticsPath: directory },
+    captureSubmissionBaseline: async () => ({}), waitForNewAssistantTurn: async () => ({ identity: "assistant-turn" }),
+    runStage: async (_trace: string, stage: string) => {
+      if (stage === "browser_page") return page;
+      if (stage === "effort_selection") return { effort: "high", localTools: false };
+      if (stage === "send") return "user_turn";
+    },
+  });
+  const turn: BrowserTurn = { traceId: "fixture_browser_turn", modelId: "gpt-5.6-sol", reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "inspect", images: [], release() {} }), onTextDelta() {} };
+  try { await run(worker, turn, page); }
+  finally { rmSync(directory, { recursive: true, force: true }); }
+}
 
-  expect(connect).toBeGreaterThan(-1);
-  expect(viewport).toBeGreaterThan(connect);
-  expect(acquired).toBeGreaterThan(viewport);
-  expect(workerSource).toContain("innerWidth >= width && innerHeight >= height");
+test("launcher acquisition waits for an operational viewport and stops on timeout or cancellation", async () => {
+  for (const outcome of ["ready", "timeout", "cancelled"]) {
+    await withBrowserTurnFixture(async (worker, turn, page) => {
+      const controller = new AbortController();
+      turn.abortSignal = controller.signal;
+      let resolveViewport!: () => void, rejectViewport!: (error: Error) => void;
+      let viewportAllows!: (width: number, height: number) => boolean;
+      let started!: () => void;
+      const waiting = new Promise<void>(resolve => { started = resolve; });
+      page.waitForFunction = (predicate: Function, minimum: object) => {
+        viewportAllows = (width, height) => runInContext(`(${predicate.toString()})`,
+          createContext({ innerWidth: width, innerHeight: height }))(minimum);
+        return new Promise<void>((resolve, reject) => { resolveViewport = resolve; rejectViewport = reject; started(); });
+      };
+      let closed = 0, domStages = 0;
+      const connection = spyOn(launcherBrowserHost, "connectLauncherBrowserHost").mockResolvedValue({
+        browser: { close: async () => { closed++; } }, page,
+      } as never);
+      worker.config.browserHostDescriptorPath = "fixture-launcher.json";
+      const downstream = new Error("viewport ready; stop before browser DOM operations");
+      worker.runStage = async (_trace: string, stage: string, _timeout: number, action: Function) => {
+        if (stage === "browser_page") return action(controller.signal);
+        domStages++;
+        throw downstream;
+      };
+      const result = worker.runBrowserTurn(turn, "fixture-surface");
+      const failure = result.then(() => undefined, (error: unknown) => error);
+      try {
+        await Promise.race([waiting, failure]);
+        expect(viewportAllows).toBeFunction();
+        expect(domStages).toBe(0);
+        expect(viewportAllows(0, 0)).toBeFalse();
+        expect(viewportAllows(319, 240)).toBeFalse();
+        expect(viewportAllows(320, 239)).toBeFalse();
+        expect(viewportAllows(320, 240)).toBeTrue();
+        if (outcome === "ready") resolveViewport();
+        else if (outcome === "timeout") rejectViewport(new Error("viewport timed out"));
+        else controller.abort();
+        const error = await failure;
+        if (outcome === "ready") expect(error).toBe(downstream);
+        else if (outcome === "timeout") expect(error).toMatchObject({ message:
+          "ChatGPT browser surface did not expose an operational viewport: viewport timed out" });
+        else expect(error).toMatchObject({ name: "AbortError" });
+        expect(domStages).toBe(outcome === "ready" ? 1 : 0);
+        expect(closed).toBe(1);
+      } finally { controller.abort(); await failure; connection.mockRestore(); }
+    });
+  }
 });
 
 test("Luna turns without a retained conversation never send connector identity alone", () => {
@@ -4086,19 +4147,6 @@ test("clearing the missing-response window preserves whether a response was ever
   expect(tracker.update(absent, 6_000)).toContain("response DOM disappeared");
 });
 
-test("the launcher helper transport carries MCP progress into the out-of-process browser worker", () => {
-  const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
-  const helper = readFileSync("src/adapters/chatgpt-web/browser-helper-main.ts", "utf8");
-
-  // The browser worker runs in the helper process while the Codex MCP broker runs in the daemon.
-  // If progress stops crossing that boundary the worker silently observes "never live" and cancels
-  // turns whose tool calls are still completing, so both ends of the transport are asserted here.
-  expect(client).toContain("forwardProgress");
-  expect(client).toMatch(/type: "progress", id: turn\.traceId, snapshot/);
-  expect(helper).toMatch(/message\.type === "progress"/);
-  expect(helper).toContain("ChatGptMirroredTurnProgress");
-  expect(helper).toMatch(/externalProgress: progress/);
-});
 
 test("the response loop checks explicit Stopped thinking before acknowledging further MCP work", () => {
   const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
@@ -4500,26 +4548,35 @@ test("a future progress timestamp is not treated as liveness", () => {
   )).toBeTrue();
 });
 
-test("the bundled helper is adopted only for the packaged runtime layout", () => {
-  const client = readFileSync("src/adapters/chatgpt-web/launcher-helper-client.ts", "utf8");
+test("bundled helper selection requires the packaged entrypoint and an existing sibling", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bundled-helper-contract-"));
+  const entrypoint = process.argv[1];
+  const client = Object.create(LauncherBrowserHelperClient.prototype) as any;
+  try {
+    const helper = join(directory, "browser-helper.cjs");
+    writeFileSync(helper, "// packaged helper fixture");
+    for (const name of ["cli.ts", "other.js", "cli.js"]) {
+      process.argv[1] = join(directory, name);
+      expect(client.bundledHelperScript()).toBe(name === "cli.js" ? helper : undefined);
+    }
+    rmSync(helper);
+    expect(client.bundledHelperScript()).toBeUndefined();
+  } finally {
+    process.argv[1] = entrypoint!;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
-  // Any daemon launched some other way keeps the launcher-advertised helper rather than adopting
-  // an unrelated sibling that merely shares a filename.
-  expect(client).toContain('basename(entrypoint) !== "cli.js"');
-
-  // Trace ids are derived deterministically and can repeat, so a run must not inherit revisions
-  // recorded for an earlier turn that happened to share the id.
-  const helper = readFileSync("src/adapters/chatgpt-web/browser-helper-main.ts", "utf8");
-  expect(helper).toContain("const progress = message.turn.externalProgress");
-  expect(helper).toContain("? new ChatGptMirroredTurnProgress(revision => {");
-
-  // A consumer callback must not be retried as though the page could not be read.
-  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
-  const heartbeat = worker.indexOf("turn.onHeartbeat?.();");
-  const tryStart = worker.search(/ {7}try \{\r?\n {8}observedThisIteration = false;/);
-  expect(heartbeat).toBeGreaterThan(0);
-  expect(tryStart).toBeGreaterThan(0);
-  expect(heartbeat).toBeLessThan(tryStart);
+test("consumer heartbeat failures leave the browser observation loop without retries", async () => {
+  await withBrowserTurnFixture(async (worker, turn, page) => {
+    const failure = new Error("consumer heartbeat failed");
+    let heartbeats = 0, observations = 0;
+    turn.onHeartbeat = () => { heartbeats++; throw failure; };
+    worker.responseDomSnapshot = async () => { observations++; throw new Error("must not observe after callback failure"); };
+    await expect(worker.runBrowserTurn(turn, undefined, page)).rejects.toBe(failure);
+    expect(heartbeats).toBe(1);
+    expect(observations).toBe(0);
+  });
 });
 
 test("the suspension clock charges only tick gaps that mean the process was frozen", () => {

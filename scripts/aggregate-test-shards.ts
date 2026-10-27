@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { performanceSource } from "./test-performance-source";
 import { parseTimingData, repositoryTestFiles } from "./test-timing-history";
-import { coldShardFiles, testFileSetDigest, testLogResult } from "./test-shards";
+import { coldShardFiles, loadShardPlan, plannedShardFiles, testFileSetDigest, testLogResult, type LoadedShardPlan } from "./test-shards";
 import { verificationCommands } from "./verify";
 import { validateShardSelection, type ShardSelection } from "./select-test-shard-artifacts";
 
@@ -12,6 +12,7 @@ export type ShardEvidence = {
 };
 export type ShardAggregationInput = {
   files: string[]; shards: ShardEvidence[]; verify: any; jobResults: Record<string, unknown>; skipEvidence?: any; selection?: ShardSelection;
+  plan?: LoadedShardPlan;
   expected: { revision: string; runId: string; attempt: string; repository: string;
     patchDigest?: string; toolDigest?: string; dependencyDigest?: string; launcherDependencyDigest?: string;
     platform?: string; arch?: string; mode?: "full" | "timing"; isolation?: "default" | "isolate"; workers?: 1 | 2 };
@@ -27,7 +28,7 @@ const segmentKeys = ["prepareMs", "executionMs", "logDrainMs", "reportMs", "tota
 const validSegments = (segments: any) => segmentKeys.every(key => duration(segments?.[key]))
   && segments.totalMs + 0.001 >= segments.prepareMs + segments.executionMs + segments.logDrainMs + segments.reportMs;
 
-function validShardCommand(summary: any): boolean {
+function validShardCommand(summary: any, target: string[], planned: boolean): boolean {
   if (!Array.isArray(summary.command) || !summary.command.every((argument: unknown) => typeof argument === "string")
     || typeof summary.cwd !== "string" || typeof summary.executable?.path !== "string") return false;
   const command = summary.command.map((argument: string) => argument.replaceAll("\\", "/"));
@@ -37,9 +38,9 @@ function validShardCommand(summary: any): boolean {
     || command.shift() !== `${summary.cwd.replaceAll("\\", "/").replace(/\/$/, "")}/scripts/test-performance-preload.ts`)) return false;
   if (command.shift() !== "--timings" || !command.shift()?.endsWith("/file-timings.json") || command.shift() !== "--update-timings") return false;
   if (summary.workers > 1 && command.shift() !== `--parallel=${summary.workers}`) return false;
-  if (command.shift() !== `--shard=${summary.shard.index}/${summary.shard.total}`) return false;
+  if (!planned && command.shift() !== `--shard=${summary.shard.index}/${summary.shard.total}`) return false;
   if (summary.isolation === "isolate" && command.shift() !== "--isolate") return false;
-  return equal(command, ["./tests"]) && summary.bail === null;
+  return equal(command, planned ? target.map(file => `./${file}`) : ["./tests"]) && summary.bail === null;
 }
 
 /** A separate multi-job gate. It never creates a single-process summary or timing history. */
@@ -68,14 +69,15 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   for (const evidence of input.shards) {
     const summary = evidence.summary;
     const label = `shard-${summary?.shard?.index ?? "unknown"}`;
-    if (summary?.version !== 5 || summary.fullSuite !== false || summary.shard?.total !== 2
+    if (summary?.version !== (input.plan ? 6 : 5) || summary.fullSuite !== false || summary.shard?.total !== 2
       || ![1, 2].includes(summary.shard?.index)) { reasons.push(`${label}:invalid-shard-schema`); continue; }
     const index = summary.shard.index;
     require(!indexes.has(index), `${label}:duplicate-shard`); indexes.add(index);
     require(typeof summary.runId === "string" && summary.runId.length > 0 && !runIds.has(summary.runId), `${label}:duplicate-or-missing-run-id`);
     runIds.add(summary.runId);
     if (index === 1) shardOne = summary;
-    const target = coldShardFiles(files, { index, total: 2 });
+    const target = input.plan ? plannedShardFiles(files, { index, total: 2 }, input.plan.plan) : coldShardFiles(files, { index, total: 2 });
+    if (input.plan) require(equal(summary.shard.plan, { path: input.plan.path, digest: input.plan.digest }), `${label}:shard-plan-mismatch`);
     require(target.length > 0, `${label}:empty-shard`);
     require(sameFiles(summary.shard.repositoryFiles, files) && summary.shard.repositoryFilesDigest === testFileSetDigest(files), `${label}:repository-file-set-mismatch`);
     require(sameFiles(summary.shard.expectedFiles, target), `${label}:expected-file-set-mismatch`);
@@ -98,14 +100,17 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
       executableDigest: summary.executable?.sha256, workers: summary.workers, isolation: summary.isolation, mode: summary.mode };
     if (common === undefined) common = identity;
     else require(equal(common, identity), `${label}:different-source-or-execution-input`);
-    require(summary.scheduling?.source === "cold" && summary.scheduling.reason === "shard-cold-only"
+    if (input.plan) {
+      require(equal(summary.scheduling, { source: "plan", reason: "committed-shard-plan", lookupMs: 0,
+        inputDigest: input.plan.digest, from: { path: input.plan.path } }), `${label}:invalid-plan-scheduling`);
+    } else require(summary.scheduling?.source === "cold" && summary.scheduling.reason === "shard-cold-only"
       && summary.scheduling.inputDigest === null && summary.scheduling.from === null, `${label}:non-cold-scheduling`);
     require(summary.historyPublication?.status === "not-requested" && summary.historyPublication.localPath === null
       && summary.historyPublication.artifactPath === null, `${label}:history-publication-forbidden`);
     require(summary.exitCode === 0 && summary.signal === null && summary.spawnError === null && summary.testResult === "success"
       && summary.wallValid === true && summary.counts?.fail === 0 && Number.isSafeInteger(summary.counts?.pass) && summary.counts.pass > 0,
     `${label}:test-execution-unsuccessful`);
-    require(validShardCommand(summary), `${label}:invalid-command-scope`);
+    require(validShardCommand(summary, target, Boolean(input.plan)), `${label}:invalid-command-scope`);
     const timing = summary.fileTiming;
     require(timing?.version === 3 && timing.complete === true && timing.fullSuite === false && timing.logsComplete === true
       && timing.sourceStable === true && timing.outputWriteError === null && equal(timing.reasons, [])
@@ -152,19 +157,19 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
     && equal(verify.testShard, { index: 1, total: 2 }) && equal(verify.workflowRun, workflowRun(1)),
   "invalid-or-missing-verify-summary");
   if (verify?.version === 2 && typeof verify.scratch === "string" && Array.isArray(verify.stages)) {
-    const commands = verificationCommands(shardOne?.mode, verify.scratch.replaceAll("\\", "/"), { index: 1, total: 2 })
+    const commands = verificationCommands(shardOne?.mode, verify.scratch.replaceAll("\\", "/"), { index: 1, total: 2 }, input.plan?.path)
       .map(command => command.map(argument => argument.replaceAll("\\", "/")));
     require(verify.stages.length === commands.length && verify.stages.every((stage: any, i: number) => stage?.exitCode === 0 && stage.error === null
       && duration(stage.elapsedMs) && Array.isArray(stage.command)
       && equal(stage.command.slice(1).map((argument: unknown) => typeof argument === "string" ? argument.replaceAll("\\", "/") : argument), commands[i])), "incomplete-non-server-verification");
     require(Array.isArray(verify.profiles) && verify.profiles.length === 1 && verify.profiles[0]?.runId === shardOne?.runId
-      && verify.profiles[0]?.summaryVersion === 5 && verify.profiles[0]?.testResult === "success"
+      && verify.profiles[0]?.summaryVersion === (input.plan ? 6 : 5) && verify.profiles[0]?.testResult === "success"
       && verify.profiles[0]?.completionStatus === "available", "verify-profile-binding-mismatch");
   } else reasons.push("missing-verify-stage-evidence");
   return { version: 1, kind: "test-shard-aggregate", success: reasons.length === 0, fullSuite: reasons.length === 0,
     source: common ?? null, repositoryFiles: files, repositoryFilesDigest: testFileSetDigest(files), executedFiles: [...executed].sort(),
     skipIdentities: [...skipped].sort(), skipEvidence: skipEvidence ?? null, jobResults: input.jobResults,
-    selection: input.selection ?? null, reasons: [...new Set(reasons)],
+    selection: input.selection ?? null, plan: input.plan ? { path: input.plan.path, digest: input.plan.digest } : null, reasons: [...new Set(reasons)],
     shards: input.shards.map(evidence => ({ directory: evidence.directory, runId: evidence.summary?.runId ?? null,
       workflowRun: evidence.summary?.workflowRun ?? null,
       shard: evidence.summary?.shard ?? null, runnerImage: evidence.summary?.runnerImage ?? null, runnerImageVersion: evidence.summary?.runnerImageVersion ?? null })),
@@ -216,11 +221,11 @@ export function loadShardArtifacts(directory: string) {
 export function aggregateShardOptions(args: string[]) {
   const options: Record<string, string> = {};
   for (const argument of args) {
-    const match = /^--(artifacts|job-results|output|selection|skip-evidence|skip-policy|mode|platform|arch)=(.+)$/.exec(argument);
+    const match = /^--(artifacts|job-results|output|selection|shard-plan|skip-evidence|skip-policy|mode|platform|arch)=(.+)$/.exec(argument);
     if (!match || options[match[1]!]) throw new Error(`Invalid or duplicate aggregation option: ${argument}`);
     options[match[1]!] = ["mode", "platform", "arch"].includes(match[1]!) ? match[2]! : resolve(match[2]!);
   }
-  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--selection=PATH] [--mode=full|timing] [--platform=win32|darwin] [--arch=x64] [--skip-evidence=PATH | --skip-policy=PATH]");
+  if (!options.artifacts || !options["job-results"] || !options.output) throw new Error("Required: --artifacts=DIR --job-results=PATH --output=PATH [--selection=PATH] [--shard-plan=PATH] [--mode=full|timing] [--platform=win32|darwin] [--arch=x64] [--skip-evidence=PATH | --skip-policy=PATH]");
   if (options["skip-evidence"] && options["skip-policy"]) throw new Error("--skip-evidence and --skip-policy are mutually exclusive.");
   if (options.mode !== undefined && options.mode !== "full" && options.mode !== "timing") throw new Error("Aggregation mode must be full or timing.");
   if (options.platform !== undefined && options.platform !== "win32" && options.platform !== "darwin") throw new Error("Aggregation platform must be win32 or darwin.");
@@ -244,6 +249,7 @@ if (import.meta.main) {
       revision: source.revision!, patchDigest: source.patchDigest!, toolDigest: source.toolDigest!,
     }) : options["skip-evidence"] ? json(options["skip-evidence"]) : undefined;
     const result = aggregateShardEvidence({ files, ...loadShardArtifacts(options.artifacts!),
+      ...(options["shard-plan"] ? { plan: loadShardPlan(root, options["shard-plan"]) } : {}),
       ...(options.selection ? { selection: json(options.selection) } : {}),
       jobResults: json(options["job-results"]!) ?? {}, ...(skipEvidence !== undefined ? { skipEvidence } : {}),
       expected: { revision: process.env.GITHUB_SHA ?? "", runId: process.env.GITHUB_RUN_ID ?? "", attempt: process.env.GITHUB_RUN_ATTEMPT ?? "",

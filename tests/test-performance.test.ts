@@ -255,7 +255,7 @@ for (const workers of [1, 2]) test(`timing mode clears inherited collection and 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("the real wrapper writes distinct v5 shard reports without changing the v4 full-run contract", () => {
+for (const planned of [false, true]) test(`the real wrapper writes complete ${planned ? "planned v6" : "cold v5"} shard reports without changing full runs`, () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-profile-shard-wrapper-"));
   try {
     for (const directory of ["scripts", "src", "tests"]) mkdirSync(join(root, directory));
@@ -264,23 +264,29 @@ test("the real wrapper writes distinct v5 shard reports without changing the v4 
       "scripts/test-timing-history.ts", "scripts/test-shards.ts", "src/runtime-performance.ts"]) copyFileSync(join(repository, file), join(root, file));
     for (const name of ["a", "b", "c"]) writeFileSync(join(root, "tests", `${name}.test.ts`), `import {test} from "bun:test";
       test("actual shard test",()=>{}); ${name === "a" ? 'test.skip("declared skip",()=>{});' : ""}`);
+    const plan = { version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2,
+      source: { runId: "41", revision: "a".repeat(40), repository: "owner/repo" }, overheadMs: [100, 0],
+      shards: [{ files: { "tests/a.test.ts": 10, "tests/b.test.ts": 20 } }, { files: { "tests/c.test.ts": 30 } }] };
+    writeFileSync(join(root, "plan.json"), JSON.stringify(plan));
     const env = { ...process.env, CGW_TEST_PROFILE_DIR: join(root, "output"), GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "3", GITHUB_REPOSITORY: "owner/repo" };
     for (const key of Object.keys(env)) if (key.startsWith("CGW_TEST_TIMING_")) delete env[key as keyof typeof env];
     for (const index of [1, 2]) {
-      const child = spawnSync(process.execPath, [join(root, "scripts/profile-tests.ts"), "--mode=timing", `--shard=${index}/2`], { encoding: "utf8", timeout: 15_000, env });
+      const child = spawnSync(process.execPath, [join(root, "scripts/profile-tests.ts"), "--mode=timing", `--shard=${index}/2`, ...(planned ? ["--shard-plan=plan.json"] : [])], { encoding: "utf8", timeout: 15_000, env });
       expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
     }
     const runs = readdirSync(join(root, "output"));
     expect(runs).toHaveLength(2);
     const summaries = runs.map(run => JSON.parse(readFileSync(join(root, "output", run, "summary.json"), "utf8"))).sort((a, b) => a.shard.index - b.shard.index);
     for (const [index, summary] of summaries.entries()) {
-      expect(summary).toMatchObject({ version: 5, fullSuite: false, shard: { index: index + 1, total: 2 },
+      expect(summary).toMatchObject({ version: planned ? 6 : 5, fullSuite: false, shard: { index: index + 1, total: 2 },
         workflowRun: { id: "42", attempt: "3", repository: "owner/repo" }, fileTiming: { version: 3, complete: true, fullSuite: false },
-        scheduling: { source: "cold", inputDigest: null, from: null }, historyPublication: { status: "not-requested" } });
+        scheduling: planned ? { source: "plan", from: { path: "plan.json" } } : { source: "cold", inputDigest: null, from: null },
+        historyPublication: { status: "not-requested" } });
       expect(summary.command.filter((value: string) => value === "--timings")).toHaveLength(1);
+      if (planned) expect(summary.command.some((value: string) => value.startsWith("--shard="))).toBe(false);
     }
-    expect(summaries[0].fileTiming.executedFiles).toEqual(["tests/a.test.ts", "tests/c.test.ts"]);
-    expect(summaries[1].fileTiming.executedFiles).toEqual(["tests/b.test.ts"]);
+    expect(summaries[0].fileTiming.executedFiles).toEqual(planned ? ["tests/a.test.ts", "tests/b.test.ts"] : ["tests/a.test.ts", "tests/c.test.ts"]);
+    expect(summaries[1].fileTiming.executedFiles).toEqual(planned ? ["tests/c.test.ts"] : ["tests/b.test.ts"]);
     expect(summaries[0].skipIdentities).toEqual(["tests/a.test.ts::declared skip"]);
     expect(summaries[1].skipIdentities).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }

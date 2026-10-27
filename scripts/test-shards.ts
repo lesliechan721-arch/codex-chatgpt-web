@@ -1,6 +1,70 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
+import { parseTimingData } from "./test-timing-history";
 
 export type TestShard = { index: number; total: number };
+export type TestShardPlan = {
+  version: 1; platform: "win32"; bunVersion: "1.4.3"; workers: 1 | 2;
+  source: { runId: string; revision: string; repository: string };
+  overheadMs: number[];
+  shards: { files: Record<string, number> }[];
+};
+export type LoadedShardPlan = { path: string; digest: string; plan: TestShardPlan };
+
+export function parseShardPlan(value: any): TestShardPlan {
+  if (value?.version !== 1 || value.platform !== "win32" || value.bunVersion !== "1.4.3"
+    || ![1, 2].includes(value.workers) || !/^[1-9]\d*$/.test(value.source?.runId)
+    || !/^[a-f0-9]{40}$/.test(value.source?.revision)
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.source?.repository)
+    || !Array.isArray(value.shards) || value.shards.length !== 2
+    || !Array.isArray(value.overheadMs) || value.overheadMs.length !== 2
+    || !value.overheadMs.every((ms: unknown) => typeof ms === "number" && Number.isFinite(ms) && ms >= 0)) {
+    throw new Error("Invalid Windows test shard plan.");
+  }
+  const seen = new Set<string>();
+  for (const shard of value.shards) {
+    const timings = parseTimingData({ version: 1, files: shard?.files });
+    if (Object.keys(timings.files).length === 0) throw new Error("Shard plan has an empty shard.");
+    for (const file of Object.keys(timings.files)) {
+      if (seen.has(file)) throw new Error(`Duplicate shard plan file: ${file}`);
+      seen.add(file);
+    }
+  }
+  return value;
+}
+
+export function loadShardPlan(root: string, path: string): LoadedShardPlan {
+  const absolute = resolve(root, path), name = relative(root, absolute).replaceAll("\\", "/");
+  if (name === ".." || name.startsWith("../") || isAbsolute(name)) throw new Error("Shard plan must be inside the checkout.");
+  const bytes = readFileSync(absolute);
+  return { path: name, digest: createHash("sha256").update(bytes).digest("hex"), plan: parseShardPlan(JSON.parse(bytes.toString("utf8"))) };
+}
+
+/** Recorded assignments stay fixed. New paths do not move existing tests. */
+export function plannedShardFiles(files: string[], shard: TestShard, plan: TestShardPlan): string[] {
+  if (shard.total !== plan.shards.length) throw new Error("Shard count does not match the plan.");
+  const assignments = new Map(plan.shards.flatMap((entry, index) => Object.keys(entry.files).map(file => [file, index + 1] as const)));
+  return [...files].sort().filter(file => {
+    const index = assignments.get(file) ?? createHash("sha256").update(file).digest().readUInt32BE(0) % shard.total + 1;
+    return index === shard.index;
+  });
+}
+
+/** Place long files first, charging serial verify work to every worker on shard 1. */
+export function balanceShardPlan(timings: Record<string, number>, workers: 1 | 2, overheadMs: number[]) {
+  const shards = overheadMs.map(() => ({ files: {} as Record<string, number> }));
+  const loads = overheadMs.map(ms => ms * workers);
+  const entries = Object.entries(timings).sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0));
+  for (const [position, [file, ms]] of entries.entries()) {
+    const empty = shards.findIndex(shard => Object.keys(shard.files).length === 0);
+    const index = position === entries.length - 1 && empty !== -1 ? empty : loads[0]! <= loads[1]! ? 0 : 1;
+    shards[index]!.files[file] = ms;
+    loads[index]! += ms;
+  }
+  for (const shard of shards) shard.files = Object.fromEntries(Object.entries(shard.files).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+  return shards;
+}
 
 export function parseTestShard(value: string): TestShard {
   const match = /^([1-9]\d*)\/([1-9]\d*)$/.exec(value);

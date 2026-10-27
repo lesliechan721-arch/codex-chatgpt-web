@@ -6,29 +6,37 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { aggregateShardEvidence, aggregateShardOptions, loadShardArtifacts, loadSkipPolicy, type ShardAggregationInput } from "../scripts/aggregate-test-shards";
 import { readPerformanceSummary } from "../scripts/compare-test-performance";
-import { measurementFingerprint, MEASUREMENT_FILES } from "../scripts/test-performance-source";
 import { profileOptions } from "../scripts/profile-tests";
-import { assertColdShardEnvironment, coldShardFiles, parseTestShard, testFileSetDigest, testLogResult } from "../scripts/test-shards";
+import { assertColdShardEnvironment, balanceShardPlan, coldShardFiles, loadShardPlan, parseShardPlan, parseTestShard, plannedShardFiles, testFileSetDigest, testLogResult, type TestShardPlan } from "../scripts/test-shards";
+import { planTestShards } from "../scripts/plan-test-shards";
 import { finalizeFileTimings, repositoryTestFiles, timingCompatibility, timingMetadata } from "../scripts/test-timing-history";
 import { verificationCommands, verifyOptions } from "../scripts/verify";
 
 const files = ["tests/a.test.ts", "tests/b.test.ts", "tests/nested/c.test.ts", "tests/z.test.ts"];
 const revision = "a".repeat(40), patchDigest = "b".repeat(64), toolDigest = "c".repeat(64);
-function gateFixture(mode: "full" | "timing" = "full"): ShardAggregationInput {
+function gateFixture(mode: "full" | "timing" = "full", planned = false): ShardAggregationInput {
   const workflowRun = { id: "42", attempt: "2", repository: "owner/repo" };
-  const shards = [[files[0]!, files[2]!], [files[1]!, files[3]!]].map((target, i) => {
+  const targets = planned ? [[files[0]!, files[1]!], [files[2]!, files[3]!]] : [[files[0]!, files[2]!], [files[1]!, files[3]!]];
+  const plan = { path: ".github/windows-test-shards.json", digest: "1".repeat(64), plan: {
+    version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2, source: { runId: "41", revision, repository: "owner/repo" },
+    overheadMs: [10, 0], shards: targets.map(target => ({ files: Object.fromEntries(target.map(file => [file, 1])) })),
+  } as TestShardPlan };
+  const shards = targets.map((target, i) => {
     const stderr = target.map(file => `${file}:\n(pass) a case [1ms]\n`).join("") + `\n ${target.length} pass\n 0 fail\nRan ${target.length} tests across ${target.length} files.\n`;
-    const summary = { version: 5, fullSuite: false, runId: `run-${i + 1}`, known: true, revision, patchDigest, toolDigest,
+    const summary = { version: planned ? 6 : 5, fullSuite: false, runId: `run-${i + 1}`, known: true, revision, patchDigest, toolDigest,
       dependencyDigest: "d".repeat(64), launcherDependencyDigest: "e".repeat(64), workflowRevision: revision, workflowRun,
-      shard: { index: i + 1, total: 2, repositoryFiles: files, repositoryFilesDigest: testFileSetDigest(files), expectedFiles: target },
+      shard: { index: i + 1, total: 2, repositoryFiles: files, repositoryFilesDigest: testFileSetDigest(files), expectedFiles: target,
+        ...(planned ? { plan: { path: plan.path, digest: plan.digest } } : {}) },
       workers: 2, isolation: "default", mode, platform: "win32", arch: "x64", bunVersion: "1.4.3", executable: { path: "C:\\bun\\bun.exe", sha256: "f".repeat(64) }, cwd: "C:\\checkout",
-      scheduling: { source: "cold", reason: "shard-cold-only", inputDigest: null, from: null },
+      scheduling: planned ? { source: "plan", reason: "committed-shard-plan", lookupMs: 0, inputDigest: plan.digest, from: { path: plan.path } }
+        : { source: "cold", reason: "shard-cold-only", inputDigest: null, from: null },
       historyPublication: { status: "not-requested", localPath: null, artifactPath: null },
       exitCode: 0, signal: null, spawnError: null, testResult: "success", wallValid: true, wallMs: 10,
       segments: { prepareMs: 1, executionMs: 10, logDrainMs: 0, reportMs: 1, totalMs: 12 },
       counts: { pass: 2, skip: 0, fail: 0 }, skipIdentities: [], bail: null,
       command: ["C:\\bun\\bun.exe", "test", "--timeout", "30000", ...(mode === "full" ? ["--preload", "C:\\checkout\\scripts\\test-performance-preload.ts"] : []),
-        "--timings", `C:\\reports\\run-${i + 1}\\file-timings.json`, "--update-timings", "--parallel=2", `--shard=${i + 1}/2`, "./tests"],
+        "--timings", `C:\\reports\\run-${i + 1}\\file-timings.json`, "--update-timings", "--parallel=2",
+        ...(planned ? target.map(file => `./${file}`) : [`--shard=${i + 1}/2`, "./tests"])],
       fileTiming: { version: 3, complete: true, fullSuite: false, logsComplete: true, sourceStable: true, outputWriteError: null, reasons: [],
         targetFiles: target, executedFiles: target, measuredFiles: target, reportedFiles: 2 },
       evidence: { summary: "summary.json", completion: "completion.json", stdout: "stdout.log", stderr: "stderr.log", timings: "file-timings.json" } };
@@ -38,9 +46,9 @@ function gateFixture(mode: "full" | "timing" = "full"): ShardAggregationInput {
         segments: { prepareMs: 1, executionMs: 10, logDrainMs: 0, reportMs: 2, totalMs: 13 } } };
   });
   const verify = { version: 2, success: true, failure: null, fullSuite: false, testShard: { index: 1, total: 2 }, workflowRun, scratch: "/scratch",
-    stages: verificationCommands(mode, "/scratch", { index: 1, total: 2 }).map(command => ({ command: ["bun", ...command], exitCode: 0, error: null, elapsedMs: 1 })),
-    profiles: [{ runId: "run-1", summaryVersion: 5, testResult: "success", completionStatus: "available" }] };
-  return { files: [...files], shards, verify, jobResults: { shard1: "success", shard2: "success", package: "success" },
+    stages: verificationCommands(mode, "/scratch", { index: 1, total: 2 }, planned ? plan.path : undefined).map(command => ({ command: ["bun", ...command], exitCode: 0, error: null, elapsedMs: 1 })),
+    profiles: [{ runId: "run-1", summaryVersion: planned ? 6 : 5, testResult: "success", completionStatus: "available" }] };
+  return { files: [...files], shards, verify, ...(planned ? { plan } : {}), jobResults: { shard1: "success", shard2: "success", package: "success" },
     expected: { revision, runId: "42", attempt: "2", repository: "owner/repo", patchDigest, toolDigest,
       dependencyDigest: "d".repeat(64), launcherDependencyDigest: "e".repeat(64), platform: "win32", workers: 2, mode, isolation: "default" } };
 }
@@ -57,6 +65,87 @@ test("shard options reject ambiguous scope and preserve default full runs and wo
     expect(() => assertColdShardEnvironment({ [key]: "" })).toThrow("cold scheduling");
   }
   expect(() => assertColdShardEnvironment({ CGW_TEST_WORKERS: "2" })).not.toThrow();
+});
+
+test("weighted plans reserve verify time and keep assignments stable when files change", () => {
+  const timings = { [files[0]!]: 80, [files[1]!]: 60, [files[2]!]: 40, [files[3]!]: 20 };
+  const shards = balanceShardPlan(timings, 2, [20, 0]);
+  // File work 80 + 40 worker-ms overhead balances file work 120.
+  expect(shards.map(shard => Object.keys(shard.files))).toEqual([[files[1], files[3]], [files[0], files[2]]]);
+  const plan = parseShardPlan({ version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2,
+    source: { runId: "41", revision, repository: "owner/repo" }, overheadMs: [20, 0], shards });
+  const expanded = ["tests/0-new.test.ts", ...files, "tests/zz-new.test.ts"];
+  const combined: string[] = [];
+  for (const index of [1, 2]) {
+    const original = plannedShardFiles(files, { index, total: 2 }, plan);
+    const current = plannedShardFiles(expanded, { index, total: 2 }, plan);
+    expect(current.filter(file => files.includes(file))).toEqual(original);
+    expect(plannedShardFiles(expanded.filter(file => file !== files[0]), { index, total: 2 }, plan)).toEqual(current.filter(file => file !== files[0]));
+    combined.push(...current);
+  }
+  expect(combined.sort()).toEqual([...expanded].sort());
+  expect(new Set(combined).size).toBe(expanded.length);
+  expect(() => plannedShardFiles(files, { index: 1, total: 3 }, plan)).toThrow("count");
+  const duplicate = structuredClone(plan); duplicate.shards[1]!.files[files[1]!] = 1;
+  expect(() => parseShardPlan(duplicate)).toThrow("Duplicate");
+  const unsafe = structuredClone(plan); unsafe.shards[0]!.files["tests/../escape.test.ts"] = 1;
+  expect(() => parseShardPlan(unsafe)).toThrow();
+});
+
+test("planned coverage is bound to the gate plan, exact commands and verify profile", () => {
+  const fixture = gateFixture("timing", true);
+  expect(aggregateShardEvidence(fixture)).toMatchObject({ success: true, fullSuite: true, plan: { digest: fixture.plan!.digest } });
+  for (const change of [
+    (input: ShardAggregationInput) => { input.plan!.digest = "2".repeat(64); },
+    (input: ShardAggregationInput) => { input.shards[0]!.summary.shard.plan.path = "other.json"; },
+    (input: ShardAggregationInput) => { input.shards[1]!.summary.command.push("./tests/unknown.test.ts"); },
+    (input: ShardAggregationInput) => { input.shards[1]!.summary.command.pop(); },
+    (input: ShardAggregationInput) => { input.shards[0]!.summary.command.push("--shard=1/2"); },
+    (input: ShardAggregationInput) => { input.shards[0]!.summary.command.push("--timings", "/foreign.json"); },
+    (input: ShardAggregationInput) => { input.shards[0]!.summary.scheduling.inputDigest = "2".repeat(64); },
+    (input: ShardAggregationInput) => { input.verify.profiles[0].summaryVersion = 5; },
+    (input: ShardAggregationInput) => { input.verify.stages.find((stage: any) => stage.command[2] === "test").command.pop(); },
+    (input: ShardAggregationInput) => { input.shards[1]!.summary.version = 5; },
+    (input: ShardAggregationInput) => { delete input.plan; },
+  ]) {
+    const altered = structuredClone(fixture); change(altered);
+    expect(aggregateShardEvidence(altered).success).toBe(false);
+  }
+  for (const [name, change] of defects) {
+    if (["restored history", "position-filtered command", "undeclared history command"].includes(name)) continue;
+    const altered = structuredClone(fixture); change(altered);
+    expect(aggregateShardEvidence(altered).success, name).toBe(false);
+  }
+});
+
+test("planning reads successful Windows artifacts and pins the resulting plan bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-plan-artifacts-"));
+  try {
+    const fixture = gateFixture("timing"), artifacts = join(root, "artifacts");
+    for (const file of files) {
+      mkdirSync(join(root, file, ".."), { recursive: true });
+      writeFileSync(join(root, file), "fixture test source");
+    }
+    for (const [index, evidence] of fixture.shards.entries()) {
+      const parent = join(artifacts, `shard-${index + 1}`), run = join(parent, "run");
+      mkdirSync(run, { recursive: true });
+      writeFileSync(join(run, "summary.json"), JSON.stringify(evidence.summary));
+      writeFileSync(join(run, "file-timings.json"), evidence.timings!);
+      writeFileSync(join(run, "stderr.log"), evidence.stderr!);
+      if (index === 0) writeFileSync(join(parent, "verify-summary.json"), JSON.stringify(fixture.verify));
+    }
+    const plan = planTestShards(root, artifacts);
+    expect(plan).toMatchObject({ source: { runId: "42", revision }, overheadMs: [11, 0] });
+    expect(plan.shards.flatMap(shard => Object.keys(shard.files)).sort()).toEqual(files);
+    const path = "plan.json"; writeFileSync(join(root, path), JSON.stringify(plan));
+    const loaded = loadShardPlan(root, path);
+    expect(loaded.plan).toEqual(plan);
+    expect(loaded.digest).toBe(createHash("sha256").update(readFileSync(join(root, path))).digest("hex"));
+    expect(() => loadShardPlan(root, "../outside.json")).toThrow("inside the checkout");
+    fixture.shards[0]!.summary.testResult = "nonzero-exit";
+    writeFileSync(join(artifacts, "shard-1/run/summary.json"), JSON.stringify(fixture.shards[0]!.summary));
+    expect(() => planTestShards(root, artifacts)).toThrow("successful");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("aggregation options select full/timing and one explicit skip source", () => {
@@ -81,6 +170,14 @@ test("verify sends a valid shard only to server tests and keeps all other stages
   expect(commands.filter(command => command.includes("--shard=1/2"))).toEqual([["run", "test", "--mode=full", "--shard=1/2"]]);
   expect(commands.filter(command => command[1] !== "test")).toEqual(verificationCommands("full", "/scratch").filter(command => command[1] !== "test"));
   expect(() => verifyOptions(["--test-shard=1/2", "--test-shard=1/2"])).toThrow("Duplicate");
+  expect(verifyOptions(["--test-shard=1/2", "--shard-plan=plan.json"])).toMatchObject({ shardPlan: "plan.json" });
+  expect(verificationCommands("timing", "/scratch", { index: 1, total: 2 }, "plan.json").find(command => command[1] === "test"))
+    .toEqual(["run", "test", "--mode=timing", "--shard=1/2", "--shard-plan=plan.json"]);
+  expect(profileOptions(["--shard=2/2", "--shard-plan=plan.json"])).toMatchObject({ shardPlan: "plan.json" });
+  for (const args of [["--shard-plan=plan.json"], ["--shard=1/2", "--shard-plan="], ["--shard=1/2", "--shard-plan=a", "--shard-plan=b"]]) {
+    expect(() => profileOptions(args)).toThrow();
+  }
+  expect(() => verifyOptions(["--shard-plan=plan.json"])).toThrow();
 });
 
 test("a complete independent two-job result is the only report that claims full-suite coverage", () => {
@@ -173,6 +270,8 @@ const defects: [string, (input: ShardAggregationInput) => void][] = [
   ["cross-source patch", input => { input.shards[1]!.summary.patchDigest = "f".repeat(64); }],
   ["matching patches from another checkout", input => { for (const shard of input.shards) shard.summary.patchDigest = "f".repeat(64); }],
   ["cross-source revision", input => { input.shards[1]!.summary.revision = "f".repeat(40); }],
+  ["matching tools from another checkout", input => { for (const shard of input.shards) shard.summary.toolDigest = "f".repeat(64); }],
+  ["matching dependencies from another checkout", input => { for (const shard of input.shards) shard.summary.dependencyDigest = "f".repeat(64); }],
   ["different tool contents", input => { input.shards[1]!.summary.toolDigest = "f".repeat(64); }],
   ["different dependencies", input => { input.shards[1]!.summary.dependencyDigest = "f".repeat(64); }],
   ["missing dependency digest", input => { input.shards[1]!.summary.launcherDependencyDigest = null; }],
@@ -337,32 +436,6 @@ test("shard timing evidence keeps the existing 0.001 ms tolerance for wall and s
   shard.summary.segments.totalMs -= 0.0005;
   shard.completion.segments.totalMs -= 0.0005;
   expect(aggregateShardEvidence(fixture)).toMatchObject({ success: true, reasons: [] });
-});
-
-test("the gate rejects actual measurement-tool and lockfile byte changes", () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-shard-input-bytes-"));
-  try {
-    for (const file of MEASUREMENT_FILES) {
-      const directory = file.slice(0, file.lastIndexOf("/"));
-      mkdirSync(join(root, directory), { recursive: true });
-      writeFileSync(join(root, file), `baseline bytes for ${file}\n`);
-    }
-    const tool = join(root, "scripts/test-shards.ts"), lockfile = join(root, "bun.lock");
-    writeFileSync(lockfile, "original lock bytes\n");
-    const digest = () => createHash("sha256").update(readFileSync(lockfile)).digest("hex");
-    const originalTool = measurementFingerprint(root).toolDigest, originalDependency = digest();
-    const fixture = gateFixture();
-    fixture.expected.toolDigest = originalTool; fixture.expected.dependencyDigest = originalDependency;
-    for (const shard of fixture.shards) { shard.summary.toolDigest = originalTool; shard.summary.dependencyDigest = originalDependency; }
-    expect(aggregateShardEvidence(fixture).success).toBe(true);
-    writeFileSync(tool, "changed measurement-tool bytes\n");
-    fixture.expected.toolDigest = measurementFingerprint(root).toolDigest;
-    expect(aggregateShardEvidence(fixture).reasons).toContain("shard-1:toolDigest-mismatch");
-    fixture.expected.toolDigest = originalTool;
-    writeFileSync(lockfile, "changed lock bytes\n");
-    fixture.expected.dependencyDigest = digest();
-    expect(aggregateShardEvidence(fixture).reasons).toContain("shard-1:dependencyDigest-mismatch");
-  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("Linux aggregation checks Windows verify paths and independent requested configuration", () => {

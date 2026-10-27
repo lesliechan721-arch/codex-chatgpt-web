@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { collectPerformanceReports } from "./test-performance-reports";
-import { assertColdShardEnvironment, coldShardFiles, parseTestShard, testFileSetDigest, testSkipIdentities, type TestShard } from "./test-shards";
+import { assertColdShardEnvironment, coldShardFiles, loadShardPlan, parseTestShard, plannedShardFiles, testFileSetDigest, testSkipIdentities, type TestShard } from "./test-shards";
 import { performanceSource } from "./test-performance-source";
 import { finalizeFileTimings, prepareTimingHistory, repositoryTestFiles, targetTestFiles, timingCompatibility, timingMetadata } from "./test-timing-history";
 
@@ -13,11 +13,15 @@ export function profileOptions(args: string[]) {
   let isolation: "default" | "isolate" | "shared" = "default";
   let bail: number | undefined;
   let shard: TestShard | undefined;
+  let shardPlan: string | undefined;
   const files: string[] = [], filters: string[] = [];
   for (const arg of args) {
     if (arg.startsWith("--shard=")) {
       if (shard) throw new Error("Duplicate --shard option.");
       shard = parseTestShard(arg.slice(8));
+    } else if (arg.startsWith("--shard-plan=")) {
+      if (shardPlan || !arg.slice(13)) throw new Error("Invalid or duplicate --shard-plan.");
+      shardPlan = arg.slice(13);
     } else if (arg.startsWith("--parallel=")) workers = arg.slice("--parallel=".length);
     else if (arg.startsWith("--mode=")) {
       const value = arg.slice(7);
@@ -32,12 +36,13 @@ export function profileOptions(args: string[]) {
       if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error("--bail must be a positive safe integer.");
       bail = Number(value);
     } else if (arg.startsWith("--test-name-pattern=")) filters.push(arg);
-    else if (arg.startsWith("-")) throw new Error(`Unsupported option ${arg}; use --parallel=1|2, --shard=i/n, --mode=full|timing, --isolation=default|isolate|shared, --bail=N or --test-name-pattern=REGEX.`);
+    else if (arg.startsWith("-")) throw new Error(`Unsupported option ${arg}; use --parallel=1|2, --shard=i/n, --shard-plan=PATH, --mode=full|timing, --isolation=default|isolate|shared, --bail=N or --test-name-pattern=REGEX.`);
     else files.push(arg);
   }
   if (workers !== "1" && workers !== "2") throw new Error("CGW_TEST_WORKERS / --parallel must be 1 or 2.");
   if (shard && (files.length || filters.length || bail !== undefined)) throw new Error("Shards cannot be combined with positional filters, name filters or bail.");
-  return { workers: Number(workers) as 1 | 2, mode, isolation, bail, files, filters, ...(shard ? { shard } : {}) };
+  if (shardPlan && !shard) throw new Error("--shard-plan requires --shard.");
+  return { workers: Number(workers) as 1 | 2, mode, isolation, bail, files, filters, ...(shard ? { shard } : {}), ...(shardPlan ? { shardPlan } : {}) };
 }
 
 export function profileEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -67,7 +72,8 @@ export async function finishProfileLogs(drains: Promise<unknown>, cancel: () => 
 
 export async function profileTests(args: string[]): Promise<number> {
   const entry = process.hrtime.bigint();
-  const { workers, mode, isolation, bail, files, filters, shard } = profileOptions(args);
+  const { workers, mode, isolation, bail, files, filters, shard, shardPlan } = profileOptions(args);
+  const plan = shardPlan ? loadShardPlan(root, shardPlan) : undefined;
   if (shard) {
     assertColdShardEnvironment(process.env);
     if (Bun.version !== "1.4.3") throw new Error("Cold shard discovery is verified only for Bun 1.4.3.");
@@ -90,16 +96,18 @@ export async function profileTests(args: string[]): Promise<number> {
   const compatibility = timingCompatibility({ workers, mode, isolation });
   const metadata = timingMetadata(root, source.revision, source.patchDigest);
   const expectedFiles = repositoryTestFiles(root);
-  const targetFiles = shard ? coldShardFiles(expectedFiles, shard) : targetTestFiles(root, files, expectedFiles);
+  const targetFiles = shard ? plan ? plannedShardFiles(expectedFiles, shard, plan.plan) : coldShardFiles(expectedFiles, shard) : targetTestFiles(root, files, expectedFiles);
+  if (shard && targetFiles.length === 0) throw new Error("Cannot run an empty test shard.");
   const history = shard ? { scheduling: { source: "cold" as const, reason: "shard-cold-only", lookupMs: 0, inputDigest: null, from: null }, input: undefined } : run ? await prepareTimingHistory({ root, runDirectory: run, compatibility, files: expectedFiles })
     : { scheduling: { source: "cold" as const, reason: "report-directory-unavailable", lookupMs: 0, inputDigest: null, from: null } };
   const command = [process.execPath, "test", "--timeout", "30000",
     ...(reports ? ["--preload", join(root, "scripts", "test-performance-preload.ts")] : []),
     ...(run ? ["--timings", join(run, "file-timings.json"), ...(history.input ? ["--timings", history.input] : []), "--update-timings"] : []),
     ...(workers > 1 ? [`--parallel=${workers}`] : []),
-    ...(shard ? [`--shard=${shard.index}/${shard.total}`] : []),
+    ...(shard && !plan ? [`--shard=${shard.index}/${shard.total}`] : []),
     ...(isolation === "isolate" ? ["--isolate"] : isolation === "shared" ? ["--no-isolate"] : []),
-    ...(bail !== undefined ? [`--bail=${bail}`] : []), ...filters, ...(files.length ? files : ["./tests"])];
+    ...(bail !== undefined ? [`--bail=${bail}`] : []), ...filters,
+    ...(plan ? targetFiles.map(file => `./${file}`) : files.length ? files : ["./tests"])];
   const startedAt = new Date().toISOString();
   let exitCode = 1, rootPid: number | null = null, signal: string | number | null = null;
   let spawnError: string | null = null;
@@ -190,9 +198,9 @@ export async function profileTests(args: string[]): Promise<number> {
     // Bun counts worker exits as failures too; aggregate counts cannot establish the cause.
     const testResult = spawnError ? "spawn-failed" : signal ? "signal" : exitCode === 0 ? "success" : "nonzero-exit";
     const reportMs = elapsed(reportStart);
-    const summary = { version: shard ? 5 : 4,
+    const summary = { version: shard ? plan ? 6 : 5 : 4,
       ...(shard ? { fullSuite: false, shard: { ...shard, repositoryFiles: expectedFiles, repositoryFilesDigest: testFileSetDigest(expectedFiles),
-        expectedFiles: targetFiles }, workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+        expectedFiles: targetFiles, ...(plan ? { plan: { path: plan.path, digest: plan.digest } } : {}) }, workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
         repository: process.env.GITHUB_REPOSITORY ?? null }, skipIdentities: testSkipIdentities(stderr),
         evidence: { summary: "summary.json", completion: "completion.json", stdout: "stdout.log", stderr: "stderr.log", timings: "file-timings.json" } } : {}), runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
       nodeCompatibilityVersion: process.versions.node, runnerImage: process.env.ImageOS ?? null, runnerImageVersion: process.env.ImageVersion ?? null,
@@ -202,7 +210,8 @@ export async function profileTests(args: string[]): Promise<number> {
         usesEmbeddedBun: process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN ? resolve(process.execPath) === resolve(process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN) : null },
       dependencyDigest: digestFile(join(root, "bun.lock")),
       ...(shard ? { launcherDependencyDigest: digestFile(join(root, "launcher", "bun.lock")) } : {}),
-      scheduling: history.scheduling, fileTiming, historyPublication,
+      scheduling: plan ? { source: "plan", reason: "committed-shard-plan", lookupMs: 0, inputDigest: plan.digest, from: { path: plan.path } } : history.scheduling,
+      fileTiming, historyPublication,
       startedAt, endedAt: new Date().toISOString(), rootPid, signal, spawnError, exitCode, testResult, wallMs,
       wallValid: wallInvalidReasons.length === 0, wallInvalidReasons,
       segments: { prepareMs, executionMs: wallMs, logDrainMs, reportMs, totalMs: elapsed(entry) },

@@ -175,12 +175,12 @@ jobs:
         run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.3 -GitHubEnv $env:GITHUB_ENV
       - name: Verify non-server stages and server shard 1
         if: matrix.shard == 1
-        run: bun run verify --test-mode=timing --test-shard=1/2
+        run: bun run verify --test-mode=timing --test-shard=1/2 --shard-plan=.github/windows-test-shards.json
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
       - name: Run server shard 2
         if: matrix.shard == 2
-        run: bun run test --mode=timing --shard=2/2
+        run: bun run test --mode=timing --shard=2/2 --shard-plan=.github/windows-test-shards.json
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
       - name: Upload shard evidence
@@ -248,7 +248,7 @@ jobs:
           WINDOWS_PACKAGE_RESULT: ${{ steps.shard-artifacts.outputs.package-result }}
         run: |
           bun -e 'import {writeFileSync} from "node:fs"; writeFileSync(process.env.RUNNER_TEMP + "/windows-shard-jobs.json", JSON.stringify({shard1:process.env.WINDOWS_SHARDS_RESULT,shard2:process.env.WINDOWS_SHARDS_RESULT,package:process.env.WINDOWS_PACKAGE_RESULT}));'
-          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/windows-shards" "--job-results=$RUNNER_TEMP/windows-shard-jobs.json" "--selection=$RUNNER_TEMP/windows-shard-selection.json" "--output=$RUNNER_TEMP/windows-shard-aggregate.json" --skip-policy=.github/windows-test-skips.json --mode=timing
+          bun run scripts/aggregate-test-shards.ts "--artifacts=$RUNNER_TEMP/windows-shards" "--job-results=$RUNNER_TEMP/windows-shard-jobs.json" "--selection=$RUNNER_TEMP/windows-shard-selection.json" "--output=$RUNNER_TEMP/windows-shard-aggregate.json" --skip-policy=.github/windows-test-skips.json --shard-plan=.github/windows-test-shards.json --mode=timing
       - name: Upload independent Windows aggregate
         if: always()
         uses: actions/upload-artifact@v4

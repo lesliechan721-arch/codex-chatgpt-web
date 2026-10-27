@@ -474,7 +474,7 @@ test.each([false, true])("connector verification drops the retired chat mode thr
   })).toEqual({ ok: true, appName: "Codex Native5" });
 });
 
-test("daemon streams browser lifecycle through the real helper process", async () => {
+test("daemon streams browser lifecycle and resets repeated traces through the real helper process", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-helper-client-"));
   roots.push(root);
   const { recovery } = recoveryFixture(join(root, "continuity"));
@@ -499,7 +499,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
         recovery: { ...turn.continuity.recovery, snapshotVersion: 1 } }) + "\\n");
       await turn.onSendActivated();
       const initial = turn.externalProgress.snapshot();
-      if (initial.nativeWaiting?.activeOperations !== 1) throw new Error("Initial Native lease lost in IPC");
+      if (initial.nativeWaiting?.activeOperations !== 1 || initial.nativeWaiting?.sourceRevision !== 1) throw new Error("Initial Native lease lost in IPC");
       const changed = turn.externalProgress.waitForChange(initial.revision, turn.abortSignal);
       turn.onSubmitted();
       const renewed = await changed;
@@ -565,12 +565,12 @@ test("daemon streams browser lifecycle through the real helper process", async (
   let heartbeats = 0;
   let generationProgress = 0;
   let released = false;
-  const externalProgress = new ChatGptExternalTurnProgress();
+  let externalProgress = new ChatGptExternalTurnProgress();
   externalProgress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
   const client = new LauncherBrowserHelperClient(config);
   try {
     await client.assertContinuityCompatible(true);
-    const result = await client.run({
+    const turn: BrowserTurn = {
       traceId: "abcdef123456",
       externalProgress,
       modelId: "gpt-5.6-sol",
@@ -602,8 +602,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
       onTextDelta: text => deltas.push(text),
       captureLunaCheckpoint: true,
       onLunaCheckpoint: checkpoint => checkpoints.push(checkpoint),
-    });
-    expect(result).toBe("done");
+    };
+    expect(await client.run(turn)).toBe("done");
     expect(reasoning).toEqual([
       { text: "Reading project", continuation: false },
       { text: " files", continuation: true },
@@ -626,6 +626,14 @@ test("daemon streams browser lifecycle through the real helper process", async (
       },
     }]);
     expect(released).toBe(true);
+    // Reuse both the helper process and trace id with a fresh, lower revision.
+    externalProgress = new ChatGptExternalTurnProgress();
+    externalProgress.recordNativeWaiting({ revision: 1, activeOperations: 1, unreadResults: 0, remainingMs: 120_000 });
+    turn.externalProgress = externalProgress;
+    expect(await client.run(turn)).toBe("done");
+    expect(activations).toBe(2);
+    expect(heartbeats).toBe(2);
+    expect(generationProgress).toBe(2);
   } finally {
     await client.close();
   }

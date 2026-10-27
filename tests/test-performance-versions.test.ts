@@ -601,17 +601,18 @@ test("full wrapper wall clocks preserve incomplete operation collection without 
 }, 30_000);
 
 for (const identity of ["equivalent", "different"] as const) test(`wrapper command and runtime paths require ${identity} filesystem identities`, () => {
-  const fixture = checkouts();
+  const fixture = reportQualificationFixture();
   try {
-    prepareWrapper(fixture);
-    const evidence = qualificationEvidence(fixture), alias = join(fixture.directory, "alias-A");
+    const evidence = qualificationEvidence(fixture, undefined, fixture.source), alias = join(fixture.directory, "alias-A");
     const executableDirectory = join(fixture.directory, "runtime-alias"), executableAlias = join(executableDirectory, basename(process.execPath));
     symlinkSync(fixture.A, alias, process.platform === "win32" ? "junction" : "dir");
     symlinkSync(dirname(process.execPath), executableDirectory, process.platform === "win32" ? "junction" : "dir");
     // Equal Bun bytes on another file object must still fail the identity check.
     const differentExecutable = join(fixture.directory, "different-bun");
-    copyFileSync(process.execPath, differentExecutable);
-    expect(createHash("sha256").update(readFileSync(differentExecutable)).digest("hex")).toBe(evidence.summary.executable.sha256);
+    if (identity === "different") {
+      copyFileSync(process.execPath, differentExecutable);
+      expect(createHash("sha256").update(readFileSync(differentExecutable)).digest("hex")).toBe(evidence.summary.executable.sha256);
+    }
     evidence.summary.cwd = alias;
     evidence.summary.executable.path = identity === "equivalent" ? executableAlias : differentExecutable;
     evidence.summary.command[0] = evidence.summary.executable.path;

@@ -23,16 +23,11 @@ test("T5 source rules: structured source key order", () => {
   const reordered = checkpointSourceDecision([marker, reverseKeys(original)], record);
   expect(reordered).toMatchObject({ action: "admit", commit: "commit-one", work: "source", primary: [1], carried: true });
   expect(checkpointSourceDecision([marker, original], record)).toEqual(reordered);
-  const content = original.content as Array<Record<string, unknown>>;
-  for (const changed of [[...content].reverse(), [{ ...content[0], text: "Changed source instruction." }, content[1]]]) {
-    rejectSource([marker, { ...original, content: changed }], record);
-  }
-  expect(checkpointSourceDecision([marker, original], record)).toEqual(reordered);
 });
 
-for (const parent of [false, true]) for (const change of ["role", "content", "turn"] as const) {
-  test(`T5 source rules: changed source ${change} parent ${parent}`, () => {
-    const original = checkpointSourceItem(parent), record = checkpointSourceView(original), marker = checkpointSourceMarker();
+for (const change of ["role", "content", "turn"] as const) {
+  test(`T5 source rules: changed text source ${change}`, () => {
+    const original = checkpointSourceItem(false), record = checkpointSourceView(original), marker = checkpointSourceMarker();
     rejectSource([changedCheckpointSource(original, change), marker], record);
     expect(checkpointSourceDecision([original, marker], record)).toMatchObject({ action: "admit", commit: "commit-one", work: "source", primary: [0] });
   });

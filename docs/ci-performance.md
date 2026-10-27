@@ -368,12 +368,39 @@ selects serial execution. Local `bun run test` and `bun run verify` still run th
 suite without a shard argument.
 
 ```sh
-bun run test --mode=timing --shard=1/2 --parallel=2
-bun run test --mode=timing --shard=2/2 --parallel=2
-bun run verify --test-mode=timing --test-shard=1/2
+bun run test --mode=timing --shard=1/2 --parallel=2 --shard-plan=.github/windows-test-shards.json
+bun run test --mode=timing --shard=2/2 --parallel=2 --shard-plan=.github/windows-test-shards.json
+bun run verify --test-mode=timing --test-shard=1/2 --shard-plan=.github/windows-test-shards.json
 ```
 
-Shards use Bun 1.4.3 cold file allocation. They reject path/name filters, bail, invalid or
+Windows CI and Release use the committed `.github/windows-test-shards.json` plan. It
+records each file's assignment and measured Windows cost. Planning places the most
+expensive files first on the lighter shard, including shard 1's serial non-server
+verification cost. The recorded worker count supplies the cost model; manual runs can
+still select one worker. Estimates describe file work divided by workers plus serial
+verification, not a guaranteed wall time.
+
+Adding a test file does not move existing assignments. New paths use a stable SHA-256
+assignment; deleted paths are ignored. Both jobs derive their subsets from the current
+checkout and execute explicit `./tests/...` paths without Bun's native `--shard` option.
+The independent gate reads the same committed plan, checks its digest, and checks the
+exact command, logs, measurements and complete file union. It rejects mismatched plans
+and partial coverage. No test is excluded because it lacks historical timing data.
+
+Rebalance explicitly after substantial test changes. Download both Windows performance
+artifacts from one successful run into separate directories under a common parent, then:
+
+```sh
+bun run scripts/plan-test-shards.ts --artifacts=/path/to/downloaded-reports --output=.github/windows-test-shards.json
+```
+
+The generator requires successful, complete Windows reports from the same revision and
+workflow run, measurements for every current test file, and shard 1's verification
+report. It derives non-server overhead from that report. Review and commit the changed
+plan. Assignment changes occur only when the plan changes; historical artifacts are
+planning inputs and do not authorize current test coverage.
+
+Without `--shard-plan`, shards retain Bun 1.4.3 cold file allocation. All shards reject path/name filters, bail, invalid or
 duplicate shard numbers, and explicit `CGW_TEST_TIMING_*` variables. They do not restore
 or publish history. Each shard has an independent output directory and artifact. Windows
 CI/Release and Intel release gates support partial reruns: each gate resolves the latest
@@ -392,7 +419,7 @@ For pull requests, selection binds REST job and artifact metadata to the PR head
 (`runHeadRevision`). The tested source (`revision`) and report aggregation stay bound to
 `GITHUB_SHA`, the PR merge commit. For other events, both revisions use `GITHUB_SHA`.
 
-Shard summaries use schema v5 and file-timing schema v3. `fullSuite=false` means that each
+Planned shard summaries use schema v6; native cold shards retain v5. Both use file-timing schema v3. `fullSuite=false` means that each
 report covers only its assigned subset. Unsharded reports retain schema v4. The independent
 aggregate checks the exact repository file union, each expected/executed/measured subset,
 source and tool identities, both lockfiles, runtime, workers, mode, isolation, exit state,
@@ -434,7 +461,7 @@ updating its policy entry. Missing entries, duplicate identities or unknown skip
 the gate.
 
 ```sh
-bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts --job-results=/path/to/jobs.json --output=/path/to/aggregate.json --skip-policy=.github/windows-test-skips.json --mode=timing
+bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts --job-results=/path/to/jobs.json --output=/path/to/aggregate.json --skip-policy=.github/windows-test-skips.json --shard-plan=.github/windows-test-shards.json --mode=timing
 ```
 
 `jobs.json` contains the actual final states of `shard1`, `shard2` and `package`.

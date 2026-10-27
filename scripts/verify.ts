@@ -1,13 +1,19 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertColdShardEnvironment, parseTestShard, type TestShard } from "./test-shards";
+import { assertColdShardEnvironment, loadShardPlan, parseTestShard, type TestShard } from "./test-shards";
 
 const root = resolve(import.meta.dir, "..");
 export function verifyOptions(args: string[]) {
   let testMode: "full" | "timing" = "full";
   let testShard: TestShard | undefined;
+  let shardPlan: string | undefined;
   for (const arg of args) {
+    if (arg.startsWith("--shard-plan=")) {
+      if (shardPlan || !arg.slice(13)) throw new Error("Invalid or duplicate --shard-plan.");
+      shardPlan = arg.slice(13);
+      continue;
+    }
     if (arg.startsWith("--test-shard=")) {
       if (testShard) throw new Error("Duplicate --test-shard option.");
       testShard = parseTestShard(arg.slice(13));
@@ -18,15 +24,16 @@ export function verifyOptions(args: string[]) {
     if (value !== "full" && value !== "timing") throw new Error("--test-mode must be full or timing.");
     testMode = value;
   }
-  return { testMode, ...(testShard ? { testShard } : {}) };
+  if (shardPlan && !testShard) throw new Error("--shard-plan requires --test-shard.");
+  return { testMode, ...(testShard ? { testShard } : {}), ...(shardPlan ? { shardPlan } : {}) };
 }
 
-export function verificationCommands(testMode: "full" | "timing", scratch: string, testShard?: TestShard) {
+export function verificationCommands(testMode: "full" | "timing", scratch: string, testShard?: TestShard, shardPlan?: string) {
   return [
     ["run", "check-version"], ["run", "audit"], ["run", "launcher:audit"],
     // Prepare Electron before timed tests; its executable is downloaded on first use.
     ["run", "launcher/node_modules/electron/install.js"], ["run", "typecheck"],
-    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : [])], ["run", "launcher:build"],
+    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : []), ...(shardPlan ? [`--shard-plan=${shardPlan}`] : [])], ["run", "launcher:build"],
     ["run", "scripts/build-runtime-bundle.ts", join(scratch, "runtime")],
     ["run", "scripts/generate-third-party-notices.ts", join(scratch, "THIRD_PARTY_NOTICES.txt"), "--include-launcher"],
     ["run", "scripts/smoke-release.ts", join(scratch, "runtime")],
@@ -34,7 +41,9 @@ export function verificationCommands(testMode: "full" | "timing", scratch: strin
 }
 
 export async function verify(args: string[]) {
-  const { testMode, testShard } = verifyOptions(args);
+  const options = verifyOptions(args);
+  const { testMode, testShard } = options;
+  const shardPlan = options.shardPlan ? loadShardPlan(root, options.shardPlan).path : undefined;
   if (testShard) {
     if (testShard.index !== 1) throw new Error("verify --test-shard is reserved for shard 1; run other shards with bun run test.");
     assertColdShardEnvironment(process.env);
@@ -69,7 +78,7 @@ export async function verify(args: string[]) {
   const priorRuns = new Set<string>();
   try { for (const entry of readdirSync(output)) priorRuns.add(entry); } catch { /* First run. */ }
   try {
-    for (const command of verificationCommands(testMode, scratch, testShard)) await run(command);
+    for (const command of verificationCommands(testMode, scratch, testShard, shardPlan)) await run(command);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     process.exitCode = stages.at(-1)?.exitCode || 1;
