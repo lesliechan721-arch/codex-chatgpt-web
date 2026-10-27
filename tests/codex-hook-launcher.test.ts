@@ -7,9 +7,12 @@ import { defaultConfig } from "../src/config";
 import { codexInterruptHookCommand, codexInterruptHookHash, installCodexInterruptHookLauncher } from "../src/codex-interrupt-hook";
 
 async function invoke(command: string, payload: string, environment: NodeJS.ProcessEnv = process.env) {
+  // cmd.exe /s removes the outer quotes. Keep the command's own quotes intact,
+  // and disable Bun's argument escaping because cmd.exe does not decode \" escapes.
   const child = Bun.spawn(process.platform === "win32"
-    ? ["cmd.exe", "/d", "/s", "/c", command]
+    ? ["cmd.exe", "/d", "/s", "/c", `"${command}"`]
     : ["/bin/sh", "-c", command], {
+    windowsVerbatimArguments: process.platform === "win32",
     env: environment,
     stdin: Buffer.from(payload), stdout: "pipe", stderr: "pipe",
   });
