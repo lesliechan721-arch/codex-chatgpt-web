@@ -63,6 +63,7 @@ test("browser preferences waits for startup and route recovery without invalidat
     const context = vm.createContext({
       runtimeStartup, finishRuntimeStartup: () => { startupSettled = true; finishRuntimeStartup(); },
       startupAuthenticationRefresh, logger, stateStore, IS_DEV_PROFILE: false, connectorSetupStatePatch,
+      SessionReminderView: class {}, mainWindow: {}, loadRenderer() {},
       ipcMain: { on() {} }, registerLoggedIpc: (_ipc, _logger, channel, handler) => handlers.set(channel, handler),
       send() {}, publishOperation() {}, startCatalogVerificationMonitor() {},
       releaseRetainedConversation() {},
@@ -121,6 +122,8 @@ test("embedded ChatGPT reports mounted bounds after activation and cancels measu
     const api = {
       setBrowserSurfaceActive: () => new Promise(resolve => activations.push(resolve)),
       setBrowserBounds: async value => { bounds.push({ ...value }); },
+      setSessionReminderVisible: async () => {},
+      onSessionReminderLogout: () => () => {},
     };
     window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
     const passthrough = ({ children }) => children ?? null;
@@ -843,7 +846,7 @@ test("Zero Risk Pro commits Launcher state before a best-effort API-key model ca
   assert.match(handler, /catch[\s\S]*?startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
 });
 
-test("Zero Risk model profile copy describes mutually exclusive installation", () => {
+test("Zero Risk Pro copy describes both base and Pro models", () => {
   const ts = require("typescript");
   const vm = require("node:vm");
   const transpiled = ts.transpileModule(
@@ -862,8 +865,8 @@ test("Zero Risk model profile copy describes mutually exclusive installation", (
   for (const language of Object.keys(require("../electron/languages.json"))) {
     const copy = translated.exports.copyFor(language);
     assert.match(copy.zeroRiskDefaultProfileBody, new RegExp(exclusiveMarker[language], "i"));
-    assert.match(copy.zeroRiskProProfileBody, new RegExp(exclusiveMarker[language], "i"));
-    assert.match(copy.zeroRiskProProfileBody, /Zero Risk Pro/);
+    assert.doesNotMatch(copy.zeroRiskProProfileBody, new RegExp(exclusiveMarker[language], "i"));
+    assert.match(copy.zeroRiskProProfileBody, /Zero Risk.*Zero Risk Pro/);
   }
 });
 
@@ -1297,15 +1300,16 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
   const vm = require("node:vm");
   for (const [property, method, channel, nextChannel] of [
     ["composerPredictionsEnabled", "setComposerPredictions", "launcher:composer-predictions", "launcher:skill-attachments"],
-    ["experimentalFreshConversationPerTurn", "setFreshConversationPerTurn", "launcher:fresh-conversation-per-turn", "launcher:auto-approve-tool-calls"],
+    ["experimentalFreshConversationPerTurn", "setFreshConversationPerTurn", "launcher:fresh-conversation-per-turn", "launcher:temporary-chats"],
+    ["useTemporaryChats", "setTemporaryChats", "launcher:temporary-chats", "launcher:auto-approve-tool-calls"],
     ["autoApproveToolCalls", "setAutoApproveToolCalls", "launcher:auto-approve-tool-calls", "launcher:zero-risk-pro"],
   ]) {
     const source = electronMain.slice(
       electronMain.indexOf(`handle("${channel}",`),
       electronMain.indexOf(`handle("${nextChannel}",`),
     );
-    const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, autoApproveToolCalls: false };
-    const config = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, autoApproveToolCalls: false };
+    const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useTemporaryChats: false, autoApproveToolCalls: false };
+    const config = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false, useTemporaryChats: false, autoApproveToolCalls: false };
     const events = [];
     let handler, finishSetup, setupFailure, calls = 0;
     const browserHost = { activeTraceId: "running-turn", currentOperation: () => null, turnTabs: new Map() };
@@ -1351,10 +1355,10 @@ test("browser preference IPC commits only after setup succeeds and refuses activ
   }
 });
 
-test("old runtime configuration keeps predictions off until explicitly enabled", () => {
+test("runtime preferences default predictions and Temporary Chat on while preserving explicit opt-outs", () => {
   const vm = require("node:vm");
-  const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
-    autoApproveToolCalls: false, experimentalBiggerContext: false, biggerContextAvailable: false };
+  const state = { composerPredictionsEnabled: false, useTemporaryChats: false, experimentalFreshConversationPerTurn: false,
+    autoApproveToolCalls: false };
   const events = [];
   const context = vm.createContext({
     stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
@@ -1365,14 +1369,14 @@ test("old runtime configuration keeps predictions off until explicitly enabled",
   const start = electronMain.indexOf("function syncBrowserPreferences(");
   const end = electronMain.indexOf("function syncZeroRiskSentConfirmationPreference(", start);
   vm.runInContext(electronMain.slice(start, end), context);
-  for (const config of [{}, { composerPredictionsEnabled: false }, { composerPredictionsEnabled: "true" }]) {
+  for (const config of [{}, { composerPredictionsEnabled: true, useTemporaryChats: true }]) {
     context.syncBrowserPreferences(context.stateStore, config);
-    assert.equal(state.composerPredictionsEnabled, false);
+    assert.equal(state.composerPredictionsEnabled, true);
+    assert.equal(state.useTemporaryChats, true);
   }
-  context.syncBrowserPreferences(context.stateStore, { composerPredictionsEnabled: true });
-  assert.equal(state.composerPredictionsEnabled, true);
-  context.syncBrowserPreferences(context.stateStore, {});
+  context.syncBrowserPreferences(context.stateStore, { composerPredictionsEnabled: false, useTemporaryChats: false });
   assert.equal(state.composerPredictionsEnabled, false);
+  assert.equal(state.useTemporaryChats, false);
   assert.equal(events.at(-1)[0], "launcher:state-changed");
 });
 
@@ -1432,7 +1436,7 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
 test("retired Bigger Context configuration does not retire chats or alter continuity", () => {
   const vm = require("node:vm");
   const { continuityLease } = require("../electron/continuity-lease.cjs");
-  const state = { composerPredictionsEnabled: false, experimentalFreshConversationPerTurn: false,
+  const state = { composerPredictionsEnabled: true, useTemporaryChats: true, experimentalFreshConversationPerTurn: false,
     autoApproveToolCalls: false };
   const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
     traceId: "continuity-trace", continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32),
@@ -1477,9 +1481,9 @@ test("retired Bigger Context configuration does not retire chats or alter contin
 
 test("broader persistence changes still require the continuity lease before releasing its page", () => {
   const vm = require("node:vm");
-  for (const property of ["experimentalFreshConversationPerTurn"]) {
-    const state = { experimentalBiggerContext: false, experimentalFreshConversationPerTurn: false,
-      autoApproveToolCalls: false, biggerContextAvailable: true };
+  for (const property of ["experimentalFreshConversationPerTurn", "useTemporaryChats"]) {
+    const state = { composerPredictionsEnabled: true, experimentalFreshConversationPerTurn: false,
+      autoApproveToolCalls: false, useTemporaryChats: false };
     const continuity = { id: "continuity", status: "ready", conversationKey: "continuity-key", interactionMode: "automatic",
       continuityOwner: "a".repeat(64), continuityLeaseId: "b".repeat(32), view: { webContents: { isDestroyed: () => false } } };
     const tabs = new Map([[continuity.id, continuity]]);
@@ -1491,11 +1495,34 @@ test("broader persistence changes still require the continuity lease before rele
     });
     vm.runInContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("function registerIpc(")), context);
     const store = { read: () => state, update: patch => Object.assign(state, patch) };
-    assert.throws(() => context.syncBrowserPreferences(store, { solAvailable: false, [property]: true }),
+    assert.throws(() => context.syncBrowserPreferences(store, { useTemporaryChats: false, [property]: true }),
       error => error.code === "continuity_session_lost");
     assert.equal(state[property], false);
     assert.equal(tabs.get("continuity"), continuity);
   }
+});
+
+test("changing chat mode retires idle automatic and manual conversations while preserving active tasks", () => {
+  const vm = require("node:vm");
+  const state = { useTemporaryChats: false };
+  const tabs = new Map([
+    ["automatic", { status: "ready", conversationKey: "automatic", interactionMode: "automatic" }],
+    ["manual", { status: "ready", conversationKey: "manual", interactionMode: "manual" }],
+    ["active", { status: "running", conversationKey: "active", interactionMode: "automatic" }],
+  ]);
+  const released = [];
+  const context = vm.createContext({
+    runtimeHost: { currentOperation: () => null }, browserHost: { turnTabs: tabs },
+    releaseRetainedConversation: (_host, key) => { released.push(key); tabs.delete(key); }, send() {},
+  });
+  vm.runInContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("function registerIpc(")), context);
+  const store = { read: () => state, update: patch => Object.assign(state, patch) };
+  context.syncBrowserPreferences(store, { useTemporaryChats: true });
+  assert.deepEqual(released, ["automatic", "manual"]);
+  assert.equal(state.useTemporaryChats, true);
+  assert.equal(tabs.has("active"), true);
+  context.syncBrowserPreferences(store, { useTemporaryChats: true });
+  assert.deepEqual(released, ["automatic", "manual"]);
 });
 
 test("browser preference controls are translated, disabled in Zero Risk, and invoke their settings", async () => {

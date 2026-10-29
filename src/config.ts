@@ -143,7 +143,8 @@ export interface AppConfig {
   composerPredictionsEnabled: boolean;
   experimentalSkillAttachments: boolean;
   experimentalFreshConversationPerTurn: boolean;
-  /** Select the Pro-sized model row instead of the default Zero Risk row. */
+  useTemporaryChats: boolean;
+  /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Require the user to confirm Sent in the Launcher before a Zero Risk connector can start. */
   zeroRiskRequireSentConfirmation: boolean;
@@ -283,9 +284,10 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     solAvailable: true,
     extraHighAvailable: false,
     proAvailable: false,
-    composerPredictionsEnabled: false,
+    composerPredictionsEnabled: true,
     experimentalSkillAttachments: false,
     experimentalFreshConversationPerTurn: false,
+    useTemporaryChats: true,
     zeroRiskProEnabled: false,
     zeroRiskRequireSentConfirmation: true,
     autoApproveToolCalls: false,
@@ -610,11 +612,14 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.experimentalSkillAttachments !== undefined && typeof parsed.experimentalSkillAttachments !== "boolean") {
     throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
   }
+  if (parsed.useTemporaryChats !== undefined && typeof parsed.useTemporaryChats !== "boolean") {
+    throw new Error(`Invalid useTemporaryChats in ${path}`);
+  }
   const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
   if (parsed.composerPredictionsEnabled !== undefined && typeof parsed.composerPredictionsEnabled !== "boolean") {
     throw new Error(`Invalid composerPredictionsEnabled in ${path}`);
   }
-  const composerPredictionsEnabled = parsed.composerPredictionsEnabled === true;
+  const composerPredictionsEnabled = parsed.composerPredictionsEnabled !== false;
   if (parsed.experimentalFreshConversationPerTurn !== undefined
     && typeof parsed.experimentalFreshConversationPerTurn !== "boolean") {
     throw new Error(`Invalid experimentalFreshConversationPerTurn in ${path}`);
@@ -648,6 +653,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     composerPredictionsEnabled,
     experimentalSkillAttachments,
     experimentalFreshConversationPerTurn,
+    useTemporaryChats: parsed.useTemporaryChats !== false,
     zeroRiskProEnabled,
     zeroRiskRequireSentConfirmation,
   } as AppConfig;
@@ -666,9 +672,14 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
   const toolAuthorityMode = effectiveToolAuthorityMode(config.toolAuthorityMode);
   const manual = config.browserInteractionMode === "manual";
   const model = manual
-    ? config.zeroRiskProEnabled ? CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL : CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
+    ? CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL
     : config.solAvailable ? "gpt-5.6-sol" : CHATGPT_WEB_LUNA_BACKEND_MODEL;
-  const models = [model];
+  const models = manual
+    ? [
+      CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
+      ...(config.zeroRiskProEnabled ? [CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL] : []),
+    ]
+    : [model];
   const efforts = manual
     ? ["low"]
     : config.solAvailable
@@ -709,6 +720,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: manual ? false : config.proAvailable,
       experimentalSkillAttachments: manual ? false : config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: !manual && config.experimentalFreshConversationPerTurn === true,
+      useTemporaryChats: config.useTemporaryChats,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },

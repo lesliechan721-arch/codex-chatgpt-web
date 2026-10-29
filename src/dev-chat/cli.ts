@@ -42,6 +42,10 @@ Usage:
   codex-chatgpt-web dev chat NAME [--model MODEL] [MESSAGE]
   codex-chatgpt-web dev list
 
+Setup options:
+  --temporary-chats    Use Temporary Chat for new task conversations (default)
+  --ordinary-chats     Keep new task conversations in ChatGPT history
+
 Repository shortcut:
   bun run dev:launcher
   bun run dev:chat NAME "message"

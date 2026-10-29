@@ -75,7 +75,7 @@ Setup options:
                                Send prompts and read ChatGPT state through browser automation (default)
   --zero-risk-browser-interaction
                                Full mode: select, paste, and send in the launcher yourself
-  --zero-risk-pro              Zero Risk: install only the explicit Pro-sized model row
+  --zero-risk-pro              Zero Risk: add the explicit Pro-sized model row
   --zero-risk-default          Zero Risk: install only the default model row
   --zero-risk-sent-confirmation
                                Zero Risk: require the Launcher Sent confirmation (default)
@@ -97,8 +97,10 @@ Setup options:
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --fresh-conversation         Start each automatic turn in a fresh browser chat
   --retained-conversation      Reuse the browser chat between turns (default)
-  --composer-predictions       Enable next-message suggestions using GPT-6 Sol Medium
-  --no-composer-predictions    Disable next-message suggestions for Web models (default)
+  --temporary-chats            Use Temporary Chat for new task conversations (default)
+  --ordinary-chats             Keep new task conversations in ChatGPT history
+  --composer-predictions       Enable next-message suggestions using GPT-6 Sol Medium (default)
+  --no-composer-predictions    Disable next-message suggestions for Web models
   --skill-attachments         Experimental selected skills as text attachments
   --inline-skills             Keep selected skills inline (default)
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice

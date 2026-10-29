@@ -54,16 +54,39 @@ app.whenReady().then(async () => {
     await view.webContents.loadURL(`about:blank#${id}`);
   }
   host.syncViewVisibility();
+  const contents = [view, ...[...host.turnTabs.values()].map(tab => tab.view)]
+    .map(view => view.webContents);
+  const release = () => {
+    for (const response of pending) response.end();
+    pending.clear();
+  };
+  let disposal;
+  const dispose = () => disposal ??= (async () => {
+    // This fixture bypasses BrowserHost's constructor and full destroy path.
+    // Close its owned guest contents explicitly before quitting Electron.
+    host.destroyed = true;
+    release();
+    const started = performance.now();
+    await Promise.all(contents.map(contents => new Promise(resolve => {
+      if (contents.isDestroyed()) return resolve();
+      contents.once("destroyed", resolve);
+      contents.close();
+    })));
+    const viewsMs = Math.round(performance.now() - started);
+    await new Promise((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+      server.closeAllConnections();
+    });
+    host.turnTabs.clear();
+    return { viewsMs, serverMs: Math.round(performance.now() - started) - viewsMs,
+      liveViews: contents.filter(contents => !contents.isDestroyed()).length,
+      pendingResponses: pending.size, serverListening: server.listening };
+  })();
   global.navigationFixture = {
     host, url: `http://127.0.0.1:${server.address().port}/page`,
-    release() {
-      for (const response of pending) response.end();
-      pending.clear();
-    },
+    release, dispose,
   };
   app.on("before-quit", () => {
-    global.navigationFixture.release();
-    server.close();
-    server.closeAllConnections();
+    void dispose().catch(error => console.error("Navigation fixture cleanup failed", error));
   });
 });

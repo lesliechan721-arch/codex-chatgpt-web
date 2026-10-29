@@ -31,13 +31,22 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.14-1` integrates upstream `6.1.14` with this fork's continuity, durable input queue,
+Version `6.1.15-1` integrates upstream `6.1.15` with this fork's continuity, durable input queue,
 short-start context, on-demand reading, API access, provider, proxy, and remote-runtime contracts.
-Task turns, sign-in, account inspection and connector verification use ordinary ChatGPT chats.
-The retired `useSavedChats` preference is ignored on upgrade, including a previous explicit false
-value; other settings are preserved. ChatGPT memory and custom instructions may apply.
-The service, Launcher, installer, and download metadata use the same version. Next-message
-suggestions remain an explicit opt-in and are disabled when the setting is absent.
+Task turns, connector verification and browser smoke tests use Temporary Chat by default.
+`useTemporaryChats: false` preserves an explicit opt-out; an absent field defaults to true,
+including when upgrading an existing configuration. Sign-in and account inspection use ordinary
+chats. The retired `useSavedChats` preference is ignored and does not select the new mode.
+ChatGPT memory and custom instructions may apply. The service, Launcher, installer, and download
+metadata use the same version. Next-message suggestions default to enabled when the setting is
+absent; an explicit false is preserved. Zero Risk with Pro enabled exposes both the base and Pro
+model rows. Bigger Context remains removed.
+
+Before publishing this version, validate the new picker and Think controls against an authenticated
+account, connector availability in both chat modes, and Temporary Chat page reuse, compaction,
+backend restart and lost-page recovery. Local fixtures and simulated retained pages do not prove
+that a real Temporary Chat page survives a Launcher restart. Keep that limit visible until the
+account-bound checks pass; use ordinary chats when the connector is unavailable in Temporary Chat.
 The tag workflow marks tags containing `beta` as pre-releases automatically and preserves an
 existing release's pre-release flag when rerun. Other preview builds must have that flag set
 explicitly before publication. Named version suffixes retain preview ordering below the base release.

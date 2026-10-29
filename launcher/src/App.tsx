@@ -379,7 +379,6 @@ function LauncherShell({
   const [sidebarOpen, setSidebarOpen] = useState(!compactAtMount);
   const [compactSidebar, setCompactSidebar] = useState(compactAtMount);
   const [browserSlot, setBrowserSlot] = useState<HTMLDivElement | null>(null);
-  const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
   const [networkProxyOpen, setNetworkProxyOpen] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
@@ -471,6 +470,18 @@ function LauncherShell({
     return () => window.clearTimeout(timer);
   }, [browser?.authenticated, snapshot.state.sessionRefreshReminderAt]);
 
+  useEffect(() => {
+    void api!.setSessionReminderVisible(sessionReminderDue)
+      .catch(cause => setError(messageOf(cause)));
+    return () => { void api!.setSessionReminderVisible(false).catch(cause => setError(messageOf(cause))); };
+  }, [sessionReminderDue, language, setError]);
+
+  useEffect(() => api!.onSessionReminderLogout(() => {
+    setSurface("browser");
+    if (compactSidebar) setSidebarOpen(false);
+    void api!.setBrowserSurfaceActive(true).catch(cause => setError(messageOf(cause)));
+  }), [compactSidebar, setError]);
+
   const activateBrowser = useCallback(async (show = false) => {
     setSurface("browser");
     await api!.setBrowserSurfaceActive(true);
@@ -499,35 +510,6 @@ function LauncherShell({
       await api!.installUpdate();
     } catch (cause) {
       setError(messageOf(cause));
-    }
-  };
-
-  const dismissSessionReminder = async () => {
-    if (sessionReminderBusy) return;
-    setSessionReminderBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.dismissSessionReminder());
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setSessionReminderBusy(false);
-    }
-  };
-
-  const logoutChatGpt = async () => {
-    if (sessionReminderBusy) return;
-    setSessionReminderBusy(true);
-    setError(null);
-    try {
-      const result = await api!.logoutChatGpt();
-      updateState(result.state);
-      navigateSurface("browser");
-      await api!.setBrowserSurfaceActive(true);
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setSessionReminderBusy(false);
     }
   };
 
@@ -767,16 +749,6 @@ function LauncherShell({
         </AnimatePresence>
       </section>
 
-      <AnimatePresence>
-        {sessionReminderDue ? (
-          <SessionRefreshReminder
-            busy={sessionReminderBusy}
-            copy={copy}
-            onDismiss={() => void dismissSessionReminder()}
-            onLogout={() => void logoutChatGpt()}
-          />
-        ) : null}
-      </AnimatePresence>
     </motion.main>
   );
 }
@@ -1915,6 +1887,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setTemporaryChats = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setTemporaryChats(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const setInteractionMode = async (mode: BrowserInteractionMode) => {
     setBusy(true);
     setError(null);
@@ -2063,6 +2046,13 @@ function SettingsSurface({
             checked={snapshot.state.browserInteractionMode !== "manual" && snapshot.state.autoApproveToolCalls}
             disabled={busy || snapshot.state.browserInteractionMode === "manual" || !snapshot.state.coreSetupComplete}
             onChange={(checked) => void setAutoApproveToolCalls(checked)}
+          />
+        </SettingRow>
+        <SettingRow body={copy.temporaryChatsBody} label={copy.temporaryChats}>
+          <Switch
+            checked={snapshot.state.useTemporaryChats}
+            disabled={busy || snapshot.state.coreSetupComplete !== true}
+            onChange={(checked) => void setTemporaryChats(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
@@ -2777,7 +2767,7 @@ function ErrorToast({ copy, message, onDismiss }: { copy: Copy; message: string;
   );
 }
 
-function SessionRefreshReminder({
+export function SessionRefreshReminder({
   busy,
   copy,
   onDismiss,

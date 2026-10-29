@@ -33,7 +33,7 @@ function descriptor(endpoint: string, features = [LAUNCHER_CONTEXT_DELIVERY_FEAT
     surfaceTargets: { launcher_surface_id_0123456789AB: "native-target" }, createdAt: new Date().toISOString() }), { mode: 0o600 });
   return { file, helper, config: { appName: "Codex Native5", browserHost: "launcher", browserHostDescriptorPath: file,
     browserHelperScriptPath: helper, storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false } satisfies ResolvedBrowserConfig };
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useTemporaryChats: true } satisfies ResolvedBrowserConfig };
 }
 
 test("a host without plan capability receives no reduced manual prompt", async () => {

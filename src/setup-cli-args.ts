@@ -24,11 +24,9 @@ function consumeRetiredContextFlags(args: string[]): void {
   }
 }
 
-function consumeRetiredChatFlags(args: string[]): void {
-  const savedChats = takeFlag(args, "--saved-chats");
-  const temporaryChats = takeFlag(args, "--temporary-chats");
-  if (savedChats || temporaryChats) {
-    process.stderr.write("Temporary Chat has been removed. Legacy chat-mode flags are ignored; task conversations now use ordinary ChatGPT history.\n");
+function consumeRetiredSavedChatFlag(args: string[]): void {
+  if (takeFlag(args, "--saved-chats")) {
+    process.stderr.write("--saved-chats has been removed and is ignored. Use --ordinary-chats to keep task conversations in ChatGPT history.\n");
   }
 }
 
@@ -92,7 +90,11 @@ export function parseProductionSetupArgs(arguments_: readonly string[]): {
   const skillAttachments = takeFlag(args, "--skill-attachments");
   const inlineSkills = takeFlag(args, "--inline-skills");
   if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
-  consumeRetiredChatFlags(args);
+  consumeRetiredSavedChatFlag(args);
+  const temporaryChats = takeFlag(args, "--temporary-chats");
+  const ordinaryChats = takeFlag(args, "--ordinary-chats");
+  if (temporaryChats && ordinaryChats) throw new Error("Choose --temporary-chats or --ordinary-chats");
+  if (temporaryChats || ordinaryChats) options.useTemporaryChats = temporaryChats;
   const freshConversation = takeFlag(args, "--fresh-conversation");
   const retainedConversation = takeFlag(args, "--retained-conversation");
   if (freshConversation && retainedConversation) {
@@ -156,7 +158,10 @@ export function parseDevSetupArgs(
   const skillAttachments = takeFlag(args, "--skill-attachments");
   const inlineSkills = takeFlag(args, "--inline-skills");
   if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
-  consumeRetiredChatFlags(args);
+  consumeRetiredSavedChatFlag(args);
+  const temporaryChats = takeFlag(args, "--temporary-chats");
+  const ordinaryChats = takeFlag(args, "--ordinary-chats");
+  if (temporaryChats && ordinaryChats) throw new Error("Choose --temporary-chats or --ordinary-chats");
   const freshConversation = takeFlag(args, "--fresh-conversation");
   const retainedConversation = takeFlag(args, "--retained-conversation");
   if (freshConversation && retainedConversation) {
@@ -178,6 +183,7 @@ export function parseDevSetupArgs(
     ...(toolAuthorityMode ? { toolAuthorityMode } : {}),
     ...(predictions || noPredictions ? { composerPredictionsEnabled: predictions } : {}),
     ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
+    ...(temporaryChats || ordinaryChats ? { useTemporaryChats: temporaryChats } : {}),
     ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
     ...(tunnelId ? { tunnelId } : {}),
     ...(runtimeKeyFile ? { runtimeKeyFile } : {}),

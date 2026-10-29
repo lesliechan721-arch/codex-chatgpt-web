@@ -155,7 +155,7 @@ function fencedHelperFixture(source: string, endpoint = "http://127.0.0.1:39002"
   const client = new LauncherBrowserHelperClient({ appName: "Codex Native5", browserHost: "launcher",
     browserHostDescriptorPath: descriptor, browserHelperScriptPath: script,
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false });
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useTemporaryChats: false });
   const turn: BrowserTurn = { traceId: "helper-fencing-trace", modelId: "gpt-6-sol",
     capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
     continuity: { owner: "f".repeat(64), recovery: durable.recovery }, recoveryStoreDirectory: directory,
@@ -453,7 +453,7 @@ test("the real helper IPC preserves an exact authenticated automatic acquire uns
   } finally { await fixture.client.close(); server.stop(true); }
 });
 
-test.each([false, true])("connector verification drops the retired chat mode through the real helper process (%s)", async useSavedChats => {
+test.each([[false, false], [false, true], [true, false], [true, true]])("helper verification preserves Temporary Chat=%s and discards retired saved-chat=%s", async (useTemporaryChats, useSavedChats) => {
   const root = mkdtempSync(join(tmpdir(), "codex-verification-chat-mode-"));
   roots.push(root);
   const helper = join(root, "helper.ts");
@@ -462,6 +462,7 @@ test.each([false, true])("connector verification drops the retired chat mode thr
     // Keep the launcher request, helper protocol and worker configuration real; replace browser IO.
     ChatGptBrowserWorker.prototype.verifyConnector = async function() {
       if (Object.hasOwn(this.config, "useSavedChats")) throw new Error("Retired setting reached helper worker");
+      if (this.config.useTemporaryChats !== ${useTemporaryChats}) throw new Error("Temporary Chat preference lost in verification IPC");
       return this.config.appName;
     };
     await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
@@ -470,7 +471,7 @@ test.each([false, true])("connector verification drops the retired chat mode thr
   expect(await verifyConnectorWithBrowserHelper({
     helper: { executable: process.execPath, script: helper },
     descriptorPath: join(root, "launcher.json"),
-    appName: "Codex Native5", useSavedChats,
+    appName: "Codex Native5", useTemporaryChats, useSavedChats,
   })).toEqual({ ok: true, appName: "Codex Native5" });
 });
 
@@ -484,6 +485,7 @@ test("daemon streams browser lifecycle and resets repeated traces through the re
     // Substitute only the browser. Both sides of the production IPC protocol run unchanged.
     ChatGptBrowserWorker.prototype.run = async function(turn) {
       if (Object.hasOwn(this.config, "useSavedChats")) throw new Error("Retired setting reached helper worker");
+      if (this.config.useTemporaryChats !== true) throw new Error("Temporary Chat preference lost in turn IPC");
       if (turn.modelFamily !== "5.6") throw new Error("Pinned model family lost in helper IPC");
       if (JSON.stringify(turn.continuity.recovery) !== ${JSON.stringify(JSON.stringify(recovery))}) throw new Error("Recovery identity lost in helper IPC");
       turn.onContinuityLease({ owner: turn.continuity.owner, leaseId: "f".repeat(32), traceId: turn.traceId, recovery: turn.continuity.recovery });
@@ -555,6 +557,7 @@ test("daemon streams browser lifecycle and resets repeated traces through the re
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useTemporaryChats: true,
   };
   const reasoning: Array<{ text: string; continuation: boolean }> = [];
   const deltas: string[] = [];
@@ -716,7 +719,7 @@ test("accepted compaction retires through the helper as completed without hiding
     appName: "Codex Native5", browserHost: "launcher", browserHostDescriptorPath: descriptorPath,
     browserHelperScriptPath: helper, browserDiagnosticsPath: join(root, "diagnostics"),
     storageStatePath: join(root, "unused-state.json"), chromeExecutablePath: join(root, "unused-chrome"),
-    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false,
+    turnTimeoutMs: 60_000, headed: true, autoApproveToolCalls: false, useTemporaryChats: false,
   });
   const logs: string[] = [];
   const logger = spyOn(console, "info").mockImplementation((...args) => { logs.push(args.join(" ")); });
@@ -762,7 +765,7 @@ test("an older helper rejects Native waiting before turn preparation or IPC disp
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native5", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
     storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome",
-    headed: true, autoApproveToolCalls: false,
+    headed: true, autoApproveToolCalls: false, useTemporaryChats: false,
   });
   const internal = client as unknown as {
     child: unknown;
@@ -808,6 +811,7 @@ test("launcher helper protocol preserves one complete prompt, broker identity an
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useTemporaryChats: false,
   });
   const internal = client as unknown as {
     pending: Map<string, { resolve(value: string): void }>;
@@ -920,6 +924,7 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useTemporaryChats: false,
   });
   const internal = client as unknown as {
     ensureChild(): Promise<void>;
@@ -966,6 +971,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
+    useTemporaryChats: false,
   });
   const internal = client as unknown as {
     child?: unknown;
@@ -1016,7 +1022,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
 test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native5", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
-    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useTemporaryChats: false,
   });
   const internal = client as unknown as {
     child: unknown;

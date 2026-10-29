@@ -1491,6 +1491,118 @@ describe("trusted Codex task environment continuity", () => {
     return { ...fixture, request: parseRequest({ ...body, model: "chatgpt-web/high" }), environment, roots, nativeContext, writeContext };
   }
 
+  function worktreeRolloutFixture() {
+    const fixture = resumedRootFixture();
+    const roots = [join(fixture.codexHome, "project"), join(fixture.codexHome, "visualizations")];
+    const request = environmentlessChild();
+    const body = request._rawBody as { client_metadata: Record<string, string>; input: Array<Record<string, unknown>> };
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, agent_name: "/root" });
+    const envelope = {
+      type: "message", role: "user", id: "msg_worktree_environment",
+      internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
+      content: [{ type: "input_text", text: `<environment_context><cwd>${root}</cwd><filesystem><workspace_roots>${roots.map(path => `<root>${path}</root>`).join("")}</workspace_roots>${dangerFullAccessProfileXml}</filesystem></environment_context>` }],
+    };
+    body.input.unshift(envelope);
+    // Captured Codex Desktop 0.164 V1 shape: the worktree cwd is current, project
+    // roots are retained in session_meta, and the turn explicitly has Full Access.
+    const session = childSessionMeta();
+    const sessionPayload = session.payload as Record<string, any>;
+    delete sessionPayload.agent_path;
+    sessionPayload.source.subagent.thread_spawn.agent_path = null;
+    sessionPayload.runtime_workspace_roots = roots;
+    const context = childTurnContext();
+    delete (context.payload as Record<string, unknown>).workspace_roots;
+    const nativeEnvelope = { ...structuredClone(envelope),
+      internal_chat_message_metadata_passthrough: {
+        turn_id: rolloutTurnId, content_item_kinds: ["environments.environment_context"],
+      } };
+    const records = [session,
+      { type: "event_msg", payload: { type: "task_started", turn_id: rolloutTurnId } },
+      { type: "response_item", payload: nativeEnvelope }, context];
+    const writeContext = () => writeFileSync(fixture.rolloutPath,
+      records.map(value => JSON.stringify(value)).join("\n") + "\n");
+    writeContext();
+    return { ...fixture, request, roots, envelope, nativeEnvelope, records, sessionPayload, context, writeContext };
+  }
+
+  test("Full Access worktree cwd uses its current native session's project roots", () => {
+    const { request, codexHome, roots } = worktreeRolloutFixture();
+    expect(() => extractChatGptTurnEnvironment(request)).toThrow();
+    const state = join(codexHome, "thread-environments.json");
+    const expected = { cwd: root, roots, writableRoots: roots, sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [] };
+    expect(new ChatGptThreadEnvironmentStore(state, Date.now, codexHome).resolve(request)).toEqual(expected);
+    expect(new ChatGptThreadEnvironmentStore(state, Date.now, codexHome).resolve(request)).toEqual(expected);
+  });
+
+  test("worktree context cannot replace native cwd, project roots, lineage, or the current turn", () => {
+    for (const conflict of ["cwd", "roots", "parent", "turn", "missing-roots", "malformed-roots", "restricted-profile", "split-policy"] as const) {
+      const fixture = worktreeRolloutFixture();
+      const payload = fixture.context.payload as Record<string, unknown>;
+      if (conflict === "cwd") payload.cwd = join(root, "different-worktree");
+      if (conflict === "roots") fixture.sessionPayload.runtime_workspace_roots = [join(fixture.codexHome, "different-project")];
+      if (conflict === "parent") fixture.sessionPayload.parent_thread_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+      if (conflict === "turn") payload.turn_id = "01a06c66-ffff-75c6-a0df-318f890ef6de";
+      if (conflict === "missing-roots") delete fixture.sessionPayload.runtime_workspace_roots;
+      if (conflict === "malformed-roots") fixture.sessionPayload.runtime_workspace_roots = ["relative-project"];
+      if (conflict === "restricted-profile") payload.permission_profile = { type: "managed" };
+      if (conflict === "split-policy") payload.file_system_sandbox_policy = { kind: "restricted", entries: [] };
+      fixture.writeContext();
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, fixture.codexHome).resolve(fixture.request)).toThrow();
+    }
+  });
+
+  test("current turn roots override the worktree session's original roots", () => {
+    const fixture = worktreeRolloutFixture();
+    (fixture.context.payload as Record<string, unknown>).workspace_roots = fixture.roots;
+    fixture.sessionPayload.runtime_workspace_roots = [join(fixture.codexHome, "previous-project")];
+    fixture.writeContext();
+    expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, fixture.codexHome).resolve(fixture.request))
+      .toMatchObject({ cwd: root, roots: fixture.roots });
+  });
+
+  test("worktree context cannot borrow cached Full Access when current native evidence is absent", () => {
+    const { request, codexHome, rolloutPath } = worktreeRolloutFixture();
+    const state = join(codexHome, "thread-environments.json");
+    expect(new ChatGptThreadEnvironmentStore(state, Date.now, codexHome).resolve(request).cwd).toBe(root);
+    rmSync(rolloutPath);
+    expect(() => new ChatGptThreadEnvironmentStore(state, Date.now, codexHome).resolve(request)).toThrow();
+  });
+
+  test.each(["missing", "wire content", "native turn", "native kind", "historical", "duplicate id"])(
+    "worktree context requires its exact current native environment message (%s)", fault => {
+      const fixture = worktreeRolloutFixture();
+      const state = join(fixture.codexHome, "thread-environments.json");
+      expect(new ChatGptThreadEnvironmentStore(state, Date.now, fixture.codexHome).resolve(fixture.request).cwd).toBe(root);
+      if (fault === "missing") fixture.records.splice(2, 1);
+      if (fault === "wire content") fixture.envelope.content[0]!.text = fixture.envelope.content[0]!.text.replace(
+        "</environment_context>", "<current_date>2026-10-29</current_date></environment_context>");
+      if (fault === "native turn") fixture.nativeEnvelope.internal_chat_message_metadata_passthrough.turn_id = rolloutParentId;
+      if (fault === "native kind") fixture.nativeEnvelope.internal_chat_message_metadata_passthrough.content_item_kinds = ["user.text"];
+      if (fault === "historical") [fixture.records[1], fixture.records[2]] = [fixture.records[2]!, fixture.records[1]!];
+      if (fault === "duplicate id") fixture.records.push({ type: "response_item", payload: structuredClone(fixture.nativeEnvelope) });
+      fixture.writeContext();
+      expect(() => new ChatGptThreadEnvironmentStore(state, Date.now, fixture.codexHome).resolve(fixture.request))
+        .toThrow("environment");
+    },
+  );
+
+  test.each(["read-only", "workspace-write"])("an outside-root worktree does not widen %s permissions", mode => {
+    const { request, codexHome, envelope, context, roots, writeContext } = worktreeRolloutFixture();
+    const profile = mode === "read-only" ? readOnlyProfileXml : workspaceWriteProfileXml;
+    envelope.content[0]!.text = envelope.content[0]!.text.replace(dangerFullAccessProfileXml, profile);
+    const payload = context.payload as Record<string, unknown>;
+    const entries = [{ path: { type: "special", value: { kind: "root" } }, access: "read" },
+      ...(mode === "workspace-write" ? roots.map(path => ({ path: { type: "path", path }, access: "write" })) : [])];
+    payload.permission_profile = { type: "managed", file_system: { type: "restricted", entries }, network: "restricted" };
+    payload.sandbox_policy = mode === "read-only" ? { type: mode, network_access: false }
+      : { type: mode, writable_roots: roots, network_access: false, exclude_slash_tmp: true, exclude_tmpdir_env_var: true };
+    writeContext();
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toThrow("outside");
+    (request._rawBody as { input: unknown[] }).input.shift();
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toThrow("outside its workspace roots");
+  });
+
   test.each([true, false])("cwd-less workspace update uses the current rollout cwd, not the first root; attributed=%s (#894)", attributed => {
     const { codexHome, request, roots } = cwdlessRolloutFixture("workspace-write", attributed);
     const writableRoots = [root, ...roots.filter(path => path !== root)];

@@ -18,9 +18,10 @@ const DEFAULT_STATE = Object.freeze({
   autoApproveToolCalls: false,
   browserInteractionMode: "automatic",
   toolAuthorityMode: "verified-environment",
-  composerPredictionsEnabled: false,
+  composerPredictionsEnabled: true,
   experimentalSkillAttachments: false,
   experimentalFreshConversationPerTurn: false,
+  useTemporaryChats: true,
   zeroRiskProEnabled: false,
   zeroRiskRequireSentConfirmation: true,
   networkProxyUrl: null,
@@ -39,7 +40,7 @@ function nextSessionRefreshReminderAt(now = Date.now()) {
 
 function readState(filePath) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
     if (!parsed || parsed.version !== 1) return { ...DEFAULT_STATE };
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
@@ -60,6 +61,7 @@ function readState(filePath) {
       "composerPredictionsEnabled",
       "experimentalSkillAttachments",
       "experimentalFreshConversationPerTurn",
+      "useTemporaryChats",
       "zeroRiskProEnabled",
       "zeroRiskRequireSentConfirmation",
       "browserSmokePassed",

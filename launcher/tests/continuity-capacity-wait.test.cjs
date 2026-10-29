@@ -25,6 +25,7 @@ function fixture(mode = "automatic", ready = 5) {
   host = Object.assign(Object.create(BrowserHost.prototype), {
     turnTabs: new Map(), closingTurnTabs: new Map(), closedTurnOwners: new Map(), userCancelledTurnOwners: new Map(),
     continuityLauncherInstance: instance, selectedTabId: "home", state: { zoomFactor: 1 },
+    getUseTemporaryChats: () => true,
     window: { contentView: { removeChildView() {}, addChildView() {} } },
     logger: { info() {}, warn() {}, error() {} }, syncPowerSaveBlocker() {}, syncViewVisibility() {},
     snapshot: () => ({}), writeDescriptor() {}, presentTurnView() {}, bindShellZoomShortcuts() {},

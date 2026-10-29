@@ -494,7 +494,7 @@ export function availableChatGptWebModelRoutes(
 ): readonly ChatGptWebModelRoute[] {
   if (capabilities.browserInteractionMode === "manual") {
     return (capabilities.zeroRiskProEnabled
-      ? [CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
+      ? [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE, CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
       : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE]).map(route => withTaskPolicy(route, capabilities));
   }
   if (!capabilities.solAvailable) return includeLegacy
@@ -530,7 +530,7 @@ export function requireChatGptWebModelRoute(
       throw new Error(`${route.displayName} is not available while Zero Risk is enabled`);
     }
     const proRoute = route.backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL;
-    if (proRoute !== (capabilities.zeroRiskProEnabled === true)) {
+    if (proRoute && capabilities.zeroRiskProEnabled !== true) {
       throw new Error(`${route.displayName} is not enabled in Zero Risk model settings`);
     }
     return route;

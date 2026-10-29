@@ -63,6 +63,7 @@ export interface SetupOptions {
   composerPredictionsEnabled?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalFreshConversationPerTurn?: boolean;
+  useTemporaryChats?: boolean;
   zeroRiskProEnabled?: boolean;
   zeroRiskRequireSentConfirmation?: boolean;
   replaceCodexRoute?: boolean;
@@ -160,6 +161,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     composerPredictionsEnabled: before.composerPredictionsEnabled,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
+    useTemporaryChats: before.useTemporaryChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     zeroRiskRequireSentConfirmation: before.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: before.autoApproveToolCalls,
@@ -192,6 +194,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     composerPredictionsEnabled: after.composerPredictionsEnabled,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
+    useTemporaryChats: after.useTemporaryChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     zeroRiskRequireSentConfirmation: after.zeroRiskRequireSentConfirmation,
     autoApproveToolCalls: after.autoApproveToolCalls,
@@ -313,6 +316,7 @@ function baseConfig(
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }
+  if (options.useTemporaryChats !== undefined) config.useTemporaryChats = options.useTemporaryChats;
   if (options.experimentalFreshConversationPerTurn !== undefined) {
     config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
   }

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { chromium, type Locator, type Page } from "playwright-core";
 import { ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptStreamDiagnostics } from "../src/adapters/chatgpt-web/stream-diagnostics";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { readFileSync } from "node:fs";
 import { createContextSnapshot } from "../src/adapters/chatgpt-web/context-snapshot";
@@ -463,7 +464,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("compiled context navigation 
       expect(plan.navigationEnabled).toBe(navigation);
       const page = await browser.newPage();
       await page.setContent("<main></main>");
-      const baseline = await worker.captureSubmissionBaseline(page, plan.compiled.text, [], plan.compiled.turnToken);
+      const baseline = await worker.captureSubmissionBaseline(page, plan.compiled.text, plan.compiled.turnToken);
       await page.locator("main").evaluate(element => {
         element.innerHTML = '<div data-turn-key="pending"><span hidden data-chatgpt-agent-turn-start></span></div>';
       });
@@ -498,7 +499,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires th
     for (const scenario of ["matching", "foreign", "missing", "duplicate", "token-prefix", "competing-turn"] as const) {
       const page = await browser.newPage();
       await page.setContent('<main></main>');
-      const baseline = await worker.captureSubmissionBaseline(page, prompt, [], token);
+      const baseline = await worker.captureSubmissionBaseline(page, prompt, token);
       await page.locator('main').evaluate(e => { e.innerHTML = '<div data-turn-key="pending"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
       const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2_000);
       await page.locator('main').evaluate(e => { e.innerHTML = '<div data-turn-key="persisted"><div data-user-message-bubble>'
@@ -522,9 +523,49 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires th
         .then((value: unknown) => ({ value }), (error: Error) => ({ error }));
       if (scenario === "matching") expect(result.value).toMatchObject({ identity: "group:assistant:persisted" });
       else expect(result.error).toBeInstanceOf(Error);
-      const invalid = await worker.captureSubmissionBaseline(page, "No broker token here", [], token)
+      const invalid = await worker.captureSubmissionBaseline(page, "No broker token here", token)
         .then(() => undefined, (error: Error) => error);
       expect(invalid).toBeInstanceOf(Error);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 20_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rebind reads token boundaries across rendered lines without accepting hidden or ambiguous tokens", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const token = "turn_0123456789abcdef0123456789abcdef";
+    const foreign = "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (const [name, html, accepted] of [
+      ["line-after", `${token}<br>Continue`, true],
+      ["line-before", `Identity<br>${token}`, true],
+      ["paragraphs", `<p>Identity</p><p>${token}</p><p>Continue</p>`, true],
+      ["inline-format", `<b>${token.slice(0, 10)}</b>${token.slice(10)}`, true],
+      ["inline-suffix", `${token}<span>extra</span>`, false],
+      ["inline-prefix", `<span>extra</span>${token}`, false],
+      ["foreign", foreign, false],
+      ["two-visible", `${token}<br>${foreign}`, false],
+      ["duplicate", `${token}<br>${token}`, false],
+      ["hidden-duplicate", `${token}<span hidden>${token}</span>`, false],
+      ["hidden-foreign", `${token}<span hidden>${foreign}<br>Continue</span>`, false],
+      ["hidden-only", `<span hidden>${token}</span>`, false],
+      ["transparent-only", `<span style="opacity:0">${token}</span>`, false],
+      ["partly-hidden", `${token.slice(0, 10)}<span style="opacity:0">${token.slice(10)}</span>`, false],
+    ] as const) {
+      const page = await browser.newPage();
+      await page.setContent("<main></main>");
+      const baseline = await worker.captureSubmissionBaseline(page, `Identity\n${token}\nContinue`, token);
+      await page.locator("main").evaluate(node => { node.innerHTML = '<div data-turn-key="pending"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2_000);
+      await page.locator("main").evaluate((node, body) => {
+        node.innerHTML = '<div data-turn-key="persisted"><div data-user-message-bubble><div data-search-result-target>'
+          + body + '</div></div><span hidden data-chatgpt-agent-turn-start></span></div>';
+      }, html);
+      const group = page.locator('[data-turn-key="persisted"]');
+      expect(await worker.userMessageMatchesSubmission(group, baseline.submittedText, undefined, token), name).toBe(accepted);
+      if (accepted) expect((await worker.reconcileAssistantTurnBinding(page, baseline, binding)).identity, name)
+        .toBe("group:assistant:persisted");
       await page.close();
     }
   } finally { await browser.close(); }
@@ -559,6 +600,61 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity befo
       expect(await page.locator('input[type="file"]').evaluate(input => (input as HTMLInputElement).files?.[0]?.name)).toBe("codex-input-image-1.png");
     }
   } finally { await browser.close(); server.stop(true); }
+}, 15_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("stream diagnostics start at physical Send after asynchronous preparation and execution authority", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  const preparedId = "11111111-1111-4111-8111-111111111111";
+  const submittedId = "22222222-2222-4222-8222-222222222222";
+  try {
+    for (const withdrawn of [false, true]) {
+      const page = await browser.newPage();
+      const rejection = new ChatGptSubmissionRejectionObserver();
+      const reports: Record<string, unknown>[] = [];
+      const streams = new ChatGptStreamDiagnostics(state => reports.push(state));
+      try {
+        await page.route("https://chatgpt.com/backend-api/f/conversation", route => route.fulfill({ status: 200,
+          headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" }, body: "{}" }));
+        await page.setContent('<main></main><form data-chatgpt-composer><div data-composer-markdown contenteditable="true" role="textbox">Prompt</div><button type="button" data-testid="send-button">Send</button></form>');
+        const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+        const baseline = await worker.captureSubmissionBaseline(page, "Prompt");
+        await streams.attach(page);
+        await page.locator("button").evaluate((button, id) => button.addEventListener("keydown", async event => {
+          if ((event as KeyboardEvent).key !== "Enter") return;
+          event.preventDefault();
+          await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ messages: [{ id, author: { role: "user" } }] }) });
+          document.querySelector("main")!.innerHTML = '<button data-testid="stop-button">Stop</button>';
+        }), submittedId);
+        const prepareRequest = () => page.evaluate(async id => {
+          await fetch("https://chatgpt.com/backend-api/f/conversation", { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ messages: [{ id, author: { role: "user" } }] }) });
+        }, preparedId);
+        const submission = worker.sendAttachedPrompt(page, baseline, undefined, undefined, undefined, {
+          onSendActivated: prepareRequest,
+          dispatchWithExecutionAuthority<T>(dispatch: () => T): T {
+            if (withdrawn) throw new Error("Execution authority withdrawn");
+            return dispatch();
+          },
+        }, undefined, undefined, undefined, rejection, streams);
+        if (withdrawn) {
+          await expect(submission).rejects.toThrow("Execution authority withdrawn");
+          await prepareRequest();
+          expect(baseline.submittedUserMessage).toBeUndefined();
+        } else {
+          expect(await submission).toBe("generation_running");
+          expect(baseline.submittedUserMessage).toEqual({ messageId: submittedId });
+        }
+        await streams.dispose();
+        if (withdrawn) expect(reports).toEqual([]);
+        else {
+          expect(reports).toHaveLength(1);
+          expect(reports[0]).toMatchObject({ request: 1, submission: 1, status: 200 });
+          expect(JSON.stringify(reports)).not.toMatch(/11111111|22222222|Prompt/);
+        }
+      } finally { rejection.dispose(); await streams.dispose(); await page.close(); }
+    }
+  } finally { await browser.close(); }
 }, 15_000);
 
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("native identity capture ends before asynchronous submission acknowledgement", async () => {

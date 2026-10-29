@@ -1,20 +1,35 @@
 import { expect, test } from "bun:test";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { activateChatGptEffortMenu } from "../src/chatgpt-session";
+import { activateChatGptEffortMenu } from "../src/chatgpt-ui/model-picker";
+
+async function cleanupStep<T>(name: string, run: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const started = performance.now();
+  try {
+    return await Promise.race([run(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Navigation fixture ${name} exceeded 5 seconds`)), 5_000);
+    })]);
+  } finally {
+    clearTimeout(timer);
+    console.info(`[navigation-fixture] ${name}: ${Math.round(performance.now() - started)}ms`);
+  }
+}
 
 test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("navigated Electron task pages stay usable before delayed resources finish", async () => {
   const userData = mkdtempSync(join(tmpdir(), "launcher-navigation-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;
-  const app = await _electron.launch({
-    executablePath: process.env.LAUNCHER_TEST_ELECTRON,
-    args: [resolve("launcher/tests/fixtures/navigation-viewport.cjs"), `--user-data-dir=${userData}`], env,
-  });
+  let app: Awaited<ReturnType<typeof _electron.launch>> | undefined;
   try {
+    app = await _electron.launch({
+      executablePath: process.env.LAUNCHER_TEST_ELECTRON,
+      args: [resolve("launcher/tests/fixtures/navigation-viewport.cjs"), `--user-data-dir=${userData}`], env,
+    });
     const deadline = Date.now() + 5_000;
     while (!await app.evaluate(() => Boolean((globalThis as any).navigationFixture)) && Date.now() < deadline) {
       await Bun.sleep(20);
@@ -59,7 +74,30 @@ test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("navigated Electron task pages 
       }
     }
   } finally {
-    await app.close();
-    rmSync(userData, { recursive: true, force: true });
+    try {
+      if (app) {
+        try {
+          const disposed = await cleanupStep("resources", () => app!.evaluate(async () =>
+            (globalThis as any).navigationFixture?.dispose()));
+          if (disposed) {
+            console.info(`[navigation-fixture] views: ${disposed.viewsMs}ms; server: ${disposed.serverMs}ms`);
+            expect(disposed).toMatchObject({ liveViews: 0, pendingResponses: 0, serverListening: false });
+          }
+        } finally {
+          await cleanupStep("exit", () => app!.close());
+        }
+      }
+    } catch (error) {
+      // Reap only this test's child on failure; a forced exit never counts as a pass.
+      const child = app?.process();
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await cleanupStep("forced exit", () => exited);
+      }
+      throw error;
+    } finally {
+      rmSync(userData, { recursive: true, force: true });
+    }
   }
 }, 30_000);

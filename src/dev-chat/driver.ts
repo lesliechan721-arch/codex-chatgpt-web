@@ -360,9 +360,7 @@ function usageOf(response: ResponsesEnvelope): DevChatUsage {
 }
 
 export function defaultDevChatModel(config: AppConfig): DevChatModel {
-  if (config.browserInteractionMode === "manual") {
-    return config.zeroRiskProEnabled ? "chatgpt-web/zero-risk-pro" : "chatgpt-web/zero-risk";
-  }
+  if (config.browserInteractionMode === "manual") return "chatgpt-web/zero-risk";
   return config.solAvailable ? "chatgpt-web/gpt-5.6-sol-instant" : "chatgpt-web/gpt-5.6-luna";
 }
 
@@ -407,6 +405,7 @@ export function createLauncherDevAdapter(
       turnTimeoutMs: 60 * 60_000,
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
+      useTemporaryChats: config.useTemporaryChats,
     },
   }, { broker });
   return { broker, adapterFactory };

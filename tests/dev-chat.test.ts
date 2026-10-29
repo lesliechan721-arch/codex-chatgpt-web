@@ -79,6 +79,40 @@ test("remote outer harness owns a turn through the live broker protocol", async 
   }
 });
 
+test("remote owners preserve Full Access worktree cwd outside project roots", async () => {
+  const root = scratch("cgw-dev-worktree");
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const remote = new RemoteTurnBroker(socketPath);
+  await broker.listen();
+  const environment = {
+    cwd: join(root, "worktree"), roots: [join(root, "project")],
+    writableRoots: [join(root, "project")],
+    sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [],
+  };
+  try {
+    const token = await remote.register(environment, 60_000, "worktree-owner");
+    await remote.updateEnvironment(token, environment);
+    await expect(remote.updateEnvironment(token, { ...environment, cwd: join(root, "other-worktree") }))
+      .rejects.toThrow("authority changed");
+    const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    const resolved = await callTurnBroker<{ environment: Record<string, unknown> }>(socketPath, { method: "resolve", bindingId: claimed.bindingId });
+    expect(resolved.environment).toMatchObject({ tools: [], registryGeneration: 2 });
+    expect(resolved.environment).not.toHaveProperty("cwd");
+    expect(resolved.environment).not.toHaveProperty("roots");
+    await remote.revoke(token);
+    for (const sandboxPolicy of [
+      { type: "readOnly" as const, networkAccess: false },
+      { type: "workspaceWrite" as const, writableRoots: environment.roots, networkAccess: false },
+    ]) {
+      await expect(remote.register({ ...environment, sandboxPolicy }, 60_000, "restricted-worktree"))
+        .rejects.toThrow("environment is invalid");
+    }
+  } finally {
+    await broker.close();
+  }
+});
+
 test("disconnecting a remote owner_next removes its broker waiter", async () => {
   const root = scratch("cgw-dev-owner-waiter");
   const socketPath = defaultBrokerEndpoint(root);
@@ -170,7 +204,7 @@ test("new DEV chats default to the cheapest account-supported browser model", ()
     ...defaultConfig("full"),
     browserInteractionMode: "manual",
     zeroRiskProEnabled: true,
-  })).toBe("chatgpt-web/zero-risk-pro");
+  })).toBe("chatgpt-web/zero-risk");
   expect(DEV_CHAT_MODELS).toContain("chatgpt-web/zero-risk-pro");
 });
 
@@ -204,7 +238,7 @@ test("GPT-6 DEV status uses the account/model history budget", () => {
   }
 });
 
-test("Zero Risk DEV chats open only the selected profile route", () => {
+test("Zero Risk DEV chats preserve the base route when Pro is enabled", () => {
   const root = scratch("cgw-dev-safe-model");
   const config = {
     ...defaultConfig("full"),
@@ -231,10 +265,8 @@ test("Zero Risk DEV chats open only the selected profile route", () => {
     },
     root,
   );
-  expect(proDriver.open("safe-pro").state.model).toBe("chatgpt-web/zero-risk-pro");
-  expect(() => proDriver.open("safe-default", "chatgpt-web/zero-risk")).toThrow(
-    "not enabled in Zero Risk model settings",
-  );
+  expect(proDriver.open("safe-default").state.model).toBe("chatgpt-web/zero-risk");
+  expect(proDriver.open("safe-pro", "chatgpt-web/zero-risk-pro").state.model).toBe("chatgpt-web/zero-risk-pro");
 });
 
 test("an existing DEV chat changes route only when the user explicitly requests it", () => {

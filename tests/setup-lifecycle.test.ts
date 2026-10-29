@@ -65,7 +65,8 @@ for (const development of [false, true]) for (const interaction of ["automatic",
       const port = listener.port!;
       await listener.stop(true);
       const options = { mode: "full" as const, browserHostDescriptorPath: existing.browserHostDescriptorPath,
-        browserInteractionMode: interaction, subagentProtocol: "native" as const, port };
+        browserInteractionMode: interaction, subagentProtocol: "native" as const, port,
+        useTemporaryChats: false, composerPredictionsEnabled: false };
       const configure = development ? setupDevProfile : setup;
       const result = await configure(options);
       const committed = JSON.parse(readFileSync(configPath, "utf8"));
@@ -77,6 +78,8 @@ for (const development of [false, true]) for (const interaction of ["automatic",
       expect(committed.manualTunnel.tunnelId).toBe(manualTunnel.tunnelId);
       expect(committed).not.toHaveProperty("useSavedChats");
       expect(committed.zeroRiskRequireSentConfirmation).toBe(false);
+      expect(committed.useTemporaryChats).toBe(false);
+      expect(committed.composerPredictionsEnabled).toBe(false);
       expect(inspect).not.toHaveBeenCalled();
       writeFileSync(configPath, original);
       rejectCommit = true;

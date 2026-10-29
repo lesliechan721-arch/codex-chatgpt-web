@@ -27,20 +27,23 @@ test("retired context state is removed on read and the next normal save", () => 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("prediction setting defaults off for new, old, and invalid state and persists explicit choices", () => {
+test("predictions and Temporary Chat start on and preserve an explicit opt-out after reopening", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prediction-state-"));
   const file = path.join(root, "state.json");
   try {
-    assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+    assert.equal(createStateStore(file).read().composerPredictionsEnabled, true);
     for (const value of [undefined, null, "true", 1]) {
       fs.writeFileSync(file, JSON.stringify({ version: 1, composerPredictionsEnabled: value }));
-      assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+      assert.equal(createStateStore(file).read().composerPredictionsEnabled, true);
     }
     const store = createStateStore(file);
     store.update({ composerPredictionsEnabled: true });
     assert.equal(createStateStore(file).read().composerPredictionsEnabled, true);
-    store.update({ composerPredictionsEnabled: false });
+    assert.equal(store.read().composerPredictionsEnabled, true);
+    assert.equal(store.read().useTemporaryChats, true);
+    store.update({ composerPredictionsEnabled: false, useTemporaryChats: false });
     assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+    assert.equal(createStateStore(file).read().useTemporaryChats, false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -62,6 +65,26 @@ test("retired saved-chat settings are discarded while other launcher settings su
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("UTF-8 settings keep explicit choices with or without a byte order mark", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-utf8-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    const expected = createStateStore(file).update({
+      coreSetupComplete: true,
+      autoStart: false,
+      useTemporaryChats: false,
+      browserInteractionMode: "manual",
+      browserSmokeVersion: "6.1.14\uFEFF-test",
+    });
+    for (const prefix of ["", "\uFEFF"]) {
+      const contents = prefix + JSON.stringify(expected);
+      fs.writeFileSync(file, contents);
+      assert.deepEqual(createStateStore(file).read(), expected);
+      assert.equal(fs.readFileSync(file, "utf8"), contents);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("launcher state persists onboarding, language, autostart, and network proxy atomically", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-launcher-state-"));
   const file = path.join(root, "state.json");
@@ -79,9 +102,10 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
-      composerPredictionsEnabled: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
+      useTemporaryChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,
@@ -113,9 +137,10 @@ test("launcher state persists onboarding, language, autostart, and network proxy
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "delegated",
-      composerPredictionsEnabled: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
+      useTemporaryChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: "http://user:p%40ss@127.0.0.1:7890/",
@@ -198,9 +223,10 @@ test("persisted sidebar and proxy corruption are repaired without changing the r
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       toolAuthorityMode: "verified-environment",
-      composerPredictionsEnabled: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
+      useTemporaryChats: true,
       zeroRiskProEnabled: false,
       zeroRiskRequireSentConfirmation: true,
       networkProxyUrl: null,

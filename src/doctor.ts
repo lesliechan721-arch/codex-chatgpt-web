@@ -4,6 +4,7 @@ import { loadApiAccessPolicy } from "./api-access-config";
 import type { AppConfig } from "./config";
 import { getConfigDir, getConfigPath, isLegacyChatGptConnectorIdentity, legacyChatGptConnectorMigrationMessage, loadConfig } from "./config";
 import { join } from "node:path";
+import { inspectCodexCompaction } from "./doctor-compaction";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
@@ -212,6 +213,7 @@ export async function runDoctor(): Promise<DoctorReport> {
   const proxy = await proxyChecks(config, accessPolicy);
   const apiKeyMode = accessPolicy.mode === "api-key" && proxy[0]?.status !== "error";
   const codex = inspectCodexIntegration();
+  checks.push(...inspectCodexCompaction(config, codex.configPath));
   if (apiKeyMode && !codex.installed) {
     checks.push({
       id: "codex",

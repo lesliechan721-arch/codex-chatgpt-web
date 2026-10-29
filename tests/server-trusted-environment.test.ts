@@ -463,9 +463,15 @@ const invalidEnvironmentCases = [
     xml: `<environment_context><cwd>${home}</cwd><cwd>${join(home, "other")}</cwd><filesystem><workspace_roots><root>${home}</root></workspace_roots>${permissionProfile}</filesystem></environment_context>`,
   },
   {
-    name: "cwd outside roots",
-    message: "ChatGPT web cwd is outside the trusted Codex workspace roots",
+    name: "Full Access cwd outside roots without current worktree proof",
+    message: "ChatGPT web turn is missing current native worktree authority in trusted Codex environment context",
+    code: "missing_trusted_codex_environment",
     xml: `<environment_context><cwd>${home}</cwd><filesystem><workspace_roots><root>${join(home, "other")}</root></workspace_roots>${permissionProfile}</filesystem></environment_context>`,
+  },
+  {
+    name: "restricted cwd outside roots",
+    message: "ChatGPT web cwd is outside the trusted Codex workspace roots",
+    xml: `<environment_context><cwd>${home}</cwd><filesystem><workspace_roots><root>${join(home, "other")}</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"><entry access="read"><special>:root</special></entry></file_system></permission_profile></filesystem></environment_context>`,
   },
   {
     name: "missing sandbox mode",
@@ -513,6 +519,7 @@ for (const stream of [true, false]) {
 
   for (const invalid of invalidEnvironmentCases) {
     test(`${invalid.name} is terminal HTTP 400 (stream=${stream})`, async () => {
+      const code = "code" in invalid ? invalid.code : "invalid_trusted_codex_environment";
       const events: AdapterEvent[] = [];
       const warnings = spyOn(console, "warn").mockImplementation(() => {});
       try {
@@ -530,11 +537,11 @@ for (const stream of [true, false]) {
         expect(await response.json()).toEqual({ error: {
           message: invalid.message,
           type: "invalid_request_error",
-          code: "invalid_trusted_codex_environment",
+          code,
         } });
         expect(events).toEqual([expect.objectContaining({
           type: "error", status: 400, errorType: "invalid_request_error",
-          code: "invalid_trusted_codex_environment", retryable: false,
+          code, retryable: false,
         })]);
       } finally {
         warnings.mockRestore();

@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 import { preflightSetup, type SetupOptions } from "../src/setup";
 import { parseDevSetupArgs, parseProductionSetupArgs } from "../src/setup-cli-args";
 
@@ -12,8 +13,33 @@ const parsers = [
 ] as const;
 
 for (const { name, parse } of parsers) {
+  for (const autoApproveToolCalls of [false, true]) {
+    for (const useTemporaryChats of [false, true]) {
+      test(`${name} chat-mode setup preserves tool approval=${autoApproveToolCalls} when temporary=${useTemporaryChats}`, async () => {
+        const { RuntimeHost } = createRequire(import.meta.url)("../launcher/electron/runtime.cjs");
+        let options: SetupOptions | undefined;
+        const runSetup = async (_name: string, args: string[]) => {
+          options = parse(args.slice(name === "DEV" ? 2 : 1));
+          return { ok: true };
+        };
+        await RuntimeHost.prototype.setTemporaryChats.call({
+          launcherProfile: name === "DEV" ? "development" : "production",
+          browserDescriptorPath: devDescriptorPath,
+          runtimeConfigSnapshot: () => ({ configured: true, mode: "full", config: { autoApproveToolCalls } }),
+          browserInteractionArgs: () => ["--automatic-browser-interaction"],
+          runSetup,
+          runDevSetup: runSetup,
+        }, useTemporaryChats);
+        expect(options).toMatchObject({ useTemporaryChats, autoApproveToolCalls });
+      });
+    }
+  }
+}
+
+for (const { name, parse } of parsers) {
   for (const { flags, message } of [
     { flags: ["--app-name", "Other Connector"], message: `Unknown ${name === "DEV" ? "DEV setup " : ""}arguments: --app-name Other Connector` },
+    { flags: ["--temporary-chats", "--ordinary-chats"], message: "Choose --temporary-chats or --ordinary-chats" },
     { flags: ["--fresh-conversation", "--retained-conversation"], message: "Choose --fresh-conversation or --retained-conversation" },
     { flags: ["--composer-predictions", "--no-composer-predictions"], message: "Choose --composer-predictions or --no-composer-predictions" },
     { flags: ["--skill-attachments", "--inline-skills"], message: "Choose --skill-attachments or --inline-skills" },
@@ -43,6 +69,7 @@ for (const { name, parse } of parsers) {
 
   test(`${name} setup preserves explicit opt-in and opt-out values`, () => {
     for (const { enabled, disabled, property } of [
+      { enabled: "--temporary-chats", disabled: "--ordinary-chats", property: "useTemporaryChats" },
       { enabled: "--fresh-conversation", disabled: "--retained-conversation", property: "experimentalFreshConversationPerTurn" },
       { enabled: "--composer-predictions", disabled: "--no-composer-predictions", property: "composerPredictionsEnabled" },
       { enabled: "--skill-attachments", disabled: "--inline-skills", property: "experimentalSkillAttachments" },
@@ -72,7 +99,7 @@ test("production setup preserves parsed options and leaves argv unchanged", () =
     "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated", "--connector-name-suffix", "Local",
     "--subagent-protocol", "native", "--tunnel-id", "tunnel", "--runtime-key-file", "key",
     "--chrome", "chrome", "--browser-host-descriptor", "descriptor", "--refresh-account-capabilities",
-    "--login", "--auto-approve-tool-calls", "--skill-attachments", "--saved-chats", "--fresh-conversation",
+    "--login", "--auto-approve-tool-calls", "--skill-attachments", "--ordinary-chats", "--fresh-conversation",
     "--bigger-context", "--zero-risk-pro", "--zero-risk-no-sent-confirmation",
     "--replace-codex-route", "--preserve-disconnected-route", "--restart-service",
   ];
@@ -84,7 +111,7 @@ test("production setup preserves parsed options and leaves argv unchanged", () =
       mode: "full", port: 16, browserInteractionMode: "manual", toolAuthorityMode: "delegated",
       connectorNameSuffix: "Local", subagentProtocol: "native", tunnelId: "tunnel", runtimeKeyFile: "key",
       chromeExecutablePath: "chrome", browserHostDescriptorPath: "descriptor", refreshAccountCapabilities: true,
-      forceLogin: true, autoApproveToolCalls: true, experimentalSkillAttachments: true,
+      forceLogin: true, autoApproveToolCalls: true, experimentalSkillAttachments: true, useTemporaryChats: false,
       experimentalFreshConversationPerTurn: true, zeroRiskProEnabled: true,
       zeroRiskRequireSentConfirmation: false, replaceCodexRoute: true, preserveDisconnectedRoute: true,
       restartService: true,
@@ -120,14 +147,14 @@ test("DEV setup preserves its defaults, accepted options, and argv", () => {
     "--full", "--tunnel-id", "tunnel", "--runtime-key-file", "key", "--browser-host-descriptor", "explicit-descriptor",
     "--connector-name-suffix", "Local", "--acknowledge-unofficial", "--refresh-account-capabilities",
     "--auto-approve-tool-calls", "--automatic-browser-interaction", "--tool-authority-mode", "delegated",
-    "--skill-attachments", "--saved-chats", "--fresh-conversation", "--bigger-context", "--native-tool-long-wait-probe",
+    "--skill-attachments", "--ordinary-chats", "--fresh-conversation", "--bigger-context", "--native-tool-long-wait-probe",
   ];
   const original = [...args];
   expect(parseDevSetupArgs(args, devDescriptorPath)).toEqual({
     mode: "full", tunnelId: "tunnel", runtimeKeyFile: "key", browserHostDescriptorPath: "explicit-descriptor",
     connectorNameSuffix: "Local", acknowledgedUnofficial: true, refreshAccountCapabilities: true,
     autoApproveToolCalls: true, browserInteractionMode: "automatic", toolAuthorityMode: "delegated",
-    experimentalSkillAttachments: true, experimentalFreshConversationPerTurn: true,
+    experimentalSkillAttachments: true, experimentalFreshConversationPerTurn: true, useTemporaryChats: false,
     devNativeToolLongWaitProbe: true,
   });
   expect(args).toEqual(original);
@@ -215,20 +242,20 @@ for (const { name, parse } of parsers) test(`${name} accepts legacy context flag
   } finally { warnings.mockRestore(); }
 });
 
-for (const { name, parse } of parsers) test(`${name} ignores retired chat flags and explains ordinary history`, () => {
+for (const { name, parse } of parsers) test(`${name} ignores retired saved-chat flags without changing the current chat mode`, () => {
   const warnings = spyOn(process.stderr, "write").mockImplementation(() => true);
   try {
-    const expected = parse(["--full", "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated"]);
-    for (const flags of [["--saved-chats"], ["--temporary-chats"], ["--saved-chats", "--temporary-chats"]]) {
-      const options = parse(["--full", "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated", ...flags]);
+    for (const modeFlags of [[], ["--temporary-chats"], ["--ordinary-chats"]]) {
+      const base = ["--full", "--zero-risk-browser-interaction", "--tool-authority-mode", "delegated", ...modeFlags];
+      const expected = parse(base);
+      const options = parse([...base, "--saved-chats"]);
       expect(options).toEqual(expected);
       expect(options).not.toHaveProperty("useSavedChats");
     }
     expect(warnings).toHaveBeenCalledTimes(3);
     for (const [warning] of warnings.mock.calls) {
-      expect(String(warning)).toContain("Temporary Chat has been removed");
-      expect(String(warning)).toContain("ignored");
-      expect(String(warning)).toContain("ordinary ChatGPT history");
+      expect(String(warning)).toContain("--saved-chats has been removed and is ignored");
+      expect(String(warning)).toContain("--ordinary-chats");
     }
   } finally { warnings.mockRestore(); }
 });

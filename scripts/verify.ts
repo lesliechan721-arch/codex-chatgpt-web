@@ -33,7 +33,7 @@ export function verificationCommands(testMode: "full" | "timing", scratch: strin
     ["run", "check-version"], ["run", "audit"], ["run", "launcher:audit"],
     // Prepare Electron before timed tests; its executable is downloaded on first use.
     ["run", "launcher/node_modules/electron/install.js"], ["run", "typecheck"],
-    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : []), ...(shardPlan ? [`--shard-plan=${shardPlan}`] : [])], ["run", "launcher:build"],
+    ["run", "launcher:typecheck"], ["run", "launcher:test"], ["run", "test", `--mode=${testMode}`, ...(testShard ? [`--shard=${testShard.index}/${testShard.total}`] : []), ...(shardPlan ? [`--shard-plan=${shardPlan}`] : [])], ["run", "--cwd", "launcher", "build:renderer"],
     ["run", "scripts/build-runtime-bundle.ts", join(scratch, "runtime")],
     ["run", "scripts/generate-third-party-notices.ts", join(scratch, "THIRD_PARTY_NOTICES.txt"), "--include-launcher"],
     ["run", "scripts/smoke-release.ts", join(scratch, "runtime")],

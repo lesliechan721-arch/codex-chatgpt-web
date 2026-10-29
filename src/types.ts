@@ -345,9 +345,11 @@ export interface CodexProviderConfig {
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
-    /** Experimental transport: adapt one context across one, two, or six ChatGPT messages. */
+    /** Attach selected skills as text files. */
     experimentalSkillAttachments?: boolean;
     /** Explicitly rebuild each automatic turn in a fresh browser conversation. */
     experimentalFreshConversationPerTurn?: boolean;
+    /** Use Temporary Chat for new task conversations; defaults to true. */
+    useTemporaryChats?: boolean;
   };
 }

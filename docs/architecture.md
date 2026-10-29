@@ -37,7 +37,7 @@ routing and metadata are defined in the [upstream provider guide](upstream-provi
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
   picker. Native model budgets are preserved; Web routes use the account/model history table below.
-- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (saved in ChatGPT history by default).
+- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (Temporary Chat by default).
 - Never starts the broker, tunnel, or MCP server.
 - Emits a nonfatal Codex commentary warning that local tools are unavailable for the selected model.
 
@@ -137,6 +137,12 @@ of [release validation](release-validation.md#context-navigation-validation).
 
 ## Browser lifecycle
 
+ChatGPT DOM contracts live in [`src/chatgpt-ui`](../src/chatgpt-ui/README.md), grouped
+by composer, model picker and turn renderer. Each component records its historical
+evidence and regression coverage. Model policy and turn ownership remain outside
+that layer. Diagnostic checkpoints identify observed structural variants without
+copying message content; a variant's age never selects or retires it automatically.
+
 The following describes the browser lifecycle. Unified task recovery is described
 separately below.
 
@@ -226,13 +232,17 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
-Automatic and Zero Risk task turns always use ordinary saved conversations. Sign-in, account
-inspection, connector verification and smoke tests use the same new-chat surface. The retired
-`useSavedChats` preference is discarded when loading configuration. Legacy `--saved-chats` and
-`--temporary-chats` flags report removal and do not select a chat mode.
-This is independent of conversation reuse. Saved history does not authorize reopening an arbitrary
-ChatGPT conversation. Applicable unified tasks retain verified page reuse across compaction.
-ChatGPT memory and custom instructions may apply to these conversations.
+Automatic and Zero Risk task turns use Temporary Chat by default. The `useTemporaryChats`
+preference (`setup --temporary-chats`; `--ordinary-chats` to disable) selects the mode for task
+turns, connector verification and smoke tests. Sign-in and account inspection still use ordinary
+chats. The retired `useSavedChats` preference is discarded and cannot override the new setting.
+An absent new setting defaults to true; an explicit false is preserved.
+Changing modes retires idle retained task surfaces after setup succeeds; the launcher refuses
+to change it during active browser work. This is independent of conversation reuse. Saved history
+does not authorize reopening an arbitrary ChatGPT conversation. Applicable unified tasks retain
+verified page reuse across compaction. Temporary Chat does not provide a saved-history fallback
+when a retained page is lost; the existing recovery admission and source checks still apply.
+ChatGPT memory and custom instructions may apply in either mode.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
 default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each logical send

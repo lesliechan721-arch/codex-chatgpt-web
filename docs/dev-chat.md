@@ -108,8 +108,10 @@ same compatible task lease one chat. Every message receives a
 new turn-bound MCP token, and all MCP tool rounds for that message remain inside the same ChatGPT
 response. On an exact native compaction request, the same Web agent submits the checkpoint through
 a one-shot MCP control call in that chat. Applicable Full Native + Launcher paths retain the
-healthy page across compaction; other paths keep their existing lifecycle. The complete named history remains owned by the existing prompt compiler. New
-chats use ordinary saved ChatGPT conversations. The separate fresh-conversation-per-turn option
+healthy page across compaction; other paths keep their existing lifecycle. The complete named
+history remains owned by the existing prompt compiler. New chats follow **Settings → Temporary
+Chat** (on by default). Ordinary chats remain in ChatGPT history; `dev setup --temporary-chats`
+and `--ordinary-chats` explicitly select the mode. The separate fresh-conversation-per-turn option
 controls whether each turn starts a new conversation. New chats use the cheapest
 account-supported browser mode:
 Instant (`light`) when Sol is available, otherwise Luna. Override it with `--model` or `/model`.

@@ -935,6 +935,7 @@ function environmentFromTurnContext(
   payload: Record<string, unknown>,
   expectedTurnId: string,
   tools: readonly CodexTool[] | undefined,
+  runtimeWorkspaceRoots?: string[],
 ): ChatGptTurnEnvironment {
   if (payload.turn_id !== expectedTurnId) {
     throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
@@ -944,15 +945,16 @@ function environmentFromTurnContext(
   }
   const cwd = resolve(payload.cwd);
   const declaredRoots = payload.workspace_roots === undefined
-    ? []
+    ? runtimeWorkspaceRoots ?? []
     : absolutePaths(payload.workspace_roots, "workspace_roots");
   const roots = declaredRoots.length > 0 ? declaredRoots : [cwd];
-  if (!roots.some(root => contains(root, cwd))) {
+  const permissionProfile = record(payload.permission_profile);
+  const sandbox = record(payload.sandbox_policy);
+  if (!roots.some(root => contains(root, cwd))
+    && !(permissionProfile?.type === "disabled" && sandbox?.type === "danger-full-access")) {
     throw new Error("Codex rollout cwd is outside its workspace roots");
   }
 
-  const permissionProfile = record(payload.permission_profile);
-  const sandbox = record(payload.sandbox_policy);
   if (!permissionProfile || !sandbox) {
     throw new Error("Codex rollout is missing its authoritative permission profile");
   }
@@ -1086,9 +1088,11 @@ function validateMetadataConsistency(
     );
   }
   if ((workspaceRootsDeclared || environment.sandboxPolicy.type !== "dangerFullAccess")
-    && lineage.workspaceRoots.some(root => !environment.roots.some(rolloutRoot => (
-    contains(rolloutRoot, root) || contains(root, rolloutRoot)
-  )))) {
+    && lineage.workspaceRoots.some(root => (
+      !environment.roots.some(rolloutRoot => contains(rolloutRoot, root) || contains(root, rolloutRoot))
+      && !(environment.sandboxPolicy.type === "dangerFullAccess"
+        && pathIdentity(root) === pathIdentity(environment.cwd))
+    ))) {
     throw new TrustedCodexEnvironmentValidationError(
       `ChatGPT Web ${owner} workspace metadata conflicts with its Codex rollout roots`,
     );
@@ -1172,6 +1176,9 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         throw error;
       }
       validateSessionMeta(sessionMeta, lineage);
+      const sessionPayload = record(sessionMeta.payload)!;
+      const runtimeWorkspaceRoots = sessionPayload.runtime_workspace_roots === undefined
+        ? undefined : absolutePaths(sessionPayload.runtime_workspace_roots, "runtime_workspace_roots");
       const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
       if (!latest) {
         if (options.publicationPendingIsTransient) {
@@ -1203,8 +1210,8 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         if (options.publicationPendingIsTransient) sawAuthenticatedStaleTurn = true;
         continue;
       }
-      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
-      const workspaceRootsDeclared = latest.workspace_roots !== undefined;
+      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools, runtimeWorkspaceRoots);
+      const workspaceRootsDeclared = latest.workspace_roots !== undefined || runtimeWorkspaceRoots !== undefined;
       validateMetadataConsistency(lineage, environment, workspaceRootsDeclared);
       if (options.currentEnvironmentMessage) {
         verifyCurrentEnvironmentMessage(fd, size, turnId, options.currentEnvironmentMessage,

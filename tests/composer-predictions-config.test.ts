@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, loadConfigFromPath } from "../src/config";
 
-test("saved profiles require explicit opt-in for next-message predictions", () => {
+test("saved profiles default to next-message predictions and preserve explicit opt-out", () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-prediction-config-"));
   const path = join(root, "config.json");
   try {
@@ -15,10 +15,10 @@ test("saved profiles require explicit opt-in for next-message predictions", () =
         runtimeKeyFile: join(root, "runtime.key"), profileDir: root,
         profileName: "prediction-test", alias: "prediction-test",
       };
-      expect(config.composerPredictionsEnabled).toBe(false);
+      expect(config.composerPredictionsEnabled).toBe(true);
       const { composerPredictionsEnabled: _preference, ...legacy } = config;
       writeFileSync(path, JSON.stringify(legacy));
-      expect(loadConfigFromPath(path).composerPredictionsEnabled).toBe(false);
+      expect(loadConfigFromPath(path).composerPredictionsEnabled).toBe(true);
       for (const enabled of [true, false]) {
         writeFileSync(path, JSON.stringify({ ...legacy, composerPredictionsEnabled: enabled }));
         expect(loadConfigFromPath(path).composerPredictionsEnabled).toBe(enabled);

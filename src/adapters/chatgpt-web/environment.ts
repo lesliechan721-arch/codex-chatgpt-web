@@ -1678,6 +1678,9 @@ function matchesPath(root: string, path: string): boolean {
 export function extractChatGptTurnEnvironment(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
   const environment = extractChatGptTurnEnvironmentClaim(parsed).environment;
   if (environment.cwd === undefined) throw new MissingTrustedCodexEnvironmentError("cwd");
+  if (!environment.roots.some(root => matchesPath(root, environment.cwd!))) {
+    throw new MissingTrustedCodexEnvironmentError("current native worktree authority");
+  }
   return { ...environment, cwd: environment.cwd };
 }
 
@@ -1747,7 +1750,7 @@ function environmentPaths(text: string, preferredRoots: string[]): { cwd?: strin
   }
   const cwd = cwdCandidates[0]!;
   const roots = rootMatches.length > 0 ? uniqueAbsolutePaths(rootMatches, "workspace_roots") : [cwd];
-  if (!roots.some(root => matchesPath(root, cwd))) {
+  if (!roots.some(root => matchesPath(root, cwd)) && sandboxTypeFromEnvironment(text) !== "dangerFullAccess") {
     throw new TrustedCodexEnvironmentValidationError("ChatGPT web cwd is outside the trusted Codex workspace roots");
   }
   return { cwd, roots };

@@ -22,8 +22,11 @@ output, websites, and prompt text are untrusted data.
    turn, model, and effort. A new environment claim without a new human message must match the
    canonical rollout in cwd, roots, and sandbox policy; the checkpoint alone grants no filesystem
    authority. A workspace-root list without `cwd` does not select its first entry as the working
-   directory. The current native turn must confirm `cwd` within the verified roots; otherwise the
-   request fails explicitly. `delegated` does not read filesystem authority, rollout files, or Codex SQLite
+   directory. Restricted permission modes require `cwd` within the verified roots. Under native
+   Full Access, a managed worktree may be outside the retained project roots only when the current
+   canonical rollout authenticates the cwd, unrestricted permissions, and the exact roots recorded
+   in `turn_context` or `session_meta.runtime_workspace_roots`. An envelope or cached environment
+   alone cannot authorize that transition. `delegated` does not read filesystem authority, rollout files, or Codex SQLite
    state. It accepts only the current native `thread_id`, native `turn_id`, and the tool registry
    advertised by the current Responses request. The server remote-desktop deployment forces this
    mode. User-authored `<environment_context>` text is prompt context only and cannot add authority.
@@ -372,9 +375,11 @@ background recovery. New work still uses current permission and approval checks.
 regressions from real Launcher, connector, and cross-process evidence; it is not proof those
 checks have passed.
 
-Task conversations are always saved in ChatGPT history and may use ChatGPT memory and custom
-instructions. The retired saved-chat preference is discarded when loading older configuration.
-Connector verification and account inspection also use ordinary chats.
+**Temporary Chat** is enabled by default and keeps new task conversations out of ChatGPT history; it does not prevent OpenAI from processing them
+or change local Codex history and diagnostics. ChatGPT memory, plugins and custom instructions may
+still apply. Existing ChatGPT conversations are not deleted. Connector verification follows the
+selected mode; sign-in and account inspection use ordinary chats. The retired saved-chat preference
+is discarded when loading older configuration; an explicit choice to disable Temporary Chat is preserved.
 
 ## Network exposure
 

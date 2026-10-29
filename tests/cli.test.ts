@@ -63,11 +63,16 @@ test("doctor distinguishes a healthy local proxy from failed, pending and recove
   config.port = server.port!;
   mkdirSync(appHome, { recursive: true });
   writeFileSync(join(appHome, "config.json"), JSON.stringify(config));
+  mkdirSync(join(root, "codex"), { recursive: true });
+  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=350000\n';
+  writeFileSync(join(root, "codex", "config.toml"), codexSettings);
   const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: join(root, "codex") };
   try {
     const check = async () => {
       const report = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
       expect(report.checks.find((c: any) => c.id === "proxy").status).toBe("ok");
+      expect(report.checks.find((c: any) => c.id === "codex-compaction").status).toBe("warning");
+      expect(readFileSync(join(root, "codex", "config.toml"), "utf8")).toBe(codexSettings);
       return report.checks.find((c: any) => c.id === "model-catalog");
     };
     expect(await check()).toMatchObject({ status: "error", detail: "HTTP 502; transport; ConnectionRefused" });
@@ -105,7 +110,8 @@ test("production and DEV setup reject the removed connector-name option before c
     expect(help.stdout).not.toContain("--bigger-context");
     expect(help.stdout).not.toContain("--standard-context");
     expect(help.stdout).not.toContain("--saved-chats");
-    expect(help.stdout).not.toContain("--temporary-chats");
+    expect(help.stdout).toContain("--temporary-chats");
+    expect(help.stdout).toContain("--ordinary-chats");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -547,6 +553,8 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
   const codexHome = join(root, "codex");
   mkdirSync(appHome, { recursive: true });
   mkdirSync(codexHome, { recursive: true });
+  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=350000\n';
+  writeFileSync(join(codexHome, "config.toml"), codexSettings);
   let health: Record<string, unknown> = {};
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
@@ -584,6 +592,9 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
       CODEX_HOME: codexHome,
     };
     const current = JSON.parse((await runCli(["doctor", "--json"], env)).stdout);
+    expect(current.checks.find((check: { id: string }) => check.id === "codex-compaction"))
+      .toMatchObject({ status: "warning" });
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(codexSettings);
     expect(current.checks.find((check: { id: string }) => check.id === "proxy")).toMatchObject({
       status: "ok",
     });

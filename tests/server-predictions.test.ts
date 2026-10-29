@@ -46,13 +46,13 @@ async function send(body: unknown, config: AppConfig = { ...defaultConfig("full"
   }
 }
 
-test("predictions stay disabled by default before constructing an adapter", async () => {
+test("predictions run by default through the Sol 6 Medium route", async () => {
   const config = defaultConfig("full");
-  expect(config.composerPredictionsEnabled).toBe(false);
+  expect(config.composerPredictionsEnabled).toBe(true);
   const result = await send(base, config);
-  expect(result.response.status).toBe(400);
-  expect(result.constructions).toBe(0);
-  expect(result.text).toContain("predictions are disabled");
+  expect(result.response.status).toBe(200);
+  expect(result.constructions).toBe(1);
+  expect(result.observed!.parsed).toMatchObject({ _chatgptModelFamily: "6", options: { reasoning: "medium" } });
 });
 
 test("prediction policy uses Sol 6 Medium, keeps history/schema, and never exposes tools or alters saved preferences", async () => {
