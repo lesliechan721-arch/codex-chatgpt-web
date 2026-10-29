@@ -64,7 +64,7 @@ test("doctor distinguishes a healthy local proxy from failed, pending and recove
   mkdirSync(appHome, { recursive: true });
   writeFileSync(join(appHome, "config.json"), JSON.stringify(config));
   mkdirSync(join(root, "codex"), { recursive: true });
-  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=350000\n';
+  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=360001\n';
   writeFileSync(join(root, "codex", "config.toml"), codexSettings);
   const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: join(root, "codex") };
   try {
@@ -553,7 +553,7 @@ test("doctor requires the running daemon to load the saved API key policy", asyn
   const codexHome = join(root, "codex");
   mkdirSync(appHome, { recursive: true });
   mkdirSync(codexHome, { recursive: true });
-  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=350000\n';
+  const codexSettings = 'model="chatgpt-web/gpt-6-sol"\nmodel_auto_compact_token_limit=360001\n';
   writeFileSync(join(codexHome, "config.toml"), codexSettings);
   let health: Record<string, unknown> = {};
   const server = createServer((_request, response) => {

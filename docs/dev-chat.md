@@ -164,10 +164,10 @@ required; trusted ordinary assistant history and detailed source maps can be rea
 Context protocol 6 uses payload v3, manifest 3 and batch-v1. See
 [context navigation](context-navigation.md) for classification, identity, readiness and source limits.
 
-History H/C tiers are 200,000/180,000, 300,000/270,000, 500,000/450,000 and 600,000/540,000 tokens,
+History H/C tiers are 300,000/270,000, 400,000/360,000, 600,000/540,000 and 800,000/720,000 tokens,
 selected by account/model, with C = 90% of H. Full + Launcher has no highest-tier override.
 Full/MCP Luna/Think reports canonical history and supports independent read-only compaction at
-180,000. Browser-only Luna retains rolling checkpoints and projected usage. The client owns the
+270,000. Browser-only Luna retains rolling checkpoints and projected usage. The client owns the
 compaction trigger. Neither H nor C is a server cumulative reading or sending limit.
 
 Bigger Context settings, capability flags, API/IPC setters and new stage/commit sends are removed.

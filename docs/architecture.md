@@ -263,11 +263,11 @@ are removed. Saved old values normalize to default behavior. Legacy command swit
 effect and report removal. Historical staged bodies remain readable data, not executable sends.
 Browser-only has no new MCP capability and must use a complete legal single-message input or fail.
 
-The account/model catalog selects H/C of 200k/180k, 300k/270k, 500k/450k or 600k/540k, with C = 90%
+The account/model catalog selects H/C of 300k/270k, 400k/360k, 600k/540k or 800k/720k, with C = 90%
 of H; Full + Launcher has no override. These are history policies. Single-message transport remains
 independent, including Luna's ordinary 28,000-token input and existing Pro text limits. H/C cannot
 raise read-response, composer, image, attachment, storage or time limits. Full/MCP Luna/Think
-estimates canonical history and uses independent client compaction at 180k; Browser-only Luna
+estimates canonical history and uses independent client compaction at 270k; Browser-only Luna
 retains rolling checkpoints and projected usage.
 
 Cumulative delivered tokens/wire bytes are diagnostics. They cannot reject Send, read, completion,

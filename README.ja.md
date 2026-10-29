@@ -86,12 +86,12 @@ ChatGPT のツール呼び出しを現在の Codex タスクへ接続します�
 > **Limits**
 >
 > ChatGPT のメッセージ上限は [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) を参照してください。
-> アカウントとモデルにより、履歴ウィンドウとクライアント圧縮閾値は **200,000 / 180,000**、
-> **300,000 / 270,000**、**500,000 / 450,000**、または **600,000 / 540,000** tokens になります。
+> アカウントとモデルにより、履歴ウィンドウとクライアント圧縮閾値は **300,000 / 270,000**、
+> **400,000 / 360,000**、**600,000 / 540,000**、または **800,000 / 720,000** tokens になります。
 > これは履歴管理の設定であり、ブラウザー容量の実測値ではありません。Full/MCP は既定で必要な本文を
 > オンデマンドで読み取ります。短い入力はインラインのままにできます。Bigger Context と分割送信は廃止されました。
 > 単一メッセージ、読み取り応答、画像、添付、保存容量、処理時間の制限は引き続き適用されます。
-> Full/MCP Luna/Think は canonical 履歴を計量し、180,000 tokens で独立した圧縮を利用できます。
+> Full/MCP Luna/Think は canonical 履歴を計量し、270,000 tokens で独立した圧縮を利用できます。
 > Browser-only Luna はローリング checkpoint と投影 usage を維持します。
 > [アカウントとモデルの表](docs/context-navigation.md#history-window-and-client-compaction) を参照してください。
 

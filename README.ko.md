@@ -90,11 +90,11 @@ inbound 포트를 열거나 라우터 포트 포워딩을 설정할 필요가 �
 > **Limits**
 >
 > ChatGPT 메시지 허용량은 [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)를 참고하세요.
-> 계정과 모델에 따라 기록 창과 클라이언트 압축 기준은 **200,000 / 180,000**, **300,000 / 270,000**,
-> **500,000 / 450,000**, 또는 **600,000 / 540,000** tokens입니다. 이는 기록 관리 정책이며 웹 용량 실측값이 아닙니다.
+> 계정과 모델에 따라 기록 창과 클라이언트 압축 기준은 **300,000 / 270,000**, **400,000 / 360,000**,
+> **600,000 / 540,000**, 또는 **800,000 / 720,000** tokens입니다. 이는 기록 관리 정책이며 웹 용량 실측값이 아닙니다.
 > Full/MCP는 기본으로 필요한 본문을 읽습니다. 짧은 입력은 인라인으로 유지할 수 있습니다.
 > Bigger Context와 분할 전송은 제거되었습니다. 단일 메시지, 읽기 응답, 이미지, 첨부, 저장 및 처리 시간 제한은 유지됩니다.
-> Full/MCP Luna/Think는 canonical 기록을 계산하고 180,000 tokens에서 독립 압축을 지원합니다.
+> Full/MCP Luna/Think는 canonical 기록을 계산하고 270,000 tokens에서 독립 압축을 지원합니다.
 > Browser-only Luna는 롤링 checkpoint와 투영 usage를 유지합니다.
 > [계정 및 모델 표](docs/context-navigation.md#history-window-and-client-compaction)를 참고하세요.
 

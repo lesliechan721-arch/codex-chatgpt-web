@@ -55,10 +55,10 @@ async function fixture(localToolsEnabled: boolean) {
   return { root, broker, provider, worker, run };
 }
 
-for (const effort of ["low", "medium"] as const) test(`Full Luna ${effort} selects default navigation and keeps canonical usage above 180k`, async () => {
+for (const effort of ["low", "medium"] as const) test(`Full Luna ${effort} selects default navigation and keeps canonical usage above 270k`, async () => {
   const f = await fixture(true);
   const parsed = request(f.root, "current", [
-    message("assistant", "OLD_ANSWER " + "word ".repeat(175_000), "previous"),
+    message("assistant", "OLD_ANSWER " + "word ".repeat(275_000), "previous"),
     message("user", "Apply the second option from the previous answer.", "current"),
   ], effort);
   const owner = await f.broker.register({ authorityMode: "delegated", threadId: f.root, turnId: "current", tools: [] });
@@ -69,9 +69,9 @@ for (const effort of ["low", "medium"] as const) test(`Full Luna ${effort} selec
     expect(plan.compiled.text).not.toContain("OLD_ANSWER");
     expect(plan.compiled.text).not.toContain(CHATGPT_LUNA_CHECKPOINT_MARKER);
     const usage = estimateChatGptWebUsage(parsed, {}, full);
-    expect(usage.inputTokens).toBeGreaterThan(180_000);
+    expect(usage.inputTokens).toBeGreaterThan(270_000);
     expect(usage.inputTokens).toBeGreaterThan(plan.costs.promptTokens + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS);
-    expect(resolveChatGptWebContextLimits(model, effort, full)).toEqual({ contextWindow: 200_000, autoCompactTokenLimit: 180_000, effectiveContextWindowPercent: 90 });
+    expect(resolveChatGptWebContextLimits(model, effort, full)).toEqual({ contextWindow: 300_000, autoCompactTokenLimit: 270_000, effectiveContextWindowPercent: 90 });
     expect(resolveChatGptWebMessageTokenBudget(model, effort, full, 4096)).toBe(15_712);
   } finally { send.retire(); await f.broker.revoke(owner); }
 }, 30_000);

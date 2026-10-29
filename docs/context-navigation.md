@@ -462,20 +462,20 @@ tokens. These are history policies, not measurements of ChatGPT capacity. Availa
 
 | Account/model or explicit mode | H / C tokens |
 | --- | --- |
-| Luna / Luna Think | 200,000 / 180,000 |
-| Plus GPT-5.6 Instant (low) | 300,000 / 270,000 |
-| Plus GPT-6 Instant (low) | 200,000 / 180,000 |
-| Plus GPT-5.6 Sol Medium/High/available Extra High | 500,000 / 450,000 |
-| Plus GPT-6 Sol Medium/High/available Extra High | 300,000 / 270,000 |
-| Pro account GPT-5.6 Instant or Sol Medium/High/Extra High | 600,000 / 540,000 |
-| Pro account GPT-6 Instant (low) | 300,000 / 270,000 |
-| Pro account GPT-6 Sol Medium/High/Extra High | 500,000 / 450,000 |
-| Pro account GPT-5.6 Pro or GPT-6 Pro model (max) | 600,000 / 540,000 |
-| Zero Risk explicit ordinary mode | 300,000 / 270,000 |
-| Zero Risk explicit Pro mode | 600,000 / 540,000 |
+| Luna / Luna Think | 300,000 / 270,000 |
+| Plus GPT-5.6 Instant (low) | 400,000 / 360,000 |
+| Plus GPT-6 Instant (low) | 300,000 / 270,000 |
+| Plus GPT-5.6 Sol Medium/High/available Extra High | 600,000 / 540,000 |
+| Plus GPT-6 Sol Medium/High/available Extra High | 400,000 / 360,000 |
+| Pro account GPT-5.6 Instant or Sol Medium/High/Extra High | 800,000 / 720,000 |
+| Pro account GPT-6 Instant (low) | 400,000 / 360,000 |
+| Pro account GPT-6 Sol Medium/High/Extra High | 600,000 / 540,000 |
+| Pro account GPT-5.6 Pro or GPT-6 Pro model (max) | 800,000 / 720,000 |
+| Zero Risk explicit ordinary mode | 400,000 / 360,000 |
+| Zero Risk explicit Pro mode | 800,000 / 720,000 |
 
-The migration basis is the old effective account/model tier: below 100k maps to 200k/180k,
-100k–below 200k to 300k/270k, 200k–below 300k to 500k/450k, and 300k or above to 600k/540k.
+The migration basis is the old effective account/model tier: below 100k maps to 300k/270k,
+100k–below 200k to 400k/360k, 200k–below 300k to 600k/540k, and 300k or above to 800k/720k.
 Match from the highest tier down. Do not multiply these results again. This basis excludes the
 former unified Launcher override and Luna's former non-Bigger catalog value. Zero Risk uses its
 explicit ordinary/Pro tier, not a guessed browser model.
@@ -487,7 +487,7 @@ the account/model tier. Runtime, generated catalog, setup and refresh share this
 Lower client settings remain effective; native models and global settings are unchanged.
 
 Full/MCP, including Luna/Think, estimates canonical history. Startup size or cumulative page delivery
-is not history usage. Luna/Think uses client compaction at 180,000 and independent read-only sources,
+is not history usage. Luna/Think uses client compaction at 270,000 and independent read-only sources,
 without per-turn rolling projection. Trusted old checkpoints retain only their proved coverage.
 Browser-only uses the same history tiers without MCP or multipart delivery. Browser-only Luna
 retains rolling checkpoints and projected usage, so canonical totals do not directly trigger its

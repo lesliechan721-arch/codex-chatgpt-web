@@ -231,7 +231,7 @@ test("GPT-6 DEV status uses the account/model history budget", () => {
     (): ProviderAdapter => { throw new Error("adapter is not needed to inspect a DEV chat"); },
     root,
   );
-  for (const [suffix, contextWindow, autoCompactTokenLimit] of [["sol-instant", 200_000, 180_000], ["sol", 300_000, 270_000]] as const) {
+  for (const [suffix, contextWindow, autoCompactTokenLimit] of [["sol-instant", 300_000, 270_000], ["sol", 400_000, 360_000]] as const) {
     const model = `chatgpt-web/gpt-6-${suffix}` as const;
     const { state } = driver.open(suffix, model);
     expect(driver.status(state)).toMatchObject({ model, contextWindow, autoCompactTokenLimit });
@@ -325,19 +325,19 @@ test("DEV status exposes the default history windows for Sol and Luna", async ()
   const state = driver.open("paid-window", "chatgpt-web/high").state;
   const status = driver.status(state);
   expect(status).toMatchObject({
-    autoCompactTokenLimit: 540_000,
-    contextWindow: 600_000,
+    autoCompactTokenLimit: 720_000,
+    contextWindow: 800_000,
   });
-  expect(status.percent).toBe(Math.round((status.inputTokens / 540_000) * 1_000) / 10);
+  expect(status.percent).toBe(Math.round((status.inputTokens / 720_000) * 1_000) / 10);
   for (const [model, contextWindow, autoCompactTokenLimit] of [
-    ["chatgpt-web/gpt-6-sol", 500_000, 450_000],
-    ["chatgpt-web/gpt-6-sol-instant", 300_000, 270_000],
+    ["chatgpt-web/gpt-6-sol", 600_000, 540_000],
+    ["chatgpt-web/gpt-6-sol-instant", 400_000, 360_000],
   ] as const) {
     const state = driver.open(model.split("/")[1]!, model).state;
     expect(driver.status(state)).toMatchObject({ contextWindow, autoCompactTokenLimit });
   }
   const proState = driver.open("six-pro", "chatgpt-web/gpt-6-pro").state;
-  expect(driver.status(proState)).toMatchObject({ contextWindow: 600_000, autoCompactTokenLimit: 540_000 });
+  expect(driver.status(proState)).toMatchObject({ contextWindow: 800_000, autoCompactTokenLimit: 720_000 });
   const luna = new DevChatDriver({
     ...config,
     solAvailable: false,
@@ -345,7 +345,7 @@ test("DEV status exposes the default history windows for Sol and Luna", async ()
   }, store, factory, root);
   for (const model of ["chatgpt-web/luna", "chatgpt-web/think"] as const) {
     const state = luna.open(model.split("/")[1]!, model).state;
-    expect(luna.status(state)).toMatchObject({ contextWindow: 200_000, autoCompactTokenLimit: 180_000 });
+    expect(luna.status(state)).toMatchObject({ contextWindow: 300_000, autoCompactTokenLimit: 270_000 });
   }
   await Promise.all([driver.close(), luna.close()]);
 });
@@ -586,8 +586,8 @@ test("synthetic fill crosses the production threshold and triggers the real comp
   const store = new DevChatStore(join(root, "chats"));
   const driver = new DevChatDriver(config, store, factory, root);
   const state = driver.open("auto-compact", "chatgpt-web/light").state;
-  driver.fill(state, 270_000);
-  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(270_000);
+  driver.fill(state, 360_000);
+  expect(driver.status(state).inputTokens).toBeGreaterThanOrEqual(360_000);
   const events: string[] = [];
   const result = await driver.send(state, "Continue after compacting the synthetic history.", event => events.push(event.type));
   expect(result).toMatchObject({ text: "DEV turn completed after compaction.", compactions: 1 });

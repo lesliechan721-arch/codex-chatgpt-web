@@ -87,11 +87,11 @@ Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Ze
 > **限制**
 >
 > ChatGPT 消息额度见 [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309)。
-> 账户和模型决定历史窗口与客户端压缩阈值：**200,000 / 180,000**、**300,000 / 270,000**、
-> **500,000 / 450,000** 或 **600,000 / 540,000** tokens。这些是历史策略，不是网页容量实测。
+> 账户和模型决定历史窗口与客户端压缩阈值：**300,000 / 270,000**、**400,000 / 360,000**、
+> **600,000 / 540,000** 或 **800,000 / 720,000** tokens。这些是历史策略，不是网页容量实测。
 > Full/MCP 默认选择按需读取；短输入可直接内联。Bigger Context 及其分段发送已移除。
 > 单条消息、单次读取、图片、附件、存储和处理时间限制仍有效。
-> Full/MCP Luna/Think 按 canonical 历史计量，并在 180,000 tokens 支持独立压缩。
+> Full/MCP Luna/Think 按 canonical 历史计量，并在 270,000 tokens 支持独立压缩。
 > Browser-only Luna 保留滚动 checkpoint 和投影用量。完整映射见
 > [账户和模型表](docs/context-navigation.md#history-window-and-client-compaction)。
 

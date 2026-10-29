@@ -79,8 +79,8 @@ test("all public routes use the account and model history tier", () => {
     const config = { ...capabilities, browserInteractionMode: manual ? "manual" as const : "automatic" as const,
       zeroRiskProEnabled: slug.endsWith("zero-risk-pro") };
     const route = requireChatGptWebModelRoute(slug, config);
-    const window = slug === "chatgpt-web/zero-risk" || slug === "chatgpt-web/gpt-6-sol-instant" ? 300_000
-      : slug === "chatgpt-web/gpt-6-sol" ? 500_000 : 600_000;
+    const window = slug === "chatgpt-web/zero-risk" || slug === "chatgpt-web/gpt-6-sol-instant" ? 400_000
+      : slug === "chatgpt-web/gpt-6-sol" ? 600_000 : 800_000;
     expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({ contextWindow: window, autoCompactTokenLimit: window * 0.9 });
     expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config,
       route.interactionMode === "automatic" ? route.modelFamily : undefined).contextWindow).toBe(window);

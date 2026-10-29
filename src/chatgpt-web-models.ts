@@ -107,7 +107,7 @@ function assertChatGptWebBackendAvailable(
   throw new Error(`ChatGPT context limit is not defined for unavailable effort: ${effort}`);
 }
 
-function historyLimits(contextWindow: 200_000 | 300_000 | 500_000 | 600_000): ChatGptWebContextLimits {
+function historyLimits(contextWindow: 300_000 | 400_000 | 600_000 | 800_000): ChatGptWebContextLimits {
   return {
     contextWindow,
     effectiveContextWindowPercent: 90,
@@ -126,16 +126,16 @@ export function resolveChatGptWebContextLimits(
   if (modelFamily !== undefined && modelFamily !== "5.6" && modelFamily !== "6") {
     throw new Error(`ChatGPT web history policy is not defined for model family: ${modelFamily}`);
   }
-  if (backendModel === CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL) return historyLimits(300_000);
-  if (backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL) return historyLimits(600_000);
-  if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return historyLimits(200_000);
-  if (effort === "max") return historyLimits(600_000);
+  if (backendModel === CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL) return historyLimits(400_000);
+  if (backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL) return historyLimits(800_000);
+  if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return historyLimits(300_000);
+  if (effort === "max") return historyLimits(800_000);
   if (modelFamily === "6") {
-    if (effort === "low") return historyLimits(capabilities.proAvailable ? 300_000 : 200_000);
-    return historyLimits(capabilities.proAvailable ? 500_000 : 300_000);
+    if (effort === "low") return historyLimits(capabilities.proAvailable ? 400_000 : 300_000);
+    return historyLimits(capabilities.proAvailable ? 600_000 : 400_000);
   }
-  if (capabilities.proAvailable) return historyLimits(600_000);
-  return historyLimits(effort === "low" ? 300_000 : 500_000);
+  if (capabilities.proAvailable) return historyLimits(800_000);
+  return historyLimits(effort === "low" ? 400_000 : 600_000);
 }
 
 /** Resolve separately measured text and character boundaries of one visible composer message. */

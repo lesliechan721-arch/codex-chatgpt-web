@@ -26,7 +26,7 @@ assert.ok(template, "The target binary must contain the Sol model template");
 const model = "chatgpt-web/gpt-5.6-sol";
 const capabilities = { mode: "full" as const, browserHost: "launcher" as const, solAvailable: true, proAvailable: false };
 const publicLimits = resolveChatGptWebHistoryLimits(requireChatGptWebModelRoute(model, capabilities), capabilities);
-assert.deepEqual(publicLimits, { contextWindow: 500_000, autoCompactTokenLimit: 450_000, effectiveContextWindowPercent: 90 });
+assert.deepEqual(publicLimits, { contextWindow: 600_000, autoCompactTokenLimit: 540_000, effectiveContextWindowPercent: 90 });
 const checkpoint = "P0_CHECKPOINT: Prior synthetic work is complete. Continue the short validation task.";
 
 interface Scenario {
@@ -38,7 +38,7 @@ interface Scenario {
   reportedUsage?: number;
 }
 const scenarios: Scenario[] = [
-  ...[200_000, 300_000, 500_000, 600_000].flatMap(window => [
+  ...[300_000, 400_000, 600_000, 800_000].flatMap(window => [
     ...[-1, 0, 1].map(offset => ({ name: `history-${window}-C${offset < 0 ? "minus1" : offset > 0 ? "plus1" : "exact"}`,
       window, limit: window * 0.9, reportedUsage: window * 0.9 + offset })),
     ...[-1, 0, 1].map(offset => ({ name: `history-${window}-H${offset < 0 ? "minus1" : offset > 0 ? "plus1" : "exact"}`,

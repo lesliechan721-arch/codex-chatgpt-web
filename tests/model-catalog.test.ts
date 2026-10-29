@@ -61,8 +61,8 @@ describe("native /models augmentation", () => {
     expect(publicWeb).toEqual(baseline.filter(model => String(model.slug).startsWith("chatgpt-web/")
       && model.visibility === "list"));
     expect(publicWeb.map(model => [model.context_window, model.auto_compact_token_limit])).toEqual([
-      [300_000, 270_000], [500_000, 450_000], [600_000, 540_000],
-      [600_000, 540_000], [600_000, 540_000], [600_000, 540_000],
+      [400_000, 360_000], [600_000, 540_000], [800_000, 720_000],
+      [800_000, 720_000], [800_000, 720_000], [800_000, 720_000],
     ]);
     const roster = (entries: Array<Record<string, unknown>>) => entries
       .filter(model => model.visibility === "list" && model.supported_in_api === true)
@@ -90,7 +90,7 @@ describe("native /models augmentation", () => {
     const legacy = models.slice(3).filter(model => model.visibility === "hide");
     expect(legacy.map(model => model.slug)).toEqual(CHATGPT_WEB_LEGACY_MODEL_ROUTES.map(route => route.slug));
     expect(legacy.map(model => [model.context_window, model.auto_compact_token_limit])).toEqual([
-      [600_000, 540_000], [600_000, 540_000], [600_000, 540_000], [600_000, 540_000], [600_000, 540_000],
+      [800_000, 720_000], [800_000, 720_000], [800_000, 720_000], [800_000, 720_000], [800_000, 720_000],
     ]);
     expect(web.map(model => model.slug)).toEqual(CHATGPT_WEB_MODEL_ROUTES.map(route => route.slug));
     expect(web.map(model => model.display_name)).toEqual(CHATGPT_WEB_MODEL_ROUTES.map(route => route.displayName));
@@ -157,7 +157,7 @@ describe("native /models augmentation", () => {
           expect(model.auto_compact_token_limit).toBe(window * 0.9);
         }
       }
-    expect([...observed].sort((a, b) => a - b)).toEqual([200_000, 300_000, 500_000, 600_000]);
+    expect([...observed].sort((a, b) => a - b)).toEqual([300_000, 400_000, 600_000, 800_000]);
   });
 
   test("publishes the explicit family and account matrix without retired capability metadata", () => {
@@ -165,12 +165,12 @@ describe("native /models augmentation", () => {
       const config = { ...defaultConfig("full"), proAvailable, extraHighAvailable: true };
       const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
       for (const [suffix, plusWindow, proWindow] of [
-        ["gpt-6-sol-instant", 200_000, 300_000],
-        ["gpt-6-sol", 300_000, 500_000],
-        ["gpt-5.6-sol-instant", 300_000, 600_000],
-        ["gpt-5.6-sol", 500_000, 600_000],
-        ["gpt-5.6-pro", 600_000, 600_000],
-        ["gpt-6-pro", 600_000, 600_000],
+        ["gpt-6-sol-instant", 300_000, 400_000],
+        ["gpt-6-sol", 400_000, 600_000],
+        ["gpt-5.6-sol-instant", 400_000, 800_000],
+        ["gpt-5.6-sol", 600_000, 800_000],
+        ["gpt-5.6-pro", 800_000, 800_000],
+        ["gpt-6-pro", 800_000, 800_000],
       ] as const) {
         const model = models.find(candidate => candidate.slug === `chatgpt-web/${suffix}`);
         if (suffix.endsWith("-pro") && !proAvailable) {
@@ -306,14 +306,14 @@ describe("native /models augmentation", () => {
       effectiveContextWindowPercent: model.effective_context_window_percent,
       autoCompactTokenLimit: model.auto_compact_token_limit,
     }))).toEqual([
-      { contextWindow: 200_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 180_000 },
       { contextWindow: 300_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 270_000 },
-      { contextWindow: 300_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 270_000 },
-      { contextWindow: 500_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 450_000 },
-      { contextWindow: 300_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 270_000 },
-      { contextWindow: 500_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 450_000 },
-      { contextWindow: 500_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 450_000 },
-      { contextWindow: 500_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 450_000 },
+      { contextWindow: 400_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 360_000 },
+      { contextWindow: 400_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 360_000 },
+      { contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000 },
+      { contextWindow: 400_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 360_000 },
+      { contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000 },
+      { contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000 },
+      { contextWindow: 600_000, effectiveContextWindowPercent: 90, autoCompactTokenLimit: 540_000 },
     ]);
   });
 
@@ -330,9 +330,9 @@ describe("native /models augmentation", () => {
       display_name: CHATGPT_WEB_LUNA_MODEL_ROUTE.displayName,
       default_reasoning_level: "low",
       supported_reasoning_levels: [{ effort: "low", description: "Ordinary Luna" }, { effort: "medium", description: "Think" }],
-      context_window: 200_000,
+      context_window: 300_000,
       effective_context_window_percent: 90,
-      auto_compact_token_limit: 180_000,
+      auto_compact_token_limit: 270_000,
     });
   });
 
@@ -352,10 +352,10 @@ describe("native /models augmentation", () => {
       input_modalities: ["text"],
       default_reasoning_level: "low",
       supported_reasoning_levels: [{ effort: "low", description: CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE.displayName }],
-      context_window: 300_000,
-      max_context_window: 300_000,
+      context_window: 400_000,
+      max_context_window: 400_000,
       effective_context_window_percent: 90,
-      auto_compact_token_limit: 270_000,
+      auto_compact_token_limit: 360_000,
     });
 
     config.zeroRiskProEnabled = true;
@@ -367,8 +367,8 @@ describe("native /models augmentation", () => {
       slug: CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE.slug,
       display_name: CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE.displayName,
       input_modalities: ["text"],
-      context_window: 600_000,
-      auto_compact_token_limit: 540_000,
+      context_window: 800_000,
+      auto_compact_token_limit: 720_000,
     });
   });
 
