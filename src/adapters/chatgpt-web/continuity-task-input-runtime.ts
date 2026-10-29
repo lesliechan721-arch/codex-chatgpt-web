@@ -74,8 +74,27 @@ export function completeTaskInputPhysicalResponse(session: ChatGptTurnSession): 
   if (!queue || session.settledOutcome()?.type !== "final") return;
   const task = queue.store.get(queue.identity);
   if (!task || task.state === "stopped") return;
+  const ref = session.runtime.continuityBinding?.recovery;
+  const record = ref && recoveryRecord(ref);
+  const work = ref && record?.works[ref.logicalWorkId];
   for (const delivery of task.deliveries) {
-    if (delivery.cancelled || delivery.physicalResponseId !== session.traceId
+    // Both queued continuations and explicit retries retain their initial delivery
+    // across recovery. Its accepted writer must retire before the same work's final.
+    const recoveredInitial = ref && work?.state === "completed" && work.terminalReceiptId
+      && work.attempts.at(-1)?.attempt === ref.attempt
+      && work.attempts.at(-1)?.sendEvidence?.status === "accepted"
+      && delivery.mode === "initial" && delivery.logicalWorkId === work.logicalWorkId
+      && delivery.workLineageId === work.workLineageId
+      && work.nativeTurnId === session.nativeTurnId
+      && delivery.acceptedTaskRevision === work.acceptedTaskRevision
+      && delivery.intentGeneration === task.intentGeneration
+      && (!work.taskInputRetry || work.taskInputRetry.taskId === queue.identity.taskId
+        && delivery.intentGeneration === work.taskInputRetry.intentGeneration
+        && delivery.messageIds.length === work.taskInputRetry.messageIds.length
+        && delivery.messageIds.every((id, index) => id === work.taskInputRetry!.messageIds[index]))
+      && work.attempts.slice(0, ref.attempt).some(attempt => attempt.writerRetired
+        && attempt.sendEvidence?.status === "accepted" && attempt.historyRevision === delivery.historyRevision);
+    if (delivery.cancelled || delivery.physicalResponseId !== session.traceId && !recoveredInitial
       || delivery.completedMessageIds.length === delivery.messageIds.length) continue;
     if (delivery.mode === "active") {
       synchronizeTaskInputDelivery(session, delivery);

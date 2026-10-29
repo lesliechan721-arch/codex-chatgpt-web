@@ -420,8 +420,27 @@ function replayEvents(events: AdapterEvent[], emit: (event: AdapterEvent) => voi
   for (const event of events) emit(event);
 }
 
-function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Error {
+function submittedTurnFailure(session: ChatGptTurnSession, error: unknown, parsed: CodexParsedRequest): Error {
   const normalized = error instanceof Error ? error : new Error(String(error));
+  if (normalized instanceof ChatGptWebAdapterError && normalized.code === "chatgpt_delivery_timeout"
+    && session.runtime.mode === "tools") {
+    // Retiring the old MCP binding cannot undo commands already dispatched to Codex.
+    // A result may arrive after the browser has failed. Its canonical native record proves
+    // completion without forwarding it to the retired browser or replaying the command.
+    const results = parsed.context.messages.filter((message): message is CodexToolResultMessage =>
+      message.role === "toolResult" && session.hasOutstanding(message.toolCallId));
+    const returnedIds = new Set(results.map(result => result.toolCallId));
+    const unresolved = session.outstanding().some(call => !returnedIds.has(call.callId))
+      || session.runtime.externalProgress.snapshot().activeToolCalls > returnedIds.size
+      || results.length !== returnedIds.size;
+    if (unresolved) {
+      return new ChatGptWebAdapterError(
+        "ChatGPT reported that message delivery timed out while a tool result was still pending. "
+        + "Check the running command and its result before continuing.",
+        { status: normalized.status, errorType: normalized.errorType, code: normalized.code, retryable: false, cause: normalized },
+      );
+    }
+  }
   if (normalized instanceof ChatGptWebAdapterError) return normalized;
   if (normalized instanceof NativeOperationError) {
     return new ChatGptWebAdapterError(normalized.message, {
@@ -2318,7 +2337,14 @@ export function createChatGptWebAdapter(
             continuationQueue = { identity: retry.identity, store: new ContinuityTaskInputStore(ref.directory), authorize: () => {
               recoveryStore(ref).assertTaskInputIntent(retry.identity, retry.intentGeneration);
             } };
-            continuationMessageIds = retry.messageIds;
+            const record = recoveryStore(ref).get(ref.thread)!;
+            const work = record.works[ref.logicalWorkId]!;
+            const task = continuationQueue.store.get(retry.identity);
+            // Recovery continues this intent's accepted input, rather than receiving it again.
+            continuationMessageIds = retry.messageIds.filter(id => !task?.deliveries.some(delivery =>
+              !delivery.cancelled && delivery.mode === "initial" && delivery.intentGeneration === retry.intentGeneration
+              && delivery.logicalWorkId === work.logicalWorkId && delivery.workLineageId === work.workLineageId
+              && delivery.messageIds.includes(id)));
             continuationIntentGeneration = retry.intentGeneration;
           }
           const admitted = preparedContinuity.get(parsed);
@@ -3137,7 +3163,7 @@ export function createChatGptWebAdapter(
           const settled = awaitingRuntime || retiredDuringRefresh ? session.settledOutcome() : undefined;
           if (settled?.type === "error") error = settled.error;
           else if (retiredDuringRefresh && session.cancellationReason) error = session.cancellationReason;
-          const turnError = submittedTurnFailure(session, error);
+          const turnError = submittedTurnFailure(session, error, parsed);
           const handledError = parsed._conversationPolicy !== "task" && turnError instanceof ChatGptWebAdapterError && turnError.retryable
             ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
             : turnError;

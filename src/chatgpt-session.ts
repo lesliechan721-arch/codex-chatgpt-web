@@ -1,4 +1,4 @@
-import { CHATGPT_COMPOSER_SELECTOR } from "./chatgpt-ui/composer";
+import { CHATGPT_COMPOSER_SELECTOR, chatGptThinkButtons } from "./chatgpt-ui/composer";
 import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
@@ -46,7 +46,7 @@ type ChatGptCapabilityProbeOptions = {
   signal?: AbortSignal;
 };
 
-/** Wait for a hydrated model control without selecting a model or opening its menu. */
+/** Undefined means the known Luna/Think control was verified, not merely a missing picker. */
 export async function waitForChatGptEffortControl(
   page: Page,
   options: ChatGptCapabilityProbeOptions = {},
@@ -84,6 +84,15 @@ export async function waitForChatGptEffortControl(
       // A short absence is not a capability result; use the complete inspection budget.
       if (absenceSince !== undefined && Date.now() - absenceSince >= stableAbsenceMs) {
         options.signal?.throwIfAborted();
+        // #932: UI drift on paid accounts must not overwrite the catalog with Luna-only.
+        const think = chatGptThinkButtons(composer);
+        const pressed = await think.count() === 1
+          ? await think.first().getAttribute("aria-pressed", { timeout: 5_000, signal: options.signal })
+          : null;
+        options.signal?.throwIfAborted();
+        if (pressed !== "true" && pressed !== "false") {
+          throw new Error("Could not identify ChatGPT's model controls. Reload ChatGPT in the launcher and retry setup.");
+        }
         return undefined;
       }
       throw new Error("ChatGPT account capability probe did not reach a stable composer state");

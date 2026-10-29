@@ -95,6 +95,7 @@ function directBrowserFixture(readText: () => Promise<string>, onSourceBoundary?
     last: () => hidden, filter: () => hidden, locator: () => hidden,
     getByText: () => hidden, getByTestId: () => hidden,
     isVisible: async () => false, count: async () => 0,
+    evaluateAll: async () => false,
   };
   const page = Object.assign(new EventEmitter(), {
     isClosed: () => false, locator: () => hidden, url: () => "https://chatgpt.com/",

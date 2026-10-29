@@ -1419,6 +1419,7 @@ function directBrowserFixture(readText: () => Promise<string>, onSourceBoundary?
     last: () => hidden, filter: () => hidden, locator: () => hidden,
     getByText: () => hidden, getByTestId: () => hidden,
     isVisible: async () => false, count: async () => 0,
+    evaluateAll: async () => false,
   };
   const page = Object.assign(new EventEmitter(), {
     isClosed: () => false, locator: () => hidden, url: () => "https://chatgpt.com/",
@@ -1595,7 +1596,7 @@ test("Remote strict answer after ACK succeeds when the real helper receives its 
     while (!fs.existsSync(${JSON.stringify(gatePath)})) await new Promise(resolve => setTimeout(resolve, 10));
     snapshot = turn.externalProgress.snapshot();
     if (snapshot.taskUpdates.acceptedRevision !== 0 || snapshot.taskUpdates.driverGeneration !== 0) throw new Error("Delayed whole progress frame unexpectedly arrived");
-    const hidden = { last: () => hidden, filter: () => hidden, locator: () => hidden, getByText: () => hidden, getByTestId: () => hidden, isVisible: async () => false, count: async () => 0 };
+    const hidden = { last: () => hidden, filter: () => hidden, locator: () => hidden, getByText: () => hidden, getByTestId: () => hidden, isVisible: async () => false, count: async () => 0, evaluateAll: async () => false };
     const page = Object.assign(new EventEmitter(), { isClosed: () => false, locator: () => hidden, url: () => "https://chatgpt.com/", evaluate: async () => { throw new Error("Controlled DOM fixture"); } });
     Object.assign(this, {
       prepareChatSurface: async () => {}, selectModelAndEffort: async () => ({ effort: "low", localTools: false }),

@@ -640,6 +640,31 @@ export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope):
   );
 }
 
+/** #929 (2026-10-29): only an explicit service alert in the bound response is evidence. */
+export async function throwIfChatGptDeliveryTimeoutAlert(page: Page, response: Locator): Promise<void> {
+  const visible = await response.evaluateAll(containers => {
+    if (containers.length !== 1) return false;
+    const container = containers[0]!;
+    const users = container.querySelectorAll('[data-user-message-bubble]');
+    if (container.hasAttribute('data-turn-key') && users.length !== 1) return false;
+    return [...container.querySelectorAll('[role="alert"]')].some(alert => {
+      if (alert.closest('[data-turn-key], [data-turn-id]') !== container) return false;
+      if (users.length === 1 && !(users[0]!.compareDocumentPosition(alert) & Node.DOCUMENT_POSITION_FOLLOWING)) return false;
+      if (alert.closest('.markdown, [data-user-message-bubble], [data-message-author-role="user"], [contenteditable="true"]')) return false;
+      for (let node: Element | null = alert; node; node = node.parentElement) {
+        if (node.matches('[hidden], [inert], [aria-hidden="true"]')) return false;
+      }
+      return alert.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+        && /^Message delivery timed out\.\s*Please try again\.$/i.test((alert as HTMLElement).innerText.trim());
+    });
+  });
+  if (!visible || await chatGptStopButton(page).isVisible()) return;
+  throw new ChatGptWebAdapterError(
+    "ChatGPT reported that message delivery timed out. Retry the turn.",
+    { status: 503, errorType: "server_error", code: "chatgpt_delivery_timeout", retryable: true },
+  );
+}
+
 export async function throwIfChatGptToolApprovalRequired(scope: Pick<Locator, "locator">): Promise<void> {
   // The current inline card exposes its question in an alert, without one of the
   // approval wrappers used for automatic clicks. Its displayed plugin name can
@@ -1110,14 +1135,19 @@ export async function setChatGptThinkMode(
   throwIfPromptAttachmentAborted(abortSignal);
   const controls = chatGptThinkButtons(composer);
   let count = await controls.count();
-  if (count === 0 && !enabled) {
-    await captureDiagnostic?.("luna-default-confirmed");
-    return;
-  }
   if (count === 0) {
     // The editor can mount before its controls. Wait for the actual button;
     // typing /think here can become a literal prompt or remove the plugin pill.
-    await controls.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
+    try {
+      await controls.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
+    } catch (error) {
+      throwIfPromptAttachmentAborted(abortSignal);
+      if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
+      throw new ChatGptWebAdapterError(
+        "ChatGPT's Luna/Think control could not be verified. Run setup again in the launcher, then restart Codex.",
+        { status: 409, errorType: "invalid_request_error", code: "chatgpt_model_controls_unavailable", retryable: false, cause: error },
+      );
+    }
     count = await controls.count();
   }
   if (count === 0) throw new Error("ChatGPT did not expose a visible Think button");
@@ -2383,8 +2413,9 @@ export class ChatGptBrowserWorker {
       await throwIfChatGptRateLimitDialog(page);
       const visibleControls = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible: true });
       if (await visibleControls.count() > 0) {
-        throw chatGptModelControlUnavailableError(
-          "ChatGPT Luna was selected from a Luna-only capability probe, but the account now exposes a model selector; rerun setup",
+        throw new ChatGptWebAdapterError(
+          "The ChatGPT account exposes a model picker, but the installed Web models only include Luna. Run setup again in the launcher, then restart Codex.",
+          { status: 409, errorType: "invalid_request_error", code: "chatgpt_capabilities_stale", retryable: false },
         );
       }
       // Enable Think during prompt attachment, before fresh connector selection. Ordinary Luna
@@ -5373,6 +5404,7 @@ export class ChatGptBrowserWorker {
         await throwIfChatGptSessionFailureAlert(page);
         await generation.checkFailure();
         await throwIfChatGptTerminalErrorAlert(page.locator(chatGptTurnContainerSelector(responseTurn.identity)));
+        await throwIfChatGptDeliveryTimeoutAlert(page, page.locator(chatGptTurnContainerSelector(responseTurn.identity)));
 
         if (mode.localTools && await resolveChatGptToolConfirmation(
           page,

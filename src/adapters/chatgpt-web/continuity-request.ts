@@ -1231,16 +1231,17 @@ async function prepareExplicitTaskInputRetry(
     parsed._continuityPageGeneration = existing.attempts[0]!.epoch;
     parsed._continuityEpoch = existing.attempts.at(-1)!.epoch;
     parsed._continuityHistoryRevision = existing.attempts.at(-1)!.historyRevision;
+    // Apply the same failure and Send checks before reusing an explicit retry's page.
+    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, attachments, bindings, observed,
+      descriptor, abortSignal, compatible);
+    if (recovered) return { ...recovered, taskInputRetry: metadata };
     const binding = bindings.observed(observed.thread);
     const executionKey = `${namespace}:${chatGptTurnExecutionKey(parsed)}`;
     if (binding && binding.executionKey === executionKey && !["lost", "ended", "unverified"].includes(binding.state)
       && observed.owner.id === bindings.owner) return { bindings, binding, descriptor,
       conversationKey: binding.conversation!.key, executionKey, nativeThreadId: native.threadId!,
       revision: observed.historyRevision, taskInputRetry: metadata };
-    const recovered = await prepareDurableOrdinary(parsed, namespace, capabilities, attachments, bindings, observed,
-      descriptor, abortSignal, compatible);
-    if (!recovered) throw continuityError("continuity_unverified");
-    return { ...recovered, taskInputRetry: metadata };
+    throw continuityError("continuity_unverified");
   }
   const source = retry.sourceLogicalWorkId ? observed.works[retry.sourceLogicalWorkId] : undefined;
   if (!source || observed.currentWorkId !== source.logicalWorkId || source.state !== "stopped" || source.nativeTurnId !== native.turnId
@@ -1303,9 +1304,6 @@ async function prepareDurableOrdinary(
   let work = record.works[logicalWorkId];
   const binding = bindings.observed(record.thread);
   if (work && work.state === "stopped") throw continuityError("continuity_stopped");
-  if (liveBinding && !["lost", "ended", "unverified"].includes(liveBinding.state) && observed.owner.id === bindings.owner) return undefined;
-  const payload = chatGptContinuityInstructionPayloadDigest(parsed, work?.instructionPrevious, work?.allowRetainedSourceFallback);
-  if (work && work.workPayloadDigest !== payload) throw continuityError("continuity_source_unproven", "The accepted instruction has a different current payload.");
   if (work) {
     parsed._continuityAttempt = work.attempts.at(-1)!.attempt;
     parsed._continuityEpoch = work.attempts.at(-1)!.epoch;
@@ -1313,6 +1311,17 @@ async function prepareDurableOrdinary(
   }
   const existingKey = work ? `${namespace}:${chatGptTurnExecutionKey(parsed)}` : undefined;
   const existing = existingKey ? chatGptTurnSessions.find(existingKey) : undefined;
+  const failed = existing?.settledOutcome();
+  const recoverDeliveryTimeout = binding?.executionKey === existingKey
+    && existing?.runtime.continuityBinding === binding
+    && existing?.runtime.submission?.phase === "accepted"
+    && work?.attempts.at(-1)?.sendEvidence?.status === "accepted"
+    && failed?.type === "error" && failed.error instanceof ChatGptWebAdapterError
+    && failed.error.code === "chatgpt_delivery_timeout" && failed.error.retryable;
+  if (!recoverDeliveryTimeout && liveBinding && !["lost", "ended", "unverified"].includes(liveBinding.state)
+    && observed.owner.id === bindings.owner) return undefined;
+  const payload = chatGptContinuityInstructionPayloadDigest(parsed, work?.instructionPrevious, work?.allowRetainedSourceFallback);
+  if (work && work.workPayloadDigest !== payload) throw continuityError("continuity_source_unproven", "The accepted instruction has a different current payload.");
   if (work?.state === "completed") {
     // The durable receipt can precede local publication while page cleanup finishes.
     const outcome = existing ? existing.settledOutcome() ?? await existing.browserOutcome : undefined;
@@ -1324,7 +1333,10 @@ async function prepareDurableOrdinary(
       executionKey: existingKey!, nativeThreadId: identity.threadId!, revision: parsed._continuityHistoryRevision! };
   }
   await assertExecutionCompatible?.();
-  if (binding?.state === "unverified" && binding.lease && binding.conversation) {
+  // A service delivery failure cannot resume its settled Session merely because its page
+  // remains alive. Below, recoveryContext still requires real results for every issued
+  // call, and retireRecoveryWriter must isolate the old writer before any new Send.
+  if (!recoverDeliveryTimeout && binding?.state === "unverified" && binding.lease && binding.conversation) {
     const inspectedLease = { ...binding.lease };
     try {
       const physical = await inspectLauncherContinuityConversation(descriptor, binding.conversation.key, inspectedLease);
@@ -1336,7 +1348,7 @@ async function prepareDurableOrdinary(
       bindings.lose(binding, binding.executionKey);
     }
   }
-  if (binding && !["lost", "ended"].includes(binding.state) && record.owner.id === bindings.owner) return undefined;
+  if (!recoverDeliveryTimeout && binding && !["lost", "ended"].includes(binding.state) && record.owner.id === bindings.owner) return undefined;
   if (work && store.get(record.thread)!.works[logicalWorkId]?.attempts.at(-1)?.stage === "send-possible") {
     throw continuityError("continuity_execution_unsettled", "The original Send has no verified submission result.");
   }

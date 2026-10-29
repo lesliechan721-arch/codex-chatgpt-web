@@ -343,6 +343,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       reviewWireName: "exec_command",
       onCapacityQuery: undefined as (() => void | Promise<void>) | undefined,
       preLeaseFailures: 0, unknownPreLeaseFailures: 0, failAfterSendOnce: false, failAfterToolsOnce: false, failAfterToolsKeepPage: false,
+      afterToolsFailure: undefined as Error | undefined,
+      beforeToolsResultFailure: undefined as Error | undefined,
       acquisitionFailures: 0, actualRecovery: false, actualAcquisitions: 0,
       prepareBeforeFailures: 0, prepareAfterFailures: 0,
       terminationConfirmFailures: 0,
@@ -522,8 +524,14 @@ export function createSessionContinuityFixtures(testFilePath: string) {
           })()]);
         } finally { waiting.abort(); }
         await turn.externalProgress!.acknowledgeToolBatch(progress.lastToolBatchRevision);
+        if (controls.beforeToolsResultFailure) {
+          const failure = controls.beforeToolsResultFailure;
+          controls.beforeToolsResultFailure = undefined;
+          if (!controls.failAfterToolsKeepPage) pages.delete(turn.conversationKey!);
+          throw failure;
+        }
         await calls;
-        if (controls.failAfterToolsOnce) { controls.failAfterToolsOnce = false; if (!controls.failAfterToolsKeepPage) pages.delete(turn.conversationKey!); throw continuityError("continuity_session_lost"); }
+        if (controls.failAfterToolsOnce) { controls.failAfterToolsOnce = false; if (!controls.failAfterToolsKeepPage) pages.delete(turn.conversationKey!); throw controls.afterToolsFailure ?? continuityError("continuity_session_lost"); }
         if (controls.pauseAfterToolResults) {
           await new Promise<void>(resolve => { controls.releaseAfterToolResults = resolve; });
           controls.releaseAfterToolResults = undefined;

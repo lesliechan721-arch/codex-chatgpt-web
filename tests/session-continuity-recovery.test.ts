@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { continuityBindingsFor, continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { bindContinuityRequestScope } from "../src/adapters/chatgpt-web/continuity-request";
 import { leaveContinuityMode } from "../src/adapters/chatgpt-web/continuity-lifecycle";
 import { chatGptWebExecutionNamespace, createChatGptWebAdapter } from "./helpers/chatgpt-web-adapter";
@@ -356,9 +357,23 @@ for (const manual of [false, true]) test(`page lifecycle regression: ${manual ? 
   expect(f.submissions[1]!.claim.recovery!.epoch).not.toBe(f.submissions[0]!.claim.recovery!.epoch);
 });
 
-test("page lifecycle regression: a real harmless command runs once and its accepted result enters the replacement prompt", async () => {
-  const f = fixture();
+for (const { failure, retainedPage, taskUpdates, pageState, interleavedRequest } of [
+  { failure: "page-loss", retainedPage: false, taskUpdates: false, pageState: "ready", interleavedRequest: false },
+  { failure: "delivery-timeout", retainedPage: false, taskUpdates: false, pageState: "ready", interleavedRequest: false },
+  ...[false, true].flatMap(taskUpdates => (["ready", "running"] as const).flatMap(pageState =>
+    [false, true].map(interleavedRequest =>
+      ({ failure: "delivery-timeout", retainedPage: true, taskUpdates, pageState, interleavedRequest })))),
+] as const)
+test(`page lifecycle regression: a real harmless command runs once and its accepted result enters the replacement prompt (${failure}, retained=${retainedPage}, updates=${taskUpdates}, page=${pageState}, interleaved=${interleavedRequest})`, async () => {
+  const f = fixture(false, { taskUpdates });
+  f.controls.actualRecovery = retainedPage;
+  f.controls.nativeSourceTools = taskUpdates;
+  f.controls.failAfterToolsKeepPage = retainedPage;
   f.controls.invokeSourceTools = true; f.controls.singleSourceTool = true; f.controls.failAfterToolsOnce = true;
+  if (failure === "delivery-timeout") f.controls.afterToolsFailure = new ChatGptWebAdapterError(
+    "Message delivery timed out. Please try again.",
+    { status: 503, errorType: "server_error", code: "chatgpt_delivery_timeout", retryable: true },
+  );
   const counter = join(f.statePath, "safe-execution-count");
   f.controls.command = harmlessContinuityCommand(counter, "real recovery result");
   const original = f.request();
@@ -373,17 +388,101 @@ test("page lifecycle regression: a real harmless command runs once and its accep
   expect(processResult.exitCode, processResult.stderr.toString()).toBe(0);
   const raw = (original._rawBody as { input: unknown[] }).input;
   const result = { type: "function_call_output", call_id: call.id, output: stdout };
-  const resultInput = [...raw, result];
+  const resultInput = [...raw, currentRecordedCall(f.provider, original), result];
   const interrupted = await f.run(f.request("", "turn-first", resultInput));
-  expect(interrupted.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submitted_turn_failed" });
+  expect(interrupted.at(-1)).toMatchObject({ type: "error",
+    code: retainedPage ? "chatgpt_delivery_timeout" : "chatgpt_submitted_turn_failed" });
   f.controls.invokeSourceTools = false;
   expect(f.submissions).toHaveLength(1);
+  const before = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  const oldTab = f.recoveryHost.turnTabs.values().next().value;
+  if (retainedPage) {
+    expect(before.works[before.currentWorkId!]!.attempts.at(-1)!.sendEvidence?.status).toBe("accepted");
+    expect(before.calls[call.id]!.state).toBe("settled");
+    for (const page of f.pages.values()) page.state = pageState;
+    oldTab.status = pageState;
+  }
+  if (interleavedRequest) {
+    await expect(f.run(f.next(original))).rejects.toMatchObject({ code: "continuity_source_unproven" });
+    expect(f.submissions).toHaveLength(1);
+  }
   const recovered = await f.run(f.request("", "turn-first", resultInput));
   expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
   expect(readFileSync(counter, "utf8")).toBe("x");
   expect(f.submissions).toHaveLength(2);
   expect(f.submissions[1]!.prompt).toContain(stdout);
   expect(recovered.some(event => event.type === "tool_call_start")).toBe(false);
+  if (retainedPage) {
+    const after = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+    const attempts = after.works[before.currentWorkId!]!.attempts;
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]!.writerRetired).toBe(true);
+    expect(oldTab.destroyed).toBe(true);
+    expect(f.controls.actualAcquisitions).toBe(2);
+  }
+});
+
+for (const taskUpdates of [false, true]) test(`task delivery timeout waits for a late real result before retiring its writer (updates=${taskUpdates})`, async () => {
+  const f = fixture(false, { taskUpdates });
+  f.controls.actualRecovery = true;
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = true;
+  f.controls.nativeSourceTools = taskUpdates;
+  f.controls.failAfterToolsKeepPage = true;
+  f.controls.beforeToolsResultFailure = new ChatGptWebAdapterError("Message delivery timed out. Please try again.",
+    { status: 503, errorType: "server_error", code: "chatgpt_delivery_timeout", retryable: true });
+  const counter = join(f.statePath, "late-execution-count");
+  f.controls.command = harmlessContinuityCommand(counter, "late recovery result");
+  const original = f.request();
+  const events = await f.run(original);
+  const call = events.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start")!;
+  expect(call).toBeDefined();
+  const session = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(original)}`)!;
+  expect(await session.browserOutcome).toMatchObject({ type: "error", error: { code: "chatgpt_delivery_timeout" } });
+  const input = [...(original._rawBody as { input: unknown[] }).input, currentRecordedCall(f.provider, original)];
+  await expect(f.run(f.request("", "turn-first", input))).rejects.toMatchObject({ code: "continuity_execution_unsettled" });
+  const before = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  expect(before.calls[call.id]!.state).toBe("delivery-possible");
+  expect(before.works[before.currentWorkId!]!.attempts).toHaveLength(1);
+  expect(before.works[before.currentWorkId!]!.attempts[0]!.writerRetired).toBe(false);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.controls.actualAcquisitions).toBe(1);
+  const processResult = await $`${{ raw: f.controls.command }}`.quiet().nothrow();
+  expect(processResult.exitCode, processResult.stderr.toString()).toBe(0);
+  const stdout = processResult.stdout.toString();
+  f.controls.invokeSourceTools = false;
+  const recovered = await f.run(f.request("", "turn-first", [...input,
+    { type: "function_call_output", call_id: call.id, output: stdout }]));
+  expect(recovered.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(recovered.some(event => event.type === "tool_call_start")).toBe(false);
+  expect(readFileSync(counter, "utf8")).toBe("x");
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.prompt).toContain(stdout);
+  expect(f.controls.actualAcquisitions).toBe(2);
+  const after = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  expect(after.works[before.currentWorkId!]!.attempts[0]!.writerRetired).toBe(true);
+});
+
+test("task delivery timeout cannot turn an unconfirmed Send into a new attempt", async () => {
+  const f = fixture();
+  f.controls.actualRecovery = true;
+  const run = f.automatic.getMockImplementation()!;
+  f.automatic.mockImplementation(turn => run({ ...turn, onSubmitted: async () => {
+    throw new ChatGptWebAdapterError("Message delivery timed out. Please try again.",
+      { status: 503, errorType: "server_error", code: "chatgpt_delivery_timeout", retryable: true });
+  } }));
+  const original = f.request();
+  expect((await f.run(original)).at(-1)).toMatchObject({ type: "error", code: "chatgpt_delivery_timeout" });
+  for (const page of f.pages.values()) page.state = "ready";
+  for (const tab of f.recoveryHost.turnTabs.values()) tab.status = "ready";
+  expect((await f.run(f.request())).at(-1)).toMatchObject({ type: "error", code: "chatgpt_delivery_timeout" });
+  const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+  const attempts = record.works[record.currentWorkId!]!.attempts;
+  expect(attempts).toHaveLength(1);
+  expect(attempts[0]!.sendEvidence?.status).toBe("possible");
+  expect(attempts[0]!.writerRetired).toBe(false);
+  expect(f.submissions).toHaveLength(1);
+  expect(f.controls.actualAcquisitions).toBe(1);
 });
 
 for (const actualRecovery of [false, true]) for (const stage of ["prepared", "page-failed", "send-possible"] as const) test(`page lifecycle regression: a real exited backend ${actualRecovery && stage === "prepared" ? "pre-RPC page-possible" : stage} attempt permits current-request recovery actualLauncher=${actualRecovery}`, async () => {

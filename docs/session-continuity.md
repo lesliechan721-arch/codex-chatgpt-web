@@ -63,6 +63,18 @@ page's payload, owner, history, tool-result, and compaction conflict checks. Mat
 still attach or replay. An HTTP disconnect or user interrupt alone does not establish page loss
 and does not start a task in the background.
 
+An explicit service delivery-timeout alert in the current response can end that response while
+its page remains available. A retry can enter the existing fenced recovery flow only when the
+original Send is confirmed accepted and every issued tool call has a verified real result body.
+The old writer is isolated before a replacement attempt; its accepted results enter the new
+context without redispatching their commands. Pending results and unconfirmed Send keep the
+no-resend boundary. A frozen page or missing final answer alone does not provide this evidence.
+Queued continuations and explicitly retried tasks use the same recovery checks and retain their
+original initial input delivery. After the accepted prior writer is retired, the recovered work's
+final receipt completes only that work's inputs under the same task and execution intent. Later
+inputs keep their own delivery and completion boundaries. Recovery does not receive the same
+input again.
+
 When the page is closed or its state is unknown, revoke the old project-controlled execution
 generation and use the current authenticated request to create a new generation. Make a best effort
 to cancel old helper, Broker, Launcher, and tool work. Do not wait for an unavailable old Send,

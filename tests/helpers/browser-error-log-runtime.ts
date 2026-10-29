@@ -43,6 +43,15 @@ const cases = [
   { name: "cancelled", failure: () => new ChatGptWebAdapterError(`Client cancelled request. ${sensitiveBody}`, {
     status: 499, errorType: "client_closed_request", code: "client_cancelled", retryable: false,
   }), reason: "task_cancelled", code: "client_cancelled" },
+  { name: "delivery-timeout", failure: () => new ChatGptWebAdapterError(`Delivery timed out. ${sensitiveBody}`, {
+    status: 503, errorType: "server_error", code: "chatgpt_delivery_timeout", retryable: true,
+  }), reason: "execution_timeout", code: "chatgpt_delivery_timeout" },
+  { name: "stale-capabilities", failure: () => new ChatGptWebAdapterError(`Refresh installed models. ${sensitiveBody}`, {
+    status: 409, errorType: "invalid_request_error", code: "chatgpt_capabilities_stale", retryable: false,
+  }), reason: "browser_execution_failed", code: "chatgpt_capabilities_stale" },
+  { name: "unknown-model-controls", failure: () => new ChatGptWebAdapterError(`Model controls unavailable. ${sensitiveBody}`, {
+    status: 409, errorType: "invalid_request_error", code: "chatgpt_model_controls_unavailable", retryable: false,
+  }), reason: "browser_execution_failed", code: "chatgpt_model_controls_unavailable" },
   { name: "unknown-adapter", failure: () => new ChatGptWebAdapterError(sensitiveBody, {
     status: 502, errorType: sensitiveErrorSamples[0]!, code: sensitiveErrorSamples[3]!, retryable: false,
     cause: new Error(sensitiveBody),

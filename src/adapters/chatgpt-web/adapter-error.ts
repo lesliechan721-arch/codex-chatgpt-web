@@ -28,6 +28,7 @@ export class ChatGptWebAdapterError extends Error {
 // Exact implementation codes are safe to log. Pattern checks alone can accept a credential.
 const browserLogCodes = new Set([
   "browser_interaction_mode_mismatch", "browser_stream_inconsistent", "chatgpt_effort_locked",
+  "chatgpt_capabilities_stale", "chatgpt_model_controls_unavailable", "chatgpt_delivery_timeout",
   "chatgpt_attachment_upload_failed", "chatgpt_response_incomplete", "chatgpt_security_check", "chatgpt_session_expired",
   "chatgpt_sign_in_required", "chatgpt_stopped_thinking", "chatgpt_subscription_unavailable",
   "chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed", "client_cancelled", "client_closed_request",
