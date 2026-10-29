@@ -76,11 +76,16 @@ test("synchronization rejects a local release tag moved away from the official c
     run("git", ["tag", tag], root);
     const preload = join(root, "preload.cjs");
     writeFileSync(preload, `
-global.fetch = async url => Response.json(String(url).includes("/git/")
+global.fetch = async url => {
+  if (String(url).includes("/releases/") && !String(url).endsWith(${JSON.stringify(`/releases/tags/${tag}`)})) {
+    throw new Error("synchronization did not request the selected release tag");
+  }
+  return Response.json(String(url).includes("/git/")
   ? { object: { type: "commit", sha: ${JSON.stringify(official)} } }
   : { tag_name: ${JSON.stringify(tag)}, draft: false, prerelease: false, assets: [] });
+};
 `);
-    const result = spawnSync(process.execPath, ["--preload", preload, join(import.meta.dir, "../scripts/generate-codex-model-artifacts.ts"), `--source=${root}`], {
+    const result = spawnSync(process.execPath, ["--preload", preload, join(import.meta.dir, "../scripts/generate-codex-model-artifacts.ts"), `--source=${root}`, `--tag=${tag}`], {
       cwd: root, encoding: "utf8", timeout: 30_000,
       env: { ...process.env, CODEX_SOURCE_DIR: undefined, CODEX_RELEASE_DIR: undefined },
     });
@@ -89,6 +94,18 @@ global.fetch = async url => Response.json(String(url).includes("/git/")
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("synchronization rejects invalid release tags and cannot override the lock during verification", () => {
+  const script = join(import.meta.dir, "../scripts/generate-codex-model-artifacts.ts");
+  for (const tag of ["", "latest", "0.165.0", "rust-v0.165.0-alpha.1"]) {
+    const result = spawnSync(process.execPath, [script, `--tag=${tag}`], { encoding: "utf8", timeout: 30_000 });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Expected --tag=rust-v<major>.<minor>.<patch>");
+  }
+  const result = spawnSync(process.execPath, [script, "--check", "--tag=rust-v0.0.0"], { encoding: "utf8", timeout: 30_000 });
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain("--check must use the locked Codex release tag");
 });
 
 test("a second CLI extraction cannot overwrite the first caller's executable", () => {

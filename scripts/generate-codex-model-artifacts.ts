@@ -10,6 +10,13 @@ const sourceLock = JSON.parse(readFileSync(lockPath, "utf8")) as SourceLock;
 const sourceArg = process.argv.find(argument => argument.startsWith("--source="))?.slice("--source=".length)
   ?? process.env.CODEX_SOURCE_DIR;
 const checkOnly = process.argv.includes("--check");
+const releaseTag = process.argv.find(argument => argument.startsWith("--tag="))?.slice("--tag=".length);
+if (releaseTag !== undefined && !/^rust-v\d+\.\d+\.\d+$/.test(releaseTag)) {
+  throw new Error("Expected --tag=rust-v<major>.<minor>.<patch>");
+}
+if (checkOnly && releaseTag !== undefined && releaseTag !== sourceLock.tag) {
+  throw new Error("--check must use the locked Codex release tag");
+}
 const schemaPath = join(generatedDir, "codex-model-info.schema.json");
 const schemaArtifact = JSON.parse(readFileSync(schemaPath, "utf8")) as {
   schema: Record<string, unknown>;
@@ -18,7 +25,7 @@ const schemaArtifact = JSON.parse(readFileSync(schemaPath, "utf8")) as {
 
 // Only synchronization follows latest. Verification uses the recorded stable release.
 if (checkOnly && !sourceLock.tag) throw new Error("Codex source lock must identify a stable release tag");
-const release = await fetchRelease(checkOnly ? sourceLock.tag : undefined, checkOnly ? sourceLock.revision : undefined);
+const release = await fetchRelease(checkOnly ? sourceLock.tag : releaseTag, checkOnly ? sourceLock.revision : undefined);
 const temporaryRoot = process.env.CODEX_RELEASE_DIR ? undefined : mkdtempSync(join(tmpdir(), "codex-model-metadata-"));
 const directory = process.env.CODEX_RELEASE_DIR ?? temporaryRoot!;
 let binary: string | undefined;

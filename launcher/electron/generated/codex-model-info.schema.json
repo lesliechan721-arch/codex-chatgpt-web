@@ -1,15 +1,17 @@
 {
   "version": 2,
-  "revision": "01fc69f4026735edfdf6789820549727a4867b11",
+  "revision": "360319d8dee62d87e2d59fc0c21805d79519cfed",
   "sourceFiles": {
-    "protocol/src/openai_models.rs": "4c8b5cafd8c55db269f669e352321f787fcaf83785bce4476cb887abfce75dc6",
-    "protocol/src/openai_models/access_programs.rs": "6c8a785431a5a79650279ca702c360d1188a6012828fda538e5eedfc9dba25ce",
+    "protocol/src/openai_models.rs": "26c1127450a3b29efbdc094af8fa2218163a735a59ad1c10843cb89e4807cbf7",
+    "protocol/src/openai_models/access_programs.rs": "bbd3bbfe18fe12263d432ae9906e7d67cf03986f5331915a165bbca3c982e3bc",
+    "protocol/src/openai_models/incremental_tools.rs": "506904d09fcfb4d74377f08cbb187ee8967f19d1130dc816bcd63fb9d97d763f",
+    "protocol/src/openai_models/memento_v2.rs": "919308017fa011d98d4aba6aff749e45fe5292c5a40f0670a9a2e9c748e655ca",
     "protocol/src/openai_models/guardian.rs": "dfe32eebcf97c4004de18f9d312510c01f532e795566d34913445dd59cde541b",
-    "protocol/src/openai_models/guardian_v2.rs": "0e086c9cb2960f38c8f835a5161edf1c4a9552720115f30614715ee28e5e53c4",
+    "protocol/src/openai_models/guardian_v2.rs": "a87d787b4c6565d31e374aad16d287858543fb1c31534c8948a3e600e9ca3e1e",
     "protocol/src/openai_models/reasoning_effort.rs": "62089cb92996bb0030d4a219a6ba06b3bcf8f2f45e95ef7204bc8632d07ea08d",
     "protocol/src/config_types.rs": "ce9b26223db7cc4b5cf474e571e4509e8cc52536e159510f153f94de0fcd37e8",
-    "protocol/src/protocol.rs": "d3d3d384da91b2824c10091de4331a2bc26ec5474887ed0aef1e3f3c4ae110f4",
-    "protocol/src/turn_input.rs": "fb7d3e20230af079cac0ce4b52fd78d0452c54519438adbe74941bde3be4bad0"
+    "protocol/src/protocol.rs": "7b896ec457c55d6d8edb959cc08cc7e903fbc73b643cbe98cccec66c2325b1e4",
+    "protocol/src/turn_input.rs": "93b69518afdfe5cae66eae6c6a36410f72a445c5734b0aba20a53a4f265712aa"
   },
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -48,6 +50,14 @@
           }
         },
         "type": "object"
+      },
+      "AsyncClassifierMode": {
+        "description": "Async classifier experiment, resolved once for each parent task.",
+        "enum": [
+          "snapshot",
+          "conversation"
+        ],
+        "type": "string"
       },
       "AutoReviewMessages": {
         "properties": {
@@ -172,8 +182,34 @@
         },
         "type": "object"
       },
+      "ContextManagementToolMessages": {
+        "description": "Model-owned context-window control tool definitions.",
+        "properties": {
+          "get_context_remaining": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "new_context": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CyberAccessProgram": {
-        "description": "Requested cyber treatment for a ChatGPT-authenticated Codex turn. Authorization and model-tier restrictions remain server-owned.",
+        "description": "Requested cyber treatment for an OpenAI model turn. Authorization and model-tier restrictions remain server-owned.",
         "enum": [
           "standard",
           "daybreak_blue",
@@ -310,6 +346,25 @@
       "GuardianV2ModelConfig": {
         "description": "Optional model-owned defaults for Guardian v2 classification experiments.",
         "properties": {
+          "async_classifier_conversation_token_limit": {
+            "description": "Reset retained async history when the next request exceeds this token estimate.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "async_classifier_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/AsyncClassifierMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "classifier_instructions": {
             "type": [
               "string",
@@ -446,8 +501,98 @@
         },
         "type": "object"
       },
+      "HistoryToolMessages": {
+        "description": "Model-owned history namespace and public tool definitions.",
+        "properties": {
+          "list_items": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "list_windows": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "namespace_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_item": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_contents": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "IncrementalToolMessages": {
+        "description": "Incremental tool notice overrides; missing/null or >512-byte values use bundled defaults. Empty strings omit static text but retain runtime names and instructions.",
+        "properties": {
+          "namespace_instructions_cleared": {
+            "description": "Message supporting `{name}` when a namespace's instructions are cleared.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace_instructions_prefix": {
+            "description": "Prefix supporting `{name}`; the namespace instructions are appended verbatim.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "removed_namespaces_header": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "removed_tools_header": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_update_hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "IndirectDescriptionPrefixes": {
-        "description": "Plain-text prefixes for Code Mode documentation, ALL_TOOLS, and loaded tool-search namespaces. Values are trimmed, and selectors for the same final namespace must agree, including empty values. Empty values add no prefix; unregistered targets are ignored.",
+        "description": "Plain-text prefixes for Code Mode documentation, ALL_TOOLS, and loaded tool-search namespaces. Flat indirect entries carry these before any per-function prefix. Values are trimmed, and selectors for the same final namespace must agree, including empty values. Empty values add no prefix; unregistered targets are ignored.",
         "properties": {
           "mcp_servers": {
             "additionalProperties": {
@@ -582,31 +727,8 @@
         ],
         "type": "object"
       },
-      "ModelInstructionsVariables": {
-        "properties": {
-          "personality_default": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "personality_friendly": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "personality_pragmatic": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "ModelMessages": {
-        "description": "A strongly-typed template for assembling model instructions and developer messages.\n\n`instructions_template` is literal text. The deprecated `instructions_variables` field is retained to decode catalogs produced before personality selection was removed.",
+        "description": "A strongly-typed template for assembling model instructions and developer messages.\n\n`instructions_template`: Formerly a personality template, now literal text. The name is retained for model catalog compatibility.",
         "properties": {
           "approvals": {
             "anyOf": [
@@ -649,6 +771,13 @@
             ],
             "description": "Replacement confirmation-policy documents forwarded in actor MCP request metadata."
           },
+          "content_filter_guidance": {
+            "description": "Developer guidance after a content-filter block. Missing, null, blank, or values over 512 UTF-8 bytes use the bundled guidance.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "guardian_v2": {
             "anyOf": [
               {
@@ -663,16 +792,6 @@
             "type": [
               "string",
               "null"
-            ]
-          },
-          "instructions_variables": {
-            "anyOf": [
-              {
-                "$ref": "#/definitions/ModelInstructionsVariables"
-              },
-              {
-                "type": "null"
-              }
             ]
           },
           "multi_agent": {
@@ -1022,8 +1141,77 @@
         ],
         "type": "string"
       },
+      "NotesToolMessages": {
+        "description": "Model-owned notes namespace and public tool definitions.",
+        "properties": {
+          "append_to_file": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "list_files_by_prefix": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "namespace_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_file": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search_contents": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "write_file": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ToolMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PermissionMessages": {
         "properties": {
+          "approved_prefixes": {
+            "description": "Supports `{{ approved_prefixes }}`. Missing or null uses the bundled text; an empty string suppresses the approved-prefix section.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "danger_full_access": {
             "type": [
               "string",
@@ -1037,6 +1225,20 @@
             ]
           },
           "workspace_write": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "writable_root": {
+            "description": "Single writable-root sentence with exactly one `{{ roots }}` placeholder. Missing, null, empty, invalid, or oversized templates use the bundled sentence.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "writable_roots": {
+            "description": "Multiple writable-roots sentence with exactly one `{{ roots }}` placeholder. Missing, null, empty, invalid, or oversized templates use the bundled sentence.",
             "type": [
               "string",
               "null"
@@ -1103,7 +1305,7 @@
             ]
           },
           "parameters": {
-            "description": "Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait, request_user_input_async (the send_user_message_async catalog key), and MCP resource helpers. Uses the harness's supported schema subset; unrecognized keywords are ignored. Missing, null, invalid or unsupported structures, or a root without `type: \"object\"` retains the harness parameters. Schema semantics must remain API-compatible. Overrides must declare harness-encrypted properties so their annotations can be retained. Argument handling is unchanged.",
+            "description": "Complete JSON Schema encoded as a string. Consumed by Multi-Agent V2 tools, Code Mode wait, request_user_input_async (the send_user_message_async catalog key), MCP resource helpers, and Memento V2 tools. Uses the harness's supported schema subset; unrecognized keywords are ignored. Missing, null, invalid or unsupported structures, or a root without `type: \"object\"` retains the harness parameters. Schema semantics must remain API-compatible. Overrides must declare harness-encrypted properties so their annotations can be retained. Argument handling is unchanged.",
             "type": [
               "string",
               "null"
@@ -1113,7 +1315,7 @@
         "type": "object"
       },
       "ToolMessages": {
-        "description": "Model-owned tool messages and indirect namespace guidance.",
+        "description": "Model-owned tool messages and description prefixes.",
         "properties": {
           "code_mode": {
             "anyOf": [
@@ -1124,6 +1326,49 @@
                 "type": "null"
               }
             ]
+          },
+          "context_management": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ContextManagementToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Memento V2 context-window control tool definitions."
+          },
+          "functions_namespace_functions_description_prefixes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Prefixes for individual functions in the `functions` namespace, keyed by unqualified name. Applies to direct declarations, Code Mode, and tool search, including custom tools. Values are trimmed; empty values and unavailable functions add nothing. The trimmed values for available functions plus separating blank lines must fit in 256 UTF-8 bytes in total. This bounds the added text, not the complete definition or its token count. Other namespaces are never affected.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "history": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/HistoryToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native Memento V2 history tool definitions, independent of runtime namespace aliases."
+          },
+          "incremental_tools": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/IncrementalToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional wording for incremental catalog notices."
           },
           "indirect_description_prefixes": {
             "anyOf": [
@@ -1155,6 +1400,17 @@
                 "type": "null"
               }
             ]
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/NotesToolMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native Memento V2 notes tool definitions."
           },
           "send_user_message_async": {
             "anyOf": [

@@ -59,6 +59,7 @@ const smokeUpstream = parseUpstreamProviderConfig({
   proxy: { mode: "direct" },
   models: [
     { id: "smoke/upstream", metadata: { mode: "upstream" } },
+    { id: "smoke/fallback", metadata: { mode: "fallback" } },
     {
       id: "smoke/custom",
       metadata: { mode: "custom", baseMode: "fallback", overrides: { display_name: "Smoke Custom" } },
@@ -68,7 +69,7 @@ const smokeUpstream = parseUpstreamProviderConfig({
 });
 const smokeModels = normalizeUpstreamModelCatalog({
   object: "list",
-  data: [{ id: "smoke/upstream" }, { id: "smoke/custom" }],
+  data: [{ id: "smoke/upstream" }, { id: "smoke/fallback" }, { id: "smoke/custom" }],
   models: [{ slug: "smoke/upstream", description: "Upstream metadata mapping smoke" }],
 }, smokeUpstream, "disabled");
 writeFileSync(catalogPath, `${JSON.stringify({
@@ -91,6 +92,9 @@ try {
   const catalog = JSON.parse(result.stdout) as {
     models?: Array<{
       slug?: string;
+      display_name?: string;
+      shell_type?: string;
+      model_messages?: { instructions_template?: string };
       supported_reasoning_levels?: unknown[];
       multi_agent_version?: string;
       supported_in_api?: boolean;
@@ -155,6 +159,14 @@ try {
   }
   if (customSmoke?.display_name !== "Smoke Custom" || customSmoke.shell_type !== "disabled") {
     throw new Error(`Codex did not accept normalized custom metadata: ${JSON.stringify(customSmoke)}`);
+  }
+  const fallbackSmoke = catalog.models?.find(model => model.slug === "smoke/fallback");
+  const fallbackMessages = smokeModels.models.find(model => model.slug === "smoke/fallback")?.model_messages as
+    { instructions_template: string };
+  if (fallbackSmoke?.display_name !== "smoke/fallback" || fallbackSmoke.shell_type !== "disabled"
+    || fallbackSmoke.priority !== 99 || fallbackSmoke.supported_reasoning_levels?.length !== 0
+    || fallbackSmoke.model_messages?.instructions_template !== fallbackMessages.instructions_template) {
+    throw new Error(`Codex did not accept minimal fallback metadata: ${JSON.stringify(fallbackSmoke)}`);
   }
   process.stdout.write("NATIVE_CODEX_CATALOG_SMOKE_OK\n");
 } finally {

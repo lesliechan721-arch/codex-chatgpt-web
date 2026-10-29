@@ -139,6 +139,36 @@ test("generic fallback is conservative and changes shell_type only from the proj
   }
 });
 
+test("ModelInfo accepts current model messages and rejects removed or malformed fields", () => {
+  const baseline = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "fallback" }, emptyDiscovery(), "disabled").model;
+  const modelMessages = {
+    ...baseline.model_messages,
+    content_filter_guidance: "Offer a permitted alternative.",
+    guardian_v2: { async_classifier_mode: "conversation", async_classifier_conversation_token_limit: 1000 },
+    permissions: { approved_prefixes: "{{ approved_prefixes }}", writable_root: "Root: {{ roots }}.", writable_roots: null },
+    tools: {
+      history: { namespace_description: "History", read_item: { description: "Read an item." } },
+      notes: { write_file: { parameters: '{"type":"object"}' } },
+      context_management: { new_context: {}, get_context_remaining: null },
+      incremental_tools: { tool_update_hint: "Tools changed.", namespace_instructions_prefix: "{name}:" },
+      functions_namespace_functions_description_prefixes: { exec_command: "Run a command." },
+    },
+  };
+  assert.equal(metadata.finalModelError({ ...baseline, model_messages: modelMessages }), null);
+  for (const changes of [
+    { instructions_variables: { personality_default: "removed" } },
+    { guardian_v2: { async_classifier_mode: "invalid" } },
+    { guardian_v2: { async_classifier_conversation_token_limit: -1 } },
+    { tools: { notes: { write_file: "invalid" } } },
+    { tools: { functions_namespace_functions_description_prefixes: { exec_command: 123 } } },
+  ]) {
+    assert.notEqual(metadata.finalModelError({ ...baseline, model_messages: { ...modelMessages, ...changes } }), null);
+  }
+  const discovery = metadata.parseUpstreamDiscovery({ models: [{ slug: UNKNOWN_ID, model_messages: modelMessages }] });
+  const upstream = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "upstream" }, discovery, "disabled");
+  assert.deepEqual(upstream.model.model_messages, baseline.model_messages);
+});
+
 test("custom metadata uses a shallow field overlay, permits schema nulls, and rejects unknown, invalid, protected, or invariant fields", () => {
   const discovery = emptyDiscovery();
   const configured = {

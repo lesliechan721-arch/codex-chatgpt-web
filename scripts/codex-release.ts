@@ -74,6 +74,8 @@ export function verifyDigest(value: Uint8Array, digest: string): void {
 export const SCHEMA_SOURCE_FILES = [
   "protocol/src/openai_models.rs",
   "protocol/src/openai_models/access_programs.rs",
+  "protocol/src/openai_models/incremental_tools.rs",
+  "protocol/src/openai_models/memento_v2.rs",
   "protocol/src/openai_models/guardian.rs",
   "protocol/src/openai_models/guardian_v2.rs",
   "protocol/src/openai_models/reasoning_effort.rs",
