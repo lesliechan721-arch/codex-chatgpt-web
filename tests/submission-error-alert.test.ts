@@ -1,11 +1,12 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { chromium } from "playwright-core";
 import { ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver } from "../src/adapters/chatgpt-web/browser-worker";
 
 const tooLong = "The message you submitted was too long, please edit it and resubmit.";
 
 for (const freshAlert of [false, true]) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`physical Send keeps the alert baseline and its native identity (fresh alert=${freshAlert})`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`physical Send keeps the alert baseline and its native identity (fresh alert=${freshAlert})`, async () => {
     const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
     const observer = new ChatGptSubmissionRejectionObserver();
     try {
@@ -62,7 +63,7 @@ for (const freshAlert of [false, true]) {
   }, 30_000);
 }
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a new service size alert survives removal of the current conversation DOM (#874)", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("a new service size alert survives removal of the current conversation DOM (#874)", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const observer = new ChatGptSubmissionRejectionObserver();
   try {
@@ -78,7 +79,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a new service size alert sur
   } finally { observer.dispose(); await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("size alerts require a current owned Send and exclude history, quoted text and hidden UI", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("size alerts require a current owned Send and exclude history, quoted text and hidden UI", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const failures: unknown[] = [];
   const observer = new ChatGptSubmissionRejectionObserver(error => failures.push(error));

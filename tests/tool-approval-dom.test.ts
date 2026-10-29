@@ -1,8 +1,9 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { chromium, type Page } from "playwright-core";
 import { resolveChatGptToolConfirmation, throwIfChatGptToolApprovalRequired } from "../src/adapters/chatgpt-web/browser-worker";
 
-const domTest = test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER);
+const domTest = optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER");
 
 // Semantic fixture from the Oct 19 screenshot/AX text and the saved role=alert
 // checkpoint. This models the permission card, not a verbatim HTML capture.

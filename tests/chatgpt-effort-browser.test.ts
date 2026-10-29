@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { chromium } from "playwright-core";
 import { ChatGptBrowserWorker, setChatGptThinkMode } from "../src/adapters/chatgpt-web/browser-worker";
@@ -6,7 +7,7 @@ import { CHATGPT_COMPOSER_SELECTOR } from "../src/chatgpt-ui/composer";
 import { detectChatGptAccountCapabilities } from "../src/chatgpt-session";
 import { assertChatGptModelFamily } from "../src/adapters/chatgpt-web/model-selection";
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-5.6 Pro verifies the split model/effort header before Send (#875)", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("GPT-5.6 Pro verifies the split model/effort header before Send (#875)", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -28,7 +29,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-5.6 Pro verifies the spl
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think uses the active editor in both composer layouts and survives its replacement", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("Think uses the active editor in both composer layouts and survives its replacement", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -58,7 +59,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think uses the active editor
 }, 30_000);
 
 for (const picker of ["classic", "power", "gpt6"])
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`model selection reuses the ${picker} picker without racing Escape cleanup`, async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`model selection reuses the ${picker} picker without racing Escape cleanup`, async () => {
   const modern = picker !== "classic";
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
@@ -103,7 +104,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`model selection reuses the $
 
 // Captured in the Plus DEV launcher on Oct 8: the new default row is just "6",
 // the model toggle omits aria-hidden, and GPT-6's header shows only the effort.
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 and GPT-5.6 remain distinct across effort changes and pre-send verification", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("GPT-6 and GPT-5.6 remain distinct across effort changes and pre-send verification", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -153,7 +154,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 and GPT-5.6 remain dis
 }, 30_000);
 
 for (const scenario of ["hydrate", "shrink", "locked", "pro-disappears"])
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`real slider ${scenario} keeps the requested available effort`, async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`real slider ${scenario} keeps the requested available effort`, async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -202,7 +203,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`real slider ${scenario} keep
 
 // Sliderless-picker reproduction and initial regression cases contributed in #876.
 for (const scenario of ["immediate", "delayed", "missing-family", "cancelled-slider"])
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`smoke handles a sliderless default picker (${scenario})`, async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`smoke handles a sliderless default picker (${scenario})`, async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -270,7 +271,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`smoke handles a sliderless d
 }, 15_000);
 
 // Luna has no model/effort control; keep the real probe's full absence budget.
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("smoke uses Luna when the composer has no model or effort control", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("smoke uses Luna when the composer has no model or effort control", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();

@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,7 +21,7 @@ async function cleanupStep<T>(name: string, run: () => Promise<T>): Promise<T> {
   }
 }
 
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("navigated Electron task pages stay usable before delayed resources finish", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("navigated Electron task pages stay usable before delayed resources finish", async () => {
   const userData = mkdtempSync(join(tmpdir(), "launcher-navigation-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;

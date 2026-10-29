@@ -6,6 +6,7 @@ import { parseTimingData, repositoryTestFiles } from "./test-timing-history";
 import { coldShardFiles, loadShardPlan, plannedShardFiles, testFileSetDigest, testLogResult, type LoadedShardPlan } from "./test-shards";
 import { verificationCommands } from "./verify";
 import { validateShardSelection, type ShardSelection } from "./select-test-shard-artifacts";
+import { optionalBrowserSkip, validOptionalBrowserRules } from "./optional-browser-tests";
 
 export type ShardEvidence = {
   directory: string; summary: any; completion: any; timings: string | null; stdout: string | null; stderr: string | null;
@@ -48,6 +49,10 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   const reasons: string[] = [];
   const require = (condition: unknown, reason: string) => { if (!condition) reasons.push(reason); };
   const files = [...input.files].sort();
+  const optionalBrowsers = input.skipEvidence?.optionalBrowsers ?? [];
+  const validBrowserPolicy = validOptionalBrowserRules(optionalBrowsers, files);
+  require(validBrowserPolicy, "invalid-optional-browser-policy");
+  const explicitSkips: string[] = [];
   require(files.length > 0 && new Set(files).size === files.length, "invalid-repository-file-set");
   require(input.shards.length === 2, "missing-or-extra-shards");
   for (const job of ["shard1", "shard2", "package"]) require(input.jobResults[job] === "success", `job-not-success:${job}`);
@@ -123,6 +128,12 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
       require(sameFiles(logs.executedFiles, target) && logs.reportedFiles === target.length && equal(logs.counts, summary.counts), `${label}:log-result-mismatch`);
       require(equal(logs.skipIdentities, summary.skipIdentities) && logs.skipIdentities.length === logs.counts.skip, `${label}:skip-identities-mismatch`);
       executed.push(...logs.executedFiles); skipped.push(...logs.skipIdentities);
+      for (const identity of logs.skipIdentities) {
+        const optional = optionalBrowserSkip(identity);
+        if (!optional) { explicitSkips.push(identity); continue; }
+        require(validBrowserPolicy && optionalBrowsers.some(rule => rule.environment === optional.environment && rule.files.includes(optional.file))
+          && summary.optionalBrowserRuntimes?.[optional.environment] === false, `${label}:unauthorized-optional-skip:${identity}`);
+      }
     }
     try {
       if (evidence.timings === null) throw new Error();
@@ -143,6 +154,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
   }
   require(indexes.size === 2, "missing-shard-index");
   require(sameFiles(executed, files), "incomplete-or-duplicate-suite-coverage");
+  require(new Set(skipped).size === skipped.length, "duplicate-skip-identities");
   const skipEvidence = input.skipEvidence;
   if (skipped.length || skipEvidence !== undefined) {
     require(skipEvidence?.version === 1 && equal(skipEvidence.source, common && {
@@ -150,7 +162,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
     const entries = skipEvidence?.entries;
     require(Array.isArray(entries) && entries.every(entry => files.includes(entry?.file) && typeof entry?.name === "string" && entry.name.length > 0
       && typeof entry?.reason === "string" && entry.reason.trim().length > 0)
-      && sameFiles(entries.map(entry => `${entry.file}::${entry.name}`), skipped), "unreviewed-or-mismatched-skips");
+      && sameFiles(entries.map(entry => `${entry.file}::${entry.name}`), explicitSkips), "unreviewed-or-mismatched-skips");
   }
   const verify = input.verify;
   require(verify?.version === 2 && verify.success === true && verify.failure === null && verify.fullSuite === false
@@ -187,14 +199,16 @@ export function loadSkipPolicy(root: string, path: string, files: string[], sour
     throw new Error("Invalid skip policy version or review provenance.");
   }
   const entries = policy.entries;
-  if (!Array.isArray(entries) || entries.length === 0 || !entries.every(entry => files.includes(entry?.file)
+  const optionalBrowsers = policy.optionalBrowsers ?? [];
+  if (!validOptionalBrowserRules(optionalBrowsers, files)) throw new Error("Invalid optional browser skip rules.");
+  if (!Array.isArray(entries) || entries.length + optionalBrowsers.length === 0 || !entries.every(entry => files.includes(entry?.file)
     && typeof entry?.name === "string" && entry.name.trim().length > 0
     && typeof entry?.reason === "string" && entry.reason.trim().length > 0)
     || new Set(entries.map(entry => `${entry.file}::${entry.name}`)).size !== entries.length) {
     throw new Error("Skip policy requires unique known test identities and nonempty reasons.");
   }
   if (!hash(source.revision, 40) || !hash(source.patchDigest, 64) || !hash(source.toolDigest, 64)) throw new Error("Unknown skip policy gate source.");
-  return { version: 1, source: { revision: source.revision, patchDigest: source.patchDigest, toolDigest: source.toolDigest }, entries,
+  return { version: 1, source: { revision: source.revision, patchDigest: source.patchDigest, toolDigest: source.toolDigest }, entries, optionalBrowsers,
     policy: { version: policy.version, path: relative(root, path).replaceAll("\\", "/"),
       sha256: createHash("sha256").update(bytes).digest("hex"), reviewedSource: policy.reviewedSource } };
 }

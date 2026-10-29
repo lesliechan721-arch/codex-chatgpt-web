@@ -30,6 +30,7 @@
     "dev:chat": "bun run src/cli.ts dev chat",
     "test": "bun run scripts/profile-tests.ts",
     "test:profile": "bun run test",
+    "test:browsers": "bun run scripts/test-optional-browsers.ts",
     "test:parallel": "bun run test --parallel=2",
     "test:compare": "bun run scripts/compare-test-performance.ts",
     "audit": "bun audit",

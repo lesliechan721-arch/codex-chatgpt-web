@@ -449,16 +449,28 @@ gh workflow run windows-performance.yml --repo OWNER/REPO --ref BRANCH -f condit
 
 ## Reviewed platform skips
 
-`.github/windows-test-skips.json` stores each permitted Windows skip by test file, test
-name and reason. Intel uses the separate
-`.github/macos-intel-test-skips.json` policy, including Windows-only skips and the macOS
-tests that must run. The gate binds the policy to the current run and requires the observed
-skip identities to match exactly. It never generates an allowlist from the current run.
+`.github/windows-test-skips.json` and `.github/macos-intel-test-skips.json` keep platform
+and temporary exclusions in `entries`, with an exact test file, name and reason. The gate
+binds the policy to the current run and requires these skips to match exactly. Renaming,
+removing or enabling an explicitly listed test requires updating its entry.
 
-Test source edits do not require policy updates unless the permitted skips change.
-New skips require a reason; renaming, removing or enabling a listed test also requires
-updating its policy entry. Missing entries, duplicate identities or unknown skips fail
-the gate.
+Optional Chromium and Electron tests use `optionalBrowserTest` from
+`tests/helpers/optional-browser-test.ts`. Each policy declares their files, required
+environment variable and reason in `optionalBrowsers`. The helper marks a skip only when
+the required executable path is unset or empty. The shard report records whether each
+runtime was configured. The gate accepts a marked skip only for a declared file and a
+runtime reported as missing. A configured but broken executable fails the test. Renaming
+or splitting these tests needs no policy update; adding a test file requires registration.
+An ordinary `.skip` in a registered browser file still needs an explicit entry.
+
+Browser tests run on demand with `bun run test:browsers`; CI does not install the optional
+browser runtimes. Set `CHATGPT_DOM_TEST_BROWSER` and `LAUNCHER_TEST_ELECTRON` to their
+executable paths before running the command. It executes all registered browser files and
+fails on any skip, test failure or missing file.
+
+The policy never accepts arbitrary skips from the current run.
+Duplicate identities and unknown skips still fail the aggregate gate. Source, shard coverage,
+job status and non-server verification checks also remain required.
 
 ```sh
 bun run scripts/aggregate-test-shards.ts --artifacts=/path/to/separate-artifacts --job-results=/path/to/jobs.json --output=/path/to/aggregate.json --skip-policy=.github/windows-test-skips.json --shard-plan=.github/windows-test-shards.json --mode=timing

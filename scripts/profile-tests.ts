@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { collectPerformanceReports } from "./test-performance-reports";
 import { assertColdShardEnvironment, coldShardFiles, loadShardPlan, parseTestShard, plannedShardFiles, testFileSetDigest, testSkipIdentities, type TestShard } from "./test-shards";
 import { performanceSource } from "./test-performance-source";
+import { optionalBrowserRuntimes } from "./optional-browser-tests";
 import { finalizeFileTimings, prepareTimingHistory, repositoryTestFiles, targetTestFiles, timingCompatibility, timingMetadata } from "./test-timing-history";
 
 const root = resolve(import.meta.dir, "..");
@@ -201,7 +202,7 @@ export async function profileTests(args: string[]): Promise<number> {
     const summary = { version: shard ? plan ? 6 : 5 : 4,
       ...(shard ? { fullSuite: false, shard: { ...shard, repositoryFiles: expectedFiles, repositoryFilesDigest: testFileSetDigest(expectedFiles),
         expectedFiles: targetFiles, ...(plan ? { plan: { path: plan.path, digest: plan.digest } } : {}) }, workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
-        repository: process.env.GITHUB_REPOSITORY ?? null }, skipIdentities: testSkipIdentities(stderr),
+        repository: process.env.GITHUB_REPOSITORY ?? null }, skipIdentities: testSkipIdentities(stderr), optionalBrowserRuntimes: optionalBrowserRuntimes(env),
         evidence: { summary: "summary.json", completion: "completion.json", stdout: "stdout.log", stderr: "stderr.log", timings: "file-timings.json" } } : {}), runId, platform: process.platform, arch: process.arch, bunVersion: Bun.version,
       nodeCompatibilityVersion: process.versions.node, runnerImage: process.env.ImageOS ?? null, runnerImageVersion: process.env.ImageVersion ?? null,
       ...source, workers, mode, isolation, bail: bail ?? null, command, cwd: root,

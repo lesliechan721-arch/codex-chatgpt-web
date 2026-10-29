@@ -1,5 +1,6 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 // Reproduction contributed by @2570165831 in PR #725.
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +13,7 @@ import {
 
 // A disposable, unauthenticated browser proves that attaching a second worker
 // does not turn either the owned page or another existing page back to light.
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("launcher CDP attachments preserve native dark appearance across pages", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("launcher CDP attachments preserve native dark appearance across pages", async () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-theme-test-"));
   // Start outside Playwright so neither media nor focus is already emulated.
   const child = Bun.spawn([

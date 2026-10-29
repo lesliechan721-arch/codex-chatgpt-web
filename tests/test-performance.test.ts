@@ -260,7 +260,7 @@ for (const planned of [false, true]) test(`the real wrapper writes complete ${pl
   try {
     for (const directory of ["scripts", "src", "tests"]) mkdirSync(join(root, directory));
     const repository = fileURLToPath(new URL("..", import.meta.url));
-    for (const file of ["scripts/profile-tests.ts", "scripts/test-performance-source.ts", "scripts/test-performance-reports.ts",
+    for (const file of ["scripts/profile-tests.ts", "scripts/optional-browser-tests.ts", "scripts/test-performance-source.ts", "scripts/test-performance-reports.ts",
       "scripts/test-timing-history.ts", "scripts/test-shards.ts", "src/runtime-performance.ts"]) copyFileSync(join(repository, file), join(root, file));
     for (const name of ["a", "b", "c"]) writeFileSync(join(root, "tests", `${name}.test.ts`), `import {test} from "bun:test";
       test("actual shard test",()=>{}); ${name === "a" ? 'test.skip("declared skip",()=>{});' : ""}`);
@@ -268,7 +268,8 @@ for (const planned of [false, true]) test(`the real wrapper writes complete ${pl
       source: { runId: "41", revision: "a".repeat(40), repository: "owner/repo" }, overheadMs: [100, 0],
       shards: [{ files: { "tests/a.test.ts": 10, "tests/b.test.ts": 20 } }, { files: { "tests/c.test.ts": 30 } }] };
     writeFileSync(join(root, "plan.json"), JSON.stringify(plan));
-    const env = { ...process.env, CGW_TEST_PROFILE_DIR: join(root, "output"), GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "3", GITHUB_REPOSITORY: "owner/repo" };
+    const env = { ...process.env, CGW_TEST_PROFILE_DIR: join(root, "output"), GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "3", GITHUB_REPOSITORY: "owner/repo",
+      CHATGPT_DOM_TEST_BROWSER: "configured", LAUNCHER_TEST_ELECTRON: "" };
     for (const key of Object.keys(env)) if (key.startsWith("CGW_TEST_TIMING_")) delete env[key as keyof typeof env];
     for (const index of [1, 2]) {
       const child = spawnSync(process.execPath, [join(root, "scripts/profile-tests.ts"), "--mode=timing", `--shard=${index}/2`, ...(planned ? ["--shard-plan=plan.json"] : [])], { encoding: "utf8", timeout: 15_000, env });
@@ -279,6 +280,7 @@ for (const planned of [false, true]) test(`the real wrapper writes complete ${pl
     const summaries = runs.map(run => JSON.parse(readFileSync(join(root, "output", run, "summary.json"), "utf8"))).sort((a, b) => a.shard.index - b.shard.index);
     for (const [index, summary] of summaries.entries()) {
       expect(summary).toMatchObject({ version: planned ? 6 : 5, fullSuite: false, shard: { index: index + 1, total: 2 },
+        optionalBrowserRuntimes: { CHATGPT_DOM_TEST_BROWSER: true, LAUNCHER_TEST_ELECTRON: false },
         workflowRun: { id: "42", attempt: "3", repository: "owner/repo" }, fileTiming: { version: 3, complete: true, fullSuite: false },
         scheduling: planned ? { source: "plan", from: { path: "plan.json" } } : { source: "cold", inputDigest: null, from: null },
         historyPublication: { status: "not-requested" } });

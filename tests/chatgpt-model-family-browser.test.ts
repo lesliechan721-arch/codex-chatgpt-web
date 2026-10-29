@@ -1,6 +1,7 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 // Reproduction contributed by @alexalok in PR #730; explicit picker by @nofihq in #921.
 import { readFileSync } from "node:fs";
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { chromium } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
@@ -11,7 +12,7 @@ import { readChatGptUsageModel } from "../src/adapters/chatgpt-web/limits";
 const EXPLICIT_PICKER = readFileSync(new URL("./fixtures/chatgpt-model-picker-explicit-2026-10-28.html", import.meta.url), "utf8");
 
 for (const [effort, label, usageModel] of [["high", "6 Sol High", "other"], ["xhigh", "6 Sol Extra High", "other"], ["max", "6 Astra Max", "gpt-6-pro"]] as const) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`explicit picker selects exact GPT-6 ${effort} beside GPT-6.1`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`explicit picker selects exact GPT-6 ${effort} beside GPT-6.1`, async () => {
     const browser=await chromium.launch({executablePath:process.env.CHATGPT_DOM_TEST_BROWSER,headless:true});
     try {
       const page=await browser.newPage();await page.setContent(EXPLICIT_PICKER);
@@ -23,7 +24,7 @@ for (const [effort, label, usageModel] of [["high", "6 Sol High", "other"], ["xh
   },30_000);
 }
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("explicit picker refuses absent GPT-6 Sol and conflicting GPT-6.1 evidence",async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("explicit picker refuses absent GPT-6 Sol and conflicting GPT-6.1 evidence",async()=>{
   const browser=await chromium.launch({executablePath:process.env.CHATGPT_DOM_TEST_BROWSER,headless:true});
   try {
     for(const scenario of ['omitSol','conflictingHeader']){
@@ -83,23 +84,23 @@ async function selectGpt6Pro(picker: Picker) {
   }
 }
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is verified from the September 29 split picker header when the slider announces only the effort", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("GPT-6 Pro is verified from the September 29 split picker header when the slider announces only the effort", async () => {
   expect(await selectGpt6Pro(PICKERS.splitHeader)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
 }, 60_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is still verified from the versioned slider announcement", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("GPT-6 Pro is still verified from the versioned slider announcement", async () => {
   expect(await selectGpt6Pro(PICKERS.versionedAnnouncement)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
 }, 60_000);
 
 for (const scenario of ["future", "versionless", "conflicting"] as const)
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro fails closed when the picker's model evidence is " + scenario, async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("GPT-6 Pro fails closed when the picker's model evidence is " + scenario, async () => {
   const result = await selectGpt6Pro(PICKERS[scenario]);
   expect(result.ok).toBe(false);
   expect(result.message).toContain("ChatGPT model 6 could not be selected and verified");
   expect(result.draft).toBe("Draft");
 }, 60_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("model evidence excludes inactive and foreign picker headers and rejects multiple active headers", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("model evidence excludes inactive and foreign picker headers and rejects multiple active headers", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -129,7 +130,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("model evidence excludes inac
   }
 }, 60_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("localized position punctuation works through actual picker selection and usage readback", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("localized position punctuation works through actual picker selection and usage readback", async () => {
   for (const separator of ["、", "،", "；", "—"]) {
     const picker: Picker = { header: null, status: (effort, value) => `${value === 4 ? "6" : "5.6"} ${effort}${separator}5 件中 ${value + 1} 番目。` };
     expect(await selectGpt6Pro(picker)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });

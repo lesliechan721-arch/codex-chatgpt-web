@@ -1,10 +1,11 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron } from "playwright-core";
 
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("session reminder stays above native browser views without changing their size or reloading them", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("session reminder stays above native browser views without changing their size or reloading them", async () => {
   const root = mkdtempSync(join(tmpdir(), "launcher-reminder-layer-"));
   let app: Awaited<ReturnType<typeof _electron.launch>> | undefined;
   try {

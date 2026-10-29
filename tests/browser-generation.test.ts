@@ -1,5 +1,6 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 import { chatGptStopButton, chatGptThinkButtons } from "../src/chatgpt-ui/composer";
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { chromium, _electron } from "playwright-core";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,7 +8,7 @@ import { join, resolve } from "node:path";
 import { ChatGptTurnDomHealthTracker, setChatGptThinkMode } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_THINK_BUTTON_SELECTOR } from "../src/chatgpt-ui/composer";
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think buttons do not require the 6.1.8 icon shape or type slash commands", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("Think buttons do not require the 6.1.8 icon shape or type slash commands", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -64,7 +65,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think buttons do not require
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think preserves both plugin pill formats and rejects plugin replacement", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("Think preserves both plugin pill formats and rejects plugin replacement", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -100,7 +101,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think preserves both plugin 
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("hidden duplicate Stop controls cannot turn live generation into an idle timeout", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("hidden duplicate Stop controls cannot turn live generation into an idle timeout", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -121,7 +122,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("hidden duplicate Stop contro
   }
 });
 
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("captured Stop is independent of language and excludes other composer actions", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("captured Stop is independent of language and excludes other composer actions", async () => {
   const userData = mkdtempSync(join(tmpdir(), "composer-stop-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;
@@ -161,7 +162,7 @@ test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("captured Stop is independent o
   }
 }, 20_000);
 
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("captured Think toggles independently of language without selecting other pills", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("captured Think toggles independently of language without selecting other pills", async () => {
   const userData = mkdtempSync(join(tmpdir(), "composer-think-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;

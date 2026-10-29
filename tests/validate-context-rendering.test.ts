@@ -1,3 +1,4 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 import { expect, test } from "bun:test";
 import { createLiveFixture, createLiveFixtureInput, createLiveRequestBody, extractLiveCompletion, inspectLiveResult, inspectLiveWebPayload, LIVE_CASES, livePairSchedule,
   createLiveDomObservation, inspectLiveDomObservations, installLiveDomObserver, prepareObservedBrowserHelper, readLiveEditorDom, readLiveSubmittedDom, type LiveDomObservation } from "../scripts/validate-context-rendering";
@@ -274,7 +275,7 @@ test("original send return and submission notification do not wait for an unfini
   } finally { completeReading({ text: null, reason: "fixture_unreadable" }); restore(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("original assert plus observer reads real DOM strictly and preserves product returns", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("original assert plus observer reads real DOM strictly and preserves product returns", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const rows: LiveDomObservation[] = [];
   class FixtureWorker {
@@ -483,7 +484,7 @@ test("live task requires one safe verbatim result block and only requested sourc
   }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("production response DOM and Markdown preserve a complete fenced result in both code layouts", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("production response DOM and Markdown preserve a complete fenced result in both code layouts", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -504,7 +505,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("production response DOM and 
   } finally { await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("submitted observer treats target and outer user collapse states as unknown", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("submitted observer treats target and outer user collapse states as unknown", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage(), expected = "Full source\n\t中文  ";

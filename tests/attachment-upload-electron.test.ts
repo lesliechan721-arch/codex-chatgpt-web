@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { _electron } from "playwright-core";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { observeChatGptAttachmentUploads } from "../src/adapters/chatgpt-web/att
 const executable = process.env.LAUNCHER_TEST_ELECTRON;
 
 for (const event of ["file.processing.completed", "file.processing.error", "file.processing.file_ready"]) {
-  test.skipIf(!executable)(`Electron handles already-finished upload response: ${event}`, async () => {
+  optionalBrowserTest("LAUNCHER_TEST_ELECTRON")(`Electron handles already-finished upload response: ${event}`, async () => {
     const scratch = mkdtempSync(join(tmpdir(), "upload-electron-"));
     const main = join(scratch, "main.cjs");
     writeFileSync(main, `const {app,BrowserWindow}=require('electron');app.whenReady().then(()=>{const window=new BrowserWindow({show:false,webPreferences:{backgroundThrottling:false}});window.loadURL('about:blank');});`);

@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { _electron } from "playwright-core";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { decodeWebContextPayload } from "../src/adapters/chatgpt-web/context-ren
 // Its code-span branch was verified in ChatGPT's public 257798.4db0db71a9.js asset.
 // Run the actual expression in Chromium, inside a terminable worker: a timeout
 // must not crash a renderer, create crash dumps, or affect a real account.
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("encoded context avoids the Chromium Markdown parser stall", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("encoded context avoids the Chromium Markdown parser stall", async () => {
   const userData = mkdtempSync(join(tmpdir(), "markdown-parser-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;

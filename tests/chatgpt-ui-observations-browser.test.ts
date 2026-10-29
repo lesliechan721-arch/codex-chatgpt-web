@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { chromium } from "playwright-core";
 import { CHATGPT_UI_VARIANT_SELECTORS, chatGptUiVariantCounts } from "../src/chatgpt-ui/observations";
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("UI observations distinguish coexisting and hidden variants without retaining page content", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("UI observations distinguish coexisting and hidden variants without retaining page content", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();

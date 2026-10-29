@@ -1,10 +1,11 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron } from "playwright-core";
 
-test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("finishing another Electron tab preserves the open model picker and viewport", async () => {
+optionalBrowserTest("LAUNCHER_TEST_ELECTRON")("finishing another Electron tab preserves the open model picker and viewport", async () => {
   const userData = mkdtempSync(join(tmpdir(), "launcher-viewport-"));
   const env = Object.fromEntries(Object.entries(process.env)
     .filter(([key, value]) => key !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;

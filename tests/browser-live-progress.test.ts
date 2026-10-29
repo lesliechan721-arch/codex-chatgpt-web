@@ -1,3 +1,4 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 import { expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { chromium } from "playwright-core";
@@ -51,7 +52,7 @@ test("a browser security challenge is scoped to the owned submission and never r
   observer.dispose();
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("response diagnostics retain wrapper ownership but omit private text, classes and identifiers", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("response diagnostics retain wrapper ownership but omit private text, classes and identifiers", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -83,7 +84,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("response diagnostics retain 
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an owned error survives removal of its assistant subtree without reading another turn", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("an owned error survives removal of its assistant subtree without reading another turn", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -105,7 +106,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an owned error survives remo
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("picker diagnostics distinguish disabled, covered and stalled controls without exposing content", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("picker diagnostics distinguish disabled, covered and stalled controls without exposing content", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -279,7 +280,7 @@ test("generation keeps assistant binding alive while tool observation retains it
   await expect(progress.waitForToolBatchObservation(1)).resolves.toBeUndefined();
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("real Enter accepts MCP while the renderer is still busy handling the key", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("real Enter accepts MCP while the renderer is still busy handling the key", async () => {
   const progress = new ChatGptExternalTurnProgress();
   let calls = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {

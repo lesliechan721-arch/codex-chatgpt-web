@@ -343,6 +343,85 @@ test("reviewed skips are exact, reasoned and bound to source", () => {
   ]) { const fixture = skippedFixture(); change(fixture); expect(aggregateShardEvidence(fixture).success).toBe(false); }
 });
 
+function optionalBrowserFixture() {
+  const fixture = skippedFixture(), shard = fixture.shards[0]!;
+  const name = "[requires:CHATGPT_DOM_TEST_BROWSER] a renamed case";
+  shard.stderr = shard.stderr!.replace("(skip) a case", `(skip) ${name}`);
+  shard.summary.skipIdentities = [`${files[0]}::${name}`];
+  shard.summary.optionalBrowserRuntimes = { CHATGPT_DOM_TEST_BROWSER: false, LAUNCHER_TEST_ELECTRON: false };
+  fixture.skipEvidence.entries = [];
+  fixture.skipEvidence.optionalBrowsers = [{ environment: "CHATGPT_DOM_TEST_BROWSER", files: [files[0]], reason: "Requires optional Chromium" }];
+  return fixture;
+}
+
+test("optional browser skips use the declared file and missing runtime instead of exact names", () => {
+  const fixture = optionalBrowserFixture();
+  expect(aggregateShardEvidence(fixture)).toMatchObject({ success: true, reasons: [] });
+  for (const change of [
+    (input: ShardAggregationInput) => { delete input.skipEvidence.optionalBrowsers; },
+    (input: ShardAggregationInput) => { input.skipEvidence.optionalBrowsers[0].files = [files[1]]; },
+    (input: ShardAggregationInput) => { input.skipEvidence.optionalBrowsers[0].environment = "OTHER_BROWSER"; },
+    (input: ShardAggregationInput) => { input.skipEvidence.optionalBrowsers[0].reason = " "; },
+    (input: ShardAggregationInput) => { input.shards[0]!.summary.optionalBrowserRuntimes.CHATGPT_DOM_TEST_BROWSER = true; },
+    (input: ShardAggregationInput) => { delete input.shards[0]!.summary.optionalBrowserRuntimes; },
+    (input: ShardAggregationInput) => {
+      input.shards[0]!.stderr = input.shards[0]!.stderr!.replace("[requires:CHATGPT_DOM_TEST_BROWSER] ", "");
+      input.shards[0]!.summary.skipIdentities = [`${files[0]}::a renamed case`];
+    },
+  ]) {
+    const altered = structuredClone(fixture); change(altered);
+    expect(aggregateShardEvidence(altered).success).toBe(false);
+  }
+});
+
+test("optional browser skips do not authorize ordinary skips or stale explicit entries", () => {
+  const fixture = optionalBrowserFixture();
+  fixture.skipEvidence.entries = [{ file: files[0], name: "old case", reason: "Temporary exclusion" }];
+  expect(aggregateShardEvidence(fixture).success).toBe(false);
+  const duplicate = optionalBrowserFixture(), shard = duplicate.shards[0]!;
+  shard.stderr = shard.stderr!.replace("(skip) [requires:", "(skip) [requires:CHATGPT_DOM_TEST_BROWSER] a renamed case\n(skip) [requires:").replace(" 1 skip", " 2 skip");
+  shard.summary.skipIdentities.push(shard.summary.skipIdentities[0]);
+  shard.summary.counts.skip = 2;
+  expect(aggregateShardEvidence(duplicate).success).toBe(false);
+});
+
+test("the optional browser helper marks missing paths and executes configured paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-optional-browser-"));
+  try {
+    const path = join(root, "browser.test.ts");
+    const helper = join(import.meta.dir, "helpers/optional-browser-test.ts");
+    writeFileSync(path, `import { optionalBrowserTest } from ${JSON.stringify(helper)};
+      optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("renamed browser case", () => {
+        if (process.env.CHATGPT_DOM_TEST_BROWSER === "broken") throw new Error("configured executable failed");
+      });`);
+    for (const executable of [undefined, "", "configured", "broken"]) {
+      const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
+      if (executable === undefined) delete env.CHATGPT_DOM_TEST_BROWSER;
+      else env.CHATGPT_DOM_TEST_BROWSER = executable;
+      const child = spawnSync(process.execPath, ["test", path], { env, encoding: "utf8" });
+      const result = testLogResult(child.stderr);
+      expect(child.status).toBe(executable === "broken" ? 1 : 0);
+      expect(result.counts.skip).toBe(executable ? 0 : 1);
+      if (!executable) expect(result.skipIdentities[0]).toContain("::[requires:CHATGPT_DOM_TEST_BROWSER] renamed browser case");
+      else expect(result.counts[executable === "broken" ? "fail" : "pass"]).toBe(1);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("optional browser policy validates runtime names, known files and reasons", () => {
+  const fixture = skipPolicyFixture();
+  try {
+    const rule = { environment: "CHATGPT_DOM_TEST_BROWSER" as const, files: [files[0]!], reason: "Optional browser" };
+    for (const optionalBrowsers of [[rule], [{ ...rule, environment: "UNKNOWN" }], [{ ...rule, files: ["tests/unknown.test.ts"] }],
+      [{ ...rule, files: [] }], [{ ...rule, files: [files[0], files[0]] }], [{ ...rule, reason: " " }], [rule, rule]]) {
+      writeFileSync(fixture.path, JSON.stringify({ ...fixture.policy, entries: [], optionalBrowsers }));
+      const load = () => loadSkipPolicy(fixture.root, fixture.path, files, { revision, patchDigest, toolDigest });
+      if (optionalBrowsers.length === 1 && optionalBrowsers[0] === rule) expect(load().optionalBrowsers).toEqual([rule]);
+      else expect(load).toThrow();
+    }
+  } finally { rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
 function skipPolicyFixture() {
   const root = mkdtempSync(join(tmpdir(), "cgw-skip-policy-"));
   const path = join(root, "policy.json"), file = files[0]!;

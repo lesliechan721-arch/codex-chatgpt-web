@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { chromium, type Locator, type Page } from "playwright-core";
 import { ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptStreamDiagnostics } from "../src/adapters/chatgpt-web/stream-diagnostics";
@@ -9,7 +10,7 @@ import { planContextDelivery } from "../src/adapters/chatgpt-web/context-planner
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import type { CodexParsedRequest } from "../src/types";
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("CodeMirror language invalidates the response cache and incomplete code is not delivered", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("CodeMirror language invalidates the response cache and incomplete code is not delivered", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -29,7 +30,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("CodeMirror language invalida
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("paragraph identity survives file preview movement in both response layouts", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("paragraph identity survives file preview movement in both response layouts", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     for (const root of ['class="markdown"', 'data-markdown-text-style="assistant-message"']) {
@@ -59,7 +60,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("paragraph identity survives 
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("activity tone and collapsed content invalidate the response cache", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("activity tone and collapsed content invalidate the response cache", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -86,7 +87,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("activity tone and collapsed 
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("preserves the accepted user identity across Activity's temporary fallback group", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("preserves the accepted user identity across Activity's temporary fallback group", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -127,7 +128,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("preserves the accepted user 
 
 // Execute the real observation/rebinding code against the reported renderer transition.
 // No account, network requests, or model submissions are used.
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a Send acknowledged under a fallback key rebinds only to its exact submitted prompt", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("a Send acknowledged under a fallback key rebinds only to its exact submitted prompt", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -157,7 +158,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a Send acknowledged under a 
 }, 15_000);
 
 for (const scenario of ["same-assistant", "foreign-assistant", "temporary-same-assistant", "temporary-foreign-assistant", "second-foreign-user", "same-formal-user"] as const) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`fallback recovery preserves message identities: ${scenario}`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`fallback recovery preserves message identities: ${scenario}`, async () => {
     const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
     try {
       const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -201,7 +202,7 @@ for (const scenario of ["same-assistant", "foreign-assistant", "temporary-same-a
 }
 
 for (const stage of ["acceptance", "initial binding"] as const) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`the submitted native user also constrains ${stage}`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`the submitted native user also constrains ${stage}`, async () => {
     const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
     try {
       const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -218,7 +219,7 @@ for (const stage of ["acceptance", "initial binding"] as const) {
 }
 
 for (const matchingUser of [true, false]) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`the physical Send identifies its formal user despite display escaping: match=${matchingUser}`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`the physical Send identifies its formal user despite display escaping: match=${matchingUser}`, async () => {
     const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
     const observer = new ChatGptSubmissionRejectionObserver();
     try {
@@ -258,7 +259,7 @@ for (const matchingUser of [true, false]) {
 }
 
 for (const hasUser of [true, false]) {
-  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`a known assistant cannot be replaced after a formal user was proved: user bubble=${hasUser}`, async () => {
+  optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`a known assistant cannot be replaced after a formal user was proved: user bubble=${hasUser}`, async () => {
     const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
     try {
       const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -285,7 +286,7 @@ for (const hasUser of [true, false]) {
   }, 15_000);
 }
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with the exact submitted prompt and no competing turn", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("an exchange rekeys only with the exact submitted prompt and no competing turn", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as {
@@ -329,7 +330,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with
   } finally { await browser.close(); }
 }, 60_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("collapsed plugin messages rebind only after their complete text is verified", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("collapsed plugin messages rebind only after their complete text is verified", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -376,7 +377,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("collapsed plugin messages re
   } finally { await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("auto-linked URLs preserve exact prompt text and reject changed labels or destinations", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("auto-linked URLs preserve exact prompt text and reject changed labels or destinations", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -398,7 +399,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("auto-linked URLs preserve ex
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("reading a collapsed message restores the viewport and remounts its virtualized active answer", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("reading a collapsed message restores the viewport and remounts its virtualized active answer", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -427,7 +428,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("reading a collapsed message 
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("plain user code blocks preserve the full submitted code and whitespace", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("plain user code blocks preserve the full submitted code and whitespace", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
@@ -441,7 +442,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("plain user code blocks prese
   } finally { await browser.close(); }
 });
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("compiled context navigation prompts rebind after collapsed message expansion", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("compiled context navigation prompts rebind after collapsed message expansion", async () => {
   const token = `turn_${"a".repeat(32)}`;
   const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false };
   const canonical: CodexParsedRequest = {
@@ -489,7 +490,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("compiled context navigation 
   } finally { await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires the exact prepared turn token after expansion", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("rich-text rebind requires the exact prepared turn token after expansion", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -531,7 +532,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires th
   } finally { await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rebind reads token boundaries across rendered lines without accepting hidden or ambiguous tokens", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("rebind reads token boundaries across rendered lines without accepting hidden or ambiguous tokens", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -571,7 +572,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rebind reads token boundarie
   } finally { await browser.close(); }
 }, 20_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity before an answer exists and recognizes uploaded native-button tiles", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("binds captured Activity before an answer exists and recognizes uploaded native-button tiles", async () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => new URL(request.url).pathname === "/backend-api/files/process_upload_stream"
     ? new Response(JSON.stringify({ event: "file.processing.completed", file_id: "fixture-file" }) + "\n", { headers: { "content-type": "application/x-ndjson" } })
     : new Response("<main></main>", { headers: { "content-type": "text/html" } }) });
@@ -602,7 +603,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity befo
   } finally { await browser.close(); server.stop(true); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("stream diagnostics start at physical Send after asynchronous preparation and execution authority", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("stream diagnostics start at physical Send after asynchronous preparation and execution authority", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const preparedId = "11111111-1111-4111-8111-111111111111";
   const submittedId = "22222222-2222-4222-8222-222222222222";
@@ -657,7 +658,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("stream diagnostics start at 
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("native identity capture ends before asynchronous submission acknowledgement", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("native identity capture ends before asynchronous submission acknowledgement", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const firstId = "11111111-1111-4111-8111-111111111111";
   const laterId = "22222222-2222-4222-8222-222222222222";
@@ -696,7 +697,7 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("native identity capture ends
   } finally { await browser.close(); }
 }, 15_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("initial assistant binding preserves the formal user accepted by physical Send", async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")("initial assistant binding preserves the formal user accepted by physical Send", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   const acceptedId = "11111111-1111-4111-8111-111111111111";
   const foreignId = "22222222-2222-4222-8222-222222222222";

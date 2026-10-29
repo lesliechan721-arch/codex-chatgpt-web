@@ -1,11 +1,12 @@
-import { expect, test } from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import { expect } from "bun:test";
 import { chromium } from "playwright-core";
 import { detectChatGptLimitsPlan } from "../src/adapters/chatgpt-web/limits";
 
 // Execute the production account reader without real credentials or changing any browser UI.
 const executablePath = process.env.CHATGPT_DOM_TEST_BROWSER;
 for (const scenario of ["pro", "prolite", "unknown", "account-change", "plan-change", "payment-change", "expired", "http-error", "redirect"])
-test.skipIf(!executablePath)(`Limits account ${scenario} preserves the page and rejects uncertain state`, async () => {
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`Limits account ${scenario} preserves the page and rejects uncertain state`, async () => {
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const context = await browser.newContext();

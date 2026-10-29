@@ -1,4 +1,5 @@
-import {test,expect} from "bun:test";
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
+import {expect} from "bun:test";
 import {chromium,type Browser} from "playwright-core";
 import {observeChatGptAttachmentUploads} from "../src/adapters/chatgpt-web/attachment-upload";
 import {ChatGptBrowserWorker} from "../src/adapters/chatgpt-web/browser-worker";
@@ -15,7 +16,7 @@ async function fixture(run:(browser:Browser,base:string)=>Promise<void>,handler:
 }
 const prompt={text:'original message',images:[{ref:'codex-input-image-1',imageUrl:'data:image/png;base64,'+Buffer.from('test').toString('base64')}]};
 
-test.skipIf(!executable)('saved-chat uploads use the active composer while the hidden home composer remains mounted',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('saved-chat uploads use the active composer while the hidden home composer remains mounted',async()=>{
  let uploads=0;
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
@@ -33,7 +34,7 @@ test.skipIf(!executable)('saved-chat uploads use the active composer while the h
  },()=>{uploads++;return new Response(JSON.stringify({event:'file.processing.completed'})+'\n',{headers:{'content-type':'application/x-ndjson'}});});
 },10000);
 
-for (const phase of ['creation','processing']) test.skipIf(!executable)(`an owned ${phase} upload limit stops attachment preparation without sending or retrying`,async()=>{
+for (const phase of ['creation','processing']) optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`an owned ${phase} upload limit stops attachment preparation without sending or retrying`,async()=>{
  let requests=0;
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
@@ -47,7 +48,7 @@ for (const phase of ['creation','processing']) test.skipIf(!executable)(`an owne
  phase==='creation'?html.replace('/backend-api/files/process_upload_stream','/backend-api/files'):html);
 },10000);
 
-test.skipIf(!executable)('file creation alone cannot complete an upload and unrelated creation failures are ignored',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('file creation alone cannot complete an upload and unrelated creation failures are ignored',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
   const observer=await observeChatGptAttachmentUploads(page,['wanted.png']);
@@ -67,7 +68,7 @@ test.skipIf(!executable)('file creation alone cannot complete an upload and unre
  });
 },10000);
 
-test.skipIf(!executable)('an enabled send button cannot bypass delayed processing or an HTTP 503',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('an enabled send button cannot bypass delayed processing or an HTTP 503',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
   const worker=Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -78,7 +79,7 @@ test.skipIf(!executable)('an enabled send button cannot bypass delayed processin
  },async()=>{await Bun.sleep(250);return new Response('unavailable',{status:503});});
 },10000);
 
-test.skipIf(!executable)('processing completion is required and accepted before the upload stream closes',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('processing completion is required and accepted before the upload stream closes',async()=>{
  let completed=false;
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);const worker=Object.create(ChatGptBrowserWorker.prototype) as any;
@@ -93,7 +94,7 @@ test.skipIf(!executable)('processing completion is required and accepted before 
  }}),{headers:{'content-type':'application/x-ndjson'}}));
 },10000);
 
-test.skipIf(!executable)('HTTP 200 processing errors fail and unrelated uploads cannot complete this turn',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('HTTP 200 processing errors fail and unrelated uploads cannot complete this turn',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);const observer=await observeChatGptAttachmentUploads(page,['wanted.png']);
   try{
@@ -105,7 +106,7 @@ test.skipIf(!executable)('HTTP 200 processing errors fail and unrelated uploads 
  },async request=>{const body=await request.json() as any;return new Response(JSON.stringify({event:body.file_name==='wanted.png'?'file.processing.error':'file.processing.completed'})+'\n',{headers:{'content-type':'application/x-ndjson'}});});
 },10000);
 
-test.skipIf(!executable)('unfinished processing is cancelled without leaking the browser observation',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('unfinished processing is cancelled without leaking the browser observation',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);const observer=await observeChatGptAttachmentUploads(page,['wanted.png']);
   try{await expect(observer.wait(AbortSignal.timeout(80))).rejects.toThrow();}finally{await observer.dispose();}
@@ -114,7 +115,7 @@ test.skipIf(!executable)('unfinished processing is cancelled without leaking the
 },10000);
 
 
-test.skipIf(!executable)('all owned files must complete, including a final event without a newline',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('all owned files must complete, including a final event without a newline',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
   const observer=await observeChatGptAttachmentUploads(page,['first.png','second.png']);
@@ -128,7 +129,7 @@ test.skipIf(!executable)('all owned files must complete, including a final event
  },()=>new Response(JSON.stringify({event:'file.processing.completed'}),{headers:{'content-type':'application/x-ndjson'}}));
 },10000);
 
-test.skipIf(!executable)('file-ready without terminal completion fails when the response ends',async()=>{
+optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")('file-ready without terminal completion fails when the response ends',async()=>{
  await fixture(async(browser,base)=>{
   const page=await browser.newPage();await page.goto(base);
   const observer=await observeChatGptAttachmentUploads(page,['wanted.png']);

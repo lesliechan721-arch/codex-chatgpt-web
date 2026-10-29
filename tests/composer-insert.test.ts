@@ -1,3 +1,4 @@
+import { optionalBrowserTest } from "./helpers/optional-browser-test";
 import { afterEach, expect, test } from "bun:test";
 import { chromium } from "playwright-core";
 import { ChatGptBrowserWorker, insertPlainTextIntoComposer } from "../src/adapters/chatgpt-web/browser-worker";
@@ -93,7 +94,7 @@ for (const modern of [false, true]) for (const scenario of [
   { name: "empty draft", lines: 3, stale: false },
   { name: "old draft", lines: 3, stale: true },
   { name: "large old draft", lines: 5_000, stale: true },
-]) test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`selected ${modern ? "modern" : "classic"} connector replaces ${scenario.name} with the exact request`, async () => {
+]) optionalBrowserTest("CHATGPT_DOM_TEST_BROWSER")(`selected ${modern ? "modern" : "classic"} connector replaces ${scenario.name} with the exact request`, async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
     const page = await browser.newPage();
