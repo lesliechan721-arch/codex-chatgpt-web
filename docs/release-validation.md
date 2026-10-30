@@ -31,8 +31,11 @@ do not poll for publication changes.
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.15-1` integrates upstream `6.1.15` with this fork's continuity, durable input queue,
+Version `6.1.17-1` integrates upstream `6.1.17` with this fork's continuity, durable input queue,
 short-start context, on-demand reading, API access, provider, proxy, and remote-runtime contracts.
+Full Access tasks can keep added workspace directories after compaction while preserving every
+native project, the current working directory, turn identity and permission mode. Restricted tasks
+keep their native filesystem grants.
 Task turns, connector verification and browser smoke tests use Temporary Chat by default.
 `useTemporaryChats: false` preserves an explicit opt-out; an absent field defaults to true,
 including when upgrading an existing configuration. Sign-in and account inspection use ordinary

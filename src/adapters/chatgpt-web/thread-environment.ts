@@ -384,18 +384,20 @@ function currentWorkspaceContext(
   workspaceRootsDeclared: boolean,
   claim: ChatGptEnvironmentClaim | undefined,
 ): ChatGptTurnEnvironment {
-  // Full access grants no native workspace restriction. A restart can omit its
-  // roots, so retain only a matching current envelope's workspace context.
-  if (!workspaceRootsDeclared
-    && environment.sandboxPolicy.type === "dangerFullAccess"
+  // Full Access roots describe workspace context. Preserve every native project
+  // when the current environment adds an output directory after compaction.
+  if (environment.sandboxPolicy.type === "dangerFullAccess"
     && claim?.environment.sandboxPolicy.type === "dangerFullAccess"
     && (claim.environment.cwd === undefined || pathIdentity(claim.environment.cwd) === pathIdentity(environment.cwd))
     && claim.environment.roots.some(root => contains(root, environment.cwd))) {
-    return {
-      ...environment,
-      roots: [...claim.environment.roots],
-      writableRoots: [...claim.environment.roots],
-    };
+    const nativeRoots = new Set(environment.roots.map(pathIdentity));
+    const claimedRoots = new Set(claim.environment.roots.map(pathIdentity));
+    if (!workspaceRootsDeclared || [...nativeRoots].every(root => claimedRoots.has(root))) {
+      const roots = workspaceRootsDeclared
+        ? [...environment.roots, ...claim.environment.roots.filter(root => !nativeRoots.has(pathIdentity(root)))]
+        : [...claim.environment.roots];
+      return { ...environment, roots, writableRoots: [...roots] };
+    }
   }
   return environment;
 }
