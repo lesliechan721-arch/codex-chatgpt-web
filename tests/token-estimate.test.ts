@@ -41,6 +41,23 @@ test("large ordinary prose is not inflated by a character-ratio heuristic", () =
   expect(estimateTokens(prose)).toBeLessThan(100_000);
 });
 
+test("fit counting stops above its ceiling without changing complete cached counts", () => {
+  const text = "中文😀 boundary ".repeat(8000);
+  const complete = estimateTokens(text);
+  const encode = spyOn(Tiktoken.prototype, "encode_ordinary");
+  try {
+    withTokenEstimateCache(() => {
+      const rejected = estimateTokens(text, undefined, 1000);
+      expect(rejected).toBeGreaterThan(1000);
+      expect(rejected).toBeLessThan(complete);
+      expect(encode.mock.calls.reduce((sum, [chunk]) => sum + chunk.length, 0)).toBeLessThan(text.length);
+      expect(estimateTokens(text)).toBe(complete);
+      expect(estimateTokens(text, undefined, complete)).toBe(complete);
+      expect(estimateTokens(text, undefined, complete - 1)).toBeGreaterThan(complete - 1);
+    });
+  } finally { encode.mockRestore(); }
+});
+
 test("nested preparations reuse counts and release source chunks when they return", () => {
   const text = "shared preparation token count";
   const expected = estimateTokens(text);

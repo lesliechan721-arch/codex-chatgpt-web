@@ -103,8 +103,8 @@ export function measureContextResponse(result: BrokerToolResult, options: {
   wireReserveBytes?: number; tokenReserve?: number; visualTokens?: number;
   /** Trusted directory admission: cover a future scope binding and cursor signature. */
   boundCursorTokens?: boolean;
-  /** Fit checks only: return a conservative token bound when it fits this total
-   * ceiling. Omit for usage accounting; tighter ceilings still use the tokenizer. */
+  /** Fit checks only: use a safe byte bound when it fits, or stop tokenizing once
+   * this total ceiling is exceeded. Omit for complete usage accounting. */
   tokenCeiling?: number;
 } = {}): ContextResponseCost {
   const json = JSON.stringify(result);
@@ -166,8 +166,12 @@ export function measureContextResponse(result: BrokerToolResult, options: {
     cursorTokens += (pieces.length - 1) * boundCursorCost(cursor);
     return pieces;
   });
-  const textTokens = fragments.reduce((sum, fragment) => sum + estimateTokens(fragment), 0) + cursorTokens
-    + (options.tokenReserve ?? CONTEXT_LIMITS.tokenReserve);
+  let textTokens = cursorTokens + (options.tokenReserve ?? CONTEXT_LIMITS.tokenReserve);
+  const textCeiling = options.tokenCeiling === undefined ? Infinity : options.tokenCeiling - visual;
+  for (const fragment of fragments) {
+    if (textTokens > textCeiling) break;
+    textTokens += estimateTokens(fragment, undefined, textCeiling - textTokens);
+  }
   return { wire_bytes: wireBytes,
     text_tokens: textTokens, visual_tokens: visual, total_tokens: textTokens + visual };
 }

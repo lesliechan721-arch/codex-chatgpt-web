@@ -5,7 +5,7 @@ import { parseTimingData } from "./test-timing-history";
 
 export type TestShard = { index: number; total: number };
 export type TestShardPlan = {
-  version: 1; platform: "win32"; bunVersion: "1.4.3"; workers: 1 | 2;
+  version: 1; platform: "win32"; bunVersion: "1.4.3" | "1.4.4"; workers: 1 | 2;
   source: { runId: string; revision: string; repository: string };
   overheadMs: number[];
   shards: { files: Record<string, number> }[];
@@ -13,7 +13,8 @@ export type TestShardPlan = {
 export type LoadedShardPlan = { path: string; digest: string; plan: TestShardPlan };
 
 export function parseShardPlan(value: any): TestShardPlan {
-  if (value?.version !== 1 || value.platform !== "win32" || value.bunVersion !== "1.4.3"
+  // This version describes historical measurements, not the runtime required by the release gate.
+  if (value?.version !== 1 || value.platform !== "win32" || !["1.4.3", "1.4.4"].includes(value.bunVersion)
     || ![1, 2].includes(value.workers) || !/^[1-9]\d*$/.test(value.source?.runId)
     || !/^[a-f0-9]{40}$/.test(value.source?.revision)
     || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.source?.repository)
@@ -83,7 +84,7 @@ export function assertColdShardEnvironment(env: NodeJS.ProcessEnv) {
 
 export const testFileSetDigest = (files: string[]) => createHash("sha256").update(JSON.stringify([...files].sort())).digest("hex");
 
-/** Bun 1.4.3 cold sharding sorts paths, then assigns their zero-based index modulo n. */
+/** Bun 1.4.4 cold sharding sorts paths, then assigns their zero-based index modulo n. */
 export function coldShardFiles(files: string[], shard: TestShard): string[] {
   // Bun compares UTF-8 path bytes. UTF-16 String.sort changes the order of supplementary characters.
   return [...files].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))

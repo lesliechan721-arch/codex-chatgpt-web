@@ -48,7 +48,7 @@
     },
     {
       "file": "tests/server-deploy.test.ts",
-      "name": "server remote desktop deployment > keeps generated launcher directories out of the Docker build context",
+      "name": "server remote desktop deployment > includes dependency patches and excludes generated launcher directories in the Docker build context",
       "reason": "!dockerAvailable：源码要求 Docker 可执行文件存在、容器类型为 Linux 且 Buildx 命令成功；实际日志未区分哪一子条件不成立。"
     },
     {

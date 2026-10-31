@@ -40,6 +40,25 @@ describe("complete context response budgets", () => {
     expect(() => measureContextResponse(result, { ...options, visualTokens: -1 })).toThrow("Invalid visual token reserve");
   });
 
+  test("large rejected fit checks preserve admission, wire size and full accounting", () => {
+    const body = { text: "中文😀\\\"\n".repeat(6000), next_cursor: "opaque-future-cursor" };
+    const result = { content: [{ type: "text", text: JSON.stringify(body) }], structuredContent: body };
+    for (const boundCursorTokens of [false, true]) {
+      const options = { boundCursorTokens, tokenReserve: 41, visualTokens: 257 };
+      const complete = measureContextResponse(result, options);
+      const rejected = measureContextResponse(result, { ...options, tokenCeiling: 2500 });
+      expect(rejected.total_tokens).toBeGreaterThan(2500);
+      expect(rejected.total_tokens).toBeLessThan(complete.total_tokens);
+      expect(rejected.wire_bytes).toBe(complete.wire_bytes);
+      expect(rejected.visual_tokens).toBe(complete.visual_tokens);
+      for (const tokenCeiling of [complete.total_tokens - 1, complete.total_tokens, complete.total_tokens + 1]) {
+        const measured = measureContextResponse(result, { ...options, tokenCeiling });
+        expect(measured.total_tokens <= tokenCeiling).toBe(complete.total_tokens <= tokenCeiling);
+      }
+      expect(measureContextResponse(result, options)).toEqual(complete);
+    }
+  });
+
   test("trusted profiles freeze the published expanded and conservative ceilings", () => {
     expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 16000, listBytes: 49152, listTokens: 6000, listEntries: 50,
       searchHits: 10, searchBytes: 12288, searchTokens: 1500 });

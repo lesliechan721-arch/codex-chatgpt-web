@@ -77,7 +77,7 @@ export async function profileTests(args: string[]): Promise<number> {
   const plan = shardPlan ? loadShardPlan(root, shardPlan) : undefined;
   if (shard) {
     assertColdShardEnvironment(process.env);
-    if (Bun.version !== "1.4.3") throw new Error("Cold shard discovery is verified only for Bun 1.4.3.");
+    if (Bun.version !== "1.4.4") throw new Error("Cold shard discovery is verified only for Bun 1.4.4.");
   }
   const output = resolve(process.env.CGW_TEST_PROFILE_DIR || join(root, "output", "test-performance"));
   let run: string | undefined, reports: string | undefined;

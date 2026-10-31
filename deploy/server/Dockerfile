@@ -19,11 +19,12 @@ RUN test "$(dpkg --print-architecture)" = "amd64" \
     ninja-build \
     pkg-config \
     xz-utils \
-  && npm install --global bun@1.4.3 \
+  && npm install --global bun@1.4.4 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json bun.lock ./
 COPY launcher/package.json launcher/bun.lock ./launcher/
+COPY launcher/patches/ ./launcher/patches/
 
 RUN bun install --frozen-lockfile \
   && cd launcher \
