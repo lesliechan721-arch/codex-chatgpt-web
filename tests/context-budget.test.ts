@@ -41,8 +41,9 @@ describe("complete context response budgets", () => {
   });
 
   test("trusted profiles freeze the published expanded and conservative ceilings", () => {
-    expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 8000, listBytes: 49152, listTokens: 6000, listEntries: 50,
+    expect(contextLimits()).toMatchObject({ readBytes: 65536, readTokens: 16000, listBytes: 49152, listTokens: 6000, listEntries: 50,
       searchHits: 10, searchBytes: 12288, searchTokens: 1500 });
+    expect(contextLimits(contextBudgetProfileLimits("expanded"))).toEqual(contextLimits());
     const configured = contextBudgetProfileLimits("conservative"), frozen = contextLimits(configured);
     expect(frozen).toMatchObject({ readBytes: 24576, readTokens: 2500, listBytes: 12288, listTokens: 1500, listEntries: 20 });
     configured.readTokens = 8000;

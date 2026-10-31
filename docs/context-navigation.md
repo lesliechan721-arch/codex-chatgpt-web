@@ -162,6 +162,18 @@ its original path, source identity, role/order, current target/read reference, e
 integrity. User fields that happen to have the same names remain user data. Exact original values
 remain recoverable from current real sources; optional bodies need not be restored before work.
 
+Already-proven external tool arguments and results can retain their exact values inline when
+the serialized payload improves in bytes or conservative tokens and does not increase the other
+measure. Selection follows source order. The planner validates the complete candidate read chain;
+its text-call count, cumulative response bytes and cumulative conservative tokens must not increase.
+If the combined candidate fails this check, the original external representation remains. There
+is no character-count threshold. Inlined fields have no external position descriptor, and their
+original snapshot sources remain readable. This choice does not change assistant classification.
+The selected values, descriptors, digests and byte ranges are fixed before publication.
+Repeated planning of the same input snapshot uses stable derived identities for cost comparison.
+Each physical-send preparation forks a fresh snapshot identity before planning. Candidate trials
+share the total processing deadline; deadline exhaustion remains a planning failure.
+
 The payload names the position array `external_positions`. The detailed `source_map` is an
 independent optional record in the fixed snapshot. The required
 payload carries its `context_id`, `target_id`, `read_ref`, `encoding`, `content_digest` and
@@ -261,6 +273,12 @@ read overview to recover the next step. For required text, follow only
 delivery. Read overview once at the end to obtain settled `context_ready`, then follow any explicit
 missing-image or recovery step without polling. Automatic normally uses two overview calls;
 Zero Risk uses its start reply and one final overview. Pure-text startup requires zero `entries` calls.
+
+Text-chain preflight reserves successor slots only for sources that can still occur: at most the
+initial batch width or the number of remaining required sources, whichever is smaller. The current
+source can be partial and retains its slot. Complete metadata, repeated metadata, cursors, remaining
+reads, successor requests and framing still count toward both response limits. The runtime packer
+verifies each saved range against its fixed bound and the effective byte and token limits.
 
 `codex_context_list(view: "entries", required_only: true)` remains available on demand; the default
 filter is false. It is not required discovery for manifest 3. Older manifests do not acquire this
@@ -516,7 +534,7 @@ the plan fixed and do not resend.
 | --- | --- | --- | --- |
 | List (`expanded`) | 50 targets | 48 KiB | 6,000 |
 | Search | 10 hits | 12 KiB | 1,500 |
-| Text read (`expanded`) | Up to 8 distinct targets | 64 KiB | 8,000 |
+| Text read (`expanded`) | Up to 8 distinct targets | 64 KiB | 16,000 |
 | Image read | One complete image | 4 MiB raw; 6 MiB wire | 1,500 metadata tokens, plus visual reserve |
 
 | Shared limit | Effective value |
@@ -567,6 +585,17 @@ reserve, including the directory-preflight cursor bound. A diagnostic estimate o
 text and structured metadata is separate and cannot reduce this hard allowance. Reports distinguish
 visible prompt bytes, editor length, JSON-encoded bytes, conservative tokens, and actual model input
 counts; actual model counts remain unknown unless observed.
+Selection diagnostics include tool-field count, inlined-field count, external-position count and
+bytes, message skeleton bytes, required body bytes and required text calls. These are local plan
+diagnostics, not stored telemetry. `bun scripts/measure-context-bootstrap-efficiency.ts` checks fixed
+synthetic inputs with the 64 KiB/8k comparison budget and the default 64 KiB/16k budget. Pass
+`--no-inline-tools` for the R1-only comparison, or `--rollout=<path>` to check the hash-bound private
+stress sample without copying it into the repository. Rollout reconstruction is not captured HTTP.
+The script checks exact ranges, payload restoration, runtime receipts and readiness; it does not
+measure real transport or business recovery. Real transport validation records
+model/mode/connector/provider/runtime details, complete blocks and receipts, and timing,
+retry, truncation and business-read evidence. The 16k budget has been validated on Automatic with
+GPT-6 Sol at low and medium reasoning effort. Zero Risk and other models remain unverified.
 Correctable errors remain limited to three bounded replies. After exhaustion, source queries stop
 under the original recovery rules and further queries receive JSON-RPC rejection. This does not
 close the shared MCP transport or grant ordinary work or compaction submission authority.

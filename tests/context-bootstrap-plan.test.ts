@@ -169,8 +169,8 @@ test("ContextSend selects the candidate's actual snapshot and retains only real 
 });
 
 for (const manual of [false, true]) test(`bootstrap retained accounting credits first text pages and charges other returns once (${manual ? "manual" : "automatic"})`, async () => {
-  // Keep two physical sends within their context window with the larger batch envelope.
-  const canonical = fixture(undefined, true, 1500);
+  // Keep multiple required pages at 16k while two physical sends fit their context window.
+  const canonical = fixture(undefined, true, 6000);
   if (manual) canonical.modelId = CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL;
   const directory = mkdtempSync(join(tmpdir(), "ctx-cost-"));
   const broker = TurnBroker.forSocket(defaultBrokerEndpoint(directory));

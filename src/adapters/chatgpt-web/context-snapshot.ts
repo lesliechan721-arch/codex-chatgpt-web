@@ -421,7 +421,10 @@ export interface FixedContextRecord {
   originalRole?: string;
 }
 export function appendFixedContextRecords(snapshot: ContextSnapshot, records: readonly FixedContextRecord[],
-  options: { contextId?: string; maxStorageBytes?: number } = {}): ContextSnapshot {
+  options: { contextId?: string; maxStorageBytes?: number;
+    /** Unpublished representation trials share derived identities. Scope and digest
+     * still bind the final read; a reference alone never grants access. */
+    referenceNamespace?: string } = {}): ContextSnapshot {
   const wire = snapshot.toWire();
   const sources = [...wire.sources], targets = [...wire.targets], payloads = [...wire.payloads];
   for (const record of records) {
@@ -430,7 +433,9 @@ export function appendFixedContextRecords(snapshot: ContextSnapshot, records: re
       original_role: record.originalRole ?? "context_record", origin: record.origin, provenance: "parsed", source_completeness: "complete",
       locator: { system_index: index - 1, field: "systemPrompt" } };
     const target: ContextTarget = { ...source, target_id: `t_${targets.length + 1}`, target_index: 1,
-      kind: "message_text", tool_name: null, namespace: null, call_id: null, read_ref: opaque("read"),
+      kind: "message_text", tool_name: null, namespace: null, call_id: null,
+      read_ref: options.referenceNamespace === undefined ? opaque("read")
+        : `read_${digest(deterministicContextJson([options.referenceNamespace, record.origin, index])).slice(0, 32)}`,
       encoding: record.encoding, utf8_bytes: Buffer.byteLength(record.text), content_digest: digest(record.text),
       mime_type: null, image_bytes: null, visual_token_reserve: null,
       label: record.origin === "context_bootstrap_protocol" ? "Required execution protocol"

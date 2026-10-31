@@ -2,13 +2,13 @@ import { estimateTokens } from "../../lib/token-estimate";
 import type { BrokerToolResult } from "./turn-broker";
 import type { ContextRemainingBudget } from "./context-types";
 
-/** Effective local ceilings, not claims about ChatGPT platform limits. Spec §7's
- * suggested text ceilings are used. Wire reserve covers the outer MCP framing.
+/** Effective local ceilings, not claims about ChatGPT platform limits.
+ * Wire reserve covers the outer MCP framing.
  * Image limits allow the measured small PNGs; larger client limits are unproven.
  * Time is active processing time only, never time between authorized calls. */
 export const CONTEXT_LIMITS = Object.freeze({
   listEntries: 50, searchHits: 10, listBytes: 48 * 1024, searchBytes: 12 * 1024,
-  readBytes: 64 * 1024, listTokens: 6_000, searchTokens: 1_500, readTokens: 8_000,
+  readBytes: 64 * 1024, listTokens: 6_000, searchTokens: 1_500, readTokens: 16_000,
   wireReserveBytes: 128, tokenReserve: 32, labelChars: 120, snippetChars: 160,
   maxImageBytes: 4 * 1024 * 1024, imageWireBytes: 6 * 1024 * 1024,
   imageMetadataTokens: 1_500, maxImageReads: 64, maxTotalImageBytes: 32 * 1024 * 1024,
@@ -24,7 +24,7 @@ export type ContextLimitOverrides = { -readonly [K in keyof ContextLimits]?: num
 export const UNLIMITED_CONTEXT_ALLOWANCE = Number.MAX_SAFE_INTEGER;
 
 export const CONTEXT_BUDGET_PROFILES = Object.freeze({
-  expanded: Object.freeze({ readBytes: 64 * 1024, readTokens: 8_000, listBytes: 48 * 1024, listTokens: 6_000, listEntries: 50 }),
+  expanded: Object.freeze({ readBytes: 64 * 1024, readTokens: 16_000, listBytes: 48 * 1024, listTokens: 6_000, listEntries: 50 }),
   conservative: Object.freeze({ readBytes: 24 * 1024, readTokens: 2_500, listBytes: 12 * 1024, listTokens: 1_500, listEntries: 20 }),
 });
 export type ContextBudgetProfile = keyof typeof CONTEXT_BUDGET_PROFILES;

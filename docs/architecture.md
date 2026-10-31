@@ -192,7 +192,7 @@ any invalid item prevents all new coverage. Single images retain their original 
 confirmation through one-item arrays. Protocol 6 and manifest 3 publish a fixed required batch
 chain, so normal pure-text startup needs no required directory traversal. A final overview
 establishes settled readiness. The expanded profile caps a complete text response at 64 KiB and
-8,000 estimated tokens; it is a local budget, not proof of real platform acceptance.
+16,000 estimated tokens; it is a local budget, not a universal platform limit.
 
 Initial Launcher setup asks which interaction mode to install and defaults to With Automation. The
 same choice remains available in Settings; changing it uses the transactional setup path, replaces

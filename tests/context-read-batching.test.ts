@@ -153,6 +153,37 @@ describe("context text batches", () => {
 });
 
 describe("fixed bootstrap batch chains", () => {
+  for (const count of [1, 8, 9]) test(`${count} sources retain partial successors, empty blocks and exact UTF-8 tails`, () => {
+    const texts = Array.from({ length: count }, (_, index) => index === count - 1
+      ? "中文🙂\\n\t  \n".repeat(3000) : index % 2 ? "" : `source-${index}`);
+    const snapshot = snapshotOf(texts), limits = contextLimits();
+    const deliveryByTarget = Object.fromEntries(snapshot.targets.map(target => [target.target_id, { delivery: "mcp", required: true }]));
+    const planned = measureBootstrapRequiredCosts({ snapshot, planId: "tails", manifestDigest: "digest", limits,
+      deliveryByTarget, started: performance.now() });
+    const nav = new ContextNavigator({ scopeId: "tails", snapshot, purpose: "normal", limits, deliveryByTarget,
+      bootstrap: { planId: "tails", manifestDigest: "digest", requiredTextBatches: planned.batches } });
+    const restored = new Map<string, string>();
+    expect(planned.batches.length).toBeGreaterThan(1);
+    expect(planned.batches.length).toBeLessThan(100);
+    for (const [index, batch] of planned.batches.entries()) {
+      const args = nav.requiredReadArgs(index), reply = nav.read(args);
+      expect(nav.read(args)).toEqual(reply);
+      const cost = measureContextResponse(reply, { boundCursorTokens: true }), page = parseContextTextReadResult(reply);
+      expect(cost.total_tokens).toBeLessThanOrEqual(batch.tokens);
+      expect(cost.wire_bytes).toBeLessThanOrEqual(batch.wire_bytes);
+      expect(cost.total_tokens).toBeLessThanOrEqual(limits.readTokens);
+      expect(cost.wire_bytes).toBeLessThanOrEqual(limits.readBytes);
+      for (const [bodyIndex, item] of page.metadata.items.entries()) {
+        const previous = restored.get(item.read_ref) ?? "";
+        expect(item.range.start).toBe(Buffer.byteLength(previous));
+        restored.set(item.read_ref, previous + page.bodies[bodyIndex]);
+      }
+      expect(page.metadata.required_step!.next_required_read?.arguments ?? null)
+        .toEqual(index + 1 < planned.batches.length ? nav.requiredReadArgs(index + 1) : null);
+    }
+    expect(snapshot.targets.map(target => restored.get(target.read_ref!))).toEqual(texts);
+  });
+
   for (const profile of ["expanded", "conservative"] as const) test(`${profile} merges 24 required sources and re-signs one finite chain without entries`, () => {
     const texts = Array.from({ length: 24 }, (_, index) => `${index}:` + "short ".repeat(63) + (index === 23 ? "REQUIRED-LAST-ITEM" : ""));
     const snapshot = snapshotOf(texts), limits = contextLimits(contextBudgetProfileLimits(profile));

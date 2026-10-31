@@ -24,7 +24,8 @@ import { CONTEXT_TEXT_READ_FORMAT, parseContextTextReadResult } from "../src/ada
 // through the real MCP transport before completing each task.
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==";
 const tailMarker = "unread-tail-evidence-七三九";
-const log = `${"recorded test line\n".repeat(3_000)}${tailMarker}\n`;
+// Exceed the 64 KiB response ceiling so the tail still requires a later read at 16k.
+const log = `${"recorded test line\n".repeat(5_000)}${tailMarker}\n`;
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   chatGptTurnSessions.clear();

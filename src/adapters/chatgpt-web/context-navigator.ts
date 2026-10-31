@@ -234,8 +234,12 @@ export class ContextNavigator {
           itemTokens = Math.max(itemTokens, cost.total_tokens); itemBytes = Math.max(itemBytes, cost.wire_bytes);
         }
         const wrapper = this.#costBound(response({ tool: "codex_context_read", arguments: { context_id: this.#snapshot.context_id, reads: [] } }));
-        const allowance = { wire_bytes: width * itemBytes + wrapper.wire_bytes, tokens: width * itemTokens + wrapper.total_tokens };
         while (position < required.length) {
+          // The current source may remain partial, but completed sources cannot
+          // occur in any successor. Keep every still-possible successor slot.
+          const successorWidth = Math.min(width, required.length - position);
+          const allowance = { wire_bytes: successorWidth * itemBytes + wrapper.wire_bytes,
+            tokens: successorWidth * itemTokens + wrapper.total_tokens };
           const reads = required.slice(position, position + width).map((target, index) => ({ target_id: target.target_id, start: index === 0 ? start : 0 }));
           const args = { context_id: this.#snapshot.context_id, reads: reads.map(read => this.readArgsAt(read.target_id, read.start).reads[0]!) };
           const validated = this.#validateReads(args);

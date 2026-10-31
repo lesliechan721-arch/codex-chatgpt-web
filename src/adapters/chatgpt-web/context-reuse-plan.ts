@@ -20,6 +20,7 @@ interface UnitDraft extends ContextReuseUnit {
 export function prepareContextReuse(input: {
   canonical: CodexParsedRequest; candidate: CodexParsedRequest; prepared: Prepared;
   snapshot: ContextSnapshot; planId: string; baseline?: ContextReuseBaseline; maxStorageBytes: number;
+  referenceNamespace?: string;
 }) {
   const rules = contextRuleSources(input.canonical, input.candidate);
   const baseline = new Map(input.baseline?.units.map(unit => [unit.unit_id, unit]));
@@ -67,7 +68,7 @@ export function prepareContextReuse(input: {
       unit_ids: snapshot.identities.map(identity => identities.get(identity)!) }));
   const appendUnits = () => appendFixedContextRecords(input.snapshot, drafts.map(unit => ({ text: unit.text, encoding: unit.encoding,
     origin: "context_reuse_unit" as const, originalRole: unit.role })),
-    { contextId: input.snapshot.context_id, maxStorageBytes: input.maxStorageBytes });
+    { contextId: input.snapshot.context_id, maxStorageBytes: input.maxStorageBytes, referenceNamespace: input.referenceNamespace });
   let snapshots = currentSnapshots();
   let snapshot = appendUnits();
   let targets = snapshot.targets.slice(input.snapshot.targets.length);

@@ -163,7 +163,7 @@ test("required text cannot change control state and has no full-read compaction 
 });
 
 function tightPlan(): ContextPlanRegistration {
-  const plan = registration(["Alpha value ".repeat(1500), "Bravo data ".repeat(1500)]);
+  const plan = registration(["Alpha value ".repeat(3000), "Bravo data ".repeat(3000)]);
   plan.limits = {};
   const costs = measureBootstrapRequiredCosts({ snapshot: plan.snapshot, planId: plan.planId, manifestDigest: plan.manifestDigest,
     limits: contextLimits(plan.limits), deliveryByTarget: plan.deliveryByTarget, started: performance.now() });
