@@ -362,9 +362,16 @@ a missing artifact or a skipped required job cannot satisfy these gates. Linux a
 macOS retain single-job verification; all platforms retain packaging, smoke and their
 platform-specific signature or ABI checks.
 
+CI and Release cover the same five native platforms: macOS ARM64 and Intel, Linux x64
+and ARM64, and Windows x64. Both use `intel-release.yml` for Intel verification and
+packaging. The workflow contract tests compare the platform sets and macOS signature
+checks. The Arch Linux AppImage ABI check runs only on Linux x64 in both workflows;
+Linux ARM64 still runs full verification, native packaging and smoke checks.
+
 Manual CI accepts `windows_test_topology=single` to run the complete Windows suite in one
 job. The default is `sharded`. `test_workers=auto|2` uses two workers per test job; `1`
-selects serial execution. Local `bun run test` and `bun run verify` still run the complete
+selects serial execution on Windows, Linux and ARM macOS. The shared Intel workflow
+always uses two workers, matching Release. Local `bun run test` and `bun run verify` still run the complete
 suite without a shard argument.
 
 ```sh
@@ -434,7 +441,7 @@ source hashes are computed.
 
 ## Intel release shards and independent measurements
 
-Release calls `intel-release.yml` at the same commit. Two `macos-15-intel` jobs each use
+CI and Release call `intel-release.yml` at the same commit. Two `macos-15-intel` jobs each use
 two workers and cold allocation: shard 1 runs `verify --test-mode=timing --test-shard=1/2`,
 and shard 2 runs `test --mode=timing --shard=2/2`. A separate job builds and smoke-tests
 the Intel package, verifies both macOS signatures, and uploads `release-macos-15-intel`.

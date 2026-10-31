@@ -439,7 +439,13 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
   const ci = readWorkflow("ci");
   const release = readWorkflow("release");
   assert.equal(release.permissions.actions, "read");
-  assert.deepEqual(ci.jobs.verify.strategy.matrix.os, ["macos-15", "ubuntu-latest"]);
+  const ciPlatforms = [...ci.jobs.verify.strategy.matrix.os, ci.jobs["windows-package"]["runs-on"]].sort();
+  const releasePlatforms = release.jobs.build.strategy.matrix.include.map(row => row.runner).sort();
+  assert.deepEqual(ciPlatforms, releasePlatforms, "CI must verify and package every Release matrix platform");
+  assert.equal(ci.jobs.verify["runs-on"], "${{ matrix.os }}");
+  assert.equal(ci.jobs.verify.if, undefined);
+  assert.equal(ci.jobs.verify["continue-on-error"], undefined);
+  assert.equal(workflowStep(ci.jobs.verify, step => step.run === "bun run verify --test-mode=timing").if, undefined);
   for (const job of [ci.jobs.verify, ci.jobs["windows-package"], release.jobs.build]) {
     for (const command of ["bun run app:package", "bun run app:smoke"]) {
       const step = workflowStep(job, step => step.run === command);
@@ -485,18 +491,32 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
     assert.match(source, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.4/);
   }
   assert.match(release.source, /launcher\/build\/runtime/);
-  const abi = workflowStep(release.jobs.build, step => step.name === "Verify Linux AppImage ABI on current Arch");
-  assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "X64" } }), true);
-  assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "ARM64" } }), false);
+  for (const job of [ci.jobs.verify, release.jobs.build]) {
+    const abi = workflowStep(job, step => step.name === "Verify Linux AppImage ABI on current Arch");
+    assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "X64" } }), true);
+    assert.equal(workflowExpression(abi.if, { runner: { os: "Linux", arch: "ARM64" } }), false);
+    for (const name of ["Verify embedded macOS runtime signature", "Verify packaged macOS application signature"]) {
+      const signature = workflowStep(job, step => step.name === name);
+      assert.equal(signature.run, workflowStep(release.jobs.build, step => step.name === name).run);
+      for (const os of ["macOS", "Linux", "Windows"]) {
+        assert.equal(workflowExpression(signature.if, { runner: { os } }), os === "macOS");
+      }
+    }
+  }
   assert.match(release.source, /codesign --verify --deep --strict --verbose=2/);
   assert.match(release.source, /Codex Web GPT\.app/);
   assert.doesNotMatch(release.source, /gh release create[\s\S]*?--draft/);
 });
 
-test("Intel release shards retain package signatures, complete coverage, and the same diagnostic workflow", () => {
-  const release = readWorkflow("release"), intel = readWorkflow("intel-release"), diagnostic = readWorkflow("windows-performance");
+test("CI, Release and diagnostics share Intel shards, package signatures and complete coverage", () => {
+  const ci = readWorkflow("ci"), release = readWorkflow("release"), intel = readWorkflow("intel-release"), diagnostic = readWorkflow("windows-performance");
   const shards = intel.jobs["test-shard"], gate = intel.jobs.gate, packaged = intel.jobs.package;
   assert.equal(release.jobs.intel.uses, "./.github/workflows/intel-release.yml");
+  assert.ok(ci.jobs.intel, "CI must run the shared Intel validation before release");
+  assert.equal(ci.jobs.intel.uses, release.jobs.intel.uses);
+  assert.equal(ci.jobs.intel.if, undefined);
+  assert.equal(ci.jobs.intel["continue-on-error"], undefined);
+  assert.deepEqual(ci.jobs.intel.permissions, { contents: "read", actions: "read" });
   assert.equal(diagnostic.jobs["intel-shards"].uses, release.jobs.intel.uses);
   assert.ok(Object.hasOwn(intel.on, "workflow_call"));
   assert.equal(shards["runs-on"], "macos-15-intel");

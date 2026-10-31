@@ -110,11 +110,13 @@ for (const deliveredBeforeFence of [false, true]) test(`live child Broker cannot
   const f = setup();
   const socket = defaultBrokerEndpoint(f.directory), ready = join(f.directory, "ready.json");
   const module = new URL("../src/adapters/chatgpt-web/turn-broker.ts", import.meta.url).href;
-  const source = `import {writeFileSync} from 'node:fs';
+  const configModule = new URL("../src/config.ts", import.meta.url).href;
+  // File existence is the readiness signal; publish only the complete token.
+  const source = `import {atomicWriteFile} from ${JSON.stringify(configModule)};
     import {TurnBroker} from ${JSON.stringify(module)};
     const broker=TurnBroker.forSocket(${JSON.stringify(socket)});
     const token=await broker.register({authorityMode:'delegated',threadId:'thread',turnId:'turn',tools:[{type:'function',name:'echo',parameters:{type:'object',properties:{},additionalProperties:false}}]},undefined,'fence-child',{recovery:${JSON.stringify(f.ref)}});
-    writeFileSync(${JSON.stringify(ready)},JSON.stringify({token}));
+    atomicWriteFile(${JSON.stringify(ready)},JSON.stringify({token}));
     await new Promise(resolve=>process.stdin.once('data',resolve)); await broker.close();`;
   const child = Bun.spawn([process.execPath, "-e", source], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   let invocation: Promise<unknown> | undefined;

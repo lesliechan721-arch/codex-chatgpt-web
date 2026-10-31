@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       test_workers:
-        description: "Server test workers (auto = 2 on all OSes; 1 = serial; 2 = parallel)"
+        description: "Server test workers (auto = 2; 1 = serial; Intel release validation stays at 2)"
         type: choice
         options: ["auto", "1", "2"]
         default: "auto"
@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-latest]
+        os: [macos-15, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     env:
       CGW_TEST_WORKERS: ${{ inputs.test_workers != 'auto' && inputs.test_workers || '2' }}
@@ -79,7 +79,7 @@ jobs:
           # PR packaging has no signing credentials; retain the verified ad-hoc signature.
           CSC_FOR_PULL_REQUEST: ${{ runner.os == 'macOS' && 'true' || 'false' }}
       - name: Verify Linux AppImage ABI on current Arch
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
           artifact="$(find launcher/artifacts -maxdepth 1 -name '*-linux-x64.AppImage' -print -quit)"
           test -n "$artifact"
@@ -90,6 +90,24 @@ jobs:
         run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
       - run: bun run app:smoke
         if: runner.os != 'Windows'
+      - name: Verify embedded macOS runtime signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict launcher/build/runtime/runtime/bun
+      - name: Verify packaged macOS application signature
+        if: runner.os == 'macOS'
+        run: |
+          archive="$(find launcher/artifacts -maxdepth 1 -name '*-mac-*.zip' -print -quit)"
+          test -n "$archive"
+          stage="$(mktemp -d)"
+          ditto -x -k "$archive" "$stage"
+          codesign --verify --deep --strict --verbose=2 "$stage/Codex Web GPT.app"
+
+  intel:
+    needs: codex-model-gate
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/intel-release.yml
 
   windows-verify:
     name: Windows full verification

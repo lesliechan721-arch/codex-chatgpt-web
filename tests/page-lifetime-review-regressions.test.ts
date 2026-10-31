@@ -1084,6 +1084,7 @@ test("page lifetime R3: destroying a retained MCP page clears its task generatio
   expect(f.pages.size).toBe(1);
 });
 
+// Full-capacity cleanup takes 10,000 real filesystem locks; allow for slow CI disks.
 test("page lifetime R3: registry-only migration frees 10000 admission slots without changing installation identity", async () => {
   const f = fixture();
   const markerFile = join(f.statePath, "initialized.json"), marker = readFileSync(markerFile, "utf8");
@@ -1098,7 +1099,7 @@ test("page lifetime R3: registry-only migration frees 10000 admission slots with
   expect(Object.keys(JSON.parse(readFileSync(registryFile, "utf8")).entries)).toEqual([continuityDigest(f.threadId)]);
   expect(readFileSync(markerFile, "utf8")).toBe(marker);
   expect(f.pages.size).toBe(1);
-}, 30000);
+}, 120000);
 
 // This interruption requires POSIX permission bits on the registry and admission lock.
 test.skipIf(process.platform === "win32")("page lifetime R3: another thread retries naturally interrupted orphan cleanup after its admission lock releases", async () => {
