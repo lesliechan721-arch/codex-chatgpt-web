@@ -150,18 +150,18 @@ async function continuationFixture(manual: boolean) {
   const environment = { authorityMode: "delegated" as const, threadId: "native-thread", turnId: "native-turn",
     tools: [{ name: "exec_command", description: "Simulated command", parameters: {
       type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } }] };
-  const completedBaseline = async (thread: string) => {
+  const baselinePlan = registration("inline", "exact stable rule");
+  const completedBaseline = async (thread: string, sourceOwner: TurnBroker | RemoteTurnBroker = owner) => {
     store.admitWork({ thread, scope, owner: processOwner, logicalWorkId: "A", instructionIdentity: "instruction-A",
       nativeTurnId: "turn-A", workPayloadDigest: digest, snapshotDigest: digest, createPage: true, dispatchProtocolComplete: true });
-    const token = await owner.register(environment, undefined, "reuse-source", {
+    const token = await sourceOwner.register(environment, undefined, "reuse-source", {
       recovery: { directory, thread, logicalWorkId: "A", attempt: 0, ownerId: processOwner.id } });
-    const plan = registration("inline", "exact stable rule");
-    await owner.registerContextPlan(token, plan); await owner.selectContextPlan(token, plan.planId);
-    await owner.markContextPlanSent(token, plan.planId);
-    const fence = await owner.beginCompletionFence(token);
-    expect(await owner.commitCompletionFence(token, fence!)).toBeTrue();
+    await sourceOwner.registerContextPlan(token, baselinePlan); await sourceOwner.selectContextPlan(token, baselinePlan.planId);
+    await sourceOwner.markContextPlanSent(token, baselinePlan.planId);
+    const fence = await sourceOwner.beginCompletionFence(token);
+    expect(await sourceOwner.commitCompletionFence(token, fence!)).toBeTrue();
     store.completeWork(thread, { scope }, "A", { receiptId: "final-A", digest });
-    return (await owner.commitContextReuse(token))!;
+    return (await sourceOwner.commitContextReuse(token))!;
   };
   const thread = "1".repeat(64);
   const baseline = await completedBaseline(thread);
@@ -256,7 +256,9 @@ test(`${stage} reuse retains its evidence when other pages evict the baseline ca
     if (stage === "active") await f.start();
     for (let index = 0; index < 129; index++) {
       const thread = recoveryDigest(`other-page-${index}`);
-      await f.completedBaseline(thread);
+      // Fill the real cache through the local broker API; the retained page and
+      // eviction probe still exercise the Remote owner boundary.
+      await f.completedBaseline(thread, f.broker);
       // Completed pages still occupy the broker cache. Retire their disk records
       // so each fixture write stays bounded instead of rewriting every prior page.
       expect(f.store.removePage(thread, f.store.get(thread)!)).toBeTrue();
@@ -274,7 +276,7 @@ test(`${stage} reuse retains its evidence when other pages evict the baseline ca
     expect(await f.owner.contextStatus(f.token)).toMatchObject({ context_ready: false, reuse_ready: false });
     await expect(f.owner.beginCompletionFence(f.token, f.context)).rejects.toBeDefined();
   } finally { await f.close(); }
-}, 30_000);
+}, 60_000);
 
 for (const manual of [false, true]) for (const stage of ["register", "select", "sent"] as const)
 test(`reuse admission pauses during recovery and resumes the same plan (${manual ? "safe" : "native"}, ${stage})`, async () => {

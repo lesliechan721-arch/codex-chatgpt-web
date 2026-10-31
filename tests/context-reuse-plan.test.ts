@@ -90,7 +90,7 @@ for (const manual of [false, true]) test(`real request rules become exact full u
 
 for (const manual of [false, true]) test(`long repeated requests remain separate complete paged delta values (${manual ? "manual" : "automatic"})`, () => {
   const first = plan(request(), undefined, manual);
-  const long = "相同新事件🙂`\\\"\n".repeat(1800) + "不能漏读尾页  \n";
+  const long = "相同新事件🙂`\\\"\n".repeat(3600) + "不能漏读尾页  \n";
   const second = plan(request(long), baseline(first), manual);
   const third = plan(request(long), baseline(second), manual);
   for (const result of [second, third]) {

@@ -5,7 +5,7 @@ import type { CodexParsedRequest } from "../../types";
 import { CompactionSourceCoverage, type CompactionSourcePlan } from "./compaction-context";
 import { contextCandidateMessageIndices, contextCandidateRawInputIndices } from "./context-candidate-mapping";
 import { planContextDelivery, type ContextDeliveryPlan } from "./context-planner";
-import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
+import { appendFixedContextRecords, createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
 import type { ChatGptWebCapabilities } from "./model";
 import type { CompileChatGptWebPromptOptions } from "./prompt";
 import type { BrokerWaitOptions, TurnBrokerOwner } from "./turn-broker";
@@ -45,7 +45,9 @@ export class ContextSend {
     const budgetProfile = configuredContextBudgetProfile();
     const reuseAvailable = bootstrapAvailable && (await this.broker.contextReuseAvailable?.() ?? false);
     const baseline = options.retainedContinuity ? this.reuseBaseline : undefined;
-    const planInput = { canonical: this.canonical, snapshot: this.initialSource, candidate,
+    // Each physical preparation owns a fresh identity; representation trials inside
+    // its planner share stable identities and cannot bias selection with random refs.
+    const planInput = { canonical: this.canonical, snapshot: appendFixedContextRecords(this.initialSource, []), candidate,
       messageIndices: contextCandidateMessageIndices(this.canonical, candidate), capabilities: this.capabilities,
       rawInputIndices: contextCandidateRawInputIndices(this.canonical, candidate),
       turnToken: token, compileOptions: options, contextToolsAvailable, budgetProfile,
