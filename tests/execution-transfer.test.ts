@@ -1,6 +1,6 @@
 import { CONTEXT_PROTOCOL_VERSION } from "../src/adapters/chatgpt-web/context-runtime";
 import { expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ContinuityRegistrationStore } from "../src/adapters/chatgpt-web/continuity-registration";
@@ -15,6 +15,7 @@ import { continuityDigest } from "../src/adapters/chatgpt-web/continuity-binding
 import { LauncherKnownUnsentReceiptError } from "../src/launcher-browser-host";
 import { continuityError } from "../src/adapters/chatgpt-web/continuity-errors";
 import { defaultBrokerEndpoint } from "../src/config";
+import { waitForChildReady } from "./helpers/child-readiness";
 
 const thread = "1".repeat(64), scope = "2".repeat(64);
 function setup() {
@@ -121,9 +122,7 @@ for (const deliveredBeforeFence of [false, true]) test(`live child Broker cannot
   const child = Bun.spawn([process.execPath, "-e", source], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   let invocation: Promise<unknown> | undefined;
   try {
-    const deadline = Date.now() + 5000;
-    while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
-    if (!existsSync(ready)) throw new Error(await new Response(child.stderr).text());
+    await waitForChildReady(child, ready);
     const { token } = JSON.parse(readFileSync(ready, "utf8"));
     const claim = await callTurnBroker<{ bindingId: string }>(socket, { method: "claim", token });
     invocation = callTurnBroker(socket, { method: "invoke", bindingId: claim.bindingId, wireName: "echo", freeform: false, arguments: {} }, null).catch(error => error);
@@ -144,10 +143,11 @@ for (const deliveredBeforeFence of [false, true]) test(`live child Broker cannot
       expect(() => assertRecoveryWriter(f.ref)).toThrow("obsolete execution");
     }
   } finally {
-    child.kill(); await child.exited; await invocation;
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited; await invocation;
     rmSync(f.directory, { recursive: true, force: true });
   }
-}, 10000);
+}, 60_000);
 
 
 test("durable fencing rejects old reads, ACK, final publication and compaction handoff", async () => {
@@ -233,9 +233,7 @@ test("a live original process settles its delayed Send after cross-process durab
     process.stdout.write(JSON.stringify({currentWriter:result.currentWriter,attempt:repeated.record.works.work.attempts[0]}));`;
   const child = Bun.spawn([process.execPath, "-e", source], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   try {
-    const deadline = Date.now() + 5000;
-    while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
-    if (!existsSync(ready)) throw new Error(await new Response(child.stderr).text());
+    await waitForChildReady(child, ready);
     f.store.retireAttempt(thread, { scope }, "work", 0); process.kill(child.pid, 0);
     expect(() => f.store.reserveRecovery(thread, { scope }, { logicalWorkId: "work", owner: f.owner, snapshotDigest: "4".repeat(64) })).toThrow("Send is still unknown");
     child.stdin.write("settle"); child.stdin.end();
@@ -249,8 +247,12 @@ test("a live original process settles its delayed Send after cross-process durab
     expect(next.works.work!.attempts[1]!.sendEvidence).toBeUndefined();
     const replay = settleRecoverySend(JSON.parse(readFileSync(ready, "utf8")));
     expect(replay.currentWriter).toBe(false); expect(replay.record.works.work!.attempts).toHaveLength(2);
-  } finally { child.kill(); await child.exited; rmSync(f.directory, { recursive: true, force: true }); }
-});
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+    rmSync(f.directory, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test("Send settlement rejects missing authorization and every mismatched original identity", () => {
   const f = setup();

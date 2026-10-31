@@ -10,6 +10,9 @@ import { get_encoding, type Tiktoken } from "tiktoken";
 const TOKENIZER_CHUNK_CHARS = 4_096;
 // At most 4 MiB of UTF-16 chunk contents, released when a synchronous preparation returns.
 const MAX_CACHED_TOKENIZER_CHUNKS = 512;
+// o200k_base tokenizes numbers separately. Require adjacent non-whitespace JSON
+// punctuation: splitting arbitrary numbers can change its trailing-space matches.
+const JSON_INTEGER = /(?<=[,:])[0-9]+(?=[,}\]])/g;
 let tokenizer: Tiktoken | undefined;
 let preparationChunks: Map<string, number> | undefined;
 
@@ -24,6 +27,17 @@ export function withTokenEstimateCache<T>(prepare: () => T): T {
 function chatGptTokenizer(): Tiktoken {
   tokenizer ??= get_encoding("o200k_base");
   return tokenizer;
+}
+
+function cachedTokens(text: string, encoding: Tiktoken, chunks: Map<string, number>): number {
+  if (!text) return 0;
+  let tokens = chunks.get(text);
+  if (tokens === undefined) {
+    tokens = encoding.encode_ordinary(text).length;
+    if (chunks.size >= MAX_CACHED_TOKENIZER_CHUNKS) chunks.delete(chunks.keys().next().value!);
+  } else chunks.delete(text);
+  chunks.set(text, tokens);
+  return tokens;
 }
 
 /**
@@ -49,15 +63,16 @@ export function estimateTokens(text: string, modelId?: string, tokenCeiling = In
       }
     }
     const chunk = text.slice(start, end);
-    let tokens = chunks.get(chunk);
-    if (tokens === undefined) {
-      tokens = encoding.encode_ordinary(chunk).length;
-      if (chunks.size >= MAX_CACHED_TOKENIZER_CHUNKS) chunks.delete(chunks.keys().next().value!);
-    } else {
-      chunks.delete(chunk);
+    // Page offsets vary during packing. Reuse the stable text around those
+    // integers without changing the original chunk's token sequence or count.
+    let offset = 0;
+    for (const match of chunk.matchAll(JSON_INTEGER)) {
+      count += cachedTokens(chunk.slice(offset, match.index), encoding, chunks)
+        + cachedTokens(match[0], encoding, chunks);
+      offset = match.index + match[0].length;
     }
-    chunks.set(chunk, tokens);
-    count += tokens;
+    count += cachedTokens(chunk.slice(offset), encoding, chunks);
+    // Keep the existing ceiling behavior: finish the whole original chunk first.
     if (count > tokenCeiling) return count;
     start = end;
   }

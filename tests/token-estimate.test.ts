@@ -129,3 +129,58 @@ test("a preparation evicts old counts when it sees many distinct chunks", () => 
     expect(encode.mock.calls.filter(([chunk]) => chunk === text)).toHaveLength(2);
   } finally { encode.mockRestore(); }
 });
+
+test("changing JSON page offsets reuses tokenized metadata without changing counts", () => {
+  const pages = Array.from({ length: 32 }, (_, index) => JSON.stringify({
+    source: "Stable source metadata 中文🙂 ".repeat(30),
+    range: { start: index, end_exclusive: index + 1000 },
+    body: "Exact source text with whitespace.\n".repeat(15),
+  }));
+  const encoding = get_encoding("o200k_base");
+  const expected = pages.map(page => encoding.encode_ordinary(page).length);
+  encoding.free();
+  const encode = spyOn(Tiktoken.prototype, "encode_ordinary");
+  try {
+    const actual = withTokenEstimateCache(() => pages.map(page => estimateTokens(page)));
+    expect(actual).toEqual(expected);
+    const encodedChars = encode.mock.calls.reduce((sum, [text]) => sum + text.length, 0);
+    expect(encodedChars).toBeLessThan(pages.reduce((sum, text) => sum + text.length, 0) / 4);
+  } finally { encode.mockRestore(); }
+});
+
+test("numeric cache boundaries preserve original chunk counts and ceiling returns", () => {
+  const encoding = get_encoding("o200k_base");
+  const values = [
+    'a  1', 'a   1', '{"n": 123}', '{"n":123 }', '{"n":-123}', '{"n":12.34}',
+    '{"n":1e10}', '[0,1,12,123,1234,1234567]', '{"n":١23}', '{"n":12３}',
+    '{"n":𝟙23}', '🙂\\n\t中文:{123,456} ', '{"n":123,"next":"a  1"}',
+    '\ud800:123,\udc00', '<|endoftext|>:123,<|im_start|>',
+  ];
+  const samples = values.flatMap(value => [value, ...[4080, 4093, 4095, 4096].map(size =>
+    "prefix ".repeat(600).slice(0, size) + value + "😀" + value)]);
+  // The previous contract counts independent 4096-UTF-16 chunks and only checks
+  // the ceiling after a whole chunk; use the real tokenizer as the oracle.
+  const originalCounts = new Map<string, number>();
+  const previous = (text: string, ceiling: number) => {
+    let total = 0;
+    for (let start = 0; start < text.length;) {
+      let end = Math.min(start + 4096, text.length);
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!) && /[\uDC00-\uDFFF]/.test(text[end]!)) end--;
+      const chunk = text.slice(start, end);
+      let tokens = originalCounts.get(chunk);
+      if (tokens === undefined) { tokens = encoding.encode_ordinary(chunk).length; originalCounts.set(chunk, tokens); }
+      total += tokens;
+      if (total > ceiling) return total;
+      start = end;
+    }
+    return total;
+  };
+  try {
+    for (const text of samples) {
+      const total = previous(text, Infinity);
+      for (const ceiling of [0, 100, total - 1, total, Infinity]) {
+        expect(withTokenEstimateCache(() => estimateTokens(text, undefined, ceiling))).toBe(previous(text, ceiling));
+      }
+    }
+  } finally { encoding.free(); }
+});

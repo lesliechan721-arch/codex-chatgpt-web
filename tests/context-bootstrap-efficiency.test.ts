@@ -7,6 +7,7 @@ import { ContextScope } from "../src/adapters/chatgpt-web/context-runtime";
 import { contextTextReadReceipt, parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
 import { createHash } from "node:crypto";
 import { bootstrapEfficiencyFixture } from "./helpers/context-bootstrap-efficiency";
+import { measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 
 function plan(canonical: ReturnType<typeof parseRequest>, inlineToolFields: boolean, reuse = false, readTokens = 8000,
   snapshot = createContextSnapshot(canonical)) {
@@ -105,6 +106,7 @@ test("unprofitable fields and unproven mappings retain the legal baseline", () =
   expect(selected.costs.selection!.reasons).toEqual(baseline.costs.selection!.reasons);
 });
 
+// Include real small-budget delivery without imposing a wall-clock performance assertion.
 for (const readTokens of [2500, 8000, 16000]) test(`complete-chain guards hold at ${readTokens} tokens`, () => {
     const canonical = fixture(), snapshot = createContextSnapshot(canonical);
     const baseline = plan(canonical, false, false, readTokens, snapshot), selected = plan(canonical, true, false, readTokens, snapshot);
@@ -112,7 +114,23 @@ for (const readTokens of [2500, 8000, 16000]) test(`complete-chain guards hold a
     expect(selected.costs.requiredTextWireBytes!).toBeLessThanOrEqual(baseline.costs.requiredTextWireBytes!);
     expect(selected.costs.requiredTextTokens!).toBeLessThanOrEqual(baseline.costs.requiredTextTokens!);
     expect(restore(selected)).toEqual(restore(baseline));
-}, 20_000);
+    if (readTokens === 2500) {
+      const scope = new ContextScope("small-budget-chain", selected.registration!, "normal", () => {}, () => {});
+      try {
+        scope.markEntryDelivered();
+        let calls = 0;
+        while (scope.status().next_required_read) {
+          expect(++calls).toBeLessThanOrEqual(selected.costs.selection!.requiredBatches);
+          const reply = scope.prepare("read", scope.status().next_required_read!.arguments);
+          const cost = measureContextResponse(reply.result);
+          expect(cost.total_tokens).toBeLessThanOrEqual(selected.limits.readTokens);
+          expect(cost.wire_bytes).toBeLessThanOrEqual(selected.limits.readBytes);
+          expect(scope.finish(reply.receiptId, true, contextTextReadReceipt(reply.result))).toBeDefined();
+        }
+        expect(scope.status().context_ready).toBeTrue();
+      } finally { scope.retire(); }
+    }
+}, 60_000);
 
 // Keep all five comparisons per boundary, with a separate timeout for each input.
 for (const readTokens of [2500, 8000]) for (const size of [165, 170])

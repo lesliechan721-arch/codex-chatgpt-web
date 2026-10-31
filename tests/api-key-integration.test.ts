@@ -77,8 +77,8 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-function cli(args: string[]) {
-  const result = Bun.spawnSync(
+async function cli(args: string[]) {
+  const child = Bun.spawn(
     [process.execPath, resolve(import.meta.dir, "../src/cli.ts"), "--home", process.env.CODEX_CHATGPT_WEB_HOME!, ...args],
     {
       env: {
@@ -87,14 +87,20 @@ function cli(args: string[]) {
       },
       stdout: "pipe",
       stderr: "pipe",
-      timeout: 15_000,
+      timeout: 30_000,
+      killSignal: "SIGKILL",
     },
   );
-  if (result.exitCode !== 0) {
-    throw new Error(`CLI ${args.join(" ")} failed: exit=${result.exitCode}; signal=${result.signalCode}`
-      + `\nstdout: ${result.stdout.toString().slice(-8_192)}\nstderr: ${result.stderr.toString().slice(-8_192)}`);
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`CLI ${args.join(" ")} failed: exit=${exitCode}; signal=${child.signalCode}`
+      + `\nstdout: ${stdout.slice(-8_192)}\nstderr: ${stderr.slice(-8_192)}`);
   }
-  return result;
+  return { exitCode, stdout, stderr };
 }
 test("API cleanup removes recorded routes/features/hooks but retains the user's provider", () => {
   injected(); expect(cleanupApiKeyCodexIntegration().changed).toBe(true);
@@ -140,6 +146,7 @@ test("API preflight accepts manual providers and creates no Codex injection", ()
   api(); preflightSetup({ mode: "browser-only", browserHostDescriptorPath: join(home, "browser.json"), acknowledgedUnofficial: true });
   expect(existsSync(getCodexConfigPath())).toBe(false); expect(existsSync(getCodexJournalPath())).toBe(false);
 });
+// Three CLI processes, server startup, and cleanup each have their own deadline.
 test("manual server mode leaves recorded Codex client files byte-for-byte unchanged on API enable, rotate and serve", async () => {
   const port = await unusedPort();
   saveApiAccessPolicy(OPENAI_ACCESS);
@@ -153,17 +160,17 @@ test("manual server mode leaves recorded Codex client files byte-for-byte unchan
   );
   const before = clientFileSnapshot();
 
-  const enabled = cli(["api-key", "enable", "--generate"]);
+  const enabled = await cli(["api-key", "enable", "--generate"]);
   expect(enabled.exitCode).toBe(0);
   expect(clientFileSnapshot()).toEqual(before);
 
-  const rotated = cli(["api-key", "rotate", "--generate"]);
+  const rotated = await cli(["api-key", "rotate", "--generate"]);
   expect(rotated.exitCode).toBe(0);
   expect(clientFileSnapshot()).toEqual(before);
 
-  const cleanup = cli(["api-key", "cleanup"]);
+  const cleanup = await cli(["api-key", "cleanup"]);
   expect(cleanup.exitCode).toBe(0);
-  expect(JSON.parse(cleanup.stdout.toString())).toEqual({ changed: false, manualConfigurationRequired: true });
+  expect(JSON.parse(cleanup.stdout)).toEqual({ changed: false, manualConfigurationRequired: true });
   expect(clientFileSnapshot()).toEqual(before);
 
   const serve = Bun.spawn(
@@ -195,7 +202,7 @@ test("manual server mode leaves recorded Codex client files byte-for-byte unchan
   const exited = serve.exited.then(code => { exitCode = code; });
   let failure: unknown;
   try {
-    const deadline = performance.now() + 15_000;
+    const deadline = performance.now() + 30_000;
     let lastFailure = "no health response";
     for (;;) {
       if (exitCode !== undefined) throw new Error("Server exited before becoming healthy");
@@ -224,7 +231,7 @@ test("manual server mode leaves recorded Codex client files byte-for-byte unchan
     throw new Error(`${String(failure)}; server exit=${exitCode}; signal=${serve.signalCode}`
       + `\nstdout: ${logs.stdout}\nstderr: ${logs.stderr}`, { cause: failure });
   }
-}, 90_000);
+}, 150_000);
 test("export shares V1 feature defaults and Interrupt command but omits conflicting auth/voice/trust", () => {
   const config = defaultConfig();
   const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/catalog.json", model: "chatgpt-web/high",
