@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseRequest } from "../src/responses/parser";
+import { parseRequest, parsedRequestRuleSourceEvidence } from "../src/responses/parser";
 import { contextRuleSources } from "../src/adapters/chatgpt-web/context-rule-sources";
 import { bindContextFullCandidate, bindContextInstructionInputSource, contextCandidateCanonicalSource,
   continuityAcceptedContextCandidate, continuityContextCandidate,
@@ -191,6 +191,30 @@ describe("verified context rule sources", () => {
     expect(() => bindContextFullCandidate(parsed, tampered)).toThrow();
     (parsed._rawBody as { input: Record<string, unknown>[] }).input[0]!.stable = true;
     expect(contextRuleSources(parsed, parsed).units).toEqual([]);
+  });
+
+  test("rule evidence checks detached nested values and preserves object-order independence", () => {
+    const raw = { type: "function_call_output", call_id: "call", output: "done",
+      _meta: { raw: "x".repeat(1024 * 1024), details: { first: 1, second: 2 }, optional: undefined, zero: -0 } };
+    const parsed = request([message("task", "user", "Keep the original rules."), raw]);
+    const original = parsedRequestRuleSourceEvidence(parsed);
+    expect(original).toBeDefined();
+    raw._meta.details = { second: 2, first: 1 };
+    raw._meta.zero = 0;
+    expect(parsedRequestRuleSourceEvidence(parsed)).toEqual(original);
+    raw._meta.details.first = 3;
+    expect(parsedRequestRuleSourceEvidence(parsed)).toBeUndefined();
+    raw._meta.details.first = 1;
+    expect(parsedRequestRuleSourceEvidence(parsed)).toEqual(original);
+    Reflect.deleteProperty(raw._meta, "optional");
+    expect(parsedRequestRuleSourceEvidence(parsed)).toBeUndefined();
+    raw._meta.optional = undefined;
+    raw._meta.raw = "y" + raw._meta.raw.slice(1);
+    expect(parsedRequestRuleSourceEvidence(parsed)).toBeUndefined();
+    raw._meta.raw = "x".repeat(1024 * 1024);
+    expect(parsedRequestRuleSourceEvidence(parsed)).toEqual(original);
+    parsed.context.messages[0]!.content = "Changed parsed rules.";
+    expect(parsedRequestRuleSourceEvidence(parsed)).toBeUndefined();
   });
 
   test("a candidate that reverses equal-text sources cannot retain their original priority proof", () => {

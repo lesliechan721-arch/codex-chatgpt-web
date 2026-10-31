@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type {
   CodexAgentMessage,
   CodexAssistantMessage,
@@ -316,17 +316,23 @@ export interface ParsedRequestRuleSourceEvidence {
 type RuleSourceProof = {
   evidence: ParsedRequestRuleSourceEvidence;
   rawBody: unknown;
-  rawDigest: string;
-  systemDigest: string;
-  messageDigests: Array<{ index: number; digest: string }>;
+  rawValue: unknown;
+  systemValue: unknown;
+  messageValues: Array<{ index: number; value: unknown }>;
 };
 const ruleSourceProofs = new WeakMap<CodexParsedRequest, RuleSourceProof>();
 const proofValue = (value: unknown): unknown => {
   if (Array.isArray(value)) return ["array", value.map(proofValue)];
   if (isObj(value)) return ["object", Object.keys(value).sort().map(key => [key, proofValue(value[key])])];
-  return [typeof value, value === undefined ? null : value];
+  // Preserve the scalar normalization of the former JSON-encoded proof.
+  if (typeof value === "bigint") JSON.stringify(value); // Still reject non-JSON integers.
+  return [typeof value, typeof value === "number" ? Number.isFinite(value) ? value || 0 : null
+    : value === undefined || typeof value === "function" || typeof value === "symbol" ? null : value];
 };
-const proofDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(proofValue(value))).digest("hex");
+// Detach mutable containers, but share immutable string values. Rule proofs are
+// local to the parsed request: hashing every multi-MiB tool result on each parse
+// and verification adds no authority to this private, in-memory comparison.
+const sameProofValue = (a: unknown, b: unknown): boolean => isDeepStrictEqual(proofValue(a), proofValue(b));
 const visibleRuleMessage = (message: CodexMessage | undefined): unknown => {
   if (!message) return undefined;
   const { timestamp: _timestamp, ...visible } = message;
@@ -337,19 +343,19 @@ function ruleSourceRaw(request: CodexParsedRequest): unknown {
   return { present: Object.hasOwn(body, "instructions"), instructions: body.instructions, input: body.input };
 }
 function rememberRuleSources(request: CodexParsedRequest, evidence: ParsedRequestRuleSourceEvidence): void {
-  ruleSourceProofs.set(request, { evidence, rawBody: request._rawBody, rawDigest: proofDigest(ruleSourceRaw(request)),
-    systemDigest: proofDigest(request.context.systemPrompt), messageDigests: evidence.input.flatMap(item =>
+  ruleSourceProofs.set(request, { evidence, rawBody: request._rawBody, rawValue: proofValue(ruleSourceRaw(request)),
+    systemValue: proofValue(request.context.systemPrompt), messageValues: evidence.input.flatMap(item =>
       item.position && "message_index" in item.position
-        ? [{ index: item.position.message_index, digest: proofDigest(visibleRuleMessage(request.context.messages[item.position.message_index])) }]
+        ? [{ index: item.position.message_index, value: proofValue(visibleRuleMessage(request.context.messages[item.position.message_index])) }]
         : []) });
 }
 
 /** Only a real parse registers provenance. Request JSON cannot supply this proof. */
 export function parsedRequestRuleSourceEvidence(request: CodexParsedRequest): ParsedRequestRuleSourceEvidence | undefined {
   const proof = ruleSourceProofs.get(request);
-  if (!proof || proof.rawBody !== request._rawBody || proof.rawDigest !== proofDigest(ruleSourceRaw(request))
-    || proof.systemDigest !== proofDigest(request.context.systemPrompt)
-    || proof.messageDigests.some(item => item.digest !== proofDigest(visibleRuleMessage(request.context.messages[item.index])))) return undefined;
+  if (!proof || proof.rawBody !== request._rawBody || !isDeepStrictEqual(proof.rawValue, proofValue(ruleSourceRaw(request)))
+    || !isDeepStrictEqual(proof.systemValue, proofValue(request.context.systemPrompt))
+    || proof.messageValues.some(item => !isDeepStrictEqual(item.value, proofValue(visibleRuleMessage(request.context.messages[item.index]))))) return undefined;
   return structuredClone(proof.evidence);
 }
 
@@ -358,10 +364,10 @@ export function parsedRequestRuleSourceEvidence(request: CodexParsedRequest): Pa
 export function inheritParsedRequestRuleSourceEvidence(parsed: CodexParsedRequest, target: CodexParsedRequest,
   restoredSystemPositions?: ReadonlyMap<number, number>): void {
   const evidence = parsedRequestRuleSourceEvidence(parsed);
-  if (!evidence || proofDigest(ruleSourceRaw(parsed)) !== proofDigest(ruleSourceRaw(target))
+  if (!evidence || !sameProofValue(ruleSourceRaw(parsed), ruleSourceRaw(target))
     || evidence.input.some(item => item.position && "message_index" in item.position
-      && proofDigest(visibleRuleMessage(parsed.context.messages[item.position.message_index]))
-        !== proofDigest(visibleRuleMessage(target.context.messages[item.position.message_index])))) return;
+      && !sameProofValue(visibleRuleMessage(parsed.context.messages[item.position.message_index]),
+        visibleRuleMessage(target.context.messages[item.position.message_index])))) return;
   if (restoredSystemPositions) {
     const parsedSystem = parsed.context.systemPrompt ?? [], targetSystem = target.context.systemPrompt ?? [];
     const used = new Set<number>();
@@ -379,7 +385,7 @@ export function inheritParsedRequestRuleSourceEvidence(parsed: CodexParsedReques
       item.position = { system_index: index };
     }
     if (used.size !== targetSystem.length) return;
-  } else if (proofDigest(parsed.context.systemPrompt) !== proofDigest(target.context.systemPrompt)) return;
+  } else if (!sameProofValue(parsed.context.systemPrompt, target.context.systemPrompt)) return;
   rememberRuleSources(target, evidence);
 }
 

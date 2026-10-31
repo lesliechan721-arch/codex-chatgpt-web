@@ -6,6 +6,7 @@ import { namespacedToolName, type AdapterEvent, type CodexParsedRequest, type Co
 import { COMPACT_PROMPT, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
 import { canonicalJson } from "./canonical-json";
+import { cloneRequestValue } from "../../lib/clone-request-value";
 import { createContextSnapshot } from "./context-snapshot";
 import type { BrokerToolRequest, BrokerWaitOptions } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserErrorLog, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
@@ -1724,15 +1725,15 @@ export class ChatGptTurnSession {
       if (!activeToolResultMatches(item, request)) {
         throw taskUpdateSourceError("task_update_result_type_invalid", `Tool result ${id} does not match the issued call's result type.`);
       }
-      rawResults.set(id, structuredClone(item));
+      rawResults.set(id, cloneRequestValue(item));
     }
     const ordered = batch.requests.flatMap(request => rawResults.has(request.callId) ? [rawResults.get(request.callId)!] : []);
     for (const request of batch.requests) {
       const stored = this.continuityReceivedResults.get(request.callId)?.item;
       if (stored && this.hasOutstanding(request.callId)) {
         const index = ordered.findIndex(item => item.call_id === request.callId);
-        if (index >= 0) ordered[index] = structuredClone(stored);
-        else ordered.push(structuredClone(stored));
+        if (index >= 0) ordered[index] = cloneRequestValue(stored);
+        else ordered.push(cloneRequestValue(stored));
       }
     }
     const messages = parseRequest({ model: parsed.modelId, input: ordered }).context.messages
@@ -1909,7 +1910,7 @@ export class ChatGptTurnSession {
     }
     if (this.runtime.continuityBinding?.recovery) acceptRecoveryResults(this.runtime.continuityBinding.recovery, fresh.map(result => result.item));
     for (const result of fresh) this.continuityReceivedResults.set(String(result.item.call_id),
-      { item: structuredClone(result.item), bytes: result.bytes });
+      { item: cloneRequestValue(result.item), bytes: result.bytes });
     this.continuityReceivedResultBytes += bytes;
     if (fresh.length) this.continuityGeneration += 1;
     return proof.messages;

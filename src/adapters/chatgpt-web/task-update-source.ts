@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { cloneRequestValue } from "../../lib/clone-request-value";
 import type { CodexParsedRequest } from "../../types";
 import { canonicalJson } from "./canonical-json";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -106,7 +107,7 @@ export function captureTaskUpdateSource(
     }
   }
   if (messages.length === 0 && !continuity) return undefined;
-  const input = structuredClone(body.input);
+  const input = cloneRequestValue(body.input);
   const requestFingerprint = taskUpdateDigest({ input, modelId: parsed.modelId, options: parsed.options,
     instructions: body.instructions ?? null, previousResponseId: parsed.previousResponseId ?? null });
   const metadataRaw = record(body.client_metadata)?.["x-codex-turn-metadata"];
