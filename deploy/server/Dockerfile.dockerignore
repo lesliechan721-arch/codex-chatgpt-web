@@ -24,6 +24,9 @@ launcher/**
 !launcher/vite.config.ts
 !launcher/index.html
 
+!launcher/patches/
+!launcher/patches/**
+
 !launcher/assets/
 !launcher/assets/**
 

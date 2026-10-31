@@ -24,6 +24,7 @@ RUN test "$(dpkg --print-architecture)" = "amd64" \
 
 COPY package.json bun.lock ./
 COPY launcher/package.json launcher/bun.lock ./launcher/
+COPY launcher/patches/ ./launcher/patches/
 
 RUN bun install --frozen-lockfile \
   && cd launcher \
