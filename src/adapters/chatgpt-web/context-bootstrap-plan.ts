@@ -22,6 +22,8 @@ export function measureBootstrapRequiredCosts(input: {
   snapshot: ContextSnapshot; planId: string; manifestDigest: string; limits: ContextLimits;
   deliveryByTarget: Readonly<Record<string, ContextDelivery>>; started: number;
   reuse?: ContextReusePlan;
+  /** Recheck the same snapshot and limits with final control metadata, without repacking. */
+  requiredTextBatches?: readonly ContextRequiredTextBatch[];
 }): { text: ContextResponseCost; discovery: ContextResponseCost; batches: ContextRequiredTextBatch[];
   retry: { tokens: number; wire_bytes: number }; control: ContextBootstrapControlCosts } {
   const { snapshot, limits, deliveryByTarget } = input;
@@ -36,7 +38,8 @@ export function measureBootstrapRequiredCosts(input: {
     limits };
   const bootstrap = { planId: input.planId, manifestDigest: input.manifestDigest, ...(input.reuse ? { reuse: input.reuse } : {}) };
   let batches: ContextRequiredTextBatch[];
-  try { batches = new ContextNavigator({ ...options, bootstrap }).preflightRequiredTextBatches(); }
+  try { batches = input.requiredTextBatches ? structuredClone([...input.requiredTextBatches])
+    : new ContextNavigator({ ...options, bootstrap }).preflightRequiredTextBatches(); }
   catch { throw new ContextDeliveryPlanningError("CONTEXT_BUDGET_EXCEEDED", "A required context batch cannot fit its complete response budget"); }
   const nav = new ContextNavigator({ ...options, bootstrap: { ...bootstrap, requiredTextBatches: batches } });
   const measure = (response: Parameters<typeof measureContextResponse>[0]): ContextResponseCost => {

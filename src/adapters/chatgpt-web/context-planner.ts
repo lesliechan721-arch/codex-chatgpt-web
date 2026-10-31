@@ -698,7 +698,7 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
         // Final control wrappers include the manifest digest. Measure that exact
         // version before the candidate can be selected or sent.
         required = measureBootstrapRequiredCosts({ snapshot, planId, manifestDigest, limits, deliveryByTarget,
-          started, ...(reuse ? { reuse } : {}) });
+          started, requiredTextBatches: required.batches, ...(reuse ? { reuse } : {}) });
         const descriptor = { planId, contextId: snapshot.context_id, manifestDigest, requiredAttachments: media.requiredAttachments };
         const entry = reuse ? shortContextReuseBootstrapPrompt({ ...entryInput, plan: descriptor, reuse,
           ...(inlineReusePayload ? { inlinePayload: inlineReusePayload } : {}) })

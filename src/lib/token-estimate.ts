@@ -30,8 +30,9 @@ function chatGptTokenizer(): Tiktoken {
  * Count ordinary text conservatively without handing pathological multi-megabyte runs to one
  * tokenizer call. Independent chunks can only lose cross-boundary merges, so their sum may
  * over-count slightly but cannot under-count because of a missed boundary token.
+ * Fit checks may stop once the count exceeds tokenCeiling. Omit it for full accounting.
  */
-export function estimateTokens(text: string, modelId?: string): number {
+export function estimateTokens(text: string, modelId?: string, tokenCeiling = Infinity): number {
   void modelId;
   if (!text) return 0;
 
@@ -57,6 +58,7 @@ export function estimateTokens(text: string, modelId?: string): number {
     }
     chunks.set(chunk, tokens);
     count += tokens;
+    if (count > tokenCeiling) return count;
     start = end;
   }
   return count;
