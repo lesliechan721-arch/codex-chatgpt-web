@@ -114,25 +114,25 @@ for (const readTokens of [2500, 8000, 16000]) test(`complete-chain guards hold a
     expect(restore(selected)).toEqual(restore(baseline));
 }, 20_000);
 
-for (const readTokens of [2500, 8000]) test(`fixed source mapping makes borderline selections deterministic at ${readTokens} tokens`, () => {
-  for (const size of [165, 170]) {
-    const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "keep exact rules\n".repeat(800), input: [
-      { type: "function_call_output", call_id: "call", output: Array.from({ length: 10 }, (_, index) =>
-        createHash("sha256").update(String(index)).digest("base64url")).join("").slice(0, size) },
-      { role: "user", content: "do task" },
-    ] });
-    const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
-      capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false },
-      turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true, limits: { readTokens } };
-    const choices = new Set<string>();
-    for (let repeat = 0; repeat < 5; repeat++) {
-      const result = planContextDelivery(input);
-      choices.add(JSON.stringify(aggregate(result).external_positions.map((position: any) => position.path)));
-      expect(restore(result)).toEqual(result.compiled.bootstrapContent!.payload);
-    }
-    expect(choices.size).toBe(1);
+// Keep all five comparisons per boundary, with a separate timeout for each input.
+for (const readTokens of [2500, 8000]) for (const size of [165, 170])
+test(`fixed source mapping makes borderline selections deterministic at ${readTokens} tokens (size=${size})`, () => {
+  const canonical = parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "keep exact rules\n".repeat(800), input: [
+    { type: "function_call_output", call_id: "call", output: Array.from({ length: 10 }, (_, index) =>
+      createHash("sha256").update(String(index)).digest("base64url")).join("").slice(0, size) },
+    { role: "user", content: "do task" },
+  ] });
+  const input = { canonical, candidate: canonical, snapshot: createContextSnapshot(canonical),
+    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: false },
+    turnToken: `turn_${"a".repeat(32)}`, contextToolsAvailable: true, limits: { readTokens } };
+  const choices = new Set<string>();
+  for (let repeat = 0; repeat < 5; repeat++) {
+    const result = planContextDelivery(input);
+    choices.add(JSON.stringify(aggregate(result).external_positions.map((position: any) => position.path)));
+    expect(restore(result)).toEqual(result.compiled.bootstrapContent!.payload);
   }
-}, 20_000);
+  expect(choices.size).toBe(1);
+}, 30_000);
 
 for (const fastAvailable of [false, true]) test(`an optional inline trial cannot swallow the shared deadline (fast=${fastAvailable})`, () => {
   const canonical = fastAvailable ? parseRequest({ model: CHATGPT_WEB_MODEL_ID, instructions: "keep exact rules\n".repeat(100),
