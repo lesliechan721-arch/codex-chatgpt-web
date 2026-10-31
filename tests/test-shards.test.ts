@@ -18,7 +18,7 @@ function gateFixture(mode: "full" | "timing" = "full", planned = false): ShardAg
   const workflowRun = { id: "42", attempt: "2", repository: "owner/repo" };
   const targets = planned ? [[files[0]!, files[1]!], [files[2]!, files[3]!]] : [[files[0]!, files[2]!], [files[1]!, files[3]!]];
   const plan = { path: ".github/windows-test-shards.json", digest: "1".repeat(64), plan: {
-    version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2, source: { runId: "41", revision, repository: "owner/repo" },
+    version: 1, platform: "win32", bunVersion: "1.4.4", workers: 2, source: { runId: "41", revision, repository: "owner/repo" },
     overheadMs: [10, 0], shards: targets.map(target => ({ files: Object.fromEntries(target.map(file => [file, 1])) })),
   } as TestShardPlan };
   const shards = targets.map((target, i) => {
@@ -27,7 +27,7 @@ function gateFixture(mode: "full" | "timing" = "full", planned = false): ShardAg
       dependencyDigest: "d".repeat(64), launcherDependencyDigest: "e".repeat(64), workflowRevision: revision, workflowRun,
       shard: { index: i + 1, total: 2, repositoryFiles: files, repositoryFilesDigest: testFileSetDigest(files), expectedFiles: target,
         ...(planned ? { plan: { path: plan.path, digest: plan.digest } } : {}) },
-      workers: 2, isolation: "default", mode, platform: "win32", arch: "x64", bunVersion: "1.4.3", executable: { path: "C:\\bun\\bun.exe", sha256: "f".repeat(64) }, cwd: "C:\\checkout",
+      workers: 2, isolation: "default", mode, platform: "win32", arch: "x64", bunVersion: "1.4.4", executable: { path: "C:\\bun\\bun.exe", sha256: "f".repeat(64) }, cwd: "C:\\checkout",
       scheduling: planned ? { source: "plan", reason: "committed-shard-plan", lookupMs: 0, inputDigest: plan.digest, from: { path: plan.path } }
         : { source: "cold", reason: "shard-cold-only", inputDigest: null, from: null },
       historyPublication: { status: "not-requested", localPath: null, artifactPath: null },
@@ -40,7 +40,7 @@ function gateFixture(mode: "full" | "timing" = "full", planned = false): ShardAg
       fileTiming: { version: 3, complete: true, fullSuite: false, logsComplete: true, sourceStable: true, outputWriteError: null, reasons: [],
         targetFiles: target, executedFiles: target, measuredFiles: target, reportedFiles: 2 },
       evidence: { summary: "summary.json", completion: "completion.json", stdout: "stdout.log", stderr: "stderr.log", timings: "file-timings.json" } };
-    return { directory: `artifact-${i + 1}`, summary, stdout: "bun test v1.4.3", stderr,
+    return { directory: `artifact-${i + 1}`, summary, stdout: "bun test v1.4.4", stderr,
       timings: JSON.stringify({ version: 1, files: Object.fromEntries(target.map(file => [file, 1])) }),
       completion: { version: 1, runId: summary.runId, endPoint: "after-summary-and-status-output", excludes: ["completion-write", "process-shutdown"],
         segments: { prepareMs: 1, executionMs: 10, logDrainMs: 0, reportMs: 2, totalMs: 13 } } };
@@ -72,7 +72,7 @@ test("weighted plans reserve verify time and keep assignments stable when files 
   const shards = balanceShardPlan(timings, 2, [20, 0]);
   // File work 80 + 40 worker-ms overhead balances file work 120.
   expect(shards.map(shard => Object.keys(shard.files))).toEqual([[files[1], files[3]], [files[0], files[2]]]);
-  const plan = parseShardPlan({ version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2,
+  const plan = parseShardPlan({ version: 1, platform: "win32", bunVersion: "1.4.4", workers: 2,
     source: { runId: "41", revision, repository: "owner/repo" }, overheadMs: [20, 0], shards });
   const expanded = ["tests/0-new.test.ts", ...files, "tests/zz-new.test.ts"];
   const combined: string[] = [];
@@ -118,7 +118,18 @@ test("planned coverage is bound to the gate plan, exact commands and verify prof
   }
 });
 
-test("planning reads successful Windows artifacts and pins the resulting plan bytes", () => {
+test("historical shard assignments remain usable but release evidence requires the patched Bun runtime", () => {
+  const fixture = gateFixture("timing", true);
+  fixture.plan!.plan.bunVersion = "1.4.3";
+  expect(parseShardPlan(fixture.plan!.plan).bunVersion).toBe("1.4.3");
+  expect(aggregateShardEvidence(fixture).success).toBe(true);
+  for (const shard of fixture.shards) shard.summary.bunVersion = "1.4.3";
+  expect(aggregateShardEvidence(fixture)).toMatchObject({ success: false,
+    reasons: expect.arrayContaining(["shard-1:unsupported-execution-configuration", "shard-2:unsupported-execution-configuration"]) });
+});
+
+for (const bunVersion of ["1.4.3", "1.4.4"] as const)
+test(`planning preserves Bun ${bunVersion} measurement provenance and pins the resulting plan bytes`, () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-plan-artifacts-"));
   try {
     const fixture = gateFixture("timing"), artifacts = join(root, "artifacts");
@@ -127,6 +138,7 @@ test("planning reads successful Windows artifacts and pins the resulting plan by
       writeFileSync(join(root, file), "fixture test source");
     }
     for (const [index, evidence] of fixture.shards.entries()) {
+      evidence.summary.bunVersion = bunVersion;
       const parent = join(artifacts, `shard-${index + 1}`), run = join(parent, "run");
       mkdirSync(run, { recursive: true });
       writeFileSync(join(run, "summary.json"), JSON.stringify(evidence.summary));
@@ -135,13 +147,17 @@ test("planning reads successful Windows artifacts and pins the resulting plan by
       if (index === 0) writeFileSync(join(parent, "verify-summary.json"), JSON.stringify(fixture.verify));
     }
     const plan = planTestShards(root, artifacts);
-    expect(plan).toMatchObject({ source: { runId: "42", revision }, overheadMs: [11, 0] });
+    expect(plan).toMatchObject({ bunVersion, source: { runId: "42", revision }, overheadMs: [11, 0] });
     expect(plan.shards.flatMap(shard => Object.keys(shard.files)).sort()).toEqual(files);
     const path = "plan.json"; writeFileSync(join(root, path), JSON.stringify(plan));
     const loaded = loadShardPlan(root, path);
     expect(loaded.plan).toEqual(plan);
     expect(loaded.digest).toBe(createHash("sha256").update(readFileSync(join(root, path))).digest("hex"));
     expect(() => loadShardPlan(root, "../outside.json")).toThrow("inside the checkout");
+    const secondPath = join(artifacts, "shard-2/run/summary.json");
+    writeFileSync(secondPath, JSON.stringify({ ...fixture.shards[1]!.summary, bunVersion: bunVersion === "1.4.3" ? "1.4.4" : "1.4.3" }));
+    expect(() => planTestShards(root, artifacts)).toThrow("same source");
+    writeFileSync(secondPath, JSON.stringify(fixture.shards[1]!.summary));
     fixture.shards[0]!.summary.testResult = "nonzero-exit";
     writeFileSync(join(artifacts, "shard-1/run/summary.json"), JSON.stringify(fixture.shards[0]!.summary));
     expect(() => planTestShards(root, artifacts)).toThrow("successful");
@@ -535,8 +551,8 @@ test("Linux aggregation checks Windows verify paths and independent requested co
   }
 });
 
-test("Bun 1.4.3 runs both cold shards with exactly the dynamically discovered files and timings", () => {
-  expect(Bun.version).toBe("1.4.3");
+test("Bun 1.4.4 runs both cold shards with exactly the dynamically discovered files and timings", () => {
+  expect(Bun.version).toBe("1.4.4");
   const root = mkdtempSync(join(tmpdir(), "cgw-native-shards-"));
   try {
     mkdirSync(join(root, "tests/nested"), { recursive: true });

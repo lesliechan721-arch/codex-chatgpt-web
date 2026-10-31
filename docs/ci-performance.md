@@ -400,7 +400,12 @@ report. It derives non-server overhead from that report. Review and commit the c
 plan. Assignment changes occur only when the plan changes; historical artifacts are
 planning inputs and do not authorize current test coverage.
 
-Without `--shard-plan`, shards retain Bun 1.4.3 cold file allocation. All shards reject path/name filters, bail, invalid or
+The plan's `bunVersion` records the runtime used for its historical measurements.
+The committed Bun 1.4.3 measurements remain valid scheduling estimates for Bun 1.4.4;
+release evidence must come from Bun 1.4.4. Regenerating a plan records the actual version
+of its source reports and rejects reports that mix runtime versions.
+
+Without `--shard-plan`, shards retain Bun 1.4.4 cold file allocation. All shards reject path/name filters, bail, invalid or
 duplicate shard numbers, and explicit `CGW_TEST_TIMING_*` variables. They do not restore
 or publish history. Each shard has an independent output directory and artifact. Windows
 CI/Release and Intel release gates support partial reruns: each gate resolves the latest

@@ -97,7 +97,7 @@ export function aggregateShardEvidence(input: ShardAggregationInput) {
       if (expected[key] !== undefined) require(summary[key] === expected[key], `${label}:unexpected-${key}`);
     }
     require([1, 2].includes(summary.workers) && ["default", "isolate"].includes(summary.isolation)
-      && ["full", "timing"].includes(summary.mode) && summary.bunVersion === "1.4.3" && hash(summary.executable?.sha256, 64), `${label}:unsupported-execution-configuration`);
+      && ["full", "timing"].includes(summary.mode) && summary.bunVersion === "1.4.4" && hash(summary.executable?.sha256, 64), `${label}:unsupported-execution-configuration`);
     const identity = { revision: summary.revision, patchDigest: summary.patchDigest, toolDigest: summary.toolDigest,
       workflowRevision: summary.workflowRevision, dependencyDigest: summary.dependencyDigest, launcherDependencyDigest: summary.launcherDependencyDigest,
       workflowRun: { id: summary.workflowRun?.id, repository: summary.workflowRun?.repository },

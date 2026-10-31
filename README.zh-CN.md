@@ -193,7 +193,7 @@ cd codex-chatgpt-web && \
 bun run app
 ```
 
-源码方式需要 Bun 1.4.3。该命令会安装锁定版本的依赖并打开应用。
+源码方式需要 Bun 1.4.4。该命令会安装锁定版本的依赖并打开应用。
 
 ```bash
 bun run app

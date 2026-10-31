@@ -17,7 +17,8 @@ export function planTestShards(root: string, artifacts: string): TestShardPlan {
   for (const evidence of shards) {
     const summary = evidence.summary;
     if (![1, 2].includes(summary?.shard?.index) || summary.shard.total !== 2 || summary.platform !== "win32"
-      || summary.arch !== "x64" || summary.bunVersion !== "1.4.3" || summary.workers !== first.workers
+      || summary.arch !== "x64" || !["1.4.3", "1.4.4"].includes(summary.bunVersion)
+      || summary.bunVersion !== first.bunVersion || summary.workers !== first.workers
       || summary.revision !== first.revision || summary.patchDigest !== first.patchDigest || summary.toolDigest !== first.toolDigest
       || summary.workflowRun?.id !== first.workflowRun?.id || summary.workflowRun?.repository !== first.workflowRun?.repository
       || summary.testResult !== "success" || summary.exitCode !== 0 || summary.wallValid !== true
@@ -41,7 +42,7 @@ export function planTestShards(root: string, artifacts: string): TestShardPlan {
     || verify.profiles?.[0]?.runId !== first.runId) throw new Error("Planning requires shard 1's successful verification report.");
   const overheadMs = [Math.ceil(verify.stages.filter((stage: any) => stage.command?.[2] !== "test")
     .reduce((sum: number, stage: any) => sum + stage.elapsedMs, 0)), 0];
-  return parseShardPlan({ version: 1, platform: "win32", bunVersion: "1.4.3", workers: first.workers,
+  return parseShardPlan({ version: 1, platform: "win32", bunVersion: first.bunVersion, workers: first.workers,
     source: { runId: first.workflowRun.id, revision: first.revision, repository: first.workflowRun.repository }, overheadMs,
     shards: balanceShardPlan(Object.fromEntries(current.map(file => [file, timings[file]!])), first.workers, overheadMs) });
 }

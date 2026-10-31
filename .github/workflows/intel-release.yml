@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
@@ -94,7 +94,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - name: Check complete Intel job states
         run: |
           [[ "$INTEL_SHARDS_RESULT" == 'success' && "$INTEL_PACKAGE_RESULT" == 'success' ]]

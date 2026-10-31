@@ -264,7 +264,7 @@ for (const planned of [false, true]) test(`the real wrapper writes complete ${pl
       "scripts/test-timing-history.ts", "scripts/test-shards.ts", "src/runtime-performance.ts"]) copyFileSync(join(repository, file), join(root, file));
     for (const name of ["a", "b", "c"]) writeFileSync(join(root, "tests", `${name}.test.ts`), `import {test} from "bun:test";
       test("actual shard test",()=>{}); ${name === "a" ? 'test.skip("declared skip",()=>{});' : ""}`);
-    const plan = { version: 1, platform: "win32", bunVersion: "1.4.3", workers: 2,
+    const plan = { version: 1, platform: "win32", bunVersion: "1.4.4", workers: 2,
       source: { runId: "41", revision: "a".repeat(40), repository: "owner/repo" }, overheadMs: [100, 0],
       shards: [{ files: { "tests/a.test.ts": 10, "tests/b.test.ts": 20 } }, { files: { "tests/c.test.ts": 30 } }] };
     writeFileSync(join(root, "plan.json"), JSON.stringify(plan));

@@ -482,7 +482,7 @@ test("CI and Release retain platform packages, smoke tests, signatures, and publ
     assert.match(source, /prepare-linux-libnotify\.sh/);
     assert.match(source, /prepare-linux-appimage-tools\.cjs/);
     assert.match(source, /archlinux:base/);
-    assert.match(source, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.3/);
+    assert.match(source, /prepare-windows-baseline-bun\.ps1 -Version 1\.4\.4/);
   }
   assert.match(release.source, /launcher\/build\/runtime/);
   const abi = workflowStep(release.jobs.build, step => step.name === "Verify Linux AppImage ABI on current Arch");

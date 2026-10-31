@@ -10,6 +10,7 @@ import { callTurnBroker, RemoteTurnBroker, TurnBroker, type BrokerToolResult } f
 import { contextLimits, measureContextResponse } from "../src/adapters/chatgpt-web/context-budget";
 import { ContextScope, type ContextPreparedReply, type ContextPlanRegistration } from "../src/adapters/chatgpt-web/context-runtime";
 import type { NativeOperationReply } from "../src/adapters/chatgpt-web/native-tool-operations";
+import { suspensionTestClock } from "./helpers/suspension-test-clock";
 
 const ownerContext = { expectedDriverGeneration: 0, taskRevision: 0, acknowledgedRevision: 0 };
 const nonce = "context-test-surface-1234567890";
@@ -187,16 +188,20 @@ test("single-image refusal permits compaction submission, while permanent source
 
 test("original compaction transaction expiry releases source capacity immediately", async () => {
   const f = await fixture(false); const a = plan("expiry-source", false);
+  const time = suspensionTestClock();
   try {
     // The source's later expiry must not retain any of the sixteen active-scope slots.
     for (let index = 0; index < 18; index++) {
       const transaction = await f.broker.beginCompactionTransaction(`expiry-${index}`, 40);
       const handle = f.broker.registerCompactionContext({ snapshot: a.snapshot, contract: "native", transactionToken: transaction.token,
         handoffId: transaction.handoffId, historyRevision: 0, ownerGeneration: "writer", expiresAt: Date.now() + 30_000 });
-      await expect(f.broker.waitForCompactionHandoff(transaction.token)).rejects.toThrow("timed out");
+      // Register the waiter before advancing the deadline, regardless of source cloning cost.
+      const expired = f.broker.waitForCompactionHandoff(transaction.token).catch(error => error);
+      time.tick(40);
+      expect(await expired).toMatchObject({ message: "compaction transaction timed out" });
       expect(() => f.broker.markCompactionContextDelivered(handle.compactionToken)).toThrow("no longer active");
     }
-  } finally { await f.close(); }
+  } finally { time.restore(); await f.close(); }
 });
 
 

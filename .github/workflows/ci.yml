@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
@@ -118,13 +118,13 @@ jobs:
           }
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
       - name: Prepare AVX2-independent Windows runtime
         shell: pwsh
-        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.3 -GitHubEnv $env:GITHUB_ENV
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.4 -GitHubEnv $env:GITHUB_ENV
       - run: bun run verify --test-mode=timing
         env:
           CGW_TEST_PROFILE_DIR: ${{ runner.temp }}/test-performance
@@ -168,13 +168,13 @@ jobs:
           }
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
       - name: Prepare AVX2-independent Windows runtime
         shell: pwsh
-        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.3 -GitHubEnv $env:GITHUB_ENV
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.4 -GitHubEnv $env:GITHUB_ENV
       - name: Verify non-server stages and server shard 1
         if: matrix.shard == 1
         run: bun run verify --test-mode=timing --test-shard=1/2 --shard-plan=.github/windows-test-shards.json
@@ -213,7 +213,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - name: Check complete Windows job states
         run: |
           if [[ "$WINDOWS_PACKAGE_RESULT" != 'success' ]]; then
@@ -273,13 +273,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: bun install --frozen-lockfile
       - run: bun install --frozen-lockfile
         working-directory: launcher
       - name: Prepare AVX2-independent Windows runtime
         shell: pwsh
-        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.3 -GitHubEnv $env:GITHUB_ENV
+        run: ./scripts/prepare-windows-baseline-bun.ps1 -Version 1.4.4 -GitHubEnv $env:GITHUB_ENV
       - run: bun run app:package
       - run: bun run app:smoke
       - name: Upload Windows package diagnostics
