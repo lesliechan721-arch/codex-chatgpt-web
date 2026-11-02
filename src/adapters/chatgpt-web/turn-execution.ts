@@ -1,4 +1,4 @@
-import { taskInputQueue } from "./continuity-task-input-runtime";
+import { completeTaskInputPhysicalResponse, taskInputQueue } from "./continuity-task-input-runtime";
 import { TASK_INPUT_HISTORICAL_RETENTION_MS } from "./continuity-task-input-types";
 import { bindRecoveryContextCoverage, acceptRecoveryResults, stopRecoveryWork, recoveryRecord, type RuntimeRecoveryFinalReceipt } from "./continuity-recovery-runtime";
 import { createHash } from "node:crypto";
@@ -877,9 +877,14 @@ export class ChatGptTurnSession {
     this.physicalSettlement = runtime.physicalSettlement.then(
       async () => {
         try {
-          if (runtime.commitContextReuse) {
+          if (runtime.commitContextReuse || taskInputQueue(this)) {
             const outcome = await this.browserOutcome;
-            if (outcome.type === "final" && !this.supersededError) await runtime.commitContextReuse();
+            if (outcome.type === "final" && !this.supersededError) {
+              // A compaction summary can settle the browser without completing ordinary work.
+              // Only an ordinary final receipt permits input completion without HTTP observers.
+              if (this.recoveryFinalReceipt()) completeTaskInputPhysicalResponse(this);
+              await runtime.commitContextReuse?.();
+            }
           }
         } finally { this.settledPhysical = true; }
       },

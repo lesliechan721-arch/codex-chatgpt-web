@@ -1583,6 +1583,32 @@ test("Q01 queued activity keeps the issued call and delivers an ordered ACK batc
   expect(events.filter(event => event.type === "tool_call_start")).toHaveLength(0);
 });
 
+for (const manual of [false, true]) test(`${manual ? "Zero Risk" : "Automatic"} completes acknowledged input after its observer disconnects`, async () => {
+  const f = await fixture(manual);
+  const [call] = await batch(f);
+  const abort = new AbortController();
+  const appended = f.request([output(call!.id, "real completed result"), user("offline-acknowledged", "Inspect the additional input.")], "offline-acknowledged");
+  const response = f.run(appended, [], abort.signal); void response.catch(() => {});
+  let reply = await f.wait(1);
+  for (let i = 0; i < 100 && (!reply.taskUpdate || reply.kind !== "result"); i++) { await Bun.sleep(2); reply = await f.wait(1); }
+  expect(reply.taskUpdate?.updates.map(update => update.sourceMessageId)).toEqual(["offline-acknowledged"]);
+  f.ack(reply.taskUpdate!);
+  const { taskInputQueue } = await import("../src/adapters/chatgpt-web/continuity-task-input-runtime");
+  const queue = taskInputQueue(f.session())!;
+  abort.abort();
+  await Promise.allSettled([response]);
+  await f.finish(); await f.session().browserOutcome; await f.session().physicalSettlement;
+  expect(f.session().settledOutcome()?.type).toBe("final");
+  expect(queue.store.get(queue.identity)).toMatchObject({ state: "completed",
+    messages: [{ messageId: "offline-acknowledged", status: "completed" }],
+    deliveries: [{ acknowledgedMessageIds: ["offline-acknowledged"], completedMessageIds: ["offline-acknowledged"] }] });
+  expect(queue.store.usage(queue.identity)).toMatchObject({ pendingMessages: 0, pendingBytes: 0 });
+  expect(queue.store.readBody(queue.identity, "offline-acknowledged")).toBe("Inspect the additional input.");
+  expect((await f.run(appended)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(queue.store.get(queue.identity)?.receivedSequence).toBe(1);
+  expect(f.sends()).toBe(1);
+});
+
 test("Q10 detached observers retain input without starting a follow-up Send", async () => {
   const f = await fixture();
   const firstAbort = new AbortController(), secondAbort = new AbortController();
