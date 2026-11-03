@@ -1,4 +1,5 @@
 import { appendFileSync, writeFileSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export type ShardSelection = {
   version: 1;
@@ -77,18 +78,34 @@ export function selectShardArtifacts(jobs: Job[], artifacts: Artifact[], expecte
 }
 
 export async function listRunItems(api: string, repository: string, runId: string, kind: "jobs" | "artifacts",
-  token: string, request: ShardFetch = fetch): Promise<any[]> {
+  token: string, request: ShardFetch = fetch, wait: (milliseconds: number) => Promise<void> = sleep): Promise<any[]> {
   const items: any[] = [];
+  // Large all-attempt job pages can return HTTP 502 after repeated workflow reruns.
+  const pageSize = 20;
   for (let page = 1; ; page++) {
-    const response = await request(`${api}/repos/${repository}/actions/runs/${runId}/${kind}?per_page=100&page=${page}${kind === "jobs" ? "&filter=all" : ""}`, {
-      headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
-      signal: AbortSignal.timeout(30_000),
-    });
+    let response: Response;
+    for (let retry = 0; ; retry++) {
+      try {
+        response = await request(`${api}/repos/${repository}/actions/runs/${runId}/${kind}?per_page=${pageSize}&page=${page}${kind === "jobs" ? "&filter=all" : ""}`, {
+          headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" },
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (error) {
+        if (retry === 3) throw error;
+        console.warn(`[test-shards] Workflow ${kind} page ${page} request failed; retry ${retry + 1}/3.`);
+        await wait(1_000 * 2 ** retry);
+        continue;
+      }
+      if (response.ok || ![500, 502, 503, 504].includes(response.status) || retry === 3) break;
+      console.warn(`[test-shards] Workflow ${kind} page ${page}: HTTP ${response.status}; retry ${retry + 1}/3.`);
+      await response.body?.cancel();
+      await wait(1_000 * 2 ** retry);
+    }
     if (!response.ok) throw new Error(`Cannot list workflow ${kind}: HTTP ${response.status}`);
     const data = await response.json() as Record<string, any>;
     if (!Array.isArray(data[kind])) throw new Error(`Invalid workflow ${kind} response.`);
     items.push(...data[kind]);
-    if (data[kind].length < 100) return items;
+    if (data[kind].length < pageSize) return items;
   }
 }
 

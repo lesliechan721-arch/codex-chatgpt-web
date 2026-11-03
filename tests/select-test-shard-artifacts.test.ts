@@ -98,13 +98,67 @@ test("the API reader paginates jobs with filter=all and artifacts before selecti
     const result = await listRunItems("https://api.github.com", "owner/repo", "42", kind, "test-token", (async (url: string, init: RequestInit) => {
       requests.push(url);
       expect(init.headers).toMatchObject({ Authorization: "Bearer test-token" });
-      return Response.json({ [kind]: requests.length === 1 ? Array.from({ length: 100 }, (_, id) => ({ id })) : [{ id: 100 }] });
+      return Response.json({ [kind]: requests.length === 1 ? Array.from({ length: 20 }, (_, id) => ({ id })) : [{ id: 20 }] });
     }));
-    expect(result).toHaveLength(101);
-    expect(requests).toEqual([1, 2].map(page => `https://api.github.com/repos/owner/repo/actions/runs/42/${kind}?per_page=100&page=${page}${kind === "jobs" ? "&filter=all" : ""}`));
+    expect(result).toEqual(Array.from({ length: 21 }, (_, id) => ({ id })));
+    expect(requests).toEqual([1, 2].map(page => `https://api.github.com/repos/owner/repo/actions/runs/42/${kind}?per_page=20&page=${page}${kind === "jobs" ? "&filter=all" : ""}`));
   }
   await expect(listRunItems("https://api.github.com", "owner/repo", "42", "jobs", "test-token",
     async () => new Response(null, { status: 403 }))).rejects.toThrow("HTTP 403");
+});
+
+test("the API reader retries the failed page without losing or duplicating items", async () => {
+  for (const kind of ["jobs", "artifacts"] as const) {
+    const pages: number[] = [], delays: number[] = [];
+    const result = await listRunItems("https://api.github.com", "owner/repo", "42", kind, "test-token", async url => {
+      const page = Number(new URL(url).searchParams.get("page"));
+      pages.push(page);
+      if (pages.length === 2) return new Response("Bad Gateway", { status: 502 });
+      if (pages.length === 3) throw new TypeError("Connection closed");
+      return Response.json({ [kind]: page === 1 ? Array.from({ length: 20 }, (_, id) => ({ id })) : [{ id: 20 }] });
+    }, async milliseconds => { delays.push(milliseconds); });
+    expect(result).toEqual(Array.from({ length: 21 }, (_, id) => ({ id })));
+    expect(pages).toEqual([1, 2, 2, 2]);
+    expect(delays).toEqual([1_000, 2_000]);
+  }
+});
+
+for (const status of [500, 503, 504]) test(`the API reader recovers from HTTP ${status}`, async () => {
+  let requests = 0;
+  const delays: number[] = [];
+  const result = await listRunItems("https://api.github.com", "owner/repo", "42", "jobs", "test-token", async () => {
+    requests++;
+    return requests === 1 ? new Response(null, { status }) : Response.json({ jobs: [{ id: 1 }] });
+  }, async milliseconds => { delays.push(milliseconds); });
+  expect(result).toEqual([{ id: 1 }]);
+  expect(requests).toBe(2);
+  expect(delays).toEqual([1_000]);
+});
+
+for (const failure of ["HTTP 502", "Connection closed", "Request timed out"]) test(`the API reader stops after three retries for ${failure}`, async () => {
+  let requests = 0;
+  const delays: number[] = [];
+  await expect(listRunItems("https://api.github.com", "owner/repo", "42", "jobs", "test-token", async () => {
+    requests++;
+    if (failure === "HTTP 502") return new Response(null, { status: 502 });
+    if (failure === "Connection closed") throw new TypeError(failure);
+    throw new DOMException(failure, "TimeoutError");
+  }, async milliseconds => { delays.push(milliseconds); })).rejects.toThrow(failure);
+  expect(requests).toBe(4);
+  expect(delays).toEqual([1_000, 2_000, 4_000]);
+});
+
+test("the API reader fails immediately on non-retryable responses", async () => {
+  for (const status of [401, 403, 404]) {
+    let requests = 0;
+    const delays: number[] = [];
+    await expect(listRunItems("https://api.github.com", "owner/repo", "42", "jobs", "test-token", async () => {
+      requests++;
+      return new Response(null, { status });
+    }, async milliseconds => { delays.push(milliseconds); })).rejects.toThrow(`HTTP ${status}`);
+    expect(requests).toBe(1);
+    expect(delays).toEqual([]);
+  }
 });
 
 for (const pullRequest of [false, true]) test(`the selector CLI writes selected IDs for ${pullRequest ? "PR merge" : "push"} reports`, async () => {
