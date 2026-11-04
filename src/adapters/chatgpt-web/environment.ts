@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { buildCompactV1Output, decodeCompactionSummary, extractCompactUserMessages, isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
-import { isNativeAgentsMdContext } from "../../responses/native-context";
+import { isNativeAgentsMdContext, isNativeSelectedSkillContext } from "../../responses/native-context";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { hasCompactionEnvironmentCheckpoint, isAcceptedCompactionContinuation, recoverCompactionInstruction } from "./compaction-continuation";
 import { ChatGptWebAdapterError } from "./adapter-error";
@@ -819,7 +819,7 @@ export function continuityCurrentInstructionInput(
       && (message?.role === "system" || message?.role === "developer");
     const grouped = Boolean(message && currentEnvironmentItems.has(message) && Array.isArray(message.content)
       && (chatGptInstructionContent(message) as unknown[]).length > 0);
-    const supplemental = envelope || grouped || Boolean(message && isNativeAgentsMdContext(message));
+    const supplemental = envelope || grouped || Boolean(message && (isNativeAgentsMdContext(message) || isNativeSelectedSkillContext(message)));
     const nativeTurnId = revision?.turnId ?? owner(candidate);
     const requestWide = requestPrefix.has(candidate);
     if (candidate <= lowerBound && !requestWide && !(nativeTurnId === identity.turnId

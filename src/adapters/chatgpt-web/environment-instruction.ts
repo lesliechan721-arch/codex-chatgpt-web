@@ -1,6 +1,6 @@
 import type { CodexParsedRequest } from "../../types";
 import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
-import { isNativeAgentsMdContext, readNativeThreadDelegation } from "../../responses/native-context";
+import { isNativeAgentsMdContext, isNativeSelectedSkillContext, readNativeThreadDelegation } from "../../responses/native-context";
 
 export interface ChatGptTurnUserRevision {
   content: unknown;
@@ -66,6 +66,7 @@ export function contextualUserMessage(value: Record<string, unknown>): boolean {
   const text = rawMessageText(value).trim();
   return hasEnvironmentContextFragment(value)
     || isNativeAgentsMdContext(value)
+    || isNativeSelectedSkillContext(value)
     || isNativeOpenPageContext(value)
     || /^<subagent_notification>[\s\S]*<\/subagent_notification>$/.test(text)
     || isReadableCompactionSummaryText(text)

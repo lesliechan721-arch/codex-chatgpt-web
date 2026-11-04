@@ -17,7 +17,7 @@ import { responsesRequestSchema } from "./schema";
 import { compactionItemToText, isNativeTextCompaction } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
-import { readNativeThreadDelegation } from "./native-context";
+import { isNativeSelectedSkillContext, readNativeThreadDelegation } from "./native-context";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -518,9 +518,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
           case "developer": {
             pendingReasoning.length = 0;
             const content = inputContentParts(msg.content as unknown[] | string | undefined);
-            const kinds = msg.internal_chat_message_metadata_passthrough?.content_item_kinds;
-            const selectedSkill = msg.role === "user" && kinds?.length === 1
-              && kinds[0] === "skills.selected_skill_instructions";
+            const selectedSkill = isNativeSelectedSkillContext(item);
             ruleSources.input.push({ rawIndex, role: msg.role, position: { message_index: messages.length } });
             messages.push({ role: msg.role, content, timestamp: now, ...(selectedSkill ? { origin: "codex_skill" as const } : {}) });
             break;

@@ -14,7 +14,7 @@ import { chatGptWebExecutionNamespace } from "./helpers/chatgpt-web-adapter";
 import { createChatGptWebAdapter as createVerifiedChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { runContextCapabilityVerification } from "../src/adapters/chatgpt-web/context-capability-verification";
 import { parseContextTextReadResult } from "../src/adapters/chatgpt-web/context-text-result";
-import { extractChatGptTurnIdentity, continuityCheckpointSiblingGroup, CONTINUITY_CHECKPOINT_SIBLING_PROOF } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnIdentity, chatGptCurrentInstructionRevision, continuityCheckpointSiblingGroup, CONTINUITY_CHECKPOINT_SIBLING_PROOF } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import { chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
@@ -650,6 +650,49 @@ for (const manual of [false, true]) for (const field of ["author", "recipient"] 
   await expect(f.run(parse([{ ...parent, [field]: "/root/other" }, marker]))).rejects.toMatchObject({ code: "continuity_source_unproven" });
   expect(f.submissions).toHaveLength(submissions);
   expect((await f.run(parse([parent, marker]))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+});
+
+for (const manual of [false, true]) for (const retainSkill of [false, true]) test(`selected skills stay attached to the human task across compaction ${manual} retained ${retainSkill}`, async () => {
+  const f = fixture(manual, { mcpTransport: "in-process" });
+  f.controls.invokeSourceTools = true;
+  f.controls.singleSourceTool = manual;
+  const human = { type: "message", role: "user", id: "human-task", content: [{ type: "input_text", text: "Continue the current task." }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first", content_item_kinds: ["user.text"] } };
+  const skill = { type: "message", role: "user", id: "selected-skill", content: [{ type: "input_text", text: "SELECTED_SKILL_RULE: check the task evidence." }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-first", content_item_kinds: ["skills.selected_skill_instructions"] } };
+  const first = f.request("", "turn-first", [human, skill]);
+  await f.run(first);
+  expect(chatGptCurrentInstructionRevision(first)?.itemId).toBe(human.id);
+  expect(JSON.stringify(taskEnvelope(f.submissions[0]!.prompt))).toContain("SELECTED_SKILL_RULE");
+  const source = chatGptTurnSessions.find(`${chatGptWebExecutionNamespace(f.provider)}:${chatGptTurnExecutionKey(first)}`)!;
+  const compact = f.request("", "turn-first", [human, skill, recordedCall(source.outstanding()[0]!),
+    { type: "function_call_output", call_id: source.outstanding()[0]!.callId, output: "Accepted source result." }]);
+  compact._compactionRequest = true;
+  const summary = (await f.run(compact)).find(event => event.type === "text_delta");
+  if (summary?.type !== "text_delta") throw new Error("Missing selected-skill checkpoint");
+  f.controls.invokeSourceTools = false;
+  const marker = { type: "compaction", encrypted_content: encodeCompactionSummary(summary.text) };
+  const input = [human, ...(retainSkill ? [skill] : []), marker];
+  const resumed = f.request("", "turn-first", input);
+  expect((await f.run(resumed)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(resumed._continuityHistoryRevision).toBe(1);
+  const submissions = f.submissions.length;
+  expect((await f.run(f.request("", "turn-first", input))).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  await expect(f.run(f.request("", "turn-first", [{ ...human, content: "Changed source task." }, ...input.slice(1)])))
+    .rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(submissions);
+
+  const nextHuman = { ...human, id: "next-human-task", internal_chat_message_metadata_passthrough: { ...human.internal_chat_message_metadata_passthrough, turn_id: "turn-next" } };
+  const nextSkill = { ...skill, id: "next-selected-skill", content: [{ type: "input_text", text: "NEXT_SKILL_RULE: verify the next task." }],
+    internal_chat_message_metadata_passthrough: { ...skill.internal_chat_message_metadata_passthrough, turn_id: "turn-next" } };
+  const next = f.request("", "turn-next", [marker, nextHuman, nextSkill]);
+  expect((await f.run(next)).at(-1)).toMatchObject({ type: "done", endTurn: true });
+  expect(chatGptCurrentInstructionRevision(next)?.itemId).toBe(nextHuman.id);
+  expect(JSON.stringify(taskEnvelope(f.submissions.at(-1)!.prompt))).toContain("NEXT_SKILL_RULE");
+  const nextSubmissions = f.submissions.length;
+  await expect(f.run(f.request("", "turn-next", [marker, nextHuman, { ...nextSkill, content: "Changed selected skill." }])))
+    .rejects.toMatchObject({ code: "continuity_source_unproven" });
+  expect(f.submissions).toHaveLength(nextSubmissions);
 });
 
 for (const manual of [false, true]) for (const retainSource of [false, true]) test(`Round 9: checkpoint-only grouped instructions preserve source payload ${manual} retained ${retainSource}`, async () => {

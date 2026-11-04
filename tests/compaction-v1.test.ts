@@ -23,6 +23,14 @@ test("v1 compaction drops native AGENTS refreshes but retains literal and mixed 
   expect(extractCompactUserMessages([refresh, literal, mixed])).toEqual([literal, mixed]);
 });
 
+test("v1 compaction drops selected skill context but keeps literal and mixed human messages", () => {
+  const skill = { type: "message", role: "user", id: "selected-skill", content: [{ type: "input_text", text: "Use the selected skill." }],
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-skill", content_item_kinds: ["skills.selected_skill_instructions"] } };
+  const human = { ...skill, id: "human-task", internal_chat_message_metadata_passthrough: { turn_id: "turn-skill", content_item_kinds: ["user.text"] } };
+  const mixed = { ...skill, id: "mixed-task", internal_chat_message_metadata_passthrough: { turn_id: "turn-skill", content_item_kinds: ["skills.selected_skill_instructions", "user.text"] } };
+  expect(extractCompactUserMessages([human, skill, mixed])).toEqual([human, mixed]);
+});
+
 test("v1 compaction keeps only the newest ten structured images without copying them into text", () => {
   const input = Array.from({ length: 12 }, (_, index) => ({
     type: "message",

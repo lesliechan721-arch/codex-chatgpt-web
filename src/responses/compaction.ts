@@ -1,4 +1,4 @@
-import { isNativeAgentsMdContext } from "./native-context";
+import { isNativeAgentsMdContext, isNativeSelectedSkillContext } from "./native-context";
 
 /**
  * Remote compaction v2 support for ROUTED providers.
@@ -136,6 +136,8 @@ export function extractCompactUserMessages(input: unknown): CompactMessageItem[]
     // Native compaction rebuilds AGENTS context instead of retaining an instruction refresh
     // as a human task. Its source revision must match that installed representation too.
     if (isNativeAgentsMdContext(rec)) continue;
+    // Native compaction removes selected-skill context. It cannot identify the retained task.
+    if (isNativeSelectedSkillContext(rec)) continue;
     // Codex removes InternalModelContextFragment during process_annotated_compacted_history.
     // In particular, a goal continuation is runtime steering, not a retained human message.
     // Exclude it before computing the v1 checkpoint source, or the next request authenticates

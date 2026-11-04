@@ -1,3 +1,11 @@
+/** Selected skills constrain the human task; native compaction can remove these fragments. */
+export function isNativeSelectedSkillContext(item: Record<string, unknown>): boolean {
+  if ((item.type !== undefined && item.type !== "message") || item.role !== "user") return false;
+  const metadata = item.internal_chat_message_metadata_passthrough as { content_item_kinds?: unknown } | undefined;
+  const kinds = metadata?.content_item_kinds;
+  return Array.isArray(kinds) && kinds.length === 1 && kinds[0] === "skills.selected_skill_instructions";
+}
+
 /** Native instruction refreshes are context, not a new human task revision. */
 export function isNativeAgentsMdContext(item: Record<string, unknown>): boolean {
   if (item.type !== "message" || item.role !== "user" || typeof item.id !== "string" || !item.id) return false;

@@ -93,11 +93,11 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 >
 > See [Limits](https://github.com/miuuyy/codex-chatgpt-web/discussions/309) for ChatGPT message allowances.
 > The account and model determine the history window and client compaction threshold:
-> **300,000 / 270,000**, **400,000 / 360,000**, **600,000 / 540,000**, or **800,000 / 720,000** tokens.
+> **500,000 / 450,000**, **600,000 / 540,000**, **800,000 / 720,000**, or **1,000,000 / 900,000** tokens.
 > These are history policies, not measured browser capacity. Full/MCP selects on-demand reading by
 > default; short inputs can stay inline. Bigger Context and its multipart sending are removed.
 > Single-message, read-response, image, attachment, storage and processing-time limits still apply.
-> Full/MCP Luna/Think measures canonical history and supports independent compaction at 270,000 tokens.
+> Full/MCP Luna/Think measures canonical history and supports independent compaction at 450,000 tokens.
 > Browser-only Luna keeps its rolling checkpoint and projected usage. See the
 > [account/model table](docs/context-navigation.md#history-window-and-client-compaction).
 

@@ -118,12 +118,12 @@ share one creation and execution with fresh generation-bound credentials. Rechec
 generation after asynchronous inspection and before creation or mutation. A late old receipt
 cannot replace a newer page.
 
-The catalog uses the account/model H/C tiers **300,000/270,000**, **400,000/360,000**,
-**600,000/540,000** and **800,000/720,000** tokens. Full + Launcher has no tier override.
+The catalog uses the account/model H/C tiers **500,000/450,000**, **600,000/540,000**,
+**800,000/720,000** and **1,000,000/900,000** tokens. Full + Launcher has no tier override.
 See the [complete table](context-navigation.md#history-window-and-client-compaction).
 C = 90% of H and lower client settings remain effective. Full/MCP usage estimates canonical
 history, including Luna/Think, rather than startup size or cumulative page deliveries. Full/MCP
-Luna uses independent client compaction at 270,000; Browser-only Luna retains rolling checkpoints
+Luna uses independent client compaction at 450,000; Browser-only Luna retains rolling checkpoints
 and projected usage. These reading/history policies do not extend the continuity route eligibility
 listed above. H and C are not server cumulative reading or history rejection lines.
 
@@ -290,7 +290,11 @@ Native compaction can retain an older human message while dropping a producer-ma
 synthetic delegated instruction. Recover that source only through its exact committed checkpoint and
 accepted producer representation. Repeated compaction preserves this provenance; a new steering
 instruction keeps its own identity. Native AGENTS refreshes remain context and do not become a new
-task. A matching completed checkpoint can restore an accepted goal or delegation to model-visible
+task. Pure `skills.selected_skill_instructions` fragments also remain task context: they are
+delivered and checked with the current instruction payload, while the human message identifies
+the task. Native compaction can remove these skill fragments without changing the checkpoint's
+source identity. Literal skill text and mixed skill/human content still count as instructions.
+A matching completed checkpoint can restore an accepted goal or delegation to model-visible
 context only when no newer steering follows it. This does not change the raw request or tool
 authority. Restored context retains its actual source identity in on-demand delivery; it must not
 reuse another raw message's position. Durable source-type evidence does not reconstruct missing
