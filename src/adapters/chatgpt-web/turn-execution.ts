@@ -2829,6 +2829,8 @@ export class ChatGptTurnSessions {
   private readonly retirements = new Map<string, Promise<void>>();
   private readonly ownerRetirements = new Map<string, Promise<void>>();
   private readonly conversationRetirements = new Map<string, Promise<void>>();
+  private readonly cancelledRequests = new Map<string, { expiresAt: number; error: ChatGptWebAdapterError }>();
+  private cancellationTimes = new WeakMap<NonNullable<ChatGptTurnRuntime["manualControl"]>, number>();
 
   constructor(
     private readonly ttlMs = TASK_INPUT_HISTORICAL_RETENTION_MS,
@@ -3350,7 +3352,50 @@ export class ChatGptTurnSessions {
     this.entries.clear();
     this.logicalRoutes.clear();
     this.conversationHeads.clear();
+    this.cancelledRequests.clear();
+    this.cancellationTimes = new WeakMap();
     return cancelled;
+  }
+
+  /** Only a proven native input event can identify a retry; matching text alone is insufficient. */
+  private cancelledRequestKey(namespace: string, parsed: CodexParsedRequest): string | undefined {
+    if (parsed._compactionRequest || parsed._continuityRequestInstruction) return undefined;
+    try {
+      const identity = extractChatGptTurnIdentity(parsed);
+      // Recovered checkpoints and synthesized summaries do not prove a native input event.
+      if (chatGptCurrentInstructionIndex(parsed) < 0) return undefined;
+      const instruction = chatGptCurrentInstructionRevision(parsed);
+      if (!identity.threadId || !identity.turnId || !instruction?.itemId) return undefined;
+      return createHash("sha256").update(canonicalJson([
+        namespace, identity.threadId, identity.turnId,
+        canonicalMessageId(parsed, instruction.itemId), instruction.content,
+      ])).digest("hex");
+    } catch { return undefined; }
+  }
+
+  rememberCancelledRequest(namespace: string, parsed: CodexParsedRequest, manualControl: ChatGptTurnRuntime["manualControl"], error: ChatGptWebAdapterError): void {
+    if (!manualControl || !["client_cancelled", "manual_turn_cancelled"].includes(error.code)) return;
+    const key = this.cancelledRequestKey(namespace, parsed);
+    if (!key) return;
+    const now = Date.now();
+    const cancelledAt = this.cancellationTimes.get(manualControl) ?? now;
+    this.cancellationTimes.set(manualControl, cancelledAt);
+    this.pruneCancelledRequests(now);
+    // Replaying a failed round must not start a new 30-second window.
+    const expiresAt = cancelledAt + 30_000;
+    if (expiresAt <= now || this.cancelledRequests.has(key)) return;
+    if (this.cancelledRequests.size >= this.maxEntries) this.cancelledRequests.delete(this.cancelledRequests.keys().next().value!);
+    this.cancelledRequests.set(key, { expiresAt, error });
+  }
+
+  cancelledRequestError(namespace: string, parsed: CodexParsedRequest): ChatGptWebAdapterError | undefined {
+    this.pruneCancelledRequests(Date.now());
+    const key = this.cancelledRequestKey(namespace, parsed);
+    return key ? this.cancelledRequests.get(key)?.error : undefined;
+  }
+
+  private pruneCancelledRequests(now: number): void {
+    for (const [key, entry] of this.cancelledRequests) if (entry.expiresAt <= now) this.cancelledRequests.delete(key);
   }
 
   async cancelTrace(traceId: string, reason = chatGptBrowserTabClosedError()): Promise<number> {

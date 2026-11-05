@@ -3,7 +3,7 @@ import { contextReusePageIdentity, contextReusePredecessor } from "./context-reu
 import { ContinuityTaskInputStore } from "./continuity-task-input-store";
 import { queuedTaskInputRequest, startTaskInputScheduler } from "./task-input-scheduler";
 import { completeTaskInputPhysicalResponse, taskInputQueue, pendingTaskInputs, synchronizeTaskInputDelivery, type RuntimeTaskInputQueue } from "./continuity-task-input-runtime";
-import { inspectLauncherContinuityConversation, terminateLauncherContinuityPreparation, CONTINUITY_PREPARATION_TERMINATION_FEATURE, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
+import { inspectLauncherContinuityConversation, retireLauncherContinuityWriter, terminateLauncherContinuityPreparation, CONTINUITY_PREPARATION_TERMINATION_FEATURE, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { recoveryTaskUpdateSources } from "./task-update-source";
 import { restoreRecoveryTaskUpdates } from "./continuity-task-update-journal";
 import { continuityBindingsFor, continuityDigest } from "./continuity-binding";
@@ -1252,6 +1252,7 @@ export function createChatGptWebAdapter(
       const token = deferred<string>();
       const externalProgress = new ChatGptExternalTurnProgress();
       const surfaceNonce = randomBytes(32).toString("base64url");
+      const manualControl = { surfaceNonce };
       const owner: LauncherManualTurnOwner = { traceId, helperPid: process.pid, requestId: recoveryRequestId, ...(continuityClaim?.recovery ? {
         recovery: continuityClaim.recovery,
         recoveryStoreDirectory: continuity!.binding.recovery!.directory,
@@ -1264,11 +1265,19 @@ export function createChatGptWebAdapter(
         if (!launcherStarted || launcherEnded) return;
         const compactionBoundary = continuity?.binding.state === "compacting"
           && continuity.binding.executionKey === continuity.executionKey;
-        await zeroRiskManualControl.end(retainedLauncherDescriptor, {
-          ...owner,
-          status,
-          ...(status === "completed" && retainConversation ? { retain: true } : {}),
-        }, undefined, parsed._compactionRequest || compactionBoundary ? { compaction: true } : undefined);
+        const wait = parsed._compactionRequest || compactionBoundary ? { compaction: true as const } : undefined;
+        try {
+          await zeroRiskManualControl.end(retainedLauncherDescriptor, {
+            ...owner,
+            status,
+            ...(status === "completed" && retainConversation ? { retain: true } : {}),
+          }, undefined, wait);
+        } catch (error) {
+          if (status !== "aborted" || !owner.recovery) throw error;
+          // Interrupt fences the durable writer before cleanup. Normal /manual/end requires
+          // execution authority; retirement instead verifies isolation of this exact old page.
+          await retireLauncherContinuityWriter(retainedLauncherDescriptor, owner.recovery, owner.recoveryStoreDirectory, wait);
+        }
         launcherEnded = true;
       };
       const runManual = async (): Promise<string> => {
@@ -1442,6 +1451,11 @@ export function createChatGptWebAdapter(
         } catch (error) {
           failed = true;
           const normalized = safeManualAdapterError(error);
+          // The HTTP observer can already be detached. Remember the physical cancellation
+          // before Launcher cleanup so its deadline does not depend on cleanup latency.
+          if (normalized instanceof ChatGptWebAdapterError) {
+            chatGptTurnSessions.rememberCancelledRequest(executionNamespace, parsed, manualControl, normalized);
+          }
           settleUnsent(error);
           if (!launcherStarted && !originalSend && !browserAbort.signal.aborted && continuity?.expected
             && continuity.recovery && continuity.binding.recovery) {
@@ -1500,7 +1514,7 @@ export function createChatGptWebAdapter(
         text,
         usageInput: checkpointInput.parsed,
         ...(contextSend ? { compactionSourceCoverage: contextSend.coverage, syncContextUsage: wait => contextSend.syncUsage(wait), commitContextReuse } : {}),
-        manualControl: { surfaceNonce },
+        manualControl,
         ...(continuity ? { continuityBinding: continuity.binding, recoveryBaselineResults, recoveryCoveredCallIds } : {}),
         ...(recoveryOrigin ? { recoveryOrigin } : {}),
         get recoveryFinal() { return recoveryFinal; },
@@ -1513,6 +1527,9 @@ export function createChatGptWebAdapter(
         },
         submission,
         cancel: (reason?: Error) => {
+          if (reason instanceof ChatGptWebAdapterError) {
+            chatGptTurnSessions.rememberCancelledRequest(executionNamespace, parsed, manualControl, reason);
+          }
           contextSend?.retire();
           loseContinuity();
           browserTurn.cancel(reason);
@@ -3167,6 +3184,9 @@ export function createChatGptWebAdapter(
           const handledError = parsed._conversationPolicy !== "task" && turnError instanceof ChatGptWebAdapterError && turnError.retryable
             ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
             : turnError;
+          if (manualRequest && handledError instanceof ChatGptWebAdapterError) {
+            chatGptTurnSessions.rememberCancelledRequest(executionNamespace, parsed, session.runtime.manualControl, handledError);
+          }
           if (!(turnError instanceof ChatGptWebAdapterError && turnError.retryable)) {
             chatGptWebTurnRetryPolicy.clear(retryKey);
           }

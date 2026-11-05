@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import {
   createChatGptWebAdapter,
+  chatGptWebExecutionNamespace,
   type ChatGptZeroRiskManualControl,
 } from "./helpers/chatgpt-web-adapter";
 import { createContinuityMcpClient } from "./helpers/continuity-mcp-client";
@@ -1198,6 +1199,8 @@ test("closing the Zero Risk Launcher tab revokes the bound turn instead of waiti
       code: "manual_turn_cancelled",
       retryable: false,
     });
+    expect(chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(config), request("turn_safe_cancelled_tab")))
+      .toMatchObject({ code: "manual_turn_cancelled" });
     expect(() => broker.startSafeTurn(exactBinding!.request_id))
       .toThrow("invalid, expired, or revoked");
   } finally {

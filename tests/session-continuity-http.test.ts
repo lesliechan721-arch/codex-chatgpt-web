@@ -21,10 +21,97 @@ import { parseRequest } from "../src/responses/parser";
 import type { CodexParsedRequest } from "../src/types";
 import { performanceTest } from "./helpers/performance-test";
 import { createSessionContinuityFixtures, launcherRecovery, reverseJsonObjectKeys, codexRoundtrippedOutput } from "./helpers/session-continuity-fixture";
+import { LauncherBrowserTurnCancelledError } from "../src/launcher-browser-host";
 
 const test = performanceTest(import.meta.path);
 const { cleanups, disposeTestFixtures, fixture, httpFixture } = createSessionContinuityFixtures(import.meta.path);
 afterEach(disposeTestFixtures);
+
+test("Zero Risk cancellation before Send records the exact native request", async () => {
+  const f = fixture(true, { mcpTransport: "in-process" });
+  const request = f.request();
+  f.manualControl.waitSent = async () => { throw new LauncherBrowserTurnCancelledError("Cancelled before Send"); };
+  const events = await f.run(request);
+  expect(events.at(-1)).toMatchObject({ type: "error", code: "manual_turn_cancelled", retryable: false });
+  expect(chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(f.provider), request))
+    .toMatchObject({ code: "manual_turn_cancelled" });
+});
+
+test("Zero Risk cancellation TTL starts before delayed Launcher cleanup", async () => {
+  const f = fixture(true, { mcpTransport: "in-process" });
+  const request = f.request();
+  let cancelledAt = 0;
+  let clock: ReturnType<typeof spyOn<typeof Date, "now">> | undefined;
+  f.manualControl.waitSent = async () => {
+    cancelledAt = Date.now();
+    clock = spyOn(Date, "now").mockReturnValue(cancelledAt);
+    throw new LauncherBrowserTurnCancelledError("Cancelled before delayed cleanup");
+  };
+  f.manualControl.end = async () => { clock!.mockReturnValue(cancelledAt + 5_000); };
+  try {
+    await f.run(request);
+    clock!.mockReturnValue(cancelledAt + 29_999);
+    expect(chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(f.provider), request))
+      .toMatchObject({ code: "manual_turn_cancelled" });
+    clock!.mockReturnValue(cancelledAt + 30_000);
+    expect(chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(f.provider), request)).toBeUndefined();
+  } finally { clock?.mockRestore(); }
+});
+
+test("Zero Risk page cancellation is remembered after its HTTP observer disconnects", async () => {
+  const f = fixture(true, { mcpTransport: "in-process" });
+  const request = f.request();
+  let started!: () => void, closePage!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const closed = new Promise<void>(resolve => { closePage = resolve; });
+  f.manualControl.markStarted = async () => { started(); };
+  f.manualControl.waitTerminal = async () => { await closed; return { status: "cancelled" }; };
+  const adapter = f.adapter(), abort = new AbortController();
+  const incoming = { headers: new Headers(), abortSignal: abort.signal };
+  await adapter.preflight!(request, incoming);
+  const observing = adapter.runTurn!(request, incoming, () => {}).catch(error => error);
+  await ready;
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  const session = chatGptTurnSessions.find(binding.executionKey!)!;
+  abort.abort();
+  await observing;
+  expect(session.isActive()).toBe(true);
+  f.pages.clear();
+  closePage();
+  await session.browserOutcome;
+  await session.physicalSettlement;
+  expect(chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(f.provider), request))
+    .toMatchObject({ code: "manual_turn_cancelled" });
+});
+
+test("Zero Risk Interrupt releases the fenced page when normal end rejects stopped execution", async () => {
+  const f = fixture(true, { mcpTransport: "in-process" });
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  f.manualControl.markStarted = async () => { started(); };
+  let rejectedEnd = false;
+  f.manualControl.end = async (_path, activity) => {
+    expect(activity.status).toBe("aborted");
+    const record = new ContinuityRecoveryStore(f.statePath).get(continuityDigest(f.threadId))!;
+    expect(record.works[record.currentWorkId!]!.state).toBe("stopped");
+    rejectedEnd = true;
+    throw continuityError("continuity_unverified");
+  };
+  const running = f.run(f.request());
+  await ready;
+  const binding = continuityBindingsFor(f.statePath).observed(continuityDigest(f.threadId))!;
+  const session = chatGptTurnSessions.find(binding.executionKey!)!;
+  expect(f.pages.size).toBe(1);
+  expect(stopDurableContinuity(f.statePath, f.threadId, "turn-first", "native-interrupt")).toBe(true);
+  const cancellation = chatGptTurnSessions.cancelNativeTurn(f.threadId, "turn-first", new DOMException("Codex interrupted", "AbortError"));
+  expect(cancellation.cancelled).toBe(1);
+  await running;
+  await session.physicalSettlement;
+  await cancellation.settlement;
+  expect(rejectedEnd).toBe(true);
+  expect(f.pages.size).toBe(0);
+  expect(() => f.broker.startSafeTurn(f.controls.safeToken)).toThrow("invalid, expired, or revoked");
+});
 
 for (const manual of [false, true]) test(`short-start budget rejection is a non-retryable HTTP request error: manual=${manual}`, async () => {
   const f = httpFixture(manual);

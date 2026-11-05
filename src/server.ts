@@ -1,4 +1,4 @@
-import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
+import { chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
@@ -67,6 +67,7 @@ import {
 } from "./codex-integration";
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
+  isChatGptWebZeroRiskBackendModel,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
@@ -1291,6 +1292,14 @@ export async function responseRequest(
   }
 
   const provider = providerConfig(executionConfig);
+  const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
+  const cancelledRequestResponse = (): Response | undefined => {
+    if (!manualRequest) return undefined;
+    const error = chatGptTurnSessions.cancelledRequestError(chatGptWebExecutionNamespace(provider), parsed);
+    return error ? Response.json({ error: { type: error.errorType, code: error.code, message: error.message } }, { status: 400 }) : undefined;
+  };
+  const cancelledRequest = cancelledRequestResponse();
+  if (cancelledRequest) return cancelledRequest;
   try {
     // Continuity resolves its history revision during preflight. An unverified caller value
     // must never participate in trace, cancellation, or replay identity.
@@ -1310,7 +1319,7 @@ export async function responseRequest(
     if (!message.includes("requires native Codex turn_id metadata")
       && !message.includes("requires a current-turn user message")) throw error;
   }
-  const cancelledError = parsed._conversationPolicy !== "task" && traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
+  const cancelledError = !manualRequest && parsed._conversationPolicy !== "task" && traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
   if (cancelledError) {
     // Codex retries unknown streamed response.failed codes. A replay after the user explicitly
     // closed the only browser document is instead a terminal client state: repeating that exact
@@ -1387,10 +1396,12 @@ export async function responseRequest(
     }
   }
   try {
+    const cancelledRequest = cancelledRequestResponse();
+    if (cancelledRequest) return cancelledRequest;
     if (parsed._conversationPolicy !== "task") {
       incoming.abortSignal.throwIfAborted();
       await leaveContinuityMode(provider.chatgptWeb?.continuityStateDirectory, webTurnIdentity?.threadId);
-    } else if (traceId) {
+    } else if (!manualRequest && traceId) {
       const interrupted = chatGptTurnSessions.cancelledError(traceId);
       if (interrupted) return Response.json({ error: {
         type: "client_closed_request", code: "client_cancelled", message: interrupted.message,
