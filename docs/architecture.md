@@ -23,6 +23,18 @@ routing and metadata are defined in the [upstream provider guide](upstream-provi
 
 ## Modes
 
+### Desktop account context
+
+Each environment profile contains an account registry. The launcher resolves one immutable account
+context before constructing its browser, state, limits, proxy and runtime controllers. Account changes
+close local and daemon admission, prove idleness, stop the owned runtime, and restart the launcher.
+The migrated default keeps its original core home and browser partition. New accounts use separate
+homes and partitions. The application directory owns API access policy, the client service key,
+stable endpoint and Codex integration recovery records; upstream configuration and keys stay local
+to the account. A narrow, read-only Responses history handoff matches a response ID and thread;
+only a successful target response commits the target account's own history. See
+[desktop accounts](multi-account.md) for switching, recovery and removal behavior.
+
 ### `browser-only`
 
 - Exposes `GPT-5.6 Luna (Web)` with ordinary/Think effort on Luna-only accounts. Sol-capable accounts

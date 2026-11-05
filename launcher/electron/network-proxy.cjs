@@ -15,17 +15,19 @@ const NETWORK_PROXY_FATAL_MESSAGE = "Network proxy authentication could not be r
 const NETWORK_PROXY_APPLY_MESSAGE = "The network proxy could not be applied to the embedded browser.";
 const NETWORK_PROXY_CONNECTION_MESSAGE = "Existing browser proxy connections could not be closed.";
 const NETWORK_PROXY_RUNTIME_MESSAGE = "Managed runtimes could not restart after the network proxy changed.";
+const NETWORK_PROXY_BUSY_MESSAGE = "Finish active API, browser, or retained tasks before changing the network proxy. Managed runtime idleness could not be confirmed.";
 const NETWORK_PROXY_SAVE_MESSAGE = "The network proxy setting could not be saved.";
 const NETWORK_PROXY_ROLLBACK_MESSAGE = "The previous network proxy could not be restored.";
 
 class FatalNetworkProxyError extends Error {}
 
 function runtimeRestartFailed(result) {
-  return Boolean(result && result.status !== "ready" && result.status !== "not-configured");
+  return !result || (result.status !== "ready" && result.status !== "not-configured");
 }
 
 function createNetworkProxyController({
   browserPartition,
+  beforeMutation,
   fatal = async () => {},
   getBrowserHost = () => null,
   getRuntimeHost = () => null,
@@ -87,27 +89,34 @@ function createNetworkProxyController({
     }
   };
 
-  const restartManagedRuntime = async () => {
-    const supervisor = getRuntimeSupervisor();
+  const startManagedRuntime = async (supervisor) => {
     if (!supervisor) return;
     try {
-      const config = supervisor.readConfig();
-      if (!config) return;
-      const result = await supervisor.restart();
+      const result = await supervisor.startIfConfigured();
       if (runtimeRestartFailed(result)) throw new Error(NETWORK_PROXY_RUNTIME_MESSAGE);
     } catch {
       throw new Error(NETWORK_PROXY_RUNTIME_MESSAGE);
     }
   };
 
-  const applyProxy = async (proxyUrl, restartRuntime, environmentSnapshot) => {
+  const stopManagedRuntime = async (supervisor) => {
+    if (!supervisor) return;
+    try {
+      const result = await supervisor.stopForAccountSwitch();
+      if (result?.status !== "stopped") throw new Error(NETWORK_PROXY_BUSY_MESSAGE);
+    } catch {
+      throw new Error(NETWORK_PROXY_BUSY_MESSAGE);
+    }
+  };
+
+  const applyProxy = async (proxyUrl, environmentSnapshot) => {
     activeAuthentication = null;
     applyNetworkProxyEnvironment(environment, inheritedEnvironment, proxyUrl);
     await applyElectronProxy(proxyUrl, environmentSnapshot);
-    if (restartRuntime) await restartManagedRuntime();
   };
 
   const updateProxy = async (rawProxyUrl) => {
+    if (beforeMutation) await beforeMutation();
     registerSensitiveProxyUrl(rawProxyUrl);
     registerEnvironment(inheritedEnvironment);
     registerEnvironment(captureProxyEnvironment(environment));
@@ -127,34 +136,55 @@ function createNetworkProxyController({
       );
     }
 
-    const environmentSnapshot = captureProxyEnvironment(environment);
-    let primaryError;
-    let state;
+    const supervisor = getRuntimeSupervisor();
+    const admissionWasClosed = browserHost?.accountAdmissionClosed === true;
+    let admissionCanResume = true;
     try {
-      await applyProxy(nextProxyUrl, true, environmentSnapshot);
+      browserHost?.closeAccountAdmission?.();
+      // The daemon drain closes API admission atomically. Keep every network
+      // setting and existing connection intact until that drain proves idle.
+      await stopManagedRuntime(supervisor);
+      const environmentSnapshot = captureProxyEnvironment(environment);
+      admissionCanResume = false;
+      let primaryError;
+      let state;
+      let runtimeStartAttempted = false;
       try {
-        state = stateStore.update({ networkProxyUrl: nextProxyUrl });
-      } catch {
-        throw new Error(NETWORK_PROXY_SAVE_MESSAGE);
+        await applyProxy(nextProxyUrl, environmentSnapshot);
+        runtimeStartAttempted = true;
+        await startManagedRuntime(supervisor);
+        try {
+          state = stateStore.update({ networkProxyUrl: nextProxyUrl });
+        } catch {
+          throw new Error(NETWORK_PROXY_SAVE_MESSAGE);
+        }
+      } catch (error) {
+        primaryError = error;
       }
-    } catch (error) {
-      primaryError = error;
-    }
-    if (primaryError) {
-      if (primaryError instanceof FatalNetworkProxyError) throw primaryError;
-      try {
-        await applyProxy(previousProxyUrl, true, environmentSnapshot);
-      } catch (rollbackError) {
-        activeAuthentication = null;
-        if (rollbackError instanceof FatalNetworkProxyError) throw rollbackError;
-        throw new Error(`${primaryError.message} ${NETWORK_PROXY_ROLLBACK_MESSAGE}`);
+      if (primaryError) {
+        if (primaryError instanceof FatalNetworkProxyError) throw primaryError;
+        try {
+          // A failed save can follow a successful new runtime start. Prove that
+          // runtime idle too before restoring the old route and credentials.
+          if (runtimeStartAttempted) await stopManagedRuntime(supervisor);
+          await applyProxy(previousProxyUrl, environmentSnapshot);
+          await startManagedRuntime(supervisor);
+          admissionCanResume = true;
+        } catch (rollbackError) {
+          activeAuthentication = null;
+          if (rollbackError instanceof FatalNetworkProxyError) throw rollbackError;
+          throw new Error(`${primaryError.message} ${NETWORK_PROXY_ROLLBACK_MESSAGE}`);
+        }
+        throw primaryError;
       }
-      throw primaryError;
-    }
 
-    logger?.info?.("network.proxy_updated", { customProxy: nextProxyUrl !== null });
-    publishState(state);
-    return state;
+      admissionCanResume = true;
+      logger?.info?.("network.proxy_updated", { customProxy: nextProxyUrl !== null });
+      publishState(state);
+      return state;
+    } finally {
+      if (!admissionWasClosed && admissionCanResume) browserHost?.resumeAccountAdmission?.();
+    }
   };
 
   const setProxy = async (rawProxyUrl) => {
@@ -178,7 +208,7 @@ function createNetworkProxyController({
     registerEnvironment(captureProxyEnvironment(environment));
     const proxyUrl = normalizeNetworkProxyUrl(savedProxyUrl);
     const environmentSnapshot = captureProxyEnvironment(environment);
-    await applyProxy(proxyUrl, false, environmentSnapshot);
+    await applyProxy(proxyUrl, environmentSnapshot);
     logger?.info?.("network.proxy_initialized", { customProxy: proxyUrl !== null });
     return proxyUrl;
   };
@@ -193,6 +223,19 @@ function createNetworkProxyController({
     return true;
   };
 
+  const restoreLaunchEnvironment = async () => {
+    activeAuthentication = null;
+    restoreProxyEnvironment(environment, inheritedEnvironment);
+    await clearAuthenticationCache(inheritedEnvironment);
+    if (typeof browserSession.closeAllConnections === "function") {
+      try {
+        await browserSession.closeAllConnections();
+      } catch {
+        throw new Error(NETWORK_PROXY_CONNECTION_MESSAGE);
+      }
+    }
+  };
+
   registerLoggedIpc(
     ipc,
     logger,
@@ -200,7 +243,7 @@ function createNetworkProxyController({
     (_event, proxyUrl) => setProxy(proxyUrl),
   );
 
-  return { applySaved, handleLogin, setProxy };
+  return { applySaved, handleLogin, restoreLaunchEnvironment, setProxy };
 }
 
 module.exports = {

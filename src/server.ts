@@ -86,7 +86,7 @@ import {
   extractCompactUserMessages,
 } from "./responses/compaction";
 import { parseRequest } from "./responses/parser";
-import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
+import { expandPreviousResponseInput, flushResponseState, rememberResponseState, ResponseContinuationError } from "./responses/state";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
@@ -1202,7 +1202,13 @@ export async function responseRequest(
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
-  const expanded = expandPreviousResponseInput(raw);
+  let expanded: unknown;
+  try {
+    expanded = expandPreviousResponseInput(raw);
+  } catch (error) {
+    if (error instanceof ResponseContinuationError) return formatErrorResponse(409, "invalid_request_error", error.message);
+    throw error;
+  }
   const prediction = isCodexComposerPrediction(raw);
   let executionConfig = config;
   let parsed: CodexParsedRequest;
@@ -1756,6 +1762,7 @@ export function startServer(
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
+    active_remote_turn_idle_leases: turnIdleLeases?.count() ?? 0,
   });
   const controlAuthorized = (req: Request): boolean => {
     const header = req.headers.get("authorization") ?? "";
@@ -1816,7 +1823,6 @@ export function startServer(
           port: config.port,
           listen_host: listenHost,
           remote_turn_idle_timeout_sec: remoteIdleTimeoutSec ?? null,
-          active_remote_turn_idle_leases: turnIdleLeases?.count() ?? 0,
           remote_turn_idle_epoch: turnIdleLeases?.epoch() ?? null,
           uptime: (Date.now() - startedAt) / 1_000,
           accepting_turns: !draining && healthy,
@@ -1943,7 +1949,8 @@ export function startServer(
       if (req.method === "POST" && url.pathname === "/admin/shutdown") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
         const current = activity();
-        if (!draining || current.active_http_turns > 0 || current.active_browser_turns > 0) {
+        if (!draining || current.active_http_turns > 0 || current.active_browser_turns > 0
+          || current.active_remote_turn_idle_leases > 0) {
           return Response.json(
             {
               status: "refused",

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { SUMMARY_PREFIX } from "../../responses/compaction";
+import { responseHistoryConversationEpoch } from "../../responses/state";
 import type { CodexParsedRequest } from "../../types";
 import { extractChatGptTurnIdentity } from "./environment";
 
@@ -33,11 +34,13 @@ export function chatGptConversationKey(
   const identity = extractChatGptTurnIdentity(parsed);
   if (!identity.threadId) return undefined;
   const raw = parsed._rawBody as { input?: unknown[] } | undefined;
+  const accountHistoryEpoch = parsed._conversationPolicy === "task" ? undefined : responseHistoryConversationEpoch(raw);
   return createHash("sha256").update(JSON.stringify({
     namespace,
     threadId: identity.threadId,
     modelId: parsed.modelId,
     reasoning: parsed.options.reasoning,
+    ...(accountHistoryEpoch ? { accountHistoryEpoch } : {}),
     ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
     ...(parsed._conversationPolicy === "task"
       ? { policy: "task", epoch: parsed._continuityEpoch ?? 0 }

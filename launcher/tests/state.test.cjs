@@ -5,10 +5,63 @@ const os = require("node:os");
 const path = require("node:path");
 const {
   SESSION_REFRESH_REMINDER_INTERVAL_MS,
+  createAccountStateStore,
   createStateStore,
   nextSessionRefreshReminderAt,
   validateSidebarState,
 } = require("../electron/state.cjs");
+
+test("account state migrates legacy choices once and shares only application preferences", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-account-state-"));
+  const sharedPath = path.join(root, "launcher-state.json");
+  const defaultPath = path.join(root, "accounts", "default", "launcher-state.json");
+  const otherPath = path.join(root, "accounts", "other", "launcher-state.json");
+  try {
+    createStateStore(sharedPath).update({
+      language: "zh-CN", onboardingComplete: true, sidebarWidth: 300, showBrowserDuringTurns: false,
+      coreSetupComplete: true, browserInteractionMode: "manual", autoApproveToolCalls: true,
+      networkProxyUrl: "http://user:secret@127.0.0.1:7890/", mcpSetupComplete: true,
+    });
+    const legacy = createAccountStateStore({ sharedPath, accountPath: defaultPath, migrateLegacy: true });
+    assert.equal(legacy.read().browserInteractionMode, "manual");
+    assert.equal(legacy.read().networkProxyUrl, "http://user:secret@127.0.0.1:7890/");
+    assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(sharedPath, "utf8")), "networkProxyUrl"), false);
+    const other = createAccountStateStore({ sharedPath, accountPath: otherPath });
+    assert.equal(other.read().language, "zh-CN");
+    assert.equal(other.read().showBrowserDuringTurns, false);
+    assert.equal(other.read().sidebarWidth, 300);
+    assert.equal(other.read().browserInteractionMode, "automatic");
+    assert.equal(other.read().networkProxyUrl, null);
+    assert.equal(other.read().autoApproveToolCalls, false);
+    assert.equal(other.read().mcpSetupComplete, undefined);
+    other.update({ language: "ja", networkProxyUrl: "https://127.0.0.1:8888/" });
+    assert.equal(legacy.read().language, "ja");
+    assert.equal(legacy.read().networkProxyUrl, "http://user:secret@127.0.0.1:7890/");
+    legacy.update({ networkProxyUrl: null });
+    assert.equal(createAccountStateStore({ sharedPath, accountPath: defaultPath, migrateLegacy: true }).read().networkProxyUrl, null);
+    assert.equal(createAccountStateStore({ sharedPath, accountPath: otherPath }).read().networkProxyUrl, "https://127.0.0.1:8888/");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("account state rejects links and permits only shared changes with no selected account", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-account-state-boundary-"));
+  const sharedPath = path.join(root, "launcher-state.json");
+  const outside = path.join(root, "outside.json");
+  const accountPath = path.join(root, "accounts", "account", "launcher-state.json");
+  try {
+    fs.writeFileSync(outside, JSON.stringify({ version: 1, networkProxyUrl: "http://outside.example/" }));
+    fs.mkdirSync(path.dirname(accountPath), { recursive: true });
+    fs.symlinkSync(outside, accountPath, "file");
+    assert.throws(() => createAccountStateStore({ sharedPath, accountPath }), /symbolic/i);
+    assert.equal(JSON.parse(fs.readFileSync(outside, "utf8")).networkProxyUrl, "http://outside.example/");
+    const empty = createAccountStateStore({ sharedPath, accountPath: null });
+    empty.update({ language: "zh-CN", sidebarOpen: false });
+    assert.equal(empty.read().language, "zh-CN");
+    assert.throws(() => empty.update({ networkProxyUrl: "http://proxy.example/" }), /No account/);
+    assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(sharedPath, "utf8")), "networkProxyUrl"), false);
+    assert.throws(() => createAccountStateStore({ sharedPath, accountPath: path.join(root, "..", "outside.json") }), /inside/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test("retired context state is removed on read and the next normal save", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-retired-context-state-"));

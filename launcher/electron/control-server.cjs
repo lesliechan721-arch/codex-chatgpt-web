@@ -137,6 +137,19 @@ class BrowserControlServer {
         request,
         manualAction === "start" ? MAX_MANUAL_START_BODY_BYTES : MAX_BODY_BYTES,
       );
+      const host = this.getBrowserHost();
+      if (!host) {
+        const error = new Error("browser host is not ready");
+        if (isContinuityInspect || recoveryAction) error.code = "continuity_unverified";
+        throw error;
+      }
+      // End, retirement, cleanup and read-only completion observations must remain
+      // available after admission closes so the old execution can prove it stopped.
+      const usesExecution = isProxyResolution || isSessionInspect || isContinuityInspect || isContinuityCapacity
+        || recoveryAction === "prepare" || recoveryAction === "send-possible"
+        || ["/v1/turn/start", "/v1/turn/heartbeat", "/v1/turn/usage", "/v1/turn/approval"].includes(request.url)
+        || manualAction === "start" || manualAction === "started";
+      if (usesExecution) host.assertAccountAdmission?.({ execution: true });
       if (isProxyResolution) {
         const url = new URL(body?.url);
         if (url.origin !== "https://chatgpt.com" || url.username || url.password
@@ -151,12 +164,6 @@ class BrowserControlServer {
         return;
       }
       const preferences = this.getPreferences();
-      const host = this.getBrowserHost();
-      if (!host) {
-        const error = new Error("browser host is not ready");
-        if (isContinuityInspect || recoveryAction) error.code = "continuity_unverified";
-        throw error;
-      }
       if (recoveryAction) {
         bindExecutionAuthority(host, body.recovery, body.recoveryStoreDirectory);
         const result = recoveryAction === "query" ? queryContinuityTransaction(host, body.recovery)
@@ -476,17 +483,21 @@ class BrowserControlServer {
       const manualOwnerLost = error?.code === "manual_turn_owner_lost";
       const manualSentPolicyMismatch = error?.code === "manual_sent_policy_mismatch";
       const manualTimedOut = error?.code === "manual_turn_timed_out";
+      const accountAdmissionClosed = error?.code === "account_admission_closed";
+      const accountIdentityMismatch = error?.code === "account_identity_mismatch";
       const continuityCode = ["continuity_session_lost", "continuity_source_unproven", "continuity_resource_capacity", "continuity_unverified", "continuity_execution_unsettled", "continuity_configuration_conflict"].includes(error?.code)
         ? error.code : undefined;
       const sendUnsentReceipt = startFailureContext ? acquisitionKnownUnsentReceipt(startFailureContext.host, error,
         startFailureContext.recovery, startFailureContext.traceId, startFailureContext.helperPid, startFailureContext.requestId) : undefined;
       writeJson(
         response,
-        continuityCode === "continuity_unverified" ? 503 : cancelled || retainedUnavailable || ownerLost || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
+        accountAdmissionClosed || continuityCode === "continuity_unverified" ? 503 : accountIdentityMismatch || cancelled || retainedUnavailable || ownerLost || manualInspectionDisabled || manualOwnerLost || manualSentPolicyMismatch || continuityCode
           ? 409
           : manualTimedOut ? 408 : 400,
         {
         error: message,
+        ...(accountAdmissionClosed ? { code: "account_admission_closed" } : {}),
+        ...(accountIdentityMismatch ? { code: "account_identity_mismatch" } : {}),
         ...(cancelled ? { code: "turn_cancelled" } : {}),
         ...(retainedUnavailable ? { code: "retained_conversation_unavailable" } : {}),
         ...(ownerLost ? { code: "turn_owner_lost" } : {}),

@@ -23,6 +23,24 @@ export interface DevProfilePaths {
 
 const WINDOWS_LAUNCHER_GUID = "d1a6026a-6210-588e-9a2b-da3936f94e02";
 
+function desktopDevAccountHome(home: string, environment: NodeJS.ProcessEnv): string | undefined {
+  const accountId = environment.CODEX_CHATGPT_WEB_ACCOUNT_ID?.trim();
+  if (!accountId) return undefined;
+  const applicationHome = environment.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim();
+  const registryPath = environment.CODEX_CHATGPT_WEB_ACCOUNTS_PATH?.trim();
+  if (!(accountId === "default" || /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(accountId))
+    || !applicationHome || resolve(expandUserPath(applicationHome)) !== home
+    || !registryPath || !isAbsolute(registryPath) || resolve(registryPath) !== join(home, "launcher", "accounts.json")) {
+    throw new Error("DEV account context does not match the isolated application home");
+  }
+  const coreHome = accountId === "default" ? home : join(home, "accounts", accountId, "core");
+  if (!environment.CODEX_CHATGPT_WEB_HOME || resolve(expandUserPath(environment.CODEX_CHATGPT_WEB_HOME)) !== coreHome
+    || !environment.CODEX_HOME || resolve(expandUserPath(environment.CODEX_HOME)) !== join(home, "codex-home")) {
+    throw new Error("DEV account paths do not match the selected account");
+  }
+  return coreHome;
+}
+
 function registeredWindowsLauncherInstallLocation(): string | undefined {
   try {
     const output = execFileSync(
@@ -50,7 +68,8 @@ export function resolveDevProfilePaths({
   const productionHome = resolve(expandUserPath(
     environment.CODEX_CHATGPT_WEB_HOME?.trim() || join(homeDirectory, ".codex-chatgpt-web"),
   ));
-  if (home === productionHome) {
+  const accountHome = desktopDevAccountHome(home, environment);
+  if (!accountHome && home === productionHome) {
     throw new Error("DEV profile home must differ from the production codex-chatgpt-web home");
   }
   const launcherUserData = join(home, "launcher");
@@ -59,16 +78,22 @@ export function resolveDevProfilePaths({
     codexHome: join(home, "codex-home"),
     launcherUserData,
     launcherStatePath: join(launcherUserData, "launcher-state.json"),
-    descriptorPath: join(home, "runtime", "launcher-browser.json"),
-    chatsPath: join(home, "chats"),
-    runtimePath: join(home, "runtime", "dev-chat"),
-    configPath: join(home, "config.json"),
+    descriptorPath: join(accountHome ?? home, "runtime", "launcher-browser.json"),
+    chatsPath: join(accountHome ?? home, "chats"),
+    runtimePath: join(accountHome ?? home, "runtime", "dev-chat"),
+    configPath: join(accountHome ?? home, "config.json"),
   };
 }
 
 export function activateDevProfileEnvironment(paths = resolveDevProfilePaths()): DevProfilePaths {
+  const accountHome = desktopDevAccountHome(paths.home, process.env);
   process.env.CODEX_WEB_GPT_DEV_HOME = paths.home;
-  process.env.CODEX_CHATGPT_WEB_HOME = paths.home;
+  process.env.CODEX_CHATGPT_WEB_HOME = accountHome ?? paths.home;
+  if (!accountHome) {
+    delete process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME;
+    delete process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH;
+    delete process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID;
+  }
   process.env.CODEX_HOME = paths.codexHome;
   delete process.env.CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES;
   if (getConfigPath() !== paths.configPath) {
@@ -142,6 +167,9 @@ export function devLauncherEnvironment(
 ): NodeJS.ProcessEnv {
   const childEnvironment = { ...environment };
   delete childEnvironment.CODEX_CHATGPT_WEB_HOME;
+  delete childEnvironment.CODEX_CHATGPT_WEB_APPLICATION_HOME;
+  delete childEnvironment.CODEX_CHATGPT_WEB_ACCOUNTS_PATH;
+  delete childEnvironment.CODEX_CHATGPT_WEB_ACCOUNT_ID;
   delete childEnvironment.CODEX_HOME;
   delete childEnvironment.CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES;
   delete childEnvironment.CODEX_WEB_GPT_LAUNCHER_DATA_DIR;

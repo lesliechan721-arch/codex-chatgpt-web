@@ -447,6 +447,59 @@ test("DEV setup child environment removes launcher-rebound production aliases", 
   assert.deepEqual(runOptions.environment, { ISOLATED_DEV_ENV: "yes" });
 });
 
+test("account DEV setup preserves the account home and shared Codex home", () => {
+  const fixture = devHostFor(null);
+  fixture.host.applicationHome = path.resolve("/dev");
+  fixture.host.coreHome = path.resolve("/dev/accounts/22222222-2222-4222-8222-222222222222/core");
+  fixture.host.codexHome = path.resolve("/dev/codex-home");
+  const environment = fixture.host.devSetupEnvironment({
+    CODEX_CHATGPT_WEB_ACCOUNT_ID: "22222222-2222-4222-8222-222222222222",
+    CODEX_CHATGPT_WEB_ACCOUNTS_PATH: path.resolve("/dev/launcher/accounts.json"),
+    CODEX_CHATGPT_WEB_HOME: "/stale/core", CODEX_HOME: "/stale/codex",
+  });
+  assert.equal(environment.CODEX_WEB_GPT_DEV_HOME, fixture.host.applicationHome);
+  assert.equal(environment.CODEX_CHATGPT_WEB_APPLICATION_HOME, fixture.host.applicationHome);
+  assert.equal(environment.CODEX_CHATGPT_WEB_HOME, fixture.host.coreHome);
+  assert.equal(environment.CODEX_HOME, fixture.host.codexHome);
+  assert.equal(environment.CODEX_CHATGPT_WEB_ACCOUNT_ID, "22222222-2222-4222-8222-222222222222");
+});
+
+test("account setup checkpoints keep integration ownership in the application home", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cwg-account-checkpoint-"));
+  const coreHome = path.join(root, "accounts", "account", "core");
+  const host = new RuntimeHost({
+    app: { getPath: () => root }, logger: { info() {}, warn() {}, error() {} },
+    coreHome, applicationHome: root, codexHome: path.join(root, "shared-codex"),
+    supervisor: { coreHome, configPath: path.join(coreHome, "config.json") },
+  });
+  try {
+    const paths = host.captureSetupCheckpoint({ owner: "none" }).map(file => file.path);
+    assert.ok(paths.includes(path.join(root, "codex", "integration-journal.json")));
+    assert.ok(paths.includes(path.join(root, "codex", "integration-journal.recovery.json")));
+    assert.equal(paths.includes(path.join(coreHome, "codex", "integration-journal.json")), false);
+    assert.ok(paths.includes(path.join(coreHome, "secrets", "tunnel-runtime.key")));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime operation children receive the application home separately from their account", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cwg-account-runtime-env-"));
+  const host = new RuntimeHost({
+    app: { getPath: () => root }, logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: path.join(root, "account-core"), applicationHome: root,
+    browserDescriptorPath: path.join(root, "account-browser.json"), supervisor: {},
+  });
+  host.command = () => ({ executable: process.execPath,
+    args: ["-e", "process.stdout.write(JSON.stringify({application:process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME,descriptor:process.env.CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR}))"], cwd: root });
+  try {
+    const result = await host.run("account-environment", []);
+    assert.deepEqual(JSON.parse(result.stdout), { application: root, descriptor: host.browserDescriptorPath });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("DEV MCP setup reuses only DEV-home credentials and targets its distinct connector", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-dev-mcp-host-"));
   const runtimeKeyFile = path.join(root, "runtime.key");

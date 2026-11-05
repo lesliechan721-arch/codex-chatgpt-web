@@ -75,6 +75,96 @@ function launcherConfig(descriptorPath, overrides = {}) {
   };
 }
 
+function accountSwitchSupervisor(activity = {}) {
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: os.tmpdir(), coreHome: os.tmpdir(), browserDescriptorPath: path.join(os.tmpdir(), "launcher-switch.json"),
+  });
+  const config = { mode: "browser-only", releaseVersion: "0.2.0" };
+  const actions = [];
+  supervisor.daemon = { pid: process.pid, exitCode: null, signalCode: null };
+  supervisor.readConfig = () => config;
+  supervisor.readState = () => null;
+  supervisor.clearState = () => {};
+  supervisor.tryWriteState = () => true;
+  supervisor.proxyHealth = async () => true;
+  supervisor.proxyIdentity = async () => true;
+  supervisor.waitForProxy = async () => {};
+  supervisor.waitForChildExit = async () => {};
+  supervisor.waitForPortRelease = async () => {};
+  supervisor.control = async (_config, action) => {
+    actions.push(action);
+    return { status: "ok", accepting_turns: action === "resume", active_http_turns: 0,
+      active_browser_turns: 0, active_remote_turn_idle_leases: 0, ...activity };
+  };
+  return { supervisor, actions };
+}
+
+test("account switching immediately rejects every active daemon category and reopens admission", async () => {
+  for (const field of ["active_http_turns", "active_browser_turns", "active_remote_turn_idle_leases"]) {
+    const { supervisor, actions } = accountSwitchSupervisor({ [field]: 1 });
+    await assert.rejects(supervisor.stopForAccountSwitch(), /atomic idleness could not be proven/);
+    assert.deepEqual(actions, ["drain", "resume"], field);
+    assert.ok(supervisor.daemon, "busy work stays with its owned daemon");
+    assert.equal(supervisor.stopping, false);
+    assert.equal(supervisor.stopPromise, null);
+  }
+});
+
+test("account switching requires complete idle evidence, while ordinary shutdown accepts the older contract", async () => {
+  const fixture = accountSwitchSupervisor({ active_remote_turn_idle_leases: undefined });
+  await assert.rejects(fixture.supervisor.stopForAccountSwitch(), /drain contract/);
+  assert.deepEqual(fixture.actions, ["drain", "resume"]);
+  fixture.actions.length = 0;
+  assert.deepEqual(await fixture.supervisor.stopForSetup(), { status: "stopped" });
+  assert.deepEqual(fixture.actions, ["drain", "shutdown"]);
+});
+
+test("idle account switching stops only the identified daemon and compensates a failed shutdown", async () => {
+  const { supervisor, actions } = accountSwitchSupervisor();
+  const control = supervisor.control;
+  supervisor.control = async (config, action) => {
+    const result = await control(config, action);
+    if (action === "shutdown") throw new Error("shutdown unavailable");
+    return result;
+  };
+  await assert.rejects(supervisor.stopForAccountSwitch(), /shutdown unavailable/);
+  assert.deepEqual(actions, ["drain", "shutdown", "resume"]);
+  supervisor.control = control;
+  assert.deepEqual(await supervisor.stopForAccountSwitch(), { status: "stopped" });
+  assert.equal(supervisor.daemon, null);
+
+  const unknown = accountSwitchSupervisor();
+  unknown.supervisor.proxyIdentity = async () => false;
+  await assert.rejects(unknown.supervisor.stopForAccountSwitch(), /matching identity evidence/);
+  assert.deepEqual(unknown.actions, []);
+  assert.ok(unknown.supervisor.daemon);
+});
+
+test("supervised runtime children and tunnel controls receive the shared application home", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cwg-account-supervisor-env-"));
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false }, logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: root, coreHome: path.join(root, "account-core"), applicationHome: root,
+    browserDescriptorPath: path.join(root, "account-browser.json"),
+  });
+  supervisor.stopping = true;
+  const script = "process.stdout.write(process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME || 'missing')";
+  try {
+    const child = supervisor.spawnChild("daemon", { executable: process.execPath, args: ["-e", script], cwd: root });
+    const output = [];
+    child.stdout.on("data", chunk => output.push(chunk));
+    await new Promise(resolve => child.once("close", resolve));
+    assert.equal(Buffer.concat(output).toString(), root);
+    const tunnel = await supervisor.runTunnelCommand({ tunnel: { binaryPath: process.execPath, profileDir: root } },
+      ["-e", script], 2000, "test account environment", {});
+    assert.equal(tunnel.stdout, root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runtime configuration accepts retired booleans but exposes no retired context setting", () => {
   const descriptor = path.join(os.tmpdir(), "retired-context-launcher.json");
   const expected = validateConfig(launcherConfig(descriptor), descriptor);

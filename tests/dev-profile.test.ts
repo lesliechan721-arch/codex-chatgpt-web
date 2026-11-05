@@ -115,6 +115,9 @@ test("DEV launcher child cannot inherit production home or browser-profile overr
   expect(devLauncherEnvironment(paths, {
     KEEP_ME: "yes",
     CODEX_CHATGPT_WEB_HOME: paths.home,
+    CODEX_CHATGPT_WEB_APPLICATION_HOME: "/Users/tester/production",
+    CODEX_CHATGPT_WEB_ACCOUNT_ID: "default",
+    CODEX_CHATGPT_WEB_ACCOUNTS_PATH: "/Users/tester/production-launcher/accounts.json",
     CODEX_HOME: "/Users/tester/production-codex",
     CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES: '["/Users/tester/second-account"]',
     CODEX_WEB_GPT_LAUNCHER_DATA_DIR: "/Users/tester/production-launcher",
@@ -125,14 +128,59 @@ test("DEV launcher child cannot inherit production home or browser-profile overr
 });
 
 test("DEV chat activation removes shared production Codex homes", () => {
-  const keys = ["CODEX_WEB_GPT_DEV_HOME", "CODEX_CHATGPT_WEB_HOME", "CODEX_HOME", "CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES"];
+  const keys = ["CODEX_WEB_GPT_DEV_HOME", "CODEX_CHATGPT_WEB_HOME", "CODEX_CHATGPT_WEB_APPLICATION_HOME",
+    "CODEX_CHATGPT_WEB_ACCOUNT_ID", "CODEX_CHATGPT_WEB_ACCOUNTS_PATH", "CODEX_HOME", "CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES"];
   const saved = keys.map(key => process.env[key]);
   try {
     process.env.CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES = '["/Users/tester/production-account"]';
+    process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME = "/Users/tester/production";
     const paths = resolveDevProfilePaths({ environment: {}, homeDirectory: "/Users/tester" });
     activateDevProfileEnvironment(paths);
     expect(process.env.CODEX_HOME).toBe(paths.codexHome);
     expect(process.env.CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES).toBeUndefined();
+    expect(process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME).toBeUndefined();
+  } finally {
+    for (const [index, key] of keys.entries()) {
+      if (saved[index] === undefined) delete process.env[key];
+      else process.env[key] = saved[index];
+    }
+  }
+});
+
+test("DEV desktop commands retain the selected account inside the DEV environment", () => {
+  const keys = ["CODEX_WEB_GPT_DEV_HOME", "CODEX_CHATGPT_WEB_HOME", "CODEX_CHATGPT_WEB_APPLICATION_HOME",
+    "CODEX_CHATGPT_WEB_ACCOUNT_ID", "CODEX_CHATGPT_WEB_ACCOUNTS_PATH", "CODEX_HOME", "CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES"];
+  const saved = keys.map(key => process.env[key]);
+  const applicationHome = resolve(tmpdir(), "dev-account-environment");
+  const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  try {
+    for (const accountId of ["default", id]) {
+      const coreHome = accountId === "default" ? applicationHome : join(applicationHome, "accounts", accountId, "core");
+      const environment = {
+        CODEX_WEB_GPT_DEV_HOME: applicationHome,
+        CODEX_CHATGPT_WEB_APPLICATION_HOME: applicationHome,
+        CODEX_CHATGPT_WEB_HOME: coreHome,
+        CODEX_CHATGPT_WEB_ACCOUNT_ID: accountId,
+        CODEX_CHATGPT_WEB_ACCOUNTS_PATH: join(applicationHome, "launcher", "accounts.json"),
+        CODEX_HOME: join(applicationHome, "codex-home"),
+      };
+      Object.assign(process.env, environment);
+      const paths = resolveDevProfilePaths({ environment });
+      expect(paths.home).toBe(applicationHome);
+      expect(paths.configPath).toBe(join(coreHome, "config.json"));
+      expect(paths.chatsPath).toBe(join(coreHome, "chats"));
+      expect(paths.descriptorPath).toBe(join(coreHome, "runtime", "launcher-browser.json"));
+      activateDevProfileEnvironment(paths);
+      expect(process.env.CODEX_CHATGPT_WEB_HOME).toBe(coreHome);
+      expect(process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME).toBe(applicationHome);
+      expect(process.env.CODEX_HOME).toBe(join(applicationHome, "codex-home"));
+      expect(() => resolveDevProfilePaths({ environment: {
+        ...environment, CODEX_CHATGPT_WEB_APPLICATION_HOME: resolve(tmpdir(), "production"),
+      } })).toThrow("isolated application home");
+      expect(() => resolveDevProfilePaths({ environment: {
+        ...environment, CODEX_CHATGPT_WEB_HOME: resolve(tmpdir(), "production"),
+      } })).toThrow("selected account");
+    }
   } finally {
     for (const [index, key] of keys.entries()) {
       if (saved[index] === undefined) delete process.env[key];

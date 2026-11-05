@@ -14,7 +14,28 @@ export interface ManualPlanConfirmation {
   manifestDigest: string;
 }
 export type ToolAuthorityMode = "verified-environment" | "delegated";
-export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "settings";
+export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "settings" | "accounts";
+
+export interface AccountSummary {
+  id: string;
+  name: string;
+  legacy: boolean;
+  status: "active" | "removing" | "removal-failed";
+  identityStatus: "unverified" | "matching" | "mismatch";
+  lastLogin: { status: "signed-in" | "signed-out" | "error" | "unknown"; checkedAt: string } | null;
+  proxyMode: "system" | "custom" | "unknown";
+  removalError: string | null;
+}
+
+export interface AccountSnapshot {
+  version: 1;
+  currentId: string | null;
+  lastLoadedId: string | null;
+  pendingId: string | null;
+  recoveryError: string | null;
+  recoveryAttempted: boolean;
+  accounts: AccountSummary[];
+}
 
 export interface LauncherState {
   version: 1;
@@ -133,6 +154,7 @@ export type UpdateState =
 
 export interface LauncherSnapshot {
   profile: LauncherProfile;
+  accounts?: AccountSnapshot;
   profilePaths: {
     coreHome: string;
     codexHome: string;
@@ -166,6 +188,12 @@ export interface LauncherSnapshot {
 }
 
 export interface LauncherApi extends ApiAccessApi, TaskInputsApi {
+  accounts(): Promise<AccountSnapshot>;
+  addAccount(input: { name: string; networkProxyUrl: string | null }): Promise<AccountSummary>;
+  renameAccount(id: string, name: string): Promise<AccountSnapshot>;
+  switchAccount(id: string): Promise<{ cancelled?: boolean; restarting?: boolean }>;
+  removeAccount(id: string): Promise<{ cancelled?: boolean; restarting?: boolean; removed?: boolean }>;
+  onAccountsChanged(listener: (accounts: AccountSnapshot) => void): () => void;
   snapshot(): Promise<LauncherSnapshot>;
   getLimits(): Promise<LimitsSnapshot>;
   setupLimits(): Promise<LimitsSnapshot>;

@@ -8,7 +8,7 @@ import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
 import { currentRuntimeCommand, defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, providerConfig, saveConfig } from "./config";
-import { installCodexInterruptHookLauncher } from "./codex-interrupt-hook";
+import { installCodexInterruptHookLauncher, loadCodexInterruptHookConfig } from "./codex-interrupt-hook";
 import { readTaskInputControl, taskInputControl } from "./task-input-control";
 import {
   inspectLauncherBrowserHost,
@@ -464,7 +464,7 @@ async function interruptHookCommand(args: string[]): Promise<void> {
     || !/^[A-Za-z0-9_-]{6,128}$/.test(turnId)) {
     throw new Error("Codex Interrupt hook payload has no valid session_id or turn_id");
   }
-  await interruptActiveTurn(loadConfig(), { threadId, turnId });
+  await interruptActiveTurn(loadCodexInterruptHookConfig(), { threadId, turnId });
 }
 
 async function tunnelCommand(args: string[]): Promise<void> {

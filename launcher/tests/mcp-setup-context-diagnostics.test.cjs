@@ -145,6 +145,7 @@ for (const profile of ["production", "development"]) for (const mode of ["automa
 for (const migrated of [false, true]) test(`runtime upgrade ${migrated ? "with connection migration resets" : "preserves"} setup completion`, async context => {
   const f = fixture(context);
   f.stateStore.update({ mcpSetupComplete: true, mcpSetupConnectorName: f.config.appName });
+  const operations = [];
   let finished;
   const finishedStartup = new Promise(resolve => { finished = resolve; });
   const sandbox = vm.createContext({
@@ -153,12 +154,15 @@ for (const migrated of [false, true]) test(`runtime upgrade ${migrated ? "with c
     runtimeSupervisor: { startIfConfigured: async () => ({ status: "ready" }), readConfig: () => f.config },
     stateStore: f.stateStore, send() {}, logger: { info() {}, warn() {}, error() {} },
     connectorSetupStatePatch: identity.connectorSetupStatePatch, startCatalogVerificationMonitor() {},
-    finishRuntimeStartup: finished, readPolicyFile: () => ({ policy: { mode: "openai" } }), path, CORE_HOME: f.root,
+    finishRuntimeStartup: finished, readPolicyFile: () => ({ policy: { mode: "openai" } }), path,
+    APPLICATION_HOME: f.root, ensureNotReadyListener: async () => {},
+    publishOperation: operation => operations.push(operation),
   });
   const start = mainSource.indexOf('} else void (async () => {');
-  vm.runInContext(mainSource.slice(start + '} else '.length, mainSource.indexOf('  app.on("before-quit"', start)), sandbox);
+  await vm.runInContext(mainSource.slice(start + '} else '.length, mainSource.indexOf('  app.on("before-quit"', start)), sandbox);
   await finishedStartup;
   assert.equal(f.stateStore.read().mcpSetupComplete, !migrated);
+  assert.deepEqual(operations, []);
 });
 
 function mcpViewHarness(f) {

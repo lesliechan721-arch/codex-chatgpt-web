@@ -1,0 +1,42 @@
+const { test } = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const net = require("node:net");
+const { createHash } = require("node:crypto");
+const { listenAccountNotReady } = require("../electron/account-not-ready.cjs");
+
+test("empty-account service keeps the existing port and rejects a wrong service key", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "account-not-ready-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const reserved = net.createServer();
+  await new Promise(resolve => reserved.listen(0, "127.0.0.1", resolve));
+  const port = reserved.address().port;
+  await new Promise(resolve => reserved.close(resolve));
+  const key = "same-service-key-".repeat(4);
+  fs.writeFileSync(path.join(root, "service-endpoint.json"), JSON.stringify({ version: 1, port }));
+  fs.writeFileSync(path.join(root, "api-access.json"), JSON.stringify({ version: 1, mode: "api-key", keySha256: createHash("sha256").update(key).digest("hex") }));
+  const listener = await listenAccountNotReady({ applicationHome: root, environment: {} });
+  t.after(() => listener.close());
+  const endpoint = `http://127.0.0.1:${port}/v1/responses`;
+  const invalidTarget = await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ port, host: "127.0.0.1" });
+    let body = "";
+    socket.setEncoding("utf8");
+    socket.setTimeout(5000, () => socket.destroy(new Error("Invalid target response timed out")));
+    socket.on("error", reject);
+    socket.on("data", chunk => { body += chunk; });
+    socket.on("end", () => resolve(body));
+    socket.on("connect", () => socket.end("GET http://[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
+  });
+  assert.match(invalidTarget, /^HTTP\/1\.1 400 /);
+  assert.match(invalidTarget, /invalid_request_target/);
+  const wrong = await fetch(endpoint, { method: "POST", headers: { authorization: "Bearer wrong" } });
+  assert.equal(wrong.status, 401);
+  const allowed = await fetch(endpoint, { method: "POST", headers: { authorization: `Bearer ${key}` } });
+  assert.equal(allowed.status, 503);
+  assert.equal((await allowed.json()).error.code, "account_not_ready");
+  await assert.rejects(listenAccountNotReady({ applicationHome: root, environment: {} }), /EADDRINUSE/);
+  assert.equal((await fetch(endpoint)).status, 401);
+});

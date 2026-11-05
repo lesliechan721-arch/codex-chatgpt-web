@@ -338,6 +338,7 @@ class RuntimeSupervisor {
     installedRuntimeRoot,
     runtimeRootProvider,
     coreHome,
+    applicationHome = coreHome,
     browserDescriptorPath,
     launcherProfile = "production",
     publishOperation,
@@ -351,6 +352,7 @@ class RuntimeSupervisor {
     this.installedRuntimeRoot = installedRuntimeRoot;
     this.runtimeRootProvider = runtimeRootProvider;
     this.coreHome = coreHome;
+    this.applicationHome = applicationHome;
     this.browserDescriptorPath = browserDescriptorPath;
     if (launcherProfile !== "production" && launcherProfile !== "development") {
       throw new Error("Runtime supervisor launcher profile is invalid");
@@ -552,6 +554,7 @@ class RuntimeSupervisor {
     delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
     Object.assign(environment, {
       CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
+      CODEX_CHATGPT_WEB_APPLICATION_HOME: this.applicationHome,
       ...(name === "daemon" && this.daemonEnvironmentProvider ? this.daemonEnvironmentProvider() : {}),
     });
     const child = spawn(invocation.executable, invocation.args, {
@@ -1693,6 +1696,7 @@ class RuntimeSupervisor {
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
     const environment = { ...env };
     delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
+    if (this.applicationHome) environment.CODEX_CHATGPT_WEB_APPLICATION_HOME = this.applicationHome;
     return await new Promise((resolve, reject) => {
       const child = spawn(tunnel.binaryPath, args, {
         cwd: tunnel.profileDir,
@@ -1807,7 +1811,7 @@ class RuntimeSupervisor {
     });
   }
 
-  async stopStaleOwnedRuntime(config) {
+  async stopStaleOwnedRuntime(config, drainOptions = {}) {
     const state = this.readState();
     if (!state) return false;
     if (runtimeOwnershipPredatesCurrentBoot(state)) {
@@ -1868,7 +1872,7 @@ class RuntimeSupervisor {
     if (daemonRunning) {
       let drained = false;
       try {
-        drained = await this.acquireDrain(config);
+        drained = await this.acquireDrain(config, drainOptions.timeoutMs, drainOptions);
         const shutdown = await this.control(config, "shutdown");
         if (shutdown.status !== "ok") throw new Error("stale daemon did not acknowledge graceful shutdown");
         await this.waitForProcessExit("stale daemon", state.daemonPid);
@@ -1896,7 +1900,7 @@ class RuntimeSupervisor {
     return true;
   }
 
-  async acquireDrain(config, timeoutMs = DRAIN_IDLE_TIMEOUT_MS) {
+  async acquireDrain(config, timeoutMs = DRAIN_IDLE_TIMEOUT_MS, { requireRemoteTurnIdleLeases = false } = {}) {
     let attempted = false;
     try {
       attempted = true;
@@ -1904,14 +1908,22 @@ class RuntimeSupervisor {
       for (;;) {
         const health = await this.control(config, "drain");
         if (health.accepting_turns !== false
+          || requireRemoteTurnIdleLeases && health.status !== "ok"
           || !Number.isInteger(health.active_http_turns)
-          || !Number.isInteger(health.active_browser_turns)) {
+          || health.active_http_turns < 0
+          || !Number.isInteger(health.active_browser_turns)
+          || health.active_browser_turns < 0
+          || (requireRemoteTurnIdleLeases || health.active_remote_turn_idle_leases !== undefined)
+            && (!Number.isInteger(health.active_remote_turn_idle_leases)
+              || health.active_remote_turn_idle_leases < 0)) {
           throw new Error("daemon did not acknowledge the drain contract");
         }
-        if (health.active_http_turns === 0 && health.active_browser_turns === 0) return true;
+        const remoteIdleLeases = health.active_remote_turn_idle_leases ?? 0;
+        if (health.active_http_turns === 0 && health.active_browser_turns === 0 && remoteIdleLeases === 0) return true;
         if (Date.now() >= deadline) {
           throw new Error(
-            `daemon has ${health.active_http_turns} active HTTP turn(s) and ${health.active_browser_turns} active browser turn(s)`,
+            `daemon has ${health.active_http_turns} active HTTP turn(s) and ${health.active_browser_turns} active browser turn(s)`
+              + (remoteIdleLeases > 0 ? ` and ${remoteIdleLeases} retained remote turn(s)` : ""),
           );
         }
         await sleep(Math.min(DRAIN_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
@@ -1920,7 +1932,10 @@ class RuntimeSupervisor {
       let resumeError;
       if (attempted) {
         try {
-          await this.control(config, "resume");
+          const resumed = await this.control(config, "resume");
+          if (requireRemoteTurnIdleLeases && (resumed.status !== "ok" || resumed.accepting_turns !== true)) {
+            throw new Error("daemon did not acknowledge resume");
+          }
         } catch (caught) {
           resumeError = caught;
         }
@@ -2017,11 +2032,18 @@ class RuntimeSupervisor {
     this[name] = null;
   }
 
-  async stopForSetup() {
+  async stopForAccountSwitch() {
+    if (this.startPromise || this.stopPromise || this.stateWriteCleanup || this.recoveryTasks.size > 0) {
+      throw new Error("Finish the active runtime operation before switching accounts");
+    }
+    return this.stopForSetup({ timeoutMs: 0, requireRemoteTurnIdleLeases: true });
+  }
+
+  async stopForSetup(drainOptions = {}) {
     if (this.stopPromise) return this.stopPromise;
     if (this.stateWriteCleanup) await this.stateWriteCleanup;
     if (this.stopPromise) return this.stopPromise;
-    this.stopPromise = this.performStopForSetup();
+    this.stopPromise = this.performStopForSetup(drainOptions);
     try {
       return await this.stopPromise;
     } finally {
@@ -2029,7 +2051,7 @@ class RuntimeSupervisor {
     }
   }
 
-  async performStopForSetup() {
+  async performStopForSetup(drainOptions = {}) {
     if (this.startPromise) {
       try {
         await this.startPromise;
@@ -2071,7 +2093,7 @@ class RuntimeSupervisor {
             throw new Error("runtime configuration is missing while launcher ownership processes are still alive");
           }
         } else if (runtimeMayBeLive) {
-          const recovered = await this.stopStaleOwnedRuntime(config);
+          const recovered = await this.stopStaleOwnedRuntime(config, drainOptions);
           if (!recovered) {
             throw new Error("an existing runtime could not be safely recovered");
           }
@@ -2085,7 +2107,7 @@ class RuntimeSupervisor {
           || !await this.proxyIdentity(config, 2_000, daemonPid)) {
           throw new Error("launcher-owned daemon did not provide matching identity evidence");
         }
-        drained = await this.acquireDrain(config);
+        drained = await this.acquireDrain(config, drainOptions.timeoutMs, drainOptions);
       }
       if (this.tunnel) {
         if (!config) throw new Error("launcher-owned tunnel cannot be stopped without a valid configuration");

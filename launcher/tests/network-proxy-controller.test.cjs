@@ -5,8 +5,14 @@ const {
   createNetworkProxyController,
 } = require("../electron/network-proxy.cjs");
 const { redactText } = require("../electron/logging.cjs");
+const { BrowserHost } = require("../electron/browser-host.cjs");
+const { RuntimeSupervisor } = require("../electron/runtime-supervisor.cjs");
+const os = require("node:os");
+const path = require("node:path");
 
 function harness({
+  beforeMutation,
+  browserHost: suppliedBrowserHost,
   clearFailures = [],
   closeFailures = [],
   environment: initialEnvironment = { OTHER: "kept" },
@@ -15,6 +21,7 @@ function harness({
   restartResults = [{ status: "ready" }],
   runtimeOperation = null,
   setFailures = [],
+  supervisor: suppliedSupervisor,
 } = {}) {
   let state = {
     version: 1,
@@ -34,10 +41,12 @@ function harness({
   let setIndex = 0;
   let activeRuntimeOperation = runtimeOperation;
   const environment = { ...initialEnvironment };
-  const supervisor = {
+  const supervisor = suppliedSupervisor || {
     readConfig: () => ({ mode: "full" }),
-    restart: async () => restartResults[Math.min(restartIndex++, restartResults.length - 1)],
+    stopForAccountSwitch: async () => ({ status: "stopped" }),
+    startIfConfigured: async () => restartResults[Math.min(restartIndex++, restartResults.length - 1)],
   };
+  const browserHost = suppliedBrowserHost || Object.assign(Object.create(BrowserHost.prototype), { turnTabs: new Map() });
   const browserSession = {
     clearAuthCache: async () => {
       events.push("clear");
@@ -58,10 +67,11 @@ function harness({
     },
   };
   const controller = createNetworkProxyController({
+    beforeMutation,
     browserPartition: "persist:test-chatgpt",
     environment,
     fatal: async message => fatalMessages.push(message),
-    getBrowserHost: () => ({ activeTraceId: null, currentOperation: () => null }),
+    getBrowserHost: () => browserHost,
     getRuntimeHost: () => ({
       currentOperation: () => activeRuntimeOperation,
       runLifecycleOperation: async (name, action) => {
@@ -101,6 +111,7 @@ function harness({
   return {
     applied,
     browserSession,
+    browserHost,
     connectionsClosed,
     controller,
     environment,
@@ -114,6 +125,96 @@ function harness({
   };
 }
 
+function drainingSupervisor(activity) {
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false }, logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: os.tmpdir(), coreHome: os.tmpdir(), browserDescriptorPath: path.join(os.tmpdir(), "proxy-test-browser.json"),
+  });
+  const daemon = { pid: process.pid, exitCode: null, signalCode: null };
+  supervisor.daemon = daemon;
+  supervisor.readConfig = () => ({ mode: "browser-only", releaseVersion: "0.2.0" });
+  supervisor.readState = () => null;
+  supervisor.clearState = () => {};
+  supervisor.tryWriteState = () => true;
+  supervisor.proxyHealth = async () => true;
+  supervisor.proxyIdentity = async () => true;
+  supervisor.waitForChildExit = async () => {};
+  supervisor.waitForPortRelease = async () => {};
+  let accepting = true;
+  supervisor.control = async (_config, action) => {
+    accepting = action === "resume";
+    return { status: "ok", accepting_turns: accepting, active_http_turns: 0,
+      active_browser_turns: 0, active_remote_turn_idle_leases: 0, ...activity };
+  };
+  supervisor.startIfConfigured = async () => {
+    supervisor.daemon = daemon; accepting = true;
+    return { status: "ready" };
+  };
+  return { supervisor, accepting: () => accepting, stopped: () => supervisor.daemon === null };
+}
+
+for (const field of ["active_http_turns", "active_remote_turn_idle_leases"]) {
+  test(`busy proxy changes preserve environment, authentication and connections: ${field}`, async () => {
+    const runtime = drainingSupervisor({ [field]: 1 });
+    const fixture = harness({ supervisor: runtime.supervisor, initialProxy: "http://old:pw@proxy.example" });
+    await fixture.controller.applySaved();
+    const environment = { ...fixture.environment };
+    const events = [...fixture.events];
+    const state = fixture.readState();
+    await assert.rejects(fixture.controller.setProxy("http://new:pw@other.example"), /active|idle|stop/i);
+    assert.deepEqual(fixture.environment, environment);
+    assert.deepEqual(fixture.events, events);
+    assert.deepEqual(fixture.readState(), state);
+    assert.deepEqual(loginAttempt(fixture.controller, fixture.browserSession, {
+      host: "proxy.example", port: 80, isProxy: true, scheme: "basic",
+    }).credentials, ["old", "pw"]);
+    assert.equal(runtime.accepting(), true);
+    assert.equal(runtime.stopped(), false);
+    assert.equal(fixture.browserHost.accountAdmissionClosed, false);
+  });
+}
+
+test("proxy drain closes browser admission before a concurrent turn can begin or network state can change", { timeout: 2000 }, async () => {
+  const runtime = drainingSupervisor({});
+  const fixture = harness({ supervisor: runtime.supervisor, initialProxy: "http://old:pw@proxy.example" });
+  await fixture.controller.applySaved();
+  const events = [...fixture.events];
+  const environment = { ...fixture.environment };
+  let drained;
+  const draining = new Promise(resolve => { drained = resolve; });
+  let release;
+  const originalControl = runtime.supervisor.control;
+  runtime.supervisor.control = async (config, action) => {
+    const result = await originalControl(config, action);
+    if (action === "drain") { drained(); await new Promise(resolve => { release = resolve; }); }
+    return result;
+  };
+  const updating = fixture.controller.setProxy("http://new:pw@other.example");
+  await draining;
+  await assert.rejects(fixture.browserHost.beginTurn("concurrent-request"), { code: "account_admission_closed" });
+  assert.throws(() => fixture.browserHost.beginManualTurn("concurrent-request"), { code: "account_admission_closed" });
+  assert.deepEqual(fixture.events, events);
+  assert.deepEqual(fixture.environment, environment);
+  assert.equal(runtime.accepting(), false);
+  release();
+  await updating;
+  assert.equal(fixture.readState().networkProxyUrl, "http://new:pw@other.example/");
+  assert.equal(fixture.browserHost.accountAdmissionClosed, false);
+  assert.equal(runtime.accepting(), true);
+});
+
+test("proxy updates preserve a previously closed admission gate after success and rollback", async () => {
+  for (const failStateUpdate of [false, true]) {
+    const browserHost = Object.assign(Object.create(BrowserHost.prototype), { turnTabs: new Map(), accountAdmissionClosed: true });
+    const fixture = harness({ browserHost, failStateUpdate, initialProxy: "http://old:pw@proxy.example" });
+    await fixture.controller.applySaved();
+    const update = fixture.controller.setProxy("http://new:pw@other.example");
+    if (failStateUpdate) await assert.rejects(update, /could not be saved/);
+    else await update;
+    assert.equal(browserHost.accountAdmissionClosed, true);
+  }
+});
+
 test("proxy controller applies persisted proxy before runtime startup", async () => {
   const testHarness = harness({ initialProxy: "http://127.0.0.1:7890/" });
   await testHarness.controller.applySaved();
@@ -126,6 +227,43 @@ test("proxy controller applies persisted proxy before runtime startup", async ()
   assert.equal(testHarness.environment.TUNNEL_CLIENT_HTTP_PROXY, "http://127.0.0.1:7890/");
   assert.equal(testHarness.restartCount(), 0);
   assert.equal(testHarness.connectionsClosed.length, 1);
+});
+
+test("relaunch restores the launch proxy baseline before the next account selects system defaults", async () => {
+  const launchEnvironment = { OTHER: "kept", HTTP_PROXY: "http://system.example:8123", no_proxy: "intranet" };
+  const accountA = harness({ environment: launchEnvironment, initialProxy: "http://user:secret@account-a.example:8124" });
+  await accountA.controller.applySaved();
+  assert.equal(accountA.environment.HTTP_PROXY, "http://user:secret@account-a.example:8124/");
+  await accountA.controller.restoreLaunchEnvironment();
+  assert.deepEqual(accountA.environment, launchEnvironment);
+  assert.equal(accountA.readState().networkProxyUrl, "http://user:secret@account-a.example:8124");
+  assert.equal(accountA.controller.handleLogin({ preventDefault() { assert.fail("Authentication was cleared"); } },
+    { session: accountA.browserSession }, { isProxy: true, host: "account-a.example", port: 8124 }, () => {}), false);
+  assert.deepEqual(accountA.events.slice(-2), ["clear", "close"]);
+
+  const accountB = harness({ environment: accountA.environment });
+  await accountB.controller.applySaved();
+  assert.deepEqual(accountB.applied, [{ mode: "system" }]);
+  assert.equal(accountB.environment.HTTP_PROXY, launchEnvironment.HTTP_PROXY);
+  assert.equal(accountB.environment.HTTPS_PROXY, undefined);
+  assert.equal(accountB.environment.TUNNEL_CLIENT_HTTP_PROXY, undefined);
+});
+
+test("proxy changes consume the account mutation check before touching network state", async () => {
+  let checks = 0;
+  const fixture = harness({ beforeMutation: () => { checks++; throw new Error("Account admission is closed"); } });
+  await assert.rejects(fixture.controller.setProxy("http://account.example:8124"), /Account admission is closed/);
+  assert.equal(checks, 1);
+  assert.deepEqual(fixture.events, []);
+  assert.equal(fixture.restartCount(), 0);
+  assert.equal(fixture.readState().networkProxyUrl, null);
+});
+
+test("failed relaunch connection cleanup still restores the original process environment", async () => {
+  const fixture = harness({ initialProxy: "http://account.example:8124", closeFailures: [2] });
+  await fixture.controller.applySaved();
+  await assert.rejects(fixture.controller.restoreLaunchEnvironment(), /browser proxy connections/);
+  assert.deepEqual(fixture.environment, { OTHER: "kept" });
 });
 
 test("proxy controller registers inherited, previous, and candidate endpoints for delayed diagnostics", async () => {

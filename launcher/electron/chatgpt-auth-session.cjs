@@ -28,7 +28,15 @@ async function readChatGptAuthSession(fetchSession, origin, timeoutMs) {
       && (payload.expires === undefined || payload.expires === null
         || typeof payload.expires === "string" && Number.isFinite(Date.parse(payload.expires))
           && Date.parse(payload.expires) > Date.now());
-    return { sessionAuthenticated: Boolean(authenticated), sessionCheckError: null };
+    const stableId = value => typeof value === "string" && value.trim().length > 0
+      && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+    const sessionIdentity = authenticated && stableId(user.id) ? {
+      userId: user.id.trim(),
+      ...(stableId(payload.account?.id) ? { accountId: payload.account.id.trim() } : {}),
+      ...(stableId(payload.workspace?.id) ? { workspaceId: payload.workspace.id.trim() } : {}),
+    } : undefined;
+    return { sessionAuthenticated: Boolean(authenticated), sessionCheckError: null,
+      ...(sessionIdentity ? { sessionIdentity } : {}) };
   } catch {
     return { sessionAuthenticated: false, sessionCheckError: controller.signal.aborted
       ? "ChatGPT session verification timed out. Check your network or proxy and retry."

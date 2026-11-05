@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { basename, dirname, join, posix, resolve, win32 } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { getStaticTOMLValue, parseTOML, type AST } from "toml-eslint-parser";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, getConfigDir } from "./config";
+import { atomicWriteFile, getApplicationDir, getApplicationPort, loadConfig, loadConfigFromPath } from "./config";
 import type { InstalledCodexInterruptHook } from "./codex-integration-shared";
 
 export const MANAGED_INTERRUPT_HOOK_START =
@@ -50,7 +50,7 @@ function cmdShellArgument(value: string): string {
 }
 
 export function codexInterruptHookCommand(
-  home = getConfigDir(),
+  home = getApplicationDir(),
   platform: NodeJS.Platform = process.platform,
 ): string {
   const path = platform === "win32" ? win32 : posix;
@@ -61,7 +61,7 @@ export function codexInterruptHookCommand(
 /** Refresh the dispatch target without changing Codex's command or its trust hash. */
 export function installCodexInterruptHookLauncher(
   config: Pick<AppConfig, "runtimeCommand">,
-  home = getConfigDir(),
+  home = getApplicationDir(),
   platform: NodeJS.Platform = process.platform,
 ): void {
   const path = platform === "win32" ? win32 : posix;
@@ -71,10 +71,54 @@ export function installCodexInterruptHookLauncher(
   const command = args.map(platform === "win32"
     ? value => cmdShellArgument(value).replaceAll("%", "%%")
     : posixShellArgument).join(" ");
+  const registryPath = process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH?.trim() || "";
+  if (registryPath && !path.isAbsolute(registryPath)) throw new Error("Account registry path must be absolute");
+  // Codex can outlive an account switch. Pin the application/registry, then resolve the loaded
+  // account at invocation time instead of keeping an old account's home or control token.
+  const environment = {
+    CODEX_CHATGPT_WEB_APPLICATION_HOME: process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim() ? absoluteHome : "",
+    CODEX_CHATGPT_WEB_ACCOUNTS_PATH: registryPath,
+    CODEX_CHATGPT_WEB_ACCOUNT_ID: "",
+  };
+  const assignments = Object.entries(environment).map(([key, value]) => {
+    if (platform !== "win32") return `export ${key}=${posixShellArgument(value)}`;
+    cmdShellArgument(value);
+    return `set "${key}=${value.replaceAll("%", "%%")}"`;
+  });
   const text = platform === "win32"
-    ? `@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n${command}\r\nexit /b %errorlevel%\r\n`
-    : `#!/bin/sh\nexec ${command}\n`;
+    ? `@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\n${assignments.join("\r\n")}\r\n${command}\r\nexit /b %errorlevel%\r\n`
+    : `#!/bin/sh\n${assignments.join("\n")}\nexec ${command}\n`;
   atomicWriteFile(script, text, { mode: 0o700 });
+}
+
+/** Registry selection is limited to the installed hook; ordinary CLI commands use --home. */
+export function loadCodexInterruptHookConfig(): AppConfig {
+  const registryPath = process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH?.trim();
+  if (!registryPath) return loadConfig();
+  if (!process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim() || !isAbsolute(registryPath)) {
+    throw new Error("Codex interrupt hook has no valid application account registry");
+  }
+  let registry;
+  try {
+    const stat = lstatSync(registryPath);
+    if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("Invalid registry file");
+    registry = JSON.parse(readFileSync(registryPath, "utf8"));
+  } catch { throw new Error("Cannot read the loaded account for the Codex interrupt hook"); }
+  const id = registry?.currentId;
+  if (registry?.version !== 1 || typeof id !== "string"
+    || !(id === "default" || /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id))
+    || registry.lastLoadedId !== id || registry.pendingId !== null || !Array.isArray(registry.accounts)) {
+    throw new Error("No loaded account is available for the Codex interrupt hook");
+  }
+  const accounts = registry.accounts.filter((account: unknown) => account && typeof account === "object"
+    && (account as Record<string, unknown>).id === id);
+  if (accounts.length !== 1 || accounts[0].status !== "active" || accounts[0].legacy !== (id === "default")) {
+    throw new Error("The loaded account is unavailable for the Codex interrupt hook");
+  }
+  const coreHome = id === "default" ? getApplicationDir() : join(getApplicationDir(), "accounts", id, "core");
+  const config = loadConfigFromPath(join(coreHome, "config.json"));
+  config.port = getApplicationPort(config.port);
+  return config;
 }
 
 function lineEnding(text: string): "\n" | "\r\n" | "\r" {

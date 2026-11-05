@@ -3,6 +3,65 @@ const assert = require("node:assert/strict");
 const { BrowserHost } = require("../electron/browser-host.cjs");
 const { BrowserControlServer } = require("../electron/control-server.cjs");
 
+test("control admission blocks direct recovery and network entries before they can change execution", async () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), { turnTabs: new Map(), accountAdmissionClosed: true });
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} }, getBrowserHost: () => host, getPreferences: () => ({}),
+    resolveProxy: async () => assert.fail("a closed account must not resolve outbound routes"),
+  }).start();
+  const { endpoint, token } = server.descriptor();
+  const send = (route, body = {}) => fetch(`${endpoint}${route}`, { method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    const routes = ["/v1/turn/continuity-prepare", "/v1/turn/continuity-send-possible", "/v1/turn/continuity-capacity",
+      "/v1/turn/continuity", "/v1/session/inspect", "/v1/turn/start", "/v1/manual/start"];
+    for (const route of routes) {
+      const response = await send(route);
+      assert.equal(response.status, 503, route);
+      assert.equal((await response.json()).code, "account_admission_closed");
+    }
+    const proxy = await send("/v1/network/resolve-proxy", { url: "https://chatgpt.com/backend-api/codex/models" });
+    assert.equal(proxy.status, 503);
+    assert.equal(host.continuityTransactions, undefined);
+    assert.equal(host.continuityAuthorityDirectories, undefined);
+
+    host.accountAdmissionClosed = false;
+    host.accountIdentityStatus = "mismatch";
+    for (const route of routes) {
+      const response = await send(route);
+      assert.equal(response.status, 409, route);
+      assert.equal((await response.json()).code, "account_identity_mismatch");
+    }
+  } finally { await server.close(); }
+});
+
+test("a closed or mismatched account still accepts owned turn completion and retained-page cleanup", async () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    accountAdmissionClosed: true, accountIdentityStatus: "mismatch", turnTabs: new Map(),
+    closedTurnOwners: new Map(), userCancelledTurnOwners: new Map(), selectedTabId: "home",
+    logger: { info() {}, warn() {} }, snapshot: () => ({}), syncPowerSaveBlocker() {}, syncViewVisibility() {}, writeDescriptor() {},
+    window: { contentView: { removeChildView() {} } },
+  });
+  const makeTab = () => ({ id: "owned-tab", traceId: "owned-completion", helperPid: process.pid, status: "running",
+    interactionMode: "automatic", view: { webContents: { isDestroyed: () => true } } });
+  host.turnTabs.set("owned-tab", makeTab());
+  const server = await new BrowserControlServer({ logger: { info() {}, warn() {}, error() {} },
+    getBrowserHost: () => host, getPreferences: () => ({}) }).start();
+  const { endpoint, token } = server.descriptor();
+  const send = (route, body) => fetch(`${endpoint}${route}`, { method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    const end = await send("/v1/turn/end", { traceId: "owned-completion", helperPid: process.pid, status: "failed" });
+    assert.equal(end.status, 200);
+    assert.equal(host.turnTabs.size, 0);
+    host.turnTabs.set("owned-tab", { ...makeTab(), status: "ready", conversationKey: "a".repeat(64) });
+    const release = await send("/v1/turn/release", { conversationKey: "a".repeat(64) });
+    assert.equal(release.status, 200);
+    assert.equal((await release.json()).released, 1);
+    assert.equal(host.turnTabs.size, 0);
+  } finally { await server.close(); }
+});
+
 test("manual control forwards selected plans and exposes owner-bound media attestation separately from Sent", async () => {
   const calls = [];
   const plan = { planId: "selected-plan", contextId: "context", manifestDigest: "a".repeat(64), requiredAttachments: [{ id: "image", label: "图片 1" }] };
@@ -247,7 +306,9 @@ test("native proxy resolution requires owner auth, restricts targets, and works 
   const resolved = [];
   const server = await new BrowserControlServer({
     logger: { info() {}, warn() {}, error() {} },
-    getBrowserHost: () => { throw new Error("proxy resolution must not inspect browser contents"); },
+    getBrowserHost: () => Object.create(BrowserHost.prototype, {
+      view: { get() { throw new Error("proxy resolution must not inspect browser contents"); } },
+    }),
     getPreferences: () => { throw new Error("proxy resolution must not depend on integration mode"); },
     resolveProxy: async url => { resolved.push(url); return "PROXY 127.0.0.1:7897"; },
   }).start();

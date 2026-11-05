@@ -50,7 +50,8 @@ function encryption() {
 function fixture(t, options = {}) {
   const coreHome = fs.mkdtempSync(path.join(os.tmpdir(), "api-access-test-"));
   t.after(() => fs.rmSync(coreHome, { recursive: true, force: true }));
-  const file = path.join(coreHome, "api-access.json");
+  const applicationHome = options.applicationHome ?? coreHome;
+  const file = path.join(applicationHome, "api-access.json");
   const modelCatalogPendingPath = path.join(coreHome, "api-key-models-refresh-pending.json");
   const config = { port: 17841, controlToken: "c".repeat(43) };
   const state = { configured: true, owner: "launcher", effective: { version: 1, mode: "openai" },
@@ -86,7 +87,7 @@ function fixture(t, options = {}) {
       return { stdout: args[1] === "codex-config"
         ? `${JSON.stringify({
           config: `requires_openai_auth = false\nexperimental_bearer_token = ${JSON.stringify(runOptions.env?.CODEX_CHATGPT_WEB_API_KEY)}\n`,
-          catalogPath: path.join(coreHome, "api-key-models.json"),
+          catalogPath: path.join(applicationHome, "api-key-models.json"),
           catalog: '{"models":[]}\n',
           environment: { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" },
         })}\n` : '{"changed":false}\n' };
@@ -114,7 +115,7 @@ function fixture(t, options = {}) {
     },
   };
   const safeStorage = options.safeStorage ?? encryption();
-  const create = () => createApiAccessSettings({ coreHome, runtimeHost: host, supervisor,
+  const create = () => createApiAccessSettings({ coreHome, applicationHome, runtimeHost: host, supervisor,
     safeStorage, browserHost: { get activeTraceId() { return state.browserActive ? "trace" : null; }, currentOperation: () => null },
     resolveProxy: async () => "DIRECT",
     getNetworkProxyUrl: () => state.networkProxyUrl ?? null,
@@ -127,8 +128,45 @@ function fixture(t, options = {}) {
   const controller = create(); t.after(() => controller.dispose());
   const apply = async (mode = "api-key", key = KEY) => controller.apply({ mode,
     ...(key !== undefined && mode === "api-key" ? { key } : {}), expectedRevision: (await controller.status()).revision });
-  return { controller, apply, state, file, coreHome, create, config };
+  return { controller, apply, state, file, coreHome, applicationHome, create, config };
 }
+
+test("accounts share the sealed client key and routing ownership while upstream credentials stay local", async t => {
+  const applicationHome = fs.mkdtempSync(path.join(os.tmpdir(), "api-access-application-"));
+  t.after(() => fs.rmSync(applicationHome, { recursive: true, force: true }));
+  const first = fixture(t, { applicationHome });
+  await first.apply();
+  await first.controller.saveUpstream({
+    expectedRevision: (await first.controller.status()).revision,
+    baseUrl: "https://provider.example/v1", apiKey: UPSTREAM_KEY,
+    proxy: { mode: "direct" }, models: [], supportsOpenAiServerCompaction: false,
+  });
+  const sharedJournal = path.join(applicationHome, "codex", "integration-journal.json");
+  fs.mkdirSync(path.dirname(sharedJournal));
+  fs.writeFileSync(sharedJournal, '{"sentinel":"original-installation"}\n');
+  const second = fixture(t, { applicationHome, effective: keyPolicy(KEY) });
+  const status = await second.controller.status();
+  assert.equal(status.configuredMode, "api-key");
+  assert.equal(status.keyStorage, "os");
+  assert.equal(status.cleanupPending, true);
+  assert.equal(status.upstream.configured, false);
+  assert.equal(second.controller.reveal(), KEY);
+  assert.deepEqual(second.controller.daemonEnvironment(), {});
+  assert.deepEqual(first.controller.daemonEnvironment(), { CODEX_CHATGPT_WEB_UPSTREAM_API_KEY: UPSTREAM_KEY });
+  assert.equal(fs.existsSync(path.join(applicationHome, "secrets", "api-client-key.json")), true);
+  assert.equal(fs.existsSync(path.join(first.coreHome, "secrets", "api-client-key.json")), false);
+  assert.equal(fs.existsSync(path.join(second.coreHome, "api-access.json")), false);
+  assert.equal(fs.existsSync(path.join(applicationHome, "upstream-provider.json")), false);
+  assert.equal(fs.existsSync(path.join(first.coreHome, "secrets", "upstream-api-key.json")), true);
+  assert.equal(fs.existsSync(path.join(second.coreHome, "secrets", "upstream-api-key.json")), false);
+  await second.apply("api-key", NEXT);
+  assert.equal(first.controller.reveal(), NEXT);
+  assert.equal(fs.readFileSync(sharedJournal, "utf8"), '{"sentinel":"original-installation"}\n');
+  second.state.operation = "setup";
+  await second.apply("openai");
+  assert.equal(fs.existsSync(path.join(applicationHome, "api-access-routing-pending.json")), true);
+  assert.equal(fs.existsSync(path.join(second.coreHome, "api-access-routing-pending.json")), false);
+});
 
 test("mode/key are saved first, then the supervised runtime restarts", async t => {
   const f = fixture(t); const result = await f.apply();
@@ -138,6 +176,15 @@ test("mode/key are saved first, then the supervised runtime restarts", async t =
   assert.equal(result.status.keyAvailable, true); assert.equal(f.controller.reveal(), KEY);
   const status = JSON.stringify(await f.controller.status()); assert.ok(!status.includes(KEY));
   assert.ok(!status.includes(keyPolicy(KEY).keySha256));
+});
+test("the shared client address remains visible while the selected account is not configured", async t => {
+  const f = fixture(t, { configured: false });
+  fs.writeFileSync(path.join(f.applicationHome, "service-endpoint.json"), '{"version":1,"port":18749}\n');
+  const status = await f.controller.status();
+  assert.equal(status.baseUrl, "http://127.0.0.1:18749/v1");
+  assert.equal(status.runtimeState, "unconfigured");
+  assert.equal(await f.controller.copyBaseUrl(), true);
+  assert.equal(f.state.clipboard, status.baseUrl);
 });
 test("API access mode transition hooks run only when the saved mode changes", async t => {
   const events = [];

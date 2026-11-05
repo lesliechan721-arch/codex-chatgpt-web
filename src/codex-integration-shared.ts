@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathS
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { AppConfig, SubagentProtocol } from "./config";
-import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
+import { atomicWriteFile, expandUserPath, getApplicationDir, getApplicationPort } from "./config";
 
 export const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
 export const MANAGED_ROUTE_COMMENT =
@@ -301,15 +301,15 @@ export function getCodexModelsCachePath(): string {
 }
 
 export function getCodexJournalPath(): string {
-  return join(getConfigDir(), "codex", "integration-journal.json");
+  return join(getApplicationDir(), "codex", "integration-journal.json");
 }
 
 export function getCodexJournalRecoveryPath(): string {
-  return join(getConfigDir(), "codex", "integration-journal.recovery.json");
+  return join(getApplicationDir(), "codex", "integration-journal.recovery.json");
 }
 
 export function routeUrl(config: AppConfig): string {
-  return `http://${config.host}:${config.port}/v1`;
+  return `http://${config.host}:${getApplicationPort(config.port)}/v1`;
 }
 
 export function sha256(value: string | Uint8Array): string {
