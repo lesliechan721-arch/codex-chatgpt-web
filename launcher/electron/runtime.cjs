@@ -914,8 +914,8 @@ class RuntimeHost {
     const evidence = report?.evidence;
     const receiptsComplete = ["ordinary", "compaction"].every((kind) =>
       ["list", "search", "read"].every((method) => evidence?.receipts?.[kind]?.[method] === true));
-    // CLI evidence v2 has already checked both actual v2 text-read transport receipts.
-    if (report?.ok !== true || evidence?.version !== 2 || !receiptsComplete
+    // The CLI has already checked both supported text-read transport receipts.
+    if (report?.ok !== true || evidence?.version !== 4 || !receiptsComplete
       || evidence.binding?.profile !== this.launcherProfile
       || evidence.binding?.mode !== this.getBrowserInteractionMode()
       || evidence.binding?.appName !== this.mcpConnectorName()) {

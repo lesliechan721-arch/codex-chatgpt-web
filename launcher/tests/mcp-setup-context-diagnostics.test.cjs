@@ -127,7 +127,7 @@ for (const profile of ["production", "development"]) for (const mode of ["automa
         ? { ok: false, checks: [{ id: "runtime", status: "error", message: "local runtime failure" }] } : healthy;
       f.host.run = async () => {
         if (outcome !== "success") throw new Error(`diagnostic ${outcome}`);
-        return { stdout: JSON.stringify({ ok: true, evidence: { version: 2,
+        return { stdout: JSON.stringify({ ok: true, evidence: { version: 4,
           binding: { profile, mode, appName: f.config.appName },
           receipts: { ordinary: { list: true, search: true, read: true },
             compaction: { list: true, search: true, read: true } } } }) };
@@ -253,7 +253,7 @@ test("the wizard cannot complete skipped configuration steps after a successful 
   f.stateStore.update({ mcpRuntimeInstalled: false });
   f.host.doctor = async () => ({ ok: true, checks: [] });
   f.host.launcherControlEnvironment = () => ({});
-  f.host.run = async () => ({ stdout: JSON.stringify({ ok: true, evidence: { version: 2,
+  f.host.run = async () => ({ stdout: JSON.stringify({ ok: true, evidence: { version: 4,
     binding: { profile: "production", mode: "automatic", appName: f.config.appName },
     receipts: { ordinary: { list: true, search: true, read: true },
       compaction: { list: true, search: true, read: true } } } }) });

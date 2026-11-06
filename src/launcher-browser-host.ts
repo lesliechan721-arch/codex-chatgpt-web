@@ -189,9 +189,14 @@ function assertDescriptorShape(value: unknown): LauncherBrowserHostDescriptor {
   if (!helperScript || !existsSync(helperScript)) {
     throw new Error("Launcher browser descriptor helper script does not exist");
   }
-  const expectedPartition = descriptor.profile === "development"
+  const legacyPartition = descriptor.profile === "development"
     ? "persist:codex-web-gpt-dev-chatgpt"
     : "persist:codex-web-gpt-chatgpt";
+  const accountId = process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID?.trim() || "default";
+  if (accountId !== "default" && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(accountId)) {
+    throw new Error("Launcher browser account identity is invalid");
+  }
+  const expectedPartition = accountId === "default" ? legacyPartition : `${legacyPartition}-account-${accountId}`;
   if (descriptor.partition !== expectedPartition) {
     throw new Error("Launcher browser descriptor identifies an unexpected browser partition");
   }

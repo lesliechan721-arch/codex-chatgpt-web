@@ -245,7 +245,14 @@ export function isWindowsPipeEndpoint(value: string): boolean {
 }
 
 export function defaultBrokerEndpoint(home = getConfigDir(), platform = process.platform): string {
-  if (platform !== "win32") return join(home, "runtime", "turn-broker.sock");
+  if (platform !== "win32") {
+    const endpoint = join(home, "runtime", "turn-broker.sock");
+    // Keep existing endpoints when they fit macOS's 103-byte sun_path limit.
+    if (Buffer.byteLength(endpoint) <= 103) return endpoint;
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+    const identity = createHash("sha256").update(`${uid}\0${resolve(home)}`).digest("hex").slice(0, 32);
+    return `/tmp/codex-chatgpt-web-${identity}.sock`;
+  }
   const identity = createHash("sha256").update(resolve(home).toLowerCase()).digest("hex").slice(0, 20);
   return `\\\\.\\pipe\\codex-chatgpt-web-${identity}`;
 }

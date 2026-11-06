@@ -7,13 +7,15 @@ const { CURRENT_CONNECTOR_NAME, CURRENT_MANUAL_CONNECTOR_NAME, DEV_CONNECTOR_NAM
 const { RuntimeHost, resolveToolAuthorityControl } = require("../electron/runtime.cjs");
 
 function contextVerificationEvidence(profile, mode, appName) {
-  const textRead = (digest) => ({ format: "context-text-read-v2", content_blocks: 2, body_content_index: 1,
-    metadata_consistent: true, utf8_bytes: 12, range: { start: 0, end_exclusive: 12 }, body_utf8_bytes: 12,
+  const textRead = (digest) => ({ format: "context-text-batch-v1", content_blocks: 3,
+    metadata_consistent: true, items: [0, 1].map(request_index => ({ request_index,
+      read_ref_digest: digest.repeat(64), target_id_digest: digest.repeat(64), body_content_index: request_index + 1,
+      utf8_bytes: 12, range: { start: 0, end_exclusive: 12 }, body_utf8_bytes: 12 })),
     result_digest: digest.repeat(64) });
-  return { version: 2, binding: { profile, mode, appName, home: "/fixture/runtime", tunnelId: "fixture-tunnel",
+  return { version: 4, binding: { profile, mode, appName, home: "/fixture/runtime", tunnelId: "fixture-tunnel",
     tunnelProfile: "c".repeat(64), brokerSocketPath: "/fixture/runtime/turn-broker.sock",
     runtimeCommand: ["/fixture/bun", "/fixture/cli.ts"], runtimeFingerprint: "d".repeat(64), schemaDigest: "e".repeat(64),
-    sentConfirmationRequired: mode === "manual", contextProtocol: 2, textReadFormat: "context-text-read-v2" },
+    sentConfirmationRequired: mode === "manual", contextProtocol: 6, textReadFormat: "context-text-batch-v1" },
     verifiedAt: "2026-10-11T00:00:00.000Z",
     receipts: { ordinary: { list: true, search: true, read: true, text_read: textRead("a") },
       compaction: { list: true, search: true, read: true, text_read: textRead("b") } } };
@@ -21,7 +23,7 @@ function contextVerificationEvidence(profile, mode, appName) {
 
 for (const development of [false, true]) for (const mode of ["automatic", "manual"]) {
   const profile = development ? "development" : "production";
-  test(`Verify runtime accepts v2 evidence through the bounded sensitive ${profile}/${mode} transaction`, async () => {
+  test(`Verify runtime accepts current evidence through the bounded sensitive ${profile}/${mode} transaction`, async () => {
     const name = mode === "manual" ? CURRENT_MANUAL_CONNECTOR_NAME : development ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
     const fixture = development ? devHostFor({ mode: "full", appName: name }, mode) : hostFor({ mode: "full", appName: name }, mode);
     fixture.host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "private-control" });
@@ -51,7 +53,7 @@ test("Verify runtime rejects old or unknown evidence, missing successful calls a
     change(report);
     await assert.rejects(fixture.host.verifyContextCapability(), /did not return successful/);
   };
-  for (const version of [1, 3, undefined]) await rejected((value) => { value.evidence.version = version; });
+  for (const version of [1, 2, 3, 5, undefined]) await rejected((value) => { value.evidence.version = version; });
   for (const kind of ["ordinary", "compaction"]) for (const method of ["list", "search", "read"]) {
     await rejected((value) => { delete value.evidence.receipts[kind][method]; });
   }
