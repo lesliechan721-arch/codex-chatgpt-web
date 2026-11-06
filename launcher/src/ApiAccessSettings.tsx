@@ -51,8 +51,8 @@ const labels = {
     cleanup: "配置已保存，但旧的 Codex 注入尚未清理，请重试或检查配置冲突。不会覆盖手动修改。",
     url: "服务 Base URL", copyUrl: "复制地址", copyConfig: "复制 Codex 配置", exportConfig: "导出 TOML",
     exported: "敏感配置已生成，包含本地 API Key。", preview: "查看导出的敏感配置",
-    client: "Codex 配置通过 experimental_bearer_token 包含本地 API Key；不会自动写入 Codex 配置或认证文件。代理启动环境与 TOML 分开显示。",
-    processEnv: "Codex 启动环境", catalogPath: "模型目录保存路径", catalog: "模型目录内容",
+    client: "Codex 配置通过 experimental_bearer_token 包含本地 API Key；不会自动写入 Codex 配置或认证文件。Codex 从服务接口读取模型目录，无需保存目录文件。代理启动环境与 TOML 分开显示。",
+    processEnv: "Codex 启动环境",
     upstreamTitle: "OpenAI 兼容上游", upstreamBase: "上游 Base URL", upstreamKey: "上游 API Key",
     upstreamDescription: "配置第三方 OpenAI 兼容服务、代理、显式模型列表和 Codex 模型元数据。详细配置放在独立页面。",
     upstreamOpen: "配置上游", upstreamBack: "返回接入模式", upstreamConfigured: "已配置", upstreamNotConfigured: "未配置",
@@ -73,10 +73,6 @@ const labels = {
     compactionHint: "仅当上游真实兼容服务端 compaction_trigger 协议时启用。",
     upstreamMissingKey: "已保存上游配置，但当前会话无法恢复上游密钥。请重新输入并保存。",
     upstreamReady: "上游已加载。", upstreamPending: "上游已保存，等待后台加载。",
-    catalogPending: "上游已加载，正在刷新 Codex 模型目录。",
-    catalogExportRequired: "Codex 模型目录已刷新。请导出更新后的 Codex 配置和模型目录，并复制到外部客户端。",
-    exportCatalog: "导出更新后的配置",
-    catalogFailed: "上游已加载，但 Codex 模型目录刷新失败；旧目录仍保留。请重试。",
     unconfigured: "配置已保存；初始化运行时后生效。", invalid: "接入配置无效，请修复 api-access.json。",
     failed: "操作未完成，请刷新状态后重试。", errors: {
       "invalid-key": "密钥格式不正确。", "key-required": "请先填写或生成密钥。",
@@ -109,8 +105,8 @@ const labels = {
     cleanup: "Saved, but previous Codex injection still needs cleanup. Retry or inspect conflicting edits; manual changes are not overwritten.",
     url: "Service Base URL", copyUrl: "Copy URL", copyConfig: "Copy Codex config", exportConfig: "Export TOML",
     exported: "Sensitive configuration generated with the local API key.", preview: "View sensitive exported configuration",
-    client: "The Codex provider uses experimental_bearer_token with the local API key. Nothing is written automatically to Codex config or authentication files. Process proxy environment is shown separately from TOML.",
-    processEnv: "Codex process environment", catalogPath: "Model catalog destination", catalog: "Model catalog content",
+    client: "The Codex provider uses experimental_bearer_token with the local API key. Nothing is written automatically to Codex config or authentication files. Codex reads the model catalog from the service. No catalog file is required. Process proxy environment is shown separately from TOML.",
+    processEnv: "Codex process environment",
     upstreamTitle: "OpenAI-compatible upstream", upstreamBase: "Upstream Base URL", upstreamKey: "Upstream API key",
     upstreamDescription: "Configure a third-party OpenAI-compatible service, proxy, explicit model list, and Codex model metadata on a separate detail page.",
     upstreamOpen: "Configure upstream", upstreamBack: "Back to access mode", upstreamConfigured: "Configured", upstreamNotConfigured: "Not configured",
@@ -131,10 +127,6 @@ const labels = {
     compactionHint: "Enable only when the upstream really implements the server-side compaction_trigger protocol.",
     upstreamMissingKey: "The upstream configuration is saved, but its key cannot be recovered in this session. Enter the key and save again.",
     upstreamReady: "Upstream is loaded.", upstreamPending: "Upstream is saved and waiting for the runtime to load it.",
-    catalogPending: "The upstream is loaded and the Codex model catalog is refreshing.",
-    catalogExportRequired: "The Codex model catalog is refreshed. Export the updated Codex config and model catalog, then copy them to the external client.",
-    exportCatalog: "Export updated config",
-    catalogFailed: "The upstream is loaded, but the Codex model catalog refresh failed. The previous catalog is still in use. Retry the operation.",
     unconfigured: "Saved for the next runtime initialization.", invalid: "Invalid access configuration. Repair api-access.json.",
     failed: "The operation could not complete. Refresh status and retry.", errors: {
       "invalid-key": "Invalid API key format.", "key-required": "Enter or generate a key first.",
@@ -183,8 +175,6 @@ export function ApiAccessSettings({
   const [notice, setNotice] = useState<string | null>(null);
   const [configText, setConfigText] = useState<string | null>(null);
   const [environmentText, setEnvironmentText] = useState<string | null>(null);
-  const [catalogText, setCatalogText] = useState<string | null>(null);
-  const [catalogPath, setCatalogPath] = useState<string | null>(null);
   const [upstreamBaseUrl, setUpstreamBaseUrl] = useState("");
   const [upstreamKey, setUpstreamKey] = useState("");
   const [proxyMode, setProxyMode] = useState<UpstreamProxy["mode"]>("global");
@@ -283,7 +273,6 @@ export function ApiAccessSettings({
     adopt(result.status);
     if (mounted.current) {
       setEditor(null); setDraft(""); setConfigText(null); setEnvironmentText(null);
-      setCatalogText(null); setCatalogPath(null);
     }
   }
   function switchMode(mode: ApiAccessMode) {
@@ -302,21 +291,14 @@ export function ApiAccessSettings({
   async function exportConfig(download: boolean) {
     const result = value(await api.apiAccessExport());
     if (download) {
-      for (const [name, body, type] of [
-        ["codex-api-key.toml", result.config, "text/plain;charset=utf-8"],
-        ["api-key-models.json", result.catalog, "application/json;charset=utf-8"],
-      ] as const) {
-        const url = URL.createObjectURL(new Blob([body], { type }));
-        const link = document.createElement("a");
-        link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-      }
+      const url = URL.createObjectURL(new Blob([result.config], { type: "text/plain;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url; link.download = "codex-api-key.toml"; document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
     if (mounted.current) {
       setConfigText(result.config);
       setEnvironmentText(Object.entries(result.environment).map(([key, item]) => `${key}=${item}`).join("\n"));
-      setCatalogText(result.catalog);
-      setCatalogPath(result.catalogPath);
       setNotice(copy.exported);
     }
     adopt(value(await api.apiAccessStatus()), true);
@@ -589,13 +571,7 @@ export function ApiAccessSettings({
         onClick={() => void perform(deleteUpstream)}>{copy.deleteUpstream}</button> : null}
     </div>
     {status?.upstream?.configured ? <small>{status.upstream.runtimeAvailable ? copy.upstreamReady : copy.upstreamPending}</small> : null}
-    {status?.modelCatalogState === "pending" ? <small className="api-access-warning">{copy.catalogPending}</small> : null}
-    {status?.modelCatalogState === "export-required" ? <>
-      <small className="api-access-warning">{copy.catalogExportRequired}</small>
-      <div className="api-access-actions"><button type="button" disabled={busy || !status.baseUrl}
-        onClick={() => void perform(() => exportConfig(true))}>{copy.exportCatalog}</button></div>
-    </> : null}
-    {status?.modelCatalogState === "failed" ? <small className="api-access-warning">{copy.catalogFailed}</small> : null}
+
   </div>;
 
   if (view === "upstream") return <section className="api-access-settings api-access-settings-detail" aria-labelledby="api-access-upstream-title">
@@ -656,8 +632,6 @@ export function ApiAccessSettings({
       </div>
       <p>{copy.client}</p>
       {configText ? <details><summary>{copy.preview}</summary><pre tabIndex={0}>{configText}</pre>
-        <label>{copy.catalogPath}</label><code>{catalogPath}</code>
-        <label>{copy.catalog}</label><pre tabIndex={0}>{catalogText}</pre>
         <label>{copy.processEnv}</label><pre tabIndex={0}>{environmentText}</pre></details> : null}
       <button className="api-access-upstream-link" type="button" disabled={busy} onClick={onOpenUpstream}>
         <span><strong>{copy.upstreamTitle}</strong><small>{copy.upstreamDescription}</small></span>
@@ -667,9 +641,7 @@ export function ApiAccessSettings({
       </button>
     </div> : null}
     <div role="status" aria-live="polite">
-      {busy ? copy.busy : status?.runtimeState === "in-sync" && status.modelCatalogState === "export-required" ? copy.catalogExportRequired
-        : status?.runtimeState === "in-sync" && status.modelCatalogState === "pending" ? copy.catalogPending
-        : status?.runtimeState === "in-sync" ? copy.saved
+      {busy ? copy.busy : status?.runtimeState === "in-sync" ? copy.saved
         : status?.runtimeState === "unconfigured" ? copy.unconfigured
           : status?.runtimeState === "invalid" ? (status.errorCode ? copy.errors[status.errorCode] ?? copy.invalid : copy.invalid)
             : pending ? copy.pending + (status?.effectiveMode === "api-key" ? copy.api
@@ -677,14 +649,9 @@ export function ApiAccessSettings({
     </div>
     {status?.routingPending ? <p className="api-access-warning">{copy.routing}</p> : null}
     {status?.cleanupPending ? <p className="api-access-warning">{copy.cleanup}</p> : null}
-    {status?.modelCatalogState === "export-required" ? <p className="api-access-warning">{copy.catalogExportRequired}</p> : null}
-    {status?.modelCatalogState === "failed" ? <p className="api-access-warning">{copy.catalogFailed}</p> : null}
     <div className="api-access-actions">
-      {pending || status?.cleanupPending || status?.routingPending
-        || status?.modelCatalogState === "pending" || status?.modelCatalogState === "failed" ? <button type="button" disabled={busy || !status?.canApply}
+      {pending || status?.cleanupPending || status?.routingPending ? <button type="button" disabled={busy || !status?.canApply}
         onClick={() => void perform(() => save(isApi ? "api-key" : "openai"))}>{copy.retry}</button> : null}
-      {status?.modelCatalogState === "export-required" ? <button type="button" disabled={busy || !status.baseUrl}
-        onClick={() => void perform(() => exportConfig(true))}>{copy.exportCatalog}</button> : null}
       <button type="button" disabled={busy} onClick={() => void perform(async () => {
         adopt(value(await api.apiAccessStatus())); setEditor(null); setDraft("");
       })}>{copy.refresh}</button>

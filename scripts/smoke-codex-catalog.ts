@@ -7,6 +7,9 @@ import { defaultConfig } from "../src/config";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
 import { normalizeUpstreamModelCatalog } from "../src/upstream-model-catalog";
 import { parseUpstreamProviderConfig } from "../src/upstream-provider";
+import { renderApiKeyCodexConfig } from "../src/api-key-codex-config";
+import { apiKeyPolicy } from "../src/api-access";
+import { modelsRequest } from "../src/server";
 import { downloadCli, fetchRelease, type SourceLock } from "./codex-release";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -168,6 +171,52 @@ try {
     || fallbackSmoke.model_messages?.instructions_template !== fallbackMessages.instructions_template) {
     throw new Error(`Codex did not accept minimal fallback metadata: ${JSON.stringify(fallbackSmoke)}`);
   }
+
+  // Exercise the exported provider against the real authenticated HTTP catalog, without a file.
+  const apiKey = `cgw_${"s".repeat(43)}`;
+  const policy = apiKeyPolicy(apiKey);
+  const requests: Array<{ path: string; authorized: boolean }> = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      requests.push({ path: url.pathname + url.search, authorized: request.headers.get("authorization") === `Bearer ${apiKey}` });
+      if (url.pathname !== "/v1/models") return new Response(null, { status: 404 });
+      return modelsRequest(request, config, undefined, undefined, policy);
+    },
+  });
+  try {
+    const dynamicHome = join(root, "dynamic-codex");
+    mkdirSync(dynamicHome);
+    const route = availableChatGptWebModelRoutes(config)[0]!;
+    writeFileSync(join(dynamicHome, "config.toml"), renderApiKeyCodexConfig({
+      port: server.port!, model: route.slug, reasoningEffort: route.codexEffort, apiKey,
+      subagentProtocol: config.subagentProtocol,
+    }));
+    const child = Bun.spawn([binary, "debug", "models"], {
+      cwd: root,
+      env: { ...isolatedEnv, CODEX_HOME: dynamicHome, HOME: root,
+        HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", http_proxy: "", https_proxy: "", all_proxy: "",
+        NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost" },
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill(), 30_000);
+    let exitCode: number, stdout: string, stderr: string;
+    try {
+      [exitCode, stdout, stderr] = await Promise.all([
+        child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+      ]);
+    } finally { clearTimeout(timer); }
+    if (exitCode !== 0) throw new Error(`Codex HTTP catalog failed: ${stderr.replaceAll(apiKey, "[REDACTED]")}`);
+    const dynamic = JSON.parse(stdout) as { models: Array<{ slug: string }> };
+    const expectedSlugs = availableChatGptWebModelRoutes(config).map(route => route.slug).sort();
+    const actualSlugs = dynamic.models.map(model => model.slug).sort();
+    if (JSON.stringify(actualSlugs) !== JSON.stringify(expectedSlugs)
+      || !requests.length || requests.some(request => !request.authorized
+        || request.path !== `/v1/models?client_version=${sourceLock.tag.replace("rust-v", "")}`)) {
+      throw new Error(`Codex did not load the exported HTTP catalog: ${JSON.stringify({ actualSlugs, expectedSlugs, requests })}`);
+    }
+  } finally { server.stop(true); }
   process.stdout.write("NATIVE_CODEX_CATALOG_SMOKE_OK\n");
 } finally {
   if (binary) rmSync(dirname(binary), { recursive: true, force: true });

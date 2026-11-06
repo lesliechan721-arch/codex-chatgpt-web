@@ -123,7 +123,7 @@ and may explicitly select delegated authority. A running native turn cannot swit
 
 1. In Launcher Settings, switch API access to **API Key** and save a client key.
 2. Use **Copy Codex config** or **Export TOML**. The provider `base_url` uses `CODEX_PUBLIC_BASE_URL`, or the host-loopback fallback when that value is empty.
-3. Copy the exported TOML into the external Codex configuration and copy the exported model catalog to `CODEX_CLIENT_CATALOG_PATH` on that client. The default destination is `~/.codex/api-key-models.json`.
+3. Merge the exported TOML into the external Codex configuration. Its provider `model_catalog_url` points to the same client Base URL followed by `/models`; no catalog file is needed. For an earlier export, remove the top-level `model_catalog_json` field and add `model_catalog_url` to the existing provider table.
 4. Restart the external Codex client.
 
 The server export deliberately contains no container-local Interrupt command and no daemon control token. Normal HTTP disconnect cancellation is still used, and the server deployment adds `REMOTE_TURN_IDLE_TIMEOUT_SEC` as a no-progress fallback. Its default is 600 seconds. It is not a total turn duration limit. Real text/reasoning progress, tool-call creation, tool results, and compaction progress refresh the native `thread_id + turn_id` idle lease; transport/helper heartbeats and retries do not.
@@ -228,7 +228,6 @@ export CODEX_WEB_REMOTE_ACCEPTANCE_CHALLENGE="<same challenge>"
 export CODEX_WEB_REMOTE_BASE_URL="https://server.example.com/v1"
 export CODEX_WEB_REMOTE_API_KEY="<dedicated acceptance API key>"
 export CODEX_WEB_REMOTE_SERVER_ATTESTATION="/path/to/delegated-server-attestation.json"
-export CODEX_WEB_REMOTE_MODEL_CATALOG="${HOME}/.codex/api-key-models.json"
 bun run accept:delegated:remote
 ```
 
@@ -236,7 +235,7 @@ The server phase fails unless the production container uses `delegated`, has no 
 
 The Automatic phase also runs real `read-only` and `workspace-write` sandboxes. Its workspace-write escape target is under the client home, not under the system temporary directory. Before the escape is attempted, the harness reads the real native rollout permission profile and fails unless that target is outside every explicit writable root, `project_roots`, `tmpdir`, and `slash_tmp` permission. A separate `approval_policy = "on-request"` run requests `require_escalated` for another out-of-scope write and requires the non-interactive native client to reject it without creating the target file. These checks verify outer Codex sandbox and approval results instead of Server-side fields.
 
-Zero Risk is a separate manual acceptance phase because the Server must be in Zero Risk browser-interaction mode and a human must perform its normal Launcher handshake. Switch the production Launcher to Zero Risk, export a fresh Zero Risk client model catalog, rerun the server attestation, and copy the new attestation to the Codex client. Then use the same remote settings and run:
+Zero Risk is a separate manual acceptance phase because the Server must be in Zero Risk browser-interaction mode and a human must perform its normal Launcher handshake. Switch the production Launcher to Zero Risk, rerun the server attestation, and copy the new attestation to the Codex client. The isolated client fetches the current model catalog from the server. Then use the same remote settings and run:
 
 ```sh
 export CODEX_WEB_REMOTE_ZERO_RISK_MODEL="chatgpt-web/zero-risk"

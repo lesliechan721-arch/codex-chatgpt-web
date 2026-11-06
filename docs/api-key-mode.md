@@ -106,9 +106,9 @@ In API mode, none of these paths installs a new Codex route, provider, or hook:
 - subagent protocol switching;
 - daemon `serve` startup.
 
-These paths may only clean injections that have an ownership journal from an earlier installation. `auth.json` and provider/table configuration that the user maintains manually are not generated or overwritten automatically. On a normal local installation, the GUI export writes `api-key-models.json` in the application directory and returns TOML. The user chooses where to paste/merge the TOML or downloads it explicitly.
+These paths may only clean injections that have an ownership journal from an earlier installation. `auth.json` and provider/table configuration that the user maintains manually are not generated or overwritten automatically. The export returns TOML with `model_catalog_url` in `[model_providers.chatgpt_web]`. Codex reads the complete model catalog from the service with the same local Bearer key. The user chooses where to paste/merge the TOML or downloads it explicitly. No static catalog file is generated.
 
-Server remote-desktop deployment uses `CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG=1`. In this mode, setup, route, subagents, and reconnect do not modify Codex configuration inside the container or on an external client. The export returns TOML, model-catalog content, and the target client path. The server does not write a catalog into its own HOME for an external Codex client. The external client must copy both files itself.
+Server remote-desktop deployment uses `CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG=1`. In this mode, setup, route, subagents, and reconnect do not modify Codex configuration inside the container or on an external client. The export returns TOML and separate process proxy environment values. The external client uses the exported public or host-loopback Base URL for inference and catalog requests; no catalog file needs to be copied.
 
 ### 5.2 Cleanup of earlier injected configuration
 
@@ -132,7 +132,8 @@ Compatible settings from the original forwarding integration are generated throu
 
 | Setting | API export policy |
 | --- | --- |
-| Custom `model_provider` / model / effort / `model_catalog_json` | Keep the existing API-mode export |
+| Custom `model_provider` / model / effort | Export the API-mode provider and initial Web model |
+| `[model_providers.chatgpt_web] model_catalog_url` | Use the full client Base URL followed by `/models`; preserve any URL path prefix |
 | `experimental_bearer_token` / `requires_openai_auth = false` / Responses wire API | Keep; `experimental_bearer_token` contains the current local service API Key and `env_key` is no longer emitted |
 | `supports_websockets = false` | Keep; use the existing HTTP/SSE transport only |
 | `web_search = "disabled"` | Keep; do not call blocked native search endpoints |
@@ -146,6 +147,16 @@ Compatible settings from the original forwarding integration are generated throu
 | `experimental_realtime_webrtc_call_base_url` | Exclude; it depends on native OpenAI identity and conflicts with standalone API access |
 | `[hooks.state] trusted_hash` | Exclude; the target file and hook index are user-selected, so export does not fabricate pre-approval state |
 | Custom upstream API Key, OAuth, Tunnel credentials | Never export; the local service API Key enters TOML only during an explicit sensitive Codex export |
+
+To migrate an earlier manual API Key configuration, remove the top-level `model_catalog_json` field and add `model_catalog_url` to the existing provider table, then restart Codex. For example:
+
+```toml
+[model_providers.chatgpt_web]
+# Keep the existing provider fields.
+model_catalog_url = "http://127.0.0.1:17841/v1/models"
+```
+
+Use the actual client service address and port. Codex requires the complete `models[]` metadata returned by this service; a public OpenAI-style `data[]` list alone is insufficient. Earlier `api-key-models.json` files and refresh markers are no longer used and can be removed after migration. The `api-key refresh-models` command and `CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH` setting are removed. The application does not edit manually maintained Codex files during this migration. Catalog updates follow Codex caching and refresh behavior; they are not guaranteed to appear immediately.
 
 After values are generated from the shared feature builder, automatic-management comments are removed. Manually exported settings are owned by the user and must not look like a new journal-managed installation.
 
@@ -196,7 +207,7 @@ bun run src/cli.ts api-key cleanup
 bun run src/cli.ts api-key codex-config
 ```
 
-CLI changes still require a restart through the existing service-management path. The GUI **Show** action can recover only copies created by the GUI. Save CLI output separately. Re-export the model catalog/configuration after model permissions, interaction mode, context, or subagent settings change.
+CLI changes still require a restart through the existing service-management path. The GUI **Show** action can recover only copies created by the GUI. Save CLI output separately. Codex reads model permissions and metadata through its catalog refresh and cache mechanism. Re-export configuration when the service address, client key, provider compaction capability, or exported feature settings change.
 
 ## 8. HTTP, proxy, and execution boundaries
 

@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
 import {
   clientBaseUrl,
-  clientCatalogPath,
   effectiveToolAuthorityMode,
   manualCodexConfigurationOnly,
   remoteTurnIdleTimeoutSec,
@@ -52,12 +51,7 @@ test("client Base URL defaults to host loopback and accepts only HTTPS remote /v
   expect(() => clientBaseUrl(17841, { CODEX_CHATGPT_WEB_CLIENT_PORT: "0" })).toThrow();
 });
 
-test("remote client catalog and turn idle timeout are explicit deployment settings", () => {
-  expect(clientCatalogPath("/server/catalog.json", false, {})).toBe("/server/catalog.json");
-  expect(clientCatalogPath("/server/catalog.json", true, {})).toBe("~/.codex/api-key-models.json");
-  expect(clientCatalogPath("/server/catalog.json", true, {
-    CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH: "/home/client/catalog.json",
-  })).toBe("/home/client/catalog.json");
+test("remote turn idle timeout and manual configuration are explicit deployment settings", () => {
   expect(remoteTurnIdleTimeoutSec({ CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC: "600" })).toBe(600);
   expect(remoteTurnIdleTimeoutSec({})).toBeUndefined();
   expect(remoteTurnIdleTimeoutSec({ CODEX_CHATGPT_WEB_REMOTE_TURN_TIMEOUT_SEC: "1800" })).toBeUndefined();

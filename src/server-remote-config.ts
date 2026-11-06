@@ -4,7 +4,6 @@ import type { ToolAuthorityMode } from "./types";
 export const RESPONSES_BIND_HOST_ENV = "CODEX_CHATGPT_WEB_BIND_HOST";
 export const PUBLIC_BASE_URL_ENV = "CODEX_CHATGPT_WEB_PUBLIC_BASE_URL";
 export const CLIENT_PORT_ENV = "CODEX_CHATGPT_WEB_CLIENT_PORT";
-export const CLIENT_CATALOG_PATH_ENV = "CODEX_CHATGPT_WEB_CLIENT_CATALOG_PATH";
 export const REMOTE_TURN_IDLE_TIMEOUT_SEC_ENV = "CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC";
 export const MANUAL_CODEX_CONFIG_ENV = "CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG";
 export const TOOL_AUTHORITY_MODE_ENV = "CODEX_CHATGPT_WEB_TOOL_AUTHORITY_MODE";
@@ -82,16 +81,6 @@ export function clientBaseUrl(
     throw new Error(`${PUBLIC_BASE_URL_ENV} must end with /v1`);
   }
   return { baseUrl: `${url.origin}${pathname}`, remote: true };
-}
-
-export function clientCatalogPath(
-  fallback: string,
-  remote: boolean,
-  environment: NodeJS.ProcessEnv = process.env,
-): string {
-  const configured = environment[CLIENT_CATALOG_PATH_ENV]?.trim();
-  if (configured) return configured;
-  return remote ? "~/.codex/api-key-models.json" : fallback;
 }
 
 export function remoteTurnIdleTimeoutSec(
