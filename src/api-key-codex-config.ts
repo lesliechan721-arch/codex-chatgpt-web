@@ -8,7 +8,6 @@ import { assertCurrentChatGptWebModelName, isChatGptWebModelSlug } from "./chatg
 export function renderApiKeyCodexConfig(options: {
   port: number;
   baseUrl?: string;
-  catalogPath: string;
   model: string;
   reasoningEffort: string;
   apiKey: string;
@@ -30,12 +29,12 @@ export function renderApiKeyCodexConfig(options: {
     'model_provider = "chatgpt_web"',
     `model = ${quote(options.model)}`,
     `model_reasoning_effort = ${quote(options.reasoningEffort)}`,
-    `model_catalog_json = ${quote(options.catalogPath)}`,
     'web_search = "disabled"',
     '',
     '[model_providers.chatgpt_web]',
     `name = ${quote(options.supportsOpenAiServerCompaction === true ? "OpenAI" : "ChatGPT Web (local API key)")}`,
     `base_url = ${quote(baseUrl)}`,
+    `model_catalog_url = ${quote(baseUrl.replace(/\/+$/, "") + "/models")}`,
     'wire_api = "responses"',
     `experimental_bearer_token = ${quote(options.apiKey)}`,
     'requires_openai_auth = false',

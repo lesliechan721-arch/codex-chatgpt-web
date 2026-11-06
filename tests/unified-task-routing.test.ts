@@ -47,7 +47,7 @@ test("public route owns task policy and missing Launcher evidence cannot downgra
 });
 
 test("removed mode names cannot be exported into a new client configuration", () => {
-  expect(() => renderApiKeyCodexConfig({ port: 17841, catalogPath: "/tmp/catalog.json",
+  expect(() => renderApiKeyCodexConfig({ port: 17841,
     model: "chatgpt-web-continuity/gpt-6-sol", reasoningEffort: "high", apiKey: "cgw_" + "a".repeat(43),
   })).toThrow("chatgpt-web/gpt-6-sol");
 });

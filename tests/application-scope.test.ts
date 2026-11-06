@@ -172,7 +172,7 @@ test("starting an empty account retains the installed Codex route and serves unr
   }
 });
 
-test("API-key export retains one client catalog path while using the selected account settings", async () => {
+test("API-key export uses the shared service URL and selected account settings", async () => {
   const { applicationHome, accountHome } = fixture();
   const key = "cgw_" + "a".repeat(43);
   const first = defaultConfig();
@@ -197,11 +197,13 @@ test("API-key export retains one client catalog path while using the selected ac
   ]);
   expect(code, errors).toBe(0);
   const exported = JSON.parse(output);
-  expect(exported.catalogPath).toBe(join(applicationHome, "api-key-models.json"));
-  expect(existsSync(exported.catalogPath)).toBe(true);
+  expect(Object.keys(exported).sort()).toEqual(["baseUrl", "config", "environment"]);
+  expect(existsSync(join(applicationHome, "api-key-models.json"))).toBe(false);
   expect(existsSync(join(accountHome, "api-key-models.json"))).toBe(false);
   expect(exported.config).not.toContain("account-a.invalid");
   expect(exported.baseUrl).toBe(`http://127.0.0.1:${first.port}/v1`);
+  const provider = (Bun.TOML.parse(exported.config) as any).model_providers.chatgpt_web;
+  expect(provider.model_catalog_url).toBe(`${exported.baseUrl}/models`);
 });
 
 test("the installed Interrupt hook selects the loaded account after a switch without another setup", async () => {

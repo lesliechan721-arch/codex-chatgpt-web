@@ -853,17 +853,15 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
 
 });
 
-test("Zero Risk Pro commits Launcher state before a best-effort API-key model catalog refresh", () => {
+test("Zero Risk Pro commits Launcher state before catalog verification", () => {
   const handler = electronMain.slice(
     electronMain.indexOf('handle("launcher:zero-risk-pro"'),
     electronMain.indexOf('handle("launcher:browser-interaction-mode"'),
   );
   const runtimeCommit = handler.indexOf("await runtimeHost.setZeroRiskPro(enabled === true)");
   const stateCommit = handler.indexOf("const state = stateStore.update");
-  const catalogRefresh = handler.indexOf("await apiAccessSettings.refreshModelCatalog()");
-  assert.ok(runtimeCommit >= 0 && runtimeCommit < stateCommit && stateCommit < catalogRefresh);
-  assert.match(handler, /try \{ await apiAccessSettings\.refreshModelCatalog\(\); \}[\s\S]*?catch \{ logger\.warn\("api_access\.model_catalog_refresh_deferred", \{\}\); \}/);
-  assert.match(handler, /catch[\s\S]*?startCatalogVerificationMonitor\(\{ logger, stateStore \}\)/);
+  const catalogVerification = handler.indexOf("startCatalogVerificationMonitor({ logger, stateStore })");
+  assert.ok(runtimeCommit >= 0 && runtimeCommit < stateCommit && stateCommit < catalogVerification);
 });
 
 test("Zero Risk Pro copy describes both base and Pro models", () => {
@@ -890,15 +888,6 @@ test("Zero Risk Pro copy describes both base and Pro models", () => {
   }
 });
 
-test("external model catalog export-required state directs the user to export instead of retrying refresh", () => {
-  assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?copy\.catalogExportRequired/);
-  assert.match(apiAccessSettingsSource, /modelCatalogState === "export-required"[\s\S]*?exportConfig\(true\)[\s\S]*?copy\.exportCatalog/);
-  const retryCondition = apiAccessSettingsSource.slice(
-    apiAccessSettingsSource.indexOf("{pending || status?.cleanupPending"),
-    apiAccessSettingsSource.indexOf("{status?.modelCatalogState === \"export-required\" ? <button", apiAccessSettingsSource.indexOf("{pending || status?.cleanupPending")),
-  );
-  assert.doesNotMatch(retryCondition, /export-required/);
-});
 
 test("API-key and remote forwarding bypass local catalog diagnostics", () => {
   assert.match(

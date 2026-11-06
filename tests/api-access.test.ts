@@ -33,11 +33,11 @@ test("standard and removed Web names reach trusted admission rather than upstrea
   }
   assert.equal(requireWebModelInApiKeyMode("chatgpt-web-continuity-other/model", policy)?.status, 400);
   assert.match(renderApiKeyCodexConfig({
-    port: 8080, catalogPath: "/tmp/catalog.json", model: "chatgpt-web/gpt-5.6-sol",
+    port: 8080, model: "chatgpt-web/gpt-5.6-sol",
     reasoningEffort: "medium", apiKey: key,
   }), /model = "chatgpt-web\/gpt-5.6-sol"/);
   assert.throws(() => renderApiKeyCodexConfig({
-    port: 8080, catalogPath: "/tmp/catalog.json", model: "chatgpt-web-continuity/gpt-5.6-sol",
+    port: 8080, model: "chatgpt-web-continuity/gpt-5.6-sol",
     reasoningEffort: "medium", apiKey: key,
   }), /removed.*chatgpt-web\/gpt-5.6-sol/);
 });
@@ -162,8 +162,7 @@ test("adapter headers drop secrets but preserve canonical turn metadata", () => 
 });
 
 test("Codex export embeds the local bearer token and switches provider name only for declared server compaction", () => {
-  const text = renderApiKeyCodexConfig({ port: 17841, catalogPath: "C:\\Local Data\\models.json",
-    model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key });
+  const text = renderApiKeyCodexConfig({ port: 17841, model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key });
   assert.ok(text.includes('requires_openai_auth = false'));
   assert.ok(text.includes(`experimental_bearer_token = "${key}"`));
   assert.ok(!text.includes("env_key ="));
@@ -171,15 +170,15 @@ test("Codex export embeds the local bearer token and switches provider name only
   assert.ok(text.includes('supports_websockets = false'));
   assert.ok(text.includes('wire_api = "responses"'));
   assert.ok(text.includes('web_search = "disabled"'));
-  assert.ok(text.includes('C:\\\\Local Data\\\\models.json'));
+  assert.ok(text.includes('model_catalog_url = "http://127.0.0.1:17841/v1/models"'));
+  assert.ok(!text.includes('model_catalog_json'));
   assert.ok(text.includes('name = "ChatGPT Web (local API key)"'));
-  const openAi = renderApiKeyCodexConfig({ port: 17841, catalogPath: "/models.json",
-    model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key, supportsOpenAiServerCompaction: true });
+  const openAi = renderApiKeyCodexConfig({ port: 17841, model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key, supportsOpenAiServerCompaction: true });
   assert.ok(openAi.includes('name = "OpenAI"'));
 });
 
 test("Codex export validates the endpoint and model", () => {
-  const base = { port: 17841, catalogPath: "/models.json", model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key };
+  const base = { port: 17841, model: "chatgpt-web/high", reasoningEffort: "high", apiKey: key };
   for (const port of [0, -1, 65536, 1.5, NaN]) assert.throws(() => renderApiKeyCodexConfig({ ...base, port }));
   assert.throws(() => renderApiKeyCodexConfig({ ...base, model: "native-model" }));
 });

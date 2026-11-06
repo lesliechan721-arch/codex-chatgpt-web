@@ -236,10 +236,6 @@ function metadata(body: Record<string, unknown>): Record<string, unknown> | unde
   }
 }
 
-function expandHome(path: string): string {
-  return path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(path);
-}
-
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
@@ -356,11 +352,6 @@ async function runClientAcceptance(): Promise<void> {
   const codexArg = process.argv[3];
   const codex = resolve(codexArg ?? Bun.which("codex") ?? "/Applications/ChatGPT.app/Contents/Resources/codex");
   if (!existsSync(codex)) throw new Error(`Codex executable is missing: ${codex}`);
-  const catalogSource = expandHome(
-    process.env.CODEX_WEB_REMOTE_MODEL_CATALOG ?? join(homedir(), ".codex", "api-key-models.json"),
-  );
-  if (!existsSync(catalogSource)) throw new Error(`Remote model catalog is missing: ${catalogSource}`);
-  JSON.parse(readFileSync(catalogSource, "utf8"));
   const rootModel = process.env.CODEX_WEB_REMOTE_ROOT_MODEL?.trim() || "chatgpt-web/medium";
   const childModel = process.env.CODEX_WEB_REMOTE_CHILD_MODEL?.trim() || "chatgpt-web/high";
 
@@ -379,8 +370,6 @@ async function runClientAcceptance(): Promise<void> {
   const parentValue = `CLIENT_PARENT_${createHash("sha256").update(`${challenge}:parent`).digest("hex").slice(0, 16)}`;
   writeFileSync(join(workspace, "child-proof.txt"), `${childValue}\n`);
   writeFileSync(join(workspace, "parent-proof.txt"), `${parentValue}\n`);
-  const catalogPath = join(root, "models.json");
-  writeFileSync(catalogPath, readFileSync(catalogSource));
 
   const captured: CapturedRequest[] = [];
   const proxy = Bun.serve({
@@ -413,12 +402,12 @@ async function runClientAcceptance(): Promise<void> {
   writeFileSync(join(codexHome, "config.toml"), [
     `model = ${JSON.stringify(rootModel)}`,
     'model_provider = "delegated_remote_acceptance"',
-    `model_catalog_json = ${JSON.stringify(catalogPath)}`,
     'approval_policy = "never"',
     "",
     "[model_providers.delegated_remote_acceptance]",
     'name = "Delegated remote acceptance"',
     `base_url = ${JSON.stringify(`http://127.0.0.1:${proxy.port}/v1`)}`,
+    `model_catalog_url = ${JSON.stringify(`http://127.0.0.1:${proxy.port}/v1/models`)}`,
     `env_key = ${JSON.stringify(API_KEY_ENV)}`,
     'wire_api = "responses"',
     "supports_websockets = false",
@@ -603,11 +592,6 @@ async function runZeroRiskAcceptance(): Promise<void> {
   const codexArg = process.argv[3];
   const codex = resolve(codexArg ?? Bun.which("codex") ?? "/Applications/ChatGPT.app/Contents/Resources/codex");
   if (!existsSync(codex)) throw new Error(`Codex executable is missing: ${codex}`);
-  const catalogSource = expandHome(
-    process.env.CODEX_WEB_REMOTE_MODEL_CATALOG ?? join(homedir(), ".codex", "api-key-models.json"),
-  );
-  if (!existsSync(catalogSource)) throw new Error(`Remote model catalog is missing: ${catalogSource}`);
-  JSON.parse(readFileSync(catalogSource, "utf8"));
   const model = process.env.CODEX_WEB_REMOTE_ZERO_RISK_MODEL?.trim() || "chatgpt-web/zero-risk";
   const timeoutMs = Number(process.env.CODEX_WEB_REMOTE_ZERO_RISK_TIMEOUT_MS ?? 15 * 60_000);
   if (!Number.isFinite(timeoutMs) || timeoutMs < 30_000) {
@@ -622,8 +606,6 @@ async function runZeroRiskAcceptance(): Promise<void> {
   const proofValue = `ZERO_RISK_PROOF_${createHash("sha256").update(challenge).digest("hex").slice(0, 16)}`;
   const sourceMarker = `ZERO_RISK_SOURCE_${createHash("sha256").update(`${challenge}:compaction`).digest("hex").slice(0, 16)}`;
   writeFileSync(join(workspace, "zero-risk-proof.txt"), `${proofValue}\n`);
-  const catalogPath = join(root, "models.json");
-  writeFileSync(catalogPath, readFileSync(catalogSource));
 
   const captured: CapturedRequest[] = [];
   const proxy = Bun.serve({
@@ -661,12 +643,12 @@ async function runZeroRiskAcceptance(): Promise<void> {
   writeFileSync(join(codexHome, "config.toml"), [
     `model = ${JSON.stringify(model)}`,
     'model_provider = "delegated_remote_acceptance"',
-    `model_catalog_json = ${JSON.stringify(catalogPath)}`,
     'approval_policy = "never"',
     "",
     "[model_providers.delegated_remote_acceptance]",
     'name = "Delegated remote acceptance"',
     `base_url = ${JSON.stringify(`http://127.0.0.1:${proxy.port}/v1`)}`,
+    `model_catalog_url = ${JSON.stringify(`http://127.0.0.1:${proxy.port}/v1/models`)}`,
     `env_key = ${JSON.stringify(API_KEY_ENV)}`,
     'wire_api = "responses"',
     "supports_websockets = false",

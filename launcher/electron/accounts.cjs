@@ -12,7 +12,7 @@ const LOGIN_STATUSES = new Set(["signed-in", "signed-out", "error", "unknown"]);
 
 // The legacy home is also the application root. Keep resources and shared records there.
 const LEGACY_ACCOUNT_PATHS = [
-  "config.json", "upstream-provider.json", "upstream-provider-reset.json", "responses-state.json", "api-key-models-refresh-pending.json",
+  "config.json", "upstream-provider.json", "upstream-provider-reset.json", "responses-state.json",
   "browser", "chats", "diagnostics", "logs", "tunnel",
   "secrets/tunnel-runtime.key", "secrets/tunnel-runtime-automatic.key", "secrets/tunnel-runtime-zero-risk.key",
   "secrets/upstream-api-key.json",

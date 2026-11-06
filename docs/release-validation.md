@@ -673,8 +673,10 @@ Check local authentication before routing, private key-vault recovery and sessio
 save-before-restart failures, API mode's no-automatic-Codex-write rule, and sensitive export
 contents. With a dedicated test upstream, exercise all three proxy policies, selected versus
 unselected models, missing/failed discovery, all metadata modes, protected Agent-control fields,
-degraded custom round-trip, v1 marker/vault cleanup, and dynamic/static catalog consistency for the
-exact response consumed by export. A configured revision does not freeze the remote catalog.
+degraded custom round-trip, and v1 marker/vault cleanup. Verify that API Key exports use a
+provider-level `model_catalog_url`, preserve the public URL path prefix, and generate no static
+catalog file. With the locked real Codex CLI and an isolated client home, check Bearer authentication
+and direct loading of the HTTP catalog. A configured revision does not freeze the remote catalog.
 
 For metadata release verification, use one immutable source lock for generated bundled data,
 schema, and the actual Codex parser. Check repeatable generation, field/type diffs, unique exact

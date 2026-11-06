@@ -1367,8 +1367,6 @@ function registerIpc({ logger, stateStore }) {
     });
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) {
-      try { await apiAccessSettings.refreshModelCatalog(); }
-      catch { logger.warn("api_access.model_catalog_refresh_deferred", {}); }
       startCatalogVerificationMonitor({ logger, stateStore });
     }
     return state;

@@ -31,7 +31,6 @@ export interface ApiAccessStatus {
   keyAvailable: boolean;
   keyStorage: "os" | "session" | "unavailable";
   runtimeState: "invalid" | "unconfigured" | "stopped" | "in-sync" | "restart-required";
-  modelCatalogState: "ready" | "pending" | "export-required" | "failed";
   baseUrl: string | null;
   canApply: boolean;
   cleanupPending: boolean;
@@ -72,8 +71,6 @@ export interface ApiAccessApi {
   apiAccessExport(): Promise<ApiAccessResult<{
     config: string;
     environment: Record<string, string>;
-    catalogPath: string;
-    catalog: string;
   }>>;
   apiAccessUpstreamSave(input: {
     expectedRevision: string;

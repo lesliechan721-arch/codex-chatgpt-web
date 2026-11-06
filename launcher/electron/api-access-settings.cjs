@@ -2,7 +2,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, createHmac, randomBytes } = require("node:crypto");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
-const { acquireModelCatalogCommandLock } = require("./model-catalog-command-lock.cjs");
 const { createApiKeyVault } = require("./api-key-vault.cjs");
 const { createUpstreamApiKeyVault, validUpstreamApiKey } = require("./upstream-api-key-vault.cjs");
 const {
@@ -22,9 +21,7 @@ const MAX_POLICY_BYTES = 4096;
 const PUBLIC_BASE_URL_ENV = "CODEX_CHATGPT_WEB_PUBLIC_BASE_URL";
 const CLIENT_PORT_ENV = "CODEX_CHATGPT_WEB_CLIENT_PORT";
 const MANUAL_CODEX_CONFIG_ENV = "CODEX_CHATGPT_WEB_MANUAL_CODEX_CONFIG";
-const MODEL_CATALOG_RETRY_MS = 1_000;
-const MODEL_CATALOG_WAIT_RETRY_MS = 5_000;
-const MODEL_CATALOG_COMMAND_TIMEOUT_MS = 30_000;
+const CONFIG_EXPORT_TIMEOUT_MS = 30_000;
 const ERROR_CODES = new Set([
   "invalid-policy", "invalid-input", "invalid-key", "key-required", "control-key-reuse",
   "stale-settings", "runtime-busy", "external-runtime", "dev-profile", "not-configured",
@@ -134,15 +131,9 @@ function createApiAccessSettings({
   const filePath = path.join(applicationHome, "api-access.json");
   const upstreamFilePath = path.join(coreHome, "upstream-provider.json");
   const routingPendingPath = path.join(applicationHome, "api-access-routing-pending.json");
-  const modelCatalogPendingPath = path.join(coreHome, "api-key-models-refresh-pending.json");
-  // Refresh intent belongs to the account. The shared output requires one cross-account lock.
-  const modelCatalogCommandPath = path.join(applicationHome, "api-key-models-refresh-pending.json");
   const revisionSecret = randomBytes(32);
   let clipboardSecret = null;
   let clipboardTimer = null;
-  let modelCatalogRetryTimer = null;
-  let modelCatalogRefreshFailed = false;
-  let disposed = false;
   let applying = false;
   let cleanupPending = false;
   let routingPending = false;
@@ -182,11 +173,12 @@ function createApiAccessSettings({
     .update("\0")
     .update(upstreamSnapshot.bytes ?? "absent-upstream-provider-file")
     .digest("hex");
-  const upstreamRuntimeApplied = (policy, upstreamConfig, health, config) => policy.mode !== "api-key" || !upstreamConfig
-    || Boolean(config && health
-      && health.upstream_provider_revision === upstreamProviderRevision(upstreamConfig, config.controlToken)
-      && health.upstream_provider_key_matches === true
-      && health.upstream_provider_available === true);
+  const upstreamRuntimeApplied = (policy, upstreamConfig, health, config) => policy.mode !== "api-key"
+    || Boolean(config && health && (upstreamConfig
+      ? health.upstream_provider_revision === upstreamProviderRevision(upstreamConfig, config.controlToken)
+        && health.upstream_provider_key_matches === true
+        && health.upstream_provider_available === true
+      : health.upstream_provider_revision === null));
   const shellType = () => runtimeSnapshot().config?.mode === "full" ? "unified_exec" : "disabled";
   const emptyDiscovery = () => ({
     ids: [], upstreamMetadata: new Map(), richIds: new Set(), sources: { data: false, models: false },
@@ -259,7 +251,7 @@ function createApiAccessSettings({
       ...(error?.message === "upstream-legacy-cleanup-failed" ? { errorCode: "upstream-legacy-cleanup-failed" } : {}),
       effectiveMode: null, revision: null,
       keyConfigured: false, keyAvailable: false, keyStorage: "unavailable",
-      runtimeState: "invalid", modelCatalogState: "ready", baseUrl: null, canApply: false, cleanupPending }; }
+      runtimeState: "invalid", baseUrl: null, canApply: false, cleanupPending }; }
     const runtime = runtimeSnapshot();
     const config = runtime.config;
     const health = await readHealth(config);
@@ -274,7 +266,6 @@ function createApiAccessSettings({
       ? upstreamKey.available && upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config)
       : upstreamRuntimeApplied(saved.policy, upstreamSaved.config, health, config);
     const manualCodexConfig = process.env[MANUAL_CODEX_CONFIG_ENV]?.trim() === "1";
-    const modelCatalogMarker = saved.policy.mode === "api-key" ? modelCatalogMarkerState() : "ready";
     const currentDiscovery = upstreamSaved.config
       && lastUpstreamDiscovery?.identity === discoveryIdentityFromDigest(
         upstreamSaved.config.baseUrl,
@@ -295,11 +286,6 @@ function createApiAccessSettings({
           : matches && upstreamApplied && health.accepting_turns === true
             ? "in-sync" : "restart-required",
       baseUrl: clientBaseUrl(clientConnectionConfig(config)),
-      modelCatalogState: modelCatalogMarker === "export-required"
-        ? "export-required"
-        : modelCatalogMarker === "pending"
-          ? modelCatalogRefreshFailed ? "failed" : "pending"
-          : "ready",
       canApply: true,
       upstream: upstreamSaved.config ? {
         configured: true,
@@ -360,8 +346,7 @@ function createApiAccessSettings({
     } else {
       try { fs.rmSync(routingPendingPath, { force: true }); } catch {}
     }
-    let restartFailed = false;
-    if (runtimeHost.currentOperation()) return restartFailed;
+    if (runtimeHost.currentOperation()) return;
     await runtimeHost.runLifecycleOperation(name, async () => {
       if (configured.mode === "api-key" && !manualCodexConfig) {
         try {
@@ -400,11 +385,9 @@ function createApiAccessSettings({
         await supervisor.stopForSetup();
         await supervisor.startIfConfigured();
       } catch {
-        restartFailed = true;
         /* status() reports pending/unreachable, never "applied" by inference. */
       }
     });
-    return restartFailed;
   }
   async function apply(raw) {
     assertProduction();
@@ -440,10 +423,6 @@ function createApiAccessSettings({
       }
       if (key !== undefined) vault.store(key);
       try {
-        if (next.mode === "api-key") {
-          return { cancelled: false, status: await reconcileModelCatalog("api-access-settings") };
-        }
-        cancelModelCatalogRetry();
         try { await reconcile("api-access-settings"); } catch { /* Saved policy is authoritative. */ }
         return { cancelled: false, status: await status() };
       } finally {
@@ -482,22 +461,20 @@ function createApiAccessSettings({
         supportsOpenAiServerCompaction: input.supportsOpenAiServerCompaction,
       };
       try {
-        await withModelCatalogCommandLock(async () => {
-          // The await above can let another settings writer win. Re-check before committing.
-          assertUnchanged(input.expectedRevision);
-          if (before.upstream.resetReason) {
-            try { clearResetMarker(upstreamFilePath); }
-            catch { return fail("upstream-legacy-cleanup-failed"); }
-          }
-          markModelCatalogPending();
-          writePrivateFileAtomic(upstreamFilePath, `${JSON.stringify(next, null, 2)}\n`);
-        });
+        // No await between optimistic concurrency check and atomic write.
+        assertUnchanged(input.expectedRevision);
+        if (before.upstream.resetReason) {
+          try { clearResetMarker(upstreamFilePath); }
+          catch { return fail("upstream-legacy-cleanup-failed"); }
+        }
+        writePrivateFileAtomic(upstreamFilePath, `${JSON.stringify(next, null, 2)}\n`);
       } catch (error) {
         if (error instanceof ApiAccessSettingsError) throw error;
         return fail("save-failed");
       }
       if (input.apiKey !== undefined) upstreamVault.store(key);
-      return { status: await reconcileModelCatalog("api-access-upstream-settings") };
+      try { await reconcile("api-access-upstream-settings"); } catch { /* Saved settings are authoritative. */ }
+      return { status: await status() };
     } finally { applying = false; }
   }
   async function deleteUpstream(raw) {
@@ -510,11 +487,9 @@ function createApiAccessSettings({
     try {
       const before = assertUnchanged(raw.expectedRevision);
       try {
-        await withModelCatalogCommandLock(async () => {
-          assertUnchanged(raw.expectedRevision);
-          markModelCatalogPending();
-          fs.rmSync(upstreamFilePath, { force: true });
-        });
+        // No await between optimistic concurrency check and deletion.
+        assertUnchanged(raw.expectedRevision);
+        fs.rmSync(upstreamFilePath, { force: true });
       } catch (error) {
         if (error instanceof ApiAccessSettingsError) throw error;
         return fail("save-failed");
@@ -524,7 +499,8 @@ function createApiAccessSettings({
         if (before.upstream.resetReason) clearResetMarker(upstreamFilePath);
       } catch { return fail("upstream-legacy-cleanup-failed"); }
       lastUpstreamDiscovery = null;
-      return { status: await reconcileModelCatalog("api-access-upstream-settings") };
+      try { await reconcile("api-access-upstream-settings"); } catch { /* Saved settings are authoritative. */ }
+      return { status: await status() };
     } finally { applying = false; }
   }
   async function fetchUpstreamModels(raw) {
@@ -616,132 +592,6 @@ function createApiAccessSettings({
     environment.no_proxy = noProxy;
     return environment;
   }
-  function cancelModelCatalogRetry() {
-    if (modelCatalogRetryTimer) clearTimer(modelCatalogRetryTimer);
-    modelCatalogRetryTimer = null;
-  }
-  function modelCatalogMarkerState() {
-    let raw;
-    try { raw = JSON.parse(fs.readFileSync(modelCatalogPendingPath, "utf8")); }
-    catch (error) {
-      return error?.code === "ENOENT" ? "ready" : "pending";
-    }
-    return raw && typeof raw === "object" && !Array.isArray(raw) && raw.state === "export-required"
-      ? "export-required"
-      : "pending";
-  }
-  function markModelCatalogPending() {
-    writePrivateFileAtomic(modelCatalogPendingPath, '{"version":2,"state":"pending"}\n');
-    modelCatalogRefreshFailed = false;
-  }
-  async function withModelCatalogCommandLock(action) {
-    const release = await acquireModelCatalogCommandLock(modelCatalogCommandPath);
-    try { return await action(); }
-    finally { release(); }
-  }
-  function scheduleModelCatalogRetry(delayMs = MODEL_CATALOG_RETRY_MS) {
-    if (disposed || modelCatalogRetryTimer || modelCatalogMarkerState() !== "pending") return;
-    modelCatalogRetryTimer = setTimer(() => {
-      modelCatalogRetryTimer = null;
-      return retryModelCatalogRefresh();
-    }, delayMs);
-    modelCatalogRetryTimer?.unref?.();
-  }
-  async function reconcileModelCatalog(name) {
-    let restartFailed = false;
-    try { restartFailed = await reconcile(name); }
-    catch { restartFailed = true; }
-    if (restartFailed) {
-      modelCatalogRefreshFailed = fs.existsSync(modelCatalogPendingPath);
-      cancelModelCatalogRetry();
-      return await status();
-    }
-    return await refreshModelCatalogIfReady();
-  }
-  async function retryModelCatalogRefresh() {
-    if (disposed || modelCatalogMarkerState() !== "pending") return;
-    if (applying || runtimeHost.currentOperation()) {
-      scheduleModelCatalogRetry();
-      return;
-    }
-    let configured;
-    try { configured = readPolicyFile(filePath).policy; }
-    catch { return; }
-    if (configured.mode !== "api-key") return;
-    const runtime = runtimeSnapshot();
-    if (!runtime.configured) {
-      scheduleModelCatalogRetry(MODEL_CATALOG_WAIT_RETRY_MS);
-      return;
-    }
-    const snapshot = await status();
-    if (snapshot.upstream?.configured && !snapshot.upstream.keyAvailable) {
-      modelCatalogRefreshFailed = true;
-      return;
-    }
-    const health = await readHealth(runtime.config);
-    if (browserHost?.activeTraceId || browserHost?.currentOperation()
-      || (health && (health.active_http_turns > 0 || health.active_browser_turns > 0))) {
-      scheduleModelCatalogRetry();
-      return;
-    }
-    if (runtime.owner === "external") {
-      if (snapshot.runtimeState === "in-sync") await refreshModelCatalogIfReady();
-      else scheduleModelCatalogRetry(MODEL_CATALOG_WAIT_RETRY_MS);
-      return;
-    }
-    await reconcileModelCatalog("api-access-upstream-settings");
-  }
-  async function refreshModelCatalogIfReady() {
-    const snapshot = await status();
-    const markerState = modelCatalogMarkerState();
-    if (markerState === "ready" || markerState === "export-required") return snapshot;
-    if (snapshot.runtimeState !== "in-sync") {
-      modelCatalogRefreshFailed = false;
-      scheduleModelCatalogRetry();
-      return snapshot;
-    }
-    const policy = readPolicyFile(filePath).policy;
-    const localKey = policy.mode === "api-key" ? vault.read(policy.keySha256) : null;
-    if (!localKey) {
-      modelCatalogRefreshFailed = true;
-      return await status();
-    }
-    try {
-      await runtimeHost.runLifecycleOperation("api-access-model-catalog-refresh", async () => {
-        await runtimeHost.run("api-access-model-catalog-refresh", ["api-key", "refresh-models"], {
-          embedded: true,
-          message: "Refreshing API key model catalog",
-          successMessage: "API key model catalog refreshed",
-          timeoutMs: MODEL_CATALOG_COMMAND_TIMEOUT_MS,
-          environment: localClientEnvironment(),
-          env: { CODEX_CHATGPT_WEB_API_KEY: localKey },
-        });
-      });
-      // The core CLI owns the post-command marker transition. Reading its result here avoids
-      // overwriting a newer external CLI refresh/export that completed after this child process.
-      if (modelCatalogMarkerState() === "export-required") cancelModelCatalogRetry();
-    } catch {
-      const latest = await status();
-      if (latest.runtimeState !== "in-sync") {
-        modelCatalogRefreshFailed = false;
-        scheduleModelCatalogRetry();
-        return latest;
-      }
-      modelCatalogRefreshFailed = true;
-    }
-    return await status();
-  }
-  async function refreshModelCatalog() {
-    assertProduction();
-    if (readPolicyFile(filePath).policy.mode !== "api-key") return await status();
-    if (applying) fail("runtime-busy");
-    applying = true;
-    try {
-      try { await withModelCatalogCommandLock(async () => { markModelCatalogPending(); }); }
-      catch { return fail("save-failed"); }
-      return await refreshModelCatalogIfReady();
-    } finally { applying = false; }
-  }
   function clearOwnedClipboard() {
     if (clipboardTimer) clearTimer(clipboardTimer);
     clipboardTimer = null;
@@ -783,7 +633,7 @@ function createApiAccessSettings({
           embedded: true,
           message: "Exporting sensitive API key client configuration",
           successMessage: "API key client configuration exported",
-          timeoutMs: MODEL_CATALOG_COMMAND_TIMEOUT_MS,
+          timeoutMs: CONFIG_EXPORT_TIMEOUT_MS,
           sensitiveOutput: true,
           environment: localClientEnvironment(),
           env: { CODEX_CHATGPT_WEB_API_KEY: localKey },
@@ -791,15 +641,12 @@ function createApiAccessSettings({
         const exported = JSON.parse(result.stdout);
         if (!exported || typeof exported.config !== "string" || !exported.config.includes('requires_openai_auth = false')
           || !exported.config.includes("experimental_bearer_token") || exported.config.includes("env_key =")
-          || typeof exported.catalog !== "string" || typeof exported.catalogPath !== "string"
           || !exported.environment || typeof exported.environment !== "object" || Array.isArray(exported.environment)) fail("export-failed");
         clearOwnedClipboard();
         clipboard.writeText(exported.config);
         return {
           config: exported.config,
           environment: exported.environment,
-          catalogPath: exported.catalogPath,
-          catalog: exported.catalog,
         };
       } catch {
         const latest = await status();
@@ -808,14 +655,11 @@ function createApiAccessSettings({
       }
     });
   }
-  scheduleModelCatalogRetry();
   return {
     status, apply, reveal, copyKey, copyBaseUrl, exportConfig,
-    saveUpstream, deleteUpstream, fetchUpstreamModels, daemonEnvironment, refreshModelCatalog,
+    saveUpstream, deleteUpstream, fetchUpstreamModels, daemonEnvironment,
     generate: () => { assertProduction(); return `cgw_${randomBytes(32).toString("base64url")}`; },
     dispose: () => {
-      disposed = true;
-      cancelModelCatalogRetry();
       clearOwnedClipboard();
       vault.dispose();
       upstreamVault.dispose();
