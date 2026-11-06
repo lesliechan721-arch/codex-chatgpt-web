@@ -315,6 +315,70 @@ function requireAutomaticBrowserInspection(host, operation) {
   }
 }
 
+function assertAccountAdmission(host) {
+  if (host.accountAdmissionClosed) {
+    const error = new Error("Account admission is closed while the launcher switches accounts");
+    error.code = "account_admission_closed";
+    throw error;
+  }
+}
+
+function assertAccountIdentity(host) {
+  if (host.accountIdentityStatus === "mismatch") {
+    const error = new Error("The signed-in ChatGPT identity does not match this account. Restore its original identity or add the signed-in identity as a new account.");
+    error.code = "account_identity_mismatch";
+    throw error;
+  }
+}
+
+function withAccountAdmission(host, action) {
+  assertAccountAdmission(host);
+  host.accountAdmissionOperations ??= new Set();
+  const operation = {};
+  host.accountAdmissionOperations.add(operation);
+  let asynchronous = false;
+  try {
+    const result = action();
+    if (result && typeof result.then === "function") {
+      asynchronous = true;
+      return Promise.resolve(result).finally(() => host.accountAdmissionOperations.delete(operation));
+    }
+    return result;
+  } finally {
+    if (!asynchronous) host.accountAdmissionOperations.delete(operation);
+  }
+}
+
+async function verifySessionAccountIdentity(host, evidence, revision) {
+  if (!evidence.sessionAuthenticated) return true;
+  if (typeof host.verifyAccountIdentity !== "function") return host.accountIdentityStatus !== "mismatch";
+  let status;
+  try {
+    const result = await host.verifyAccountIdentity(evidence.sessionIdentity);
+    status = ["matching", "mismatch", "unverified"].includes(result?.status) ? result.status : "unverified";
+  } catch {
+    if (host.destroyed || revision !== host.authenticationRevision) return false;
+    host.setState({ authenticated: false, status: "error", message: "The ChatGPT account identity could not be checked. Retry the session check." });
+    return false;
+  }
+  if (host.destroyed || host.accountAdmissionClosed || revision !== host.authenticationRevision) return false;
+  // Missing evidence cannot erase an already observed mismatch.
+  if (host.accountIdentityStatus === "mismatch" && status !== "matching") status = "mismatch";
+  host.accountIdentityStatus = status;
+  if (status === "mismatch") {
+    for (const tab of host.turnTabs.values()) {
+      tab.continuityInvalidated = true;
+      tab.authenticationRequired = true;
+      tab.message = "The ChatGPT account identity changed. Restore the original identity before retrying.";
+    }
+    host.setState({ accountIdentityStatus: status, authenticated: false, status: "error",
+      message: "The signed-in ChatGPT identity does not match this account. Restore the original identity or add a new account." });
+    return false;
+  }
+  host.setState({ accountIdentityStatus: status });
+  return true;
+}
+
 class BrowserTurnCancelledError extends Error {
   constructor(traceId) {
     super(`Browser turn ${traceId} was cancelled by the user`);
@@ -422,6 +486,8 @@ class BrowserHost {
     loginWithPasskey,
     partition = "persist:codex-web-gpt-chatgpt",
     profile = "production",
+    accountContext,
+    verifyAccountIdentity,
     publishState,
     showWindow = () => {},
     clipboardApi = clipboard,
@@ -446,10 +512,30 @@ class BrowserHost {
     if (profile !== "production" && profile !== "development") {
       throw new Error("Browser host profile is invalid");
     }
-    const expectedPartition = profile === "development"
+    const legacyPartition = profile === "development"
       ? "persist:codex-web-gpt-dev-chatgpt"
       : "persist:codex-web-gpt-chatgpt";
+    let expectedPartition = legacyPartition;
+    if (accountContext !== undefined) {
+      const validAccountId = typeof accountContext?.id === "string"
+        && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(accountContext.id);
+      if (!accountContext || accountContext.profileKind !== profile
+        || accountContext.legacy !== (accountContext.id === "default")
+        || accountContext.id !== "default" && !validAccountId) {
+        throw new Error("Browser host account context does not match its profile");
+      }
+      expectedPartition = accountContext.legacy ? legacyPartition : `${legacyPartition}-account-${accountContext.id}`;
+      if (accountContext.browserPartition !== expectedPartition) {
+        throw new Error("Browser host account partition does not match its account context");
+      }
+      this.accountContext = Object.freeze({ ...accountContext });
+    }
     if (partition !== expectedPartition) throw new Error("Browser host partition does not match its profile");
+    this.verifyAccountIdentity = verifyAccountIdentity;
+    this.accountIdentityStatus = ["matching", "mismatch", "unverified"].includes(accountContext?.identityStatus)
+      ? accountContext.identityStatus : undefined;
+    this.accountAdmissionClosed = false;
+    this.accountAdmissionOperations = new Set();
     this.partition = partition;
     this.profile = profile;
     this.publishState = publishState;
@@ -504,8 +590,11 @@ class BrowserHost {
     this.boundsReady = false;
     this.bounds = { x: 0, y: 0, width: 1, height: 1 };
     this.state = {
-      status: "idle",
-      message: "No active task",
+      status: this.accountIdentityStatus === "mismatch" ? "error" : "idle",
+      message: this.accountIdentityStatus === "mismatch"
+        ? "The signed-in ChatGPT identity does not match this account. Restore the original identity or add a new account."
+        : "No active task",
+      ...(this.accountIdentityStatus ? { accountIdentityStatus: this.accountIdentityStatus } : {}),
       url: "about:blank",
       title: "ChatGPT",
       authenticated: false,
@@ -569,6 +658,42 @@ class BrowserHost {
     return this.manualOperation || (this.loginOperation ? "ChatGPT login" : null);
   }
 
+  assertAccountAdmission({ execution = false } = {}) {
+    assertAccountAdmission(this);
+    if (execution) assertAccountIdentity(this);
+  }
+
+  closeAccountAdmission() {
+    const previouslyClosed = this.accountAdmissionClosed === true;
+    this.accountAdmissionClosed = true;
+    try {
+      if (this.activeTraceId || this.currentOperation()
+        || this.accountAdmissionOperations?.size
+        || this.sessionRefreshOperation || this.authenticationProbe || this.authenticationRefresh
+        || this.authView || this.primaryRendererRecovery || this.primaryRendererRecoveryNeeded
+        || this.cloudflareChallengeRecovery
+        || physicalTurnTabs(this).some(tab => tab.approvalPending || !isSafelyReclaimableTurnTab(this, tab))) {
+        throw new Error("Finish active ChatGPT tasks, login and diagnostics before switching accounts; the browser is busy");
+      }
+      for (const record of this.continuityTransactions?.values() ?? []) {
+        if (record.pending && !record.result || !["completed", "retired", "missing"].includes(record.state)
+          || record.state === "missing" && record.result && !record.writerRetired && !record.executionIsolated
+          || !record.executionIsolated && this.continuityAuthorityDirectories?.has(record.identity?.installationId)
+            && !require("./continuity-execution-authority.cjs").hasIdleExecutionAuthority(this, record.identity)) {
+          throw new Error("Finish active or retained ChatGPT execution before switching accounts");
+        }
+      }
+      return { status: "closed" };
+    } catch (error) {
+      this.accountAdmissionClosed = previouslyClosed;
+      throw error;
+    }
+  }
+
+  resumeAccountAdmission() {
+    this.accountAdmissionClosed = false;
+  }
+
   assertTurnTabsCanResetForInteractionModeChange() {
     if ([...this.turnTabs.values()].some(tab => tab.status === "running")) {
       throw new Error("Finish or cancel active ChatGPT turns before changing browser interaction mode");
@@ -576,6 +701,7 @@ class BrowserHost {
   }
 
   async withInteractionModeChange(mode, action) {
+    assertAccountAdmission(this);
     if (mode !== "automatic" && mode !== "manual") {
       throw new Error("Browser interaction mode must be automatic or manual");
     }
@@ -683,6 +809,8 @@ class BrowserHost {
   }
 
   async createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal, continuity) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     signal?.throwIfAborted();
     if (this.destroyed) throw continuityFailure("continuity_unverified");
     if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
@@ -693,6 +821,8 @@ class BrowserHost {
     }
     signal?.throwIfAborted();
     if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))) throw continuityFailure("continuity_unverified");
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
     // No await from this final capacity check through the turnTabs reservation.
     if (!reclaimed || physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
@@ -795,6 +925,8 @@ class BrowserHost {
     manualSentConfirmationRequired,
     continuity,
   ) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     if (this.destroyed) throw continuityFailure("continuity_unverified");
     if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
     const instance = launcherInstance(this);
@@ -803,6 +935,8 @@ class BrowserHost {
       reclaimed = await BrowserHost.prototype.evictOldestReclaimableTurnTab.call(this);
     }
     if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))) throw continuityFailure("continuity_unverified");
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
     if (!reclaimed || physicalTurnTabs(this).length >= MAX_BROWSER_TABS) {
       if (continuity) throw acquisitionCapacityFailure(this, continuity);
@@ -923,6 +1057,8 @@ class BrowserHost {
 
   /** Read-only admission check; allocation confirms physical cleanup before creating a page. */
   hasContinuityCapacity() {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     return physicalTurnTabs(this).length < MAX_BROWSER_TABS
       || [...this.turnTabs.values()].some(tab => isSafelyReclaimableTurnTab(this, tab));
   }
@@ -990,6 +1126,7 @@ class BrowserHost {
       this.syncPowerSaveBlocker();
     };
     contents.setWindowOpenHandler(({ url }) => {
+      if (this.accountAdmissionClosed) return { action: "deny" };
       if (allowedAuthUrl(url)) {
         this.markTurnAuthenticationRequired(tab);
         return { action: "deny" };
@@ -1192,6 +1329,7 @@ class BrowserHost {
       this.logger.info("browser.manual_conversation_invalidated", navigation);
     };
     contents.setWindowOpenHandler(({ url }) => {
+      if (this.accountAdmissionClosed) return { action: "deny" };
       let parsed;
       try { parsed = new URL(url); } catch { return { action: "deny" }; }
       if (parsed.protocol === "https:" || parsed.protocol === "http:") {
@@ -1283,6 +1421,7 @@ class BrowserHost {
   bindWebContents() {
     const contents = this.view.webContents;
     contents.setWindowOpenHandler(({ url }) => {
+      if (this.accountAdmissionClosed) return { action: "deny" };
       if (allowedAuthUrl(url)) {
         return {
           action: "allow",
@@ -1324,6 +1463,7 @@ class BrowserHost {
     });
     contents.on("did-finish-load", () => {
       this.clearHomeNavigationTimeout();
+      if (this.accountAdmissionClosed) return;
       if (this.primaryNavigationError) return;
       this.primaryRendererReady = true;
       this.syncViewVisibility();
@@ -1412,7 +1552,7 @@ class BrowserHost {
   }
 
   recoverPrimaryRenderer() {
-    if (this.destroyed || this.manualOperation || !this.primaryRendererRecoveryNeeded
+    if (this.destroyed || this.accountAdmissionClosed || this.manualOperation || !this.primaryRendererRecoveryNeeded
       || this.primaryRendererRecovery) return this.primaryRendererRecovery;
     this.primaryRendererRecoveryNeeded = false;
     const contents = this.view.webContents;
@@ -1468,6 +1608,7 @@ class BrowserHost {
   }
 
   async hardRefreshHome(timeoutMs = BROWSER_NAVIGATION_TIMEOUT_MS) {
+    assertAccountAdmission(this);
     const contents = this.view?.webContents;
     if (!contents || contents.isDestroyed()) {
       throw new Error("The managed ChatGPT page is not available for connector verification");
@@ -1529,6 +1670,7 @@ class BrowserHost {
   }
 
   async refreshChatGptHomeDocument(useTemporaryChats = false) {
+    assertAccountAdmission(this);
     // A navigation from the idle host already creates a fresh ChatGPT document. Reload only an
     // existing new-chat document in the selected mode so the helper sees one fresh catalog.
     const targetUrl = useTemporaryChats ? `${NEW_CHAT_URL}?temporary-chat=true` : NEW_CHAT_URL;
@@ -1556,7 +1698,7 @@ class BrowserHost {
   }
 
   refreshAuthenticationFromSession() {
-    if (this.destroyed || this.primaryRendererRecoveryNeeded || this.primaryRendererRecovery
+    if (this.destroyed || this.accountAdmissionClosed || this.primaryRendererRecoveryNeeded || this.primaryRendererRecovery
       || this.reauthenticationRequired || browserInteractionModeFor(this) !== "automatic") return Promise.resolve();
     this.authenticationRevision = (this.authenticationRevision ?? 0) + 1;
     if (this.authenticationRefresh) return this.authenticationRefresh;
@@ -1582,6 +1724,9 @@ class BrowserHost {
         if (this.destroyed || browserInteractionModeFor(this) !== "automatic") return;
         if (revision !== this.authenticationRevision) continue;
         if (this.reauthenticationRequired) return;
+        if (!await verifySessionAccountIdentity(this, result, revision)) return;
+        if (this.destroyed || this.accountAdmissionClosed) return;
+        if (revision !== this.authenticationRevision) continue;
         const availability = this.activeTraceId || this.manualOperation ? {} : result.sessionCheckError
           ? { status: "error", message: result.sessionCheckError }
           : result.sessionAuthenticated
@@ -1614,6 +1759,7 @@ class BrowserHost {
   }
 
   handleChatGptBackendResponse(details) {
+    if (this.accountAdmissionClosed) return false;
     const contents = this.view?.webContents;
     if (!contents || contents.isDestroyed() || details?.webContentsId !== contents.id) return false;
     if (!isChatGptBackendUrl(details.url)) return false;
@@ -1655,6 +1801,7 @@ class BrowserHost {
   }
 
   async reloadHomeAfterCloudflareChallenge() {
+    assertAccountAdmission(this);
     const contents = this.view.webContents;
     this.setState({
       status: "loading",
@@ -1734,6 +1881,8 @@ class BrowserHost {
   }
 
   heartbeatTurn(traceId, helperPid, refreshViewport = false, progress) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     if (typeof refreshViewport !== "boolean") throw new Error("refreshViewport is invalid");
     const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
     if (!tab) {
@@ -2149,6 +2298,7 @@ class BrowserHost {
   }
 
   createAuthView(options = {}, requestedUrl = "") {
+    assertAccountAdmission(this);
     this.closeAuthView(this.authView, true);
     const authView = new WebContentsView({ webContents: options.webContents });
     this.authView = authView;
@@ -2239,6 +2389,7 @@ class BrowserHost {
       this.setState({ status: "error", message, loading: false });
     });
     contents.setWindowOpenHandler(({ url }) => {
+      if (this.accountAdmissionClosed) return { action: "deny" };
       if (allowedAuthUrl(url)) {
         armNavigationTimeout(url);
         void contents.loadURL(url).catch((error) => {
@@ -2328,13 +2479,15 @@ class BrowserHost {
   }
 
   async reveal(inspectSession = true) {
-    if (inspectSession) requireAutomaticBrowserInspection(this, "ChatGPT session inspection");
-    this.show();
-    if (!this.selectedTurnTab() && this.view.webContents.getURL() === IDLE_BROWSER_URL) {
-      await this.view.webContents.loadURL(NEW_CHAT_URL);
-      if (inspectSession) await this.probeAuthentication();
-    }
-    return this.snapshot();
+    return withAccountAdmission(this, async () => {
+      if (inspectSession) requireAutomaticBrowserInspection(this, "ChatGPT session inspection");
+      this.show();
+      if (!this.selectedTurnTab() && this.view.webContents.getURL() === IDLE_BROWSER_URL) {
+        await this.view.webContents.loadURL(NEW_CHAT_URL);
+        if (inspectSession) await this.probeAuthentication();
+      }
+      return this.snapshot();
+    });
   }
 
   hide() {
@@ -2362,6 +2515,7 @@ class BrowserHost {
   }
 
   navigate(action) {
+    assertAccountAdmission(this);
     if (this.activeTraceId) {
       throw new Error("Browser navigation is locked while ChatGPT is running a Codex turn");
     }
@@ -2473,11 +2627,14 @@ class BrowserHost {
   beginManualTurn(traceId, helperPid, prompt, conversationKey, resumePrompt, compaction = false,
     manualSentConfirmationRequired = true, expectedManualSentConfirmationRequired = manualSentConfirmationRequired,
     continuity, requireRetainedConversation = false, contextPlans, requestId) {
-    const create = () => (this.beginManualTurnAcquisition ?? BrowserHost.prototype.beginManualTurnAcquisition).call(this, traceId, helperPid, prompt, conversationKey, resumePrompt,
-      compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation, contextPlans);
-    return continuity?.recovery
-      ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create, requestId)
-      : create();
+    assertAccountIdentity(this);
+    return withAccountAdmission(this, () => {
+      const create = () => (this.beginManualTurnAcquisition ?? BrowserHost.prototype.beginManualTurnAcquisition).call(this, traceId, helperPid, prompt, conversationKey, resumePrompt,
+        compaction, manualSentConfirmationRequired, expectedManualSentConfirmationRequired, continuity, requireRetainedConversation, contextPlans);
+      return continuity?.recovery
+        ? acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "manual", create, requestId)
+        : create();
+    });
   }
 
   beginManualTurnAcquisition(
@@ -2493,6 +2650,8 @@ class BrowserHost {
     requireRetainedConversation = false,
     contextPlans,
   ) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     if (this.manualOperation) {
       if (continuity && !continuity.expected) throw acquisitionCapacityFailure(this, continuity);
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
@@ -2529,6 +2688,7 @@ class BrowserHost {
     }
     const sameTrace = [...this.turnTabs.values()].find(tab => tab.traceId === traceId);
     const continuityCandidate = sameTrace ?? [...this.turnTabs.values()].find(tab => tab.conversationKey === conversationKey && conversationKey);
+    if (continuityCandidate?.continuityInvalidated) throw continuityFailure();
     assertContinuityStart(continuityCandidate, continuity, traceId, helperPid);
     if (continuity?.expected && !requireRetainedConversation) throw continuityFailure("continuity_source_unproven");
     if (requireRetainedConversation && !continuityCandidate) throw continuityFailure();
@@ -2672,6 +2832,8 @@ class BrowserHost {
       const accept = tab => {
         bindContinuityTab(tab, continuity);
         try {
+          assertAccountAdmission(this);
+          assertAccountIdentity(this);
           if (this.destroyed || !sameLauncherInstance(instance, launcherInstance(this))
             || this.turnTabs.get(tab.id) !== tab || tab.view?.webContents?.isDestroyed?.()) throw continuityFailure("continuity_unverified");
           if (continuity?.recovery) assertExecutionAuthority(this, continuity.recovery);
@@ -2765,6 +2927,8 @@ class BrowserHost {
   }
 
   confirmManualAttachments(tabId, binding) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual" || !tab.manualContextPlan) throw new Error("Zero Risk attachment plan does not exist");
     this.assertManualPlanBinding(tab, binding);
@@ -2844,6 +3008,8 @@ class BrowserHost {
   }
 
   copyManualPrompt(tabId, binding) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual" || typeof tab.prompt !== "string") {
       throw new Error("Manual prompt is no longer available");
@@ -2860,6 +3026,8 @@ class BrowserHost {
   }
 
   confirmManualSent(tabId, binding) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     const tab = this.turnTabs.get(tabId);
     if (!tab || tab.interactionMode !== "manual") throw new Error("Zero Risk tab does not exist");
     this.assertManualPlanBinding(tab, binding);
@@ -2887,6 +3055,8 @@ class BrowserHost {
   }
 
   markManualTurnStarted(traceId, helperPid) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
     if (!tab || tab.interactionMode !== "manual" || tab.helperPid !== helperPid) {
       throw new Error(`Zero Risk turn ownership mismatch: no browser tab owns ${traceId}`);
@@ -2981,14 +3151,17 @@ class BrowserHost {
 
   async beginTurn(traceId, reveal, helperPid, conversationKey, connectorIdentity,
     requireRetainedConversation = false, signal, continuity, requestId) {
-    if (!continuity?.recovery) {
-      return (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
-        requireRetainedConversation, signal, continuity);
-    }
-    // Acquisition belongs to its transaction. Closing one HTTP observer does not retire it.
-    return acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "automatic", () =>
-      (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
-        requireRetainedConversation, undefined, continuity), requestId);
+    assertAccountIdentity(this);
+    return withAccountAdmission(this, () => {
+      if (!continuity?.recovery) {
+        return (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
+          requireRetainedConversation, signal, continuity);
+      }
+      // Acquisition belongs to its transaction. Closing one HTTP observer does not retire it.
+      return acquireContinuityTransaction(this, continuity, traceId, helperPid, conversationKey, "automatic", () =>
+        (this.beginTurnAcquisition ?? BrowserHost.prototype.beginTurnAcquisition).call(this, traceId, reveal, helperPid, conversationKey, connectorIdentity,
+          requireRetainedConversation, undefined, continuity), requestId);
+    });
   }
 
   async beginTurnAcquisition(
@@ -3001,6 +3174,8 @@ class BrowserHost {
     signal,
     continuity,
   ) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     signal?.throwIfAborted();
     if (this.manualOperation) {
       if (continuity && !continuity.expected) throw acquisitionCapacityFailure(this, continuity);
@@ -3011,6 +3186,7 @@ class BrowserHost {
     }
     const sameTrace = [...this.turnTabs.values()].find((tab) => tab.traceId === traceId);
     const continuityCandidate = sameTrace ?? [...this.turnTabs.values()].find(tab => tab.conversationKey === conversationKey && conversationKey);
+    if (continuityCandidate?.continuityInvalidated) throw continuityFailure();
     assertContinuityStart(continuityCandidate, continuity, traceId, helperPid);
     if (continuity?.expected && !requireRetainedConversation) throw continuityFailure("continuity_source_unproven");
     if (sameTrace && sameTrace.interactionMode !== "automatic") {
@@ -3203,6 +3379,7 @@ class BrowserHost {
   }
 
   openLogin() {
+    assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "Automated ChatGPT sign-in verification");
     if (this.state.authenticated && !this.primaryNavigationError) {
       this.activateHomeSurface();
@@ -3254,6 +3431,7 @@ class BrowserHost {
   }
 
   openPasskeyLogin() {
+    assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "Automated ChatGPT passkey import");
     if (this.state.authenticated) {
       this.activateHomeSurface();
@@ -3292,6 +3470,7 @@ class BrowserHost {
   }
 
   async runPasskeyLogin() {
+    assertAccountAdmission(this);
     // Switching from embedded sign-in retains the same exclusive browser operation.
     this.manualOperation = "ChatGPT passkey login";
     this.authNavigationError = null;
@@ -3336,6 +3515,7 @@ class BrowserHost {
   }
 
   async installPasskeyLogin(transfer) {
+    assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "Automated ChatGPT session import");
     if (!transfer || typeof transfer !== "object" || typeof transfer.cleanup !== "function") {
       throw new Error("Passkey sign-in returned an invalid transfer handle");
@@ -3427,6 +3607,7 @@ class BrowserHost {
   }
 
   refreshAuthentication() {
+    assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "ChatGPT authentication refresh");
     if (this.sessionRefreshOperation) return this.sessionRefreshOperation;
     const operation = this.withManualOperation("session refresh", async () => {
@@ -3462,6 +3643,7 @@ class BrowserHost {
   }
 
   async probeAuthentication() {
+    assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "ChatGPT authentication probe");
     if (this.destroyed || this.primaryRendererRecoveryNeeded || this.primaryRendererRecovery) {
       throw new Error("ChatGPT browser is unavailable while its renderer restarts. Retry when it is ready.");
@@ -3476,6 +3658,19 @@ class BrowserHost {
       if (!this.view || this.view.webContents.isDestroyed()) return this.snapshot();
       let url = this.view.webContents.getURL();
       if (url === IDLE_BROWSER_URL) {
+        if (typeof this.verifyAccountIdentity === "function") {
+          const session = this.view.webContents.session;
+          const result = await readChatGptAuthSession(session.fetch.bind(session), CHATGPT_ORIGIN, CHATGPT_AUTH_SESSION_TIMEOUT_MS);
+          if (this.destroyed || revision !== this.authenticationRevision) return this.snapshot();
+          if (!await verifySessionAccountIdentity(this, result, revision)
+            || this.destroyed || this.accountAdmissionClosed || revision !== this.authenticationRevision) return this.snapshot();
+          this.setState({ authenticated: result.sessionAuthenticated,
+            ...(result.sessionCheckError ? { status: "error", message: result.sessionCheckError } : {
+              status: result.sessionAuthenticated ? "ready" : "signed-out",
+              message: result.sessionAuthenticated ? "No active task" : "Sign in to ChatGPT",
+            }), url });
+          return this.snapshot();
+        }
         this.setState({
           status: this.state.authenticated ? "ready" : "signed-out",
           message: this.state.authenticated ? "No active task" : "Sign in to ChatGPT",
@@ -3539,6 +3734,8 @@ class BrowserHost {
       // A newer session change owns authentication. Do not publish an old in-flight
       // page probe after a sign-out/sign-in notification.
       if (revision !== this.authenticationRevision) return this.snapshot();
+      if (!await verifySessionAccountIdentity(this, result, revision)
+        || this.destroyed || this.accountAdmissionClosed || revision !== this.authenticationRevision) return this.snapshot();
       if (result.sessionAuthenticated) {
         this.reauthenticationRequired = false;
         if (this.authView && !this.authView.webContents.isDestroyed()) {
@@ -3583,6 +3780,7 @@ class BrowserHost {
         throw error;
       }
       const state = await this.probeAuthentication();
+      assertAccountIdentity(this);
       if (state.authenticated) return state;
       await sleep(750);
     }
@@ -3590,6 +3788,8 @@ class BrowserHost {
   }
 
   async smokeTest() {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT browser smoke test");
     return await this.withManualOperation("browser smoke test", () => this.runSmokeTest());
   }
@@ -3602,6 +3802,8 @@ class BrowserHost {
   }
 
   async runSmokeTest() {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT browser smoke test");
     const connectorName = this.connectorName();
     this.show();
@@ -3617,6 +3819,7 @@ class BrowserHost {
       logger: this.logger,
     });
     const evidence = result?.value;
+    assertAccountIdentity(this);
     if (!evidence
       || typeof evidence.effort !== "string"
       || !evidence.effort
@@ -3629,11 +3832,15 @@ class BrowserHost {
   }
 
   async verifyConnector(appName) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT connector verification");
     return await this.withManualOperation("connector verification", () => this.runConnectorVerification(appName));
   }
 
   async runConnectorVerification(appName) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT connector verification");
     const connectorName = validateConnectorName(appName);
     this.setState({ status: "testing", message: "Checking ChatGPT connector" });
@@ -3646,6 +3853,7 @@ class BrowserHost {
         useTemporaryChats: this.getUseTemporaryChats(),
         logger: this.logger,
       });
+      assertAccountIdentity(this);
       this.logger.info("connector.verified", { appName: connectorName });
       this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
       return result;
@@ -3661,6 +3869,8 @@ class BrowserHost {
   }
 
   async inspectSession(detectCapabilities = false) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT session and capability inspection");
     if (this.manualOperation === INTERACTION_MODE_CHANGE_OPERATION) {
       return await this.runSessionInspection(detectCapabilities);
@@ -3669,7 +3879,14 @@ class BrowserHost {
   }
 
   async runSessionInspection(detectCapabilities = false) {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "ChatGPT session and capability inspection");
+    if (typeof this.verifyAccountIdentity === "function") {
+      const session = await this.probeAuthentication();
+      assertAccountIdentity(this);
+      if (!session.authenticated) throw new Error("Check the ChatGPT sign-in before inspecting this account's capabilities");
+    }
     const connectorName = this.connectorName();
     const initialUrl = this.view.webContents.getURL();
     const startedIdle = initialUrl === IDLE_BROWSER_URL;
@@ -3684,6 +3901,7 @@ class BrowserHost {
       logger: this.logger,
     });
     const inspected = result?.value;
+    assertAccountIdentity(this);
     if (!inspected || inspected.authenticated !== true || inspected.newChat !== true || typeof inspected.url !== "string") {
       throw new Error("Browser helper returned invalid ChatGPT session evidence");
     }
@@ -3699,6 +3917,8 @@ class BrowserHost {
   }
 
   async inspectLimitsPlan() {
+    assertAccountAdmission(this);
+    assertAccountIdentity(this);
     requireAutomaticBrowserInspection(this, "Limits plan detection");
     return this.withManualOperation("Limits plan detection", async () => {
       const result = await this.runBrowserHelperOperation({
@@ -3719,28 +3939,31 @@ class BrowserHost {
   }
 
   async withManualOperation(name, action) {
-    await this.ready();
-    if (this.activeTraceId) {
-      throw new Error(`ChatGPT browser is running Codex turn ${this.activeTraceId}`);
-    }
-    if (this.manualOperation) {
-      throw new Error(`ChatGPT browser is already busy with ${this.manualOperation}`);
-    }
-    this.activateHomeSurface();
-    this.manualOperation = name;
-    const contents = this.view?.webContents;
-    if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(false);
-    try {
-      return await action();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.setState({ status: "error", message });
-      throw error;
-    } finally {
-      if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
-      this.manualOperation = null;
-      if (this.primaryRendererRecoveryNeeded) void this.recoverPrimaryRenderer();
-    }
+    return withAccountAdmission(this, async () => {
+      await this.ready();
+      assertAccountAdmission(this);
+      if (this.activeTraceId) {
+        throw new Error(`ChatGPT browser is running Codex turn ${this.activeTraceId}`);
+      }
+      if (this.manualOperation) {
+        throw new Error(`ChatGPT browser is already busy with ${this.manualOperation}`);
+      }
+      this.activateHomeSurface();
+      this.manualOperation = name;
+      const contents = this.view?.webContents;
+      if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(false);
+      try {
+        return await action();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.setState({ status: "error", message });
+        throw error;
+      } finally {
+        if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
+        this.manualOperation = null;
+        if (this.primaryRendererRecoveryNeeded) void this.recoverPrimaryRenderer();
+      }
+    });
   }
 
   writeDescriptor() {

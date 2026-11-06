@@ -1,7 +1,7 @@
 import { stdin, stdout, stderr } from "node:process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, currentRuntimeCommand, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
+import { atomicWriteFile, currentRuntimeCommand, getApplicationDir, getConfigDir, getConfigPath, loadConfig, type AppConfig } from "./config";
 import {
   API_KEY_ENV,
   MODEL_CATALOG_STATUS_HEADER,
@@ -228,11 +228,13 @@ export async function runApiKeyCommand(args: string[]): Promise<void> {
   if (!localApiKey || !apiKeyMatches(localApiKey, policy)) {
     throw new Error(`${API_KEY_ENV} must contain the current local API key before export`);
   }
-  const localCatalogPath = join(getConfigDir(), "api-key-models.json");
+  const localCatalogPath = join(getApplicationDir(), "api-key-models.json");
   const modelCatalogPendingPath = join(getConfigDir(), "api-key-models-refresh-pending.json");
+  // Refresh intent belongs to the account. The shared output requires one cross-account lock.
+  const modelCatalogCommandPath = join(getApplicationDir(), "api-key-models-refresh-pending.json");
   // Keep catalog generation and its marker transition in one cross-process transaction. Without
   // this lock, an older export/refresh can finish after a newer command and overwrite its state.
-  const releaseCatalogCommandLock = await acquireModelCatalogCommandLock(modelCatalogPendingPath);
+  const releaseCatalogCommandLock = await acquireModelCatalogCommandLock(modelCatalogCommandPath);
   try {
     const config = loadConfig();
     const route = availableChatGptWebModelRoutes(config)[0];

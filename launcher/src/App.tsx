@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import { NetworkProxySettings } from "./NetworkProxySettings";
+import { AccountManagement, accountCopy } from "./AccountManagement";
 import { ApiAccessSettings } from "./ApiAccessSettings";
 import type { ApiAccessMode } from "./api-access-types";
 import { LimitsSurface } from "./LimitsSurface";
@@ -87,6 +88,9 @@ export function App() {
           }
         : current);
     });
+    const unsubscribeAccounts = api.onAccountsChanged?.(accounts => {
+      setSnapshot(current => current ? { ...current, accounts } : current);
+    });
     const unsubscribeConnectorNames = api.onConnectorNamesChanged(names => {
       setSnapshot(current => current ? { ...current, ...names } : current);
     });
@@ -110,6 +114,7 @@ export function App() {
     return () => {
       cancelled = true;
       unsubscribeState();
+      unsubscribeAccounts?.();
       unsubscribeConnectorNames();
       unsubscribeBrowser();
       unsubscribeOperation();
@@ -147,7 +152,12 @@ export function App() {
       data-theme="dark"
     >
       <AnimatePresence mode="wait">
-        {!snapshot.state.onboardingComplete ? (
+        {snapshot.accounts && !snapshot.accounts.currentId ? (
+          <div className="account-management-only" key="accounts-only">
+            <TitleBar copy={copy} devProfile={snapshot.profile === "development"} draggable sidebarOpen={false} toggleSidebar={() => {}} />
+            <AccountManagement api={api} accounts={snapshot.accounts} language={language} />
+          </div>
+        ) : !snapshot.state.onboardingComplete ? (
           <Onboarding
             key="onboarding"
             language={language}
@@ -375,6 +385,8 @@ function LauncherShell({
     firstRunZeroRiskSetup ? "mcp" : interactionSetupComplete ? "browser" : "setup",
   );
   const devProfile = snapshot.profile === "development";
+  const accountsCopy = accountCopy(language);
+  const currentAccount = snapshot.accounts?.accounts.find(account => account.id === snapshot.accounts?.currentId);
   const compactAtMount = useRef(window.matchMedia(COMPACT_SIDEBAR_QUERY).matches).current;
   const [sidebarOpen, setSidebarOpen] = useState(!compactAtMount);
   const [compactSidebar, setCompactSidebar] = useState(compactAtMount);
@@ -527,6 +539,7 @@ function LauncherShell({
         toggleSidebar={toggleSidebar}
       >
         <NetworkProxySettings
+          accountName={currentAccount?.name}
           disabled={operation?.status === "running" || browser?.status === "running"}
           onOpenChange={setNetworkProxyOpen}
           state={snapshot.state}
@@ -570,6 +583,10 @@ function LauncherShell({
                 />
               </div>
             </div>
+
+            {snapshot.accounts ? <button className="account-selector" type="button" onClick={() => navigateSurface("accounts")}>
+              <span>{accountsCopy.current}：{currentAccount?.name ?? accountsCopy.empty}</span><span aria-hidden="true">⌄</span>
+            </button> : null}
 
             <nav className="sidebar-nav" aria-label={copy.workspace}>
               <SidebarGroup label={copy.workspace}>
@@ -643,6 +660,9 @@ function LauncherShell({
       </motion.aside>
 
       <section className="workspace">
+        {currentAccount && ["setup", "mcp", "limits", "settings"].includes(surface) ? <div className="account-scope-label" role="status">
+          {accountsCopy.accountScope}：<strong>{currentAccount.name}</strong>
+        </div> : null}
         {approvalTabs.map(tab => (
           <div className="tool-approval-notice" key={tab.id} role="status">
             <Icon name="alert" />
@@ -666,6 +686,9 @@ function LauncherShell({
             key={surface}
             transition={{ duration: 0.16 }}
           >
+            {surface === "accounts" && snapshot.accounts ? <AccountManagement
+              api={api!} accounts={snapshot.accounts} language={language} onSettings={() => navigateSurface("settings")}
+            /> : null}
             {surface === "browser" ? (
               <BrowserSurface
                 browser={browser}
@@ -740,6 +763,7 @@ function LauncherShell({
                 devProfile={devProfile}
                 language={language}
                 onApiAccessModeChange={onApiAccessModeChange}
+                onManageAccounts={() => navigateSurface("accounts")}
                 setError={setError}
                 snapshot={snapshot}
                 updateState={updateState}
@@ -1755,6 +1779,7 @@ function SettingsSurface({
   devProfile,
   language,
   onApiAccessModeChange,
+  onManageAccounts,
   setError,
   snapshot,
   updateState,
@@ -1764,6 +1789,7 @@ function SettingsSurface({
   devProfile: boolean;
   language: Language;
   onApiAccessModeChange: (mode: ApiAccessMode | "invalid") => void;
+  onManageAccounts: () => void;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
@@ -1941,6 +1967,7 @@ function SettingsSurface({
   return (
     <ContentSurface narrow title={devProfile ? copy.devSettingsTitle : copy.settingsTitle}>
       <div hidden={apiUpstreamOpen}>
+        <button className="account-settings-link" type="button" onClick={onManageAccounts}>{accountCopy(language).title} →</button>
         <SectionHeading label={copy.general} />
         <div className="settings-list">
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} flushAfter label={copy.launchAtLogin}>

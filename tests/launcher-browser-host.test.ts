@@ -769,6 +769,36 @@ test("launcher profile checks reject cross-profile browser ownership", async () 
     .rejects.toThrow("belongs to development");
 });
 
+test("launcher descriptors require the active account's exact profile partition", () => {
+  const previousAccount = process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID;
+  const account = "12345678-1234-4123-8123-123456789abc";
+  try {
+    for (const profile of ["production", "development"] as const) {
+      const path = descriptorFile(undefined, profile);
+      const value = JSON.parse(readFileSync(path, "utf8"));
+      const legacyPartition = value.partition;
+      value.partition = `${legacyPartition}-account-${account}`;
+      writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+      process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = account;
+      expect(readLauncherBrowserHostDescriptor(path).partition).toBe(value.partition);
+      process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("unexpected browser partition");
+      process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = "default";
+      expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("unexpected browser partition");
+      value.partition = legacyPartition;
+      writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+      expect(readLauncherBrowserHostDescriptor(path).partition).toBe(legacyPartition);
+      process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = account;
+      expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("unexpected browser partition");
+      process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = "../../other-account";
+      expect(() => readLauncherBrowserHostDescriptor(path)).toThrow();
+    }
+  } finally {
+    if (previousAccount === undefined) delete process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID;
+    else process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = previousAccount;
+  }
+});
+
 function nativeTargetContext(pages: Page[], targetId: (page: Page) => string): BrowserContext {
   return {
     pages: () => pages,

@@ -41,6 +41,8 @@
 
 应用已包含浏览器和运行时，无需另外安装 Chrome、Node 或 Bun。
 
+桌面启动器支持[多个 ChatGPT 账号](docs/multi-account.md)：点击侧边栏当前账号，或进入“设置项 → 账号管理”。账号独立保存登录、模型、MCP 和代理。切换会重启启动器，有任务时会拒绝切换；API 服务地址和服务访问密钥保持不变。
+
 <details>
 <summary><strong>命令行安装、更新与修复</strong></summary>
 

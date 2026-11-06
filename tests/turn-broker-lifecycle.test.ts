@@ -4,7 +4,7 @@ import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions } from "../src/a
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   callTurnBroker,
   closeTurnBrokers,
@@ -12,6 +12,43 @@ import {
   type BrokerToolResult,
 } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
+
+test.skipIf(process.platform === "win32")("long account homes use distinct bindable default broker endpoints", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-long-home-"));
+  const accountRoot = join(root, "应用目录".repeat(12), "accounts");
+  const firstHome = join(accountRoot, "12345678-1234-4123-8123-123456789abc", "core");
+  const secondHome = join(accountRoot, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "core");
+  const endpoints = [defaultBrokerEndpoint(firstHome), defaultBrokerEndpoint(secondHome)];
+  const brokers = endpoints.map(endpoint => TurnBroker.forSocket(endpoint));
+  const sockets = new Set(endpoints);
+  try {
+    expect(Buffer.byteLength(join(firstHome, "runtime", "turn-broker.sock"))).toBeGreaterThan(103);
+    expect(endpoints[0]).not.toBe(endpoints[1]);
+    expect(defaultBrokerEndpoint(firstHome)).toBe(endpoints[0]);
+    for (const endpoint of endpoints) expect(Buffer.byteLength(endpoint)).toBeLessThanOrEqual(103);
+    for (let index = 0; index < brokers.length; index++) {
+      await brokers[index]!.listen();
+      const endpoint = endpoints[index]!;
+      if (fs.lstatSync(endpoint).isSymbolicLink()) sockets.add(resolve(dirname(endpoint), fs.readlinkSync(endpoint)));
+    }
+    for (const endpoint of endpoints) {
+      expect(await callTurnBroker(endpoint, { method: "owner_status" })).toMatchObject({ nativeWaitProtocol: 1 });
+    }
+  } finally {
+    for (const broker of brokers) await broker.close();
+    for (const socket of sockets) rmSync(socket, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("default broker endpoints retain short Unix paths and Windows named pipes", () => {
+  expect(defaultBrokerEndpoint("/tmp/cgw-short", "darwin")).toBe(join("/tmp/cgw-short", "runtime", "turn-broker.sock"));
+  expect(defaultBrokerEndpoint("/tmp/cgw-short", "linux")).toBe(join("/tmp/cgw-short", "runtime", "turn-broker.sock"));
+  const pipe = defaultBrokerEndpoint("/tmp/cgw-short", "win32");
+  expect(isWindowsPipeEndpoint(pipe)).toBe(true);
+  expect(defaultBrokerEndpoint("/tmp/cgw-short", "win32")).toBe(pipe);
+  expect(defaultBrokerEndpoint("/tmp/cgw-other", "win32")).not.toBe(pipe);
+});
 
 test.skipIf(process.platform === "win32")("closing a rejected broker leaves the live socket reachable", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-owner-"));

@@ -23,7 +23,7 @@ type ProxyCopy = {
 const COPY: Record<Language, ProxyCopy> = {
   en: {
     button: "Proxy",
-    title: "Global network proxy",
+    title: "Account network proxy",
     body: "Use one HTTP/HTTPS proxy for the embedded ChatGPT browser and Responses runtime. For authentication, use http://user:password@host:port. MCP Tunnel receives the same proxy environment, but authentication support depends on the Tunnel implementation. Leave the field empty to use the system and inherited process defaults.",
     label: "Proxy URL",
     placeholder: "http://user:password@proxy.example:8080",
@@ -37,7 +37,7 @@ const COPY: Record<Language, ProxyCopy> = {
   },
   "zh-CN": {
     button: "代理",
-    title: "全局网络代理",
+    title: "账号网络代理",
     body: "让内置 ChatGPT 浏览器和 Responses 运行时使用一个 HTTP/HTTPS 代理。认证格式为 http://user:password@host:port。MCP Tunnel 会接收相同的代理环境变量，但是否支持认证取决于 Tunnel 实现。留空则使用系统和进程继承的默认设置。",
     label: "代理 URL",
     placeholder: "http://user:password@proxy.example:8080",
@@ -51,7 +51,7 @@ const COPY: Record<Language, ProxyCopy> = {
   },
   "zh-TW": {
     button: "代理",
-    title: "全域網路代理",
+    title: "帳號網路代理",
     body: "讓內建 ChatGPT 瀏覽器與 Responses 執行環境使用同一個 HTTP/HTTPS 代理。認證格式為 http://user:password@host:port。MCP Tunnel 會接收相同的代理環境變數，但是否支援認證取決於 Tunnel 實作。留空則使用系統與程序繼承的預設設定。",
     label: "代理 URL",
     placeholder: "http://user:password@proxy.example:8080",
@@ -65,7 +65,7 @@ const COPY: Record<Language, ProxyCopy> = {
   },
   ja: {
     button: "Proxy",
-    title: "グローバルネットワークプロキシ",
+    title: "アカウントのネットワークプロキシ",
     body: "組み込み ChatGPT ブラウザと Responses ランタイムで同じ HTTP/HTTPS プロキシを使用します。認証形式は http://user:password@host:port です。MCP Tunnel には同じプロキシ環境変数が渡されますが、認証対応は Tunnel の実装に依存します。空欄にするとシステムおよび継承されたプロセス設定を使用します。",
     label: "プロキシ URL",
     placeholder: "http://user:password@proxy.example:8080",
@@ -79,7 +79,7 @@ const COPY: Record<Language, ProxyCopy> = {
   },
   ko: {
     button: "Proxy",
-    title: "전역 네트워크 프록시",
+    title: "계정 네트워크 프록시",
     body: "내장 ChatGPT 브라우저와 Responses 런타임에 하나의 HTTP/HTTPS 프록시를 사용합니다. 인증 형식은 http://user:password@host:port입니다. MCP Tunnel은 같은 프록시 환경 변수를 받지만, 인증 지원 여부는 Tunnel 구현에 따라 달라집니다. 비워 두면 시스템 및 상속된 프로세스 기본값을 사용합니다.",
     label: "프록시 URL",
     placeholder: "http://user:password@proxy.example:8080",
@@ -94,11 +94,13 @@ const COPY: Record<Language, ProxyCopy> = {
 };
 
 export function NetworkProxySettings({
+  accountName,
   disabled = false,
   onOpenChange,
   state,
   updateState,
 }: {
+  accountName?: string;
   disabled?: boolean;
   onOpenChange: (open: boolean) => void;
   state: LauncherState;
@@ -178,7 +180,7 @@ export function NetworkProxySettings({
             <header>
               <div>
                 <small>{status}</small>
-                <h2 id="network-proxy-title">{copy.title}</h2>
+                <h2 id="network-proxy-title">{copy.title}{accountName ? ` · ${accountName}` : ""}</h2>
               </div>
               <button
                 aria-label={copy.cancel}

@@ -1,26 +1,26 @@
 import { readFileSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, getConfigDir } from "./config";
+import { atomicWriteFile, getApplicationDir } from "./config";
 import { OPENAI_ACCESS, parseApiAccessPolicy, type ApiAccessPolicy } from "./api-access";
 
-export function apiAccessConfigPath(home = getConfigDir()): string {
+export function apiAccessConfigPath(home = getApplicationDir()): string {
   return join(home, "api-access.json");
 }
 
-export function apiKeyReuseMarkerPath(home = getConfigDir()): string {
+export function apiKeyReuseMarkerPath(home = getApplicationDir()): string {
   return join(home, "secrets", "api-client-key-reuse.json");
 }
 
-export function openAiRoutingPendingPath(home = getConfigDir()): string {
+export function openAiRoutingPendingPath(home = getApplicationDir()): string {
   return join(home, "api-access-routing-pending.json");
 }
 
-export function clearOpenAiRoutingPending(home = getConfigDir()): void {
+export function clearOpenAiRoutingPending(home = getApplicationDir()): void {
   rmSync(openAiRoutingPendingPath(home), { force: true });
 }
 
 /** A missing file is the only implicit legacy-mode fallback. Invalid/unreadable files fail closed. */
-export function loadApiAccessPolicy(home = getConfigDir()): ApiAccessPolicy {
+export function loadApiAccessPolicy(home = getApplicationDir()): ApiAccessPolicy {
   const path = apiAccessConfigPath(home);
   let stat: ReturnType<typeof lstatSync>;
   try { stat = lstatSync(path); }
@@ -43,7 +43,7 @@ export function loadApiAccessPolicy(home = getConfigDir()): ApiAccessPolicy {
   return parseApiAccessPolicy(value);
 }
 
-export function saveApiAccessPolicy(policy: ApiAccessPolicy, home = getConfigDir()): void {
+export function saveApiAccessPolicy(policy: ApiAccessPolicy, home = getApplicationDir()): void {
   const validated = parseApiAccessPolicy(policy);
   // CLI/core policy changes cannot prove that a GUI-sealed key still belongs to the current
   // policy history. Remove the GUI-only reuse grant before committing the external change.

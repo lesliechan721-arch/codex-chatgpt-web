@@ -216,6 +216,7 @@ class RuntimeHost {
     runtimeRootProvider,
     browserDescriptorPath,
     coreHome,
+    applicationHome = coreHome,
     codexHome,
     launcherProfile = "production",
     launchAgentsDir,
@@ -235,6 +236,7 @@ class RuntimeHost {
     }
     this.launcherProfile = launcherProfile;
     this.coreHome = coreHome ? resolveUserPath(coreHome) : null;
+    this.applicationHome = applicationHome ? resolveUserPath(applicationHome) : this.coreHome;
     if (launcherProfile === "development" && !this.coreHome) {
       throw new Error("Runtime host DEV profile requires its isolated home");
     }
@@ -495,7 +497,13 @@ class RuntimeHost {
     delete childEnvironment.CODEX_CHATGPT_WEB_HOME;
     delete childEnvironment.CODEX_HOME;
     delete childEnvironment.CODEX_WEB_GPT_LAUNCHER_DATA_DIR;
-    childEnvironment.CODEX_WEB_GPT_DEV_HOME = this.coreHome;
+    const applicationHome = this.applicationHome || this.coreHome;
+    childEnvironment.CODEX_WEB_GPT_DEV_HOME = applicationHome;
+    if (applicationHome !== this.coreHome || environment.CODEX_CHATGPT_WEB_ACCOUNT_ID) {
+      childEnvironment.CODEX_CHATGPT_WEB_APPLICATION_HOME = applicationHome;
+      childEnvironment.CODEX_CHATGPT_WEB_HOME = this.coreHome;
+      childEnvironment.CODEX_HOME = this.codexHome;
+    }
     return childEnvironment;
   }
 
@@ -564,10 +572,11 @@ class RuntimeHost {
     }
     const coreHome = this.supervisor.coreHome
       || path.dirname(this.supervisor.configPath);
+    const applicationHome = this.applicationHome || this.supervisor.applicationHome || coreHome;
     const paths = new Set([
       this.supervisor.configPath,
-      path.join(coreHome, "codex", "integration-journal.json"),
-      path.join(coreHome, "codex", "integration-journal.recovery.json"),
+      path.join(applicationHome, "codex", "integration-journal.json"),
+      path.join(applicationHome, "codex", "integration-journal.recovery.json"),
       path.join(this.codexHome, "config.toml"),
       path.join(this.codexHome, "models_cache.json"),
       path.join(coreHome, "secrets", "tunnel-runtime.key"),
@@ -716,6 +725,7 @@ class RuntimeHost {
         delete environment.CODEX_CHATGPT_WEB_UPSTREAM_API_KEY;
         Object.assign(environment, {
           CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
+          ...(this.applicationHome ? { CODEX_CHATGPT_WEB_APPLICATION_HOME: this.applicationHome } : {}),
           ...(options.env || {}),
         });
         const child = spawn(invocation.executable, invocation.args, {
@@ -904,8 +914,8 @@ class RuntimeHost {
     const evidence = report?.evidence;
     const receiptsComplete = ["ordinary", "compaction"].every((kind) =>
       ["list", "search", "read"].every((method) => evidence?.receipts?.[kind]?.[method] === true));
-    // CLI evidence v2 has already checked both actual v2 text-read transport receipts.
-    if (report?.ok !== true || evidence?.version !== 2 || !receiptsComplete
+    // The CLI has already checked both supported text-read transport receipts.
+    if (report?.ok !== true || evidence?.version !== 4 || !receiptsComplete
       || evidence.binding?.profile !== this.launcherProfile
       || evidence.binding?.mode !== this.getBrowserInteractionMode()
       || evidence.binding?.appName !== this.mcpConnectorName()) {

@@ -45,11 +45,15 @@ const { registerApiAccessIpc } = require("./api-access-ipc.cjs");
 const { registerTaskInputIpc } = require("./task-input-ipc.cjs");
 const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
+const { createAccountStore } = require("./accounts.cjs");
+const { createAccountController, registerAccountIpc } = require("./account-controller.cjs");
+const { listenAccountNotReady } = require("./account-not-ready.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
 const { createUpdateController } = require("./update.cjs");
 const {
   createStateStore,
+  createAccountStateStore,
   nextSessionRefreshReminderAt,
   validateSidebarState,
 } = require("./state.cjs");
@@ -63,8 +67,11 @@ const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
 const SOURCE_ROOT = path.resolve(__dirname, "../..");
 const LAUNCHER_PROFILE = resolveLauncherProfile({ appData: app.getPath("appData") });
 const IS_DEV_PROFILE = LAUNCHER_PROFILE.kind === DEVELOPMENT_PROFILE;
-const CORE_HOME = LAUNCHER_PROFILE.coreHome;
-const BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browser.json");
+const APPLICATION_HOME = LAUNCHER_PROFILE.coreHome;
+let ACCOUNT_CONTEXT = null;
+let CORE_HOME = APPLICATION_HOME;
+let BROWSER_PARTITION = LAUNCHER_PROFILE.browserPartition;
+let BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browser.json");
 const BROWSER_HELPER_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "runtime", "app", "browser-helper.cjs")
   : path.join(SOURCE_ROOT, ".launcher-runtime", "browser-helper.cjs");
@@ -81,6 +88,9 @@ const LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE = "Launcher could not confirm that ma
 const launchEnvironment = {
   CODEX_CHATGPT_WEB_HOME: process.env.CODEX_CHATGPT_WEB_HOME,
   CODEX_HOME: process.env.CODEX_HOME,
+  CODEX_CHATGPT_WEB_APPLICATION_HOME: process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME,
+  CODEX_CHATGPT_WEB_ACCOUNTS_PATH: process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH,
+  CODEX_CHATGPT_WEB_ACCOUNT_ID: process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID,
 };
 process.env.CODEX_CHATGPT_WEB_HOME = CORE_HOME;
 process.env.CODEX_HOME = LAUNCHER_PROFILE.codexHome;
@@ -123,6 +133,128 @@ let catalogVerificationInFlight = false;
 let catalogVerificationGeneration = 0;
 let updateController = null;
 let limitsController = null;
+let accountStore = null;
+let accountController = null;
+let networkProxyController = null;
+let notReadyListener = null;
+let proxyReady = true;
+let proxyStartupError = null;
+
+async function closeNotReadyListener() {
+  const listener = notReadyListener;
+  notReadyListener = null;
+  await listener?.close();
+}
+
+async function ensureNotReadyListener() {
+  if (IS_DEV_PROFILE || notReadyListener || exitCommitted) return;
+  const config = runtimeHost?.runtimeConfigSnapshot().config;
+  if (proxyReady && config && await runtimeSupervisor?.ownedRuntimeReady(config)) return;
+  notReadyListener = await listenAccountNotReady({ applicationHome: APPLICATION_HOME });
+}
+
+function restoreLaunchEnvironment() {
+  for (const [key, value] of Object.entries(launchEnvironment)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+const readOnlyIpcChannels = new Set([
+  "launcher:snapshot", "launcher:limits", "launcher:logs", "launcher:window-state",
+  "launcher:browser-bounds", "launcher:browser-surface-active", "launcher:browser-hide",
+  "launcher:sidebar-state", "launcher:session-reminder-visible", "launcher:session-reminder-language",
+  "launcher:api-access-status",
+]);
+const accountIpc = Object.create(ipcMain);
+accountIpc.handle = (channel, handler) => ipcMain.handle(channel, (...args) => {
+  if (!accountController || readOnlyIpcChannels.has(channel)) return handler(...args);
+  return accountController.runAction(async () => {
+    if (!proxyReady && !["launcher:network-proxy", "launcher:set-language", "launcher:set-preference", "launcher:autostart"].includes(channel)) {
+      throw new Error("The account proxy is not ready. Correct its proxy settings or switch accounts.");
+    }
+    if (channel === "launcher:network-proxy") await closeNotReadyListener();
+    try { return await handler(...args); }
+    finally { if (channel === "launcher:network-proxy") await ensureNotReadyListener(); }
+  });
+});
+
+function trustedAccountSender(event) {
+  const contents = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+  return contents && !contents.isDestroyed() && event.sender === contents
+    && event.senderFrame === contents.mainFrame && rendererNavigationAllowed(event.senderFrame.url);
+}
+
+function initializeAccountController() {
+  const chinese = () => (createStateStore(path.join(launcherUserData, "launcher-state.json")).read().language || "en").startsWith("zh");
+  accountController = createAccountController({
+    store: accountStore,
+    context: ACCOUNT_CONTEXT,
+    getRuntimeHost: () => runtimeHost,
+    getSupervisor: () => runtimeSupervisor,
+    getBrowserHost: () => browserHost,
+    beforeTransition: () => runtimeStartup,
+    publish: value => send("launcher:accounts-changed", value),
+    confirmSwitch: async target => {
+      const account = accountStore.snapshot().accounts.find(item => item.id === target.id);
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: "question", noLink: true, defaultId: 0, cancelId: 0,
+        buttons: chinese() ? ["取消", "切换并重启"] : ["Cancel", "Switch and restart"],
+        message: chinese() ? `切换到“${account.name}”将重启启动器。` : `Switch to “${account.name}” and restart Launcher?`,
+        detail: chinese()
+          ? "活动任务不会被取消。有任务、登录或诊断时会拒绝切换。切换后请重启 Codex，以刷新模型列表。"
+          : "Active tasks will not be cancelled. Tasks, login, or diagnostics block the switch. Restart Codex afterwards to refresh models.",
+      });
+      return result.response === 1;
+    },
+    confirmRemoval: async account => {
+      const result = await dialog.showMessageBox(mainWindow, {
+        type: "warning", noLink: true, defaultId: 0, cancelId: 0,
+        buttons: chinese() ? ["取消", "移除此账号"] : ["Cancel", "Remove account"],
+        message: chinese() ? `移除“${account.name}”？` : `Remove “${account.name}”?`,
+        detail: chinese()
+          ? "将删除该账号的本地登录、设置、账号密钥、代理认证、额度和任务缓存。已续接到其它账号的任务历史仍保留。项目文件、Codex 自身历史和共享 API 服务访问密钥保留。此操作不会注销线上 ChatGPT 账号或撤销线上 Tunnel。最后一个账号会先退出运行环境。"
+          : "Delete this account's local login, settings, account keys, proxy credentials, limits, and task cache. History already continued in another account remains. Project files, Codex history, and the shared service access key remain. This does not delete the online ChatGPT account or revoke its Tunnel. The last account will exit its runtime first.",
+      });
+      return result.response === 1;
+    },
+    clearBrowserStorage: async partition => {
+      const browserSession = session.fromPartition(partition);
+      await browserSession.closeAllConnections();
+      await browserSession.clearAuthCache();
+      await browserSession.clearStorageData();
+      await browserSession.clearCache();
+      browserSession.flushStorageData();
+      await browserSession.cookies.flushStore();
+    },
+    beforeRestart: async () => {
+      stopCatalogVerificationMonitor();
+      await closeNotReadyListener();
+      await networkProxyController?.restoreLaunchEnvironment();
+      restoreLaunchEnvironment();
+    },
+    restoreAfterFailure: async () => {
+      process.env.CODEX_CHATGPT_WEB_HOME = CORE_HOME;
+      process.env.CODEX_HOME = LAUNCHER_PROFILE.codexHome;
+      process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME = APPLICATION_HOME;
+      process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH = path.join(launcherUserData, "accounts.json");
+      if (ACCOUNT_CONTEXT) process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = ACCOUNT_CONTEXT.id;
+      await networkProxyController?.applySaved();
+    },
+    restart: async () => {
+      app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--hidden") });
+      exitCommitted = true;
+      quitting = true;
+      try {
+        browserHost?.destroy();
+        await browserControl?.close();
+      } catch (error) {
+        publishOperation({ name: "account-restart", status: "failed", message: error.message });
+      } finally { app.quit(); }
+    },
+  });
+  registerAccountIpc({ ipcMain, controller: accountController, trusted: trustedAccountSender });
+}
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -205,7 +337,7 @@ function stopCatalogVerificationMonitor() {
 
 function currentApiAccessMode() {
   try {
-    return readPolicyFile(path.join(CORE_HOME, "api-access.json")).policy.mode;
+    return readPolicyFile(path.join(APPLICATION_HOME, "api-access.json")).policy.mode;
   } catch {
     return "invalid";
   }
@@ -337,27 +469,6 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
   catalogVerificationTimer = setInterval(() => { void check(); }, 2_000);
   catalogVerificationTimer.unref?.();
   void check();
-}
-
-async function restoreCodexRouteAfterRuntimeFailure({ logger, stateStore }) {
-  try {
-    const route = await runtimeHost.restoreBridgeRoute("runtime-start-fail-safe");
-    if (!route.installed || route.active) return { restored: false };
-    const state = stateStore.update({
-      codexCatalogVerified: false,
-      codexRestartRequired: true,
-    });
-    send("launcher:state-changed", state);
-    stopCatalogVerificationMonitor();
-    logger.warn("bridge.route_restored_after_runtime_failure", {
-      changed: route.changed === true,
-    });
-    return { restored: true };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error("bridge.route_restore_after_runtime_failure_failed", { message });
-    return { restored: false, error: message };
-  }
 }
 
 function trayImage() {
@@ -727,17 +838,21 @@ function registerIpc({ logger, stateStore }) {
     "launcher:browser-passkey-login", "launcher:browser-logout", "launcher:browser-smoke",
     "launcher:limits-setup", "launcher:update-install", "launcher:complete-onboarding",
   ]);
-  const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, async (...args) => {
+  const handle = (channel, handler) => registerLoggedIpc(accountIpc, logger, channel, async (...args) => {
     if (runtimeChannels.has(channel)) await runtimeStartup;
-    return handler(...args);
+    const changesRuntime = ["launcher:setup-core", "launcher:setup-mcp", "launcher:uninstall-integration"].includes(channel);
+    if (changesRuntime) await closeNotReadyListener();
+    try { return await handler(...args); }
+    finally { if (changesRuntime) await ensureNotReadyListener(); }
   });
   const apiAccessSettings = createApiAccessSettings({
     coreHome: CORE_HOME,
+    applicationHome: APPLICATION_HOME,
     runtimeHost,
     supervisor: runtimeSupervisor,
     browserHost,
     clipboard,
-    resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
+    resolveProxy: url => session.fromPartition(BROWSER_PARTITION).resolveProxy(url),
     getNetworkProxyUrl: () => stateStore.read().networkProxyUrl,
     onModeCommitted: () => handleApiAccessModeCommitted({ logger, stateStore }),
     onModeSettled: () => handleApiAccessModeSettled({ logger, stateStore }),
@@ -767,7 +882,7 @@ function registerIpc({ logger, stateStore }) {
   });
   runtimeSupervisor.setDaemonEnvironmentProvider(() => apiAccessSettings.daemonEnvironment());
   const disposeApiAccessIpc = registerApiAccessIpc({
-    ipcMain,
+    ipcMain: accountIpc,
     controller: apiAccessSettings,
     getWindow: () => mainWindow,
     rendererNavigationAllowed,
@@ -775,7 +890,7 @@ function registerIpc({ logger, stateStore }) {
   });
   app.once("will-quit", disposeApiAccessIpc);
   const disposeTaskInputIpc = registerTaskInputIpc({
-    ipcMain, runtimeHost, clipboard, getWindow: () => mainWindow,
+    ipcMain: accountIpc, runtimeHost, clipboard, getWindow: () => mainWindow,
     rendererNavigationAllowed, beforeAction: () => runtimeStartup,
   });
   app.once("will-quit", disposeTaskInputIpc);
@@ -790,6 +905,7 @@ function registerIpc({ logger, stateStore }) {
     const state = syncZeroRiskSentConfirmationPreference(stateStore, config);
     return {
       profile: LAUNCHER_PROFILE.kind,
+      accounts: accountStore.snapshot(),
       profilePaths: {
         coreHome: CORE_HOME,
         codexHome: LAUNCHER_PROFILE.codexHome,
@@ -1360,6 +1476,7 @@ async function requestQuit() {
   }
   shutdownInProgress = true;
   try {
+    accountController?.assertAvailable();
     const activeOperation = runtimeHost?.currentOperation() || browserHost?.currentOperation();
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
@@ -1376,6 +1493,7 @@ async function requestQuit() {
       }
     }
     stopCatalogVerificationMonitor();
+    await closeNotReadyListener();
     quitting = true;
     await browserHost?.persistSession();
     browserHost?.destroy();
@@ -1394,6 +1512,42 @@ async function requestQuit() {
   }
 }
 
+async function startAccountManagement() {
+  const stateStore = createAccountStateStore({
+    sharedPath: path.join(launcherUserData, "launcher-state.json"), accountPath: null,
+  });
+  const logger = createLogger({ filePath: path.join(app.getPath("logs"), "launcher.jsonl"), publish: record => send("launcher:log", record) });
+  mainWindow = createWindow({ logger, stateStore, windowStatePath: path.join(launcherUserData, "window-state.json"), startHidden: false });
+  initializeAccountController();
+  registerLoggedIpc(ipcMain, logger, "launcher:snapshot", () => ({
+    profile: LAUNCHER_PROFILE.kind,
+    profilePaths: { coreHome: APPLICATION_HOME, codexHome: LAUNCHER_PROFILE.codexHome, userData: launcherUserData },
+    accounts: accountStore.snapshot(), state: stateStore.read(), browser: null,
+    connectorName: "Codex Native5", connectorNames: { automatic: "Codex Native5", manual: "Codex Zero Risk4" },
+    toolAuthority: { effectiveMode: "verified-environment", forced: false, source: null },
+    apiAccessMode: currentApiAccessMode(), mcpCredentialsConfigured: false, logs: logger.recent(),
+    urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
+    platform: process.platform, packaged: app.isPackaged, version: app.getVersion(),
+    smokePassed: false, operation: lastOperation, update: { status: "disabled" },
+  }));
+  ipcMain.handle("launcher:window-state", () => windowStateSnapshot(mainWindow));
+  ipcMain.on("launcher:window-control", (_event, action) => {
+    if (action === "close") void requestQuit();
+    else if (action === "minimize") mainWindow.minimize();
+    else if (action === "zoom") mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+  });
+  createTray(logger, stateStore.read().language);
+  finishRuntimeStartup();
+  await loadRenderer(mainWindow);
+  try { await ensureNotReadyListener(); }
+  catch (error) { publishOperation({ name: "account-service", status: "failed", message: error.message }); }
+  app.on("before-quit", event => {
+    if (exitCommitted) return;
+    event.preventDefault();
+    void requestQuit();
+  });
+}
+
 async function start() {
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
@@ -1402,6 +1556,19 @@ async function start() {
   }
   app.on("second-instance", () => showMainWindow());
   app.on("activate", () => showMainWindow());
+
+  accountStore = createAccountStore({ profile: LAUNCHER_PROFILE });
+  ACCOUNT_CONTEXT = accountStore.context();
+  process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME = APPLICATION_HOME;
+  process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH = path.join(launcherUserData, "accounts.json");
+  if (ACCOUNT_CONTEXT) {
+    CORE_HOME = ACCOUNT_CONTEXT.coreHome;
+    BROWSER_PARTITION = ACCOUNT_CONTEXT.browserPartition;
+    BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browser.json");
+    process.env.CODEX_CHATGPT_WEB_HOME = CORE_HOME;
+    process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = ACCOUNT_CONTEXT.id;
+    app.setAppLogsPath(path.join(launcherUserData, "accounts", ACCOUNT_CONTEXT.id, "logs"));
+  }
 
   await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });
   let installedRuntimeRoot = null;
@@ -1412,7 +1579,7 @@ async function start() {
     if (!runtimeRootResolved || packagedRuntimeWasRemoved) {
       installedRuntimeRoot = ensurePackagedRuntime({
         app,
-        coreHome: CORE_HOME,
+        coreHome: APPLICATION_HOME,
         resourcesPath: process.resourcesPath,
       });
       runtimeRootResolved = true;
@@ -1430,8 +1597,19 @@ async function start() {
 
   await app.whenReady();
 
-  const stateStore = createStateStore(path.join(app.getPath("userData"), "launcher-state.json"));
-  limitsController = new LimitsController(path.join(app.getPath("userData"), "limits.json"), {
+  if (!ACCOUNT_CONTEXT) {
+    await startAccountManagement();
+    return;
+  }
+
+  const stateStore = createAccountStateStore({
+    sharedPath: path.join(launcherUserData, "launcher-state.json"),
+    accountPath: ACCOUNT_CONTEXT.statePath,
+    migrateLegacy: ACCOUNT_CONTEXT.legacy,
+  });
+  if (accountStore.snapshot().pendingId !== null) stateStore.update({ codexRestartRequired: true, codexCatalogVerified: false });
+  initializeAccountController();
+  limitsController = new LimitsController(ACCOUNT_CONTEXT.limitsPath, {
     getInteractionMode: () => stateStore.read().browserInteractionMode,
   });
   if (IS_DEV_PROFILE && !stateStore.read().onboardingComplete) {
@@ -1463,6 +1641,7 @@ async function start() {
     filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
     publish: (record) => send("launcher:log", record),
   });
+  logger.info("launcher.account_loaded", { accountId: ACCOUNT_CONTEXT.id, profile: LAUNCHER_PROFILE.kind });
   const exitForUnsafeProxyAuthenticationState = () => handleUnsafeProxyAuthenticationState({
     appApi: app,
     browserControlInstance: browserControl,
@@ -1479,15 +1658,23 @@ async function start() {
     stopBackgroundWork: stopCatalogVerificationMonitor,
     showWindow: showMainWindow,
   });
-  const networkProxyController = createNetworkProxyController({
-    browserPartition: LAUNCHER_PROFILE.browserPartition,
+  networkProxyController = createNetworkProxyController({
+    browserPartition: BROWSER_PARTITION,
     fatal: exitForUnsafeProxyAuthenticationState,
     getBrowserHost: () => browserHost,
     getRuntimeHost: () => runtimeHost,
     getRuntimeSupervisor: () => runtimeSupervisor,
     logger,
-    publishState: (state) => send("launcher:state-changed", state),
+    publishState: (state) => {
+      const recoveringProxy = !proxyReady;
+      proxyReady = true;
+      proxyStartupError = null;
+      if (recoveringProxy) browserHost?.resumeAccountAdmission();
+      send("launcher:state-changed", state);
+    },
     stateStore,
+    ipc: accountIpc,
+    beforeMutation: () => accountController.assertAvailable(),
   });
   app.on("login", (event, webContents, authenticationResponseDetails, authInfo, callback) => {
     handleNetworkProxyLogin(
@@ -1499,7 +1686,12 @@ async function start() {
       callback,
     );
   });
-  await networkProxyController.applySaved();
+  try { await networkProxyController.applySaved(); }
+  catch (error) {
+    if (networkProxyFatalExit) throw error;
+    proxyReady = false;
+    proxyStartupError = "The account proxy could not be applied. Correct the proxy settings or switch accounts.";
+  }
   app.on("child-process-gone", (_event, details) => {
     logger.warn("launcher.child_process_gone", {
       type: details.type, reason: details.reason, exitCode: details.exitCode,
@@ -1521,7 +1713,7 @@ async function start() {
       syncBrowserPreferences(stateStore, config);
       return syncZeroRiskSentConfirmationPreference(stateStore, config);
     },
-    resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
+    resolveProxy: url => session.fromPartition(BROWSER_PARTITION).resolveProxy(url),
     limits: limitsController,
   }).start();
   runtimeSupervisor = new RuntimeSupervisor({
@@ -1531,9 +1723,10 @@ async function start() {
     installedRuntimeRoot,
     runtimeRootProvider,
     coreHome: CORE_HOME,
+    applicationHome: APPLICATION_HOME,
     browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
     launcherProfile: LAUNCHER_PROFILE.kind,
-    resolveProxy: url => session.fromPartition(LAUNCHER_PROFILE.browserPartition).resolveProxy(url),
+    resolveProxy: url => session.fromPartition(BROWSER_PARTITION).resolveProxy(url),
     publishOperation,
     onConfigRead: config => {
       // Setup may read an intermediate config before rollback. The setting IPC commits
@@ -1549,6 +1742,7 @@ async function start() {
     runtimeRootProvider,
     browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
     coreHome: CORE_HOME,
+    applicationHome: APPLICATION_HOME,
     codexHome: LAUNCHER_PROFILE.codexHome,
     launcherProfile: LAUNCHER_PROFILE.kind,
     publishOperation,
@@ -1570,14 +1764,33 @@ async function start() {
     helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
     logger,
     loginWithPasskey: onProgress => runtimeHost.capturePasskeyLogin(onProgress),
-    partition: LAUNCHER_PROFILE.browserPartition,
+    partition: BROWSER_PARTITION,
     profile: LAUNCHER_PROFILE.kind,
-    publishState: (state) => send("launcher:browser-state", state),
+    accountContext: ACCOUNT_CONTEXT,
+    verifyAccountIdentity: identity => {
+      const result = accountStore.recordIdentity(ACCOUNT_CONTEXT.id, identity);
+      send("launcher:accounts-changed", accountStore.snapshot());
+      return result;
+    },
+    publishState: (state) => {
+      send("launcher:browser-state", state);
+      if (!["ready", "signed-out", "error"].includes(state.status)) return;
+      const previous = accountStore.snapshot().accounts.find(item => item.id === ACCOUNT_CONTEXT.id)?.lastLogin;
+      const status = state.authenticated ? "signed-in" : state.status === "error" ? "error" : "signed-out";
+      if (previous?.status !== status) {
+        accountStore.recordLogin(ACCOUNT_CONTEXT.id, { authenticated: state.authenticated, status: state.status });
+        send("launcher:accounts-changed", accountStore.snapshot());
+      }
+    },
     showWindow: showMainWindow,
     getUseTemporaryChats: () => stateStore.read().useTemporaryChats,
     getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
   });
   await browserHost.ready();
+  if (!proxyReady) {
+    browserHost.closeAccountAdmission();
+    browserHost.setState({ status: "error", authenticated: false, message: proxyStartupError });
+  }
   const updaterRuntimeRoot = runtimeRootProvider();
   updateController = createUpdateController({
     currentVersion: app.getVersion(),
@@ -1593,10 +1806,11 @@ async function start() {
     logger,
   });
   registerIpc({ logger, stateStore });
+  accountStore.commitLoaded(ACCOUNT_CONTEXT.id);
   const trayAvailable = createTray(logger, stateStore.read().language);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
-  if (!launcherSmokeTest && stateStore.read().browserInteractionMode === "automatic") {
+  if (!launcherSmokeTest && proxyReady && stateStore.read().browserInteractionMode === "automatic") {
     void browserHost.refreshAuthentication().catch((error) => {
       logger.warn("browser.session_refresh_failed", {
         ...navigationErrorForLog(error),
@@ -1604,6 +1818,18 @@ async function start() {
     });
   }
   await loadRenderer(mainWindow);
+  send("launcher:accounts-changed", accountStore.snapshot());
+  if (!proxyReady) {
+    finishRuntimeStartup();
+    publishOperation({ name: "network-proxy", status: "failed", message: proxyStartupError });
+    await ensureNotReadyListener();
+    app.on("before-quit", event => {
+      if (exitCommitted) return;
+      event.preventDefault();
+      void requestQuit();
+    });
+    return;
+  }
   if (!launcherSmokeTest) void updateController.checkOnce();
   if (launcherSmokeTest) {
     const smokeRuntimeRoot = runtimeRootProvider();
@@ -1752,7 +1978,7 @@ async function start() {
     if (runtime.status !== "ready") return runtime;
     // API-key clients use an explicitly exported provider. Do not reconnect the legacy OpenAI
     // route on Launcher startup or overwrite the user's independently chosen client routing.
-    if (readPolicyFile(path.join(CORE_HOME, "api-access.json")).policy.mode === "api-key") return runtime;
+    if (readPolicyFile(path.join(APPLICATION_HOME, "api-access.json")).policy.mode === "api-key") return runtime;
     const route = await runtimeHost.connectBridgeRoute({ recoveryOnly: true });
     return { ...runtime, bridgeRouteChanged: route.changed === true };
   })().then(async (runtime) => {
@@ -1784,7 +2010,8 @@ async function start() {
       return;
     }
     if (runtime.status === "not-configured") {
-      const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+      // The endpoint and Codex integration belong to the application. An empty account
+      // keeps that route and serves account_not_ready until its own setup is complete.
       const current = stateStore.read();
       if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
         const state = stateStore.update({
@@ -1796,16 +2023,8 @@ async function start() {
         });
         send("launcher:state-changed", state);
       }
-      if (routeRecovery.error) {
-        publishOperation({
-          name: "runtime-start",
-          status: "failed",
-          message: `Local runtime is not configured; restoring the previous Codex route also failed: ${routeRecovery.error}`,
-        });
-      }
       return;
     }
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     if (runtime.status === "external" || runtime.status === "needs-setup") {
@@ -1817,26 +2036,20 @@ async function start() {
       publishOperation({
         name: "runtime-start",
         status: "failed",
-        message: routeRecovery.error
-          ? `${detail}; restoring the previous Codex route also failed: ${routeRecovery.error}`
-          : routeRecovery.restored
-            ? `${detail}; the previous Codex route was restored, restart Codex once`
-            : detail,
+        message: detail,
       });
     }
   }).catch(async (error) => {
-    const primary = error instanceof Error ? error.message : String(error);
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
-    const message = routeRecovery.error
-      ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
-      : routeRecovery.restored
-        ? `${primary}; the previous Codex route was restored, restart Codex once`
-        : primary;
+    const message = error instanceof Error ? error.message : String(error);
     logger.error("runtime.startup_failed", { message });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     publishOperation({ name: "runtime-start", status: "failed", message });
-  }).finally(finishRuntimeStartup);
+  }).finally(async () => {
+    finishRuntimeStartup();
+    try { await ensureNotReadyListener(); }
+    catch (error) { publishOperation({ name: "account-service", status: "failed", message: error.message }); }
+  });
 
   app.on("before-quit", (event) => {
     if (exitCommitted) return;
@@ -1864,6 +2077,19 @@ void start().catch(async (error) => {
     try { browserHost?.destroy(); } catch (caught) { cleanupErrors.push(String(caught)); }
     try { await browserControl?.close(); } catch (caught) { cleanupErrors.push(String(caught)); }
     if (process.argv.includes("--launcher-smoke-test")) return;
+    const accounts = accountStore?.snapshot();
+    if (accounts && (accounts.pendingId !== null || accounts.currentId !== null) && cleanupErrors.length === 0) {
+      // One recovery attempt returns to the last loaded account. A second failure opens management.
+      if (runtimeSupervisor) {
+        const stopped = await runtimeSupervisor.stopForAccountSwitch();
+        if (stopped.status !== "stopped") throw new Error(LAUNCHER_SHUTDOWN_INCOMPLETE_MESSAGE);
+      }
+      accountStore.failPending(message);
+      await networkProxyController?.restoreLaunchEnvironment();
+      restoreLaunchEnvironment();
+      app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--hidden") });
+      return;
+    }
     await app.whenReady();
     quitting = true;
     showMainWindow();
@@ -1885,10 +2111,8 @@ void start().catch(async (error) => {
     if (result.response === 0) {
       // Internal child commands use the resolved profile. A fresh launcher must instead
       // resolve the original launch environment, especially for the isolated DEV profile.
-      for (const [key, value] of Object.entries(launchEnvironment)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
+      await networkProxyController?.restoreLaunchEnvironment();
+      restoreLaunchEnvironment();
       app.relaunch({ args: process.argv.slice(1).filter(argument => argument !== "--hidden") });
     }
   } finally {

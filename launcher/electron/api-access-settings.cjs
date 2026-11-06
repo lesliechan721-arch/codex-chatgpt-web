@@ -43,10 +43,10 @@ class ApiAccessSettingsError extends Error {
 const fail = code => { throw new ApiAccessSettingsError(code); };
 
 function clientBaseUrl(config, environment = process.env) {
-  if (!config) return null;
   const configured = environment[PUBLIC_BASE_URL_ENV]?.trim();
   if (!configured) {
     const rawClientPort = environment[CLIENT_PORT_ENV]?.trim();
+    if (!rawClientPort && !config) return null;
     const clientPort = rawClientPort ? Number(rawClientPort) : config.port;
     if (!Number.isSafeInteger(clientPort) || clientPort <= 0 || clientPort > 65_535) {
       return fail("invalid-policy");
@@ -122,19 +122,21 @@ function validateChange(input) {
 
 /** Main-process only. Persist user intent first; runtime availability is not a save precondition. */
 function createApiAccessSettings({
-  coreHome, runtimeHost, supervisor, browserHost,
+  coreHome, applicationHome = coreHome, runtimeHost, supervisor, browserHost,
   clipboard, setTimer = setTimeout, clearTimer = clearTimeout, safeStorage,
   resolveProxy, getNetworkProxyUrl, onModeCommitted, onModeSettled,
 }) {
   if (safeStorage === undefined) {
     try { safeStorage = require("electron").safeStorage; } catch { /* Node tests / headless host. */ }
   }
-  const vault = createApiKeyVault({ coreHome, safeStorage });
+  const vault = createApiKeyVault({ coreHome: applicationHome, safeStorage });
   const upstreamVault = createUpstreamApiKeyVault({ coreHome, safeStorage });
-  const filePath = path.join(coreHome, "api-access.json");
+  const filePath = path.join(applicationHome, "api-access.json");
   const upstreamFilePath = path.join(coreHome, "upstream-provider.json");
-  const routingPendingPath = path.join(coreHome, "api-access-routing-pending.json");
+  const routingPendingPath = path.join(applicationHome, "api-access-routing-pending.json");
   const modelCatalogPendingPath = path.join(coreHome, "api-key-models-refresh-pending.json");
+  // Refresh intent belongs to the account. The shared output requires one cross-account lock.
+  const modelCatalogCommandPath = path.join(applicationHome, "api-key-models-refresh-pending.json");
   const revisionSecret = randomBytes(32);
   let clipboardSecret = null;
   let clipboardTimer = null;
@@ -145,6 +147,19 @@ function createApiAccessSettings({
   let cleanupPending = false;
   let routingPending = false;
   let lastUpstreamDiscovery = null;
+  function clientConnectionConfig(config) {
+    const endpointPath = path.join(applicationHome, "service-endpoint.json");
+    let stat;
+    try { stat = fs.lstatSync(endpointPath); }
+    catch (error) { if (error.code === "ENOENT") return config; return fail("invalid-policy"); }
+    try {
+      const endpoint = stat.isFile() && stat.size <= 512 ? JSON.parse(fs.readFileSync(endpointPath, "utf8")) : null;
+      if (!endpoint || endpoint.version !== 1
+        || Object.keys(endpoint).some(key => key !== "version" && key !== "port")
+        || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65_535) return fail("invalid-policy");
+      return { port: endpoint.port };
+    } catch { return fail("invalid-policy"); }
+  }
   const upstreamSnapshotForPolicy = policy => {
     let snapshot;
     try { snapshot = readUpstreamConfig(upstreamFilePath); }
@@ -279,7 +294,7 @@ function createApiAccessSettings({
         : !health ? "stopped"
           : matches && upstreamApplied && health.accepting_turns === true
             ? "in-sync" : "restart-required",
-      baseUrl: clientBaseUrl(config),
+      baseUrl: clientBaseUrl(clientConnectionConfig(config)),
       modelCatalogState: modelCatalogMarker === "export-required"
         ? "export-required"
         : modelCatalogMarker === "pending"
@@ -315,8 +330,8 @@ function createApiAccessSettings({
       routingPending: saved.policy.mode === "openai"
         && (routingPending || fs.existsSync(routingPendingPath)),
       cleanupPending: !manualCodexConfig && saved.policy.mode === "api-key" && (cleanupPending
-        || fs.existsSync(path.join(coreHome, "codex", "integration-journal.json"))
-        || fs.existsSync(path.join(coreHome, "codex", "integration-journal.recovery.json"))),
+        || fs.existsSync(path.join(applicationHome, "codex", "integration-journal.json"))
+        || fs.existsSync(path.join(applicationHome, "codex", "integration-journal.recovery.json"))),
     };
   }
   function assertUnchanged(revision) {
@@ -620,7 +635,7 @@ function createApiAccessSettings({
     modelCatalogRefreshFailed = false;
   }
   async function withModelCatalogCommandLock(action) {
-    const release = await acquireModelCatalogCommandLock(modelCatalogPendingPath);
+    const release = await acquireModelCatalogCommandLock(modelCatalogCommandPath);
     try { return await action(); }
     finally { release(); }
   }

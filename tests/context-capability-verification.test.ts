@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import { defaultBrokerEndpoint, defaultConfig, getContextCapabilityEvidencePath, providerConfig, ZERO_RISK_CHATGPT_CONNECTOR_NAME } from "../src/config";
 import { CONTEXT_CAPABILITY_VERIFICATION_VERSION, assertContextCapabilityVerified, contextCapabilitySchemaDigest, invalidateContextCapabilityEvidence,
   contextCapabilityReceiptsComplete, contextCapabilityDiagnosticReceiptsComplete,
@@ -132,6 +133,15 @@ describe("context capability evidence", () => {
       for (const item of receipt.items) expect(json).not.toContain(item.read_ref);
     }
     if (process.platform !== "win32") expect(statSync(getContextCapabilityEvidencePath(f.home)).mode & 0o777).toBe(0o600);
+    const { RuntimeHost } = createRequire(import.meta.url)("../launcher/electron/runtime.cjs");
+    const host = new RuntimeHost({
+      app: { getPath: () => f.home, getVersion: () => "fixture" },
+      logger: { info() {}, warn() {}, error() {} }, sourceRoot: process.cwd(), coreHome: f.home,
+      supervisor: { readConfig: () => f.config, readSetupConfig: () => f.config },
+    });
+    host.launcherControlEnvironment = () => ({});
+    host.run = async () => ({ stdout: JSON.stringify({ ok: true, evidence: saved }) });
+    expect(await host.verifyContextCapability()).toEqual({ ok: true, evidence: saved });
   });
   test("loading rejects sensitive or malformed diagnostic fields and saving does not retain unsafe modes", () => {
     const f = fixture(), schema = contextCapabilitySchemaDigest(tools(), "automatic"), fullReceipts = receipts();

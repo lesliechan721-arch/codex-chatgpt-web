@@ -1,10 +1,15 @@
 const languages = require("./languages.json");
 const fs = require("node:fs");
+const path = require("node:path");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const { normalizeNetworkProxyUrl } = require("./network-proxy-config.cjs");
 const SIDEBAR_MIN_WIDTH = 240;
 const SIDEBAR_MAX_WIDTH = 420;
 const SESSION_REFRESH_REMINDER_INTERVAL_MS = 48 * 60 * 60 * 1000;
+const SHARED_STATE_KEYS = new Set([
+  "language", "onboardingComplete", "githubOpened", "xOpened", "autoStart",
+  "keepRunningOnClose", "showBrowserDuringTurns", "sidebarOpen", "sidebarWidth",
+]);
 
 const DEFAULT_STATE = Object.freeze({
   version: 1,
@@ -38,10 +43,16 @@ function nextSessionRefreshReminderAt(now = Date.now()) {
   return new Date(now + SESSION_REFRESH_REMINDER_INTERVAL_MS).toISOString();
 }
 
-function readState(filePath) {
+function readStateData(filePath) {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
-    if (!parsed || parsed.version !== 1) return { ...DEFAULT_STATE };
+    return parsed && !Array.isArray(parsed) && parsed.version === 1 ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeState(parsed) {
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
     delete state.experimentalBiggerContext;
@@ -111,9 +122,10 @@ function readState(filePath) {
       if (state[key] !== undefined && typeof state[key] !== "boolean") delete state[key];
     }
     return state;
-  } catch {
-    return { ...DEFAULT_STATE };
-  }
+}
+
+function readState(filePath) {
+  return normalizeState(readStateData(filePath));
 }
 
 function writeState(filePath, state) {
@@ -148,10 +160,75 @@ function createStateStore(filePath) {
   };
 }
 
+function splitState(state, shared) {
+  return Object.fromEntries(Object.entries(state).filter(([key]) => key === "version" || SHARED_STATE_KEYS.has(key) === shared));
+}
+
+function assertStatePath(root, filePath) {
+  const relative = path.relative(root, filePath);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Account state path must remain inside launcher userData");
+  }
+  let current = root;
+  for (const component of ["", ...relative.split(path.sep)]) {
+    if (component) current = path.join(current, component);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error("Launcher state path must not use symbolic links");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function createAccountStateStore({ sharedPath, accountPath, migrateLegacy = false }) {
+  if (typeof sharedPath !== "string" || !path.isAbsolute(sharedPath)
+    || (accountPath !== null && (typeof accountPath !== "string" || !path.isAbsolute(accountPath)))) {
+    throw new Error("Account state requires absolute storage paths");
+  }
+  const root = path.dirname(sharedPath);
+  const validatePaths = () => {
+    assertStatePath(root, sharedPath);
+    if (accountPath !== null) assertStatePath(root, accountPath);
+    if (accountPath === sharedPath) throw new Error("Shared and account state must use separate files");
+  };
+  validatePaths();
+  const shared = readState(sharedPath);
+  if (accountPath !== null && !fs.existsSync(accountPath)) {
+    writeState(accountPath, splitState(migrateLegacy ? shared : { ...DEFAULT_STATE }, false));
+  }
+  // Copy the legacy account settings before removing them from the shared file.
+  writeState(sharedPath, splitState(shared, true));
+  const read = () => {
+    validatePaths();
+    return normalizeState({
+      ...(accountPath === null ? {} : splitState(readStateData(accountPath), false)),
+      ...splitState(readState(sharedPath), true),
+      version: 1,
+    });
+  };
+  return {
+    read() { return structuredClone(read()); },
+    update(patch) {
+      validatePaths();
+      if (accountPath === null && Object.keys(patch).some(key => key !== "version" && !SHARED_STATE_KEYS.has(key))) {
+        throw new Error("No account is selected for account settings");
+      }
+      const next = { ...read(), ...patch, version: 1 };
+      delete next.experimentalBiggerContext;
+      delete next.biggerContextAvailable;
+      delete next.useSavedChats;
+      if (accountPath !== null) writeState(accountPath, splitState(next, false));
+      writeState(sharedPath, splitState(next, true));
+      return structuredClone(next);
+    },
+  };
+}
+
 module.exports = {
   SESSION_REFRESH_REMINDER_INTERVAL_MS,
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
+  createAccountStateStore,
   createStateStore,
   nextSessionRefreshReminderAt,
   validateSidebarState,

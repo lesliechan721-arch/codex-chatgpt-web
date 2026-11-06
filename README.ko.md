@@ -41,6 +41,8 @@ Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미�
 
 브라우저와 런타임이 앱에 포함되어 있습니다. Chrome, Node, Bun을 따로 설치할 필요가 없습니다.
 
+데스크톱 런처는 [여러 ChatGPT 계정](docs/multi-account.md)을 지원합니다. 사이드바의 현재 계정 또는 설정 → 계정 관리를 엽니다. 로그인, 모델, MCP, 프록시 설정은 계정별로 저장됩니다. 전환하면 런처가 다시 시작되며 작업 중에는 전환할 수 없습니다. API 주소와 서비스 액세스 키는 그대로 유지됩니다.
+
 <details>
 <summary><strong>터미널 설치, 업데이트 및 복구</strong></summary>
 

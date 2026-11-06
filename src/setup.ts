@@ -11,6 +11,7 @@ import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
   defaultConfig,
+  getApplicationPort,
   getConfigPath,
   loadConfigForSetup,
   resolveInteractionConnectorIdentities,
@@ -300,6 +301,11 @@ function baseConfig(
     if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65_535) throw new Error("--port must be an integer from 1 to 65535");
     config.port = options.port;
   }
+  const applicationPort = getApplicationPort(config.port);
+  if (options.port !== undefined && options.port !== applicationPort) {
+    throw new Error("Setup must use the established application service port");
+  }
+  config.port = applicationPort;
   if (options.chromeExecutablePath) config.chromeExecutablePath = options.chromeExecutablePath;
   if (options.browserHostDescriptorPath) {
     config.browserHost = "launcher";

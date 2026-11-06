@@ -77,6 +77,11 @@
       "reason": "process.platform === win32：Unix socket 路径、权限和 listener 生命周期检查。"
     },
     {
+      "file": "tests/turn-broker-lifecycle.test.ts",
+      "name": "long account homes use distinct bindable default broker endpoints",
+      "reason": "process.platform === win32：验证 Unix socket 路径字节长度限制及真实绑定；Windows 使用命名管道。"
+    },
+    {
       "file": "tests/turn-broker-unix.test.ts",
       "name": "binding a used Unix path preserves its listener and reports the native errno",
       "reason": "process.platform === win32：Unix fd 接管、私有权限、close-on-exec 及 native errno 检查。"

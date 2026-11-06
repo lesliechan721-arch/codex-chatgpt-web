@@ -7,6 +7,12 @@ function subscription(channel, listener) {
 }
 
 contextBridge.exposeInMainWorld("codexWebLauncher", {
+  accounts: () => ipcRenderer.invoke("launcher:accounts"),
+  addAccount: input => ipcRenderer.invoke("launcher:account-add", input),
+  renameAccount: (id, name) => ipcRenderer.invoke("launcher:account-rename", id, name),
+  switchAccount: id => ipcRenderer.invoke("launcher:account-switch", id),
+  removeAccount: id => ipcRenderer.invoke("launcher:account-remove", id),
+  onAccountsChanged: listener => subscription("launcher:accounts-changed", listener),
   taskInputs: (request) => ipcRenderer.invoke("launcher:task-input", request),
   apiAccessStatus: () => ipcRenderer.invoke("launcher:api-access-status"),
   apiAccessReveal: () => ipcRenderer.invoke("launcher:api-access-reveal"),

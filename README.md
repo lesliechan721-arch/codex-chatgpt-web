@@ -41,6 +41,8 @@ Full harness mode connects ChatGPT to the current task’s files, terminal, tool
 
 The app includes its browser and runtime. No separate Chrome, Node, or Bun installation is needed.
 
+The desktop launcher supports [multiple ChatGPT accounts](docs/multi-account.md). Open the current account in the sidebar or go to Settings → Accounts. Login, models, MCP and proxy settings are separate. Switching restarts Launcher and is blocked during tasks; the API address and service access key stay the same.
+
 <details>
 <summary><strong>Terminal install, updates & repair</strong></summary>
 

@@ -13,6 +13,15 @@ const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "prelo
 const networkProxySettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "NetworkProxySettings.tsx"), "utf8");
 const { connectorSetupStatePatch, MCP_SETUP_CONTRACT } = require("../electron/connector-identity.cjs");
 const apiAccessSettingsSource = fs.readFileSync(path.join(launcherRoot, "src", "ApiAccessSettings.tsx"), "utf8");
+const accountComponents = { exports: {} };
+require("node:vm").runInNewContext(require("typescript").transpileModule(
+  fs.readFileSync(path.join(launcherRoot, "src", "AccountManagement.tsx"), "utf8"), {
+    fileName: "AccountManagement.tsx", compilerOptions: {
+      target: require("typescript").ScriptTarget.ES2022, module: require("typescript").ModuleKind.CommonJS,
+      jsx: require("typescript").JsxEmit.ReactJSX,
+    },
+  },
+).outputText, { exports: accountComponents.exports, require: name => name.endsWith(".css") ? {} : require(name) });
 
 // Use real React hooks and DOM events; only the native host and layout APIs are fixtures.
 async function withRendererDom(run) {
@@ -56,6 +65,7 @@ test("browser preferences waits for startup and route recovery without invalidat
     let startupSettled = false;
     const calls = [];
     const handlers = new Map();
+    const accountIpc = {};
     const config = { mode: "full", composerPredictionsEnabled: false };
     const state = { coreSetupComplete: true, codexCatalogVerified: true };
     const stateStore = { read: () => state, update: patch => Object.assign(state, patch) };
@@ -64,7 +74,11 @@ test("browser preferences waits for startup and route recovery without invalidat
       runtimeStartup, finishRuntimeStartup: () => { startupSettled = true; finishRuntimeStartup(); },
       startupAuthenticationRefresh, logger, stateStore, IS_DEV_PROFILE: false, connectorSetupStatePatch,
       SessionReminderView: class {}, mainWindow: {}, loadRenderer() {},
-      ipcMain: { on() {} }, registerLoggedIpc: (_ipc, _logger, channel, handler) => handlers.set(channel, handler),
+      ipcMain: { on() {} }, accountIpc,
+      registerLoggedIpc: (ipc, _logger, channel, handler) => {
+        assert.equal(ipc, accountIpc);
+        handlers.set(channel, handler);
+      },
       send() {}, publishOperation() {}, startCatalogVerificationMonitor() {},
       releaseRetainedConversation() {},
       restoreCodexRouteAfterRuntimeFailure: async () => { calls.push("recovery"); return {}; },
@@ -79,7 +93,9 @@ test("browser preferences waits for startup and route recovery without invalidat
           return { status: "ready" };
         },
       },
-      CORE_HOME: "/tmp/codex-home", browserHost: { turnTabs: new Map(), currentOperation: () => null }, clipboard: {}, path,
+      CORE_HOME: "/tmp/codex-home", APPLICATION_HOME: "/tmp/codex-home", BROWSER_PARTITION: "persist:codex-web-gpt-chatgpt",
+      closeNotReadyListener: async () => {}, ensureNotReadyListener: async () => {},
+      browserHost: { turnTabs: new Map(), currentOperation: () => null }, clipboard: {}, path,
       readPolicyFile: () => ({ policy: { mode: "openai" } }),
       createApiAccessSettings: () => ({ daemonEnvironment: () => ({}) }),
       registerApiAccessIpc: () => () => {}, rendererNavigationAllowed: () => true,
@@ -109,7 +125,7 @@ test("browser preferences waits for startup and route recovery without invalidat
     assert.deepEqual(calls, ["upgrade", "startup"]);
     completeRuntime();
     await setting;
-    assert.deepEqual(calls, fails ? ["upgrade", "startup", "recovery", "setting"] : ["upgrade", "startup", "route", "setting"]);
+    assert.deepEqual(calls, fails ? ["upgrade", "startup", "setting"] : ["upgrade", "startup", "route", "setting"]);
     assert.equal(state.composerPredictionsEnabled, true);
     assert.equal(state.coreSetupComplete, !fails, "only a real startup failure may invalidate setup");
   }
@@ -130,7 +146,7 @@ test("embedded ChatGPT reports mounted bounds after activation and cancels measu
     const source = appSource.slice(appSource.indexOf("function requiresCodexCatalog("), appSource.indexOf("export function App("))
       + appSource.slice(appSource.indexOf("function LauncherShell("), appSource.indexOf("function TitleBar("))
       + appSource.slice(appSource.indexOf("function BrowserSurface("), appSource.indexOf("function ManualTurnGuide("));
-    const scope = { api, COMPACT_SIDEBAR_QUERY: "fixture", useLimits: () => ({}), limitsCopyFor: () => ({}),
+    const scope = { ...accountComponents.exports, api, COMPACT_SIDEBAR_QUERY: "fixture", useLimits: () => ({}), limitsCopyFor: () => ({}),
       messageOf: String, formatBrowserAddress: value => value ?? "", AnimatePresence: passthrough,
       motion: Object.fromEntries(["main", "aside", "div"].map(tag => [tag, ({ children, className }) => React.createElement(tag, { className }, children)])),
       requestAnimationFrame: callback => { frames.set(++nextFrame, callback); return nextFrame; },
@@ -399,6 +415,8 @@ test("fatal partial shutdown stays supervised and a later partial quit does not 
     quitting: false,
     runtimeHost: { currentOperation: () => null },
     runtimeSupervisor,
+    accountController: { assertAvailable() {} },
+    closeNotReadyListener: async () => {},
     showMainWindow: () => events.push("window-shown"),
     shutdownInProgress: false,
     stopCatalogVerificationMonitor: () => events.push("background-stopped"),
@@ -446,8 +464,8 @@ test("proxy settings render the selected language and authentication guidance", 
   await withRendererDom(async ({ React, window, compile, render }) => {
     window.codexWebLauncher = {};
     const Settings = compile(networkProxySettingsSource, "NetworkProxySettings");
-    for (const [language, title] of Object.entries({ en: "Global network proxy", "zh-CN": "全局网络代理",
-      "zh-TW": "全域網路代理", ja: "グローバルネットワークプロキシ", ko: "전역 네트워크 프록시" })) {
+    for (const [language, title] of Object.entries({ en: "Account network proxy", "zh-CN": "账号网络代理",
+      "zh-TW": "帳號網路代理", ja: "アカウントのネットワークプロキシ", ko: "계정 네트워크 프록시" })) {
       await render(React.createElement(Settings, { key: language, state: { language }, onOpenChange() {}, updateState() {} }));
       await React.act(async () => window.document.querySelector(".network-proxy-launcher")
         .click());
@@ -562,9 +580,10 @@ test("setup preserves session-check failures and never installs without verified
   }
 });
 
-test("startup failure stays visible on another launch and Retry exits the failed instance", async () => {
+test("startup failure before account resolution stays visible on another launch and Retry exits the failed instance", async () => {
   const vm = require("node:vm");
   const source = electronMain.slice(electronMain.indexOf("function showMainWindow()"), electronMain.indexOf("async function openWebUrl"))
+    + electronMain.slice(electronMain.indexOf("function restoreLaunchEnvironment()"), electronMain.indexOf("const readOnlyIpcChannels"))
     + electronMain.slice(electronMain.indexOf("void start().catch("));
   const events = [];
   let visible = false;
@@ -579,7 +598,8 @@ test("startup failure stays visible on another launch and Retry exits the failed
     startupFailed: false, quitting: false,
     browserHost: { destroy: () => events.push("destroy") },
     browserControl: { close: async () => events.push("control closed") },
-    start: async () => { throw new Error("Browser idle document did not commit within 10000ms"); },
+    start: async () => { throw new Error("Account registry could not load"); },
+    accountStore: null, ACCOUNT_CONTEXT: null, networkProxyController: null,
     app: { getPath: () => "/unused", whenReady: async () => {},
       relaunch: options => events.push(["relaunch", options.args]), exit: code => events.push(["exit", code]) },
     fs: { appendFileSync() {} }, path,
@@ -1409,6 +1429,8 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
     GITHUB_URL: "", X_URL: "", CONNECTORS_URL: "", TUNNELS_URL: "", KEYS_URL: "",
     process: { platform: "darwin" }, app: { isPackaged: false, getVersion: () => "test" },
     smokePassedThisSession: false, smokePassedForCurrentVersion: () => false, lastOperation: null, updateController: null,
+    accountStore: { snapshot: () => ({ version: 1, currentId: "default", lastLoadedId: "default", pendingId: null,
+      accounts: [{ id: "default", name: "Default", legacy: true, status: "active", proxyMode: "system" }] }) },
   };
   vm.runInNewContext(electronMain.slice(electronMain.indexOf("function syncBrowserPreferences("), electronMain.indexOf("function registerIpc(")) +
     electronMain.slice(electronMain.indexOf('handle("launcher:snapshot",'),
@@ -1545,6 +1567,7 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
       setAutoApproveToolCalls: async enabled => { invocation = enabled; return { autoApproveToolCalls: enabled }; },
     },
     messageOf: String, platformLabel: String, requiresCodexCatalog: () => false,
+    accountCopy: accountComponents.exports.accountCopy,
   };
   for (const name of ["ContentSurface", "SectionHeading", "SettingRow", "PrimaryButton", "SecondaryButton", "Switch", "InteractionModePicker", "LanguageMenu", "NoticeRow", "Icon", "DoctorSummary", "BrandMark", "ApiAccessSettings"]) sandbox[name] = name;
   vm.runInNewContext(transpile(settings, "settings.tsx") + "\nrender = SettingsSurface;", Object.assign(sandbox, { render }));
@@ -1598,7 +1621,7 @@ test("approval notices are visible outside Browser and open the exact waiting ta
     window: { matchMedia: () => ({ matches: false }) }, COMPACT_SIDEBAR_QUERY: "fixture",
     useLimits: () => ({}), limitsCopyFor: () => ({}), browserTabTitleFromTitle: title => title,
     motion: { main: "main", aside: "aside", div: "div" },
-    messageOf: String,
+    messageOf: String, accountCopy: accountComponents.exports.accountCopy,
     api: {
       selectBrowserTab: async id => { calls.push(["select", id]); },
       setBrowserSurfaceActive: async active => { calls.push(["surface", active]); },
@@ -1690,6 +1713,7 @@ test("plugin name editor fixes Codex and edits Native4 before asking to reconfig
     useState: initial => { const index = cursor++; if (!(index in hooks)) hooks[index] = initial;
       return [hooks[index], value => { hooks[index] = value; }]; },
     useEffect() {}, messageOf: String, platformLabel: String, requiresCodexCatalog: () => false,
+    accountCopy: accountComponents.exports.accountCopy,
     api: { setConnectorNameSuffix: async suffix => { submitted = suffix; return { mcpSetupComplete: false }; } },
   };
   for (const name of ["ContentSurface", "SectionHeading", "SettingRow", "PrimaryButton", "SecondaryButton", "Switch", "InteractionModePicker", "LanguageMenu", "NoticeRow", "Icon", "DoctorSummary", "BrandMark", "ApiAccessSettings"]) sandbox[name] = name;

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, openSync, closeSync, fsyncSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, openSync, closeSync, fsyncSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
@@ -186,6 +186,51 @@ export function getConfigDir(): string {
   return resolve(expandUserPath(configured || join(homedir(), ".codex-chatgpt-web")));
 }
 
+export function getApplicationDir(): string {
+  const configured = process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim();
+  return configured ? resolve(expandUserPath(configured)) : getConfigDir();
+}
+
+/** Desktop accounts share one listener. Ordinary CLI profiles keep their own configured port. */
+export function getApplicationPort(fallbackPort = 17841): number {
+  if (!process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim()) return fallbackPort;
+  const endpointPath = join(getApplicationDir(), "service-endpoint.json");
+  let endpointStat;
+  try { endpointStat = lstatSync(endpointPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Cannot inspect application service port");
+  }
+  if (endpointStat) {
+    if (!endpointStat.isFile() || endpointStat.size > 512) throw new Error("Invalid application service port");
+    let endpoint;
+    try { endpoint = JSON.parse(readFileSync(endpointPath, "utf8")); }
+    catch { throw new Error("Invalid application service port"); }
+    if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint) || endpoint.version !== 1
+      || Object.keys(endpoint).some(key => key !== "version" && key !== "port")
+      || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65_535) {
+      throw new Error("Invalid application service port");
+    }
+    return endpoint.port;
+  }
+  // The legacy/default account stays at the application root. Read only its endpoint when
+  // creating the shared record; account credentials and runtime settings are never copied.
+  const legacyPath = join(getApplicationDir(), "config.json");
+  if (!existsSync(legacyPath)) return fallbackPort;
+  let legacy;
+  try { legacy = JSON.parse(stripUtf8Bom(readFileSync(legacyPath, "utf8"))); }
+  catch { throw new Error("Cannot read the existing application service port"); }
+  if (!legacy || !Number.isInteger(legacy.port) || legacy.port < 1 || legacy.port > 65_535) {
+    throw new Error("Invalid existing application service port");
+  }
+  return legacy.port;
+}
+
+function retainApplicationPort(port: number): void {
+  if (!process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME?.trim()) return;
+  const endpointPath = join(getApplicationDir(), "service-endpoint.json");
+  if (!existsSync(endpointPath)) atomicWriteFile(endpointPath, `${JSON.stringify({ version: 1, port })}\n`);
+}
+
 export function getConfigPath(): string {
   return join(getConfigDir(), "config.json");
 }
@@ -200,7 +245,14 @@ export function isWindowsPipeEndpoint(value: string): boolean {
 }
 
 export function defaultBrokerEndpoint(home = getConfigDir(), platform = process.platform): string {
-  if (platform !== "win32") return join(home, "runtime", "turn-broker.sock");
+  if (platform !== "win32") {
+    const endpoint = join(home, "runtime", "turn-broker.sock");
+    // Keep existing endpoints when they fit macOS's 103-byte sun_path limit.
+    if (Buffer.byteLength(endpoint) <= 103) return endpoint;
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+    const identity = createHash("sha256").update(`${uid}\0${resolve(home)}`).digest("hex").slice(0, 32);
+    return `/tmp/codex-chatgpt-web-${identity}.sock`;
+  }
   const identity = createHash("sha256").update(resolve(home).toLowerCase()).digest("hex").slice(0, 20);
   return `\\\\.\\pipe\\codex-chatgpt-web-${identity}`;
 }
@@ -270,7 +322,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     mode,
     subagentProtocol: "compatibility-v1",
     host: "127.0.0.1",
-    port: 17841,
+    port: getApplicationPort(),
     contextWindow: 256_000,
     appName: CHATGPT_CONNECTOR_NAME,
     automaticAppName: CHATGPT_CONNECTOR_NAME,
@@ -414,7 +466,10 @@ export function defaultChromeExecutable(
 
 export function loadConfig(): AppConfig {
   const path = getConfigPath();
-  return loadConfigFromPath(path);
+  const config = loadConfigFromPath(path);
+  config.port = getApplicationPort(config.port);
+  retainApplicationPort(config.port);
+  return config;
 }
 
 /** Read a recorded runtime profile without changing this process's active profile. */
@@ -449,7 +504,9 @@ export function loadConfigForSetup(): AppConfig {
     raw.automaticAppName = CHATGPT_CONNECTOR_NAME;
     if (interactionMode === "automatic") raw.appName = CHATGPT_CONNECTOR_NAME;
   }
-  return parseConfig(raw, path);
+  const config = parseConfig(raw, path);
+  config.port = getApplicationPort(config.port);
+  return config;
 }
 
 function parseConfig(value: unknown, path: string): AppConfig {
@@ -660,12 +717,16 @@ function parseConfig(value: unknown, path: string): AppConfig {
 }
 
 export function saveConfig(config: AppConfig): void {
+  if (getApplicationPort(config.port) !== config.port) {
+    throw new Error("Account configuration must use the application service port");
+  }
   const path = getConfigPath();
   const original = existsSync(path) ? readFileSync(path, "utf8") : "";
   const persisted: AppConfig & { experimentalBiggerContext?: unknown; useSavedChats?: unknown } = { ...config };
   delete persisted.experimentalBiggerContext;
   delete persisted.useSavedChats;
   atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(persisted, null, 2)}\n`, original));
+  retainApplicationPort(config.port);
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {
