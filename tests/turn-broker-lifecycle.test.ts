@@ -42,8 +42,8 @@ test.skipIf(process.platform === "win32")("long account homes use distinct binda
 });
 
 test("default broker endpoints retain short Unix paths and Windows named pipes", () => {
-  expect(defaultBrokerEndpoint("/tmp/cgw-short", "darwin")).toBe("/tmp/cgw-short/runtime/turn-broker.sock");
-  expect(defaultBrokerEndpoint("/tmp/cgw-short", "linux")).toBe("/tmp/cgw-short/runtime/turn-broker.sock");
+  expect(defaultBrokerEndpoint("/tmp/cgw-short", "darwin")).toBe(join("/tmp/cgw-short", "runtime", "turn-broker.sock"));
+  expect(defaultBrokerEndpoint("/tmp/cgw-short", "linux")).toBe(join("/tmp/cgw-short", "runtime", "turn-broker.sock"));
   const pipe = defaultBrokerEndpoint("/tmp/cgw-short", "win32");
   expect(isWindowsPipeEndpoint(pipe)).toBe(true);
   expect(defaultBrokerEndpoint("/tmp/cgw-short", "win32")).toBe(pipe);
