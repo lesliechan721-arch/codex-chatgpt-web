@@ -2,7 +2,6 @@ import { contextReusePageIdentity } from "./context-reuse-lifecycle";
 import { recoveryContinuationPrimaryIndices } from "./continuity-source";
 import { isReadableCompactionSummaryText } from "../../responses/compaction";
 import { parseRequest } from "../../responses/parser";
-import { responseHistoryNeedsFreshConversation } from "../../responses/state";
 import { chatGptCurrentInstructionRevision } from "./environment";
 import { existsSync, lstatSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -598,7 +597,7 @@ async function reconcilePage(bindings: ContinuityBindings, thread: string, descr
     if (!current || current.epoch !== record.epoch || current.owner.id !== record.owner.id
       || current.transaction?.transactionId !== record.transaction?.transactionId
       || current.transaction?.version !== record.transaction?.version) continue;
-    if (live && !responseHistoryNeedsFreshConversation(parsed._rawBody)) {
+    if (live) {
       if (binding && !currentLease && !binding.pendingCreation
         && (binding.owner !== record.owner.id || !binding.recovery || !record.works[binding.recovery.logicalWorkId])) bindings.forget(binding);
       return true;

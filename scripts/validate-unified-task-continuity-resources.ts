@@ -399,7 +399,7 @@ async function runResourceLive(options: RunOptions) {
       };
       const request = async () => { const encoded = JSON.stringify(body); const response = await responseRequest(new Request("http://unified-resource.dev/v1/responses", {
         method: "POST", headers: { "content-type": "application/json", "x-codex-turn-metadata": body.client_metadata["x-codex-turn-metadata"] }, body: encoded, signal: controller.signal }), config, factory,
-      { rememberState: false, onTurnIdentity: () => controller.signal }); const envelope = await response.json() as Row;
+      { onTurnIdentity: () => controller.signal }); const envelope = await response.json() as Row;
         report.responses.push({ task, requestNumber: report.responses.length + 1, ...resourceResponseObservation(encoded, response, envelope) }); save(); return { response, envelope }; };
       const first = await request(); assert.ok(first.response.ok, "首轮真实 Responses 失败");
       const calls = (first.envelope.output ?? []).filter((item: Row) => item.type === "function_call");

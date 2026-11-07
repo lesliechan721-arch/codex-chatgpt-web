@@ -38,7 +38,7 @@ if (replayPath) {
         emit({ type: "text_delta", text: "REPLAY_MARKER", phase: "final_answer" });
         emit({ type: "done", endTurn: true, stopReason: "stop" });
       },
-    }), { rememberState: false });
+    }));
     const wire = await response.text();
     assert.equal(response.status, 200, wire.slice(-1_000));
     if (entry.parsed?.input) assert.deepEqual(normalizedInput, entry.parsed.input, `${entry.label} normalized input`);
@@ -143,7 +143,7 @@ const server = Bun.serve({
         emit({ type: "done", endTurn: !callRequested, stopReason: "stop",
           usage: { inputTokens: activeCompact && callRequested ? 200 : 10, outputTokens: 5, totalTokens: activeCompact && callRequested ? 205 : 15 } });
       },
-    }), { rememberState: false });
+    }));
     const wire = await response.text();
     entry.status = response.status;
     entry.response = completedResponse(wire);

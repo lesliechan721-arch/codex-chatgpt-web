@@ -385,10 +385,6 @@ for (const scenario of [
     const real = createAdapter();
     return { ...real, async runTurn(parsed, incoming, emit) {
       if (!parsed._compactionRequest) Object.assign(source, structuredClone(parsed));
-      if (parsed._compactionRequest) {
-        expect(parsed.previousResponseId).toBeUndefined();
-        expect(parsed._replayPrefixLen ?? 0).toBe(0);
-      }
       await real.runTurn!(parsed, incoming, event => {
         (parsed._compactionRequest ? checkpoint : events).push(event);
         emit(event);
@@ -415,7 +411,7 @@ for (const scenario of [
       ...real, async runTurn(incoming, request, emit) {
         await real.runTurn!(incoming, request, event => { emitted.push(event); emit(event); });
       },
-    }), { accessPolicy, rememberState: false });
+    }), { accessPolicy });
     const body = await response.json() as { error?: unknown; status?: string };
     expect(response.status, JSON.stringify(body)).toBe(200);
     expect(body.error, JSON.stringify(body)).toBeFalsy();
@@ -424,7 +420,7 @@ for (const scenario of [
   try {
     let sourceOutput: unknown[] = [];
     if (scenario.apiKey) {
-      const response = await responseRequest(apiRequest(source), appConfig, apiAdapter, { accessPolicy, rememberState: false });
+      const response = await responseRequest(apiRequest(source), appConfig, apiAdapter, { accessPolicy });
       const body = await response.json() as { status: string; output: unknown[] };
       expect(response.status, JSON.stringify(body)).toBe(200);
       expect(body.status, JSON.stringify({ body, controlRejections })).toBe("completed");
@@ -652,7 +648,7 @@ for (const scenario of [
       }) + "\n");
       checkpoint.length = 0;
       const secondResponse = await responseRequest(
-        apiRequest(secondCompact), appConfig, rolloutApiAdapter, { accessPolicy, rememberState: false },
+        apiRequest(secondCompact), appConfig, rolloutApiAdapter, { accessPolicy },
       );
       const secondBody = await secondResponse.json() as {
         error?: unknown; status?: string; output?: Array<{ type?: string; content?: unknown }>;

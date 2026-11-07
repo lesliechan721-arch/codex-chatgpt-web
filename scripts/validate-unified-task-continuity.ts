@@ -473,7 +473,7 @@ export async function runContinuityLive(options: ContinuityLiveOptions, hooks?: 
           report.fixture.requestReceivedBytes.push(Buffer.byteLength(exact.body)); save();
           const response = await responseRequest(new Request("http://unified-continuity.dev/v1/responses", { method: "POST",
             headers: exact.headers, body: exact.body, signal: exact.signal }), config, factory,
-          { rememberState: false, onTurnIdentity: () => exact.signal, onAdapterEvent: value => {
+          { onTurnIdentity: () => exact.signal, onAdapterEvent: value => {
             if (value.type === "tool_call_start") event("actual-business-dispatch", { callId: value.id, name: value.name });
             if (["done", "error", "incomplete"].includes(value.type)) event("adapter-outcome", { type: value.type,
               ...(value.type === "done" ? { usage: value.usage, ...summarizeHarnessResponse({ end_turn: value.endTurn }) } : value.type === "error" ? summarizeHarnessResponse({ error: { code: value.code, message: value.message },

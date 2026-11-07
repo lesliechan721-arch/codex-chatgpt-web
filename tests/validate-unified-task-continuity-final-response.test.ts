@@ -53,7 +53,7 @@ test("public Responses preserves commentary phases and persists the actual final
         emit({ type: "text_delta", text: "A new ChatGPT conversation was created with the current context.", phase: "commentary" });
         emit({ type: "assistant_boundary" }); emit({ type: "text_delta", text: answer, phase: "final_answer" });
         emit({ type: "done", stopReason: "stop", endTurn: true });
-      } }), { rememberState: false });
+      } }), {});
     expect(response.status).toBe(200);
     const envelope = await response.json() as Record<string, unknown>;
     const saved = JSON.parse(JSON.stringify(summarizeContinuityFinalResponse(envelope, redactContinuityEvidence)));

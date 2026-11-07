@@ -31,8 +31,8 @@ close local and daemon admission, prove idleness, stop the owned runtime, and re
 The migrated default keeps its original core home and browser partition. New accounts use separate
 homes and partitions. The application directory owns API access policy, the client service key,
 stable endpoint and Codex integration recovery records; upstream configuration and keys stay local
-to the account. A narrow, read-only Responses history handoff matches a response ID and thread;
-only a successful target response commits the target account's own history. See
+to the account. After a switch, the current Codex request supplies the task context for a new
+page under the active account. Old response IDs do not trigger cross-account history lookup. See
 [desktop accounts](multi-account.md) for switching, recovery and removal behavior.
 
 ### `browser-only`
@@ -386,9 +386,11 @@ can finish only their old transmission.
 
 Closing a page removes its registration, work/call, stop/completion, history/checkpoint/retry,
 binding/index, and task snapshots by exact generation. A late destroyed event cannot remove a
-new page. Do not retain replacement task tombstones or history archives. The independent
-one-hour memory/disk API increment cache remains, including its existing missing-context 409.
-Installation identity and login state also retain their existing lifetimes.
+new page. Do not retain replacement task tombstones or history archives. Codex supplies the
+current context, including compacted history, in each HTTP request. The bridge does not store
+Responses input/output history, expand old response IDs, or compare that history to select a page.
+Account switches stop the runtime and destroy its pages; the next request initializes a new page.
+Installation identity and login state retain their existing lifetimes.
 
 Physical cleanup is a fixed-target transaction with at most three automatic attempts. Closing
 or failed-cleanup documents count toward five real pages until actual destruction. A revoked
@@ -399,7 +401,7 @@ not establish closure and does not start background recovery.
 
 Old independent names are rejected with an ordinary replacement name. Managed exports use
 ordinary names; user TOML needs explicit replacement. Migration preserves required confirmed-live
-activity, installation/login state, and the increment cache, removes closed-page records, and
+activity and installation/login state, removes closed-page records, and
 revokes unknown generations. Legacy, missing, or corrupt old journals cannot become a permanent
 deny list. Run compatible backend, Broker, helper, and Launcher versions; files on disk do not
 prove runtime compatibility. Actually unavailable creation interfaces remain service errors.

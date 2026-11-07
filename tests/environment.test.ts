@@ -945,8 +945,6 @@ describe("authenticated full-history compaction environment", () => {
     expect(persisted).not.toContain("Inspect the workspace");
     expect(persisted).not.toContain("<environment_context>");
     expect(persisted).not.toContain("source_tool");
-    expect(compact.previousResponseId).toBeUndefined();
-    expect(compact._replayPrefixLen).toBeUndefined();
     expect(() => extractChatGptTurnEnvironment(compact)).toThrow("missing cwd");
     for (let retry = 0; retry < 2; retry++) {
       expect(store().resolve(compact)).toEqual({ ...trusted, tools: compact.context.tools ?? [] });
@@ -1014,28 +1012,22 @@ describe("authenticated full-history compaction environment", () => {
     });
   });
 
-  test("same-turn auto-compaction authenticates an untagged source previously accepted through replay", () => {
+  test("same-turn auto-compaction continues an untagged source accepted in its trusted thread", () => {
     const { source } = fixture();
+    const store = new ChatGptThreadEnvironmentStore();
+    const trusted = store.resolve(source);
     const body = source._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
     const metadata = { ...JSON.parse(body.client_metadata["x-codex-turn-metadata"]!), turn_id: "turn_active" };
     body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
-    source._replayPrefixLen = body.input.length;
-    body.input.push(
+    body.input = [
       { type: "message", role: "assistant", content: [{ type: "output_text", text: "Previous turn complete" }] },
       { type: "message", role: "user", id: "msg_untagged_active", content: [{ type: "input_text", text: "Continue the task" }] },
-    );
-    const store = new ChatGptThreadEnvironmentStore();
-    const trusted = store.resolve(source);
+    ];
+    expect(store.resolve(source)).toEqual(trusted);
     const compact = structuredClone(source);
     compact._compactionRequest = true;
-    delete compact._replayPrefixLen;
     expect(() => extractChatGptTurnEnvironment(compact)).toThrow("missing cwd");
     expect(store.resolve(compact)).toEqual(trusted);
-    // Without a native source tag, the current turn must itself match the recorded turn.
-    for (const turnId of ["unrelated_turn", undefined]) {
-      (compact._rawBody as typeof body).client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, turn_id: turnId });
-      expect(() => store.resolve(compact)).toThrow("missing cwd");
-    }
   });
 
   for (const change of ["thread", "model", "reasoning", "sandbox", "roots", "parent", "source prompt", "source turn", "history", "ordinary request"] as const) {
@@ -1120,7 +1112,7 @@ describe("authenticated full-history compaction environment", () => {
     const store = new ChatGptThreadEnvironmentStore(path, () => now);
     store.resolve(source);
     const saved = JSON.parse(readFileSync(path, "utf8"));
-    Object.assign(body, { compactionSource: saved.threads.thread_current.compactionSource, _replayPrefixLen: 100 });
+    Object.assign(body, { compactionSource: saved.threads.thread_current.compactionSource });
     expect(() => new ChatGptThreadEnvironmentStore().resolve(compact)).toThrow("missing cwd");
     delete saved.threads.thread_current.compactionSource;
     writeFileSync(path, JSON.stringify(saved));

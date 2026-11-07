@@ -123,6 +123,31 @@ test("a complete bundled ModelInfo sent by upstream normalizes to the same trust
   assert.deepEqual(upstream.model, defaults.model);
 });
 
+test("the review model stays hidden in every metadata mode while ordinary models stay selectable", () => {
+  for (const { id, visibility } of [
+    { id: "codex-auto-review", visibility: "hide" },
+    { id: "gpt-6-luna", visibility: "list" },
+    { id: "codex-auto-balanced", visibility: "list" },
+  ]) {
+    for (const discovery of [emptyDiscovery(), metadata.parseUpstreamDiscovery({
+      models: [{ slug: id, visibility: "list" }],
+    })]) {
+      for (const configured of [
+        undefined,
+        ...["upstream", "default", "fallback"].map(mode => ({ mode })),
+        ...["upstream", "default", "fallback"].map(baseMode => ({
+          mode: "custom", baseMode, overrides: { display_name: "Custom model" },
+        })),
+      ]) {
+        const { model } = metadata.resolveModelMetadata(id, configured, discovery, "disabled", { strictCustom: true });
+        assert.equal(model.visibility, visibility, `${id}: ${JSON.stringify(configured)}`);
+        assert.equal(model.supported_in_api, true);
+        assert.equal(metadata.finalModelError(model), null);
+      }
+    }
+  }
+});
+
 test("generic fallback is conservative and changes shell_type only from the project runtime mode", () => {
   const disabled = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "fallback" }, emptyDiscovery(), "disabled").model;
   const full = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "fallback" }, emptyDiscovery(), "unified_exec").model;

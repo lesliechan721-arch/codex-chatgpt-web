@@ -20,12 +20,12 @@ test("public Responses runTurn rejection is HTTP 200 failed, while a preflight r
   const rejectedAck = continuityError("continuity_source_unproven", "An obsolete execution cannot write to the current recovery attempt.");
   // Only the adapter outcome is controlled. Production public parsing, routing, error
   // handling and Responses serialization determine the transport/envelope result.
-  const response = await responseRequest(request(), config, () => ({ name: "local-error-fixture", async runTurn() { throw rejectedAck; } }), { rememberState: false });
+  const response = await responseRequest(request(), config, () => ({ name: "local-error-fixture", async runTurn() { throw rejectedAck; } }), {});
   const envelope = await response.json() as Record<string, unknown>;
   expect(response.status).toBe(200); expect(response.ok).toBe(true);
   expect(envelope.status).toBe("failed");
   expect(inspectRejectedResourceAppend(response, envelope)).toMatchObject({ rejected: true, code: rejectedAck.code, representation: "failed-response" });
-  const preflight = await responseRequest(request(), config, () => ({ name: "local-preflight-fixture", async preflight() { throw rejectedAck; }, async runTurn() { throw new Error("must not run"); } }), { rememberState: false });
+  const preflight = await responseRequest(request(), config, () => ({ name: "local-preflight-fixture", async preflight() { throw rejectedAck; }, async runTurn() { throw new Error("must not run"); } }), {});
   expect(preflight.status).toBe(409);
   expect(inspectRejectedResourceAppend(preflight, await preflight.json() as Record<string, unknown>)).toMatchObject({ rejected: true, representation: "http-error" });
 });
@@ -59,7 +59,7 @@ test("public failed Responses observations retain serialized body digest and act
   const encoded = JSON.stringify({ model: "chatgpt-web/gpt-6-sol-instant", stream: false, input: [{ role: "user", content: "Synthetic control observation." }] });
   const response = await responseRequest(new Request("http://resource-control.invalid/v1/responses", { method: "POST", headers: { "content-type": "application/json" }, body: encoded }),
     config, () => ({ name: "local-ACK-fence", async runTurn() { throw new ChatGptWebAdapterError("The pending update requires an actual ACK.",
-      { code: "task_update_unacknowledged", status: 409, errorType: "invalid_request_error", retryable: false }); } }), { rememberState: false });
+      { code: "task_update_unacknowledged", status: 409, errorType: "invalid_request_error", retryable: false }); } }), {});
   const envelope = await response.json() as Record<string, any>;
   expect(response.status).toBe(200); expect(envelope.status).toBe("failed");
   expect(resourceResponseObservation(encoded, response, envelope)).toMatchObject({ httpStatus: 200, status: "failed", code: "task_update_unacknowledged",

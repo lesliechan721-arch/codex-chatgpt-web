@@ -426,7 +426,7 @@ async function runZeroRiskBoundary(boundary: "active" | "ended", model: string, 
     const request = async (raw: Row) => {
       const response = await responseRequest(new Request("http://unified-continuity.dev/v1/responses", { method: "POST", headers: { "content-type": "application/json",
         "x-codex-turn-metadata": source.client_metadata["x-codex-turn-metadata"] }, body: JSON.stringify(raw), signal: controller.signal }), config, factory,
-        { rememberState: false, onTurnIdentity: () => controller.signal, onAdapterEvent: event => {
+        { onTurnIdentity: () => controller.signal, onAdapterEvent: event => {
           if (event.type === "tool_call_start") report.calls.push({ phase, callId: event.id, name: event.name });
           if (["done", "error", "incomplete"].includes(event.type)) report.events.push({ phase, kind: "adapter-outcome", type: event.type }); save(); } });
       const result = await response.json() as Row;

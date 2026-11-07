@@ -209,7 +209,7 @@ bun run app:package
 
 `dev:launcher` 在 `~/.codex-chatgpt-web-dev` 下使用独立配置和账户。`dev:chat` 使用真实浏览器与压缩流程，并提供明确的模拟工具结果，不改变正常 Codex 路由。设置和命令请参阅 [DEV chat harness](docs/dev-chat.md)。
 
-[会话连续性](docs/session-continuity.md)在受支持的 Full Native + Launcher 路由中使用统一任务机制和常规 `chatgpt-web/` 模型名。健康且兼容的页面优先复用；普通未完成工作、checkpoint 续接和未提交压缩可在项目权限隔离、真实工具结算、合法来源与实际计划核对后换页恢复。未知 Send、未知结果和停止事实仍有效。Fresh Conversation Per Turn 只改变页面选择；Zero Risk 保留手动发送限制。Codex 历史窗口使用上述账户/模型四档，不扩大单条传输限制。物理页面上限仍为五个，清理次数有限。旧前缀配置需改为对应常规模型名，迁移保留 work、stop、checkpoint 和 retry 事实。真实平台验证状态见文档。
+[会话连续性](docs/session-continuity.md)在受支持的 Full Native + Launcher 路由中使用统一任务机制和常规 `chatgpt-web/` 模型名。上下文由 Codex 当前请求提供，包括有效压缩摘要。账号切换或重启销毁旧页面后，使用当前上下文建立新页面；服务不按旧响应 ID 恢复历史。健康且兼容的页面优先复用；普通未完成工作、checkpoint 续接和未提交压缩可在项目权限隔离、真实工具结算、合法来源与实际计划核对后换页恢复。未知 Send、未知结果和停止事实仍有效。Fresh Conversation Per Turn 只改变页面选择；Zero Risk 保留手动发送限制。Codex 历史窗口使用上述账户/模型四档，不扩大单条传输限制。物理页面上限仍为五个，清理次数有限。旧前缀配置需改为对应常规模型名，迁移保留 work、stop、checkpoint 和 retry 事实。真实平台验证状态见文档。
 
 </details>
 

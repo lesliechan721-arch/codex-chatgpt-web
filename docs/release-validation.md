@@ -430,10 +430,11 @@ Record the following before claiming page-lifecycle recovery validated:
    storage/lock failures and late completion of original in-flight transmissions separately.
 7. Close a real page and restart backend. Confirm its registration, work/attempt/call,
    stop/completion, history/checkpoint/retry data, binding/index, and task snapshots are removed,
-   without TTL or replacement tombstones. The independent one-hour input/output cache must
-   remain compatible. Independently referenced in-flight bodies may remain only until completion.
+   without TTL or replacement tombstones. Confirm ordinary restart, A → B, and A → B → A
+   destroy old pages and initialize new pages from current request context. Independently
+   referenced in-flight bodies may remain only until completion.
 8. Migrate current and old formats, missing/corrupt closed-page records, and interrupted migration.
-   Preserve confirmed-live activity, installation/login state, and increment cache; revoke unknown
+   Preserve confirmed-live activity and installation/login state; revoke unknown
    generations and remove closed-page task records. No permanent deny list, long-term quarantine
    archive, or two current writers. Verify running backend, helper, Broker, and Launcher; new
    files on disk alone do not prove compatibility or old-process termination.
@@ -443,11 +444,15 @@ Record the following before claiming page-lifecycle recovery validated:
    compaction still commits once. Cover a legal tool log whose inline form exceeds the old
    window but whose real on-demand plan fits, and read a unique unread tail through actual
    delivery. Compare healthy-page incremental continuation without injecting test answers.
-10. Test increment-cache hit and expiry, unreadable ciphertext, missing current source bytes,
+10. Test unreadable ciphertext, missing current source bytes,
     non-externalizable instructions, image/attachment, input/output, snapshot, and navigation
-    limits. Report actual source/read/plan budgets and preserve required bodies. A missing
-    `previous_response_id` cache keeps its API-context 409. Corrected requests retain recovery
-    eligibility. Load each current account/model H/C tier with the target Codex binary and lower
+    limits. Report actual source/read/plan budgets and preserve required bodies. With default
+    and non-default accounts, return tool results with Codex-added history metadata and verify
+    the live page continues without cancellation or reacquisition. Missing, expired, corrupt,
+    and mismatched legacy response caches must not change the result or page selection; requests
+    and shutdown must not create or update them. An extra `previous_response_id` must not expand
+    history or cause a dedicated error; general request validation still applies. Load each
+    current account/model H/C tier with the target Codex binary and lower
     client limits; these checks do not measure browser capacity.
 11. Exercise five physical pages, safe idle reclamation, and cleanup that never destroys a page.
     Closing/fault documents still occupy slots, with at most three automatic closes per fixed
@@ -494,7 +499,7 @@ end-to-end pass:
 | --- | --- | --- |
 | Budget probe, Codex 0.157.0, 17 controlled cases | Native app-server configuration, usage-triggered compaction, lower user limits, and a finite upper bound with the 1,000,000 / 900,000 catalog settings | Million-token browser input, throughput, or ChatGPT context capacity; requests were short with controlled usage |
 | 2026-09-28 DEV page probes | Automatic active/completed source and Zero Risk active source each completed two same-page runs with new authority; completed/pre-control-ended Zero Risk stopped | Complete production outer-Codex integration; outer work-tool receipts were simulated |
-| Synthetic component resource sample | About 4.85 MB of history, about 1.03 million estimated tokens, short-increment acceptance, oversized-first-input rejection, and bounded response-cache eviction | Five real pages, checkpoint load, sustained throughput, or a process-memory cap; maximum sampled RSS was about 0.8 GB, not a precise peak |
+| Synthetic component resource sample | About 4.85 MB of history, about 1.03 million estimated tokens, short-increment acceptance, and oversized-first-input rejection | Five real pages, checkpoint load, sustained throughput, or a process-memory cap; maximum sampled RSS was about 0.8 GB, not a precise peak |
 | 2026-09-30 current-work protocol capture | 34 real Codex POSTs, a harmless Native `printf`, retry, steering, local/v2 compact, and active/completed checkpoint-only shapes against a fake page | Authenticated ChatGPT DOM, Launcher surface/lease, remote deployment, or complete real Zero Risk interaction |
 
 The [budget probe](../scripts/probe-session-continuity-budget.ts) records the chosen binary,
@@ -528,8 +533,7 @@ The captured normal requests retained predecessors. Deleting completed history, 
 native developer kinds, removing an AGENTS part, and testing role/attachment conflicts are
 explicit synthetic variants, not additional captured client behavior. The native-source layout
 coverage is retained in the [input regression tests](../tests/session-continuity-input.test.ts).
-These captures do not cover v1 compaction, JSON responses, `previous_response_id` expansion, or
-real file/image/audio attachments. The current-work change still lacked authenticated-page,
+These captures do not cover v1 compaction, JSON responses, or real file/image/audio attachments. The current-work change still lacked authenticated-page,
 real 24-hour, sustained real-page-memory, and remote-deployment acceptance in its recorded result.
 
 Replay exercises only the parser/normalize boundary. It does not run Native tools or open a page:

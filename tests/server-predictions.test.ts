@@ -36,7 +36,7 @@ async function send(body: unknown, config: AppConfig = { ...defaultConfig("full"
         emit({ type: "text_delta", text: '{"suggestion":"Show me the diff."}', phase: "final_answer" });
         emit({ type: "done", stopReason: "stop", endTurn: true });
       } };
-    }, { rememberState: false });
+    }, {});
     const text = await response.text();
     return { response, text, observed, constructions };
   } finally {
@@ -137,8 +137,8 @@ test("prompt wording and inherited thread source do not reclassify real user tur
   }
 });
 
-test("missing continuation state cannot produce a prediction from incomplete context", async () => {
+test("an extra old response ID does not prevent a prediction from the current input", async () => {
   const result = await send({ ...base, previous_response_id: "missing-prediction-parent" });
-  expect(result.response.status).toBe(409);
-  expect(result.constructions).toBe(0);
+  expect(result.response.status).toBe(200);
+  expect(result.constructions).toBe(1);
 });

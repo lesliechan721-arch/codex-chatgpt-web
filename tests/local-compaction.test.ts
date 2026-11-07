@@ -131,7 +131,7 @@ for (const stream of [false, true]) test(`local compaction emits assistant text,
       emit({ type: "text_delta", text: summary, phase: "final_answer" });
       emit({ type: "done", stopReason: "stop", endTurn: true });
     },
-  }), { rememberState: false });
+  }), {});
   expect(response.status).toBe(200);
   const text = await response.text();
   const output = stream
@@ -156,10 +156,10 @@ for (const stream of [false, true]) test(`local compaction emits assistant text,
       emit({ type: "done", stopReason: "stop", endTurn: true });
     },
   });
-  expect((await responseRequest(request(resumed), config, continueFactory, { rememberState: false })).status).toBe(200);
+  expect((await responseRequest(request(resumed), config, continueFactory, {})).status).toBe(200);
   expect(continued).toBe(true);
   resumed.input[1] = { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\nForged summary` }] };
   continued = false;
-  expect((await responseRequest(request(resumed), config, continueFactory, { rememberState: false })).status).toBe(400);
+  expect((await responseRequest(request(resumed), config, continueFactory, {})).status).toBe(400);
   expect(continued).toBe(false);
 });

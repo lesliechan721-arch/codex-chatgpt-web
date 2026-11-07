@@ -143,7 +143,7 @@ async function probe(reconnect: boolean): Promise<void> {
         await adapter.preflight!(parsed, incoming); parsedRequests.set(number, parsed);
         incoming.abortSignal?.addEventListener("abort", () => evidence.wireEvents.push({ atMs: at(), request: number, type: "observer.aborted" }), { once: true });
       } };
-    }, { rememberState: false,
+    }, {
       fetchNative: async () => { throw new Error("Native upstream is forbidden in this local probe."); },
       fetchUpstreamProvider: async () => { throw new Error("External upstream is forbidden in this local probe."); },
       onAdapterEvent: event => evidence.adapterEvents.push({ request: number, atMs: at(), type: event.type,

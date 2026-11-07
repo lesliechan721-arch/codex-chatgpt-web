@@ -131,7 +131,6 @@ export function scrubBridgeArtifactsForNative(value: unknown): { value: unknown;
     return hasSummary || hasContent || hasNativeEncryptedContent ? [clean] : [];
   });
   const clean: JsonObject = { ...value, input };
-  delete clean.previous_response_id;
   return { value: clean, changed: true };
 }
 

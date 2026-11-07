@@ -1,4 +1,4 @@
-import type { AdapterEvent, CodexMessagePhase, CodexProviderContinuationState, CodexUsage } from "./types";
+import type { AdapterEvent, CodexMessagePhase, CodexUsage } from "./types";
 import { adapterFailureFromMessage, classifyError, type CodexErrorPayload } from "./lib/errors";
 import { encodeCompactionSummary } from "./responses/compaction";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "./responses/reasoning-envelope";
@@ -102,7 +102,7 @@ export function bridgeToResponsesSSE(
     /** One-shot: first non-empty text/thinking/raw-reasoning delta observed (WP4 TTFT). */
     onFirstOutput?: () => void;
     onTerminal?: (status: ResponsesTerminalStatus) => void;
-    onCompletedResponse?: (response: Record<string, unknown>, providerState?: CodexProviderContinuationState) => void;
+    onCompletedResponse?: (response: Record<string, unknown>) => void;
     /** Test seam for the platform-specific Bun stream transport. */
     streamPlatform?: NodeJS.Platform;
     /** Test seam for the monotonic upstream-silence clock. */
@@ -425,11 +425,8 @@ export function bridgeToResponsesSSE(
           adapterEventCount += 1;
           stallWarned = false;
           reportFirstOutput(event);
-          // Compaction turns emit ONLY the synthetic compaction item + response.completed. The
-          // summary text is accumulated silently: emitting it as a normal assistant message would
-          // duplicate the summary if this response is ever replayed via previous_response_id
-          // expansion (rememberResponseState stores input + output). Codex ignores extra items but
-          // its compaction UI renders nothing mid-turn, so nothing is lost visually.
+          // Compaction turns emit only the synthetic compaction item and terminal response.
+          // Accumulate the summary silently so the output contains it exactly once.
           if (options?.compaction) {
             if (event.type === "text_delta") { compactionText += event.text; continue; }
             if (event.type !== "done" && event.type !== "incomplete" && event.type !== "error") continue;
@@ -612,9 +609,7 @@ export function bridgeToResponsesSSE(
                     reason: event.stopReason === "max_tokens" ? "max_output_tokens" : "content_filter",
                   },
                 };
-                // Cache max-output partials so previous_response_id replay can continue them;
-                // rememberResponseState rejects content-filtered incomplete responses.
-                options?.onCompletedResponse?.(response, event.providerState);
+                options?.onCompletedResponse?.(response);
                 emit("response.incomplete", { response });
                 reportTerminal("incomplete");
               } else {
@@ -623,7 +618,7 @@ export function bridgeToResponsesSSE(
                   usage: responsesUsage(event.usage),
                   ...(event.responseMetadata ? { metadata: event.responseMetadata } : {}),
                 };
-                options?.onCompletedResponse?.(response, event.providerState);
+                options?.onCompletedResponse?.(response);
                 emit("response.completed", {
                   response,
                 });
@@ -862,7 +857,6 @@ export function buildResponseJSON(
     toolSearchToolNames?: Set<string>;
     /** Remote compaction v2 turn — append one synthetic compaction output item (see bridgeToResponsesSSE). */
     compaction?: boolean;
-    onProviderState?: (state: CodexProviderContinuationState) => void;
   },
 ): Record<string, unknown> {
   const responseId = `resp_${uuid()}`;
@@ -1035,13 +1029,11 @@ export function buildResponseJSON(
       case "incomplete":
         incompleteEvent = e;
         endTurn = e.endTurn;
-        if (e.providerState) options?.onProviderState?.(e.providerState);
         break;
       case "done":
         usage = e.usage;
         endTurn = e.endTurn;
         responseMetadata = e.responseMetadata ?? responseMetadata;
-        if (e.providerState) options?.onProviderState?.(e.providerState);
         if (e.stopReason === "max_tokens") stopReason = "max_tokens";
         break;
     }

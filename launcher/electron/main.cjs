@@ -213,8 +213,8 @@ function initializeAccountController() {
         buttons: chinese() ? ["取消", "移除此账号"] : ["Cancel", "Remove account"],
         message: chinese() ? `移除“${account.name}”？` : `Remove “${account.name}”?`,
         detail: chinese()
-          ? "将删除该账号的本地登录、设置、账号密钥、代理认证、额度和任务缓存。已续接到其它账号的任务历史仍保留。项目文件、Codex 自身历史和共享 API 服务访问密钥保留。此操作不会注销线上 ChatGPT 账号或撤销线上 Tunnel。最后一个账号会先退出运行环境。"
-          : "Delete this account's local login, settings, account keys, proxy credentials, limits, and task cache. History already continued in another account remains. Project files, Codex history, and the shared service access key remain. This does not delete the online ChatGPT account or revoke its Tunnel. The last account will exit its runtime first.",
+          ? "将删除该账号的本地登录、设置、账号密钥、代理认证、额度和任务缓存。其它账号的恢复记录保留。项目文件、Codex 自身历史和共享 API 服务访问密钥保留。此操作不会注销线上 ChatGPT 账号或撤销线上 Tunnel。最后一个账号会先退出运行环境。"
+          : "Delete this account's local login, settings, account keys, proxy credentials, limits, and task cache. Other accounts’ recovery records remain. Project files, Codex history, and the shared service access key remain. This does not delete the online ChatGPT account or revoke its Tunnel. The last account will exit its runtime first.",
       });
       return result.response === 1;
     },

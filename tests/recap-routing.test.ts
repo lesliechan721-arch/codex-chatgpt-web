@@ -135,7 +135,7 @@ test("an ordinary Web summary request keeps its browser route", async () => {
       emit({ type: "text_delta", text: '{"summary":"Done","next_action":null}' });
       emit({ type: "done", stopReason: "stop", endTurn: true });
     },
-  }), { rememberState: false });
+  }), {});
   expect(response.status).toBe(200);
   await response.json();
   expect(turns).toBe(1);

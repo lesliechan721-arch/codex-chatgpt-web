@@ -182,9 +182,7 @@ export class ChatGptLunaCheckpointStream {
   }
 }
 
-function currentTurnBoundary(parsed: CodexParsedRequest, input: unknown[], turnId: string): number | undefined {
-  const replayPrefix = Math.min(parsed._replayPrefixLen ?? 0, input.length);
-  if (replayPrefix > 0) return replayPrefix;
+function currentTurnBoundary(input: unknown[], turnId: string): number | undefined {
   const firstCurrentItem = input.findIndex(item => itemTurnId(item) === turnId);
   return firstCurrentItem >= 0 ? firstCurrentItem : undefined;
 }
@@ -211,7 +209,7 @@ function parentAssistantAnswer(
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : undefined;
   if (!input) return undefined;
-  const boundary = currentTurnBoundary(parsed, input, turnId);
+  const boundary = currentTurnBoundary(input, turnId);
   if (boundary === undefined) return undefined;
   for (let index = boundary - 1; index >= 0; index -= 1) {
     const text = assistantItemText(input[index]);
@@ -225,7 +223,7 @@ function currentTurnInput(parsed: CodexParsedRequest, turnId: string): unknown[]
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : undefined;
   if (!input) return undefined;
-  const boundary = currentTurnBoundary(parsed, input, turnId);
+  const boundary = currentTurnBoundary(input, turnId);
   if (boundary === undefined) return undefined;
   const suffix = input.slice(boundary);
   return suffix.length > 0 ? suffix : undefined;
@@ -293,9 +291,8 @@ export class ChatGptLunaCheckpointStore {
       content: [{ type: "output_text", text: checkpointContext(stored.checkpoint) }],
       internal_chat_message_metadata_passthrough: { turn_id: identity.turnId },
     };
-    const { previous_response_id: _previousResponseId, ...bodyWithoutPrevious } = body;
     const compacted = parseRequest({
-      ...bodyWithoutPrevious,
+      ...body,
       input: [checkpointItem, ...currentInput],
     });
     // `_rawBody.model` remains the public route slug while the server has already resolved the

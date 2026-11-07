@@ -214,7 +214,7 @@ bun run app:package
 
 `dev:launcher`는 `~/.codex-chatgpt-web-dev`의 별도 프로필과 계정을 사용합니다. `dev:chat`은 실제 브라우저와 compaction 경로를 사용하며, 도구 결과는 명시적인 시뮬레이션입니다. 일반 Codex 경로는 변경하지 않습니다. 설정과 명령은 [DEV chat harness](docs/dev-chat.md)를 참고하세요.
 
-[세션 연속성](docs/session-continuity.md)은 지원되는 Full Native + Launcher 경로에서 일반 `chatgpt-web/` 모델 이름과 공통 작업 처리를 사용합니다. 정상이며 호환되는 페이지를 재사용합니다. 프로젝트 실행 권한 격리, 실제 도구 결과, 유효한 소스와 전송 계획을 확인한 뒤 미완료 작업, checkpoint 후 계속 작업, 미확정 압축을 새 페이지에서 복구할 수 있습니다. 알 수 없는 Send, 결과, 중지 기록은 계속 유효합니다. Fresh Conversation Per Turn은 페이지 선택만 변경합니다. Zero Risk의 수동 전송 제한은 유지됩니다. Codex 기록 창은 위의 네 단계를 사용하며 단일 메시지 전송 제한을 늘리지 않습니다. 실제 페이지는 최대 다섯 개이며 정리 시도 횟수는 제한됩니다. 이전 접두사 설정은 해당 일반 이름으로 변경해야 합니다. 이전 작업의 work, stop, checkpoint, retry 기록은 유지됩니다. 실제 환경 검증 상태는 문서에서 확인할 수 있습니다.
+[세션 연속성](docs/session-continuity.md)은 지원되는 Full Native + Launcher 경로에서 일반 `chatgpt-web/` 모델 이름과 공통 작업 처리를 사용합니다. 컨텍스트는 유효한 압축 요약을 포함한 현재 Codex 요청에서 가져옵니다. 계정 전환이나 재시작으로 이전 페이지를 닫은 뒤에는 현재 컨텍스트로 새 페이지를 만듭니다. 이전 응답 ID로 기록을 복구하지 않습니다. 정상이며 호환되는 페이지를 재사용합니다. 프로젝트 실행 권한 격리, 실제 도구 결과, 유효한 소스와 전송 계획을 확인한 뒤 미완료 작업, checkpoint 후 계속 작업, 미확정 압축을 새 페이지에서 복구할 수 있습니다. 알 수 없는 Send, 결과, 중지 기록은 계속 유효합니다. Fresh Conversation Per Turn은 페이지 선택만 변경합니다. Zero Risk의 수동 전송 제한은 유지됩니다. Codex 기록 창은 위의 네 단계를 사용하며 단일 메시지 전송 제한을 늘리지 않습니다. 실제 페이지는 최대 다섯 개이며 정리 시도 횟수는 제한됩니다. 이전 접두사 설정은 해당 일반 이름으로 변경해야 합니다. 이전 작업의 work, stop, checkpoint, retry 기록은 유지됩니다. 실제 환경 검증 상태는 문서에서 확인할 수 있습니다.
 
 </details>
 

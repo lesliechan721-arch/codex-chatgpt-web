@@ -119,7 +119,7 @@ for (const manual of [false, true]) test(`short-start budget rejection is a non-
   const events: Array<{ type: string; retryable?: boolean; code?: string }> = [];
   const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(f.body),
-  }), f.config, () => f.adapter(), { rememberState: false, onAdapterEvent: event => { events.push(event); } });
+  }), f.config, () => f.adapter(), { onAdapterEvent: event => { events.push(event); } });
   expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ error: {
     type: "invalid_request_error", code: "CONTEXT_BUDGET_EXCEEDED",
@@ -928,7 +928,7 @@ test("HTTP reordered reconnect replays commentary already journaled before obser
   f.controls.emitReviewCommentary = true;
   f.controls.deferCompletion = true;
   const abort = new AbortController();
-  const first = await f.send({ ...f.body, stream: true }, false, false, abort.signal);
+  const first = await f.send({ ...f.body, stream: true }, false, abort.signal);
   expect(first.status).toBe(200);
   const reader = first.body!.getReader();
   const decoder = new TextDecoder();
@@ -1040,26 +1040,18 @@ for (const kind of ["namespaced", "tool_search"] as const) test(`HTTP ${kind} na
   expect(f.controls.toolResults).toHaveLength(1);
 });
 
-test("HTTP expired previous_response_id rejects partial input, then a full canonical resend uses the retained page", async () => {
+test("HTTP complete input with an extra previous_response_id keeps the retained page", async () => {
   const f = httpFixture();
-  const first = await (await f.send(f.body, false, true)).json();
+  const first = await (await f.send(f.body)).json();
   expect(first.status).toBe("completed");
-  const next: Record<string, unknown> = {
-    ...(f.next(parseRequest(f.body))._rawBody as Record<string, unknown>), model: f.body.model, reasoning: f.body.reasoning,
-  };
-  const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 61 * 60_000);
-  try {
-    const partial = await f.send({ ...next, previous_response_id: first.id, input: (next.input as unknown[]).slice(-1) });
-    expect(partial.status).toBe(409);
-    expect(await partial.text()).toContain("previous_response_id");
-    expect(f.pages.size).toBe(1);
-    expect(f.submissions).toHaveLength(1);
-    const full = await f.send(next);
-    expect(full.status).toBe(200);
-    expect((await full.json()).status).toBe("completed");
-    expect(f.submissions).toHaveLength(2);
-    expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
-  } finally { clock.mockRestore(); }
+  const next = { ...(f.next(parseRequest(f.body))._rawBody as Record<string, unknown>),
+    model: f.body.model, reasoning: f.body.reasoning, previous_response_id: "unavailable-response" };
+  const response = await f.send(next);
+  expect(response.status).toBe(200);
+  expect((await response.json()).status).toBe("completed");
+  expect(f.pages.size).toBe(1);
+  expect(f.submissions).toHaveLength(2);
+  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
 });
 
 test("HTTP streamed compaction failure preserves its deterministic code and never emits a completed checkpoint", async () => {
@@ -1664,7 +1656,7 @@ for (const taskUpdates of [false, true]) for (const variant of ["identical", "ch
     };
     const send = (value: unknown) => responseRequest(new Request("http://fixture.invalid/v1/responses", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
-    }), f.config, factory, { rememberState: false });
+    }), f.config, factory, {});
     const first = send(body);
     await firstPrepared;
     const other = structuredClone(body);

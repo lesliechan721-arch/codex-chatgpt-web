@@ -175,6 +175,10 @@ try {
   // Exercise the exported provider against the real authenticated HTTP catalog, without a file.
   const apiKey = `cgw_${"s".repeat(43)}`;
   const policy = apiKeyPolicy(apiKey);
+  const pickerUpstream = parseUpstreamProviderConfig({
+    ...smokeUpstream,
+    models: [{ id: "codex-auto-review" }, { id: "gpt-6-luna" }],
+  });
   const requests: Array<{ path: string; authorized: boolean }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
@@ -182,7 +186,9 @@ try {
       const url = new URL(request.url);
       requests.push({ path: url.pathname + url.search, authorized: request.headers.get("authorization") === `Bearer ${apiKey}` });
       if (url.pathname !== "/v1/models") return new Response(null, { status: 404 });
-      return modelsRequest(request, config, undefined, undefined, policy);
+      return modelsRequest(request, config, undefined, undefined, policy, undefined, {
+        available: true, keyMatches: true, apiKey: "smoke-upstream-key", config: pickerUpstream,
+      }, async () => Response.json({ data: pickerUpstream.models.map(({ id }) => ({ id })) }));
     },
   });
   try {
@@ -208,13 +214,20 @@ try {
       ]);
     } finally { clearTimeout(timer); }
     if (exitCode !== 0) throw new Error(`Codex HTTP catalog failed: ${stderr.replaceAll(apiKey, "[REDACTED]")}`);
-    const dynamic = JSON.parse(stdout) as { models: Array<{ slug: string }> };
-    const expectedSlugs = availableChatGptWebModelRoutes(config).map(route => route.slug).sort();
+    const dynamic = JSON.parse(stdout) as { models: Array<{ slug: string; visibility: string; supported_in_api: boolean }> };
+    const webSlugs = availableChatGptWebModelRoutes(config).map(route => route.slug);
+    const expectedSlugs = [...webSlugs, "codex-auto-review", "gpt-6-luna"].sort();
     const actualSlugs = dynamic.models.map(model => model.slug).sort();
     if (JSON.stringify(actualSlugs) !== JSON.stringify(expectedSlugs)
       || !requests.length || requests.some(request => !request.authorized
         || request.path !== `/v1/models?client_version=${sourceLock.tag.replace("rust-v", "")}`)) {
       throw new Error(`Codex did not load the exported HTTP catalog: ${JSON.stringify({ actualSlugs, expectedSlugs, requests })}`);
+    }
+    const review = dynamic.models.find(model => model.slug === "codex-auto-review");
+    const visibleSlugs = dynamic.models.filter(model => model.visibility === "list").map(model => model.slug).sort();
+    if (review?.visibility !== "hide" || review.supported_in_api !== true
+      || JSON.stringify(visibleSlugs) !== JSON.stringify([...webSlugs, "gpt-6-luna"].sort())) {
+      throw new Error(`Codex did not preserve reviewer and ordinary model visibility: ${JSON.stringify({ review, visibleSlugs })}`);
     }
   } finally { server.stop(true); }
   process.stdout.write("NATIVE_CODEX_CATALOG_SMOKE_OK\n");

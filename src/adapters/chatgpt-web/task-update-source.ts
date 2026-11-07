@@ -109,7 +109,7 @@ export function captureTaskUpdateSource(
   if (messages.length === 0 && !continuity) return undefined;
   const input = cloneRequestValue(body.input);
   const requestFingerprint = taskUpdateDigest({ input, modelId: parsed.modelId, options: parsed.options,
-    instructions: body.instructions ?? null, previousResponseId: parsed.previousResponseId ?? null });
+    instructions: body.instructions ?? null });
   const metadataRaw = record(body.client_metadata)?.["x-codex-turn-metadata"];
   let metadata = record(metadataRaw);
   if (typeof metadataRaw === "string") { try { metadata = record(JSON.parse(metadataRaw)); } catch {} }

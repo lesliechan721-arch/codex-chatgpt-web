@@ -1,5 +1,11 @@
 # Context navigation
 
+Context comes from the current Codex request, including instructions, tool calls and results,
+and readable compaction summaries. It need not reproduce all history from before compaction.
+The bridge does not reconstruct omitted history from old response IDs or compare a Responses
+cache to choose a page. Environment provenance, native turn identity, tool authorization,
+context delivery, and compaction recovery checks still apply.
+
 Automatic and Zero Risk Full/MCP tasks compare inline and on-demand candidates by default,
 including GPT-6 Instant and Luna/Think. Short inputs can stay inline when reading gives no complete
 cost benefit. This does not require a setting. Browser-only adds no MCP tools; upstream API
@@ -634,7 +640,7 @@ live image evidence and the remaining acceptance requirements.
 ## Page replacement and source reconstruction
 
 Retired or restarted snapshots do not provide a permanent original-text store. Rebuild from the
-current authenticated request, legal previous-response expansion, or still-held verifiable content.
+current authenticated request or still-held verifiable content.
 A specifically bound checkpoint may cover its earlier history, but cannot recover discarded bytes.
 A digest, URL, expired reference, or result-exists record does not replace source content. For
 supported closed or unknown-page recovery, revoke old project permissions and make a best effort

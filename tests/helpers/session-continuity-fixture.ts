@@ -279,7 +279,8 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       features: [CONTINUITY_FEATURE, CONTINUITY_RECOVERY_FEATURE, CONTINUITY_EXECUTION_FENCING_FEATURE], endpoint: `http://127.0.0.1:${server.port}`,
       control: { endpoint: `http://127.0.0.1:${server.port}`, token: "a".repeat(43) },
       helper: { executable: process.execPath, script: testFilePath },
-      partition: "persist:codex-web-gpt-dev-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+      partition: `persist:codex-web-gpt-dev-chatgpt${process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID && process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID !== "default"
+        ? `-account-${process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID}` : ""}`, idleUrl: LAUNCHER_BROWSER_IDLE_URL,
       surfaceId: "a".repeat(32), surfaceTargets: {}, createdAt: new Date().toISOString(),
     };
     writeFileSync(descriptorPath, JSON.stringify(descriptor), { mode: 0o600 });
@@ -723,13 +724,13 @@ export function createSessionContinuityFixtures(testFilePath: string) {
       reasoning: { effort: manual ? "low" : "medium" },
       stream: false,
     };
-    const send = (value: unknown, compact = false, rememberState = false, signal?: AbortSignal) => {
+    const send = (value: unknown, compact = false, signal?: AbortSignal) => {
       const request = new Request(`http://127.0.0.1/v1/responses${compact ? "/compact" : ""}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
         ...(signal ? { signal } : {}),
       });
       return compact ? compactRequest(request, config, () => f.adapter())
-        : responseRequest(request, config, () => f.adapter(), { rememberState });
+        : responseRequest(request, config, () => f.adapter());
     };
     return { ...f, config, body, send };
   }
