@@ -112,13 +112,19 @@ for (const model of bundledArtifact.models) {
   bundledBySlug.set(model.slug, Object.freeze(model));
 }
 
+function pickerVisibility(modelId) {
+  // Guardian still needs this row, but Codex treats visible codex-auto-* rows as homepage choices.
+  // Keep the reviewer hidden even when fallback metadata replaces its bundled baseline.
+  return modelId === "codex-auto-review" ? "hide" : "list";
+}
+
 function genericBaseline(modelId, shellType) {
   const model = {
     slug: modelId,
     display_name: modelId,
     supported_reasoning_levels: [],
     shell_type: shellType,
-    visibility: "list",
+    visibility: pickerVisibility(modelId),
     supported_in_api: true,
     priority: 99,
     support_verbosity: false,
@@ -212,7 +218,7 @@ function trustedFields(model) {
 function applyProjectBoundary(model, modelId, trusted) {
   const result = { ...model, ...trusted };
   result.slug = modelId;
-  result.visibility = "list";
+  result.visibility = pickerVisibility(modelId);
   result.supported_in_api = true;
   return result;
 }

@@ -91,7 +91,7 @@ An older custom configuration that becomes invalid after a schema upgrade must s
 
 ## Codex schema and project instruction boundary
 
-Every published model always satisfies `slug == selected ID`, `visibility == "list"`, and `supported_in_api == true`. The following Agent-control metadata can come only from trusted project bundled or generic baselines:
+Every published model always satisfies `slug == selected ID` and `supported_in_api == true`. Selected models use `visibility == "list"`, except `codex-auto-review`, which uses `visibility == "hide"` in every metadata mode. The reviewer remains in the catalog and routing allowlist for Guardian, but does not appear in the Codex model picker. This also prevents it from triggering the `codex-auto-*` homepage menu and moving ordinary models into All models. Upstream metadata and custom overrides cannot change this visibility rule. The following Agent-control metadata can come only from trusted project bundled or generic baselines:
 
 ```text
 base_instructions

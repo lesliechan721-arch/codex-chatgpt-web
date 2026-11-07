@@ -139,6 +139,36 @@ test("API-key model catalog accepts OpenAI-compatible data arrays without an obj
   assert.ok(payload.data.some(row => row.id === "gpt-upstream"));
 });
 
+test("the HTTP catalog hides the review model from the picker and keeps it routable for reviews", async () => {
+  const runtime = upstream([{ id: "codex-auto-review" }, { id: "gpt-6-luna" }]);
+  const cfg = { ...config(), browserInteractionMode: "manual" as const };
+  const response = await modelsRequest(
+    new Request("http://127.0.0.1/v1/models", { headers: { authorization: `Bearer ${key}` } }),
+    cfg, undefined, undefined, accessPolicy, undefined, runtime,
+    async () => Response.json({ data: [{ id: "codex-auto-review" }, { id: "gpt-6-luna" }] }),
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json() as {
+    data: Array<{ id: string }>;
+    models: Array<{ slug: string; visibility: string; supported_in_api: boolean }>;
+  };
+  assert.ok(payload.data.some(row => row.id === "codex-auto-review"));
+  assert.deepEqual(payload.models.filter(row => row.visibility === "list").map(row => row.slug),
+    ["chatgpt-web/zero-risk", "gpt-6-luna"]);
+  assert.equal(payload.models.find(row => row.slug === "codex-auto-review")?.visibility, "hide");
+  assert.equal(payload.models.find(row => row.slug === "codex-auto-review")?.supported_in_api, true);
+
+  let forwarded = 0;
+  const review = await responseRequest(jsonRequest("/v1/responses", {
+    model: "codex-auto-review", input: "Review this action", stream: false,
+  }), cfg, () => { throw new Error("Reviews must use the upstream provider"); }, {
+    accessPolicy, upstreamRuntime: runtime,
+    fetchUpstreamProvider: async () => { forwarded++; return Response.json({ ok: true }); },
+  });
+  assert.equal(review.status, 200);
+  assert.equal(forwarded, 1);
+});
+
 test("upstream catalog failures return the complete local catalog without stale data", async () => {
   let failure: unknown;
   const response = await modelsRequest(
