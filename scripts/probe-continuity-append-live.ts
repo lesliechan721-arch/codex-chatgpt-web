@@ -403,7 +403,7 @@ try {
         record("append-with-real-result", { sequence: entry.sequence, resultCount: resultItems.length });
       }
       const response = await responseRequest(request, config, adapterFactory, {
-        rememberState: false, onTurnIdentity: () => controller.signal,
+        onTurnIdentity: () => controller.signal,
         onAdapterEvent(event) {
           if (event.type === "error") {
             const message = redact(event.message);

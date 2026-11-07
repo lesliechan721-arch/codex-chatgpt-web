@@ -635,8 +635,8 @@ export class ChatGptThreadEnvironmentStore {
       if (this.codexHomes.length > 1) {
         throw new Error("No current native Codex task proof in the trusted homes", { cause: error });
       }
-      // Custom-provider compaction can replay full history without previous_response_id. Bind
-      // that history to an input previously accepted with this exact trusted authority, not to
+      // Custom-provider compaction can replay full history. Bind that history to an input
+      // previously accepted with this exact trusted authority, not to
       // XML supplied by this request. Current updates and unproven suffixes remain fail-closed.
       if (!hasCurrentContext && parsed._compactionRequest) diagnostics.recovery_stage = "compaction_replay";
       const replay = !hasCurrentContext && parsed._compactionRequest

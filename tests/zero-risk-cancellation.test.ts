@@ -41,7 +41,7 @@ async function send(value = body()) {
       emit({ type: "text_delta", text: "Accepted new work.", phase: "final_answer" });
       emit({ type: "done", stopReason: "stop", endTurn: true });
     } };
-  }, { rememberState: false });
+  }, {});
   const result = await response.json();
   return { response, result, starts };
 }

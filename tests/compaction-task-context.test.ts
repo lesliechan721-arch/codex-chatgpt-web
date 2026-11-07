@@ -68,7 +68,7 @@ for (const format of ["v1", "v2"] as const) {
             expect(JSON.stringify(parsed.context.messages)).toBe(before);
             emit({ type: "text_delta", text: "Observed model-facing context", phase: "final_answer" });
             emit({ type: "done", stopReason: "stop", endTurn: true });
-          } }), { rememberState: false });
+          } }), {});
         const observed = await response.json();
         expect(response.status).toBe(200);
         expect(observed.status).toBe("completed");

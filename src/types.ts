@@ -1,6 +1,5 @@
 export interface CodexParsedRequest {
   modelId: string;
-  previousResponseId?: string;
   context: CodexContext;
   stream: boolean;
   options: CodexRequestOptions;
@@ -24,8 +23,6 @@ export interface CodexParsedRequest {
   /** Canonical provider scope and exact old keys, computed from trusted local configuration. */
   _continuityCanonicalScope?: string;
   _continuityLegacyScopes?: string[];
-  /** Number of leading raw input items restored from local previous_response_id state. */
-  _replayPrefixLen?: number;
   /**
    * A dedicated native compaction request (local Responses or remote v1/v2).
    * This controls summarization and lifecycle, not the output wire format.
@@ -207,14 +204,6 @@ export interface CodexRequestOptions {
 
 export type CodexMessagePhase = "commentary" | "final_answer";
 
-/**
- * Provider-private state that must follow a locally expanded `previous_response_id` chain.
- * Kept out of public Responses output and persisted only in the bounded local continuation cache.
- */
-export interface CodexProviderContinuationState {
-  [provider: string]: Record<string, unknown> | undefined;
-}
-
 export type AdapterEvent =
   | { type: "heartbeat" }
   | { type: "text_delta"; text: string; phase?: CodexMessagePhase }
@@ -233,7 +222,6 @@ export type AdapterEvent =
       usage?: CodexUsage;
       stopReason?: string;
       endTurn?: boolean;
-      providerState?: CodexProviderContinuationState;
       /** Public Responses metadata for explicit protocol diagnostics. */
       responseMetadata?: Record<string, string>;
     }
@@ -244,7 +232,6 @@ export type AdapterEvent =
       usage?: CodexUsage;
       retryable?: boolean;
       endTurn?: boolean;
-      providerState?: CodexProviderContinuationState;
     }
   // `usage` carries best-effort partial consumption when a turn dies before a clean done
   // so failed requests can log best-effort token counts.

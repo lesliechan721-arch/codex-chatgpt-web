@@ -299,8 +299,6 @@ export function trustedEnvironmentRequestFingerprint(parsed: CodexParsedRequest)
   update(parsed.modelId);
   update(identity.threadId);
   update(identity.turnId);
-  update(parsed.previousResponseId);
-  update(parsed._replayPrefixLen ?? 0);
   update(input.length);
   for (const value of input) {
     const item = record(value);
@@ -1548,14 +1546,7 @@ function rawEnvironmentText(parsed: CodexParsedRequest): string | undefined {
   // item metadata is incomplete. Never mask malformed permissions/cwd with a previous turn.
   if (hasCurrentChatGptEnvironmentContext(parsed)) return undefined;
 
-  const replayPrefixLen = Math.min(parsed._replayPrefixLen ?? 0, input.length);
-  for (let index = replayPrefixLen - 1; index > 0; index -= 1) {
-    const replayed = environmentBeforeUser(input, index, undefined, metadata);
-    if (replayed) return replayed;
-  }
-
-  // Codex can resume a local task by explicitly replaying its native transcript instead of
-  // sending previous_response_id. In that shape, accept a historical environment/user pair only
+  // Codex can resume a local task with its native transcript. Accept a historical environment/user pair only
   // when both items carry the same native turn_id and either completed assistant output separates
   // that turn from the active user or the complete historical pair is server-owned and its
   // filesystem authority still matches the current thread's canonical workspace/sandbox metadata.

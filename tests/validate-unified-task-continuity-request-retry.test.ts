@@ -112,7 +112,7 @@ function publicLossFixture(successorFails = false) {
   const store = new ContinuityRecoveryStore(statePath), thread = continuityDigest(threadId);
   const received: Array<{ body: string; headers: Readonly<Record<string, string>>; signal: AbortSignal }> = [];
   const http = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => responseRequest(request, config,
-    () => createChatGptWebAdapter(provider, { broker }), { rememberState: false, onTurnIdentity: () => request.signal,
+    () => createChatGptWebAdapter(provider, { broker }), { onTurnIdentity: () => request.signal,
       onAdapterEvent: event => { if (event.type === "tool_call_start") dispatches++; } }) });
   const send: HarnessRequestOptions["send"] = async exact => {
     received.push(exact);

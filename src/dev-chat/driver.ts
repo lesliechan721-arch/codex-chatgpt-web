@@ -524,7 +524,6 @@ export class DevChatDriver {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       }), this.config, this.adapterFactory, {
-        rememberState: false,
         onAdapterEvent: event => observeAdapterEvent(event, emit),
       });
       const envelope = await response.json() as ResponsesEnvelope;

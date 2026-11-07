@@ -406,11 +406,19 @@ that page closed or unknown, the old stop cannot block recovery. Late stops, too
 updates/ACK, Send receipts, and checkpoint commits cannot restore cleaned records or affect a
 new generation. Already-issued external commands may still run.
 
-The independent `previous_response_id` cache retains its one-hour memory and disk behavior,
-capacity limits, and expiry collection. It can contain input and output bodies after page task
-cleanup. It only expands API input; it does not prove a live page or old ownership. Missing or
-expired cache data returns the existing 409 context error: resend full canonical history through
-normal client handling. A chat URL, hash, or old task record cannot supply missing bytes.
+Codex supplies the current context in each HTTP request, including instructions, tool calls and
+results, and any compaction summary. A healthy page can continue when Codex adds metadata or
+uses an equivalent history representation. Page selection uses actual page liveness, task scope,
+and execution ownership. After a runtime restart or account switch destroys the old page, the
+current request supplies the context for a new page.
+
+The local Web route ignores an extra `previous_response_id`; it does not restore omitted history
+or return a cache-missing error. General request validation and tool/result authorization still
+apply. Native and API Key upstream routes use generic passthrough rules, including when bridge
+artifacts need conversion. The upstream decides whether it supports extra request fields.
+
+Legacy `responses-state.json` files are not read, created, or updated. Startup does not scan or
+delete them. Account removal retains responsibility for deleting that account’s legacy data.
 
 A fresh page must satisfy actual HTTP, parsing, readable-source, input/output, attachment,
 navigation, snapshot, account, and physical-capacity limits. Do not silently trim required text,

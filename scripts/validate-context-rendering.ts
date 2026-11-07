@@ -291,7 +291,7 @@ export async function executeLiveRequestPipeline(body: ReturnType<typeof createL
     headers: { "content-type": "application/json", "x-codex-turn-metadata": metadata }, body: encoded, signal: options.signal });
   if (purpose === "ordinary") {
     options.onStage?.("ordinary");
-    return responseRequest(request(), config, provider => adapterFactory(options.configureProvider?.(provider) ?? provider), { rememberState: false,
+    return responseRequest(request(), config, provider => adapterFactory(options.configureProvider?.(provider) ?? provider), {
       onAdapterEvent: event => options.onAdapterEvent?.("ordinary", event) });
   }
   let stage: LiveStage = "primer", sourceParsed: CodexParsedRequest | undefined, sourceProvider: CodexProviderConfig | undefined;
@@ -315,7 +315,7 @@ export async function executeLiveRequestPipeline(body: ReturnType<typeof createL
     } };
   };
   options.onStage?.(stage);
-  const primerResponse = await responseRequest(request(), config, factory, { rememberState: false,
+  const primerResponse = await responseRequest(request(), config, factory, {
     onAdapterEvent: event => options.onAdapterEvent?.("primer", event) });
   const envelope = await primerResponse.json() as Record<string, any>;
   const primer = { httpStatus: primerResponse.status, envelope };

@@ -86,7 +86,6 @@ import {
   extractCompactUserMessages,
 } from "./responses/compaction";
 import { parseRequest } from "./responses/parser";
-import { expandPreviousResponseInput, flushResponseState, rememberResponseState, ResponseContinuationError } from "./responses/state";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
@@ -422,8 +421,6 @@ type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapt
 export interface ResponseRequestOptions {
   /** Explicit HTTP policy; internal DEV callers retain their existing in-process behavior. */
   accessPolicy?: ApiAccessPolicy;
-  /** DEV and other in-process harnesses can keep continuation state in their own canonical store. */
-  rememberState?: boolean;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
   onAdapterEvent?: (event: AdapterEvent, context: { compaction: boolean }) => void;
   /** Observe proven native-turn progress at its source, before replay or output buffering. */
@@ -1199,22 +1196,12 @@ export async function responseRequest(
       );
     }
   }
-  const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as { previous_response_id?: unknown }).previous_response_id
-    : undefined;
-  let expanded: unknown;
-  try {
-    expanded = expandPreviousResponseInput(raw);
-  } catch (error) {
-    if (error instanceof ResponseContinuationError) return formatErrorResponse(409, "invalid_request_error", error.message);
-    throw error;
-  }
   const prediction = isCodexComposerPrediction(raw);
   let executionConfig = config;
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
   try {
-    parsed = parseRequest(expanded);
+    parsed = parseRequest(raw);
     if (prediction) executionConfig = configureComposerPrediction(parsed, config);
     route = routeChatGptWebRequest(parsed, executionConfig);
   } catch (error) {
@@ -1226,13 +1213,6 @@ export async function responseRequest(
       "invalid_request_error",
       "ChatGPT Web cannot read this encrypted cross-backend subagent payload. "
         + "Start a new Compatibility V1 task, or delegate from a Web model whose collaboration call uses the plaintext-delivery marker.",
-    );
-  }
-  if (typeof requestedPreviousResponseId === "string" && expanded === raw) {
-    return formatErrorResponse(
-      409,
-      "invalid_request_error",
-      "Local continuation state for previous_response_id is unavailable; refusing to run ChatGPT Web with partial Codex context. Compact the Codex task or start a new task before retrying.",
     );
   }
 
@@ -1251,11 +1231,8 @@ export async function responseRequest(
     && parsed._compactionOutput !== "message"
     && parsed._compactionResponseFormat !== "message";
   let traceId: string | undefined;
-  const rememberCompletedResponse = (response: Record<string, unknown>): void => {
-    if (!compaction) {
-      if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
-      return;
-    }
+  const rememberCompletedCompaction = (response: Record<string, unknown>): void => {
+    if (!compaction) return;
     // Continuity records both producer representations at commit; cached HTTP reads add none.
     if (parsed._conversationPolicy === "task" || response.status !== "completed") return;
     const identity = extractChatGptTurnIdentity(parsed);
@@ -1459,7 +1436,7 @@ export async function responseRequest(
           ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
           : {}),
         ...(compactionItem ? { compaction: true } : {}),
-        onCompletedResponse: rememberCompletedResponse,
+        onCompletedResponse: rememberCompletedCompaction,
       },
     );
     return new Response(stream, {
@@ -1483,7 +1460,7 @@ export async function responseRequest(
     toolSearchToolNames: maps.toolSearchToolNames,
     ...(compactionItem ? { compaction: true } : {}),
   });
-  rememberCompletedResponse(json);
+  rememberCompletedCompaction(json);
   return Response.json(json);
 }
 
@@ -2183,7 +2160,6 @@ export function startServer(
     chatGptTurnSessions.clear();
     turnIdleLeases?.clear();
     modelCatalogFetches.close();
-    flushResponseState();
     shutdownPromise = (async () => {
       const results = await Promise.allSettled([
         closeChatGptBrowserWorkers(),

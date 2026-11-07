@@ -601,13 +601,13 @@ function httpFixture(manual = false, taskUpdates = false, options: { root?: stri
     reasoning: { effort: manual ? "low" : "medium" },
     stream: false,
   };
-  const send = (value: unknown, compact = false, rememberState = false, signal?: AbortSignal) => {
+  const send = (value: unknown, compact = false, signal?: AbortSignal) => {
     const request = new Request(`http://127.0.0.1/v1/responses${compact ? "/compact" : ""}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(value),
       ...(signal ? { signal } : {}),
     });
     return compact ? compactRequest(request, config, () => f.adapter())
-      : responseRequest(request, config, () => f.adapter(), { rememberState });
+      : responseRequest(request, config, () => f.adapter());
   };
   return { ...f, config, body, send };
 }

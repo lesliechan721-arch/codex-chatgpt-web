@@ -2429,7 +2429,7 @@ test("remote compaction progress refreshes the existing native turn idle lease w
   }
 });
 
-test("pre-adapter 400 and 409 responses do not create remote native turn idle leases", async () => {
+test("invalid request input does not create remote native turn idle leases", async () => {
   const previousTimeout = process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC;
   process.env.CODEX_CHATGPT_WEB_REMOTE_TURN_IDLE_TIMEOUT_SEC = "1";
   const config = { ...defaultConfig("browser-only"), port: 0 };
@@ -2473,30 +2473,6 @@ test("pre-adapter 400 and 409 responses do not create remote native turn idle le
       active_remote_turn_idle_leases: 0,
     });
 
-    const missingThreadId = "thread_remote_missing_continuation";
-    const missingTurnId = "turn_remote_missing_continuation";
-    const missingContinuation = await request({
-      model: "chatgpt-web/high",
-      stream: false,
-      previous_response_id: "resp_state_not_available",
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify({
-          thread_id: missingThreadId,
-          turn_id: missingTurnId,
-        }),
-      },
-      input: [{
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "This continuation has no local state." }],
-        internal_chat_message_metadata_passthrough: { turn_id: missingTurnId },
-      }],
-    });
-    expect(missingContinuation.status).toBe(409);
-    expect(await health()).toMatchObject({
-      active_http_turns: 0,
-      active_remote_turn_idle_leases: 0,
-    });
     expect(adapterConstructions).toBe(0);
   } finally {
     await server.stop(true);

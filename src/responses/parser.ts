@@ -15,7 +15,6 @@ import type {
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import { compactionItemToText, isNativeTextCompaction } from "./compaction";
-import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { isNativeSelectedSkillContext, readNativeThreadDelegation } from "./native-context";
 
@@ -390,7 +389,6 @@ export function inheritParsedRequestRuleSourceEvidence(parsed: CodexParsedReques
 }
 
 export function parseRequest(body: unknown): CodexParsedRequest {
-  const replayedInputPrefixLength = previousResponseReplayPrefixLength(body);
   const parsed = responsesRequestSchema.safeParse(body);
   if (!parsed.success) {
     throw new Error(`responses parse error: ${parsed.error.message}`);
@@ -754,12 +752,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   const textCompaction = !compactionRequest && isNativeTextCompaction(body);
   const request: CodexParsedRequest = {
     modelId: data.model,
-    ...(data.previous_response_id ? { previousResponseId: data.previous_response_id } : {}),
     context,
     stream: data.stream === true,
     options,
     _rawBody: body,
-    ...(replayedInputPrefixLength > 0 ? { _replayPrefixLen: replayedInputPrefixLength } : {}),
     ...(compactionRequest || textCompaction ? { _compactionRequest: true } : {}),
     ...(localCompaction ? { _compactionOutput: "message" as const } : {}),
     ...(textCompaction ? { _compactionResponseFormat: "message" as const } : {}),

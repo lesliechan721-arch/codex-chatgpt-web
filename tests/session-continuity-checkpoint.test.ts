@@ -1403,7 +1403,7 @@ for (const boundary of ["missing-result", "conflicting-result", "stopped", "abor
       if (boundary === "abort") controller.abort();
     });
     try {
-      const response = await f.send(f.compactBody, false, false, controller.signal), body = await response.json();
+      const response = await f.send(f.compactBody, false, controller.signal), body = await response.json();
       expect(response.status).not.toBe(200);
       if (boundary !== "abort") expect(body.error.code).toBe(boundary === "missing-result"
         ? "continuity_source_unproven" : boundary === "conflicting-result" ? "continuity_result_conflict"

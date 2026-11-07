@@ -266,7 +266,7 @@ the launcher never send that header. This closes the browser path only and is no
 The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
 `/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
 user-only application config. The launcher uses them to reject new work, prove that both the HTTP
-request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
+request and long-lived browser/tool loop are idle, and stop a process. The
 token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
 or unauthenticated lifecycle control through ordinary requests.
 
@@ -294,10 +294,12 @@ and upstream API forwarding retain their existing contracts.
 Browser turns use at most five independent task-bound pages in one private login partition.
 Every task has its own exact Launcher surface lease; chats are not shared across tasks. Closing
 a page terminates that page's execution, but a later request may recover in a new page. Tool
-round trips remain in the same response. The independent `previous_response_id` input/output
-cache retains its one-hour memory and disk lifetime and capacity limits. It can outlive page task
-cleanup; it grants no page ownership or tool authority. A missing or expired entry still produces
-the existing 409 API-context error and requires full canonical input.
+round trips remain in the same response. Context comes from the current Codex request, including
+readable compaction summaries. The bridge does not keep a Responses history cache or read
+another account’s response history. Account switches stop the old runtime and destroy its pages.
+Historical tool calls and results are context only; they do not grant execution authority.
+Environment provenance, native turn identity, tool/result association, cancellation, page leases,
+and compaction recovery proofs retain their independent checks.
 
 Choose the page branch before historical admission checks. A current authenticated Launcher must
 confirm the actual page and its execution generation before the bridge treats it as alive. A disk

@@ -187,7 +187,7 @@ test("removes ChatGPT Web item identities before native Codex compaction", async
     previous_response_id?: string;
     input: Array<Record<string, unknown>>;
   };
-  expect(forwarded).not.toHaveProperty("previous_response_id");
+  expect(forwarded.previous_response_id).toBe(body.previous_response_id);
   expect(forwarded.input.every(item => !("id" in item))).toBe(true);
   expect(forwarded.input.some(item => "encrypted_content" in item
     && typeof item.encrypted_content === "string"
@@ -249,6 +249,7 @@ test("converts mixed Web history across native turns and both compaction protoco
         expect(forwarded.headers.get("content-length")).toBeNull();
         expect(await forwarded.json()).toEqual({
           model: body.model,
+          previous_response_id: body.previous_response_id,
           input: [
             { type: "message", role: "user", content: [{
               type: "input_text", text: `${SUMMARY_PREFIX}\n\n${summary}`,

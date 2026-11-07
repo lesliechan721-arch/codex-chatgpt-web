@@ -745,39 +745,6 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
   });
 
-  test("recovers the trusted environment from a locally restored previous_response prefix", () => {
-    const first = rawWireRequest(environmentXml);
-    const firstInput = (first._rawBody as { input: unknown[] }).input;
-    const request = parsed();
-    const turnId = "turn_test_456";
-    request._rawBody = {
-      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ turn_id: turnId }) },
-      input: [
-        ...structuredClone(firstInput),
-        {
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text: "First turn complete" }],
-        },
-        {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Continue in the same repository" }],
-          internal_chat_message_metadata_passthrough: { turn_id: turnId },
-        },
-      ],
-    };
-    request._replayPrefixLen = firstInput.length + 1;
-
-    expect(extractChatGptTurnEnvironment(request)).toEqual({
-      cwd: tempRoot,
-      roots: [tempRoot],
-      writableRoots: [tempRoot],
-      sandboxPolicy: { type: "dangerFullAccess" },
-      tools,
-    });
-  });
-
   test("recovers the trusted environment from a native full-history Codex resume", () => {
     const first = rawWireRequest(environmentXml);
     const firstInput = (first._rawBody as { input: unknown[] }).input;

@@ -82,7 +82,7 @@ try {
             usage: { inputTokens: automatic && observed.length === 0 ? 200 : 10, outputTokens: 5, totalTokens: automatic && observed.length === 0 ? 205 : 15 },
           });
         },
-      }), { rememberState: false });
+      }));
       const wire = await response.text();
       const completedResponses = [...wire.matchAll(/data: (.+)/g)].flatMap(match => {
         if (match[1] === "[DONE]") return [];

@@ -619,7 +619,7 @@ export function createChatGptWebAdapter(
         ...resolution,
       };
       console.warn(
-        `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ? "present" : "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length}, error_type=${failure.errorType}, reason=${failure.reason}, error_code=${failure.errorCode ?? "none"}, ${Object.entries(diagnostics).map(([key, value]) => `${key}=${value}`).join(", ")})`,
+        `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, context_messages=${parsed.context.messages.length}, error_type=${failure.errorType}, reason=${failure.reason}, error_code=${failure.errorCode ?? "none"}, ${Object.entries(diagnostics).map(([key, value]) => `${key}=${value}`).join(", ")})`,
       );
       throw error;
     }

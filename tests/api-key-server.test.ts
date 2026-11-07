@@ -404,7 +404,6 @@ test("Web models remain local when a custom upstream is available", async () => 
     accessPolicy,
     upstreamRuntime: upstream([]),
     fetchUpstreamProvider: async () => { forwarded++; throw new Error("must stay local"); },
-    rememberState: false,
   });
   assert.equal(response.status, 200);
   assert.equal(forwarded, 0);
@@ -429,7 +428,7 @@ test("authenticated JSON and SSE responses retain the adapter contract without f
     } });
     const req = jsonRequest("/v1/responses", { model: "chatgpt-web/high", input: "hello", stream });
     req.headers.set("cookie", "not-for-browser=secret");
-    const response = await responseRequest(req, config(), adapter, { accessPolicy, rememberState: false });
+    const response = await responseRequest(req, config(), adapter, { accessPolicy });
     assert.equal(response.status, 200);
     const text = await response.text();
     assert.equal(called, 1);
@@ -447,7 +446,7 @@ test("local compaction v1 and v2 continue through the existing summary bridge", 
   assert.ok(Array.isArray((await v1.json() as { output: unknown[] }).output));
   const v2 = await responseRequest(jsonRequest("/v1/responses", {
     ...base, input: [...base.input, { type: "compaction_trigger" }],
-  }), config(), silentAdapter, { accessPolicy, rememberState: false });
+  }), config(), silentAdapter, { accessPolicy });
   assert.equal(v2.status, 200);
   const output = (await v2.json() as { output: Array<{ type: string }> }).output;
   assert.equal(output.length, 1);

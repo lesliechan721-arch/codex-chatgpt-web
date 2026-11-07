@@ -1,12 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig } from "../src/config";
-import { parseRequest } from "../src/responses/parser";
-import { flushResponseState } from "../src/responses/state";
-import { responseRequest } from "../src/server";
-import { codexRoundtrippedOutput, createSessionContinuityFixtures } from "./helpers/session-continuity-fixture";
+import { codexRoundtrippedOutput, createSessionContinuityFixtures, deliveredStartupSources } from "./helpers/session-continuity-fixture";
 
 const fixtures = createSessionContinuityFixtures(import.meta.path);
 const accountB = "12345678-1234-4123-8123-123456789abc";
@@ -14,7 +10,6 @@ const keys = ["CODEX_CHATGPT_WEB_HOME", "CODEX_CHATGPT_WEB_APPLICATION_HOME", "C
 const original = Object.fromEntries(keys.map(key => [key, process.env[key]]));
 const roots: string[] = [];
 afterEach(async () => {
-  flushResponseState();
   await fixtures.disposeTestFixtures();
   for (const key of keys) {
     if (original[key] === undefined) delete process.env[key]; else process.env[key] = original[key];
@@ -22,7 +17,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-test("A -> B -> A rebuilds the retained page when B added task history; an unchanged A head still reuses its page", async () => {
+function accounts() {
   const app = mkdtempSync(join(tmpdir(), "account-page-history-"));
   roots.push(app);
   const registry = join(app, "accounts.json");
@@ -30,53 +25,84 @@ test("A -> B -> A rebuilds the retained page when B added task history; an uncha
     { id: "default", name: "A", legacy: true, status: "active" },
     { id: accountB, name: "B", legacy: false, status: "active" },
   ] }));
-  function select(id: "default" | typeof accountB) {
+  return (id: "default" | typeof accountB) => {
     const home = id === "default" ? app : join(app, "accounts", id, "core");
     mkdirSync(home, { recursive: true });
     process.env.CODEX_CHATGPT_WEB_HOME = home;
     process.env.CODEX_CHATGPT_WEB_APPLICATION_HOME = app;
     process.env.CODEX_CHATGPT_WEB_ACCOUNT_ID = id;
     process.env.CODEX_CHATGPT_WEB_ACCOUNTS_PATH = registry;
-  }
-  select("default");
-  const f = fixtures.httpFixture(false, false, { root: app, threadId: "account-switch-task" });
-  const first = await (await f.send(f.body, false, true)).json();
-  expect(first.status).toBe("completed");
-  const normalRaw = f.next(parseRequest(f.body))._rawBody as { input: unknown[] };
-  const normal = { ...normalRaw, model: f.body.model, reasoning: f.body.reasoning,
-    input: [...f.body.input, ...codexRoundtrippedOutput(first.output), normalRaw.input.at(-1)] };
-  const second = await (await f.send(normal, false, true)).json();
-  expect(second.status).toBe("completed");
-  expect(f.submissions).toHaveLength(2);
-  expect(f.submissions[1]!.key).toBe(f.submissions[0]!.key);
-  flushResponseState();
+    return home;
+  };
+}
 
-  function delta(turnId: string, previousId: string) {
-    return { ...f.body, previous_response_id: previousId,
-      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: turnId }) },
-      input: [{ type: "message", id: `msg-${turnId}`, role: "user", content: `Instruction for ${turnId}.`,
-        internal_chat_message_metadata_passthrough: { turn_id: turnId } }] };
+for (const account of ["default", accountB] as const) {
+  for (const cache of ["absent", "expired", "corrupt", "different"] as const) {
+    test(`tool results with Codex metadata keep the live page (account=${account}, old cache=${cache})`, async () => {
+      const home = accounts()(account);
+      const path = join(home, "responses-state.json");
+      const contents = cache === "absent" ? undefined : cache === "corrupt" ? "not JSON" : JSON.stringify({ version: 1, states: [["old-response", {
+        createdAt: Date.now() - (cache === "expired" ? 61 * 60_000 : 0), completed: true, threadId: "metadata-task",
+        items: [{ role: "user", content: "Different old task history." }],
+      }]] });
+      if (contents !== undefined) writeFileSync(path, contents);
+      const f = fixtures.httpFixture(false, false, { root: home, threadId: "metadata-task" });
+      f.controls.invokeSourceTools = true;
+      f.controls.singleSourceTool = true;
+      const first = await (await f.send(f.body)).json();
+      expect(first.error).toBeUndefined();
+      const output = codexRoundtrippedOutput(first.output).map<Record<string, unknown>>(item => ({ ...item,
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-first" },
+      }));
+      const call = output.find(item => item.type === "function_call")!;
+      expect(call).toBeDefined();
+      const page = [...f.pages.values()][0];
+      const continuation = await f.send({ ...f.body, input: [...f.body.input, ...output,
+        { type: "function_call_output", call_id: call.call_id, output: "Actual fixture tool result: 42." },
+      ] });
+      expect(continuation.status).toBe(200);
+      expect((await continuation.json()).status).toBe("completed");
+      expect(f.controls.toolResults).toHaveLength(1);
+      expect(JSON.stringify(f.controls.toolResults)).toContain("Actual fixture tool result: 42.");
+      expect(f.submissions).toHaveLength(1);
+      expect(f.pages.size).toBe(1);
+      expect([...f.pages.values()][0]).toBe(page);
+      await fixtures.disposeTestFixtures();
+      if (contents === undefined) expect(existsSync(path)).toBe(false);
+      else expect(readFileSync(path, "utf8")).toBe(contents);
+    });
   }
-  select(accountB);
-  const responseB = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(delta("turn-b", second.id)),
-  }), defaultConfig("browser-only"), () => ({ name: "B",
-    async runTurn(_parsed, _incoming, emit) {
-      emit({ type: "text_delta", text: "New history committed by B.", phase: "final_answer" });
-      emit({ type: "done", stopReason: "stop", endTurn: true });
-    },
-  }));
-  expect(responseB.status).toBe(200);
-  const committedB = await responseB.json();
-  expect(committedB.status).toBe("completed");
-  flushResponseState();
+}
 
-  select("default");
-  const returned = await f.send(delta("turn-returned-a", committedB.id), false, true);
-  expect(returned.status).toBe(200);
-  expect((await returned.json()).status).toBe("completed");
-  expect(f.submissions).toHaveLength(3);
-  expect(f.submissions[2]!.key).not.toBe(f.submissions[0]!.key);
-  expect(f.submissions[2]!.reused).toBe(false);
-  expect(f.pages.size).toBe(1);
-});
+for (const sequence of [["default", "default"], ["default", accountB], ["default", accountB, "default"]] as const) {
+  test(`restart lifecycle ${sequence.join(" -> ")} destroys old pages and delivers current context`, async () => {
+    const select = accounts();
+    let history: unknown[] = [];
+    for (const [index, account] of sequence.entries()) {
+      const home = select(account);
+      const f = fixtures.httpFixture(false, false, { root: home, threadId: "restart-task" });
+      const turnId = `turn-restart-${index}`;
+      const instruction = `Current instruction from ${account}, step ${index}.`;
+      const body = { ...f.body, input: [...history, { type: "message", role: "user", id: `msg-${turnId}`, content: instruction,
+        internal_chat_message_metadata_passthrough: { turn_id: turnId } }],
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify({ thread_id: f.threadId, turn_id: turnId }) } };
+      const response = await f.send(body);
+      expect(await response.clone().json()).not.toHaveProperty("error");
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result.status).toBe("completed");
+      expect(f.submissions).toHaveLength(1);
+      expect(f.submissions[0]!.reused).toBe(false);
+      const delivered = deliveredStartupSources(f.submissions[0]!.prompt);
+      expect(delivered).toContain(instruction);
+      if (index > 0) expect(delivered).toContain("step 0");
+      history = [...body.input, ...codexRoundtrippedOutput(result.output)];
+      // Account switching stops the old runtime and destroys its browser documents.
+      await fixtures.disposeTestFixtures();
+      f.pages.clear();
+      for (const tab of [...f.recoveryHost.turnTabs.values()]) f.recoveryHost.removeTurnTab(tab);
+      expect(f.pages.size).toBe(0);
+      expect(existsSync(join(home, "responses-state.json"))).toBe(false);
+    }
+  });
+}
