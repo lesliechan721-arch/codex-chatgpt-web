@@ -34,6 +34,7 @@ import {
 } from "./environment";
 import {
   CodexRolloutPublicationPendingError,
+  latestCodexRolloutFilesystem,
   resolveCurrentCodexRolloutEnvironment,
   resolveCurrentCodexRolloutMessageIdAliases,
 } from "./codex-rollout-environment";
@@ -86,6 +87,7 @@ export function trustedEnvironmentFailureDetails(error: unknown): {
   return { errorType, reason, ...(errorCode ? { errorCode } : {}) };
 }
 import { ChatGptWebAdapterError } from "./adapter-error";
+import { durableGoalCompactionProof } from "./compaction-continuation";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -383,23 +385,31 @@ function currentWorkspaceContext(
   environment: ChatGptTurnEnvironment,
   workspaceRootsDeclared: boolean,
   claim: ChatGptEnvironmentClaim | undefined,
-): ChatGptTurnEnvironment {
+  rolloutPath: string,
+): { environment: ChatGptTurnEnvironment; conflicts: string[] } {
+  let verifiedClaim = claim;
   // Full Access roots describe workspace context. Preserve every native project
   // when the current environment adds an output directory after compaction.
   if (environment.sandboxPolicy.type === "dangerFullAccess"
     && claim?.environment.sandboxPolicy.type === "dangerFullAccess"
-    && (claim.environment.cwd === undefined || pathIdentity(claim.environment.cwd) === pathIdentity(environment.cwd))
-    && claim.environment.roots.some(root => contains(root, environment.cwd))) {
+    && (claim.environment.cwd === undefined || pathIdentity(claim.environment.cwd) === pathIdentity(environment.cwd))) {
     const nativeRoots = new Set(environment.roots.map(pathIdentity));
     const claimedRoots = new Set(claim.environment.roots.map(pathIdentity));
-    if (!workspaceRootsDeclared || [...nativeRoots].every(root => claimedRoots.has(root))) {
+    const accepted = claim.environment.roots.some(root => contains(root, environment.cwd))
+      && (!workspaceRootsDeclared || [...nativeRoots].every(root => claimedRoots.has(root)));
+    // Desktop keeps start roots in session_meta, while world_state can replace
+    // the current roots. Preserve start projects only after exact native proof.
+    const recorded = !accepted && claim.filesystemXml !== undefined
+      && claim.filesystemXml === latestCodexRolloutFilesystem(rolloutPath);
+    if (accepted || recorded) {
       const roots = workspaceRootsDeclared
         ? [...environment.roots, ...claim.environment.roots.filter(root => !nativeRoots.has(pathIdentity(root)))]
         : [...claim.environment.roots];
-      return { ...environment, roots, writableRoots: [...roots] };
+      environment = { ...environment, roots, writableRoots: [...roots] };
+      if (recorded) verifiedClaim = { ...claim, environment: { ...claim.environment, roots, writableRoots: roots } };
     }
   }
-  return environment;
+  return { environment, conflicts: verifiedClaim ? conflictingAuthorityFields(verifiedClaim, environment) : [] };
 }
 
 /**
@@ -483,12 +493,13 @@ export class ChatGptThreadEnvironmentStore {
         codexHome: this.codexHomes[0]!, additionalCodexHomes: this.codexHomes.slice(1),
         ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
         lineage, turnId: identity.turnId, compactionSource: source, compactionPhase,
+        durableGoalProof: durableGoalCompactionProof(parsed, source),
         ...(source.turnId ? { compactionSourceTurnId: source.turnId } : {}),
         ...(messages.current ? { currentEnvironmentMessage: messages.current } : {}),
         historicalEnvironmentMessages: messages.historical,
-        validateCurrentEnvironmentMessage(message, environment, workspaceRootsDeclared) {
+        validateCurrentEnvironmentMessage(message, environment, workspaceRootsDeclared, rolloutPath) {
           const claim = extractChatGptEnvironmentMessageClaim(parsed, message);
-          if (conflictingAuthorityFields(claim, currentWorkspaceContext(environment, workspaceRootsDeclared, claim)).length > 0) {
+          if (currentWorkspaceContext(environment, workspaceRootsDeclared, claim, rolloutPath).conflicts.length > 0) {
             throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
           }
         },
@@ -500,7 +511,7 @@ export class ChatGptThreadEnvironmentStore {
       }
       if (messages.current) {
         const claim = extractChatGptEnvironmentMessageClaim(parsed, messages.current);
-        if (conflictingAuthorityFields(claim, currentWorkspaceContext(native.environment, native.workspaceRootsDeclared, claim)).length > 0) {
+        if (currentWorkspaceContext(native.environment, native.workspaceRootsDeclared, claim, native.rolloutPath).conflicts.length > 0) {
           throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
         }
       }
@@ -580,13 +591,13 @@ export class ChatGptThreadEnvironmentStore {
           ...(parsed._conversationPolicy === "task" && !parsed._compactionRequest
             ? { currentInstruction: chatGptCurrentInstructionRevision(parsed) } : {}),
           ...(compactionSource?.turnId ? { compactionSourceTurnId: compactionSource.turnId } : {}),
-          ...(compactionSource ? { compactionSource } : {}),
+          ...(compactionSource ? { compactionSource, durableGoalProof: durableGoalCompactionProof(parsed, compactionSource) } : {}),
           ...(extractChatGptNativeCompactionPhase(parsed) ? { compactionPhase: extractChatGptNativeCompactionPhase(parsed) } : {}),
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
           ...(initialClaim?.sourceMessage ? { currentEnvironmentMessage: initialClaim.sourceMessage } : {}),
-          validateCurrentEnvironmentMessage(message, nativeEnvironment, workspaceRootsDeclared) {
+          validateCurrentEnvironmentMessage(message, nativeEnvironment, workspaceRootsDeclared, rolloutPath) {
             const claim = extractChatGptEnvironmentMessageClaim(parsed, message);
-            if (conflictingAuthorityFields(claim, currentWorkspaceContext(nativeEnvironment, workspaceRootsDeclared, claim)).length > 0) {
+            if (currentWorkspaceContext(nativeEnvironment, workspaceRootsDeclared, claim, rolloutPath).conflicts.length > 0) {
               throw new TrustedCodexEnvironmentValidationError("Current environment conflicts with its current Codex rollout");
             }
           },
@@ -601,7 +612,8 @@ export class ChatGptThreadEnvironmentStore {
         }
         diagnostics.rollout_lookup = rollout ? "hit" : "miss";
         if (rollout) {
-          const rolloutEnvironment = currentWorkspaceContext(rollout.environment, rollout.workspaceRootsDeclared, currentClaim);
+          const { environment: rolloutEnvironment, conflicts } = currentWorkspaceContext(
+            rollout.environment, rollout.workspaceRootsDeclared, currentClaim, rollout.rolloutPath);
           if (resolvedCalendarDelta) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
             if (resolvedCalendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
@@ -610,7 +622,6 @@ export class ChatGptThreadEnvironmentStore {
               throw new TrustedCodexEnvironmentValidationError("Calendar environment delta conflicts with its current Codex rollout");
             }
           }
-          const conflicts = currentClaim ? conflictingAuthorityFields(currentClaim, rolloutEnvironment) : [];
           if (conflicts.length > 0) {
             const source = currentCompaction || nativeCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
             // Export fixed field names only; keep paths and permission contents private.
@@ -727,7 +738,7 @@ export class ChatGptThreadEnvironmentStore {
         turnId: aliasTurnId,
         revisions,
         ...(compactionSource ? {
-          compactionSource, compactionTurnId: turnId,
+          compactionSource, compactionTurnId: turnId, durableGoalProof: durableGoalCompactionProof(parsed, compactionSource),
           ...(extractChatGptNativeCompactionPhase(parsed) ? { compactionPhase: extractChatGptNativeCompactionPhase(parsed) } : {}),
         } : {}),
       });

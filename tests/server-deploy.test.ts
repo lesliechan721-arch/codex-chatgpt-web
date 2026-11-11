@@ -100,7 +100,7 @@ describe("server remote desktop deployment", () => {
     expect(dockerignore.split(/\r?\n/)[0]).toBe("**");
   });
 
-  test.skipIf(!dockerAvailable)("includes dependency patches and excludes generated launcher directories in the Docker build context", () => {
+  test.skipIf(!dockerAvailable)("includes declared dependency patches and excludes generated launcher directories in the Docker build context", () => {
     const allowedPaths = [
       "package.json",
       "bun.lock",
@@ -114,7 +114,7 @@ describe("server remote desktop deployment", () => {
       "launcher/package.json",
       "launcher/bun.lock",
       ...Object.values(
-        JSON.parse(readFileSync(resolve(root, "launcher/package.json"), "utf8")).patchedDependencies,
+        JSON.parse(readFileSync(resolve(root, "launcher/package.json"), "utf8")).patchedDependencies ?? {},
       ).map((path) => `launcher/${path}`),
       "launcher/tsconfig.json",
       "launcher/vite.config.ts",

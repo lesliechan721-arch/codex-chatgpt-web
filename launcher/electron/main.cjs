@@ -1445,6 +1445,10 @@ function registerIpc({ logger, stateStore }) {
     logger.info("launcher.logs_exported", { recordCount });
     return result.filePath;
   });
+  handle("launcher:update-check", () => {
+    if (!updateController) throw new Error("Launcher updates are unavailable");
+    return updateController.checkNow();
+  });
   handle("launcher:update-install", async () => {
     if (!updateController) throw new Error("Launcher updates are unavailable");
     const launch = await updateController.beginInstall();

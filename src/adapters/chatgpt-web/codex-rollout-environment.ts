@@ -17,6 +17,11 @@ import { isDeepStrictEqual } from "node:util";
 import { expandUserPath } from "../../config";
 import { findTopLevelAssignment } from "../../codex-integration-document";
 import type { CodexTool } from "../../types";
+import { isNativeUserGoalUpdate } from "../../responses/native-context";
+import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFIX } from "../../responses/compaction";
+import { chatGptInstructionEnvelope, isNativeInstruction } from "./environment-instruction";
+import { continuityDigest, continuitySourceRepresentationDigest } from "./continuity-source";
+import type { ChatGptDurableGoalCompactionProof } from "./compaction-continuation";
 import { TrustedCodexEnvironmentValidationError } from "./environment";
 import type {
   ChatGptRootThreadMetadata,
@@ -36,6 +41,7 @@ export interface CodexRolloutEnvironment {
   currentInstructionOwnership?: ChatGptNativeInstructionOwnership;
   /** Native model-visible projection; never used to grant execution permissions. */
   filesystemProfileXml?: string;
+  rolloutPath: string;
 }
 
 const CODEX_ID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -277,6 +283,26 @@ function latestRolloutRecord(
   return matches(item) ? item : undefined;
 }
 
+/** Compare Codex's rendered filesystem directly; it never grants execution permissions. */
+export function latestCodexRolloutFilesystem(rolloutPath: string): string | undefined {
+  const fd = openSync(rolloutPath, "r");
+  try {
+    const latest = record(latestRolloutRecord(fd, fstatSync(fd).size, item => {
+      if (item.type !== "world_state") return false;
+      const payload = record(item.payload);
+      const environments = record(payload?.state)?.environments;
+      // Partial world-state records are JSON merge patches. A full record or a
+      // null environment clears an older filesystem even when no new value exists.
+      return payload?.full === true || environments === null
+        || (record(environments) !== undefined && "filesystem" in record(environments)!);
+    })?.payload);
+    const filesystem = record(record(latest?.state)?.environments)?.filesystem;
+    return typeof filesystem === "string" ? filesystem : undefined;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function verifyCompactedEnvironmentItems(fd: number, size: number, items: Record<string, unknown>[]): void {
   const compacted = record(latestRolloutRecord(fd, size, item => item.type === "compacted")?.payload);
   const history = Array.isArray(compacted?.replacement_history) ? compacted.replacement_history : [];
@@ -356,12 +382,151 @@ interface NativeCompactionSourceProof {
   environmentTurnId: string;
 }
 
+/** Native grouping must not hide a task instruction beside contextual fragments. */
+function isRolloutInstruction(payload: Record<string, unknown>, metadata: Record<string, unknown>): boolean {
+  const native = record(payload.internal_chat_message_metadata_passthrough), kinds = native?.content_item_kinds;
+  if ((payload.type === "message" || payload.type === undefined) && payload.role === "user" && Array.isArray(kinds)) {
+    if (kinds.some(kind => kind === "user.text" || kind === "user.goal" || kind === "user.goal.omitted" || kind === "goal.internal_context")) return true;
+    if (Array.isArray(payload.content) && payload.content.length === kinds.length && payload.content.length > 1) {
+      return payload.content.some((part, index) => isNativeInstruction({ ...payload, content: [part],
+        internal_chat_message_metadata_passthrough: { ...native, content_item_kinds: [kinds[index]] } }, metadata));
+    }
+  }
+  return isNativeInstruction(payload, metadata);
+}
+
+function checkpointSummaryDigest(value: unknown): string | undefined {
+  const item = record(value);
+  if (!item) return undefined;
+  if (["compaction", "compaction_summary", "context_compaction"].includes(String(item.type))) {
+    const summary = typeof item.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null;
+    return summary === null ? undefined : continuityDigest(summary);
+  }
+  if ((item.type !== "message" && item.type !== undefined) || item.role !== "user") return undefined;
+  const text = typeof item.content === "string" ? item.content : Array.isArray(item.content)
+    ? item.content.map(part => record(part)?.text ?? "").join("\n") : "";
+  return isReadableCompactionSummaryText(text) ? continuityDigest(text.slice(SUMMARY_PREFIX.length + 1)) : undefined;
+}
+
+/** A durable identity needs the same checkpoint in current canonical replacement history. */
+function authenticateDurableGoalSource(fd: number, size: number, source: ChatGptTurnUserRevision,
+  latestTurnId: string, currentTurnId: string, phase: ChatGptNativeCompactionPhase,
+  proof: ChatGptDurableGoalCompactionProof, instructionMetadata: Record<string, unknown>): NativeCompactionSourceProof | undefined {
+  if (proof.sourceIdentity !== source.itemId || proof.sourceTurnId !== source.turnId || proof.requestTurnId !== currentTurnId
+    || !Array.isArray(source.content) || source.content.length !== 0
+    || !CODEX_ID.test(proof.sourceTurnId) || !CODEX_ID.test(proof.checkpointTurnId)
+    || (proof.sourceTurnId !== currentTurnId && phase !== "pre_turn")
+    || (latestTurnId !== currentTurnId && latestTurnId !== proof.checkpointTurnId)) return undefined;
+  const boundaries: LocatedRolloutRecord[] = [], originals: LocatedRolloutRecord[] = [], instructions: LocatedRolloutRecord[] = [];
+  let compacted: LocatedRolloutRecord | undefined, context: LocatedRolloutRecord | undefined;
+  visitRolloutRecords(fd, size, entry => {
+    const payload = record(entry.item.payload);
+    if (entry.item.type === "compacted") compacted = entry;
+    if (entry.item.type === "turn_context") context = entry;
+    if (entry.item.type === "event_msg" && payload?.type === "task_started") boundaries.push(entry);
+    if (entry.item.type === "response_item" && payload) {
+      if (payload.id === proof.sourceIdentity) originals.push(entry);
+      if (isRolloutInstruction(payload, instructionMetadata)) instructions.push(entry);
+    }
+  });
+  const original = originals[0], payload = record(original?.item.payload), native = record(payload?.internal_chat_message_metadata_passthrough);
+  const kinds = native?.content_item_kinds;
+  const goalUpdate = payload !== undefined && isNativeUserGoalUpdate(payload);
+  const goalContext = payload?.type === "message" && payload.role === "user" && native?.turn_id === proof.sourceTurnId
+    && Array.isArray(kinds) && kinds.length === 1 && kinds[0] === "goal.internal_context";
+  const sourceBoundaries = boundaries.filter(entry => record(entry.item.payload)?.turn_id === proof.sourceTurnId);
+  const checkpointBoundaries = boundaries.filter(entry => record(entry.item.payload)?.turn_id === proof.checkpointTurnId);
+  const currentBoundaries = boundaries.filter(entry => record(entry.item.payload)?.turn_id === currentTurnId);
+  const sourceBoundary = sourceBoundaries[0], checkpointBoundary = checkpointBoundaries[0], currentBoundary = currentBoundaries[0];
+  if (originals.length !== 1 || !original || !payload || (!goalUpdate && !goalContext)
+    || original.activeTurn !== proof.sourceTurnId || sourceBoundaries.length !== 1 || !sourceBoundary || sourceBoundary.order >= original.order
+    || checkpointBoundaries.length !== 1 || !checkpointBoundary || currentBoundaries.length !== 1 || !currentBoundary
+    || boundaries.at(-1) !== currentBoundary || !compacted || original.order >= compacted.order
+    || compacted.activeTurn !== proof.checkpointTurnId || checkpointBoundary.order >= compacted.order
+    || !context || context.activeTurn !== latestTurnId || record(context.item.payload)?.turn_id !== latestTurnId
+    || instructions.at(-1) !== original) return undefined;
+  if (goalUpdate && !instructions.some(entry => entry.activeTurn === proof.sourceTurnId
+    && entry.order > sourceBoundary.order && entry.order < original.order
+    && record(record(entry.item.payload)?.internal_chat_message_metadata_passthrough)?.turn_id === proof.sourceTurnId)) return undefined;
+  if (proof.checkpointTurnId !== currentTurnId
+    && (phase !== "pre_turn" || boundaries.at(-2) !== checkpointBoundary || compacted.order >= currentBoundary.order)) return undefined;
+  const representation = continuitySourceRepresentationDigest({}, { itemId: proof.sourceIdentity, turnId: proof.sourceTurnId,
+    ...(goalUpdate ? { nativeTurnId: String(native?.turn_id) } : {}), content: payload.content,
+    instructionEnvelope: chatGptInstructionEnvelope(payload) });
+  if (!proof.sourceRepresentationDigests.includes(representation)) return undefined;
+  const checkpoint = record(compacted.item.payload), history = checkpoint?.replacement_history;
+  if (!Array.isArray(history)) return undefined;
+  const summaries = history.filter(item => checkpointSummaryDigest(item) === proof.summaryDigest);
+  const summaryOwner = record(record(summaries[0])?.internal_chat_message_metadata_passthrough)?.turn_id;
+  if (summaries.length !== 1 || (summaryOwner !== undefined && summaryOwner !== proof.checkpointTurnId)
+    || (record(checkpoint?.resume_metadata)?.last_started_turn_id !== undefined
+      && record(checkpoint?.resume_metadata)?.last_started_turn_id !== proof.checkpointTurnId)
+    || !proof.acceptsProducerHistory(history)) return undefined;
+  return { sourceTurnId: proof.sourceTurnId, environmentTurnId: latestTurnId };
+}
+
+/** A goal history ID is not a task owner. Prove its exact current native task window. */
+function authenticateGoalCompactionSource(fd: number, size: number, source: ChatGptTurnUserRevision,
+  latestTurnId: string, currentTurnId: string, phase: ChatGptNativeCompactionPhase,
+  instructionMetadata: Record<string, unknown>): NativeCompactionSourceProof | undefined {
+  const sourceTurnId = source.turnId;
+  if (!sourceTurnId || !CODEX_ID.test(sourceTurnId)
+    || (sourceTurnId !== currentTurnId && phase !== "pre_turn")
+    || (latestTurnId !== sourceTurnId && latestTurnId !== currentTurnId)) return undefined;
+  const boundaries: LocatedRolloutRecord[] = [], originals: LocatedRolloutRecord[] = [];
+  let context: LocatedRolloutRecord | undefined, anchor: LocatedRolloutRecord | undefined, compacted: LocatedRolloutRecord | undefined;
+  let latestInstruction: LocatedRolloutRecord | undefined;
+  visitRolloutRecords(fd, size, entry => {
+    const payload = record(entry.item.payload);
+    if (entry.item.type === "event_msg" && payload?.type === "task_started") boundaries.push(entry);
+    if (entry.item.type === "turn_context") context = entry;
+    if (entry.item.type === "compacted") compacted = entry;
+    if (entry.item.type !== "response_item") return;
+    if (payload?.id === source.itemId) originals.push(entry);
+    if (payload && isRolloutInstruction(payload, instructionMetadata)) latestInstruction = entry;
+    if (entry.activeTurn !== sourceTurnId || payload?.type !== "message" || payload.role !== "user") return;
+    const provenance = record(payload.internal_chat_message_metadata_passthrough);
+    const kinds = provenance?.content_item_kinds;
+    const human = provenance?.turn_id === sourceTurnId && Array.isArray(kinds) && kinds.length > 0
+      && Array.isArray(payload.content) && kinds.length === payload.content.length && kinds.every(kind => kind === "user.text");
+    const goalContext = provenance?.turn_id === sourceTurnId && Array.isArray(kinds) && kinds.length === 1
+      && kinds[0] === "goal.internal_context";
+    if ((human || goalContext) && originals.length === 0) anchor = entry;
+  });
+  const original = originals[0], payload = record(original?.item.payload);
+  const sourceBoundaries = boundaries.filter(entry => record(entry.item.payload)?.turn_id === sourceTurnId);
+  const currentBoundaries = boundaries.filter(entry => record(entry.item.payload)?.turn_id === currentTurnId);
+  const sourceBoundary = sourceBoundaries[0], currentBoundary = currentBoundaries[0];
+  const originalGoalUpdate = payload !== undefined && isNativeUserGoalUpdate(payload);
+  const originalKinds = record(payload?.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  const originalGoalContext = payload?.type === "message" && payload.role === "user"
+    && record(payload.internal_chat_message_metadata_passthrough)?.turn_id === sourceTurnId
+    && source.nativeTurnId === undefined && Array.isArray(originalKinds) && originalKinds.length === 1 && originalKinds[0] === "goal.internal_context";
+  if (originals.length !== 1 || !original || !payload || (!originalGoalUpdate && !originalGoalContext)
+    || (originalGoalUpdate && record(payload.internal_chat_message_metadata_passthrough)?.turn_id !== source.nativeTurnId)
+    || !isDeepStrictEqual(payload.content, source.content) || original.activeTurn !== sourceTurnId
+    || (compacted !== undefined && compacted.order > original.order)
+    || (originalGoalUpdate && (!anchor || anchor.order >= original.order)) || latestInstruction !== original
+    || sourceBoundaries.length !== 1 || currentBoundaries.length !== 1 || !sourceBoundary || !currentBoundary
+    || sourceBoundary.order >= (anchor?.order ?? original.order) || boundaries.at(-1) !== currentBoundary
+    || !context || context.activeTurn !== latestTurnId || record(context.item.payload)?.turn_id !== latestTurnId) return undefined;
+  if (sourceTurnId !== currentTurnId && (boundaries.at(-2) !== sourceBoundary || original.order >= currentBoundary.order)) return undefined;
+  return { sourceTurnId, environmentTurnId: latestTurnId };
+}
+
 /** Retained human ownership and the latest permission turn can differ only in a proved checkpoint. */
 function authenticateCompactionSource(
   fd: number, size: number, source: ChatGptTurnUserRevision | undefined, latestTurnId: unknown,
-  currentTurnId?: string, phase?: ChatGptNativeCompactionPhase,
+  lineage: RolloutIdentity,
+  currentTurnId?: string, phase?: ChatGptNativeCompactionPhase, durableGoalProof?: ChatGptDurableGoalCompactionProof,
 ): NativeCompactionSourceProof | undefined {
   if (!source?.itemId || typeof latestTurnId !== "string") return undefined;
+  const instructionMetadata = { request_kind: "compaction", thread_id: lineage.threadId,
+    ...("parentThreadId" in lineage ? { parent_thread_id: lineage.parentThreadId, agent_name: lineage.agentName, subagent_kind: "thread_spawn" } : {}) };
+  if (durableGoalProof) return phase && currentTurnId
+    ? authenticateDurableGoalSource(fd, size, source, latestTurnId, currentTurnId, phase, durableGoalProof, instructionMetadata) : undefined;
+  if (source.nativeTurnId !== undefined) return phase && currentTurnId
+    ? authenticateGoalCompactionSource(fd, size, source, latestTurnId, currentTurnId, phase, instructionMetadata) : undefined;
   // Local compaction re-ids retained human messages. Only the latest replacement history is
   // current; neither guardian_history nor a message removed by a later compact is proof.
   const item = latestRolloutRecord(fd, size, item => item.type === "compacted"
@@ -371,6 +536,11 @@ function authenticateCompactionSource(
     ? replacement.map(record).filter(message => message?.id === source.itemId) : [];
   const payload = item?.type === "compacted"
     ? matches.length === 1 ? matches[0] : undefined : record(item?.payload);
+  const sourceKinds = record(payload?.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  if (Array.isArray(sourceKinds) && sourceKinds.length === 1 && sourceKinds[0] === "goal.internal_context") {
+    return phase && currentTurnId
+      ? authenticateGoalCompactionSource(fd, size, source, latestTurnId, currentTurnId, phase, instructionMetadata) : undefined;
+  }
   if (payload?.type === "message" && payload.role === "user"
     && record(payload.internal_chat_message_metadata_passthrough)?.turn_id === latestTurnId
     && (source.turnId === undefined || source.turnId === latestTurnId)
@@ -517,6 +687,7 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
   compactionSource?: ChatGptTurnUserRevision;
   compactionTurnId?: string;
   compactionPhase?: ChatGptNativeCompactionPhase;
+  durableGoalProof?: ChatGptDurableGoalCompactionProof;
 }): ResolvedCodexRolloutMessageIdentity | undefined {
   const requested = options.revisions.filter((revision): revision is ChatGptTurnUserRevision & { itemId: string } => (
     typeof revision.itemId === "string" && revision.itemId.length > 0
@@ -540,8 +711,8 @@ export function resolveCurrentCodexRolloutMessageIdAliases(options: {
         if (!Number.isSafeInteger(size) || size <= 0) continue;
         validateSessionMeta(firstRolloutRecord(fd, size), options.lineage);
         const latest = record(latestRolloutRecord(fd, size, item => item.type === "turn_context")?.payload);
-        const sourceProof = authenticateCompactionSource(fd, size, options.compactionSource, latest?.turn_id,
-          options.compactionTurnId, options.compactionPhase);
+        const sourceProof = authenticateCompactionSource(fd, size, options.compactionSource, latest?.turn_id, options.lineage,
+          options.compactionTurnId, options.compactionPhase, options.durableGoalProof);
         // A wire source owner is a constraint on native proof. Even when it names the latest
         // permission turn, it cannot establish the retained human's execution identity.
         const aliasTurnId = options.compactionSource
@@ -1107,6 +1278,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
   turnId: string;
   compactionSourceTurnId?: string;
   compactionSource?: ChatGptTurnUserRevision;
+  durableGoalProof?: ChatGptDurableGoalCompactionProof;
   tools?: readonly CodexTool[];
   historicalEnvironmentMessages?: ChatGptUnattributedEnvironmentMessage[];
   currentEnvironmentMessage?: ChatGptUnattributedEnvironmentMessage;
@@ -1116,6 +1288,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
     message: ChatGptUnattributedEnvironmentMessage,
     environment: ChatGptTurnEnvironment,
     workspaceRootsDeclared: boolean,
+    rolloutPath: string,
   ) => void;
   publicationPendingIsTransient?: boolean;
   compactedEnvironmentItems?: Record<string, unknown>[];
@@ -1187,7 +1360,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         throw new Error("Codex rollout has no complete turn context");
       }
       const sourceProof = options.compactionSource
-        ? authenticateCompactionSource(fd, size, options.compactionSource, latest.turn_id, turnId, options.compactionPhase)
+        ? authenticateCompactionSource(fd, size, options.compactionSource, latest.turn_id, lineage, turnId, options.compactionPhase, options.durableGoalProof)
         : undefined;
       if (options.compactionSource && (!sourceProof
         || (compactionSourceTurnId !== undefined && sourceProof.sourceTurnId !== compactionSourceTurnId))) {
@@ -1231,7 +1404,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
           const currentMessages = verifyHistoricalEnvironmentMessages(fd, size, turnId, historical,
             Boolean(options.compactionSource && options.compactionPhase));
           for (const message of currentMessages) {
-            options.validateCurrentEnvironmentMessage?.(message, environment, workspaceRootsDeclared);
+            options.validateCurrentEnvironmentMessage?.(message, environment, workspaceRootsDeclared, rolloutPath);
           }
         }
       }
@@ -1241,7 +1414,7 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         verifyCompactedEnvironmentItems(fd, size, options.compactedEnvironmentItems);
       }
       const filesystemProfileXml = renderFilesystemProfile(latest.permission_profile, environment.roots);
-      matching.push({ environment, workspaceRootsDeclared, filesystemProfileXml,
+      matching.push({ environment, workspaceRootsDeclared, filesystemProfileXml, rolloutPath,
         ...(ownership ? { currentInstructionOwnership: ownership } : {}) });
     } finally {
       closeSync(fd);

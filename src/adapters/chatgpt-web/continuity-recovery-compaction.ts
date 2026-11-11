@@ -9,6 +9,7 @@ import { assertLauncherContinuityCapacity, inspectLauncherContinuityConversation
   markLauncherContinuitySendPossible, readLauncherContinuityInstance, retireLauncherContinuityWriter } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import { canonicalJson } from "./canonical-json";
+import { continuitySourcePayloadRepresentationDigest as sourcePayloadRepresentation } from "./continuity-source";
 import type { ChatGptBrowserWorker } from "./browser-worker";
 import { canonicalizeCompactionHandoff, existingStructuredCompactionRun, MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   runStructuredCompactionOnce, withCompactionAbort } from "./compaction-handoff";
@@ -17,8 +18,7 @@ import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationD
 import { sameContinuityLauncherInstance, sameContinuityRecoveryIdentity, type ContinuityLease } from "./continuity-contract";
 import { chatGptConversationKey } from "./conversation-key";
 import { continuityError } from "./continuity-errors";
-import { compactionSourceWasDelegation, compactionSourceWasGoal, CONTINUITY_GOAL_SOURCE, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity } from "./compaction-continuation";
-import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
+import { compactionSourceWasDelegation, compactionSourceWasGoal, CONTINUITY_GOAL_SOURCE, CONTINUITY_DELEGATION_SOURCE, CONTINUITY_IDENTITY_ONLY_SOURCE, isAcceptedCompactionContinuation, isDurableCompactionSourceIdentity, selectCompactionRecoveryContinuation } from "./compaction-continuation";
 import { assertContinuityCompiledInput } from "./continuity-input";
 import type { PreparedContinuityRequest } from "./continuity-request";
 import { beginRecoveryAcquisition, beginRecoverySend, evictOptionalRecoveryResults, recoveryCanonicalResults, recoveryContext, recoveryDigest, recoveryFinalReceipt, recoveryIdentity, recoveryResultDigest, settleRecoveryKnownUnsent, settleRecoverySend, type RuntimeRecoverySendReference } from "./continuity-recovery-runtime";
@@ -32,7 +32,7 @@ import { CompactionSourceCoverage, assertCompactionReadable, compactionSourceIns
 import { createContextSnapshot, type ContextSnapshot } from "./context-snapshot";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type TurnBrokerOwner } from "./turn-broker";
-import { assertContinuityToolResultReplayEvidence, chatGptContinuityInstructionPayloadDigest, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptTurnRuntime } from "./turn-execution";
+import { assertContinuityToolResultReplayEvidence, chatGptContinuityCarriedInstructionPayloadDigest, chatGptContinuityInstructionPayloadDigest, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptTurnRuntime } from "./turn-execution";
 
 export type StartManualRecoveryCompaction = (options: {
   traceId: string; sourceSnapshot: ContextSnapshot; deadlineAt: number | (() => number);
@@ -94,9 +94,6 @@ export function assertHealthyRecoveryCompactionAuthority(prepared: PreparedConti
   }
 }
 
-function sourcePayloadRepresentation(digest: string): string {
-  return continuityDigest(["continuity-compaction-source-payload", digest]);
-}
 const REQUEST_CONTEXT_SOURCE = continuityDigest("continuity-request-context-source-v1");
 function requestContextRepresentation(parsed: CodexParsedRequest): string {
   return continuityDigest(["continuity-request-context", continuityCompactionSourceHistory(parsed)]);
@@ -154,9 +151,9 @@ function sourceSiblingPrevious(parsed: CodexParsedRequest, record: RecoveryThrea
 }
 function sourcePayloadDigest(parsed: CodexParsedRequest, source: RecoveryWorkRecord): string {
   if (source.allowRetainedSourceFallback && isDurableCompactionSourceIdentity(parsed, extractChatGptCompactionSourceRevision(parsed))) {
-    // Hash only the actual request-carried producer projection. Removing recognition
-    // from this read-only projection prevents the identity placeholder becoming body.
-    return chatGptContinuityInstructionPayloadDigest({ ...parsed, _continuityScope: undefined });
+    // The durable identity grants no body. Compare only the actual carried
+    // projection, including the producer's legitimate summary-only shape.
+    return chatGptContinuityCarriedInstructionPayloadDigest(parsed);
   }
   return chatGptContinuityInstructionPayloadDigest(parsed, source.instructionPrevious, source.allowRetainedSourceFallback ?? false);
 }
@@ -276,7 +273,7 @@ export function selectRecoveryCompactionTarget(parsed: CodexParsedRequest, recor
 function continuedSyntheticInstruction(parsed: CodexParsedRequest, record: RecoveryThreadRecord, source: ChatGptTurnUserRevision) {
   const identity = sourceIdentity(parsed, source);
   if (compactionSourceWasDelegation(parsed, source) || compactionSourceWasGoal(parsed, source)) {
-    const continuation = selectRecoveryContinuation(parsed, record, extractChatGptTurnIdentity(parsed));
+    const continuation = selectCompactionRecoveryContinuation(parsed, record, extractChatGptTurnIdentity(parsed));
     // The exact checkpoint selects its source, or its recorded consumer once consumed.
     // That execution can keep the original delegated source's different native turn.
     if (continuation?.checkpoint.sourceIdentity === identity
@@ -671,9 +668,13 @@ function representations(parsed: CodexParsedRequest, selection: CompactionSelect
   const payloads = [sourcePayloadRepresentation(sourcePayloadDigest(parsed, selection.source))];
   try { payloads.push(sourcePayloadRepresentation(sourcePayloadDigest(producer, selection.source))); }
   catch (error) {
-    // v1 retains human user messages. A source with no such representation keeps its exact proof.
     if (!(error instanceof ChatGptWebAdapterError && error.code === "continuity_source_unproven")
       && !(error instanceof Error && error.message === "ChatGPT web compaction requires a source user message")) throw error;
+    // Native compaction can drop every synthetic task instruction. Commit the
+    // exact empty/supplemental producer projection, never a recovered source body.
+    if (!extractCompactUserMessages(sourceInput).length) {
+      payloads.push(sourcePayloadRepresentation(chatGptContinuityCarriedInstructionPayloadDigest(producer)));
+    }
   }
   return [...new Set([
     ...[selection.sourceRevision, extractChatGptCompactV1SourceRevision(parsed, summary)]

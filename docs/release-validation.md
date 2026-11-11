@@ -26,16 +26,23 @@ launcher update channel or custom release-body flag is required.
 After validation, uncheck **Set as a pre-release** and select **Set as latest release**, or publish
 a newer stable release. Launchers discover it on their next startup update check, provided its
 version is newer and its platform asset and checksums are present. Already running launchers
-do not poll for publication changes.
+do not poll for publication changes. Settings provides a manual update check and shows check
+failures. A GitHub rate-limit reset blocks both scheduled and manual retries until that time.
 
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.17-1` integrates upstream `6.1.17` with this fork's continuity, durable input queue,
+Version `6.1.18-1` integrates upstream `6.1.18` with this fork's continuity, durable input queue,
 short-start context, on-demand reading, API access, provider, proxy, and remote-runtime contracts.
 Full Access tasks can keep added workspace directories after compaction while preserving every
 native project, the current working directory, turn identity and permission mode. Restricted tasks
 keep their native filesystem grants.
+The Launcher uses the upstream scoped minimatch override to `11.0.5`; legacy packaging tools
+retain their declared minimatch APIs. Validate file discovery, ASAR unpack rules, and directory
+filters when changing that override. See [packaging dependency compatibility](../launcher/patches/README.md).
+The macOS passkey import requires a clean exit from its dedicated Chrome login process. Exercise
+this with a real security-key sign-in before claiming account-bound validation; process fixtures
+alone do not prove that Chrome saved the account's cookies.
 Task turns, connector verification and browser smoke tests use Temporary Chat by default.
 `useTemporaryChats: false` preserves an explicit opt-out; an absent field defaults to true,
 including when upgrading an existing configuration. Sign-in and account inspection use ordinary

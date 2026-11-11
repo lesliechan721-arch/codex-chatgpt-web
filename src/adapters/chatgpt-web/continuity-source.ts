@@ -9,10 +9,14 @@ export function continuityDigest(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
-export function continuitySourceRepresentationDigest(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): string {
-  return continuityDigest([source.turnId,
+export function continuitySourceRepresentationDigest(parsed: Pick<CodexParsedRequest, "_chatGptMessageIdAliases">, source: ChatGptTurnUserRevision): string {
+  return continuityDigest([source.nativeTurnId ?? source.turnId,
     source.itemId ? parsed._chatGptMessageIdAliases?.[source.itemId] ?? source.itemId : null,
     source.content, source.instructionEnvelope ?? { role: "user" }]);
+}
+
+export function continuitySourcePayloadRepresentationDigest(payloadDigest: string): string {
+  return continuityDigest(["continuity-compaction-source-payload", payloadDigest]);
 }
 
 /** Validate a unique retained primary; repeated echoes keep the ordinary request routing. */

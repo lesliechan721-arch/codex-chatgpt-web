@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { parseRequest } from "../../responses/parser";
-import { readNativeThreadDelegation } from "../../responses/native-context";
+import { isNativeUserGoalUpdate, readNativeThreadDelegation } from "../../responses/native-context";
 import { decodeCompactionSummary, isReadableCompactionSummaryText, SUMMARY_PREFIX } from "../../responses/compaction";
 import type { CodexMessage, CodexParsedRequest } from "../../types";
 import { extractChatGptTurnIdentity, requestCarriedChatGptInstructionRevision, type ChatGptTurnIdentity, type ChatGptTurnUserRevision } from "./environment";
@@ -8,6 +8,9 @@ import { continuityError } from "./continuity-errors";
 import { continuityCheckpoint, continuityDigest, continuitySourceRepresentationDigest, findContinuityRecoveryRecord, selectContinuityCheckpoint } from "./continuity-binding";
 import { selectRecoveryContinuation } from "./continuity-recovery-continuation";
 import type { RecoveryThreadRecord, RecoveryWorkRecord } from "./continuity-recovery-store";
+import { clientTurnMetadata } from "./environment-instruction";
+import { chatGptContinuityCarriedInstructionPayloadDigest } from "./turn-execution";
+import { continuitySourcePayloadRepresentationDigest } from "./continuity-source";
 
 interface CompletedCheckpoint {
   summaryHash: string;
@@ -49,32 +52,103 @@ function durableContinuation(parsed: CodexParsedRequest, identity: ChatGptTurnId
   if (!parsed._continuityScope || !identity.threadId || !identity.turnId) return undefined;
   const record = findContinuityRecoveryRecord(continuityDigest(identity.threadId), parsed._continuityScope, parsed._continuityStateDirectory);
   if (!record) return undefined;
-  const selected = selectRecoveryContinuation(parsed, record, identity);
+  const selected = selectCompactionRecoveryContinuation(parsed, record, identity);
   if (!selected) return undefined;
   let sourceWork = record.works[selected.checkpoint.sourceLogicalWorkId]!;
   if (selected.checkpoint.representationDigests.some(digest => digest === CONTINUITY_DELEGATION_SOURCE || digest === CONTINUITY_GOAL_SOURCE)) {
     sourceWork = originalSyntheticWork(record, sourceWork, selected.checkpoint.sourceIdentity);
   }
-  return { ...selected, sourceWork };
+  return { ...selected, sourceWork, record };
 }
 
-function originalSyntheticWork(record: RecoveryThreadRecord, source: RecoveryWorkRecord, identity: string): RecoveryWorkRecord {
+/** Read-only historical selection for compaction; ordinary recovery keeps its native turn. */
+export function selectCompactionRecoveryContinuation(parsed: CodexParsedRequest, record: RecoveryThreadRecord,
+  identity: ChatGptTurnIdentity) {
+  let selected = selectRecoveryContinuation(parsed, record, identity);
+  if (!selected && automaticPreTurnCompaction(parsed)) {
+    // A pre-turn compact can precede the new task instruction. Select an exact
+    // older committed summary in this same durable scope, never the latest head.
+    const turns = new Set(Object.values(record.checkpoints).map(checkpoint => {
+      const consumer = checkpoint.continuation.consumerLogicalWorkId;
+      const work = record.works[consumer ?? checkpoint.sourceLogicalWorkId];
+      return checkpoint.continuation.nativeTurnId ?? work?.nativeTurnId;
+    }));
+    if (turns.has(identity.turnId)) return undefined;
+    for (const turnId of turns) {
+      if (!turnId || turnId === identity.turnId) continue;
+      const previous = selectRecoveryContinuation(parsed, record, { ...identity, turnId });
+      if (!previous) continue;
+      if (selected) return undefined;
+      selected = previous;
+    }
+  }
+  return selected;
+}
+
+function originalSyntheticWork(record: RecoveryThreadRecord, source: RecoveryWorkRecord, identity: string,
+  sourceRepresentations?: string[]): RecoveryWorkRecord {
   const seen = new Set<string>();
   while (source.allowRetainedSourceFallback) {
     if (seen.has(source.logicalWorkId)) throw continuityError("continuity_source_unproven");
     seen.add(source.logicalWorkId);
     const previous = source.predecessorLogicalWorkId ? record.works[source.predecessorLogicalWorkId] : undefined;
+    const relations = Object.values(record.checkpoints).filter(checkpoint => checkpoint.sourceLogicalWorkId === previous?.logicalWorkId
+      && checkpoint.sourceIdentity === identity && checkpoint.workLineageId === source.workLineageId
+      && checkpoint.continuation.state === "consumed" && checkpoint.continuation.consumerLogicalWorkId === source.logicalWorkId);
     if (!previous || previous.purpose !== "ordinary" || previous.workLineageId !== source.workLineageId
       || previous.instructionIdentity !== identity || source.instructionIdentity !== identity
       || previous.workPayloadDigest !== source.workPayloadDigest || previous.acceptedTaskRevision !== source.acceptedTaskRevision
-      || !Object.values(record.checkpoints).some(checkpoint => checkpoint.sourceLogicalWorkId === previous.logicalWorkId
-        && checkpoint.sourceIdentity === identity && checkpoint.workLineageId === source.workLineageId
-        && checkpoint.continuation.state === "consumed" && checkpoint.continuation.consumerLogicalWorkId === source.logicalWorkId)) {
+      || !relations.length || (sourceRepresentations && relations.length !== 1)) {
       throw continuityError("continuity_source_unproven", "The synthetic task source has no exact retained predecessor relation.");
     }
+    sourceRepresentations?.push(...relations[0]!.representationDigests);
     source = previous;
   }
   return source;
+}
+
+/** Internal read-only proof; canonical bodies remain outside the recovered instruction. */
+export interface ChatGptDurableGoalCompactionProof {
+  readonly sourceIdentity: string;
+  readonly sourceTurnId: string;
+  readonly requestTurnId: string;
+  readonly checkpointTurnId: string;
+  readonly summaryDigest: string;
+  readonly sourceRepresentationDigests: readonly string[];
+  acceptsProducerHistory(history: unknown[]): boolean;
+}
+
+export function durableGoalCompactionProof(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): ChatGptDurableGoalCompactionProof | undefined {
+  if (!parsed._compactionRequest || !isDurableCompactionSourceIdentity(parsed, source)) return undefined;
+  const identity = extractChatGptTurnIdentity(parsed);
+  const durable = durableContinuation(parsed, identity);
+  if (!durable || !identity.turnId || !durable.checkpoint.representationDigests.includes(CONTINUITY_GOAL_SOURCE)
+    || canonicalItemId(parsed, source.itemId) !== durable.checkpoint.sourceIdentity
+    || source.turnId !== durable.sourceWork.nativeTurnId
+    || (source.turnId !== identity.turnId && !automaticPreTurnCompaction(parsed))) return undefined;
+  const live = liveCheckpoint(parsed, identity);
+  if (live?.checkpoint.sourceInstruction === source && continuityDigest(live.checkpoint.summary) !== durable.checkpoint.summaryDigest) return undefined;
+  const sourceRepresentations = [...durable.checkpoint.representationDigests];
+  originalSyntheticWork(durable.record, durable.record.works[durable.checkpoint.sourceLogicalWorkId]!,
+    durable.checkpoint.sourceIdentity, sourceRepresentations);
+  const checkpointTurnId = durable.checkpoint.continuation.nativeTurnId
+    ?? durable.record.works[durable.checkpoint.sourceLogicalWorkId]?.nativeTurnId;
+  if (!source.turnId || !checkpointTurnId) return undefined;
+  const producerRepresentations = [...durable.checkpoint.representationDigests];
+  const body = parsed._rawBody as Record<string, unknown>;
+  return {
+    sourceIdentity: durable.checkpoint.sourceIdentity, sourceTurnId: source.turnId,
+    requestTurnId: identity.turnId, checkpointTurnId, summaryDigest: durable.checkpoint.summaryDigest,
+    sourceRepresentationDigests: [...new Set(sourceRepresentations)],
+    acceptsProducerHistory(history) {
+      try {
+        const projection = { ...parsed, _continuityScope: undefined, _continuityRequestInstruction: undefined,
+          _compactionOutput: undefined, _rawBody: { ...body, input: history } };
+        return producerRepresentations.includes(continuitySourcePayloadRepresentationDigest(
+          chatGptContinuityCarriedInstructionPayloadDigest(projection)));
+      } catch { return false; }
+    },
+  };
 }
 
 function liveCheckpoint(parsed: CodexParsedRequest, identity: ChatGptTurnIdentity) {
@@ -98,7 +172,12 @@ function digest(value: unknown): string {
 }
 
 function sourceDigest(source: ChatGptTurnUserRevision): string {
-  return digest([source.turnId, source.content]);
+  return digest([source.nativeTurnId ?? source.turnId, source.content]);
+}
+
+function automaticPreTurnCompaction(parsed: CodexParsedRequest): boolean {
+  const compaction = clientTurnMetadata(parsed)?.compaction as { trigger?: unknown; phase?: unknown } | undefined;
+  return parsed._compactionRequest === true && compaction?.trigger === "auto" && compaction.phase === "pre_turn";
 }
 
 function makeCheckpointRoom(key: string): void {
@@ -131,8 +210,9 @@ function canonicalItemId(parsed: CodexParsedRequest, id: unknown): unknown {
 
 function matchesRevision(parsed: CodexParsedRequest, item: Record<string, unknown>, source: ChatGptTurnUserRevision): boolean {
   return canonicalItemId(parsed, item.id) === canonicalItemId(parsed, source.itemId)
+    && (source.nativeTurnId === undefined || isNativeUserGoalUpdate(item))
     && digest([(item.internal_chat_message_metadata_passthrough as { turn_id?: unknown } | undefined)?.turn_id,
-      item.type === "function_call_output" ? item.output : item.content]) === sourceDigest(source);
+      item.type === "function_call_output" ? item.output : item.content]) === digest([source.nativeTurnId ?? source.turnId, source.content]);
 }
 
 function nativeGoal(item: Record<string, unknown>): boolean {
@@ -141,7 +221,7 @@ function nativeGoal(item: Record<string, unknown>): boolean {
     && typeof item.id === "string" && !!item.id
     && typeof metadata?.turn_id === "string" && !!metadata.turn_id.trim()
     && Array.isArray(metadata.content_item_kinds) && metadata.content_item_kinds.length === 1
-    && metadata.content_item_kinds[0] === "goal.internal_context";
+    && (metadata.content_item_kinds[0] === "goal.internal_context" || isNativeUserGoalUpdate(item));
 }
 
 export function compactionSourceWasGoal(parsed: CodexParsedRequest, source: ChatGptTurnUserRevision): boolean {
@@ -379,6 +459,26 @@ export function hasCompactionEnvironmentCheckpoint(parsed: CodexParsedRequest, i
   if (!recovered) return false;
   const carried = requestCarriedChatGptInstructionRevision(prefix, identity.turnId);
   return !carried || isAcceptedCompactionContinuation(prefix, identity, carried);
+}
+
+/** Historical source recognition is confined to automatic compaction before a turn. */
+export function previousCompletedCompactionSource(parsed: CodexParsedRequest,
+  identity: ChatGptTurnIdentity): ChatGptTurnUserRevision | undefined {
+  if (!automaticPreTurnCompaction(parsed)) return undefined;
+  if (parsed._conversationPolicy === "task") return recoverCompactionInstruction(parsed, identity)?.source;
+  const current = scope(parsed, identity);
+  if (!current || checkpoints.has(current)) return undefined;
+  let source: ChatGptTurnUserRevision | undefined;
+  for (const key of [...checkpoints.keys()]) {
+    const [threadId, turnId] = JSON.parse(key) as string[];
+    if (threadId !== identity.threadId || turnId === identity.turnId
+      || key !== scope(parsed, { ...identity, turnId })) continue;
+    const previous = acceptedCheckpoint(parsed, { ...identity, turnId });
+    if (!previous) continue;
+    if (source) return undefined;
+    source = previous.checkpoint.source;
+  }
+  return source ? structuredClone(source) : undefined;
 }
 
 function acceptedCheckpoint(

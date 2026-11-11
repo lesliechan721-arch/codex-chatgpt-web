@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createContinuityMcpClient } from "./helpers/continuity-mcp-client";
-import { readContinuityStartup } from "./helpers/session-continuity-fixture";
+import { deliveredStartupSources, readContinuityStartup } from "./helpers/session-continuity-fixture";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
@@ -1213,7 +1213,7 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
-  test("steering retires a browser waiting for an old tool result and rejects late older requests", async () => {
+  test.each(["user.text", "user.goal"])("%s steering retires a browser waiting for an old tool result and rejects late older requests", async kind => {
     const sessions = new ChatGptTurnSessions();
     const original = rawWireRequest(environmentXml);
     const originalInput = (original._rawBody as { input: Array<Record<string, unknown>> }).input;
@@ -1223,6 +1223,12 @@ describe("ChatGPT outer-native harness v4", () => {
     steeredInput.push({ type: "function_call_output", call_id: "pending", output: "actual command result" });
     // Identical text still represents a new native instruction when Codex assigns a new item id.
     steeredInput.push({ ...structuredClone(originalInput.at(-1)!), id: "msg_steered" });
+    if (kind === "user.goal") {
+      steeredInput.at(-1)!.internal_chat_message_metadata_passthrough = {
+        turn_id: "auto-compact-3", content_item_kinds: [kind],
+      };
+      steeredInput.at(-1)!.content = [{ type: "input_text", text: '<codex_internal_context source="user_goal">User cleared the goal.</codex_internal_context>' }];
+    }
     const oldKey = chatGptTurnExecutionKey(original);
     const newKey = chatGptTurnExecutionKey(steered);
     expect(newKey).not.toBe(oldKey);
@@ -1264,6 +1270,106 @@ describe("ChatGPT outer-native harness v4", () => {
     finishNew("done");
     await current.browserOutcome;
     sessions.clear();
+  });
+
+  test("goal clear during a native command resumes with its result and the new workspace context", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-goal-edit-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://goal-edit-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, ...toolCapabilities },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let starts = 0;
+    let oldToken = "";
+    let replacementPrompt = "";
+    let oldSettled = false;
+    let contextClient: Awaited<ReturnType<typeof createContinuityMcpClient>> | undefined;
+    worker.run = async turn => {
+      const ordinal = ++starts;
+      const prepared = await turn.prepare();
+      try {
+        if (prepared.contextPlan) await turn.onContextPlanSelected?.(prepared.contextPlan.planId);
+        await turn.onSendActivated?.();
+        await turn.onSubmitted?.();
+        const token = prepared.turnToken ?? prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("missing test token");
+        if (prepared.text.includes("<codex_bootstrap_json>")) {
+          contextClient ??= await createContinuityMcpClient({ brokerSocketPath: socketPath, contract: "native", transport: "in-process" });
+          await readContinuityStartup(prepared.text, contextClient.client);
+        }
+        if (ordinal > 1) {
+          expect(oldSettled).toBeTrue();
+          await callTurnBroker(socketPath, { method: "claim", token });
+          replacementPrompt = deliveredStartupSources(prepared.text);
+          turn.onTextDelta("Command finished; goal cleared.");
+          return "Command finished; goal cleared.";
+        }
+        oldToken = token;
+        const { bindingId } = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+        return await Promise.race([
+          invokeAfterBrowserBoundary(turn, () => callTurnBroker<BrokerToolResult>(socketPath, {
+            method: "invoke", bindingId, wireName: "exec_command", arguments: { cmd: "long-running-command" },
+          }, null)).then(() => { throw new Error("superseded browser must not continue"); }),
+          new Promise<never>((_resolve, reject) => {
+            const abort = () => reject(turn.abortSignal!.reason);
+            if (turn.abortSignal?.aborted) abort();
+            else turn.abortSignal?.addEventListener("abort", abort, { once: true });
+          }),
+        ]);
+      } finally {
+        prepared.release();
+        if (ordinal === 1) oldSettled = true;
+      }
+    };
+    const initial = rawWireRequest(environmentXml.replace("</workspace_roots>", `<root>${join(tempRoot, "visualizations")}</root></workspace_roots>`));
+    const adapter = createChatGptWebAdapter(provider, { broker });
+    let continuation: CodexParsedRequest | undefined;
+    try {
+      const first: AdapterEvent[] = [];
+      await adapter.runTurn!(initial, { headers: new Headers() }, event => first.push(event));
+      const call = first.find((event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start");
+      if (!call) throw new Error("missing native tool call");
+      continuation = structuredClone(initial);
+      const raw = continuation._rawBody as { input: Array<Record<string, unknown>> };
+      raw.input[0]!.content = [{ type: "input_text", text: environmentXml }];
+      const goalText = '<codex_internal_context source="user_goal">User cleared the goal.</codex_internal_context>';
+      const result = JSON.stringify({ output: "command executed once", exit_code: 0 });
+      raw.input.push(
+        { type: "function_call", call_id: call.id, name: "exec_command", arguments: '{"cmd":"long-running-command"}' },
+        { type: "message", role: "user", id: "msg_goal_clear", content: [{ type: "input_text", text: goalText }],
+          internal_chat_message_metadata_passthrough: { turn_id: "auto-compact-3", content_item_kinds: ["user.goal"] } },
+        { type: "function_call_output", call_id: call.id, output: result },
+      );
+      continuation.context.messages.push(
+        { role: "assistant", timestamp: 3, content: [{ type: "toolCall", id: call.id, name: "exec_command", arguments: { cmd: "long-running-command" } }] },
+        { role: "user", timestamp: 4, content: goalText },
+        { role: "toolResult", timestamp: 5, toolCallId: call.id, toolName: "exec_command", content: result, isError: false },
+      );
+      const events: AdapterEvent[] = [];
+      expect(extractChatGptTurnEnvironment(continuation).roots).toEqual([tempRoot]);
+      await adapter.runTurn!(continuation, { headers: new Headers() }, event => events.push(event));
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
+      expect(starts).toBe(2);
+      expect(replacementPrompt).toContain("User cleared the goal.");
+      expect(replacementPrompt).toContain("command executed once");
+      await expect(callTurnBroker(socketPath, { method: "claim", token: oldToken })).rejects.toThrow();
+      const late: AdapterEvent[] = [];
+      const lateError = await adapter.runTurn!(initial, { headers: new Headers() }, event => late.push(event)).catch(error => error);
+      if (lateError) expect(lateError).toMatchObject({ code: "client_cancelled" });
+      else expect(late).toContainEqual(expect.objectContaining({ type: "error", code: "client_cancelled" }));
+      expect(late.some(event => event.type === "tool_call_start")).toBeFalse();
+      expect(starts).toBe(2);
+    } finally {
+      worker.run = originalRun;
+      for (const request of [initial, continuation]) if (request) {
+        await chatGptTurnSessions.retireAndWait(`${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`);
+      }
+      await broker.close();
+      await contextClient?.close();
+    }
   });
 
   test("retires only the exact active native turn that Codex marked aborted", () => {

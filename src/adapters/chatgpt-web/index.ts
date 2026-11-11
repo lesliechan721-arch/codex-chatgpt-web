@@ -2325,6 +2325,7 @@ export function createChatGptWebAdapter(
         const taskExecution = environment ? taskUpdateExecutionIdentity(environment, executionNamespace, parsed) : undefined;
         const existingTaskSession = parsed._conversationPolicy !== "task"
           ? chatGptTurnSessions.find(executionKey) : undefined;
+        if (existingTaskSession?.supersededError) throw existingTaskSession.supersededError;
         const ordinaryLegacyReplay = retainedContinuitySession && !retainedContinuitySession.taskUpdatesEnabled()
           && !retainedContinuitySession.isQueuedTaskInputRequest(parsed);
         const updatedTaskSession = !existingTaskSession && !ordinaryLegacyReplay && taskExecution && environment

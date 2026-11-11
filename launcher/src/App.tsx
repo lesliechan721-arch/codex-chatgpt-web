@@ -18,6 +18,7 @@ import { AccountManagement, accountCopy } from "./AccountManagement";
 import { ApiAccessSettings } from "./ApiAccessSettings";
 import type { ApiAccessMode } from "./api-access-types";
 import { LimitsSurface } from "./LimitsSurface";
+import { UpdateSettings } from "./UpdateSettings";
 import { limitsCopyFor } from "./limits-copy";
 import { useLimits } from "./useLimits";
 import { describeTurnActivity } from "./turn-activity";
@@ -638,6 +639,10 @@ function LauncherShell({
             </nav>
 
             <div className="sidebar-footer">
+              {snapshot.update.status === "error" ? (
+                <SidebarItem active={false} icon="update" label={copy.updateCheckFailed}
+                  onClick={() => navigateSurface("settings")} />
+              ) : null}
               {updateVisible ? (
                 <SidebarItem
                   active={false}
@@ -1970,6 +1975,10 @@ function SettingsSurface({
         <button className="account-settings-link" type="button" onClick={onManageAccounts}>{accountCopy(language).title} →</button>
         <SectionHeading label={copy.general} />
         <div className="settings-list">
+        {snapshot.packaged && snapshot.update.status !== "disabled" ? (
+          <UpdateSettings copy={copy} language={language} update={snapshot.update}
+            version={snapshot.version} onCheck={() => api!.checkForUpdates()} setError={setError} />
+        ) : null}
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} flushAfter label={copy.launchAtLogin}>
           <Switch
             checked={snapshot.state.autoStart}

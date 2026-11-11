@@ -294,13 +294,25 @@ task. Pure `skills.selected_skill_instructions` fragments also remain task conte
 delivered and checked with the current instruction payload, while the human message identifies
 the task. Native compaction can remove these skill fragments without changing the checkpoint's
 source identity. Literal skill text and mixed skill/human content still count as instructions.
+Producer-identified `user.goal` and `user.goal.omitted` edits belong to the active task only when
+a preceding instruction proves that task's turn. Their internal history ID remains part of exact
+source matching. Clearing or replacing a goal is new steering; completed command results remain
+context and do not authorize running the command again.
 A matching completed checkpoint can restore an accepted goal or delegation to model-visible
 context only when no newer steering follows it. This does not change the raw request or tool
 authority. Restored context retains its actual source identity in on-demand delivery; it must not
 reuse another raw message's position. Durable source-type evidence does not reconstruct missing
 instruction text after restart.
+For a Native UUID task, an identity-only goal source also needs canonical rollout proof of the
+original goal and its task window. After native compaction, the latest replacement history must
+retain the selected checkpoint and the user messages required by its accepted producer projection.
+An older matching summary or guardian history cannot supply this proof. Canonical goal text is
+used only to verify the stored source digest, not to fill the request or recover missing history.
 Verified mode retains only its existing legitimate mappings. Retained-page continuation selects
 a unique source; a matching summary or the latest head cannot replace missing source proof.
+An explicitly automatic `pre_turn` compaction may identify the preceding task from its exact
+completed checkpoint before the next instruction is recorded. This exception is confined to
+compaction and does not authorize ordinary replay of an earlier task in another turn.
 
 | Recognized work | Result |
 | --- | --- |

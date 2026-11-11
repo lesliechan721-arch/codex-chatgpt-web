@@ -1,16 +1,13 @@
 # Packaging dependency compatibility
 
-The launcher overrides `minimatch` to `11.0.1` to address
-[GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249)
-without excluding the advisory from dependency audits.
+The launcher overrides only `minimatch@>=7.0.0 <11.0.1` to `11.0.5`.
+This keeps modern consumers on the upstream security update while allowing legacy
+packaging tools to use the minimatch interfaces declared by their dependencies.
 
-The installed packaging tools still use older minimatch interfaces. Bun applies
-these patches during installation:
-
-- `@electron/asar@3.4.1` and `dir-compare@4.2.0` use the named `minimatch` function.
-- `glob@7.2.3` uses the path segment matcher's `pattern` and `test()` interfaces
-  in both asynchronous and synchronous directory traversal.
+`@electron/asar@3.4.1`, `glob@7.2.3`, and `dir-compare@4.2.0` use minimatch 3.
+Their original callable export and path segment matcher remain available, so no
+compatibility patches or `patchedDependencies` entries are needed.
 
 `tests/packaging-dependencies.test.cjs` checks file discovery, ASAR unpack rules,
-and directory comparison filters. Remove each patch when its upstream dependency
-supports minimatch 11. Keep these checks when updating the packaging dependencies.
+and directory comparison filters against the installed packages. Keep these
+behavior checks when updating packaging dependencies or the override range.

@@ -365,6 +365,27 @@ export function chatGptContinuityInstructionPayloadDigest(
   return continuityInstructionPayloadDigestForContents(parsed, contents);
 }
 
+/** Hash the actual producer projection, including a valid projection with no task instruction. */
+export function chatGptContinuityCarriedInstructionPayloadDigest(parsed: CodexParsedRequest): string {
+  const raw = rawRecord(parsed._rawBody), input = Array.isArray(raw?.input) ? raw.input : [];
+  const projection = parsed._compactionOutput === "message"
+    ? { ...parsed, _rawBody: { ...raw, input: input.slice(0, -1) }, _compactionOutput: undefined } : parsed;
+  for (const value of parsed._compactionOutput === "message" ? input.slice(0, -1) : input) {
+    const item = rawRecord(value), owner = rawRecord(item?.internal_chat_message_metadata_passthrough)?.turn_id;
+    if (hasNativeChatGptInstruction(projection, [value])
+      && !(typeof item?.id === "string" && item.id) && !(typeof owner === "string" && owner.trim())) {
+      throw continuityError("continuity_source_unproven", "A carried instruction has no native identity.");
+    }
+  }
+  const selected = continuityCurrentInstructionInput(projection, undefined, false, undefined, true);
+  const contents = selected.map(value => {
+    const item = rawRecord(value);
+    if (!item) throw continuityError("continuity_source_unproven");
+    return { ...chatGptInstructionEnvelope(item), content: chatGptInstructionContent(item) };
+  });
+  return continuityInstructionPayloadDigestForContents({ ...projection, _continuityScope: undefined }, contents);
+}
+
 function continuityInstructionPayloadDigestForContents(parsed: CodexParsedRequest, contents: unknown[]): string {
   const raw = rawRecord(parsed._rawBody);
   const sourceOptions = parsed._compactionRequest ? { ...(parsed._compactionSourceOptions ?? parsed.options) } : parsed.options;

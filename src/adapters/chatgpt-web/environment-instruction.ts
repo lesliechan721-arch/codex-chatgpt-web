@@ -1,11 +1,13 @@
 import type { CodexParsedRequest } from "../../types";
 import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
-import { isNativeAgentsMdContext, isNativeSelectedSkillContext, readNativeThreadDelegation } from "../../responses/native-context";
+import { isNativeAgentsMdContext, isNativeSelectedSkillContext, isNativeUserGoalUpdate, readNativeThreadDelegation } from "../../responses/native-context";
 
 export interface ChatGptTurnUserRevision {
   content: unknown;
   turnId?: string;
   itemId?: string;
+  /** Producer history ID when a native goal edit is bound to its active task. */
+  nativeTurnId?: string;
   instructionEnvelope?: Record<string, unknown>;
 }
 
@@ -145,10 +147,10 @@ export function requestCarriedChatGptInstructionRevision(parsed: CodexParsedRequ
   const selection = continuityInstructionSelection(parsed, input);
   if (selection?.carried.has(expectedTurnId)) {
     const index = selection.carried.get(expectedTurnId)!;
-    return index >= 0 ? userRevision(input[index], expectedTurnId, metadata, true) : undefined;
+    return index >= 0 ? nativeUserRevisionAt(input, index, expectedTurnId, metadata, true) : undefined;
   }
   for (let index = input.length - 1; index >= 0; index -= 1) {
-    const revision = userRevision(input[index], expectedTurnId, metadata, parsed._conversationPolicy === "task");
+    const revision = nativeUserRevisionAt(input, index, expectedTurnId, metadata, parsed._conversationPolicy === "task");
     if (revision) {
       selection?.carried.set(expectedTurnId, index);
       return revision;
@@ -156,6 +158,37 @@ export function requestCarriedChatGptInstructionRevision(parsed: CodexParsedRequ
   }
   selection?.carried.set(expectedTurnId, -1);
   return undefined;
+}
+
+/** Native goal mutations inherit only the task owner of their preceding instruction. */
+export function nativeUserRevisions(input: unknown[], expectedTurnId?: string,
+  metadata?: Record<string, unknown>, includeEnvelope = false): Array<{ index: number; revision: ChatGptTurnUserRevision }> {
+  const revisions: Array<{ index: number; revision: ChatGptTurnUserRevision }> = [];
+  let instructionTurnId: string | undefined;
+  for (let index = 0; index < input.length; index += 1) {
+    let revision = userRevision(input[index], expectedTurnId, metadata, includeEnvelope);
+    if (!revision) continue;
+    if (isNativeUserGoalUpdate(record(input[index])!)) {
+      if (expectedTurnId !== undefined && instructionTurnId === expectedTurnId) {
+        revision = { ...revision, nativeTurnId: revision.turnId, turnId: expectedTurnId };
+      }
+    } else instructionTurnId = revision.turnId;
+    revisions.push({ index, revision });
+  }
+  return revisions;
+}
+
+export function nativeUserRevisionAt(input: unknown[], index: number, expectedTurnId?: string,
+  metadata?: Record<string, unknown>, includeEnvelope = false): ChatGptTurnUserRevision | undefined {
+  const revision = userRevision(input[index], expectedTurnId, metadata, includeEnvelope);
+  if (!revision || expectedTurnId === undefined || !isNativeUserGoalUpdate(record(input[index])!)) return revision;
+  for (let previous = index - 1; previous >= 0; previous -= 1) {
+    const preceding = userRevision(input[previous], expectedTurnId, metadata);
+    if (!preceding || isNativeUserGoalUpdate(record(input[previous])!)) continue;
+    return preceding.turnId === expectedTurnId
+      ? { ...revision, nativeTurnId: revision.turnId, turnId: expectedTurnId } : revision;
+  }
+  return revision;
 }
 
 /** Preserve the instruction roles that the prompt compiler treats differently. */

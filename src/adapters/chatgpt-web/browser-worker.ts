@@ -1031,13 +1031,14 @@ interface ChatGptSubmissionDomState {
   userIdentities: string[];
   responseIdentities: string[];
   responseMessageIds?: Record<string, string[]>;
+  observedTurnIdentities: string[];
 }
 
 export function chatGptTurnBindingDiagnostic(
   event: "accepted" | "detached" | "rebound" | "missing",
   baseline: Pick<ChatGptSubmissionBaseline, "initialTurnIdentities">,
   binding: ChatGptAssistantTurnBinding | undefined,
-  state: ChatGptSubmissionDomState,
+  state: Omit<ChatGptSubmissionDomState, "observedTurnIdentities">,
 ) {
   const identity = (value: string) => {
     const group = /^group:(user|assistant):/.exec(value);
@@ -2769,7 +2770,7 @@ export class ChatGptBrowserWorker {
   ): Promise<ChatGptSubmissionDomState> {
     throwIfPromptAttachmentAborted(signal);
     const observed = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(page.evaluate(options => {
-      type ObserverState = { id: string; revision: number; observer: MutationObserver };
+      type ObserverState = { id: string; revision: number; observer: MutationObserver; turnHistory?: Set<string> };
       const scope = globalThis as typeof globalThis & {
         __CODEX_WEB_GPT_TURN_OBSERVER__?: ObserverState;
       };
@@ -2847,6 +2848,11 @@ export class ChatGptBrowserWorker {
           }
         }
       });
+      // #948, observed 2026-11-08: scrolling can unmount the whole group. Retained
+      // documents outlive browser helpers, so remember actually observed identities
+      // with the document observer. Never infer identities from message text.
+      const turnHistory = observerState.turnHistory ??= new Set<string>();
+      for (const identity of turnIdentities) turnHistory.add(identity);
       return {
         key: observerKey,
         snapshot: {
@@ -2857,6 +2863,7 @@ export class ChatGptBrowserWorker {
           userIdentities,
           responseIdentities,
           responseMessageIds,
+          observedTurnIdentities: [...turnHistory],
         },
       };
     }, {
@@ -2942,7 +2949,9 @@ export class ChatGptBrowserWorker {
       submittedText,
       turnToken,
     };
-    baseline.initialTurnIdentities = [...state.turnIdentities];
+    // Copy document history before Send so a remounted turn cannot acknowledge it.
+    // Later observations must not add competing turns to this baseline.
+    baseline.initialTurnIdentities = [...state.observedTurnIdentities];
     return baseline;
   }
 
