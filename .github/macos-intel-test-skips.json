@@ -1,9 +1,9 @@
 {
   "version": 1,
   "reviewedSource": {
-    "revision": "0b1e42296e26eee9d29a8c5fa16453464a0b4c56",
-    "patchDigest": "2d1dce03a349a11564e2607771c004890a653ee67c92f7d4b5b61e1e9cc458d8",
-    "toolDigest": "92f2c054cf12b5b1a5bad065926a429f823b99e738ac713fce88ee88a1529245"
+    "revision": "249a6dbdbf9f94c486c3a6d828af4dbe6c8194ea",
+    "patchDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "toolDigest": "842a7590f23e3609b44a87382950ded9d1ac8ee27ee91ee74b76624ce19c3414"
   },
   "entries": [
     {
@@ -47,8 +47,23 @@
       "reason": "process.platform !== win32：Windows 命名空间路径与任务恢复检查仅在 Windows 执行。"
     },
     {
+      "file": "tests/native-goal-recovery.test.ts",
+      "name": "UUID goal recovery child repeat",
+      "reason": "!process.env.NATIVE_UUID_GOAL_ROOT：独立子进程入口，普通全套根进程未提供非空 root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/native-goal-recovery.test.ts",
+      "name": "UUID goal recovery child seed",
+      "reason": "!process.env.NATIVE_UUID_GOAL_ROOT：独立子进程入口，普通全套根进程未提供非空 root；父场景显式设置变量并调用此入口。"
+    },
+    {
+      "file": "tests/native-task-compaction.test.ts",
+      "name": "native task goal restart seed",
+      "reason": "!process.env.NATIVE_TASK_RESTART_ROOT：独立子进程入口，普通全套根进程未提供非空 root；父场景显式设置变量并调用此入口。"
+    },
+    {
       "file": "tests/server-deploy.test.ts",
-      "name": "server remote desktop deployment > includes dependency patches and excludes generated launcher directories in the Docker build context",
+      "name": "server remote desktop deployment > includes declared dependency patches and excludes generated launcher directories in the Docker build context",
       "reason": "!dockerAvailable：源码要求 Docker 可执行文件存在、容器类型为 Linux 且 Buildx 命令成功；实际日志未区分哪一子条件不成立。"
     },
     {
