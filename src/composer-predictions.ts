@@ -47,5 +47,6 @@ export function assertComposerPredictionFits(parsed: CodexParsedRequest, config:
     "medium",
     capabilities,
     compiledChatGptWebMaxMessageChars(compiled),
+    parsed._chatgptModelFamily,
   );
 }

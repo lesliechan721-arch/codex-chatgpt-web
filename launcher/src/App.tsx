@@ -1812,6 +1812,8 @@ function SettingsSurface({
       ? copy.delegatedToolAuthorityForcedRemote
       : copy.delegatedToolAuthorityForcedEnvironment}`
     : copy.delegatedToolAuthorityBody;
+  const [confirmBrowserReset, setConfirmBrowserReset] = useState(false);
+  const [browserDataReset, setBrowserDataReset] = useState(false);
   const currentPluginName = snapshot.connectorNames[snapshot.state.browserInteractionMode];
   const [nameSuffix, setNameSuffix] = useState(currentPluginName.slice(6));
   const [confirmNameChange, setConfirmNameChange] = useState(false);
@@ -1923,6 +1925,19 @@ function SettingsSurface({
     setError(null);
     try {
       updateState(await api!.setTemporaryChats(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const resetEmbeddedBrowserData = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api!.resetEmbeddedBrowserData();
+      setBrowserDataReset(true);
+      setConfirmBrowserReset(false);
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -2091,7 +2106,23 @@ function SettingsSurface({
             onChange={(checked) => void setTemporaryChats(checked)}
           />
         </SettingRow>
-        <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
+        <SettingRow
+          body={confirmBrowserReset ? copy.embeddedBrowserResetConfirm
+            : browserDataReset ? copy.embeddedBrowserResetSuccess : copy.embeddedBrowserResetBody}
+          label={copy.embeddedBrowserReset}
+        >
+          {confirmBrowserReset ? (
+            <div className="manual-turn-actions">
+              <SecondaryButton disabled={busy} onClick={() => setConfirmBrowserReset(false)}>{copy.close}</SecondaryButton>
+              <PrimaryButton disabled={busy} onClick={() => void resetEmbeddedBrowserData()}>{copy.reset}</PrimaryButton>
+            </div>
+          ) : (
+            <SecondaryButton disabled={busy} onClick={() => { setBrowserDataReset(false); setConfirmBrowserReset(true); }}>
+              {copy.reset}
+            </SecondaryButton>
+          )}
+        </SettingRow>
+        <SettingRow body={copy.embeddedBrowserLanguageHint} label={copy.language}>
           <LanguageMenu copy={copy} language={language} onChange={(next) => void updateLanguage(next)} />
         </SettingRow>
         </div>

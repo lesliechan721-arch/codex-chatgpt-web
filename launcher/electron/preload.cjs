@@ -47,6 +47,7 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   confirmManualSent: (tabId, binding) => ipcRenderer.invoke("launcher:manual-prompt-sent", tabId, binding),
   confirmManualAttachments: (tabId, binding) => ipcRenderer.invoke("launcher:manual-attachments-confirm", tabId, binding),
   openLogin: () => ipcRenderer.invoke("launcher:browser-login"),
+  resetEmbeddedBrowserData: () => ipcRenderer.invoke("launcher:browser-reset-data"),
   openPasskeyLogin: () => ipcRenderer.invoke("launcher:browser-passkey-login"),
   continuePasskeyLogin: () => ipcRenderer.invoke("launcher:browser-passkey-login-continue"),
   logoutChatGpt: () => ipcRenderer.invoke("launcher:browser-logout"),

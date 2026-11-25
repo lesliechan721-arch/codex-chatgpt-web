@@ -32,7 +32,7 @@ failures. A GitHub rate-limit reset blocks both scheduled and manual retries unt
 This fork's installers and launcher updater use releases from
 `lesliechan721-arch/codex-chatgpt-web`. Numeric suffixes are stable fork revisions:
 `6.1.7-1` follows `6.1.7`, `6.1.7-2` follows `6.1.7-1`, `6.1.7-3` follows `6.1.7-2`, `6.1.7-4` follows `6.1.7-3`, and `6.1.7-5` follows `6.1.7-4`.
-Version `6.1.18-1` integrates upstream `6.1.18` with this fork's continuity, durable input queue,
+Version `6.2.0-1` integrates upstream `6.2.0` with this fork's continuity, durable input queue,
 short-start context, on-demand reading, API access, provider, proxy, and remote-runtime contracts.
 Full Access tasks can keep added workspace directories after compaction while preserving every
 native project, the current working directory, turn identity and permission mode. Restricted tasks

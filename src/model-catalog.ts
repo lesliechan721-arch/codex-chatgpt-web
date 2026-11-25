@@ -49,11 +49,18 @@ function routedModelPriority(
   const priority = modelPriority(template);
   if (priority === undefined
     || config.subagentProtocol !== "compatibility-v1"
-    || !["chatgpt-web/light", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-6-sol-instant"].includes(route.slug)) return priority;
+    || ![
+      "chatgpt-web/light",
+      "chatgpt-web/gpt-5.6-sol-instant",
+      ...(config.proAvailable ? ["chatgpt-web/gpt-5.6-sol"] : []),
+      "chatgpt-web/gpt-6-sol-instant",
+      "chatgpt-web/gpt-6.2-sol-instant",
+    ].includes(route.slug)) return priority;
   if (priority === Number.MAX_SAFE_INTEGER) {
     throw new Error("Native Codex model template priority cannot reserve the Compatibility V1 roster");
   }
-  // Preserve the native model and the reasoning/Pro choices in Codex V1's bounded registry.
+  // Reserve the native model and the newest reasoning/Pro choices in the five-entry
+  // V1 registry. Without Pro, keep the older 5.6 reasoning choice ahead of Instant too.
   return priority + 1;
 }
 

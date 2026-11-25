@@ -256,6 +256,13 @@ function isAbortedNavigationError(error) {
   return error instanceof Error && /\bERR_ABORTED\b/.test(error.message);
 }
 
+function logChatGptSessionLoss(host, result, source) {
+  // Only record an observed transition. The session payload can contain credentials.
+  if (host.state.authenticated && ["http-401", "session-error", "no-user", "expired"].includes(result.signedOutReason)) {
+    host.logger.info("browser.session_signed_out", { source, reason: result.signedOutReason });
+  }
+}
+
 function isNewChatUrl(value) {
   let parsed;
   try {
@@ -317,7 +324,7 @@ function requireAutomaticBrowserInspection(host, operation) {
 
 function assertAccountAdmission(host) {
   if (host.accountAdmissionClosed) {
-    const error = new Error("Account admission is closed while the launcher switches accounts");
+    const error = new Error("Account admission is closed during launcher maintenance");
     error.code = "account_admission_closed";
     throw error;
   }
@@ -663,7 +670,7 @@ class BrowserHost {
     if (execution) assertAccountIdentity(this);
   }
 
-  closeAccountAdmission() {
+  closeAccountAdmission(operation = "switching accounts") {
     const previouslyClosed = this.accountAdmissionClosed === true;
     this.accountAdmissionClosed = true;
     try {
@@ -673,14 +680,14 @@ class BrowserHost {
         || this.authView || this.primaryRendererRecovery || this.primaryRendererRecoveryNeeded
         || this.cloudflareChallengeRecovery
         || physicalTurnTabs(this).some(tab => tab.approvalPending || !isSafelyReclaimableTurnTab(this, tab))) {
-        throw new Error("Finish active ChatGPT tasks, login and diagnostics before switching accounts; the browser is busy");
+        throw new Error(`Finish active ChatGPT tasks, login and diagnostics before ${operation}; the browser is busy`);
       }
       for (const record of this.continuityTransactions?.values() ?? []) {
         if (record.pending && !record.result || !["completed", "retired", "missing"].includes(record.state)
           || record.state === "missing" && record.result && !record.writerRetired && !record.executionIsolated
           || !record.executionIsolated && this.continuityAuthorityDirectories?.has(record.identity?.installationId)
             && !require("./continuity-execution-authority.cjs").hasIdleExecutionAuthority(this, record.identity)) {
-          throw new Error("Finish active or retained ChatGPT execution before switching accounts");
+          throw new Error(`Finish active or retained ChatGPT execution before ${operation}`);
         }
       }
       return { status: "closed" };
@@ -1481,9 +1488,13 @@ class BrowserHost {
       this.setState({ url, loading: false });
       if (this.primaryRendererRecovery) return; // Recovery establishes ownership once below.
       void this.applyViewportCss();
+      const revision = this.authenticationRevision;
       void this.markOwnedSurface()
-        .then(() => this.probeAuthentication())
+        .then(() => {
+          if (!this.accountAdmissionClosed && revision === this.authenticationRevision) return this.probeAuthentication();
+        })
         .catch((error) => {
+          if (this.destroyed || this.accountAdmissionClosed || revision !== this.authenticationRevision) return;
           this.logger.error("browser.surface_mark_failed", {
             message: error instanceof Error ? error.message : String(error),
           });
@@ -1727,6 +1738,7 @@ class BrowserHost {
         if (!await verifySessionAccountIdentity(this, result, revision)) return;
         if (this.destroyed || this.accountAdmissionClosed) return;
         if (revision !== this.authenticationRevision) continue;
+        logChatGptSessionLoss(this, result, "idle");
         const availability = this.activeTraceId || this.manualOperation ? {} : result.sessionCheckError
           ? { status: "error", message: result.sessionCheckError }
           : result.sessionAuthenticated
@@ -3606,6 +3618,65 @@ class BrowserHost {
     });
   }
 
+  async resetEmbeddedBrowserData() {
+    await this.ready();
+    assertAccountAdmission(this);
+    // The account switch guard also rejects in-flight authentication and any
+    // active, pending or unverified retained execution. Keep admission closed
+    // until all this account's pages have left ChatGPT and storage is cleared.
+    this.closeAccountAdmission("resetting embedded browser data");
+    this.manualOperation = "embedded browser data reset";
+    try {
+      const contents = this.view?.webContents;
+      if (!contents || contents.isDestroyed()) throw new Error("Embedded ChatGPT browser is unavailable");
+      const tabs = [...this.turnTabs.values()];
+      const liveContents = [contents, ...tabs.map(tab => tab.view.webContents)]
+        .filter(candidate => candidate && !candidate.isDestroyed());
+      const browserSession = contents.session;
+      if (liveContents.some(candidate => candidate.session !== browserSession)) {
+        throw new Error("Owned ChatGPT views do not share one browser session");
+      }
+      // Establish a new authentication generation before any cookie or page
+      // notification can arrive from the browser reset. A saved session may
+      // be checked again by explicit sign-in, not by a delayed background event.
+      this.authenticationRevision = (this.authenticationRevision ?? 0) + 1;
+      this.reauthenticationRequired = true;
+      this.activateHomeSurface();
+      this.hide();
+      this.setState({ authenticated: false, status: "loading", message: "Resetting embedded browser data" });
+      const navigations = await Promise.allSettled(liveContents.map(async candidate => candidate.loadURL(IDLE_BROWSER_URL)));
+      const failedNavigation = navigations.find(result => result.status === "rejected");
+      if (failedNavigation) throw failedNavigation.reason;
+      await browserSession.closeAllConnections();
+      await browserSession.clearStorageData();
+      await browserSession.clearCache();
+      browserSession.flushStorageData();
+      await browserSession.cookies.flushStore();
+      for (const tab of tabs) this.removeTurnTab(tab, false);
+      this.primaryNavigationError = null;
+      this.authNavigationError = null;
+      this.primaryRendererReady = true;
+      if (browserInteractionModeFor(this) === "automatic") await this.markOwnedSurface();
+      this.writeDescriptor();
+      this.setState({
+        authenticated: false,
+        loading: false,
+        message: "Embedded browser data was reset. Sign in to ChatGPT",
+        status: "signed-out",
+        url: IDLE_BROWSER_URL,
+      });
+      this.logger.info("browser.session_reset");
+      return this.snapshot();
+    } catch (error) {
+      this.setState({ status: "error", message: error instanceof Error ? error.message : String(error), loading: false });
+      throw error;
+    } finally {
+      this.manualOperation = null;
+      this.resumeAccountAdmission();
+      if (this.primaryRendererRecoveryNeeded) void this.recoverPrimaryRenderer();
+    }
+  }
+
   refreshAuthentication() {
     assertAccountAdmission(this);
     requireAutomaticBrowserInspection(this, "ChatGPT authentication refresh");
@@ -3664,6 +3735,7 @@ class BrowserHost {
           if (this.destroyed || revision !== this.authenticationRevision) return this.snapshot();
           if (!await verifySessionAccountIdentity(this, result, revision)
             || this.destroyed || this.accountAdmissionClosed || revision !== this.authenticationRevision) return this.snapshot();
+          logChatGptSessionLoss(this, result, "idle");
           this.setState({ authenticated: result.sessionAuthenticated,
             ...(result.sessionCheckError ? { status: "error", message: result.sessionCheckError } : {
               status: result.sessionAuthenticated ? "ready" : "signed-out",
@@ -3736,6 +3808,7 @@ class BrowserHost {
       if (revision !== this.authenticationRevision) return this.snapshot();
       if (!await verifySessionAccountIdentity(this, result, revision)
         || this.destroyed || this.accountAdmissionClosed || revision !== this.authenticationRevision) return this.snapshot();
+      logChatGptSessionLoss(this, result, "page");
       if (result.sessionAuthenticated) {
         this.reauthenticationRequired = false;
         if (this.authView && !this.authView.webContents.isDestroyed()) {

@@ -42,7 +42,7 @@ export function assertContinuityCompiledInput(
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
     assertChatGptWebInputWithinLimits(
       inputTokens, estimateCompiledChatGptWebMessageTokens(compiled, parsed.modelId) + capabilityReserveTokens,
-      parsed.modelId, mode.effort, capabilities, compiled.text.length,
+      parsed.modelId, mode.effort, capabilities, compiled.text.length, parsed._chatgptModelFamily,
     );
   } catch {
     throw continuityError("continuity_input_limit");

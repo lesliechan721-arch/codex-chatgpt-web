@@ -12,7 +12,7 @@ async function readChatGptAuthSession(fetchSession, origin, timeoutMs) {
       signal: controller.signal,
     });
     received = true;
-    if (response.status === 401) return { sessionAuthenticated: false, sessionCheckError: null };
+    if (response.status === 401) return { sessionAuthenticated: false, sessionCheckError: null, signedOutReason: "http-401" };
     if (!response.ok) {
       return { sessionAuthenticated: false, sessionCheckError: `ChatGPT session verification failed (HTTP ${response.status}). Check your connection and retry.` };
     }
@@ -22,20 +22,24 @@ async function readChatGptAuthSession(fetchSession, origin, timeoutMs) {
     const payload = await response.json();
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Invalid session");
     const user = payload.user;
-    const authenticated = user && typeof user === "object" && !Array.isArray(user)
-      && Object.keys(user).length > 0
-      && (payload.error === undefined || payload.error === null || payload.error === "")
-      && (payload.expires === undefined || payload.expires === null
-        || typeof payload.expires === "string" && Number.isFinite(Date.parse(payload.expires))
-          && Date.parse(payload.expires) > Date.now());
+    let signedOutReason;
+    if (payload.error != null && payload.error !== "") {
+      signedOutReason = "session-error";
+    } else if (!user || typeof user !== "object" || Array.isArray(user) || Object.keys(user).length === 0) {
+      signedOutReason = "no-user";
+    } else if (payload.expires != null) {
+      const expires = typeof payload.expires === "string" ? Date.parse(payload.expires) : NaN;
+      if (!Number.isFinite(expires)) throw new Error("Invalid session expiration");
+      if (expires <= Date.now()) signedOutReason = "expired";
+    }
     const stableId = value => typeof value === "string" && value.trim().length > 0
       && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
-    const sessionIdentity = authenticated && stableId(user.id) ? {
+    const sessionIdentity = !signedOutReason && stableId(user.id) ? {
       userId: user.id.trim(),
       ...(stableId(payload.account?.id) ? { accountId: payload.account.id.trim() } : {}),
       ...(stableId(payload.workspace?.id) ? { workspaceId: payload.workspace.id.trim() } : {}),
     } : undefined;
-    return { sessionAuthenticated: Boolean(authenticated), sessionCheckError: null,
+    return { sessionAuthenticated: !signedOutReason, sessionCheckError: null, signedOutReason,
       ...(sessionIdentity ? { sessionIdentity } : {}) };
   } catch {
     return { sessionAuthenticated: false, sessionCheckError: controller.signal.aborted

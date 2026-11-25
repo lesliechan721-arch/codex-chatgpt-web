@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ Full harness mode connects ChatGPT to the current task’s files, terminal, tool
 
 ## Get started
 
-**Available models:** Free/Go → **Luna / Think**. Paid accounts → **GPT-6 Sol** and **GPT-5.6 Sol**, with **Instant–High**, plus **Extra High** and **Pro** when available. Each version has its own entry; existing GPT-5.6 chats keep GPT-5.6. Availability depends on your account and workspace.
+**Available models:** Free/Go → **Luna / Think**. Paid accounts → **GPT-6.2 Sol**, **GPT-6 Sol**, and **GPT-5.6 Sol**, with **Instant–High**, plus **Extra High** and **Pro** when available. Each version has its own entry; existing chats keep their selected version. Availability depends on your account and workspace.
 
 1. **Install the launcher** using the download for your system above.
 2. **Sign in to ChatGPT** in the embedded browser and run the browser smoke test.

@@ -45,13 +45,13 @@ import {
 import {
   compiledChatGptWebMaxMessageChars,
   estimateCompiledChatGptWebMessageTokens,
+  estimateCompiledChatGptWebInputTokens,
 } from "./input-tokens";
 import {
   CHATGPT_MAX_INPUT_IMAGES,
   type CompiledChatGptWebPrompt,
   type ChatGptWebPromptImage,
 } from "./prompt";
-import { estimateCompiledChatGptWebInputTokens } from "./input-tokens";
 import {
   assertAuthenticatedChatGptPage,
   assertNewChatPage,
@@ -68,6 +68,7 @@ import {
   CHATGPT_USER_TURN_SELECTOR,
 } from "../../chatgpt-ui/turns";
 import {
+  chatGptAttachmentPreview,
   chatGptStopButton,
   chatGptThinkButtons,
   CHATGPT_COMPOSER_SELECTOR,
@@ -82,6 +83,11 @@ import {
 import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_ITEM_SELECTOR,
+  chatGptLockedEffortMessage,
+  chatGptModelOption,
+  disabledRowTooltip,
+  chatGptLockedEffortPanel,
+  waitForChatGptEffortRange,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   activateChatGptEffortMenu,
   readChatGptEffortSnapshot,
@@ -106,7 +112,7 @@ import {
   type ChatGptWebModelFamily,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
-import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
+import { assertChatGptModelFamily, chatGptModelFamilyMatches, hasConfirmedLockedInstant, selectChatGptModelFamily } from "./model-selection";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import {
   ChatGptCompactionHandoffAccepted,
@@ -237,6 +243,13 @@ function chatGptModelControlUnavailableError(diagnostic: string): Error {
   return new Error(CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE, { cause: new Error(diagnostic) });
 }
 
+function unconfirmedLockedInstantError(family: "6" | "6.2"): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    `ChatGPT could not confirm GPT-${family} Instant in the model picker. The message was not sent.`,
+    { status: 400, errorType: "invalid_request_error", code: "model_version_unavailable", retryable: false },
+  );
+}
+
 function chatGptModelControlUnavailableAdapterError(diagnostic: string, detail?: string): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     detail ? `${CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE} ChatGPT: ${detail}` : CHATGPT_MODEL_CONTROL_UNAVAILABLE_MESSAGE,
@@ -253,36 +266,7 @@ function chatGptModelControlUnavailableAdapterError(diagnostic: string, detail?:
 export async function chatGptUnavailableProDetail(menu: Locator): Promise<string | undefined> {
   // Pro is the product label in the picker. Its linked tooltip supplies the site's own
   // localized explanation/date; do not search the conversation or infer a reset time.
-  const rows = menu.getByRole("menuitemradio", { name: "Pro", exact: true }).filter({ visible: true });
-  try {
-    if (await rows.count() !== 1 || await rows.getAttribute("aria-disabled") !== "true") return undefined;
-    await rows.hover({ timeout: 1_500 });
-    return await rows.evaluate(async element => {
-      const deadline = Date.now() + 1_000;
-      do {
-        const ids = element.getAttribute("aria-describedby")?.trim().split(/\s+/).filter(Boolean) ?? [];
-        const tooltips = ids.map(id => document.getElementById(id))
-          .filter((node): node is HTMLElement => node instanceof HTMLElement && node.getAttribute("role") === "tooltip");
-        const visible = tooltips.filter(node => {
-          for (let current: HTMLElement | null = node; current; current = current.parentElement) {
-            const style = getComputedStyle(current);
-            if (!current.isConnected || current.hidden || current.getAttribute("aria-hidden") === "true"
-              || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-          }
-          return true;
-        });
-        if (visible.length === 1) {
-          const text = visible[0]!.textContent?.replace(/\s+/g, " ").trim();
-          if (text && text.length <= 512) return text;
-        }
-        await new Promise(resolve => setTimeout(resolve, 50));
-      } while (Date.now() < deadline);
-      return undefined;
-    }, undefined, { timeout: 1_500 });
-  } catch {
-    // Optional UI detail must not replace the existing model-unavailable error.
-    return undefined;
-  }
+  return disabledRowTooltip(menu.getByRole("menuitemradio", { name: "Pro", exact: true }).filter({ visible: true }));
 }
 
 const CHATGPT_CONNECTOR_CLEANUP_TIMEOUT_MS = 5_000;
@@ -621,8 +605,9 @@ export class ChatGptSubmissionRejectionObserver {
 }
 
 type SelectedChatGptWebModelMode = ChatGptWebModelMode & {
-  modelFamily?: "5.6" | "6";
+  modelFamily?: "5.6" | "6" | "6.2";
   selection?: { url: string; label: string };
+  lockedInstant?: true;
   usageModel?: ChatGptUsageModel;
 };
 
@@ -764,6 +749,7 @@ export function assertChatGptWebInputWithinLimits(
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
   promptChars?: number,
+  modelFamily?: ChatGptWebModelFamily,
 ): void {
   if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error(`ChatGPT web context limit is not defined for model: ${modelId}`);
@@ -781,6 +767,7 @@ export function assertChatGptWebInputWithinLimits(
     modelId,
     effort,
     capabilities,
+    modelFamily,
   );
   if (
     browserComposerCharLimit !== undefined
@@ -936,7 +923,7 @@ export interface BrowserTurn {
   traceId: string;
   modelId: string;
   reasoning?: string;
-  modelFamily?: "5.6" | "6";
+  modelFamily?: "5.6" | "6" | "6.2";
   capabilities: ChatGptWebCapabilities;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
@@ -1702,7 +1689,7 @@ class ChatGptBrowserDiagnostics {
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
-      const failed = /turn-failed|response-stalled/.test(checkpoint);
+      const failed = /turn-failed|response-stalled|capability-inspection-failed/.test(checkpoint);
       const [screenshotResult, stateResult, structureResult, interactionResult, variantsResult] = await Promise.allSettled([
         includeScreenshot
           ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
@@ -2098,6 +2085,30 @@ export function insertPlainTextIntoComposer(element: HTMLElement, value: string)
   return document.execCommand("insertText", false, value);
 }
 
+/**
+ * Plain browser turns own the whole composer rather than appending
+ * after a connector pill (#977). Select the complete editor contents in the same synchronous page
+ * step so a draft restored by ChatGPT after `fill("")` is replaced instead of prepended.
+ */
+export function replacePlainTextInComposer(element: HTMLElement, value: string): boolean {
+  if (document.activeElement !== element) element.focus();
+  if (document.activeElement !== element) return false;
+  const selection = window.getSelection();
+  if (!selection) return false;
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  if (
+    !selection.anchorNode
+    || !element.contains(selection.anchorNode)
+    || (selection.focusNode != null && !element.contains(selection.focusNode))
+  ) {
+    return false;
+  }
+  return document.execCommand("insertText", false, value);
+}
+
 export class ChatGptBrowserWorker {
   static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
     const config = resolveBrowserConfig(provider);
@@ -2219,7 +2230,7 @@ export class ChatGptBrowserWorker {
     return this.enqueueMaintenance("connector verification", () => this.verifyConnectorExclusive(traceId));
   }
 
-  inspectSession(detectCapabilities: boolean): Promise<{
+  inspectSession(detectCapabilities: boolean, traceId?: string): Promise<{
     authenticated: true;
     newChat: true;
     url: string;
@@ -2227,7 +2238,10 @@ export class ChatGptBrowserWorker {
     extraHighAvailable?: boolean;
     proAvailable?: boolean;
   }> {
-    return this.enqueueMaintenance("session inspection", () => this.inspectSessionExclusive(detectCapabilities));
+    if (traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(traceId)) {
+      return Promise.reject(new Error("ChatGPT session inspection trace id is invalid"));
+    }
+    return this.enqueueMaintenance("session inspection", () => this.inspectSessionExclusive(detectCapabilities, traceId));
   }
 
   smokeTest(abortSignal?: AbortSignal): Promise<{ effort: string; response: string }> {
@@ -2403,7 +2417,7 @@ export class ChatGptBrowserWorker {
     capabilities: ChatGptWebCapabilities,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
     trackUsage = false,
-    modelFamily?: "5.6" | "6",
+    modelFamily?: "5.6" | "6" | "6.2",
   ): Promise<SelectedChatGptWebModelMode> {
     const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
     const composer = await this.activeComposer(page);
@@ -2461,14 +2475,40 @@ export class ChatGptBrowserWorker {
     const waitAbort = new AbortController();
     try {
       const ready = await Promise.race([
-        sliderContainer.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal })
-          .then(() => effortSlider.waitFor({ state: "attached", timeout: 70_000, signal: waitAbort.signal }))
-          .then(() => "slider" as const),
+        waitForChatGptEffortRange(activation, 70_000, waitAbort.signal),
         chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "rate-limit" as const),
         chatGptExpiredSessionAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-expired" as const),
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
       if (ready === "session-expired") await throwIfChatGptSessionFailureAlert(page);
+      if (ready === "locked") {
+        await throwIfChatGptRateLimitDialog(page);
+        await throwIfChatGptSessionFailureAlert(page);
+        const panel = chatGptLockedEffortPanel(activation.menu);
+        if ((modelFamily !== "6" && modelFamily !== "6.2") || mode.effort !== "low") {
+          throw new ChatGptWebAdapterError(await chatGptLockedEffortMessage(panel, mode.displayLabel), {
+            status: 400, errorType: "invalid_request_error", code: "chatgpt_effort_locked", retryable: false,
+          });
+        }
+        const url = page.url();
+        if (!await hasConfirmedLockedInstant(activation, modelFamily)) {
+          const lockedOption = await chatGptModelOption(panel, { version: modelFamily, name: "sol" });
+          if (await lockedOption.getAttribute("aria-disabled") === "true") throw unconfirmedLockedInstantError(modelFamily);
+          await lockedOption.click({ timeout: 5_000 });
+        }
+        if (await currentEffort.getAttribute("aria-expanded") === "true") await page.keyboard.press("Escape");
+        await settleChatGptUi();
+        const label = (await currentEffort.innerText()).trim();
+        if (!chatGptModelFamilyMatches([label], modelFamily, "low")) {
+          throw unconfirmedLockedInstantError(modelFamily);
+        }
+        const selected: SelectedChatGptWebModelMode = {
+          ...mode, modelFamily, selection: { url, label }, lockedInstant: true,
+          ...(trackUsage ? { usageModel: "other" as const } : {}),
+        };
+        await this.assertSelectedEffort(page, selected);
+        return selected;
+      }
       await captureDiagnostic?.("effort-slider-visible");
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
@@ -2582,7 +2622,14 @@ export class ChatGptBrowserWorker {
     if (verifyFamily && mode.modelFamily && mode.uiEffortIndex !== null) {
       const menu = await activateChatGptEffortMenu(page, control);
       try {
-        await assertChatGptModelFamily(menu, mode.modelFamily, mode.effort, mode.uiEffortIndex);
+        if (mode.lockedInstant) {
+          if ((mode.modelFamily !== "6" && mode.modelFamily !== "6.2")
+            || !await hasConfirmedLockedInstant(menu, mode.modelFamily)) {
+            throw unconfirmedLockedInstantError(mode.modelFamily === "6.2" ? "6.2" : "6");
+          }
+        } else {
+          await assertChatGptModelFamily(menu, mode.modelFamily, mode.effort, mode.uiEffortIndex);
+        }
       } finally {
         await page.keyboard.press("Escape");
       }
@@ -3631,7 +3678,7 @@ export class ChatGptBrowserWorker {
         if (requireThink) {
           await setChatGptThinkMode(composer, true, captureDiagnostic, abortSignal);
         }
-        await this.insertPromptText(page, prompt, abortSignal);
+        await this.insertPromptText(page, prompt, abortSignal, true);
         await this.assertPromptAttached(page, prompt, abortSignal);
         return;
       }
@@ -3898,7 +3945,12 @@ export class ChatGptBrowserWorker {
     }
   }
 
-  private async insertPromptText(page: Page, text: string, abortSignal?: AbortSignal): Promise<void> {
+  private async insertPromptText(
+    page: Page,
+    text: string,
+    abortSignal?: AbortSignal,
+    replace = false,
+  ): Promise<void> {
     throwIfPromptAttachmentAborted(abortSignal);
     const composer = await this.activeComposer(page, 30_000, abortSignal);
     await composer.focus({ signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
@@ -3907,7 +3959,7 @@ export class ChatGptBrowserWorker {
     // delimiters from textContent, and leave the next insertion outside the intended block. The
     // browser's plain-text editing command updates the same focused contenteditable atomically
     // without running those Markdown shortcuts. Exact readback below remains the authority.
-    const inserted = await composer.evaluate(insertPlainTextIntoComposer, text, {
+    const inserted = await composer.evaluate(replace ? replacePlainTextInComposer : insertPlainTextIntoComposer, text, {
       timeout: 20_000,
       signal: abortSignal,
     });
@@ -3953,7 +4005,10 @@ export class ChatGptBrowserWorker {
     }
   }
 
-  private async inspectSessionExclusive(detectCapabilities: boolean): Promise<{
+  private async inspectSessionExclusive(
+    detectCapabilities: boolean,
+    traceId = `inspect_${randomUUID().replaceAll("-", "")}`,
+  ): Promise<{
     authenticated: true;
     newChat: true;
     url: string;
@@ -3962,11 +4017,39 @@ export class ChatGptBrowserWorker {
     proAvailable?: boolean;
   }> {
     const page = await this.ensurePage();
-    await this.prepareChatSurface(page);
-    const url = page.url();
-    if (!detectCapabilities) return { authenticated: true, newChat: true, url };
-    const capabilities = await detectChatGptAccountCapabilities(page);
-    return { authenticated: true, newChat: true, url, ...capabilities };
+    if (!detectCapabilities) {
+      await this.prepareChatSurface(page);
+      return { authenticated: true, newChat: true, url: page.url() };
+    }
+    const diagnostics = new ChatGptBrowserDiagnostics(
+      traceId,
+      this.config.browserDiagnosticsPath ?? join(getConfigDir(), "diagnostics", "browser-turns"),
+      this.config.appName,
+    );
+    const captureDiagnostic = (checkpoint: string): Promise<void> => diagnostics.capture(page, checkpoint);
+    let completed = false;
+    let failureCaptured = false;
+    const captureFailure = async (error: unknown): Promise<void> => {
+      if (failureCaptured) return;
+      failureCaptured = true;
+      await diagnostics.capture(page, "capability-inspection-failed", error);
+    };
+    try {
+      await captureDiagnostic("capability-inspection-started");
+      await this.prepareChatSurface(page, captureDiagnostic);
+      const url = page.url();
+      const capabilities = await detectChatGptAccountCapabilities(page, {
+        onFailureBeforeCleanup: captureFailure,
+      });
+      await captureDiagnostic("capability-inspection-succeeded");
+      completed = true;
+      return { authenticated: true, newChat: true, url, ...capabilities };
+    } catch (error) {
+      await captureFailure(error);
+      throw error;
+    } finally {
+      diagnostics.finish(completed ? "completed" : "failed");
+    }
   }
 
   private async smokeTestExclusive(abortSignal?: AbortSignal): Promise<{ effort: string; response: string }> {
@@ -4018,23 +4101,29 @@ export class ChatGptBrowserWorker {
     const input = composerForm.locator('input[data-testid="upload-photos-input"], input[type="file"][multiple]:not([accept])');
     await input.waitFor({ state: "attached", timeout: 20_000 });
     const uploads = await observeChatGptAttachmentUploads(page, files.map(file => file.name));
+    const previewWait = new AbortController();
     try {
       await withBrowserTurnAbort(input.setInputFiles(files), abortSignal);
+      let visiblePreviews = 0;
       try {
-        await withBrowserTurnAbort(Promise.all([uploads.wait(abortSignal), ...files.map(file => (
-          composerForm.getByRole("group", { name: file.name, exact: true })
-            .or(composerForm.locator(`.composer-attachment-surface:is(button, [role="button"])[aria-label=${JSON.stringify(file.name)}]`))
-            .waitFor({ state: "visible", timeout: 60_000 })
-        ))]), abortSignal);
+        const previews = files.map(async file => {
+          await chatGptAttachmentPreview(composerForm, file)
+            .waitFor({ state: "visible", timeout: 60_000, signal: previewWait.signal });
+          visiblePreviews++;
+        });
+        await withBrowserTurnAbort(Promise.all([uploads.wait(abortSignal), ...previews]), abortSignal);
       } catch (error) {
         uploads.throwIfFailed();
-        if (abortSignal?.aborted) throw error;
+        if (abortSignal?.aborted || !(error instanceof Error) || error.name !== "TimeoutError") throw error;
         const alerts = (await page.locator('[role="alert"]').allInnerTexts().catch(() => []))
           .map(text => text.replace(/\s+/g, " ").trim())
           .filter(Boolean);
-        throw new Error(
-          `ChatGPT did not accept all prompt attachments`
-          + (alerts.length > 0 ? `: ${alerts.join(" | ")}` : ""),
+        throw new ChatGptWebAdapterError(
+          `The launcher recognized ${visiblePreviews}/${files.length} attachment previews. `
+          + `ChatGPT confirmed ${uploads.completedCount}/${files.length} uploads. `
+          + "Check the attachments in the ChatGPT tab before retrying."
+          + (alerts.length > 0 ? ` ChatGPT: ${alerts.join(" | ")}` : ""),
+          { status: 502, errorType: "server_error", code: "chatgpt_attachment_unconfirmed", retryable: false },
         );
       }
       uploads.throwIfFailed();
@@ -4047,6 +4136,7 @@ export class ChatGptBrowserWorker {
       }
       throw new Error("ChatGPT accepted the prompt attachments but did not make the message ready to send");
     } finally {
+      previewWait.abort();
       await uploads.dispose();
     }
   }
@@ -4257,6 +4347,19 @@ export class ChatGptBrowserWorker {
         for (const widget of Array.from(content.querySelectorAll(
           ".chart-widget-container, [data-code-block-preview-pane], script, style, svg, img, picture, source",
         ))) widget.remove();
+        // #974: Mermaid previews mount as top-level `[data-chatgpt-mermaid-preview]` DIVs without
+        // source ranges and can remount after later prose has already streamed. Remove preview-only
+        // shells so remounts do not create empty unanchored DIV blocks, while keeping any code view.
+        for (const preview of Array.from(content.querySelectorAll("[data-chatgpt-mermaid-preview]"))) {
+          if (preview.closest("pre, code")) continue;
+          if (!preview.querySelector('pre, code, [data-markdown-copy="code-block"], .cm-content[data-language]')) {
+            preview.remove();
+          } else {
+            for (const chrome of Array.from(preview.querySelectorAll('[data-block-actions="true"][data-markdown-copy="exclude"]'))) {
+              if (!chrome.closest("pre, code")) chrome.remove();
+            }
+          }
+        }
         for (const button of Array.from(content.querySelectorAll("button"))) {
           // Follow-up labels also live in hidden sizing siblings; removing only buttons leaks them.
           if (button.classList.contains("group/suggested-followup")) {
@@ -5008,6 +5111,7 @@ export class ChatGptBrowserWorker {
         requestedMode.effort,
         browserCapabilities,
         maxMessageChars,
+        turn.modelFamily,
       );
       const deadline = this.config.turnTimeoutMs === undefined
         ? undefined

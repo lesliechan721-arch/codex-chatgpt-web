@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">所有版本</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">所有版本</a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
 
 ## 开始使用
 
-**可用模型：** Free/Go → **Luna / Think**；具有推理控制选项的账户 → **Instant–High**，并按实际可用状态提供 **Extra High** 和 **Pro**。启动器会自动检测账户可用的模型。
+**可用模型：** Free/Go → **Luna / Think**；具有推理控制选项的账户 → **GPT-6.2 Sol**、**GPT-6 Sol** 和 **GPT-5.6 Sol**，支持 **Instant–High**，并按实际可用状态提供 **Extra High** 和 **Pro**。启动器会自动检测账户可用的模型。
 
 1. **安装启动器**：点击上方对应系统的下载按钮。
 2. **登录 ChatGPT**：在内置浏览器中登录并运行浏览器冒烟测试。

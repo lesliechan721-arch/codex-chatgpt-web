@@ -31,7 +31,7 @@ interface RunMessage {
     traceId: string;
     modelId: string;
     reasoning?: string;
-    modelFamily?: "5.6" | "6";
+    modelFamily?: "5.6" | "6" | "6.2";
     capabilities: ChatGptWebCapabilities;
     nativeConnector?: boolean;
     resumeAvailable?: boolean;
@@ -594,7 +594,7 @@ async function maintain(message: InspectMessage | SmokeMessage | LimitsMessage):
   try {
     const worker = maintenanceWorker(message);
     const value = message.type === "inspect"
-      ? await worker.inspectSession(message.detectCapabilities)
+      ? await worker.inspectSession(message.detectCapabilities, message.id)
       : message.type === "limits" ? await worker.inspectLimitsPlan()
       : await worker.smokeTest(abortController.signal);
     writeProtocol({ type: "result", id: message.id, value });

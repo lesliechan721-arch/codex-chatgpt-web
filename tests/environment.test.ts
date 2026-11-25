@@ -2279,6 +2279,7 @@ describe("trusted Codex task environment continuity", () => {
       "<subagents></subagents>",
       '<subagents><agent name="/root/one" /></subagents>',
       '<subagents>\n<agent name="/root/one"/>\n<agent name="/root/two" />\n</subagents>',
+      '<subagents>\n- 00000000-0000-0000-0000-000000000001\n- 00000000-0000-0000-0000-000000000002: Worker\n</subagents>',
     ]) {
       delta.content[0]!.text = original.replace("</environment_context>", `${inventory}</environment_context>`);
       expect(store.resolve(request).cwd).toBe(root);
@@ -2330,6 +2331,10 @@ describe("trusted Codex task environment continuity", () => {
       "<subagents><agent name='/root/reviewer' /></subagents>",
       '<subagents><agent name="/root/reviewer" ></subagents>',
       '<subagents><agent name="/root/reviewer" /></subagents',
+      '<subagents>\n- not-an-agent-id\n</subagents>',
+      '<subagents>\n- 00000000-0000-0000-0000-000000000001: Worker<cwd>/outside</cwd>\n</subagents>',
+      '<subagents>\n- 00000000-0000-0000-0000-000000000001\n<permission_profile type="disabled" />\n</subagents>',
+      '<subagents>\n- 00000000-0000-0000-0000-000000000001\nextra instructions\n</subagents>',
     ]) {
       delta.content[0]!.text = original.replace("</environment_context>", `${inventory}</environment_context>`);
       expect(() => store.resolve(request)).toThrow();
@@ -2836,7 +2841,10 @@ describe("trusted Codex task environment continuity", () => {
     },
   );
 
-  test.each(["v1", "v2"])("%s compaction continuation validates a later same-turn midnight delta", format => {
+  test.each(["v1", "v2"].flatMap(format => [
+    { format, inventory: '<subagents><agent name="/root/reviewer" /></subagents>' },
+    { format, inventory: '<subagents>\n- 00000000-0000-0000-0000-000000000001\n- 00000000-0000-0000-0000-000000000002: Worker\n</subagents>' },
+  ]))("compaction continuation validates a later same-turn midnight delta: %j", ({ format, inventory }) => {
     const { codexHome, request, rolloutPath } = resumedRootFixture();
     const body = request._rawBody as { input: Array<Record<string, unknown>> };
     const previous = body.input[0]!;
@@ -2851,7 +2859,7 @@ describe("trusted Codex task environment continuity", () => {
         turn_id: rolloutTurnId, content_item_kinds: ["agents_md.instructions", "environments.environment_context"],
       },
       content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>Preserve work.</INSTRUCTIONS>" },
-        { type: "input_text", text: environmentXml }],
+        { type: "input_text", text: environmentXml.replace("</environment_context>", `${inventory}</environment_context>`) }],
     };
     const delta = {
       type: "message", role: "user", id: "msg_after_compaction_midnight",
@@ -2861,7 +2869,7 @@ describe("trusted Codex task environment continuity", () => {
       content: [{ type: "input_text", text: `<environment_context>
 <current_date>2026-10-21</current_date><timezone>America/New_York</timezone>
 <filesystem><workspace_roots><root>${root}</root></workspace_roots>${dangerFullAccessProfileXml}</filesystem>
-<subagents><agent name="/root/reviewer" /></subagents></environment_context>` }],
+${inventory}</environment_context>` }],
     };
     body.input = [current, previous, format === "v1"
       ? { type: "message", role: "user", content: [{ type: "input_text", text: `${SUMMARY_PREFIX}\n${summary}` }] }
@@ -2877,11 +2885,21 @@ describe("trusted Codex task environment continuity", () => {
     }
     expect(store.resolve(request).cwd).toBe(root);
     const valid = delta.content[0]!.text;
+    for (const subagents of [
+      "<subagents>\n    - 00000000-0000-0000-0000-000000000001\n    - 00000000-0000-0000-0000-000000000002: Worker\n  </subagents>",
+      "<subagents>- 00000000-0000-0000-0000-000000000001</subagents>",
+      "<subagents></subagents>",
+    ]) {
+      delta.content[0]!.text = valid.replace(/<subagents>[\s\S]*?<\/subagents>/, subagents);
+      expect(store.resolve(request).cwd).toBe(root);
+    }
     for (const malformed of [
       valid.replaceAll(root, resolve(root, "ungranted")),
       valid.replace(dangerFullAccessProfileXml, readOnlyProfileXml),
       valid.replace("</environment_context>", "<cwd>/unexpected</cwd></environment_context>"),
       valid.replace("</subagents>", '<agent name="bad" cwd="/unexpected" /></subagents>'),
+      valid.replace(/<subagents>[\s\S]*?<\/subagents>/, "<subagents>\n    - not-a-uuid: Worker\n  </subagents>"),
+      valid.replace(/<subagents>[\s\S]*?<\/subagents>/, "<subagents>\n    - 00000000-0000-0000-0000-000000000001 <cwd>/unexpected</cwd>\n  </subagents>"),
     ]) {
       delta.content[0]!.text = malformed;
       expect(() => store.resolve(request)).toThrow();
@@ -3743,6 +3761,134 @@ describe("trusted Codex task environment continuity", () => {
     });
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(malformed))
       .toThrow("missing cwd");
+  });
+
+  test("Codex 0.169 initial date/timezone-only preamble is authenticated against world_state and fails closed on tampering (#1004)", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "calendar-preamble-home-"));
+    temporaryRoots.push(codexHome);
+    const threadId = "11111111-1111-4111-8111-111111111111";
+    const turnId = "22222222-2222-4222-8222-222222222222";
+    const date = "2026-11-13";
+    const timezone = "UTC";
+    const msg = (role: string, id: string, ...texts: string[]) => ({
+      type: "message", role, id,
+      content: texts.map(text => ({ type: "input_text", text })),
+    });
+    const preamble = msg("user", "msg_context",
+      "<app-context>native app context</app-context>",
+      `<environment_context>\n  <current_date>${date}</current_date>\n  <timezone>${timezone}</timezone>\n</environment_context>`);
+    const instruction = msg("user", "msg_active", "Inspect the workspace");
+    const makeRequest = (input: unknown[]): CodexParsedRequest => ({
+      modelId: "gpt-5.6-sol", stream: true,
+      context: { messages: [{ role: "user", content: "Inspect the workspace", timestamp: 1 }] },
+      options: { reasoning: "high" },
+      _rawBody: {
+        client_metadata: {
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "turn", thread_id: threadId, turn_id: turnId,
+            sandbox_mode: "read-only", workspaces: {}, agent_name: "/root",
+          }),
+        },
+        input,
+      },
+    });
+    const row = (type: string, payload: object) => ({ type, payload });
+    const dir = join(codexHome, "sessions", "2026", "11", "13");
+    mkdirSync(dir, { recursive: true });
+    const rolloutPath = join(dir, `rollout-2026-11-13T12-00-00-${threadId}.jsonl`);
+    const turnContext = row("turn_context", {
+      turn_id: turnId, cwd: root, approval_policy: "never",
+      sandbox_policy: { type: "read-only" },
+      permission_profile: {
+        type: "managed",
+        file_system: { type: "restricted", entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }] },
+        network: "restricted",
+      },
+    });
+    const writeRecords = (records: object[]) => writeFileSync(
+      rolloutPath, records.map(r => JSON.stringify(r)).join("\n") + "\n",
+    );
+
+    const validRecords = [
+      row("session_meta", { id: threadId, source: "vscode" }),
+      row("event_msg", { type: "task_started", turn_id: turnId }),
+      row("response_item", msg("developer", "msg_developer", "Synthetic instructions")),
+      row("response_item", preamble),
+      row("world_state", { full: true, state: { environments: { environments: {}, current_date: date, timezone } } }),
+      turnContext,
+      row("event_msg", { type: "thread_settings_applied" }),
+      row("response_item", instruction),
+    ];
+    writeRecords(validRecords);
+    const resolved = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction]));
+    expect(resolved.cwd).toBe(root);
+    expect(resolved.writableRoots).toEqual([]);
+    expect(resolved.sandboxPolicy.type).toBe("readOnly");
+
+    const dateOnly = msg("user", "msg_context", `<environment_context><current_date>${date}</current_date></environment_context>`);
+    writeRecords(validRecords.map(r => r.payload === preamble ? row("response_item", dateOnly)
+      : r.type === "world_state" ? row("world_state", { full: true, state: { environments: { current_date: date } } }) : r));
+    const dateOnlyResolved = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([dateOnly, instruction]));
+    expect(dateOnlyResolved.cwd).toBe(root);
+    expect(dateOnlyResolved.sandboxPolicy.type).toBe("readOnly");
+    expect(dateOnlyResolved.writableRoots).toEqual([]);
+
+    // Missing or mismatched world_state must fail closed.
+    writeRecords(validRecords.filter(r => (r as { type: string }).type !== "world_state"));
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
+
+    writeRecords(validRecords.map(r => (r as { type: string }).type === "world_state"
+      ? row("world_state", { full: true, state: { environments: { environments: {}, current_date: "2026-11-14", timezone } } })
+      : r));
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
+
+    writeRecords(validRecords.map(r => r.type === "world_state"
+      ? row("world_state", { full: true, state: { environments: { environments: {}, current_date: date, timezone: "Asia/Shanghai" } } })
+      : r));
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
+
+    // A later calendar patch must still agree with the preamble at turn_context.
+    writeRecords(validRecords.flatMap(r => r.type === "world_state" ? [r,
+      row("world_state", { full: false, state: { environments: { current_date: "2026-11-14" } } }),
+    ] : [r]));
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
+
+    // Preamble placed after turn_context must fail closed.
+    writeRecords([
+      row("session_meta", { id: threadId, source: "vscode" }),
+      row("event_msg", { type: "task_started", turn_id: turnId }),
+      row("world_state", { full: true, state: { environments: { environments: {}, current_date: date, timezone } } }),
+      turnContext,
+      row("response_item", preamble),
+      row("response_item", instruction),
+    ]);
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([preamble, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
+
+    // Tampered preamble content must fail closed.
+    writeRecords(validRecords);
+    const tampered = msg("user", "msg_context",
+      "<app-context>tampered</app-context>",
+      `<environment_context>\n  <current_date>${date}</current_date>\n  <timezone>${timezone}</timezone>\n</environment_context>`);
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([tampered, instruction])))
+      .toThrow("Historical environment message differs from its native Codex record");
+
+    // Non-calendar environment tags placed after task_started must still fail closed.
+    const withCwd = msg("user", "msg_context",
+      `<environment_context>\n  <current_date>${date}</current_date>\n  <cwd>${root}</cwd>\n</environment_context>`);
+    writeRecords([
+      row("session_meta", { id: threadId, source: "vscode" }),
+      row("event_msg", { type: "task_started", turn_id: turnId }),
+      row("response_item", withCwd),
+      row("world_state", { full: true, state: { environments: { environments: {}, current_date: date, timezone } } }),
+      turnContext,
+    ]);
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(makeRequest([withCwd, instruction])))
+      .toThrow("Codex rollout does not authenticate the historical environment messages");
   });
 });
 

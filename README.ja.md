@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">すべてのリリース</a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ Full ハーネスモードでは、MCP を通じて ChatGPT を現在のタス�
 
 ## 使い始める
 
-**利用可能なモデル：** Free/Go → **Luna / Think**。推論コントロールがあるアカウント → **Instant～High** に加え、利用可能な場合に **Extra High** と **Pro**。ランチャーがアカウントの利用可能なモデルを検出します。
+**利用可能なモデル：** Free/Go → **Luna / Think**。推論コントロールがあるアカウント → **GPT-6.2 Sol**、**GPT-6 Sol**、**GPT-5.6 Sol** の **Instant～High** に加え、利用可能な場合に **Extra High** と **Pro**。ランチャーがアカウントの利用可能なモデルを検出します。
 
 1. **ランチャーをインストール**：上のボタンから、お使いの OS 向けのアプリをダウンロードします。
 2. **ChatGPT にサインイン**：内蔵ブラウザーでログインし、ブラウザーのスモークテストを実行します。

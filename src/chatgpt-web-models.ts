@@ -22,7 +22,7 @@ export type ChatGptWebZeroRiskBackendModel =
 
 export type ChatGptWebCodexEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max";
-export type ChatGptWebModelFamily = "5.6" | "6";
+export type ChatGptWebModelFamily = "5.6" | "6" | "6.2";
 
 /** Visible text accepted by one Plus browser message after the platform reserve. */
 export const CHATGPT_WEB_INSTANT_MESSAGE_TOKEN_LIMIT = 32_807;
@@ -123,14 +123,14 @@ export function resolveChatGptWebContextLimits(
   modelFamily?: ChatGptWebModelFamily,
 ): ChatGptWebContextLimits {
   assertChatGptWebBackendAvailable(backendModel, effort, capabilities);
-  if (modelFamily !== undefined && modelFamily !== "5.6" && modelFamily !== "6") {
+  if (modelFamily !== undefined && modelFamily !== "5.6" && modelFamily !== "6" && modelFamily !== "6.2") {
     throw new Error(`ChatGPT web history policy is not defined for model family: ${modelFamily}`);
   }
   if (backendModel === CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL) return historyLimits(600_000);
   if (backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL) return historyLimits(1_000_000);
   if (backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return historyLimits(500_000);
   if (effort === "max") return historyLimits(1_000_000);
-  if (modelFamily === "6") {
+  if (modelFamily === "6" || modelFamily === "6.2") {
     if (effort === "low") return historyLimits(capabilities.proAvailable ? 600_000 : 500_000);
     return historyLimits(capabilities.proAvailable ? 800_000 : 600_000);
   }
@@ -143,6 +143,7 @@ export function resolveChatGptWebTransportLimits(
   backendModel: ChatGptWebBackendModel,
   effort: ChatGptWebAdapterEffort,
   capabilities: ChatGptWebAccountCapabilities,
+  modelFamily?: ChatGptWebModelFamily,
 ): ChatGptWebTransportLimits {
   assertChatGptWebBackendAvailable(backendModel, effort, capabilities);
   if (isChatGptWebZeroRiskBackendModel(backendModel)) return {};
@@ -156,7 +157,11 @@ export function resolveChatGptWebTransportLimits(
   if (effort === "low") {
     return {
       browserMessageTokenLimit: CHATGPT_WEB_PRO_STANDARD_MESSAGE_TOKEN_LIMIT,
-      browserComposerCharLimit: CHATGPT_WEB_PRO_INSTANT_COMPOSER_CHAR_LIMIT,
+      // Rechecked 2026-11-23 on Pro: 6.2 Instant accepted 500,000 chars and rejected 545,000
+      // with message_length_exceeds_limit.
+      browserComposerCharLimit: modelFamily === "6.2"
+        ? CHATGPT_WEB_PRO_REASONING_COMPOSER_CHAR_LIMIT
+        : CHATGPT_WEB_PRO_INSTANT_COMPOSER_CHAR_LIMIT,
     };
   }
   if (effort === "max") {
@@ -367,6 +372,30 @@ export const CHATGPT_WEB_LEGACY_MODEL_ROUTES: readonly ChatGptWebAutomaticModelR
 
 /** Group only efforts with identical context and compaction budgets. */
 export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebAutomaticModelRoute[] = [
+  {
+    slug: "chatgpt-web/gpt-6.2-sol-instant",
+    displayName: "GPT-6.2 Sol Instant (Web)",
+    description: "GPT-6.2 Sol Instant through ChatGPT, with history sized for the account.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    modelFamily: "6.2",
+    codexEffort: "low",
+    adapterEffort: "low",
+    supportedCodexEfforts: ["low"],
+    requiresPro: false,
+  },
+  {
+    slug: "chatgpt-web/gpt-6.2-sol",
+    displayName: "GPT-6.2 Sol (Web)",
+    description: "GPT-6.2 Sol with Medium, High, or account-supported Extra High and history sized for the account.",
+    interactionMode: "automatic",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
+    modelFamily: "6.2",
+    codexEffort: "high",
+    adapterEffort: "high",
+    supportedCodexEfforts: ["medium", "high", "xhigh"],
+    requiresPro: false,
+  },
   {
     slug: "chatgpt-web/gpt-6-sol-instant",
     displayName: "GPT-6 Sol Instant (Web)",

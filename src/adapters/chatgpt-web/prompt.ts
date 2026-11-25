@@ -610,7 +610,7 @@ function promptCandidateCost(compiled: CompiledChatGptWebPrompt, parsed: CodexPa
   const finalBudget = resolveChatGptWebMessageTokenBudget(backendModel, mode.effort, capabilities, images + files);
   const finalChars = options?.manualControl && parsed._conversationPolicy === "task"
     ? CHATGPT_ZERO_RISK_CONTINUITY_INPUT_CHAR_LIMIT
-    : resolveChatGptWebTransportLimits(backendModel, mode.effort, capabilities).browserComposerCharLimit ?? Infinity;
+    : resolveChatGptWebTransportLimits(backendModel, mode.effort, capabilities, parsed._chatgptModelFamily).browserComposerCharLimit ?? Infinity;
   const tokens = estimateTokens(compiled.text, parsed.modelId);
   const jsonBytes = chatGptPromptJsonBytes(compiled.text);
   return { tokens: tokens + images + files, jsonBytes,

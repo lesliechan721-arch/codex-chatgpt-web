@@ -73,14 +73,14 @@ test("an ordinary live owner without durable dispatch evidence cannot be adopted
 
 test("all public routes use the account and model history tier", () => {
   const capabilities = { ...defaultConfig("full"), browserHost: "launcher" as const, proAvailable: true, extraHighAvailable: true };
-  expect(availableChatGptWebModelRoutes(capabilities)).toHaveLength(6);
+  expect(availableChatGptWebModelRoutes(capabilities)).toHaveLength(8);
   for (const slug of [...availableChatGptWebModelRoutes(capabilities).map(route => route.slug), "chatgpt-web/zero-risk", "chatgpt-web/zero-risk-pro"]) {
     const manual = slug.includes("zero-risk");
     const config = { ...capabilities, browserInteractionMode: manual ? "manual" as const : "automatic" as const,
       zeroRiskProEnabled: slug.endsWith("zero-risk-pro") };
     const route = requireChatGptWebModelRoute(slug, config);
-    const window = slug === "chatgpt-web/zero-risk" || slug === "chatgpt-web/gpt-6-sol-instant" ? 600_000
-      : slug === "chatgpt-web/gpt-6-sol" ? 800_000 : 1_000_000;
+    const window = ["chatgpt-web/zero-risk", "chatgpt-web/gpt-6-sol-instant", "chatgpt-web/gpt-6.2-sol-instant"].includes(slug)
+      ? 600_000 : ["chatgpt-web/gpt-6-sol", "chatgpt-web/gpt-6.2-sol"].includes(slug) ? 800_000 : 1_000_000;
     expect(resolveChatGptWebHistoryLimits(route, config)).toMatchObject({ contextWindow: window, autoCompactTokenLimit: window * 0.9 });
     expect(resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config,
       route.interactionMode === "automatic" ? route.modelFamily : undefined).contextWindow).toBe(window);

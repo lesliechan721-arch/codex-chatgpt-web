@@ -38,13 +38,15 @@ page under the active account. Old response IDs do not trigger cross-account his
 ### `browser-only`
 
 - Exposes `GPT-5.6 Luna (Web)` with ordinary/Think effort on Luna-only accounts. Sol-capable accounts
-  get `GPT-5.6 Sol Instant (Web)` and `GPT-5.6 Sol (Web)` with Medium/High and available Extra High.
+  get separate Sol Instant (Web) and Sol (Web) rows for GPT-6.2, GPT-6 and GPT-5.6,
+  with Medium/High and available Extra High on the Sol rows.
   Pro-capable accounts also get separate `GPT-5.6 Pro (Web)` and `GPT-6 Pro (Web)` rows.
 - Instant retains its own context budget. Grouped efforts must have identical context and compaction
   limits; catalog generation rejects a mismatch rather than reducing a budget. Pro rows use the
   native `max` effort; `ultra` is not used for new rows because Codex transforms it before transport.
 - Named Sol/Pro routes select the exact browser family and verify it again before every Send.
-  Latest must identify version 6 for a GPT-6 Pro response. No version fallback is allowed.
+  Latest must identify version 6.2 for Sol or version 6 for Pro before selecting that route.
+  No version fallback is allowed.
 - Pre-6.0 slugs remain hidden catalog entries with their original fixed bindings, including the
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
@@ -264,7 +266,7 @@ this preference. It changes page choice, not work identity, stop, checkpoint or 
 existing Zero Risk send capability and manual boundaries still apply.
 
 Default Full/MCP planning compares inline and selective delivery for Automatic and Zero Risk,
-including GPT-6 Instant and Luna/Think. Payload v3 uses an external position table for optional
+including GPT-6.2/GPT-6 Instant and Luna/Think. Payload v3 uses an external position table for optional
 fields and an optional detailed source_map; manifest 3 and text-batch-v1 use protocol 6. Requests,
 effective rules, current delegation and recovery checkpoints remain required. Only trusted ordinary
 assistant history is optional by default; unknown mixed records and unproved skill/image scope

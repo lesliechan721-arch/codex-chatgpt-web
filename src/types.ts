@@ -5,7 +5,7 @@ export interface CodexParsedRequest {
   options: CodexRequestOptions;
   _rawBody?: unknown;
   /** Set only by the trusted Web route, never parsed from caller-supplied model metadata. */
-  _chatgptModelFamily?: "5.6" | "6";
+  _chatgptModelFamily?: "5.6" | "6" | "6.2";
   /** Internal trusted-route policy. Never parsed from request metadata or summary text. */
   _conversationPolicy?: "recoverable" | "task";
   /** Resolved only from the live continuity binding, never from request metadata. */

@@ -213,6 +213,7 @@ export interface LauncherApi extends ApiAccessApi, TaskInputsApi {
   confirmManualSent(tabId: string, binding?: ManualPlanConfirmation): Promise<BrowserState>;
   confirmManualAttachments(tabId: string, binding: ManualPlanConfirmation): Promise<BrowserState>;
   openLogin(): Promise<BrowserState>;
+  resetEmbeddedBrowserData(): Promise<BrowserState>;
   openPasskeyLogin(): Promise<BrowserState>;
   continuePasskeyLogin(): Promise<boolean>;
   logoutChatGpt(): Promise<{ browser: BrowserState; state: LauncherState }>;

@@ -472,7 +472,7 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
         ? "The complete prompt exceeds the composer code point budget and the current connector does not support context-bootstrap-v1"
         : "A complete composer message exceeds the configured Unicode code point budget", { max_composer_code_points: maxComposer, costs });
     const transportLimits = resolveChatGptWebTransportLimits(input.candidate.modelId as Parameters<typeof resolveChatGptWebTransportLimits>[0],
-      input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities);
+      input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities, input.candidate._chatgptModelFamily);
     const tokenBudget = resolveChatGptWebMessageTokenBudget(input.candidate.modelId as Parameters<typeof resolveChatGptWebMessageTokenBudget>[0],
       input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities,
       costs.attachmentVisualTokens + skillFileTokens(compiled.skillFiles));
@@ -640,7 +640,7 @@ function planDelivery(input: ContextDeliveryPlanInput): ContextDeliveryPlan {
             const trialEntry = shortContextReuseBootstrapPrompt({ ...entryInput, plan: provisionalDescriptor,
               reuse: reusePrepared.makePlan(true), inlinePayload });
             const singleLimits = resolveChatGptWebTransportLimits(input.candidate.modelId as Parameters<typeof resolveChatGptWebTransportLimits>[0],
-              input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities);
+              input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities, input.candidate._chatgptModelFamily);
             const singleTokens = resolveChatGptWebMessageTokenBudget(input.candidate.modelId as Parameters<typeof resolveChatGptWebMessageTokenBudget>[0],
               input.compileOptions?.manualControl ? "low" : mode.effort, input.capabilities,
               media.attachmentVisualTokens + skillFileTokens(prepared.skillFiles));

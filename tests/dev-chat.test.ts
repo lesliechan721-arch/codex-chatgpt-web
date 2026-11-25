@@ -330,6 +330,8 @@ test("DEV status exposes the default history windows for Sol and Luna", async ()
   });
   expect(status.percent).toBe(Math.round((status.inputTokens / 900_000) * 1_000) / 10);
   for (const [model, contextWindow, autoCompactTokenLimit] of [
+    ["chatgpt-web/gpt-6.2-sol", 800_000, 720_000],
+    ["chatgpt-web/gpt-6.2-sol-instant", 600_000, 540_000],
     ["chatgpt-web/gpt-6-sol", 800_000, 720_000],
     ["chatgpt-web/gpt-6-sol-instant", 600_000, 540_000],
   ] as const) {

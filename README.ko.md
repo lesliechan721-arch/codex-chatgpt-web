@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.1.18-1/codex-web-gpt-6.1.18-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">모든 릴리스</a>
+  <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/download/v6.2.0-1/codex-web-gpt-6.2.0-1-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/lesliechan721-arch/codex-chatgpt-web/releases/latest">모든 릴리스</a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미�
 
 ## 시작하기
 
-**사용 가능한 모델:** Free/Go → **Luna / Think**. 추론 설정이 있는 계정 → **Instant–High**, 계정에서 제공되는 경우 **Extra High** 및 **Pro**. 런처가 계정에서 사용할 수 있는 모델을 감지합니다.
+**사용 가능한 모델:** Free/Go → **Luna / Think**. 추론 설정이 있는 계정 → **GPT-6.2 Sol**, **GPT-6 Sol**, **GPT-5.6 Sol**의 **Instant–High**, 계정에서 제공되는 경우 **Extra High** 및 **Pro**. 런처가 계정에서 사용할 수 있는 모델을 감지합니다.
 
 1. **런처 설치**: 위에서 운영체제에 맞는 다운로드 버튼을 선택하세요.
 2. **ChatGPT 로그인**: 내장 브라우저에서 로그인하고 브라우저 smoke test를 실행하세요.

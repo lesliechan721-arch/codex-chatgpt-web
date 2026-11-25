@@ -1178,9 +1178,11 @@ test("session verification distinguishes a missing login from network and invali
   const validSession = { user: { id: "fixture" }, expires: "2099-01-01T00:00:00Z" };
   const cases = [
     { name: "valid", fetch: async () => response(validSession), status: "ready", authenticated: true },
-    { name: "guest", fetch: async () => response({}), status: "signed-out" },
-    { name: "expired", fetch: async () => response({ ...validSession, expires: "2000-01-01T00:00:00Z" }), status: "signed-out" },
-    { name: "unauthorized", fetch: async () => response(null, { ok: false, status: 401 }), status: "signed-out" },
+    { name: "guest", fetch: async () => response({}), status: "signed-out", reason: "no-user" },
+    { name: "expired", fetch: async () => response({ ...validSession, expires: "2000-01-01T00:00:00Z" }), status: "signed-out", reason: "expired" },
+    { name: "unauthorized", fetch: async () => response(null, { ok: false, status: 401 }), status: "signed-out", reason: "http-401" },
+    { name: "session error", fetch: async () => response({ error: "private-detail" }), status: "signed-out", reason: "session-error" },
+    { name: "invalid expiry", fetch: async () => response({ ...validSession, expires: "private-invalid-date" }), status: "error" },
     { name: "network", fetch: async () => { throw new Error("private-proxy-secret"); }, status: "error", message: /connection|network/i },
     { name: "deadline", timeout: true, fetch: async (_url, { signal }) => {
       await new Promise(resolve => setImmediate(resolve));
@@ -1197,6 +1199,7 @@ test("session verification distinguishes a missing login from network and invali
     { name: "renderer", rendererError: true, status: "error", message: /browser/i },
   ];
   for (const item of cases) {
+    const log = [];
     const fixture = {
       state: { authenticated: true }, activeTraceId: null, manualOperation: null,
       view: { webContents: {
@@ -1215,13 +1218,15 @@ test("session verification distinguishes a missing login from network and invali
         },
       } },
       setState(patch) { this.state = { ...this.state, ...patch }; },
-      snapshot() { return { ...this.state }; }, logger: { info() {} },
+      snapshot() { return { ...this.state }; }, logger: { info: (...entry) => log.push(entry) },
     };
     const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
     assert.equal(result.status, item.status, item.name);
     assert.equal(result.authenticated, item.authenticated === true, item.name);
     if (item.message) assert.match(result.message, item.message, item.name);
     assert.doesNotMatch(JSON.stringify(result), /private-/);
+    if (item.reason) await BrowserHost.prototype.probeAuthentication.call(fixture);
+    assert.deepEqual(log, item.reason ? [["browser.session_signed_out", { source: "page", reason: item.reason }]] : []);
   }
 });
 
@@ -1325,6 +1330,7 @@ test("shared session changes refresh hidden sign-in state without navigating any
   const requests = [];
   let payload = {};
   let mode = "automatic";
+  const sessionEvents = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     state: { authenticated: true, status: "ready" },
     turnTabs: new Map(),
@@ -1341,7 +1347,7 @@ test("shared session changes refresh hidden sign-in state without navigating any
       },
     } } },
     setState(patch) { this.state = { ...this.state, ...patch }; },
-    logger: { warn() { assert.fail("Session refresh failed"); } },
+    logger: { info: (...entry) => sessionEvents.push(entry), warn() { assert.fail("Session refresh failed"); } },
   });
   fixture.bindAuthenticationChanges();
   const notify = cookie => cookies.emit("changed", {}, cookie, "explicit", true);
@@ -1352,6 +1358,7 @@ test("shared session changes refresh hidden sign-in state without navigating any
   await fixture.authenticationRefresh;
   assert.equal(fixture.state.authenticated, false);
   assert.equal(fixture.state.status, "signed-out");
+  assert.deepEqual(sessionEvents, [["browser.session_signed_out", { source: "idle", reason: "no-user" }]]);
   payload = { user: { id: "test" }, expires: "2099-01-01T00:00:00Z" };
   notify({ httpOnly: true, domain: "chatgpt.com" });
   await fixture.authenticationRefresh;
@@ -1675,7 +1682,17 @@ test("passkey login imports only validated state and re-proves the Launcher sess
   assert.ok(calls.some(value => Array.isArray(value) && value[0] === "inspect" && value[1] === false));
 });
 
-test("invalid passkey transfer is removed without mutating the embedded session", async () => {
+for (const { domain, origins, error } of [
+  { domain: ".accounts.google.com", origins: [], error: /no ChatGPT\/OpenAI cookies/ },
+  {
+    domain: ".chatgpt.com",
+    origins: [{ origin: "https://chatgpt.com", localStorage: [
+      { name: "first", value: "x".repeat(3 * 1024 * 1024) },
+      { name: "second", value: "x".repeat(3 * 1024 * 1024) },
+    ] }],
+    error: /local-storage total is too large/,
+  },
+]) test(`invalid passkey transfer is removed without mutating the embedded session (${error.source})`, async () => {
   let cleared = false;
   let cleaned = false;
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
@@ -1691,18 +1708,18 @@ test("invalid passkey transfer is removed without mutating the embedded session"
         cookies: [{
           name: "identity-provider",
           value: "private",
-          domain: ".accounts.google.com",
+          domain,
           path: "/",
           expires: -1,
           httpOnly: true,
           secure: true,
           sameSite: "Lax",
         }],
-        origins: [],
+        origins,
       },
       cleanup: async () => { cleaned = true; },
     }),
-    /no ChatGPT\/OpenAI cookies/,
+    error,
   );
   assert.equal(cleared, false);
   assert.equal(cleaned, true);
@@ -1811,6 +1828,197 @@ test("logout clears only the owned ChatGPT session and returns to the sign-in su
   assert.deepEqual(calls[4], ["loadURL", "https://chatgpt.com/"]);
   assert.ok(calls.some(([name]) => name === "activateHomeSurface"));
   assert.ok(calls.some(([name]) => name === "show"));
+});
+
+function resetFixture({ mode = "automatic", clearStorageData } = {}) {
+  const calls = [];
+  const session = {
+    closeAllConnections: async () => calls.push("close-connections"),
+    clearStorageData: async () => { calls.push("clear-storage"); await clearStorageData?.(); },
+    clearCache: async () => calls.push("clear-cache"),
+    flushStorageData: () => calls.push("flush-storage"),
+    cookies: { flushStore: async () => calls.push("flush-cookies") },
+    fetch: async () => { throw new Error("No background session fetch is expected after reset"); },
+  };
+  const page = name => {
+    let currentUrl = "https://chatgpt.com/";
+    return { session, getURL: () => currentUrl, isDestroyed: () => false,
+      loadURL: async url => { calls.push([name, url]); currentUrl = url; } };
+  };
+  const tab = { id: "retained-tab", status: "ready", view: { webContents: page("load-tab") } };
+  const otherTab = { id: "other-retained-tab", status: "ready", view: { webContents: page("load-other-tab") } };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab], [otherTab.id, otherTab]]),
+    view: { webContents: page("load") },
+    getBrowserInteractionMode: () => mode,
+    ready: async () => {}, activateHomeSurface() {}, hide() {},
+    state: { authenticated: true, status: "ready", accountIdentityStatus: "matching" },
+    accountIdentityStatus: "matching",
+    primaryNavigationError: new Error("previous navigation"),
+    authNavigationError: new Error("previous auth"),
+    authenticationRevision: 17,
+    removeTurnTab(item, force) {
+      calls.push(["close-tab", item.id, force]);
+      this.turnTabs.delete(item.id);
+    },
+    markOwnedSurface: async () => calls.push("mark-surface"),
+    writeDescriptor() { calls.push("write-descriptor"); },
+    setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    logger: { info(event) { calls.push(["log", event]); } },
+  });
+  return { fixture, calls, session, tab, otherTab };
+}
+
+test("embedded browser reset discards only its account session and safely closes its retained tabs", async () => {
+  for (const mode of ["automatic", "manual"]) {
+    const { fixture, calls, tab, otherTab } = resetFixture({ mode });
+    const unrelatedAccount = resetFixture({ mode });
+    const result = await fixture.resetEmbeddedBrowserData();
+    assert.deepEqual(calls, [
+      ["load", IDLE_BROWSER_URL],
+      ["load-tab", IDLE_BROWSER_URL],
+      ["load-other-tab", IDLE_BROWSER_URL],
+      "close-connections", "clear-storage", "clear-cache", "flush-storage", "flush-cookies",
+      ["close-tab", tab.id, false],
+      ["close-tab", otherTab.id, false],
+      ...(mode === "automatic" ? ["mark-surface"] : []),
+      "write-descriptor",
+      ["log", "browser.session_reset"],
+    ]);
+    assert.equal(fixture.turnTabs.size, 0);
+    assert.equal(fixture.primaryNavigationError, null);
+    assert.equal(fixture.authNavigationError, null);
+    assert.equal(fixture.authenticationRevision, 18);
+    assert.equal(fixture.reauthenticationRequired, true);
+    assert.equal(fixture.accountAdmissionClosed, false);
+    assert.equal(result.authenticated, false);
+    assert.equal(result.status, "signed-out");
+    assert.equal(result.url, IDLE_BROWSER_URL);
+    assert.equal(fixture.accountIdentityStatus, "matching");
+    assert.deepEqual(unrelatedAccount.calls, [], "other account's partition must be left untouched");
+    assert.equal(unrelatedAccount.fixture.state.authenticated, true);
+    assert.equal(unrelatedAccount.fixture.turnTabs.size, 2);
+  }
+});
+
+test("reset refuses active or uncertain execution and other-account pages without changing storage", async () => {
+  for (const fields of [
+    { status: "running" }, { pendingBusinessDispatch: true }, { unsettledOperations: 1 },
+    { unknownSend: true }, { approvalPending: true }, { checkpointPending: true },
+  ]) {
+    const { fixture, tab, calls } = resetFixture();
+    Object.assign(tab, fields);
+    await assert.rejects(fixture.resetEmbeddedBrowserData(), /browser is busy/);
+    assert.deepEqual(calls, []);
+    assert.equal(fixture.turnTabs.size, 2);
+    assert.equal(fixture.state.authenticated, true);
+    assert.equal(fixture.accountAdmissionClosed, false);
+  }
+  const { fixture, tab, calls } = resetFixture();
+  tab.view.webContents.session = resetFixture().session;
+  await assert.rejects(fixture.resetEmbeddedBrowserData(), /do not share one browser session/);
+  assert.deepEqual(calls, []);
+  assert.equal(fixture.accountAdmissionClosed, false);
+});
+
+test("reset serializes with login and authentication probes and fences delayed checks after clearing", async () => {
+  const { fixture, calls } = resetFixture();
+  for (const field of ["loginOperation", "sessionRefreshOperation", "authenticationProbe", "authenticationRefresh"]) {
+    fixture[field] = Promise.resolve();
+    await assert.rejects(fixture.resetEmbeddedBrowserData(), /browser is busy/);
+    assert.deepEqual(calls, []);
+    delete fixture[field];
+  }
+  let beginClear, finishClear;
+  const clearing = new Promise(resolve => { beginClear = resolve; });
+  const clearDone = new Promise(resolve => { finishClear = resolve; });
+  fixture.view.webContents.session.clearStorageData = async () => { beginClear(); await clearDone; };
+  fixture.accountIdentityStatus = "mismatch";
+  fixture.state.accountIdentityStatus = "mismatch";
+  const reset = fixture.resetEmbeddedBrowserData();
+  await clearing;
+  assert.equal(fixture.accountAdmissionClosed, true);
+  assert.equal(fixture.currentOperation(), "embedded browser data reset");
+  await assert.rejects(fixture.resetEmbeddedBrowserData(), { code: "account_admission_closed" });
+  await assert.rejects(fixture.probeAuthentication(), { code: "account_admission_closed" });
+  assert.throws(() => fixture.openLogin(), { code: "account_admission_closed" });
+  await fixture.refreshAuthenticationFromSession();
+  finishClear();
+  await reset;
+  await fixture.refreshAuthenticationFromSession();
+  await fixture.probeAuthentication();
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.state.status, "signed-out");
+  assert.equal(fixture.state.accountIdentityStatus, "mismatch");
+  assert.throws(() => fixture.assertAccountAdmission({ execution: true }), { code: "account_identity_mismatch" });
+  assert.equal(fixture.accountAdmissionClosed, false);
+});
+
+test("reset waits for all page navigations even when one fails", async () => {
+  const { fixture, calls, tab, otherTab } = resetFixture();
+  let finishNavigation, navigationStarted;
+  const navigating = new Promise(resolve => { navigationStarted = resolve; });
+  const navigationDone = new Promise(resolve => { finishNavigation = resolve; });
+  tab.view.webContents.loadURL = async () => { throw new Error("navigation failed"); };
+  otherTab.view.webContents.loadURL = async () => { navigationStarted(); await navigationDone; };
+  let settled = false;
+  const reset = fixture.resetEmbeddedBrowserData().finally(() => { settled = true; });
+  const expectedFailure = assert.rejects(reset, /navigation failed/);
+  await navigating;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(fixture.accountAdmissionClosed, true);
+  assert.ok(!calls.includes("clear-storage"));
+  await assert.rejects(fixture.resetEmbeddedBrowserData(), { code: "account_admission_closed" });
+  finishNavigation();
+  await expectedFailure;
+  assert.equal(fixture.accountAdmissionClosed, false);
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.turnTabs.size, 2);
+});
+
+test("a delayed pre-reset page ownership completion cannot replace the signed-out state", async () => {
+  for (const fails of [false, true]) {
+    const { fixture } = resetFixture();
+    const contents = Object.assign(new EventEmitter(), fixture.view.webContents, { setWindowOpenHandler() {} });
+    fixture.view.webContents = contents;
+    fixture.primaryNavigationError = null;
+    fixture.syncViewVisibility = () => {};
+    fixture.applyViewportCss = async () => {};
+    fixture.logger.error = () => {};
+    let settleOldMark;
+    const oldMark = new Promise((resolve, reject) => {
+      settleOldMark = () => fails ? reject(new Error("obsolete ownership failed")) : resolve();
+    });
+    let marks = 0;
+    fixture.markOwnedSurface = async () => { if (++marks === 1) await oldMark; };
+    fixture.probeAuthentication = async () => {
+      fixture.setState({ authenticated: true, status: "ready" });
+    };
+    fixture.bindWebContents();
+    contents.emit("did-finish-load");
+    assert.equal(marks, 1);
+    await fixture.resetEmbeddedBrowserData();
+    assert.equal(marks, 2);
+    settleOldMark();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.state.authenticated, false);
+    assert.equal(fixture.state.status, "signed-out");
+  }
+});
+
+test("failed storage reset retains the authentication fence and releases admission for retry", async () => {
+  const { fixture, calls } = resetFixture({ clearStorageData: async () => { throw new Error("storage failed"); } });
+  await assert.rejects(fixture.resetEmbeddedBrowserData(), /storage failed/);
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.state.status, "error");
+  assert.equal(fixture.accountAdmissionClosed, false);
+  assert.equal(fixture.reauthenticationRequired, true);
+  assert.equal(fixture.turnTabs.size, 2);
+  assert.ok(!calls.includes("clear-cache"));
+  await fixture.probeAuthentication();
+  assert.equal(fixture.state.authenticated, false);
 });
 
 test("launcher shutdown persists ChatGPT DOM storage and cookies before browser destruction", async () => {

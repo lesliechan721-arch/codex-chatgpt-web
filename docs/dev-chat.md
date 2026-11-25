@@ -158,7 +158,7 @@ that ChatGPT will follow them more reliably.
 
 ## Default reading and history policy
 
-Full/MCP compares inline and on-demand candidates by default, including Luna/Think and GPT-6
+Full/MCP compares inline and on-demand candidates by default, including Luna/Think and GPT-6.2/GPT-6
 Instant. Short inputs can stay inline. Current requests, effective rules and recovery state stay
 required; trusted ordinary assistant history and detailed source maps can be read when needed.
 Context protocol 6 uses payload v3, manifest 3 and batch-v1. See

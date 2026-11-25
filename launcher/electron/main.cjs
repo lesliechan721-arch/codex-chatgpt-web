@@ -21,6 +21,7 @@ const {
   Tray,
 } = require("electron");
 const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
+const { localeForEmbeddedBrowser } = require("./browser-locale.cjs");
 const { SessionReminderView } = require("./session-reminder-view.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
 const { LimitsController } = require("./limits-controller.cjs");
@@ -104,6 +105,10 @@ fs.mkdirSync(launcherUserData, { recursive: true, mode: 0o700 });
 if (process.platform !== "win32") fs.chmodSync(launcherUserData, 0o700);
 app.setPath("userData", launcherUserData);
 app.setAppLogsPath(path.join(launcherUserData, "logs"));
+// Language is shared between accounts and must be read before Chromium initializes.
+const launcherLanguage = createStateStore(path.join(launcherUserData, "launcher-state.json")).read().language;
+const browserLocale = localeForEmbeddedBrowser(launcherLanguage);
+if (browserLocale) app.commandLine.appendSwitch("lang", browserLocale);
 installProcessDiagnosticGuards({
   filePath: path.join(launcherUserData, "logs", "process-stream-errors.log"),
 });
@@ -835,7 +840,7 @@ function registerIpc({ logger, stateStore }) {
     "launcher:browser-interaction-mode", "launcher:tool-authority-mode", "launcher:connector-name",
     "launcher:mcp-verify", "launcher:complete-mcp-setup", "launcher:doctor", "launcher:cancel-turns",
     "launcher:auto-approve-tool-calls",
-    "launcher:browser-passkey-login", "launcher:browser-logout", "launcher:browser-smoke",
+    "launcher:browser-passkey-login", "launcher:browser-logout", "launcher:browser-reset-data", "launcher:browser-smoke",
     "launcher:limits-setup", "launcher:update-install", "launcher:complete-onboarding",
   ]);
   const handle = (channel, handler) => registerLoggedIpc(accountIpc, logger, channel, async (...args) => {
@@ -990,6 +995,11 @@ function registerIpc({ logger, stateStore }) {
       const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
       send("launcher:state-changed", state);
     }
+    return browser;
+  });
+  handle("launcher:browser-reset-data", async () => {
+    const browser = await runtimeHost.runLifecycleOperation("browser-reset-data", () => browserHost.resetEmbeddedBrowserData());
+    dismissSessionReminder();
     return browser;
   });
   handle("launcher:browser-passkey-login", async () => {

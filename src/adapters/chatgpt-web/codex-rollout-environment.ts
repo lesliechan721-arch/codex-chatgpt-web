@@ -847,6 +847,69 @@ function verifyCurrentEnvironmentMessage(
   }
 }
 
+const CALENDAR_ONLY_ENVIRONMENT_PATTERN =
+  /^<environment_context>\s*<current_date>(\d{4}-\d{2}-\d{2})<\/current_date>\s*(?:<timezone>([^<>\r\n]+)<\/timezone>\s*)?<\/environment_context>$/;
+
+function calendarOnlyEnvironment(content: unknown): { currentDate: string; timezone?: string } | undefined {
+  if (!Array.isArray(content)) return undefined;
+  let parsed: { currentDate: string; timezone?: string } | undefined;
+  for (const part of content) {
+    const text = record(part)?.text;
+    if (typeof text !== "string" || !/<\/?environment_context\b/i.test(text)) continue;
+    if (parsed) return undefined;
+    const match = CALENDAR_ONLY_ENVIRONMENT_PATTERN.exec(text.trim());
+    if (!match) return undefined;
+    const timezone = match[2]?.trim();
+    if (match[2] !== undefined && !timezone) return undefined;
+    parsed = { currentDate: match[1]!, ...(timezone ? { timezone } : {}) };
+  }
+  return parsed;
+}
+
+/** Codex 0.169's initial calendar-only context cannot supply filesystem or task authority. */
+function isCurrentCalendarPreamble(fd: number, size: number, turnId: string, proof: NativeEnvironmentEvidence): boolean {
+  if (proof.checkpoint || proof.location.activeTurn !== turnId
+    || proof.payload.type !== "message" || proof.payload.role !== "user") return false;
+  const provenance = record(proof.payload.internal_chat_message_metadata_passthrough);
+  if ((provenance?.turn_id !== undefined && provenance.turn_id !== turnId)
+    || (provenance?.content_item_kinds !== undefined
+      && (!isNativeEnvironmentMessage(proof.payload) || isRolloutInstruction(proof.payload, {})))) return false;
+  const calendar = calendarOnlyEnvironment(proof.payload.content);
+  if (!calendar) return false;
+
+  // Require matching calendar state inside the same task_started → turn_context window.
+  // Full state and null fields replace earlier values; subsequent patches in that window
+  // must not leave stale calendar evidence usable. The current turn_context remains authoritative.
+  let boundaries = 0;
+  let inPreamble = false;
+  let contextOrder: number | undefined;
+  let currentDate: unknown, timezone: unknown;
+  visitRolloutRecords(fd, size, entry => {
+    const payload = record(entry.item.payload);
+    if (entry.item.type === "event_msg" && payload?.type === "task_started") {
+      if (payload.turn_id === turnId) boundaries += 1;
+      inPreamble = entry.order === proof.boundary.order;
+      return;
+    }
+    if (!inPreamble) return;
+    if (entry.item.type === "turn_context") {
+      inPreamble = false;
+      if (payload?.turn_id === turnId) contextOrder = entry.order;
+    } else if (entry.item.type === "world_state") {
+      const value = record(payload?.state)?.environments;
+      const environments = record(value);
+      if (payload?.full === true || (value !== undefined && !environments)) {
+        currentDate = undefined;
+        timezone = undefined;
+      }
+      if (environments && "current_date" in environments) currentDate = environments.current_date;
+      if (environments && "timezone" in environments) timezone = environments.timezone;
+    }
+  });
+  return boundaries === 1 && contextOrder !== undefined && proof.location.order < contextOrder
+    && currentDate === calendar.currentDate && (calendar.timezone === undefined || timezone === calendar.timezone);
+}
+
 function verifyHistoricalEnvironmentMessages(
   fd: number, size: number, turnId: string, messages: ChatGptUnattributedEnvironmentMessage[], nativeCompaction = false,
 ): ChatGptUnattributedEnvironmentMessage[] {
@@ -854,6 +917,7 @@ function verifyHistoricalEnvironmentMessages(
     throw new TrustedCodexEnvironmentValidationError("Codex environment history repeats a message id");
   }
   const current: ChatGptUnattributedEnvironmentMessage[] = [];
+  let calendarPreambleSeen = false;
   for (const message of messages) {
     const proof = nativeEnvironmentEvidence(fd, size, turnId, message);
     if (!proof) {
@@ -875,6 +939,13 @@ function verifyHistoricalEnvironmentMessages(
       throw new TrustedCodexEnvironmentValidationError("Historical environment provenance differs from its native Codex record");
     }
     if (proof.location.order > proof.boundary.order) {
+      // Only one exact, permission-neutral initial preamble is compatible with the new
+      // record order. Native compaction and ordinary current grants still follow their
+      // existing ownership, checkpoint, and current-message validation rules.
+      if (!nativeCompaction && !calendarPreambleSeen && isCurrentCalendarPreamble(fd, size, turnId, proof)) {
+        calendarPreambleSeen = true;
+        continue;
+      }
       // Only a native compaction installs a new current environment away from the instruction.
       // An ordinary current update must still pass the explicit current-message proof above.
       if ((!proof.checkpoint && !nativeCompaction) || proof.location.activeTurn !== turnId

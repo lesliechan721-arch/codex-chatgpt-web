@@ -1,8 +1,10 @@
 import { CHATGPT_COMPOSER_SELECTOR, chatGptThinkButtons } from "./chatgpt-ui/composer";
 import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
-  CHATGPT_EFFORT_MENU_SELECTOR,
-  chatGptEffortSlider,
+  activateChatGptEffortMenu,
+  chatGptLockedEffortPanel,
+  chatGptLockedEffortMessage,
+  waitForChatGptEffortRange,
   readChatGptEffortSnapshot,
   type ChatGptEffortActivation,
 } from "./chatgpt-ui/model-picker";
@@ -43,7 +45,9 @@ export async function assertNewChatPage(page: Page, useTemporaryChats = false): 
 type ChatGptCapabilityProbeOptions = {
   selectorTimeoutMs?: number;
   stableAbsenceMs?: number;
+  settleMs?: number;
   signal?: AbortSignal;
+  onFailureBeforeCleanup?: (error: unknown) => Promise<void>;
 };
 
 /** Undefined means the known Luna/Think control was verified, not merely a missing picker. */
@@ -103,16 +107,17 @@ export async function waitForChatGptEffortControl(
 
 /** Read only the selected model's rendered range; callers own selection and menu cleanup. */
 export async function readChatGptEffortCapabilities(
-  { sliderContainer, slider }: Pick<ChatGptEffortActivation, "sliderContainer" | "slider">,
+  activation: ChatGptEffortActivation,
   options: Pick<ChatGptCapabilityProbeOptions, "selectorTimeoutMs" | "signal"> = {},
 ): Promise<ChatGptWebAccountCapabilities & { extraHighAvailable: boolean }> {
   options.signal?.throwIfAborted();
   const timeout = options.selectorTimeoutMs ?? 70_000;
   // Model radio rows can hydrate before the effort control. They carry no evidence
   // of the account's reasoning range, so an absent slider must fail, not cache false.
-  await sliderContainer.waitFor({ state: "visible", timeout, signal: options.signal });
-  await slider.waitFor({ state: "attached", timeout, signal: options.signal });
-  const { available } = await readChatGptEffortSnapshot(sliderContainer);
+  if (await waitForChatGptEffortRange(activation, timeout, options.signal) === "locked") {
+    throw new Error(await chatGptLockedEffortMessage(chatGptLockedEffortPanel(activation.menu)));
+  }
+  const { available } = await readChatGptEffortSnapshot(activation.sliderContainer);
   options.signal?.throwIfAborted();
   return { solAvailable: true, extraHighAvailable: available[3] === true, proAvailable: available[4] === true };
 }
@@ -121,14 +126,21 @@ export async function detectChatGptAccountCapabilities(
   page: Page,
   options: ChatGptCapabilityProbeOptions = {},
 ): Promise<ChatGptWebAccountCapabilities & { extraHighAvailable: boolean }> {
-  const effortButton = await waitForChatGptEffortControl(page, options);
+  let effortButton: Locator | undefined;
+  try {
+    effortButton = await waitForChatGptEffortControl(page, options);
+  } catch (error) {
+    await options.onFailureBeforeCleanup?.(error);
+    throw error;
+  }
   if (!effortButton) return { solAvailable: false, extraHighAvailable: false, proAvailable: false };
   try {
-    const menu = page.locator(CHATGPT_EFFORT_MENU_SELECTOR).last();
-    const menuVisible = await menu.isVisible().catch(() => false);
-    const menuExpanded = await effortButton.getAttribute("aria-expanded").catch(() => null);
-    if (!menuVisible && menuExpanded !== "true") await effortButton.press("Enter");
-    return await readChatGptEffortCapabilities(chatGptEffortSlider(page), options);
+    const activation = await activateChatGptEffortMenu(page, effortButton, { settleMs: options.settleMs });
+    options.signal?.throwIfAborted();
+    return await readChatGptEffortCapabilities(activation, options);
+  } catch (error) {
+    await options.onFailureBeforeCleanup?.(error);
+    throw error;
   } finally {
     await page.keyboard.press("Escape").catch(() => {});
   }
