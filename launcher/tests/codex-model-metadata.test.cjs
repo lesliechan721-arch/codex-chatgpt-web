@@ -103,6 +103,27 @@ test("nested unknown metadata keys are rejected by the shared schema boundary", 
   }), /additional properties/);
 });
 
+test("Codex 0.172 model metadata recognizes new wire fields without trusting provider instructions", () => {
+  const discovery = metadata.parseUpstreamDiscovery({ models: [{
+    slug: UNKNOWN_ID,
+    web_search_provider: "standalone",
+    model_messages: { plugins: { generic: { intro: "Provider plugin text" } } },
+  }] });
+  const { model } = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "upstream" }, discovery, "disabled");
+  assert.equal(model.web_search_provider, "standalone");
+  assert.equal(model.model_messages.plugins, undefined);
+  const withPluginMessages = {
+    ...model,
+    model_messages: { ...model.model_messages, plugins: { generic: { intro: "Plugin information" } } },
+  };
+  assert.equal(metadata.finalModelError(withPluginMessages), null);
+  assert.notEqual(metadata.finalModelError({ ...model, web_search_provider: "unknown" }), null);
+  assert.notEqual(metadata.finalModelError({
+    ...withPluginMessages,
+    model_messages: { ...withPluginMessages.model_messages, plugins: { generic: { intro: 42 } } },
+  }), null);
+});
+
 test("display_name must be non-empty for upstream, custom, and final ModelInfo validation", () => {
   const discovery = metadata.parseUpstreamDiscovery({ models: [{ slug: UNKNOWN_ID, display_name: "" }] });
   const upstream = metadata.resolveModelMetadata(UNKNOWN_ID, { mode: "upstream" }, discovery, "disabled");

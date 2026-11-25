@@ -76,6 +76,7 @@ export const SCHEMA_SOURCE_FILES = [
   "protocol/src/openai_models/access_programs.rs",
   "protocol/src/openai_models/incremental_tools.rs",
   "protocol/src/openai_models/memento_v2.rs",
+  "protocol/src/openai_models/plugins.rs",
   "protocol/src/openai_models/guardian.rs",
   "protocol/src/openai_models/guardian_v2.rs",
   "protocol/src/openai_models/reasoning_effort.rs",

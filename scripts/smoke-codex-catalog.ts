@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { CHATGPT_WEB_MODEL_ROUTES, availableChatGptWebModelRoutes, chatGptWebRouteEfforts, isChatGptWebModelSlug } from "../src/chatgpt-web-models";
+import { availableChatGptWebModelRoutes, chatGptWebRouteEfforts, isChatGptWebModelSlug } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
 import { normalizeUpstreamModelCatalog } from "../src/upstream-model-catalog";
@@ -127,7 +127,8 @@ try {
     );
   }
   const features = runCodex(["features", "list"], isolatedEnv).stdout;
-  if (!/^multi_agent\s+stable\s+true$/m.test(features)
+  // Codex 0.172 marks the legacy V1 feature deprecated, but still honors it.
+  if (!/^multi_agent\s+(?:stable|deprecated)\s+true$/m.test(features)
     || !/^multi_agent_v2\s+stable\s+false$/m.test(features)) {
     throw new Error(`Codex did not load the Compatibility V1 feature override:\n${features}`);
   }
@@ -144,12 +145,15 @@ try {
     .toSorted((left, right) => (typeof left.priority === "number" ? left.priority : Number.MAX_SAFE_INTEGER)
       - (typeof right.priority === "number" ? right.priority : Number.MAX_SAFE_INTEGER))[0]?.slug;
   if (typeof nativeSpawnLeader !== "string") throw new Error("Codex smoke catalog has no native API model for the V1 roster");
-  // V1 has five slots: the native leader, reasoning/Pro routes, then Instant if space remains.
+  // This fixture enables Pro. Its five V1 slots reserve the native leader, the two
+  // newest Sol reasoning routes and both Pro routes; older Sol/Instant remain in the catalog.
   const expectedSpawnOverrides = [
     nativeSpawnLeader,
-    ...CHATGPT_WEB_MODEL_ROUTES.filter(route => route.adapterEffort !== "low").map(route => route.slug),
-    ...CHATGPT_WEB_MODEL_ROUTES.filter(route => route.adapterEffort === "low").map(route => route.slug),
-  ].slice(0, 5);
+    "chatgpt-web/gpt-6.2-sol",
+    "chatgpt-web/gpt-6-sol",
+    "chatgpt-web/gpt-5.6-pro",
+    "chatgpt-web/gpt-6-pro",
+  ];
   if (JSON.stringify(spawnOverrides) !== JSON.stringify(expectedSpawnOverrides)) {
     throw new Error(`Codex did not preserve the bounded V1 subagent roster: ${JSON.stringify(spawnOverrides)}`);
   }

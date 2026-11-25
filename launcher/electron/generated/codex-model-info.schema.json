@@ -1,17 +1,18 @@
 {
   "version": 2,
-  "revision": "360319d8dee62d87e2d59fc0c21805d79519cfed",
+  "revision": "3d86e43b075adeba2193ec5c22ac92f55afd82e6",
   "sourceFiles": {
-    "protocol/src/openai_models.rs": "26c1127450a3b29efbdc094af8fa2218163a735a59ad1c10843cb89e4807cbf7",
-    "protocol/src/openai_models/access_programs.rs": "bbd3bbfe18fe12263d432ae9906e7d67cf03986f5331915a165bbca3c982e3bc",
-    "protocol/src/openai_models/incremental_tools.rs": "506904d09fcfb4d74377f08cbb187ee8967f19d1130dc816bcd63fb9d97d763f",
+    "protocol/src/openai_models.rs": "a255feb0126f3dfe88a74f458eb6fcc25557baba2d01eea86d9707547b1d1a7b",
+    "protocol/src/openai_models/access_programs.rs": "8df0e0ce94d201704607a00cb78b4a1736a8ea58f1ff4cffbc25bbe8afa00435",
+    "protocol/src/openai_models/incremental_tools.rs": "d354c8ec1f4bacd0e6b0a876888c6eb068cdcf820f787205ed6f7d6234915a9a",
     "protocol/src/openai_models/memento_v2.rs": "919308017fa011d98d4aba6aff749e45fe5292c5a40f0670a9a2e9c748e655ca",
-    "protocol/src/openai_models/guardian.rs": "dfe32eebcf97c4004de18f9d312510c01f532e795566d34913445dd59cde541b",
-    "protocol/src/openai_models/guardian_v2.rs": "a87d787b4c6565d31e374aad16d287858543fb1c31534c8948a3e600e9ca3e1e",
+    "protocol/src/openai_models/plugins.rs": "ecbe576634082c9097317f513032de2239d689a949310dfac554efd44f126a5c",
+    "protocol/src/openai_models/guardian.rs": "596c981da7221de5e5567fd26ef15194c6baa768226a64160da6b9b4b12c674b",
+    "protocol/src/openai_models/guardian_v2.rs": "bd23f24709694a16d3e5f436fe959e2e8eae44a94b23c9bef59a449c98d55250",
     "protocol/src/openai_models/reasoning_effort.rs": "62089cb92996bb0030d4a219a6ba06b3bcf8f2f45e95ef7204bc8632d07ea08d",
     "protocol/src/config_types.rs": "ce9b26223db7cc4b5cf474e571e4509e8cc52536e159510f153f94de0fcd37e8",
-    "protocol/src/protocol.rs": "7b896ec457c55d6d8edb959cc08cc7e903fbc73b643cbe98cccec66c2325b1e4",
-    "protocol/src/turn_input.rs": "93b69518afdfe5cae66eae6c6a36410f72a445c5734b0aba20a53a4f265712aa"
+    "protocol/src/protocol.rs": "7ca6ed42552ced2a81092f17e23ab57ec791a6a2a32449587f549ae4c0daa700",
+    "protocol/src/turn_input.rs": "d4ae36c3f37875ceb3c6f707dcafb06db9444c5c5acce343aafe5d586978f888"
   },
   "schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -24,6 +25,24 @@
       },
       "ApprovalMessages": {
         "properties": {
+          "auto_review_suffix": {
+            "description": "Optional introduction to the harness-owned automatic escalation review policy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "granular": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/GranularApprovalMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional catalog templates for harness-owned granular approval facts."
+          },
           "never": {
             "type": [
               "string",
@@ -42,6 +61,13 @@
               "null"
             ]
           },
+          "request_permissions": {
+            "description": "Optional replacement heading for the request_permissions tool instructions.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "unless_trusted": {
             "type": [
               "string",
@@ -51,8 +77,21 @@
         },
         "type": "object"
       },
+      "AppsMessages": {
+        "description": "Literal model-owned Apps guidance inside the existing developer fragment markers.",
+        "properties": {
+          "usage_instructions": {
+            "description": "Missing/null uses bundled guidance; empty clears it. Whitespace-only or more than 800 UTF-8 bytes falls back to bundled guidance. Other values preserve exact bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AsyncClassifierMode": {
-        "description": "Async classifier experiment, resolved once for each parent task.",
+        "description": "Legacy classifier modes retained for configuration and model-catalog compatibility.",
         "enum": [
           "snapshot",
           "conversation"
@@ -217,6 +256,63 @@
         ],
         "type": "string"
       },
+      "DaybreakAvailability": {
+        "description": "Server-resolved Daybreak availability for this caller and model.",
+        "enum": [
+          "available",
+          "enrollment_required",
+          "unavailable_for_model",
+          "default"
+        ],
+        "type": "string"
+      },
+      "GenericPluginMessages": {
+        "description": "Literal generic plugin wording. Missing, null, blank, or invalid values use bundled text.",
+        "properties": {
+          "intro": {
+            "description": "Literal text, up to 500 UTF-8 bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage_instructions": {
+            "description": "Up to 2,000 UTF-8 bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "GranularApprovalMessages": {
+        "description": "Catalog presentation for granular approval policy; the harness owns the policy and lists. This wire type preserves templates verbatim; validation and rendering are consumer concerns.",
+        "properties": {
+          "intro": {
+            "description": "Rendering contract: at most 500 UTF-8 bytes with exactly one `{{ policy }}` marker. Consumers must use bundled text for missing, null, empty, invalid, or oversized templates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompted_categories": {
+            "description": "Presentation around `{{ categories }}`, including the fixed prompted-bucket label. Uses the same byte limit and fallback rules as `intro`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rejected_categories": {
+            "description": "Presentation around `{{ categories }}`, including the fixed rejected-bucket label. Uses the same byte limit and fallback rules as `intro`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "GuardianModelPolicy": {
         "description": "A complete model policy. Omitted scopes are disabled; unknown fields are ignored. Code Mode wrappers have no approval scope; their nested tools follow this policy.",
         "properties": {
@@ -363,7 +459,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Deprecated and ignored; asynchronous classification always uses conversations."
           },
           "classifier_instructions": {
             "type": [
@@ -556,6 +653,20 @@
       "IncrementalToolMessages": {
         "description": "Incremental tool notice overrides; missing/null or >512-byte values use bundled defaults. Empty strings omit static text but retain runtime names and instructions.",
         "properties": {
+          "exec_tools_removed_definitions_header": {
+            "description": "Literal header before removed Code Mode tool and namespace-instruction identities.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exec_tools_update_hint": {
+            "description": "Literal hint before changed Code Mode tool definitions and namespace instructions.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "namespace_instructions_cleared": {
             "description": "Message supporting `{name}` when a namespace's instructions are cleared.",
             "type": [
@@ -687,6 +798,15 @@
               "$ref": "#/definitions/CyberAccessProgram"
             },
             "type": "array"
+          },
+          "daybreak_availability": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/DaybreakAvailability"
+              }
+            ],
+            "default": "default",
+            "description": "Server-resolved Daybreak availability for this caller and model."
           }
         },
         "required": [
@@ -739,6 +859,17 @@
                 "type": "null"
               }
             ]
+          },
+          "apps": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/AppsMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model-owned Apps usage guidance, subject to existing Apps availability and authorization."
           },
           "auto_review": {
             "anyOf": [
@@ -820,6 +951,17 @@
               "string",
               "null"
             ]
+          },
+          "plugins": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/PluginMessages"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model-owned plugin wording; runtime capability facts and eligibility remain client-owned."
           },
           "token_budget": {
             "anyOf": [
@@ -1205,6 +1347,13 @@
       },
       "PermissionMessages": {
         "properties": {
+          "approved_command_prefix_saved": {
+            "description": "Optional plain heading for the separate saved-command-prefix notification. The harness formats the prefix list and falls back to its bundled heading for invalid text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "approved_prefixes": {
             "description": "Supports `{{ approved_prefixes }}`. Missing or null uses the bundled text; an empty string suppresses the approved-prefix section.",
             "type": [
@@ -1213,6 +1362,20 @@
             ]
           },
           "danger_full_access": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "denied_reads": {
+            "description": "Presentation with exactly one `{{ denied_reads }}` placeholder for the harness-owned denial explanation, no-escalation rule, and path/glob list. Empty, invalid, or oversized templates use the bundled presentation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "omitted_paths": {
+            "description": "Optional presentation before the harness-owned omission and no-bypass warning. Empty, invalid, or oversized text uses the bundled warning without a lead-in.",
             "type": [
               "string",
               "null"
@@ -1239,6 +1402,55 @@
           },
           "writable_roots": {
             "description": "Multiple writable-roots sentence with exactly one `{{ roots }}` placeholder. Missing, null, empty, invalid, or oversized templates use the bundled sentence.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PluginMessages": {
+        "description": "Sparse plugin wording families, independent of runtime availability and authorization.",
+        "properties": {
+          "generic": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/GenericPluginMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "recommendations": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/PluginRecommendationMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selected": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/SelectedPluginMessages"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PluginRecommendationMessages": {
+        "description": "Literal recommendation introduction; plugin identities remain supplied by the harness.",
+        "properties": {
+          "intro": {
+            "description": "Literal text, up to 500 UTF-8 bytes.",
             "type": [
               "string",
               "null"
@@ -1293,6 +1505,61 @@
             "type": "string"
           }
         ]
+      },
+      "SelectedPluginMessages": {
+        "description": "Selected-plugin wording. Fact-bearing fields require exactly one documented placeholder.",
+        "properties": {
+          "apps": {
+            "description": "Up to 500 UTF-8 bytes; requires `{{ apps }}`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closing": {
+            "description": "Up to 500 UTF-8 bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intro": {
+            "description": "Up to 500 UTF-8 bytes. Selected intro requires `{{ plugin_name }}`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mcp_servers": {
+            "description": "Up to 500 UTF-8 bytes; requires `{{ mcp_servers }}`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "omitted": {
+            "description": "Nonblank omission notice, up to 500 UTF-8 bytes, including any desired separator.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "search_tools": {
+            "description": "Up to 500 UTF-8 bytes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_namespace": {
+            "description": "Up to 500 UTF-8 bytes; requires `{{ skill_namespace }}`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ToolMessage": {
         "description": "Model-owned messages for a built-in tool.",
@@ -1463,6 +1730,14 @@
           "low",
           "medium",
           "high"
+        ],
+        "type": "string"
+      },
+      "WebSearchProvider": {
+        "description": "Provider preference selected by the resolved model catalog entry.",
+        "enum": [
+          "standalone",
+          "search_mcp"
         ],
         "type": "string"
       },
@@ -1665,6 +1940,13 @@
         ],
         "description": "Reasoning effort used for multi-agent work when the user selects Ultra."
       },
+      "multi_agent_tools_in_code_mode": {
+        "description": "Whether native multi-agent tools follow the model's tool mode instead of staying direct-only. When absent, preserve the runtime's `multi_agent_v2.non_code_mode_only` setting.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
       "multi_agent_version": {
         "anyOf": [
           {
@@ -1763,6 +2045,16 @@
       },
       "visibility": {
         "$ref": "#/definitions/ModelVisibility"
+      },
+      "web_search_provider": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/WebSearchProvider"
+          },
+          {
+            "type": "null"
+          }
+        ]
       },
       "web_search_tool_type": {
         "allOf": [
